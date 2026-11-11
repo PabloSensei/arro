@@ -1,5 +1,5 @@
 # Manages the reference projects in corpus/: sync pinned commits, build each one
-# with its own wrapper, print the table for team/reports/corpus.md.
+# with its own wrapper, print a table of the results.
 #
 #   pwsh tools/corpus/corpus.ps1 sync
 #   pwsh tools/corpus/corpus.ps1 build [name...]

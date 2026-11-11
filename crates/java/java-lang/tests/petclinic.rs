@@ -39,7 +39,7 @@ fn petclinic() -> PathBuf {
     let found = candidates.iter().find(|root| root.join("pom.xml").exists());
     let Some(found) = found else {
         panic!(
-            "PetClinic is missing, looked for pom.xml in {candidates:?}; clone it as              team/reports/corpus.md says or point IDE_CORPUS at the folder that holds src/petclinic"
+            "PetClinic is missing, looked for pom.xml in {candidates:?}; clone it with tools/corpus/corpus.ps1 or point IDE_CORPUS at the folder that holds src/petclinic"
         );
     };
     fs::canonicalize(found).expect("the corpus folder can be read")

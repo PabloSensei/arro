@@ -1,5 +1,5 @@
 # Measures memory and idle CPU of a process and of its process tree over a fixed
-# window. Method and rules for results are in team/reports/measurement.md.
+# window.
 #
 #   pwsh tools/measure/measure.ps1 -Id 1234
 #   pwsh tools/measure/measure.ps1 -Name ide -WindowSeconds 60 -Runs 3 -Out result.json
