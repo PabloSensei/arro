@@ -1,0 +1,17 @@
+[package]
+name = "tool-gateway"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dap-client.workspace = true
+futures-core = "0.3"
+lang-api.workspace = true
+platform.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+base.workspace = true
+tree-sitter-language = "0.1"

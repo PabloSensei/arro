@@ -1,0 +1,10 @@
+[package]
+name = "change-tracker"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+base.workspace = true
+crossbeam-channel = "0.5"

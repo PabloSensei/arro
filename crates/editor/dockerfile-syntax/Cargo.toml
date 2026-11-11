@@ -1,0 +1,12 @@
+[package]
+name = "dockerfile-syntax"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+syntax = { path = "../syntax" }
+tree-sitter-dockerfile-updated.workspace = true
+
+[dev-dependencies]
+tree-sitter.workspace = true

@@ -1,0 +1,56 @@
+[package]
+name = "panels"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# An empty home and a local model API for harnesses, for tests of the window.
+mock-agents = ["dep:agent-testkit"]
+
+[dependencies]
+dap-client.workspace = true
+agent-core = { path = "../../ai/agent-core" }
+agent-pty = { path = "../../ai/agent-pty" }
+agent-testkit = { path = "../../ai/agent-testkit", optional = true }
+base.workspace = true
+change-tracker = { path = "../../ai/change-tracker" }
+container.workspace = true
+crossbeam-channel = "0.5"
+editor-view = { path = "../editor-view" }
+fs-watch = { path = "../../foundation/fs-watch" }
+futures-channel = "0.3"
+futures-util = "0.3"
+keymap = { path = "../../editor/keymap" }
+lang-api.workspace = true
+local-history = { path = "../../services/local-history" }
+mcp-server = { path = "../../ai/mcp-server" }
+platform.workspace = true
+proc-sup.workspace = true
+project-model.workspace = true
+runner.workspace = true
+plugin-host.workspace = true
+search = { path = "../../services/search" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
+store = { path = "../../foundation/store" }
+terminal.workspace = true
+text-core = { path = "../../editor/text-core" }
+tool-gateway = { path = "../../ai/tool-gateway" }
+ui-kit = { path = "../ui-kit" }
+vcs.workspace = true
+workspace = { path = "../workspace" }
+workspace-core.workspace = true
+
+[dev-dependencies]
+# A language for the editor keys in window tests: comments and syntax without a server.
+dockerfile-syntax = { path = "../../editor/dockerfile-syntax" }
+# The mock debug adapter of the fixture language, for the debug window tests.
+lang-fixture = { path = "../../../tools/lang-fixture" }
+# The real language and debugger, for the ignored window tests of a real project.
+window-language = { path = "../../../tools/window-language" }
+# A runtime for the debug session of those tests, on the same client as the application.
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync"] }
+# The test platform of GPUI: real components in headless windows, through ui-kit.
+ui-kit = { path = "../ui-kit", features = ["test-support"] }
+workspace = { path = "../workspace", features = ["test-support"] }

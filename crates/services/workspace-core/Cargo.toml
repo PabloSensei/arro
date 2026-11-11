@@ -1,0 +1,18 @@
+[package]
+name = "workspace-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+futures-channel = "0.3"
+futures-core = "0.3"
+platform.workspace = true
+text-core = { path = "../../editor/text-core" }
+
+[dev-dependencies]
+encoding_rs.workspace = true
+text-core = { path = "../../editor/text-core" }
+futures-executor = "0.3"
+futures-util = "0.3"

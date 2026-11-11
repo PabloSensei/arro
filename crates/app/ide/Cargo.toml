@@ -1,0 +1,29 @@
+[package]
+name = "ide"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[features]
+mock-agents = ["panels/mock-agents"]
+
+[[bin]]
+name = "arro"
+path = "src/main.rs"
+
+[dependencies]
+backtrace = "0.3.77"
+base.workspace = true
+dockerfile-syntax = { path = "../../editor/dockerfile-syntax" }
+editor-view = { path = "../../ui/editor-view" }
+futures-channel = "0.3"
+java-lang = { path = "../../java/java-lang" }
+lang-api.workspace = true
+panels = { path = "../../ui/panels" }
+platform.workspace = true
+store = { path = "../../foundation/store" }
+syntax = { path = "../../editor/syntax" }
+workspace = { path = "../../ui/workspace" }

@@ -1,0 +1,39 @@
+// Adds the IDE test listener to every Test task and tells it where the IDE listens.
+//   gradlew --init-script ide-test.init.gradle --no-configuration-cache --no-scan \
+//       -Pide.test.listener=JAR -Pide.test.port=PORT -Pide.test.token=TOKEN :test --tests X
+//
+// The port and token go as system properties of the test JVM. The environment of the run
+// reached the test JVM under a running server too (S8, Gradle 9.5), but a property does not
+// depend on how the server passes it on.
+
+def properties = gradle.startParameter.projectProperties
+def listener = properties['ide.test.listener']
+def port = properties['ide.test.port']
+def token = properties['ide.test.token']
+def debugAgent = properties['ide.debug.agent']
+
+if (listener != null) {
+    allprojects {
+        // A dependency and not a classpath of its own: setting the classpath here would fix it
+        // before the test suite plugin fills it in.
+        plugins.withId('java') {
+            dependencies { testRuntimeOnly files(listener) }
+        }
+        tasks.withType(Test).configureEach { test ->
+            if (port != null) {
+                test.systemProperty 'ide.test.port', port
+                test.systemProperty 'ide.test.token', token
+            }
+            if (debugAgent != null) {
+                test.jvmArgs debugAgent
+                // Gradle keeps the output of a test JVM to itself until the test ends.
+                // The agent names its port before the tests start and the debugger waits
+                // for that line, so the output must flow at once.
+                test.testLogging.showStandardStreams = true
+            }
+            // The IDE asked for a run: an up-to-date or cached result sends no events.
+            test.outputs.upToDateWhen { false }
+            test.outputs.cacheIf { false }
+        }
+    }
+}

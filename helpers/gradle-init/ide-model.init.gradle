@@ -1,0 +1,109 @@
+// Writes one JSON file per project into the directory given by -Pide.model.out.
+//   gradlew --init-script ide-model.init.gradle --no-configuration-cache --no-scan \n//       -Pide.model.out=DIR ideModel
+//
+// Every project resolves its own configurations in its own task, so no task reaches into
+// another project.
+
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
+def classpathOf = { project, String name, List problems ->
+    def configuration = project.configurations.findByName(name)
+    if (configuration == null) {
+        return []
+    }
+    // Lenient: a project dependency gives its output path without building anything.
+    def view = configuration.incoming.artifactView { lenient(true) }
+    def entries = view.artifacts.artifacts.collect { artifact ->
+        def id = artifact.id.componentIdentifier
+        def entry = [path: artifact.file.path]
+        if (id instanceof ProjectComponentIdentifier) {
+            entry.kind = 'module'
+            entry.module = id.projectPath
+            entry.built = artifact.file.exists()
+        } else if (id instanceof ModuleComponentIdentifier) {
+            entry.kind = 'library'
+            entry.coordinates = id.displayName
+        } else {
+            entry.kind = 'file'
+        }
+        entry
+    }
+    view.artifacts.failures.each { problems << "${name}: ${it.message}".toString() }
+    entries
+}
+
+// Plugins add to a source set's classpath past its configuration (jmh does), and a test set
+// sees the main output there. Those entries have no component id, so they stay plain files.
+def withFilesOf = { List entries, classpath, Set ownOutput, List problems ->
+    def known = entries*.path as Set
+    try {
+        classpath.files.each { file ->
+            if (!known.contains(file.path) && !ownOutput.contains(file.path)) {
+                entries << [path: file.path, kind: 'file']
+            }
+        }
+    } catch (Exception e) {
+        problems << e.message
+    }
+    entries
+}
+
+def describe = { project ->
+    def problems = []
+    def sourceSets = project.extensions.findByName('sourceSets')
+    def sets = sourceSets == null ? [] : sourceSets.collect { set ->
+        def ownOutput = set.output.classesDirs.files*.path as Set
+        if (set.output.resourcesDir != null) {
+            ownOutput << set.output.resourcesDir.path
+        }
+        [
+            name: set.name,
+            sourceRoots: set.allJava.srcDirs*.path.sort(),
+            allSourceRoots: set.allSource.srcDirs*.path.sort(),
+            resourceRoots: set.resources.srcDirs*.path.sort(),
+            classesDirs: set.output.classesDirs.files*.path.sort(),
+            resourcesDir: set.output.resourcesDir?.path,
+            compileClasspath: withFilesOf(
+                classpathOf(project, set.compileClasspathConfigurationName, problems),
+                set.compileClasspath, ownOutput, problems),
+            runtimeClasspath: withFilesOf(
+                classpathOf(project, set.runtimeClasspathConfigurationName, problems),
+                set.runtimeClasspath, ownOutput, problems),
+        ]
+    }
+    [
+        path: project.path,
+        name: project.name,
+        projectDir: project.projectDir.path,
+        buildDir: project.layout.buildDirectory.get().asFile.path,
+        plugins: [
+            java: project.plugins.hasPlugin('java'),
+            kotlin: project.plugins.hasPlugin('org.jetbrains.kotlin.jvm'),
+        ],
+        sourceSets: sets,
+        problems: problems,
+    ]
+}
+
+
+allprojects { project ->
+    project.tasks.register('ideModel') {
+        group = 'ide'
+        doNotTrackState('The model is written on every request')
+        doLast {
+            def directory = new File(project.property('ide.model.out').toString())
+            directory.mkdirs()
+            def name = project.path == ':' ? 'root' : project.path.substring(1).replace(':', '.')
+            def model = [
+                schema: 1,
+                tool: 'gradle',
+                toolVersion: project.gradle.gradleVersion,
+                javaVersion: System.getProperty('java.version'),
+                project: describe(project),
+            ]
+            new File(directory, "${name}.json").setText(JsonOutput.toJson(model), 'UTF-8')
+        }
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "lang-api"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+futures-channel = "0.3"
+futures-core = "0.3"
+tree-sitter-language = "0.1"
+
+[dev-dependencies]
+futures-executor = "0.3"
+futures-util = "0.3"

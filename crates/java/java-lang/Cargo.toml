@@ -1,0 +1,42 @@
+[package]
+name = "java-lang"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+dap-client.workspace = true
+futures-util = "0.3"
+java-exec.workspace = true
+java-project.workspace = true
+java-syntax = { path = "../java-syntax" }
+platform.workspace = true
+proc-sup.workspace = true
+project-model.workspace = true
+runner.workspace = true
+jdtls-adapter.workspace = true
+lang-api.workspace = true
+lsp-client.workspace = true
+semantic-router.workspace = true
+serde_json = "1.0.154"
+sidecar.workspace = true
+syntax = { path = "../../editor/syntax" }
+templates = { path = "../../editor/templates" }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+tree-sitter.workspace = true
+tree-sitter-java-orchard.workspace = true
+tree-sitter-language = "0.1"
+
+[dev-dependencies]
+base.workspace = true
+fs-watch = { path = "../../foundation/fs-watch" }
+editor-view = { path = "../../ui/editor-view" }
+keymap = { path = "../../editor/keymap" }
+lsp-client.workspace = true
+platform.workspace = true
+search = { path = "../../services/search" }
+lang-fixture = { path = "../../../tools/lang-fixture" }
+text-core = { path = "../../editor/text-core" }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }
+workspace-core.workspace = true

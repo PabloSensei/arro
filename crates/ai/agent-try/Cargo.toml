@@ -1,0 +1,15 @@
+[package]
+name = "agent-try"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+agent-pty = { path = "../agent-pty" }
+agent-testkit = { path = "../agent-testkit" }
+change-tracker = { path = "../change-tracker" }
+mcp-server = { path = "../mcp-server" }
+terminal.workspace = true
+tool-gateway = { path = "../tool-gateway" }
+

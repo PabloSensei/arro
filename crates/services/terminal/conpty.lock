@@ -1,0 +1,9 @@
+# Pinned Microsoft.Windows.Console.ConPTY package for x64.
+# Every value is a SHA-256 in lowercase hex. An empty value means "not pinned yet":
+# a release build then falls back to the system ConPTY and never loads the file.
+# `cargo run -p xtask -- fetch-conpty` prints the values to put here.
+package = Microsoft.Windows.Console.ConPTY
+version = 1.25.260930003
+package_sha256 = 02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee
+conpty_dll_sha256 = feeef341d891643c62d30b6b07800bc70f0bc148f44cb8c3bee84aa557ae805a
+open_console_exe_sha256 = 3d66b23d0a71bb8eed2b77edc8b9df9bf54ce6c8fb74c863a30e760997f80586

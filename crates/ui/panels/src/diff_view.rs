@@ -1,0 +1,893 @@
+//! The changes of one file against the last commit, line by line, with a button that takes
+//! one hunk back.
+
+use std::path::{Path, PathBuf};
+
+use editor_view::EditorView;
+use ui_kit::metrics::*;
+use ui_kit::prelude::*;
+use ui_kit::*;
+use vcs::{Hunk, TextEdit};
+use workspace::Workspace;
+
+use crate::git::{GitState, Kind, relative_of};
+
+const WIDTH: f32 = 920.;
+const CONTEXT_LINES: usize = 2;
+const LINE_HEIGHT: f32 = 20.;
+const CONTEXT: &str = "DiffView";
+
+actions!(
+    diff_view,
+    [
+        NextDiff,
+        PreviousDiff,
+        NextChange,
+        PreviousChange,
+        ApplyLeftSide,
+        ApplyRightSide
+    ]
+);
+
+/// One key of the diff and the IDEA action it implements, if any.
+#[cfg(test)]
+pub(crate) struct DiffKey {
+    pub(crate) keys: &'static str,
+    pub(crate) action: &'static str,
+    pub(crate) idea: Option<&'static str>,
+}
+
+macro_rules! diff_keys {
+    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+        /// The diff keys, while the popup has the focus.
+        pub(crate) fn bind_keys(cx: &mut App) {
+            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+        }
+
+        #[cfg(test)]
+        pub(crate) const KEYS: &[DiffKey] = &[
+            $(DiffKey {
+                keys: $keys,
+                action: concat!("diff_view::", stringify!($action)),
+                idea: $idea,
+            }),*
+        ];
+    };
+}
+
+diff_keys![
+    ("f7", NextDiff, Some("NextDiff")),
+    ("shift-f7", PreviousDiff, Some("PreviousDiff")),
+    ("alt-shift-right", NextChange, Some("Diff.NextChange")),
+    ("alt-shift-left", PreviousChange, Some("Diff.PrevChange")),
+    ("ctrl-alt-r", ApplyLeftSide, Some("Diff.ApplyLeftSide")),
+    ("ctrl-alt-a", ApplyRightSide, Some("Diff.ApplyRightSide")),
+];
+
+pub struct DiffView {
+    git: Entity<GitState>,
+    workspace: WeakEntity<Workspace>,
+    path: PathBuf,
+    focus: FocusHandle,
+    changes: Changes,
+    source: Source,
+    /// The files of the changes list, in the order the next file walks them.
+    files: Vec<PathBuf>,
+    /// Where `path` sits in `files`.
+    index: usize,
+    /// The hunk the diff keys act on.
+    selected: usize,
+    scroll: ScrollHandle,
+}
+
+/// What the diff is taken from: the working tree, one commit, or the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Source {
+    WorkingTree,
+    Commit(String),
+    /// The working tree against the head of a branch, as Compare shows it.
+    Branch(String),
+    Clipboard,
+    /// Another file, the left side of Compare Two Files.
+    File(PathBuf),
+    /// A shelf, the left side of its diff is `HEAD`.
+    Shelf(String),
+}
+
+/// What the file is now and what the last commit has, with `\n` line ends, and the hunks
+/// between them.
+struct Changes {
+    current: String,
+    base: String,
+    hunks: Vec<Hunk>,
+}
+
+impl Changes {
+    /// The edit that takes the hunk back, if the text is still the one the diff was taken
+    /// from. `None` means the text moved, so the hunk may sit elsewhere now.
+    fn revert(&self, index: usize, text_now: &str) -> Option<TextEdit> {
+        if text_now != self.current {
+            return None;
+        }
+        Some(vcs::revert_hunk(
+            &self.base,
+            &self.current,
+            self.hunks.get(index)?,
+        ))
+    }
+}
+
+/// The text of the file as the user sees it: the open editor, or the disk.
+fn current_text(path: &Path, editor: Option<&Entity<EditorView>>, cx: &App) -> String {
+    let text = editor
+        .and_then(|editor| editor.read(cx).text())
+        .or_else(|| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    text.replace("\r\n", "\n")
+}
+
+fn editor_of(
+    workspace: &WeakEntity<Workspace>,
+    path: &Path,
+    cx: &App,
+) -> Option<Entity<EditorView>> {
+    let open = workspace
+        .read_with(cx, |workspace, _| workspace.open_editors())
+        .ok()?;
+    let (_, view) = open.into_iter().find(|(open, _)| open == path)?;
+    view.downcast::<EditorView>().ok()
+}
+
+impl DiffView {
+    /// Reads the diff in the background and opens the popup when it is there.
+    pub fn open(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let files = vec![path.clone()];
+        Self::open_list(git, workspace, files, 0, window, cx);
+    }
+
+    /// Opens the diff of one file of a changes list, so that the diff keys walk the list.
+    pub fn open_list(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        files: Vec<PathBuf>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(path) = files.get(index).cloned() else {
+            return;
+        };
+        Self::open_source(
+            git,
+            workspace,
+            path,
+            Source::WorkingTree,
+            files,
+            index,
+            window,
+            cx,
+        );
+    }
+
+    /// The diff of a file as one commit changed it, for the Git Log window.
+    pub fn open_commit(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        commit: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let files = vec![path.clone()];
+        Self::open_source(
+            git,
+            workspace,
+            path,
+            Source::Commit(commit),
+            files,
+            0,
+            window,
+            cx,
+        );
+    }
+
+    /// The working tree of a file of a Compare window against the head of `branch`.
+    pub fn open_branch(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        files: Vec<PathBuf>,
+        index: usize,
+        branch: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(path) = files.get(index).cloned() else {
+            return;
+        };
+        Self::open_source(
+            git,
+            workspace,
+            path,
+            Source::Branch(branch),
+            files,
+            index,
+            window,
+            cx,
+        );
+    }
+
+    /// Ctrl+D on a file of a shelf: `HEAD` against the version the shelf holds.
+    pub fn open_shelf(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        shelf: String,
+        path: PathBuf,
+        patch: Vec<u8>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(repo) = git.read(cx).repo() else {
+            return;
+        };
+        let job_path = path.clone();
+        let job = cx.background_executor().spawn(async move {
+            let relative = relative_of(repo.root(), &job_path);
+            repo.shelf_diff(&patch, &relative).ok().flatten()
+        });
+        window
+            .spawn(cx, async move |cx| {
+                let Some(diff) = job.await else {
+                    return;
+                };
+                cx.update(|window, cx| {
+                    Self::show(
+                        git,
+                        workspace,
+                        path,
+                        Source::Shelf(shelf),
+                        Vec::new(),
+                        0,
+                        diff.current,
+                        diff.base,
+                        diff.hunks,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// Ctrl+D on one file: the difference between the file and the clipboard.
+    pub fn compare_clipboard(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        clipboard: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_text(
+            git,
+            workspace,
+            path,
+            Source::Clipboard,
+            window,
+            cx,
+            move |path| {
+                let current = std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .replace("\r\n", "\n");
+                (clipboard, current)
+            },
+        );
+    }
+
+    /// Ctrl+D on two files of the project tree: `left` against `right`, both read in
+    /// the background.
+    pub fn compare_files(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        left: PathBuf,
+        right: PathBuf,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let other = left.clone();
+        Self::open_text(
+            git,
+            workspace,
+            right,
+            Source::File(left),
+            window,
+            cx,
+            move |path| {
+                let read = |path: &Path| {
+                    std::fs::read_to_string(path)
+                        .unwrap_or_default()
+                        .replace("\r\n", "\n")
+                };
+                (read(&other), read(path))
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_source(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        source: Source,
+        files: Vec<PathBuf>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(repo) = git.read(cx).repo() else {
+            return;
+        };
+        let current = match source {
+            Source::WorkingTree | Source::Branch(_) => {
+                current_text(&path, editor_of(&workspace, &path, cx).as_ref(), cx)
+            }
+            Source::Commit(_) | Source::Shelf(_) => String::new(),
+            Source::Clipboard | Source::File(_) => String::new(),
+        };
+        let (job_path, job_text) = (path.clone(), current.clone());
+        let job_source = source.clone();
+        let job = cx.background_executor().spawn(async move {
+            let relative = relative_of(repo.root(), &job_path);
+            let mut blobs = repo.blobs().ok()?;
+            match &job_source {
+                Source::WorkingTree => repo.file_diff(&mut blobs, &relative, &job_text).ok(),
+                Source::Branch(branch) => repo
+                    .file_diff_with(&mut blobs, branch, &relative, &job_text)
+                    .ok(),
+                Source::Commit(commit) => repo.commit_file_diff(&mut blobs, commit, &relative).ok(),
+                Source::Clipboard | Source::File(_) | Source::Shelf(_) => None,
+            }
+        });
+        window
+            .spawn(cx, async move |cx| {
+                let Some(diff) = job.await else {
+                    return;
+                };
+                cx.update(|window, cx| {
+                    Self::show(
+                        git, workspace, path, source, files, index, current, diff.base, diff.hunks,
+                        window, cx,
+                    );
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// A diff that is not taken from git: two files, or one file and the clipboard.
+    fn open_text(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        source: Source,
+        window: &mut Window,
+        cx: &mut App,
+        read: impl FnOnce(&Path) -> (String, String) + Send + 'static,
+    ) {
+        let job_path = path.clone();
+        let job = cx
+            .background_executor()
+            .spawn(async move { read(&job_path) });
+        window
+            .spawn(cx, async move |cx| {
+                let (base, current) = job.await;
+                cx.update(|window, cx| {
+                    let hunks = vcs::line_hunks(&base, &current);
+                    Self::show(
+                        git,
+                        workspace,
+                        path,
+                        source,
+                        Vec::new(),
+                        0,
+                        current,
+                        base,
+                        hunks,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn show(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        source: Source,
+        files: Vec<PathBuf>,
+        index: usize,
+        current: String,
+        base: String,
+        hunks: Vec<Hunk>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(shared) = workspace.upgrade() else {
+            return;
+        };
+        let weak = workspace.clone();
+        shared.update(cx, |workspace, cx| {
+            let view = cx.new(|cx| Self {
+                git,
+                workspace: weak,
+                path,
+                focus: cx.focus_handle(),
+                changes: Changes {
+                    current,
+                    base,
+                    hunks,
+                },
+                source,
+                files,
+                index,
+                selected: 0,
+                scroll: ScrollHandle::new(),
+            });
+            let focus = view.read(cx).focus.clone();
+            workspace.show_overlay(view.into(), focus, window, cx);
+        });
+    }
+
+    fn revertable(&self) -> bool {
+        self.source == Source::WorkingTree
+    }
+
+    /// F7 and Shift+F7: the next or previous hunk; the last one goes to the next file.
+    fn next_diff(&mut self, cx: &mut Context<Self>) {
+        if self.selected + 1 < self.changes.hunks.len() {
+            self.selected += 1;
+            cx.notify();
+        } else {
+            self.move_file(1, false, cx);
+        }
+    }
+
+    fn previous_diff(&mut self, cx: &mut Context<Self>) {
+        if self.selected > 0 {
+            self.selected -= 1;
+            cx.notify();
+        } else {
+            self.move_file(-1, true, cx);
+        }
+    }
+
+    /// Alt+Shift+Right and Alt+Shift+Left: the next or previous file of the list.
+    fn next_change(&mut self, cx: &mut Context<Self>) {
+        self.move_file(1, false, cx);
+    }
+
+    fn previous_change(&mut self, cx: &mut Context<Self>) {
+        self.move_file(-1, true, cx);
+    }
+
+    /// Shows another file of the list. `last` selects the last hunk, as going back does.
+    fn move_file(&mut self, step: isize, last: bool, cx: &mut Context<Self>) {
+        if !matches!(
+            self.source,
+            Source::WorkingTree | Source::Commit(_) | Source::Branch(_)
+        ) {
+            return;
+        }
+        let next = self.index as isize + step;
+        if next < 0 || next as usize >= self.files.len() {
+            return;
+        }
+        let index = next as usize;
+        let Some(path) = self.files.get(index).cloned() else {
+            return;
+        };
+        let Some(repo) = self.git.read(cx).repo() else {
+            return;
+        };
+        let source = self.source.clone();
+        let editor = editor_of(&self.workspace, &path, cx);
+        let current = match source {
+            Source::WorkingTree | Source::Branch(_) => current_text(&path, editor.as_ref(), cx),
+            _ => String::new(),
+        };
+        let (job_path, job_text) = (path.clone(), current.clone());
+        let job = cx.background_executor().spawn(async move {
+            let relative = relative_of(repo.root(), &job_path);
+            let mut blobs = repo.blobs().ok()?;
+            match source {
+                Source::WorkingTree => repo.file_diff(&mut blobs, &relative, &job_text).ok(),
+                Source::Branch(branch) => repo
+                    .file_diff_with(&mut blobs, &branch, &relative, &job_text)
+                    .ok(),
+                Source::Commit(commit) => {
+                    repo.commit_file_diff(&mut blobs, &commit, &relative).ok()
+                }
+                Source::Clipboard | Source::File(_) | Source::Shelf(_) => None,
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let Some(diff) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let selected = if last {
+                    diff.hunks.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                this.path = path;
+                this.changes = Changes {
+                    current,
+                    base: diff.base,
+                    hunks: diff.hunks,
+                };
+                this.index = index;
+                this.selected = selected;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn revert(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.revertable() {
+            return;
+        }
+        let editor = editor_of(&self.workspace, &self.path, cx);
+        let text_now = current_text(&self.path, editor.as_ref(), cx);
+        let Some(TextEdit { range, text }) = self.changes.revert(index, &text_now) else {
+            // The text moved while the popup was open: the old hunk may land in the wrong
+            // place, so read the diff again and say why nothing was taken back.
+            self.git.update(cx, |git, cx| {
+                git.tell("Revert", "The text changed, so the diff was read again", cx)
+            });
+            self.reread(cx);
+            return;
+        };
+        let path = self.path.clone();
+        match editor {
+            Some(editor) => {
+                let bytes = editor.read(cx).file_bytes();
+                let cause = local_history::Cause::BeforeGitRevert;
+                crate::history::snapshot_bytes(&path, bytes, cause, cx);
+                editor.update(cx, |editor, cx| {
+                    editor.replace_text(range.clone(), &text, cx)
+                });
+                self.workspace
+                    .update(cx, |workspace, cx| workspace.save_editor(&path, cx))
+                    .ok();
+            }
+            None => {
+                // A small file, read and written here anyway: the snapshot goes first.
+                if let Some(history) = crate::history::get(cx) {
+                    let _ = history.record_file(&path, local_history::Cause::BeforeGitRevert);
+                }
+                let mut next = text_now;
+                next.replace_range(range, &text);
+                if let Err(error) = std::fs::write(&path, next) {
+                    let message = format!("{}: {error}", path.display());
+                    self.git
+                        .update(cx, |git, cx| git.report("Revert", message, cx));
+                    return;
+                }
+            }
+        }
+        self.reread(cx);
+    }
+
+    /// Ctrl+Alt+R: the left side of the selected change lands in the working tree.
+    fn apply_left(&mut self, cx: &mut Context<Self>) {
+        if self.changes.hunks.is_empty() {
+            return;
+        }
+        self.revert(self.selected, cx);
+    }
+
+    /// Ctrl+Alt+A: the right side stays, and the diff moves on to the next change.
+    fn apply_right(&mut self, cx: &mut Context<Self>) {
+        if self.changes.hunks.is_empty() {
+            return;
+        }
+        self.next_diff(cx);
+    }
+
+    /// Takes the diff again after a change.
+    fn reread(&mut self, cx: &mut Context<Self>) {
+        if !self.revertable() {
+            return;
+        }
+        let Some(repo) = self.git.read(cx).repo() else {
+            return;
+        };
+        let editor = editor_of(&self.workspace, &self.path, cx);
+        let current = current_text(&self.path, editor.as_ref(), cx);
+        let (path, text) = (self.path.clone(), current.clone());
+        let job = cx.background_executor().spawn(async move {
+            let relative = relative_of(repo.root(), &path);
+            let mut blobs = repo.blobs().ok()?;
+            repo.file_diff(&mut blobs, &relative, &text).ok()
+        });
+        cx.spawn(async move |this, cx| {
+            let Some(diff) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.changes = Changes {
+                    current,
+                    base: diff.base,
+                    hunks: diff.hunks,
+                };
+                this.selected = this
+                    .selected
+                    .min(this.changes.hunks.len().saturating_sub(1));
+                this.git.update(cx, |git, cx| git.refresh(cx));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+
+    /// The file the diff shows, for tests.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The selected hunk, for tests.
+    #[cfg(test)]
+    pub(crate) fn hunk_index(&self) -> usize {
+        self.selected
+    }
+
+    /// How many hunks the diff has, for tests.
+    #[cfg(test)]
+    pub(crate) fn hunk_count(&self) -> usize {
+        self.changes.hunks.len()
+    }
+
+    fn hunk_rows(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let hunk = &self.changes.hunks[index];
+        let rows = hunk_lines(&self.changes.base, &self.changes.current, hunk, theme);
+        let start = (hunk.after.start as usize).min(self.changes.current.split('\n').count());
+        let revert = self.revertable().then(|| {
+            div()
+                .id(("revert-hunk", index))
+                .debug_selector(move || format!("diff-revert-{index}"))
+                .flex()
+                .items_center()
+                .h(px(22.))
+                .px(px(8.))
+                .rounded(px(CONTROL_RADIUS))
+                .text_color(theme.text)
+                .hover({
+                    let pressed = theme.pressed;
+                    move |style| style.bg(pressed)
+                })
+                .child("Revert")
+                .on_click(cx.listener(move |this, _, _, cx| this.revert(index, cx)))
+        });
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .when(self.selected == index, |this| {
+                this.bg(theme.selection_inactive)
+            })
+            .when(self.selected != index, |this| this.bg(theme.hover))
+            .text_color(theme.text_secondary)
+            .child(format!("Line {}", start + 1))
+            .children(revert);
+        div().flex().flex_col().mb(px(8.)).child(header).child(rows)
+    }
+}
+
+fn line(text: &str, sign: &'static str, tint: Option<Hsla>, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .h(px(LINE_HEIGHT))
+        .items_center()
+        .when_some(tint, |this, tint| this.bg(tint.opacity(0.18)))
+        .child(
+            div()
+                .w(px(22.))
+                .flex_none()
+                .text_color(theme.text_secondary)
+                .child(sign),
+        )
+        .child(div().whitespace_nowrap().child(text.to_string()))
+}
+
+/// The lines of one hunk between `base` and `current`, with a little context around:
+/// removed lines red, added green. Shared with the Local History window.
+pub(crate) fn hunk_lines(base: &str, current: &str, hunk: &Hunk, theme: &Theme) -> Div {
+    let before: Vec<&str> = base.split('\n').collect();
+    let after: Vec<&str> = current.split('\n').collect();
+    let clamp = |line: u32| (line as usize).min(after.len());
+    let (start, end) = (clamp(hunk.after.start), clamp(hunk.after.end));
+    let from = start.saturating_sub(CONTEXT_LINES);
+    let to = (end + CONTEXT_LINES).min(after.len());
+    let removed_from = (hunk.before.start as usize).min(before.len());
+    let removed_to = (hunk.before.end as usize).min(before.len());
+    let removed = Some(Kind::Conflicted.color(theme.dark));
+    let added = Some(Kind::Added.color(theme.dark));
+
+    let mut rows = div().flex().flex_col();
+    for text in &after[from..start] {
+        rows = rows.child(line(text, " ", None, theme));
+    }
+    for text in &before[removed_from..removed_to] {
+        rows = rows.child(line(text, "-", removed, theme));
+    }
+    for text in &after[start..end] {
+        rows = rows.child(line(text, "+", added, theme));
+    }
+    for text in &after[end..to] {
+        rows = rows.child(line(text, " ", None, theme));
+    }
+    rows
+}
+
+impl Render for DiffView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let viewport = window.viewport_size();
+        let width = px(WIDTH).min(viewport.width - px(40.));
+        let height = viewport.height * 0.7;
+        let left = (viewport.width - width) / 2.;
+        let top = viewport.height * 0.12;
+        let repo = self.git.read(cx).repo();
+        let root = repo.as_ref().map_or(Path::new(""), |repo| repo.root());
+        let title = relative_of(root, &self.path);
+        let title = match &self.source {
+            Source::WorkingTree => {
+                if self.files.len() > 1 {
+                    format!(
+                        "Changes in {title} ({} of {})",
+                        self.index + 1,
+                        self.files.len()
+                    )
+                } else {
+                    format!("Changes in {title}")
+                }
+            }
+            Source::Commit(commit) => {
+                format!("Changes in {title} at {}", &commit[..commit.len().min(7)])
+            }
+            Source::Branch(branch) => format!("Difference between '{branch}' and {title}"),
+            Source::Clipboard => format!("Difference between the clipboard and {title}"),
+            Source::File(other) => {
+                let other = other.file_name().map_or_else(
+                    || other.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                format!("Difference between {other} and {title}")
+            }
+            Source::Shelf(shelf) => format!("HEAD and {title} in shelf {shelf}"),
+        };
+        let rows: Vec<Div> = (0..self.changes.hunks.len())
+            .map(|index| self.hunk_rows(index, &theme, cx))
+            .collect();
+        let empty = rows.is_empty();
+        let body = surface(&theme)
+            .id("diff")
+            .track_focus(&self.focus)
+            .key_context(CONTEXT)
+            .on_action(cx.listener(|this, _: &NextDiff, _, cx| this.next_diff(cx)))
+            .on_action(cx.listener(|this, _: &PreviousDiff, _, cx| this.previous_diff(cx)))
+            .on_action(cx.listener(|this, _: &NextChange, _, cx| this.next_change(cx)))
+            .on_action(cx.listener(|this, _: &PreviousChange, _, cx| this.previous_change(cx)))
+            .on_action(cx.listener(|this, _: &ApplyLeftSide, _, cx| this.apply_left(cx)))
+            .on_action(cx.listener(|this, _: &ApplyRightSide, _, cx| this.apply_right(cx)))
+            .occlude()
+            .w(width)
+            .h(height)
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .child(
+                div()
+                    .debug_selector(|| "diff-title".to_owned())
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .h(px(40.))
+                    .px(px(DIALOG_PADDING))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
+            )
+            .child(
+                scrollable(
+                    "diff-list",
+                    &self.scroll,
+                    div()
+                        .id("diff-list")
+                        .flex()
+                        .flex_col()
+                        .px(px(8.))
+                        .font_family(MONO_FONT)
+                        .text_size(px(CODE_SIZE))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .children(rows)
+                        .when(empty, |this| {
+                            this.items_center()
+                                .justify_center()
+                                .text_color(theme.text_secondary)
+                                .child("No changes")
+                        }),
+                    &theme,
+                    window,
+                    cx,
+                )
+                .flex_1()
+                .min_h_0(),
+            );
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .child(enter("diff-enter", body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Changes;
+
+    fn apply(mut text: String, edit: vcs::TextEdit) -> String {
+        text.replace_range(edit.range, &edit.text);
+        text
+    }
+
+    #[test]
+    fn a_hunk_is_taken_back_only_over_the_text_the_diff_was_taken_from() {
+        let base = "a\nb\nc\n";
+        let current = "a\nB\nc\n";
+        let changes = Changes {
+            current: current.into(),
+            base: base.into(),
+            hunks: vcs::line_hunks(base, current),
+        };
+
+        let edit = changes.revert(0, current).unwrap();
+        assert_eq!(apply(current.to_string(), edit), base);
+    }
+
+    #[test]
+    fn a_changed_text_gives_no_edit_and_the_caller_rereads_the_diff() {
+        let base = "a\nb\nc\n";
+        let current = "a\nB\nc\n";
+        let changes = Changes {
+            current: current.into(),
+            base: base.into(),
+            hunks: vcs::line_hunks(base, current),
+        };
+
+        assert_eq!(changes.revert(0, "a\nB\nC\n"), None);
+        assert_eq!(changes.revert(7, current), None);
+    }
+}

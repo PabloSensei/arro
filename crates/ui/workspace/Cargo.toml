@@ -1,0 +1,19 @@
+[package]
+name = "workspace"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# Builds a window against the test platform of GPUI, with no real window.
+test-support = []
+
+[dependencies]
+keymap = { path = "../../editor/keymap" }
+platform.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.154"
+store = { path = "../../foundation/store" }
+ui-kit = { path = "../ui-kit" }
+updater.workspace = true
+workspace-core.workspace = true

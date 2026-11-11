@@ -1,0 +1,21 @@
+[package]
+name = "plugin-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+keymap = { path = "../../editor/keymap" }
+proc-sup.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+workspace-core.workspace = true
+
+[[bin]]
+# The toy plugin of the headless tests, not shipped.
+name = "plugin-host-toy"
+path = "src/bin/toy.rs"
+test = false
+doc = false

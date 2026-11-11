@@ -1,0 +1,11 @@
+[package]
+name = "agent-testkit"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json = "1"
+terminal.workspace = true
+tool-gateway = { path = "../tool-gateway" }
+

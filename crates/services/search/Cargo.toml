@@ -1,0 +1,20 @@
+[package]
+name = "search"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+lang-api.workspace = true
+nucleo-matcher.workspace = true
+regex.workspace = true
+text-core = { path = "../../editor/text-core" }
+
+[dev-dependencies]
+futures-executor = "0.3"
+futures-util = "0.3"
+workspace-core.workspace = true

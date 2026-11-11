@@ -1,0 +1,10 @@
+[package]
+name = "vcs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+imara-diff = "0.2"
+platform.workspace = true

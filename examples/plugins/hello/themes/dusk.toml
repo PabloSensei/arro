@@ -1,0 +1,13 @@
+# Tokens of the IDE theme. The ones left out come from the built-in dark theme.
+dark = true
+
+[colors]
+editor_bg = "#1e1b26"
+island_bg = "#1e1b26"
+main_bg = "#2a2633"
+border = "#2a2633"
+caret_row = "#262231"
+selection = "#4a3b6b"
+keyword = "#e0a3ff"
+string = "#9fd8a0"
+comment = "#857d99"

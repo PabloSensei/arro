@@ -1,0 +1,21 @@
+[package]
+name = "window-language"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Test support only, never shipped: the window tests of `panels` get the real language
+# through this crate, so that the neutral crates stay free of the language.
+[dependencies]
+base.workspace = true
+dap-client.workspace = true
+java-exec.workspace = true
+java-lang = { path = "../../crates/java/java-lang" }
+lang-api.workspace = true
+lsp-client.workspace = true
+platform.workspace = true
+proc-sup.workspace = true
+project-model.workspace = true
+runner.workspace = true
+syntax = { path = "../../crates/editor/syntax" }
+templates = { path = "../../crates/editor/templates" }

@@ -1,0 +1,19 @@
+[package]
+name = "editor-view"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+display-map = { path = "../../editor/display-map" }
+futures-channel = "0.3"
+futures-util = "0.3"
+keymap = { path = "../../editor/keymap" }
+lang-api.workspace = true
+lsp-client.workspace = true
+platform.workspace = true
+syntax = { path = "../../editor/syntax" }
+templates = { path = "../../editor/templates" }
+text-core = { path = "../../editor/text-core" }
+ui-kit = { path = "../ui-kit" }
