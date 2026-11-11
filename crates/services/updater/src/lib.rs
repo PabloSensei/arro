@@ -226,9 +226,21 @@ fn stage_as(zip: &Path, install_dir: &Path, running: Option<&str>) -> Result<(),
     let files = extract(zip, &extracted).inspect_err(|_| {
         let _ = fs::remove_dir_all(&temp);
     })?;
+    // The release archive holds one folder named after the release; its contents go
+    // into the install folder.
+    let (staged, files) = match single_root(&files) {
+        Some(root) => {
+            let inner = files
+                .iter()
+                .filter_map(|file| file.strip_prefix(&root).ok().map(Path::to_path_buf))
+                .collect();
+            (extracted.join(&root), inner)
+        }
+        None => (extracted.clone(), files),
+    };
 
     let mut transaction = Transaction::default();
-    let result = transaction.replace(&extracted, install_dir, &temp, &files, running);
+    let result = transaction.replace(&staged, install_dir, &temp, &files, running);
     if let Err(error) = result {
         transaction.rollback();
         let _ = fs::remove_dir_all(&temp);
@@ -338,6 +350,42 @@ fn extract(zip: &Path, into: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(files)
 }
 
+/// The one folder every file of the archive sits in, if there is such a folder.
+fn single_root(files: &[PathBuf]) -> Option<PathBuf> {
+    let mut root: Option<&std::ffi::OsStr> = None;
+    for file in files {
+        let mut parts = file.components();
+        let first = parts.next()?.as_os_str();
+        parts.next()?;
+        match root {
+            Some(known) if known != first => return None,
+            _ => root = Some(first),
+        }
+    }
+    root.map(PathBuf::from)
+}
+
+/// Whether two files hold the same bytes, read without loading them whole.
+fn same_content(left: &Path, right: &Path) -> io::Result<bool> {
+    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = io::BufReader::new(File::open(left)?);
+    let mut right = io::BufReader::new(File::open(right)?);
+    let mut a = [0u8; 64 * 1024];
+    let mut b = [0u8; 64 * 1024];
+    loop {
+        let read = left.read(&mut a)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        right.read_exact(&mut b[..read])?;
+        if a[..read] != b[..read] {
+            return Ok(false);
+        }
+    }
+}
+
 /// Files that were put in place, so that a failure can take them away again.
 #[derive(Default)]
 struct Transaction {
@@ -361,6 +409,12 @@ impl Transaction {
             let target = install.join(relative);
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
+            }
+            // An unchanged file stays where it is: the language server and the
+            // terminal keep their jars and libraries open, and Windows does not let a
+            // file in use be renamed.
+            if target.is_file() && same_content(&staged.join(relative), &target)? {
+                continue;
             }
             if target.exists() {
                 let old = old_path(&target);
@@ -821,6 +875,63 @@ mod tests {
         );
         assert!(!install.join("ide.exe.old").exists());
         assert!(!install.join("sub/inner.txt").exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_release_folder_inside_the_archive_is_unpacked_into_the_install_folder() {
+        let dir = temp("root");
+        let install = dir.join("install");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("ide.exe"), "old exe").unwrap();
+        let zip = dir.join("update.zip");
+        write_zip(
+            &zip,
+            &[
+                ("arro-0.2.0-windows-x86_64/ide.exe", "new exe"),
+                ("arro-0.2.0-windows-x86_64/tools/server.jar", "jar"),
+            ],
+        );
+        stage_as(&zip, &install, Some("ide.exe")).unwrap();
+        assert_eq!(
+            fs::read_to_string(install.join("ide.exe")).unwrap(),
+            "new exe"
+        );
+        assert_eq!(
+            fs::read_to_string(install.join("tools/server.jar")).unwrap(),
+            "jar"
+        );
+        assert!(!install.join("arro-0.2.0-windows-x86_64").exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unchanged_file_in_use_does_not_stop_the_update() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = temp("in-use");
+        let install = dir.join("install");
+        fs::create_dir_all(install.join("tools")).unwrap();
+        fs::write(install.join("ide.exe"), "old exe").unwrap();
+        fs::write(install.join("tools/server.jar"), "same jar").unwrap();
+        // A process that keeps the jar open without FILE_SHARE_DELETE, as a JVM does.
+        let _held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(install.join("tools/server.jar"))
+            .unwrap();
+        let zip = dir.join("update.zip");
+        write_zip(
+            &zip,
+            &[("ide.exe", "new exe"), ("tools/server.jar", "same jar")],
+        );
+        stage_as(&zip, &install, Some("ide.exe")).unwrap();
+        assert_eq!(
+            fs::read_to_string(install.join("ide.exe")).unwrap(),
+            "new exe"
+        );
+        drop(_held);
         fs::remove_dir_all(dir).ok();
     }
 
