@@ -1053,8 +1053,8 @@ impl RunPanel {
             && self.console.as_ref().is_some_and(Console::takes_input)
     }
 
-    /// The line typed into the console, for tests.
-    #[cfg(test)]
+    /// The line typed into the console, for tests (their program is powershell.exe).
+    #[cfg(all(test, windows))]
     pub(crate) fn input_text(&self) -> &str {
         self.console_input.text()
     }

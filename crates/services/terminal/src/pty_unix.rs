@@ -122,7 +122,7 @@ impl Pty {
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -190,14 +190,27 @@ impl Drop for Pty {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+use libc::ptsname_r;
+
+// The libc crate does not declare ptsname_r for macOS; the system has it since 10.13.4.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn ptsname_r(fd: libc::c_int, buffer: *mut libc::c_char, length: libc::size_t) -> libc::c_int;
+}
+
 /// The path of the slave side of a pseudoterminal.
 fn slave_name(master: &File) -> io::Result<String> {
     let mut buffer = [0u8; 128];
     // SAFETY: the buffer is writable for its whole length and the descriptor is ours.
-    let done =
-        unsafe { libc::ptsname_r(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    let done = unsafe { ptsname_r(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
     if done != 0 {
-        return Err(io::Error::from_raw_os_error(done));
+        // Linux returns the error number, macOS returns -1 and sets errno.
+        return Err(if done > 0 {
+            io::Error::from_raw_os_error(done)
+        } else {
+            io::Error::last_os_error()
+        });
     }
     // SAFETY: a successful call wrote a zero-terminated name into the buffer.
     let name = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr().cast()) };
