@@ -60,15 +60,7 @@ impl Job {
             return Ok(Vec::new());
         };
         let mut ids = Vec::new();
-        let entries = std::fs::read_dir("/proc")?;
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
+        for pid in crate::process_stats::all_process_ids() {
             let Some(process_group) = crate::process_stats::process_group(pid) else {
                 continue;
             };

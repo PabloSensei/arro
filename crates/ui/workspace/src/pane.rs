@@ -22,6 +22,8 @@ pub struct Pane {
     pub tabs: Vec<Tab>,
     pub active: usize,
     pub scroll: ScrollHandle,
+    /// The bar of this group, when the window has built it.
+    pub bar: Option<Entity<crate::chrome::TabBarView>>,
 }
 
 impl Pane {

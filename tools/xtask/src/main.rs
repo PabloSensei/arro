@@ -4,10 +4,12 @@ mod budgets;
 mod ci;
 mod conpty;
 mod dist;
+mod dist_macos;
 mod helpers;
 mod icons;
 mod idea_keymap;
 mod layers;
+mod macos_keymap;
 mod notice;
 mod release;
 mod scrollbars;
@@ -37,17 +39,19 @@ commands:
   check-scrollbars           every scrolled area in the UI crates has scrollbars or is exempt
   build-helpers --out DIR [--maven-lib DIR]
                              the helper jars that run in project JVMs, needs a JDK
-  dist --out DIR [--symbols DIR] [--tools DIR] [--zip]
+  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--target windows|macos]
                              release Arro, helpers, jdtls, java-debug, README, run-arro.cmd
                              and THIRD-PARTY.txt; the jdtls and java-debug archives come
                              from --tools DIR, $IDE_CORPUS/tools by default; arro.pdb and
-                             arro.exe go to DIR-symbols/<commit> by default
+                             arro.exe go to DIR-symbols/<commit> by default. --target macos
+                             builds Arro.app with an ad-hoc signature instead, on a Mac
   symbolize LOG [--symbols DIR]
                              function and file:line for the arro.exe frames of a panic log;
                              DIR is target/symbols by default
   release-assets --out DIR   zip a ready dist folder and write its .sha256 next to it
   fetch-conpty               download the pinned ConPTY package into crates/services/terminal/vendor
   idea-keymap XML JSON       IntelliJ IDEA $default.xml to the keymap crate's JSON
+  macos-keymap IN OUT        the Windows keymap of the keymap crate to its macOS one
   icons --lucide DIR         generate assets/icons from the Lucide sources in DIR";
 
 fn main() -> ExitCode {
@@ -65,6 +69,7 @@ fn main() -> ExitCode {
         ["check-scrollbars"] => scrollbars::run(&root),
         ["fetch-conpty"] => conpty::fetch(&root),
         ["idea-keymap", xml, json] => idea_keymap::run(Path::new(xml), Path::new(json)),
+        ["macos-keymap", windows, macos] => macos_keymap::run(Path::new(windows), Path::new(macos)),
         ["build-helpers", "--out", out] => helpers::run(&root, Path::new(out), None),
         ["build-helpers", "--out", out, "--maven-lib", lib] => {
             helpers::run(&root, Path::new(out), Some(Path::new(lib)))
@@ -89,16 +94,21 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// `--out DIR`, `--symbols DIR`, `--tools DIR` and `--zip` in any order.
+/// `--out DIR`, `--symbols DIR`, `--tools DIR`, `--zip` and `--target` in any order.
 fn dist_command(root: &Path, args: &[&str]) -> Result {
     let mut out = None;
     let mut symbols = None;
     let mut tools = None;
+    let mut target = "windows";
     let mut zip = false;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
             "--zip" => zip = true,
+            "--target" => {
+                index += 1;
+                target = args.get(index).ok_or("--target needs windows or macos")?;
+            }
             "--out" => {
                 index += 1;
                 out = Some(Path::new(args.get(index).ok_or("--out needs a directory")?));
@@ -120,7 +130,11 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
         index += 1;
     }
     let out = out.ok_or("dist needs --out DIR")?;
-    dist::run(root, out, symbols, tools, zip)
+    match target {
+        "windows" => dist::run(root, out, symbols, tools, zip),
+        "macos" => dist_macos::run(root, out, tools, zip),
+        other => Err(format!("unknown dist target: {other}; windows or macos").into()),
+    }
 }
 
 /// `LOG` and an optional `--symbols DIR`.

@@ -18,6 +18,7 @@ use ui_kit::*;
 use workspace_core::CommandRegistry;
 
 use crate::about::AboutView;
+use crate::chrome::{EditorChromeSignal, StatusBarView, TabBarView};
 use crate::editor::{EditorFactory, EditorStatus, FileIcons};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{DockState, Layout, PaneState, WindowPlacement, save_dark_theme, save_layout};
@@ -115,6 +116,8 @@ actions!(
         GotoRelated,
         NextProjectWindow,
         PreviousProjectWindow,
+        // The window only declares it, the menu of the screen of macOS runs it.
+        QuitApp,
         RerunInspection,
         // Project Structure, Ctrl+Alt+Shift+S: the dialog is in `panels`.
         ProjectStructure,
@@ -140,6 +143,9 @@ macro_rules! window_keys {
     ($(($keys:literal, $action:ident, $context:expr, $idea:expr)),* $(,)?) => {
         pub fn bind_keys(cx: &mut App) {
             cx.bind_keys([$(KeyBinding::new($keys, $action, $context)),*]);
+            // Every application of macOS quits with Command+Q, from its own menu.
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([KeyBinding::new("cmd-q", QuitApp, None)]);
         }
 
         /// The same bindings as [`bind_keys`], for the keymap check.
@@ -261,21 +267,26 @@ pub fn build_date() -> &'static str {
     env!("IDE_BUILD_DATE")
 }
 
-/// `ctrl-shift-n` as the menus write it, `Ctrl+Shift+N`.
+/// How many times the window has drawn a change of its own state, for tests that check
+/// what a keystroke does not redraw. GPUI redraws the root view when any view under it
+/// repaints, so a plain count of renders would also include the editor's own frames.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub struct WindowRenderCount(pub Cell<usize>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Global for WindowRenderCount {}
+
+/// The number of draws that showed a change of the window's own state, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn window_render_count(cx: &App) -> usize {
+    cx.try_global::<WindowRenderCount>()
+        .map_or(0, |count| count.0.get())
+}
+
+/// `ctrl-shift-n` as the menus write it: `Ctrl+Shift+N`, or `⇧⌘N` on macOS.
 fn shortcut_label(text: &str) -> String {
-    let part = |part: &str| match part {
-        "ctrl" => "Ctrl".to_owned(),
-        "alt" => "Alt".to_owned(),
-        "shift" => "Shift".to_owned(),
-        other => {
-            let mut chars = other.chars();
-            chars
-                .next()
-                .map(|first| first.to_uppercase().chain(chars).collect())
-                .unwrap_or_default()
-        }
-    };
-    text.split('-').map(part).collect::<Vec<_>>().join("+")
+    keymap::shortcut_label(text, keymap::platform())
 }
 pub const MIN_DOCK_SIZE: f32 = 160.;
 /// What a dock leaves to the editor when it is dragged to the limit.
@@ -408,6 +419,16 @@ impl MenuShortcut {
     }
 }
 
+/// A row of the menu of the screen of macOS, named by the path of its rows through the menu
+/// of the window: the section, then the row, then its submenu and so on. The row is looked
+/// up in the menu of the moment when it is chosen, so the menu of the screen can be built
+/// once and still run what the window would run.
+#[derive(Clone, PartialEq, Debug, ui_kit::gpui::Action)]
+#[action(no_json, no_register)]
+pub struct MenuRow {
+    pub path: Vec<usize>,
+}
+
 pub(crate) struct Balloon {
     pub title: SharedString,
     pub text: SharedString,
@@ -453,6 +474,18 @@ pub struct Workspace {
     pub(crate) name: SharedString,
     pub(crate) branch: Option<SharedString>,
     pub(crate) focus_handle: FocusHandle,
+    /// The signal that editor events go through to the status bar and the tabs.
+    pub(crate) chrome_signal: Entity<EditorChromeSignal>,
+    /// The status bar, which follows the active editor on its own.
+    pub(crate) status_view: Entity<StatusBarView>,
+    /// The status bar and the tabs follow the changes of the window once it is built.
+    chrome_started: bool,
+    /// The number of changes of what the window itself shows, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) state_revision: usize,
+    /// The last change of the window that a draw has shown, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) counted_revision: usize,
     pub(crate) left: Dock,
     pub(crate) right: Dock,
     pub(crate) bottom: Dock,
@@ -627,13 +660,20 @@ impl Workspace {
             saved.ok();
             true
         });
+        let chrome_weak = cx.weak_entity();
+        let chrome_signal = cx.new(|_| EditorChromeSignal);
+        let status_view = StatusBarView::create(chrome_weak.clone(), chrome_signal.clone(), cx);
         let bounds = cx.observe_window_bounds(window, |this, window, cx| {
             this.placement = placement_of(window).or(this.placement);
             this.layout_changed(cx);
         });
         // Leaving the window for another program writes what is unsaved, as the IDE does.
         let activation = cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() && autosave_on(cx) {
+            if window.is_window_active() {
+                // The menu of the screen follows what the window holds: recent projects,
+                // run configurations, the tabs of the window.
+                this.refresh_platform_menus(cx);
+            } else if autosave_on(cx) {
                 this.save_all_now(cx);
             }
         });
@@ -699,6 +739,13 @@ impl Workspace {
             name,
             branch: None,
             focus_handle,
+            chrome_signal,
+            status_view,
+            chrome_started: false,
+            #[cfg(any(test, feature = "test-support"))]
+            state_revision: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            counted_revision: 0,
             left: Dock::new(layout.left),
             right: Dock::new(layout.right),
             bottom: Dock::new(bottom),
@@ -770,8 +817,20 @@ impl Workspace {
             root,
             _subscriptions: vec![bounds, activation, keystrokes],
         };
+        workspace.panes[0].bar = Some(TabBarView::create(
+            chrome_weak,
+            workspace.chrome_signal.clone(),
+            cx,
+        ));
+        let chrome = cx.weak_entity();
+        cx.defer(move |cx| {
+            chrome
+                .update(cx, |workspace, cx| workspace.start_chrome(cx))
+                .ok();
+        });
         workspace.start_update_tasks(cx);
         workspace.reload_keymap(cx);
+        workspace.refresh_platform_menus(cx);
         workspace
     }
 
@@ -1089,16 +1148,13 @@ impl Workspace {
                 tabs.push(tab);
             }
             if !tabs.is_empty() {
-                panes.push(Pane {
-                    tabs,
-                    active,
-                    scroll: ScrollHandle::new(),
-                });
+                panes.push(self.new_pane(tabs, active, cx));
             }
         }
         if !panes.is_empty() {
             self.active_pane = self.layout.active_pane.min(panes.len() - 1);
             self.panes = panes;
+            self.renumber_bars(cx);
         }
         self.focus_active(window, cx);
     }
@@ -1128,6 +1184,64 @@ impl Workspace {
 
     pub fn set_editor_factory(&mut self, factory: EditorFactory) {
         self.editor_factory = Some(factory);
+    }
+
+    /// Makes the status bar and the tabs follow the window after it was built. The
+    /// window is not reachable as an entity while its constructor runs, so this waits
+    /// for the first effect cycle.
+    fn start_chrome(&mut self, cx: &mut Context<Self>) {
+        if self.chrome_started {
+            return;
+        }
+        self.chrome_started = true;
+        let subscription = cx.observe_self(|this, cx| this.notify_chrome_views(cx));
+        self._subscriptions.push(subscription);
+        self.notify_chrome_views(cx);
+    }
+
+    /// The status bar and the tab strips show what the window itself shows, such as the
+    /// active tab or the layout, so they redraw with it.
+    fn notify_chrome_views(&mut self, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.state_revision += 1;
+        }
+        self.status_view.update(cx, |_, cx| cx.notify());
+        for pane in &self.panes {
+            if let Some(bar) = &pane.bar {
+                bar.update(cx, |_, cx| cx.notify());
+            }
+        }
+    }
+
+    /// The text or the caret of an editor changed: what shows it redraws itself, the
+    /// rest of the window stays as it is.
+    pub fn editor_chrome_changed(&mut self, cx: &mut Context<Self>) {
+        self.chrome_signal
+            .update(cx, |signal, cx| signal.changed(cx));
+    }
+
+    /// Gives every tab strip the index of its group after a group was added or removed.
+    fn renumber_bars(&mut self, cx: &mut Context<Self>) {
+        for (index, pane) in self.panes.iter().enumerate() {
+            if let Some(bar) = pane.bar.clone() {
+                bar.update(cx, |bar, cx| bar.set_pane(index, cx));
+            }
+        }
+    }
+
+    /// A group with its own tab strip.
+    fn new_pane(&self, tabs: Vec<Tab>, active: usize, cx: &mut Context<Self>) -> Pane {
+        Pane {
+            tabs,
+            active,
+            scroll: ScrollHandle::new(),
+            bar: Some(TabBarView::create(
+                cx.weak_entity(),
+                self.chrome_signal.clone(),
+                cx,
+            )),
+        }
     }
 
     /// Puts a tool window into a dock, in place of one with the same id.
@@ -2026,14 +2140,9 @@ impl Workspace {
             self.split_down = down;
         }
         let at = (self.active_pane + 1).min(self.panes.len());
-        self.panes.insert(
-            at,
-            Pane {
-                tabs: vec![tab],
-                active: 0,
-                scroll: ScrollHandle::new(),
-            },
-        );
+        let pane = self.new_pane(vec![tab], 0, cx);
+        self.panes.insert(at, pane);
+        self.renumber_bars(cx);
         self.active_pane = at;
         self.tab_serial += 1;
         self.focus_active(window, cx);
@@ -2403,11 +2512,12 @@ impl Workspace {
 
     /// Takes a tab out of its group, and the group too when it was the last tab of a group
     /// that is not the only one. Nothing is written.
-    fn drop_tab(&mut self, pane: usize, index: usize) -> Tab {
+    fn drop_tab(&mut self, pane: usize, index: usize, cx: &mut Context<Self>) -> Tab {
         let tab = self.panes[pane].remove(index);
         if self.panes[pane].tabs.is_empty() && self.panes.len() > 1 {
             self.panes.remove(pane);
             self.active_pane = active_after_removal(self.active_pane, pane, self.panes.len());
+            self.renumber_bars(cx);
         }
         tab
     }
@@ -2427,7 +2537,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         (self.panes[pane].tabs[index].editor.save)(cx);
-        let tab = self.drop_tab(pane, index);
+        let tab = self.drop_tab(pane, index, cx);
         remember_closed(&mut self.closed, tab.path);
         self.tab_removed(window, cx);
     }
@@ -2534,7 +2644,7 @@ impl Workspace {
     ) {
         for index in indexes.into_iter().rev() {
             (self.panes[pane].tabs[index].editor.save)(cx);
-            let tab = self.drop_tab(pane, index);
+            let tab = self.drop_tab(pane, index, cx);
             remember_closed(&mut self.closed, tab.path);
         }
         self.tab_removed(window, cx);
@@ -2606,7 +2716,7 @@ impl Workspace {
             return;
         }
         let source_vanishes = !same && self.panes[source].tabs.len() == 1;
-        let tab = self.drop_tab(source, index);
+        let tab = self.drop_tab(source, index, cx);
         let target = if source_vanishes && source < target {
             target - 1
         } else {
@@ -2630,15 +2740,12 @@ impl Workspace {
         let pane = if self.panes[source].tabs.len() > 1 {
             let active = self.panes[source].active;
             let tab = self.panes[source].remove(active);
-            Pane {
-                tabs: vec![tab],
-                active: 0,
-                scroll: ScrollHandle::new(),
-            }
+            self.new_pane(vec![tab], 0, cx)
         } else {
-            Pane::default()
+            self.new_pane(Vec::new(), 0, cx)
         };
         self.panes.insert(source + 1, pane);
+        self.renumber_bars(cx);
         self.active_pane = source + 1;
         self.tab_serial += 1;
         self.focus_active(window, cx);
@@ -2722,7 +2829,7 @@ impl Workspace {
             let Some((pane, index)) = found else {
                 break;
             };
-            self.drop_tab(pane, index);
+            self.drop_tab(pane, index, cx);
         }
         self.tab_removed(window, cx);
     }
@@ -2897,6 +3004,26 @@ impl Workspace {
     /// The status of the active tab, for scripts and tests.
     pub fn editor_status(&self, cx: &App) -> Option<EditorStatus> {
         self.active_status(cx)
+    }
+
+    /// The caret the status bar drew last, for tests of what a keystroke redraws.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn status_caret_on_screen(&self, cx: &App) -> Option<String> {
+        self.status_view.read(cx).shown_caret.clone()
+    }
+
+    /// The dirty marks the tab strips drew last, group by group, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tab_dirty_on_screen(&self, cx: &App) -> Vec<Vec<bool>> {
+        self.panes
+            .iter()
+            .map(|pane| {
+                pane.bar
+                    .as_ref()
+                    .map(|bar| bar.read(cx).shown_dirty.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Whether the dock is open, for scripts and tests.
@@ -3486,7 +3613,14 @@ impl Workspace {
     ) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        if modifiers.platform || matches!(key, "shift" | "control" | "alt" | "platform") {
+        // Command is the primary modifier of macOS; the Super key of the other systems is
+        // not ours and never reaches the keymap.
+        if (modifiers.platform && !cfg!(target_os = "macos"))
+            || matches!(
+                key,
+                "shift" | "control" | "alt" | "platform" | "cmd" | "command"
+            )
+        {
             return;
         }
         if self.overlay.is_some() && self.menu_key(event, window, cx) {
@@ -3497,6 +3631,7 @@ impl Workspace {
             ctrl: modifiers.control,
             alt: modifiers.alt,
             shift: modifiers.shift,
+            cmd: modifiers.platform,
             key: key.to_lowercase(),
         };
         let contexts = [keymap::workspace::CONTEXT];
@@ -3591,6 +3726,7 @@ impl Workspace {
             ctrl: false,
             alt: true,
             shift: false,
+            cmd: false,
             key: key.to_lowercase(),
         };
         !matches!(

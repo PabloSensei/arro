@@ -95,10 +95,15 @@ impl DebugSessions {
     /// The debuggee of `debugger` is starting now, so its classes are measured from
     /// this moment.
     fn recheck(&self, debugger: &Debugger) {
+        self.recheck_at(debugger, SystemTime::now());
+    }
+
+    /// Moves the point of one session to `moment`, without touching the others.
+    fn recheck_at(&self, debugger: &Debugger, moment: SystemTime) {
         self.checked
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(debugger.id(), SystemTime::now());
+            .insert(debugger.id(), moment);
     }
 
     /// The server reads the one setting from the map it gets; the rest stays as it was.
@@ -169,6 +174,9 @@ impl DebugExtension {
     /// since the last check of this session, and returns what the adapter said.
     pub async fn reload_classes(&self, debugger: &Debugger, outputs: &[PathBuf]) -> ReloadOutcome {
         let since = self.sessions.checked_at(debugger);
+        // The classes are read as they are now: a build that writes while the adapter
+        // works is still new for the next reload of this session.
+        let checked = SystemTime::now();
         let changed = changed_class_files(outputs, since);
         if changed.is_empty() {
             return ReloadOutcome::default();
@@ -183,7 +191,7 @@ impl DebugExtension {
         // server has updated them, so the request waits one turn of its event loop.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let outcome = self.request_reload(debugger).await;
-        self.sessions.recheck(debugger);
+        self.sessions.recheck_at(debugger, checked);
         outcome
     }
 
@@ -825,6 +833,72 @@ mod tests {
             second_point,
             "the point of the second session stays where it was"
         );
+    }
+
+    /// A class that a build wrote after both sessions started reaches the second session
+    /// even after the first one has already reloaded it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_class_changed_before_a_reload_reaches_the_other_session() {
+        let classes = test_support::scratch("hot-swap-two-sessions").join("classes");
+        fs::create_dir_all(&classes).unwrap();
+        let outputs = [classes.clone()];
+        let (_revision, status) = tokio::sync::watch::channel(sidecar::Status {
+            state: sidecar::State::Stopped,
+            generation: 0,
+            alive: false,
+            client: None,
+            process_id: None,
+            crashes: 0,
+            last_error: None,
+        });
+        let extension = DebugExtension::with_router(Router::new(status), Autobuild::default());
+        let session = || {
+            let server = lang_fixture::MockDap::start().unwrap();
+            let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (snapshots, incoming) = channel();
+            let launch = Launch {
+                address: server.address().to_owned(),
+                adapter_id: "fixture".into(),
+                name: "fixture".into(),
+                ..Launch::default()
+            };
+            let running = tokio::spawn(dap_client::run(launch, receiver, snapshots));
+            (Debugger::new(commands, incoming), server, running)
+        };
+        let (first, first_server, first_run) = session();
+        let (second, second_server, second_run) = session();
+        extension.session_started(&first);
+        extension.session_started(&second);
+
+        // Both sessions started before this build, so both have to see the class.
+        std::thread::sleep(Duration::from_millis(30));
+        fs::write(classes.join("Changed.class"), b"changed").unwrap();
+
+        let first_outcome = extension.reload_classes(&first, &outputs).await;
+        assert_eq!(first_outcome.reloaded, ["demo.Probe", "demo.Probe$1"]);
+
+        let second_outcome = extension.reload_classes(&second, &outputs).await;
+        assert_eq!(
+            second_outcome.reloaded,
+            ["demo.Probe", "demo.Probe$1"],
+            "the class is still new for the second session"
+        );
+        assert!(
+            second_server
+                .requests()
+                .iter()
+                .any(|request| request["command"] == "redefineClasses"),
+            "the second adapter received the hot swap request"
+        );
+
+        for (debugger, server, running) in [
+            (first, first_server, first_run),
+            (second, second_server, second_run),
+        ] {
+            assert!(debugger.send(dap_client::Command::Disconnect));
+            running.await.unwrap().unwrap();
+            server.join();
+        }
     }
 
     #[test]

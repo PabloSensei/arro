@@ -101,6 +101,7 @@ The Java language server and the debugger are already in the zip. `README.txt` i
 ```shell
 cargo build --release -p ide
 cargo run -p xtask -- dist --out <folder>
+cargo run -p xtask -- dist --target macos --out <folder> --zip
 ```
 
 The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `cargo run -p xtask -- ci` runs formatting, lints, tests, license and architecture checks.
@@ -113,8 +114,9 @@ The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `c
 | Maven and Gradle, run, tests, debugger | ✅ Works |
 | Git | ✅ Works |
 | Windows 11 x86-64 | ✅ Supported |
+| Linux x86-64 | 🚧 Builds and tests pass; no release yet |
+| macOS (Apple silicon and Intel) | 🚧 In progress; no release yet |
 | AI agent panel (Claude Code, Codex, OpenCode) | 🚧 In progress |
-| Linux and macOS | 🗓️ Planned |
 | More languages on the same core | 🗓️ Planned |
 
 ## Support

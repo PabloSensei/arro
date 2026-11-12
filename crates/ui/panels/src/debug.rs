@@ -22,6 +22,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{DEBUG_TOOL, Workspace};
 
+use crate::ansi::OutputBuffers;
 use crate::console_input::{ConsoleInput, ConsoleKey};
 use crate::navigation;
 use crate::prompt::Prompt;
@@ -249,6 +250,10 @@ pub struct DebugPanel {
     console_input: ConsoleInput,
     /// The build step of a debug launch, before the debuggee starts.
     build: Option<Console>,
+    /// The unfinished lines of the build process, each stream on its own.
+    build_output: OutputBuffers,
+    /// The process of the build step whose output comes now.
+    build_process: Option<u32>,
     pending: Option<PendingLaunch>,
     /// Held while a program this window launched is under the debugger; dropping it
     /// lets the language turn compilation on save back on.
@@ -300,6 +305,8 @@ impl DebugPanel {
             seen_console: Vec::new(),
             console_input: ConsoleInput::new(),
             build: None,
+            build_output: OutputBuffers::default(),
+            build_process: None,
             pending: None,
             session: None,
             store,
@@ -520,6 +527,8 @@ impl DebugPanel {
         self.seen_console.clear();
         self.console_input.restart();
         self.build = None;
+        self.build_output = OutputBuffers::default();
+        self.build_process = None;
         self.pending = None;
         self.session = None;
     }
@@ -869,23 +878,44 @@ impl DebugPanel {
         let mut changed = false;
         let mut exit = None;
         let mut lines: Vec<(String, bool)> = Vec::new();
+        let mut done = Vec::new();
         for _ in 0..EVENTS {
             let Ok(event) = console.events().try_recv() else {
                 break;
             };
             changed = true;
             match event {
-                ConsoleEvent::Output { stream, text } => {
-                    lines.push((text, stream == Stream::Stderr));
+                ConsoleEvent::Output {
+                    process,
+                    stream,
+                    text,
+                } => {
+                    self.build_output
+                        .push(process, stream == Stream::Stderr, &text, &mut done);
                 }
-                ConsoleEvent::Started { .. } => {}
+                ConsoleEvent::Started { pid, .. } => self.build_process = Some(pid),
                 ConsoleEvent::Failed { message } => lines.push((message, true)),
                 ConsoleEvent::Exited { code, step } => {
+                    match self.build_process.take() {
+                        Some(process) => self.build_output.finish(process, &mut done),
+                        None => self.build_output.finish_all(&mut done),
+                    }
                     exit = Some((code, step));
                     break;
                 }
-                ConsoleEvent::Closed => break,
+                ConsoleEvent::Closed => {
+                    self.build_output.finish_all(&mut done);
+                    self.build_process = None;
+                    break;
+                }
             }
+        }
+        for line in done {
+            if line.text.is_empty() {
+                continue;
+            }
+            let error = line.spans.first().is_some_and(|(_, style)| style.error);
+            lines.push((line.text, error));
         }
         for (text, error) in lines {
             self.push_output(text, error, cx);
@@ -3389,7 +3419,8 @@ mod tests {
     use ui_kit::gpui::{AppContext, Entity, ScrollHandle, TestAppContext, WeakEntity};
 
     use super::{
-        BreakpointSpec, ConsoleEvent, DebugPanel, DebugService, Debugger, RunPlan, Snapshot,
+        BreakpointSpec, ConsoleEvent, DebugPanel, DebugService, Debugger, OutputBuffers, RunPlan,
+        Snapshot,
     };
 
     /// Counts the launches; a start after Stop would be a failure of the panel.
@@ -3451,6 +3482,8 @@ mod tests {
                 seen_console: Vec::new(),
                 console_input: crate::console_input::ConsoleInput::new(),
                 build: None,
+                build_output: OutputBuffers::default(),
+                build_process: None,
                 pending: None,
                 session: None,
                 store: None,

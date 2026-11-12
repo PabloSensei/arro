@@ -47,7 +47,11 @@ pub fn open_url(url: &str) -> bool {
 }
 
 fn shell_open(url: &str) -> bool {
-    Command::new("xdg-open")
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    Command::new(program)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

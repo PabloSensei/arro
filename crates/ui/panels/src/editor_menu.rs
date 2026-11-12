@@ -8,21 +8,9 @@ use keymap::workspace as workspace_keys;
 use ui_kit::*;
 use workspace::Workspace;
 
-/// `ctrl-shift-n` as the menus write it, `Ctrl+Shift+N`.
+/// `ctrl-shift-n` as the menus write it: `Ctrl+Shift+N`, or `⇧⌘N` on macOS.
 fn shortcut_label(text: &str) -> String {
-    let part = |part: &str| match part {
-        "ctrl" => "Ctrl".to_owned(),
-        "alt" => "Alt".to_owned(),
-        "shift" => "Shift".to_owned(),
-        other => {
-            let mut chars = other.chars();
-            chars
-                .next()
-                .map(|first| first.to_uppercase().chain(chars).collect())
-                .unwrap_or_default()
-        }
-    };
-    text.split('-').map(part).collect::<Vec<_>>().join("+")
+    keymap::shortcut_label(text, keymap::platform())
 }
 
 /// What the menu reads from the window before it is built, so that building it never

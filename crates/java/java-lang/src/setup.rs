@@ -110,7 +110,21 @@ impl Search {
                 jdk_roots.push(base.join("Programs"));
             }
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        {
+            // A JDK of macOS is a bundle under one of these folders, as `/usr/libexec/java_home`
+            // reports them.
+            jdk_roots.push(PathBuf::from("/Library/Java/JavaVirtualMachines"));
+            if let Some(home) = base::program::home_dir() {
+                jdk_roots.push(
+                    home.join("Library")
+                        .join("Java")
+                        .join("JavaVirtualMachines"),
+                );
+                jdk_roots.push(home.join(".sdkman").join("candidates").join("java"));
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             jdk_roots.push(PathBuf::from("/usr/lib/jvm"));
             if let Some(home) = base::program::home_dir() {
@@ -130,11 +144,16 @@ impl Search {
     }
 
     /// The folders that hold `jdtls-*` and `vscode-java-debug-*`: next to `arro.exe`
-    /// first, then `IDE_TOOLS` and its `tools`.
+    /// first, then `IDE_TOOLS` and its `tools`. In the bundle of macOS the program sits in
+    /// `Contents/MacOS` and the tools in `Contents/Resources/tools`.
     fn tool_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(exe_dir) = &self.exe_dir {
             dirs.push(exe_dir.join("tools"));
+            #[cfg(target_os = "macos")]
+            if let Some(contents) = exe_dir.parent() {
+                dirs.push(contents.join("Resources").join("tools"));
+            }
         }
         if let Some(tools) = &self.tools {
             dirs.push(tools.clone());
@@ -218,6 +237,19 @@ fn version_order(name: &str) -> Vec<u64> {
         .collect()
 }
 
+/// A JDK of macOS is a bundle whose `Contents/Home` is the home folder; the other systems
+/// name the home folder itself.
+fn bundle_home(home: PathBuf) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let contents = home.join("Contents").join("Home");
+        if contents.is_dir() {
+            return contents;
+        }
+    }
+    home
+}
+
 /// The newest JDK of [`MIN_JAVA_VERSION`] or newer under the install roots; `JAVA_HOME`
 /// counts only when nothing is installed, the same rule as the script.
 fn find_jdk(search: &Search) -> Option<PathBuf> {
@@ -225,10 +257,14 @@ fn find_jdk(search: &Search) -> Option<PathBuf> {
     for root in &search.jdk_roots {
         let mut homes: Vec<PathBuf> = entries(root)
             .into_iter()
-            .filter(|path| path.is_dir() && name_is(path).starts_with("jdk"))
+            .filter(|path| {
+                path.is_dir()
+                    && (name_is(path).starts_with("jdk") || name_is(path).ends_with(".jdk"))
+            })
             .collect();
         homes.sort_by_key(|path| name_is(path));
         for home in homes {
+            let home = bundle_home(home);
             let Some(feature) = release_feature(&home) else {
                 continue;
             };

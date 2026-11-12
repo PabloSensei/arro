@@ -2,7 +2,8 @@
 //!
 //! A role is a short label the launcher gives a child, such as `Terminal` or `Build tool`.
 //! It is kept beside the process id only, so a child started outside that path still
-//! shows its image name. The tree is read from `/proc`: no call waits for a process.
+//! shows its image name. Linux reads `/proc`, macOS `proc_listallpids` and `proc_pidinfo`:
+//! no call waits for a process.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -81,19 +82,49 @@ struct Entry {
     name: String,
 }
 
-fn snapshot() -> Vec<Entry> {
+/// Every process id of the machine. A job looks for the group of its child among them.
+#[cfg(target_os = "linux")]
+pub(crate) fn all_process_ids() -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+        })
+        .collect()
+}
+
+/// Every process id of the machine. A job looks for the group of its child among them.
+#[cfg(target_os = "macos")]
+pub(crate) fn all_process_ids() -> Vec<u32> {
+    // SAFETY: a plain query of a size; a null buffer is not written.
+    let capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if capacity < 1 {
+        return Vec::new();
+    }
+    let mut pids = vec![0 as libc::c_int; capacity as usize];
+    let bytes = std::mem::size_of_val(pids.as_slice());
+    // SAFETY: the buffer holds `bytes` bytes and the call writes at most that many.
+    let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes as libc::c_int) };
+    if filled < 1 {
+        return Vec::new();
+    }
+    pids.truncate((filled as usize).min(pids.len()));
+    pids.into_iter()
+        .filter(|pid| *pid > 0)
+        .map(|pid| pid as u32)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot() -> Vec<Entry> {
     let mut processes = Vec::new();
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
+    for pid in all_process_ids() {
         let Some(stat) = stat_of(pid) else {
             continue;
         };
@@ -109,6 +140,68 @@ fn snapshot() -> Vec<Entry> {
     processes
 }
 
+/// macOS answers the parent, the group, the state and the name of every process through
+/// `proc_pidinfo`, so one call fills an entry of the tree.
+#[cfg(target_os = "macos")]
+fn snapshot() -> Vec<Entry> {
+    let mut processes = Vec::new();
+    for pid in all_process_ids() {
+        let Some(info) = bsd_info(pid) else {
+            continue;
+        };
+        if info.pbi_status == libc::SZOMB {
+            continue;
+        }
+        processes.push(Entry {
+            pid,
+            parent: Some(info.pbi_ppid),
+            name: command_name(&info),
+        });
+    }
+    processes
+}
+
+/// The BSD half of `proc_pidinfo`: the parent, the process group, the state and the name.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: the structure is writable and `size` is its own size.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size as libc::c_int,
+        )
+    };
+    (filled as usize >= size).then_some(info)
+}
+
+/// The name a BSD info structure carries, preferring the longer one. Both fields are
+/// zero-terminated when the name is shorter than the field.
+#[cfg(target_os = "macos")]
+fn command_name(info: &libc::proc_bsdinfo) -> String {
+    let long = c_string(&info.pbi_name);
+    if long.is_empty() {
+        c_string(&info.pbi_comm)
+    } else {
+        long
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn c_string(field: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = field
+        .iter()
+        .map(|byte| *byte as u8)
+        .take_while(|byte| *byte != 0)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(target_os = "linux")]
 struct Stat {
     parent: Option<u32>,
     group: i32,
@@ -118,6 +211,7 @@ struct Stat {
 
 /// The parent and the process group from `/proc/<pid>/stat`. The command name in the
 /// second field may hold spaces and parentheses, so parsing starts after the last `)`.
+#[cfg(target_os = "linux")]
 fn stat_of(pid: u32) -> Option<Stat> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = &text[text.rfind(')')? + 1..];
@@ -134,12 +228,22 @@ fn stat_of(pid: u32) -> Option<Stat> {
 
 /// The process group of a living process, or `None` when it is gone. A zombie is gone
 /// for a caller that wants to end the group: nothing is left to signal.
+#[cfg(target_os = "linux")]
 pub(crate) fn process_group(pid: u32) -> Option<i32> {
     stat_of(pid)
         .filter(|stat| stat.alive)
         .map(|stat| stat.group)
 }
 
+/// The process group of a living process, or `None` when it is gone. A zombie is gone
+/// for a caller that wants to end the group: nothing is left to signal.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_group(pid: u32) -> Option<i32> {
+    let info = bsd_info(pid)?;
+    (info.pbi_status != libc::SZOMB).then_some(info.pbi_pgid as i32)
+}
+
+#[cfg(target_os = "linux")]
 fn name_of(pid: u32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|name| name.trim().to_owned())
@@ -148,6 +252,7 @@ fn name_of(pid: u32) -> String {
 
 /// Resident set, then private bytes. Linux has no private working set of its own, so the
 /// shared pages are taken out of the resident set.
+#[cfg(target_os = "linux")]
 fn process_memory(pid: u32) -> Option<(u64, u64, u64)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let resident = status.lines().find_map(|line| {
@@ -159,6 +264,7 @@ fn process_memory(pid: u32) -> Option<(u64, u64, u64)> {
     Some((resident, private, private))
 }
 
+#[cfg(target_os = "linux")]
 fn private_bytes(pid: u32) -> Option<u64> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
     let mut fields = text.split_whitespace();
@@ -167,6 +273,32 @@ fn private_bytes(pid: u32) -> Option<u64> {
     // SAFETY: a plain query of an unchanged system value.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
     Some(resident.saturating_sub(shared).saturating_mul(page))
+}
+
+/// Resident set, then the address space. macOS reports no private bytes of a process, so
+/// the mapped size stands in for them and the table says so.
+#[cfg(target_os = "macos")]
+fn process_memory(pid: u32) -> Option<(u64, u64, u64)> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>();
+    // SAFETY: the structure is writable and `size` is its own size.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size as libc::c_int,
+        )
+    };
+    if (filled as usize) < size {
+        return None;
+    }
+    Some((
+        info.pti_resident_size,
+        info.pti_virtual_size,
+        info.pti_resident_size,
+    ))
 }
 
 fn roles() -> &'static Mutex<HashMap<u32, &'static str>> {

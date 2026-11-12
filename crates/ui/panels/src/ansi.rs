@@ -1,6 +1,7 @@
 //! Console output into lines of styled text. Knows SGR colors and bold, drops every other
 //! escape sequence, and a lone `\r` starts the line over, as a progress bar expects.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -141,6 +142,54 @@ impl AnsiParser {
                 _ => {}
             }
         }
+    }
+}
+
+/// The unfinished line of every process and stream that writes into one console. Each
+/// writer has a parser of its own, so the end of a line of one process never joins a
+/// piece of the line of another, and stdout and stderr are separate as well.
+#[derive(Default)]
+pub struct OutputBuffers {
+    parsers: BTreeMap<(u32, bool), AnsiParser>,
+}
+
+impl OutputBuffers {
+    /// Feeds a piece of the output of `process`; `error` says that it came from stderr.
+    /// Lines it completes go to `done`.
+    pub fn push(&mut self, process: u32, error: bool, text: &str, done: &mut Vec<Line>) {
+        self.parsers
+            .entry((process, error))
+            .or_default()
+            .push(text, error, done);
+    }
+
+    /// The process is gone: what it left unfinished is a line too.
+    pub fn finish(&mut self, process: u32, done: &mut Vec<Line>) {
+        for error in [false, true] {
+            if let Some(mut parser) = self.parsers.remove(&(process, error)) {
+                parser.finish(done);
+            }
+        }
+    }
+
+    /// No process writes any more: what every one of them left unfinished is a line too.
+    pub fn finish_all(&mut self, done: &mut Vec<Line>) {
+        for (_, mut parser) in std::mem::take(&mut self.parsers) {
+            parser.finish(done);
+        }
+    }
+
+    /// The lines that have not ended yet, one per writer.
+    pub fn unfinished(&self) -> impl Iterator<Item = &Line> {
+        self.parsers
+            .values()
+            .map(AnsiParser::current)
+            .filter(|line| !line.text.is_empty())
+    }
+
+    /// The first line that has not ended yet, for a console that shows one.
+    pub fn current(&self) -> Option<&Line> {
+        self.unfinished().next()
     }
 }
 

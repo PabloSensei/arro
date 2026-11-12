@@ -1,0 +1,1225 @@
+{
+  "actions": {
+    "$Copy": [
+      "cmd-c"
+    ],
+    "$Cut": [
+      "cmd-x"
+    ],
+    "$Delete": [
+      "delete"
+    ],
+    "$Paste": [
+      "cmd-v"
+    ],
+    "$Redo": [
+      "shift-cmd-z"
+    ],
+    "$SelectAll": [
+      "cmd-a"
+    ],
+    "$Undo": [
+      "cmd-z"
+    ],
+    "ActivateBookmarksToolWindow": [
+      "alt-2"
+    ],
+    "ActivateCommitToolWindow": [
+      "alt-0"
+    ],
+    "ActivateDebugToolWindow": [
+      "alt-5"
+    ],
+    "ActivateFindToolWindow": [
+      "alt-3"
+    ],
+    "ActivateNuGetToolWindow": [
+      "alt-shift-7"
+    ],
+    "ActivateProblemsViewToolWindow": [
+      "alt-6"
+    ],
+    "ActivateProjectToolWindow": [
+      "alt-1"
+    ],
+    "ActivateRunToolWindow": [
+      "alt-4"
+    ],
+    "ActivateServicesToolWindow": [
+      "alt-8"
+    ],
+    "ActivateStructureToolWindow": [
+      "alt-7"
+    ],
+    "ActivateTerminalToolWindow": [
+      "alt-f12"
+    ],
+    "ActivateUnitTestsToolWindow": [
+      "alt-shift-8"
+    ],
+    "ActivateVersionControlToolWindow": [
+      "alt-9"
+    ],
+    "AutoIndentLines": [
+      "alt-cmd-i"
+    ],
+    "Back": [
+      "cmd-[",
+      "alt-cmd-left"
+    ],
+    "BraceOrQuoteOut": [
+      "tab"
+    ],
+    "CallHierarchy": [
+      "ctrl-alt-h"
+    ],
+    "ChangeSignature": [
+      "cmd-f6"
+    ],
+    "ChangeTypeSignature": [
+      "shift-cmd-f6"
+    ],
+    "ChangesView.GroupBy.Directory": [
+      "alt-cmd-p"
+    ],
+    "ChangesView.GroupBy.Module": [
+      "alt-cmd-m"
+    ],
+    "ChangesView.Move": [
+      "alt-shift-m"
+    ],
+    "ChangesView.Rename": [
+      "f2",
+      "shift-f6"
+    ],
+    "ChangesView.Revert": [
+      "alt-cmd-z"
+    ],
+    "ChangesView.SetDefault": [
+      "cmd-space"
+    ],
+    "ChangesView.ShowCommitOptions": [
+      "cmd-o"
+    ],
+    "ChooseDebugConfiguration": [
+      "alt-shift-f9"
+    ],
+    "ChooseRunConfiguration": [
+      "alt-shift-f10"
+    ],
+    "ClassNameCompletion": [
+      "ctrl-alt-space"
+    ],
+    "CloseActiveTab": [
+      "cmd-w"
+    ],
+    "CloseContent": [
+      "cmd-f4"
+    ],
+    "CloseGotItTooltip": [
+      "escape"
+    ],
+    "CodeCompletion": [
+      "ctrl-space"
+    ],
+    "CodeFloatingToolbar.GotoNextMenu": [
+      "tab"
+    ],
+    "CodeFloatingToolbar.GotoPrevMenu": [
+      "shift-tab"
+    ],
+    "CodeInspection.OnEditor": [
+      "alt-shift-cmd-i"
+    ],
+    "CollapseAll": [
+      "cmd-numpad_subtract",
+      "cmd--"
+    ],
+    "CollapseAllRegions": [
+      "shift-cmd--"
+    ],
+    "CollapseBlock": [
+      "shift-cmd-."
+    ],
+    "CollapseExpandableComponent": [
+      "shift-enter",
+      "cmd-numpad_subtract",
+      "cmd--"
+    ],
+    "CollapseRegion": [
+      "cmd--"
+    ],
+    "CollapseRegionRecursively": [
+      "alt-cmd--"
+    ],
+    "CollapseSelection": [
+      "cmd-."
+    ],
+    "CollapseTreeNode": [
+      "numpad_subtract"
+    ],
+    "CommentByBlockComment": [
+      "alt-cmd-/"
+    ],
+    "CommentByLineComment": [
+      "cmd-/"
+    ],
+    "Compare.SameVersion": [
+      "cmd-d"
+    ],
+    "CompareTwoFiles": [
+      "cmd-d"
+    ],
+    "Compile": [
+      "shift-cmd-f9"
+    ],
+    "CompileDirty": [
+      "cmd-f9"
+    ],
+    "Console.Execute": [
+      "enter"
+    ],
+    "Console.Execute.Multiline": [
+      "cmd-enter"
+    ],
+    "Console.History.Browse": [
+      "ctrl-alt-e"
+    ],
+    "Console.Open": [
+      "shift-cmd-f10"
+    ],
+    "ContextHelp": [
+      "f1"
+    ],
+    "CopyElement": [
+      "f5"
+    ],
+    "CopyPaths": [
+      "shift-cmd-c"
+    ],
+    "CopyReference": [
+      "alt-shift-cmd-c"
+    ],
+    "Debug": [
+      "shift-f9"
+    ],
+    "Diff.ApplyLeftSide": [
+      "alt-cmd-r"
+    ],
+    "Diff.ApplyRightSide": [
+      "alt-cmd-a"
+    ],
+    "Diff.FocusOppositePane": [
+      "shift-cmd-tab"
+    ],
+    "Diff.NextChange": [
+      "alt-shift-right"
+    ],
+    "Diff.PrevChange": [
+      "alt-shift-left"
+    ],
+    "Diff.ShowDiff": [
+      "cmd-d"
+    ],
+    "Diff.ShowSettingsPopup": [
+      "shift-cmd-d"
+    ],
+    "DirDiffMenu.SynchronizeDiff": [
+      "enter"
+    ],
+    "DirDiffMenu.SynchronizeDiff.All": [
+      "cmd-enter"
+    ],
+    "DumpLookupElementWeights": [
+      "alt-shift-cmd-w"
+    ],
+    "DuplicatesForm.SendToLeft": [
+      "cmd-1"
+    ],
+    "DuplicatesForm.SendToRight": [
+      "cmd-2"
+    ],
+    "EditBreakpoint": [
+      "shift-cmd-f8"
+    ],
+    "EditSource": [
+      "f4"
+    ],
+    "EditSourceInNewWindow": [
+      "shift-f4"
+    ],
+    "EditorAddCaretPerSelectedLine": [
+      "alt-shift-g"
+    ],
+    "EditorBackSpace": [
+      "backspace",
+      "shift-backspace"
+    ],
+    "EditorChooseLookupItem": [
+      "enter"
+    ],
+    "EditorChooseLookupItemDot": [
+      "cmd-."
+    ],
+    "EditorChooseLookupItemReplace": [
+      "tab"
+    ],
+    "EditorCodeBlockEnd": [
+      "alt-cmd-]"
+    ],
+    "EditorCodeBlockEndWithSelection": [
+      "shift-cmd-]"
+    ],
+    "EditorCodeBlockStart": [
+      "alt-cmd-["
+    ],
+    "EditorCodeBlockStartWithSelection": [
+      "shift-cmd-["
+    ],
+    "EditorCompleteStatement": [
+      "shift-cmd-enter"
+    ],
+    "EditorContextInfo": [
+      "alt-q"
+    ],
+    "EditorDecreaseFontSizeGlobal": [
+      "alt-shift-,"
+    ],
+    "EditorDeleteLine": [
+      "cmd-backspace"
+    ],
+    "EditorDeleteToWordEnd": [
+      "alt-delete"
+    ],
+    "EditorDeleteToWordStart": [
+      "alt-backspace"
+    ],
+    "EditorDown": [
+      "down"
+    ],
+    "EditorDownWithSelection": [
+      "shift-down"
+    ],
+    "EditorDuplicate": [
+      "cmd-d"
+    ],
+    "EditorEnter": [
+      "enter"
+    ],
+    "EditorEscape": [
+      "escape"
+    ],
+    "EditorFocusGutter": [
+      "alt-shift-6 f"
+    ],
+    "EditorIncreaseFontSizeGlobal": [
+      "alt-shift-."
+    ],
+    "EditorIndentSelection": [
+      "tab"
+    ],
+    "EditorJoinLines": [
+      "ctrl-shift-j"
+    ],
+    "EditorLeft": [
+      "left"
+    ],
+    "EditorLeftWithSelection": [
+      "shift-left"
+    ],
+    "EditorLineEnd": [
+      "cmd-right"
+    ],
+    "EditorLineEndWithSelection": [
+      "shift-cmd-right"
+    ],
+    "EditorLineStart": [
+      "cmd-left"
+    ],
+    "EditorLineStartWithSelection": [
+      "shift-cmd-left"
+    ],
+    "EditorLookupDown": [
+      "ctrl-down"
+    ],
+    "EditorLookupUp": [
+      "ctrl-up"
+    ],
+    "EditorMatchBrace": [
+      "shift-cmd-m"
+    ],
+    "EditorMoveToPageBottom": [
+      "cmd-pagedown"
+    ],
+    "EditorMoveToPageBottomWithSelection": [
+      "shift-cmd-pagedown"
+    ],
+    "EditorMoveToPageTop": [
+      "cmd-pageup"
+    ],
+    "EditorMoveToPageTopWithSelection": [
+      "shift-cmd-pageup"
+    ],
+    "EditorNextWord": [
+      "alt-right"
+    ],
+    "EditorNextWordWithSelection": [
+      "alt-shift-right"
+    ],
+    "EditorPageDown": [
+      "pagedown"
+    ],
+    "EditorPageDownWithSelection": [
+      "shift-pagedown"
+    ],
+    "EditorPageUp": [
+      "pageup"
+    ],
+    "EditorPageUpWithSelection": [
+      "shift-pageup"
+    ],
+    "EditorPasteSimple": [
+      "alt-shift-cmd-v"
+    ],
+    "EditorPreviousWord": [
+      "alt-left"
+    ],
+    "EditorPreviousWordWithSelection": [
+      "alt-shift-left"
+    ],
+    "EditorRight": [
+      "right"
+    ],
+    "EditorRightWithSelection": [
+      "shift-right"
+    ],
+    "EditorScrollDown": [
+      "ctrl-down"
+    ],
+    "EditorScrollToCenter": [
+      "ctrl-m"
+    ],
+    "EditorScrollUp": [
+      "ctrl-up"
+    ],
+    "EditorSelectWord": [
+      "alt-up"
+    ],
+    "EditorShowGutterIconTooltip": [
+      "alt-shift-6 t"
+    ],
+    "EditorSplitLine": [
+      "cmd-enter"
+    ],
+    "EditorStartNewLine": [
+      "shift-enter"
+    ],
+    "EditorStartNewLineBefore": [
+      "alt-cmd-enter"
+    ],
+    "EditorTab": [
+      "tab"
+    ],
+    "EditorTextEnd": [
+      "cmd-down"
+    ],
+    "EditorTextEndWithSelection": [
+      "shift-cmd-down"
+    ],
+    "EditorTextStart": [
+      "cmd-up"
+    ],
+    "EditorTextStartWithSelection": [
+      "shift-cmd-up"
+    ],
+    "EditorToggleCase": [
+      "shift-cmd-u"
+    ],
+    "EditorToggleColumnMode": [
+      "shift-cmd-8"
+    ],
+    "EditorToggleInsertState": [],
+    "EditorUnSelectWord": [
+      "alt-down"
+    ],
+    "EditorUnindentSelection": [
+      "shift-tab"
+    ],
+    "EditorUp": [
+      "up"
+    ],
+    "EditorUpWithSelection": [
+      "shift-up"
+    ],
+    "EvaluateExpression": [
+      "alt-f8"
+    ],
+    "ExpandAll": [
+      "cmd-numpad_add",
+      "cmd-="
+    ],
+    "ExpandAllRegions": [
+      "shift-cmd-="
+    ],
+    "ExpandAllToLevel1": [
+      "shift-cmd-numpad_multiply 1",
+      "shift-cmd-numpad_multiply numpad1"
+    ],
+    "ExpandAllToLevel2": [
+      "shift-cmd-numpad_multiply 2",
+      "shift-cmd-numpad_multiply numpad2"
+    ],
+    "ExpandAllToLevel3": [
+      "shift-cmd-numpad_multiply 3",
+      "shift-cmd-numpad_multiply numpad3"
+    ],
+    "ExpandAllToLevel4": [
+      "shift-cmd-numpad_multiply 4",
+      "shift-cmd-numpad_multiply numpad4"
+    ],
+    "ExpandAllToLevel5": [
+      "shift-cmd-numpad_multiply 5",
+      "shift-cmd-numpad_multiply numpad5"
+    ],
+    "ExpandExpandableComponent": [
+      "shift-enter",
+      "cmd-numpad_add",
+      "cmd-="
+    ],
+    "ExpandLiveTemplateByTab": [
+      "tab"
+    ],
+    "ExpandRegion": [
+      "cmd-="
+    ],
+    "ExpandRegionRecursively": [
+      "alt-cmd-="
+    ],
+    "ExpandToLevel1": [
+      "cmd-numpad_multiply 1",
+      "cmd-numpad_multiply numpad1"
+    ],
+    "ExpandToLevel2": [
+      "cmd-numpad_multiply 2",
+      "cmd-numpad_multiply numpad2"
+    ],
+    "ExpandToLevel3": [
+      "cmd-numpad_multiply 3",
+      "cmd-numpad_multiply numpad3"
+    ],
+    "ExpandToLevel4": [
+      "cmd-numpad_multiply 4",
+      "cmd-numpad_multiply numpad4"
+    ],
+    "ExpandToLevel5": [
+      "cmd-numpad_multiply 5",
+      "cmd-numpad_multiply numpad5"
+    ],
+    "ExpandTreeNode": [
+      "numpad_add"
+    ],
+    "ExportToTextFile": [
+      "alt-o"
+    ],
+    "ExpressionTypeInfo": [
+      "shift-cmd-p"
+    ],
+    "ExternalJavaDoc": [
+      "shift-f1"
+    ],
+    "ExtractMethod": [
+      "alt-cmd-m"
+    ],
+    "FileChooser.GoToParent": [
+      "backspace"
+    ],
+    "FileChooser.GoToRoot": [
+      "cmd-\\"
+    ],
+    "FileChooser.GotoDesktop": [
+      "cmd-d"
+    ],
+    "FileChooser.GotoHome": [
+      "cmd-1"
+    ],
+    "FileChooser.GotoModule": [
+      "cmd-3"
+    ],
+    "FileChooser.GotoProject": [
+      "cmd-2"
+    ],
+    "FileChooser.NewFolder": [
+      "cmd-n"
+    ],
+    "FileChooser.TogglePathBar": [
+      "cmd-p"
+    ],
+    "FileStructurePopup": [
+      "cmd-f12"
+    ],
+    "Find": [
+      "cmd-f"
+    ],
+    "FindInPath": [
+      "shift-cmd-f"
+    ],
+    "FindNext": [
+      "cmd-g"
+    ],
+    "FindPrevWordAtCaret": [
+      "ctrl-shift-f3"
+    ],
+    "FindPrevious": [
+      "shift-cmd-g"
+    ],
+    "FindUsages": [
+      "alt-f7"
+    ],
+    "FindUsagesInFile": [
+      "ctrl-f7"
+    ],
+    "FindWordAtCaret": [
+      "ctrl-f3"
+    ],
+    "FocusEditor": [
+      "escape"
+    ],
+    "ForceRefresh": [
+      "shift-cmd-f5"
+    ],
+    "ForceRunToCursor": [
+      "alt-cmd-f9"
+    ],
+    "ForceStepInto": [
+      "alt-shift-f7"
+    ],
+    "ForceStepOver": [
+      "alt-shift-f8"
+    ],
+    "Forward": [
+      "cmd-]",
+      "alt-cmd-right"
+    ],
+    "FullyExpandTreeNode": [
+      "numpad_multiply"
+    ],
+    "Generate": [
+      "cmd-n"
+    ],
+    "Git.CreateNewBranch": [
+      "alt-cmd-n"
+    ],
+    "Git.New.Branch.In.Log": [
+      "alt-cmd-n"
+    ],
+    "Git.Rename.Local.Branch": [
+      "f2",
+      "shift-f6"
+    ],
+    "Git.Reword.Commit": [
+      "f2",
+      "shift-f6"
+    ],
+    "GotoAction": [
+      "shift-cmd-a"
+    ],
+    "GotoBookmark0": [
+      "ctrl-0"
+    ],
+    "GotoBookmark1": [
+      "ctrl-1"
+    ],
+    "GotoBookmark2": [
+      "ctrl-2"
+    ],
+    "GotoBookmark3": [
+      "ctrl-3"
+    ],
+    "GotoBookmark4": [
+      "ctrl-4"
+    ],
+    "GotoBookmark5": [
+      "ctrl-5"
+    ],
+    "GotoBookmark6": [
+      "ctrl-6"
+    ],
+    "GotoBookmark7": [
+      "ctrl-7"
+    ],
+    "GotoBookmark8": [
+      "ctrl-8"
+    ],
+    "GotoBookmark9": [
+      "ctrl-9"
+    ],
+    "GotoClass": [
+      "cmd-o"
+    ],
+    "GotoCustomRegion": [
+      "alt-cmd-."
+    ],
+    "GotoDeclaration": [
+      "cmd-b"
+    ],
+    "GotoFile": [
+      "shift-cmd-o"
+    ],
+    "GotoImplementation": [
+      "alt-cmd-b"
+    ],
+    "GotoLine": [
+      "cmd-l"
+    ],
+    "GotoNextError": [
+      "f2"
+    ],
+    "GotoPreviousError": [
+      "shift-f2"
+    ],
+    "GotoRelated": [
+      "alt-cmd-home"
+    ],
+    "GotoSuperMethod": [
+      "cmd-u"
+    ],
+    "GotoSymbol": [
+      "alt-cmd-o"
+    ],
+    "GotoTest": [
+      "shift-cmd-t"
+    ],
+    "GotoTypeDeclaration": [
+      "ctrl-shift-b"
+    ],
+    "HideActiveWindow": [
+      "shift-escape"
+    ],
+    "HideAllWindows": [
+      "shift-cmd-f12"
+    ],
+    "HighlightUsagesInFile": [
+      "ctrl-shift-f7"
+    ],
+    "HippieBackwardCompletion": [
+      "alt-shift-/"
+    ],
+    "HippieCompletion": [
+      "alt-/"
+    ],
+    "ImplementMethods": [
+      "ctrl-i"
+    ],
+    "Inline": [
+      "alt-cmd-n"
+    ],
+    "InsertLiveTemplate": [
+      "cmd-j"
+    ],
+    "IntroduceConstant": [
+      "alt-cmd-c"
+    ],
+    "IntroduceField": [
+      "alt-cmd-f"
+    ],
+    "IntroduceParameter": [
+      "alt-cmd-p"
+    ],
+    "IntroduceVariable": [
+      "alt-cmd-v"
+    ],
+    "JumpToLastChange": [
+      "shift-cmd-backspace"
+    ],
+    "JumpToLastWindow": [
+      "f12"
+    ],
+    "MainMenuButton.ShowMenu": [
+      "alt-\\"
+    ],
+    "MaximizeToolWindow": [],
+    "MethodDown": [
+      "alt-cmd-down"
+    ],
+    "MethodHierarchy": [
+      "shift-cmd-h"
+    ],
+    "MethodOverloadSwitchDown": [
+      "ctrl-down"
+    ],
+    "MethodOverloadSwitchUp": [
+      "ctrl-up"
+    ],
+    "MethodUp": [
+      "alt-cmd-up"
+    ],
+    "Move": [
+      "f6"
+    ],
+    "MoveElementLeft": [
+      "alt-shift-cmd-left"
+    ],
+    "MoveElementRight": [
+      "alt-shift-cmd-right"
+    ],
+    "MoveLineDown": [
+      "shift-cmd-down"
+    ],
+    "MoveLineUp": [
+      "shift-cmd-up"
+    ],
+    "MoveStatementDown": [
+      "ctrl-shift-down"
+    ],
+    "MoveStatementUp": [
+      "ctrl-shift-up"
+    ],
+    "MoveToolWindowTabToEditorAction": [
+      "alt-shift-enter"
+    ],
+    "NewElement": [
+      "ctrl-alt-n"
+    ],
+    "NewElementSamePlace": [
+      "ctrl-alt-shift-n"
+    ],
+    "NewScratchFile": [
+      "shift-cmd-n"
+    ],
+    "NextDiff": [
+      "f7"
+    ],
+    "NextEditorTab": [
+      "shift-cmd-]"
+    ],
+    "NextOccurence": [
+      "ctrl-alt-down"
+    ],
+    "NextParameter": [
+      "tab"
+    ],
+    "NextProjectWindow": [
+      "alt-cmd-]"
+    ],
+    "NextTab": [
+      "alt-right"
+    ],
+    "NextTemplateVariable": [
+      "tab",
+      "enter"
+    ],
+    "OpenInRightSplit": [
+      "shift-enter"
+    ],
+    "OptimizeImports": [
+      "ctrl-alt-o"
+    ],
+    "OverrideMethods": [
+      "ctrl-o"
+    ],
+    "ParameterInfo": [
+      "cmd-p"
+    ],
+    "PasteMultiple": [
+      "shift-cmd-v"
+    ],
+    "PopupHector": [
+      "alt-shift-cmd-h"
+    ],
+    "PrevParameter": [
+      "shift-tab"
+    ],
+    "PreviousDiff": [
+      "shift-f7"
+    ],
+    "PreviousEditorTab": [
+      "shift-cmd-["
+    ],
+    "PreviousOccurence": [
+      "ctrl-alt-up"
+    ],
+    "PreviousProjectWindow": [
+      "alt-cmd-["
+    ],
+    "PreviousTab": [
+      "alt-left"
+    ],
+    "PreviousTemplateVariable": [
+      "shift-tab"
+    ],
+    "QuickActionPopup": [
+      "alt-cmd-enter"
+    ],
+    "QuickChangeScheme": [
+      "cmd-`"
+    ],
+    "QuickEvaluateExpression": [
+      "alt-cmd-f8"
+    ],
+    "QuickImplementations": [
+      "ctrl-shift-i"
+    ],
+    "QuickJavaDoc": [
+      "f1"
+    ],
+    "RecentFiles": [
+      "cmd-e"
+    ],
+    "RecentLocations": [
+      "shift-cmd-e"
+    ],
+    "Refactorings.QuickListPopupAction": [
+      "ctrl-alt-shift-t"
+    ],
+    "ReformatCode": [
+      "alt-cmd-l"
+    ],
+    "Refresh": [
+      "cmd-f5"
+    ],
+    "RenameElement": [
+      "shift-f6"
+    ],
+    "Replace": [
+      "cmd-r"
+    ],
+    "ReplaceInPath": [
+      "shift-cmd-r"
+    ],
+    "Rerun": [
+      "cmd-f5"
+    ],
+    "RerunTests": [
+      "alt-shift-r"
+    ],
+    "ResetIdeScaleAction": [
+      "alt-shift-0"
+    ],
+    "ResizeToolWindowDown": [
+      "alt-shift-cmd-down"
+    ],
+    "ResizeToolWindowLeft": [
+      "alt-shift-cmd-left"
+    ],
+    "ResizeToolWindowRight": [
+      "alt-shift-cmd-right"
+    ],
+    "ResizeToolWindowUp": [
+      "alt-shift-cmd-up"
+    ],
+    "RestoreDefaultLayout": [
+      "shift-f12"
+    ],
+    "Resume": [
+      "f9"
+    ],
+    "Run": [
+      "shift-f10"
+    ],
+    "RunAnything": [
+      "double-ctrl"
+    ],
+    "RunClass": [
+      "ctrl-shift-r"
+    ],
+    "RunInspection": [
+      "ctrl-alt-shift-i"
+    ],
+    "RunToCursor": [
+      "alt-f9"
+    ],
+    "SafeDelete": [
+      "cmd-delete"
+    ],
+    "SaveAll": [
+      "cmd-s"
+    ],
+    "SaveAs": [
+      "shift-cmd-s"
+    ],
+    "SearchEverywhere": [
+      "double-shift"
+    ],
+    "SearchEverywhere.CompleteCommand": [
+      "tab"
+    ],
+    "SearchEverywhere.NavigateToNextGroup": [
+      "pagedown",
+      "cmd-down"
+    ],
+    "SearchEverywhere.NavigateToPrevGroup": [
+      "pageup",
+      "cmd-up"
+    ],
+    "SearchEverywhere.NextTab": [
+      "tab"
+    ],
+    "SearchEverywhere.PrevTab": [
+      "shift-tab"
+    ],
+    "SearchEverywhere.SelectItem": [
+      "enter"
+    ],
+    "SelectAllOccurrences": [
+      "alt-shift-cmd-j"
+    ],
+    "SelectIn": [
+      "alt-f1"
+    ],
+    "SelectNextOccurrence": [
+      "ctrl-g"
+    ],
+    "SelectVirtualTemplateElement": [
+      "alt-shift-o"
+    ],
+    "SendEOF": [
+      "ctrl-d"
+    ],
+    "ServiceView.GroupByContributor": [
+      "alt-cmd-t"
+    ],
+    "ServiceView.ShowServices": [
+      "shift-cmd-t"
+    ],
+    "ShelveChanges.UnshelveWithDialog": [
+      "shift-cmd-u"
+    ],
+    "ShelvedChanges.Rename": [
+      "f2",
+      "shift-f6"
+    ],
+    "ShowBookmarks": [
+      "shift-f3"
+    ],
+    "ShowContent": [
+      "alt-down"
+    ],
+    "ShowErrorDescription": [
+      "cmd-f1"
+    ],
+    "ShowExecutionPoint": [
+      "alt-f10"
+    ],
+    "ShowFilePath": [
+      "alt-cmd-f12"
+    ],
+    "ShowFilterPopup": [
+      "alt-cmd-f"
+    ],
+    "ShowIntentionActions": [
+      "alt-enter"
+    ],
+    "ShowNavBar": [
+      "alt-home"
+    ],
+    "ShowPopupMenu": [],
+    "ShowProjectStructureSettings": [
+      "alt-shift-cmd-s"
+    ],
+    "ShowReformatFileDialog": [
+      "alt-shift-cmd-l"
+    ],
+    "ShowSearchHistory": [
+      "alt-down"
+    ],
+    "ShowSettings": [
+      "alt-cmd-s"
+    ],
+    "ShowSettingsAndFindUsages": [
+      "ctrl-alt-shift-f7"
+    ],
+    "ShowTypeBookmarks": [
+      "shift-cmd-f3"
+    ],
+    "ShowUsages": [
+      "alt-cmd-f7"
+    ],
+    "SmartStepInto": [
+      "shift-f7"
+    ],
+    "SmartTypeCompletion": [
+      "ctrl-shift-space"
+    ],
+    "StepInto": [
+      "f7"
+    ],
+    "StepOut": [
+      "shift-f8"
+    ],
+    "StepOver": [
+      "f8"
+    ],
+    "Stop": [
+      "cmd-f2"
+    ],
+    "StopBackgroundProcesses": [
+      "shift-cmd-f2"
+    ],
+    "SurroundWith": [
+      "alt-cmd-t"
+    ],
+    "SurroundWithLiveTemplate": [
+      "alt-cmd-j"
+    ],
+    "SwitchCoverage": [
+      "alt-cmd-f6"
+    ],
+    "SwitchHeaderSource": [
+      "f10"
+    ],
+    "Switcher": [
+      "ctrl-tab",
+      "ctrl-shift-tab"
+    ],
+    "SwitcherIterateItems": [],
+    "SwitcherRecentEditedChangedToggleCheckBox": [
+      "cmd-e"
+    ],
+    "Synchronize": [
+      "alt-cmd-y"
+    ],
+    "TextSearchAction": [
+      "alt-shift-cmd-e"
+    ],
+    "TodoViewGroupByFlattenPackage": [
+      "alt-cmd-c"
+    ],
+    "TodoViewGroupByShowModules": [
+      "alt-cmd-m"
+    ],
+    "TodoViewGroupByShowPackages": [
+      "alt-cmd-p"
+    ],
+    "ToggleBookmark": [
+      "f3"
+    ],
+    "ToggleBookmark0": [
+      "ctrl-shift-0"
+    ],
+    "ToggleBookmark1": [
+      "ctrl-shift-1"
+    ],
+    "ToggleBookmark2": [
+      "ctrl-shift-2"
+    ],
+    "ToggleBookmark3": [
+      "ctrl-shift-3"
+    ],
+    "ToggleBookmark4": [
+      "ctrl-shift-4"
+    ],
+    "ToggleBookmark5": [
+      "ctrl-shift-5"
+    ],
+    "ToggleBookmark6": [
+      "ctrl-shift-6"
+    ],
+    "ToggleBookmark7": [
+      "ctrl-shift-7"
+    ],
+    "ToggleBookmark8": [
+      "ctrl-shift-8"
+    ],
+    "ToggleBookmark9": [
+      "ctrl-shift-9"
+    ],
+    "ToggleBookmarkWithMnemonic": [
+      "alt-f3"
+    ],
+    "ToggleFindInSelection": [
+      "alt-cmd-e"
+    ],
+    "ToggleLineBreakpoint": [
+      "cmd-f8"
+    ],
+    "ToggleRenderedDocPresentation": [
+      "alt-cmd-q"
+    ],
+    "ToggleTemporaryLineBreakpoint": [
+      "alt-shift-cmd-f8"
+    ],
+    "TypeHierarchy": [
+      "ctrl-h"
+    ],
+    "UnselectPreviousOccurrence": [
+      "ctrl-shift-g"
+    ],
+    "Unwrap": [
+      "shift-cmd-delete"
+    ],
+    "UsageFiltering.Imports": [
+      "cmd-i"
+    ],
+    "UsageFiltering.ReadAccess": [
+      "cmd-r"
+    ],
+    "UsageFiltering.WriteAccess": [
+      "cmd-w"
+    ],
+    "UsageGrouping.Directory": [
+      "alt-cmd-p"
+    ],
+    "UsageGrouping.DirectoryStructure": [
+      "alt-cmd-d"
+    ],
+    "UsageGrouping.FileStructure": [
+      "alt-cmd-f"
+    ],
+    "UsageGrouping.FlattenModules": [
+      "alt-cmd-o"
+    ],
+    "UsageGrouping.Module": [
+      "alt-cmd-m"
+    ],
+    "UsageGrouping.UsageType": [
+      "alt-cmd-t"
+    ],
+    "UsageView.Include": [],
+    "Vcs.MoveChangedLinesToChangelist": [
+      "alt-shift-m"
+    ],
+    "Vcs.QuickListPopupAction": [
+      "alt-`"
+    ],
+    "Vcs.RollbackChangedLines": [
+      "alt-cmd-z"
+    ],
+    "Vcs.ShowMessageHistory": [
+      "cmd-m"
+    ],
+    "Vcs.ToggleAmendCommitMode": [
+      "alt-m"
+    ],
+    "VcsHistory.ShowAllAffected": [
+      "alt-shift-a"
+    ],
+    "VcsShowNextChangeMarker": [
+      "alt-shift-cmd-down"
+    ],
+    "VcsShowPrevChangeMarker": [
+      "alt-shift-cmd-up"
+    ],
+    "ViewBreakpoints": [
+      "shift-cmd-f8"
+    ],
+    "ViewSource": [
+      "cmd-enter"
+    ],
+    "XDebugger.AttachToProcess": [
+      "alt-cmd-f5"
+    ],
+    "XDebugger.JumpToTypeSource": [
+      "shift-f4"
+    ],
+    "XDebugger.NewWatch": [],
+    "XDebugger.SetValue": [
+      "f2"
+    ],
+    "ZoomInIdeAction": [
+      "alt-shift-="
+    ],
+    "ZoomOutIdeAction": [
+      "alt-shift--"
+    ]
+  }
+}

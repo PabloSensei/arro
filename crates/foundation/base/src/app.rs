@@ -12,9 +12,20 @@ pub fn folder_under(base: &Path) -> PathBuf {
 
 /// `FOLDER` under the profile variable, the temporary folder when the variable is missing.
 /// On Unix the two Windows variables map to the folders of the desktop: `APPDATA` to the
-/// configuration folder and `LOCALAPPDATA` to the data folder.
+/// configuration folder and `LOCALAPPDATA` to the data folder. macOS keeps both under
+/// `~/Library/Application Support`, where its applications keep theirs.
 pub fn folder(variable: &str) -> PathBuf {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        let base = match variable {
+            "APPDATA" | "LOCALAPPDATA" => library("Application Support"),
+            other => std::env::var_os(other)
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        };
+        folder_under(&base)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let base = match variable {
             "APPDATA" => xdg("XDG_CONFIG_HOME", ".config"),
@@ -32,8 +43,17 @@ pub fn folder(variable: &str) -> PathBuf {
     }
 }
 
+/// `~/Library/<name>`, or the temporary folder when there is no home folder.
+#[cfg(target_os = "macos")]
+fn library(name: &str) -> PathBuf {
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => home.join("Library").join(name),
+        None => std::env::temp_dir(),
+    }
+}
+
 /// `$XDG_...` when it is absolute, else the folder of the same name under the home folder.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn xdg(variable: &str, fallback: &str) -> PathBuf {
     if let Some(value) = std::env::var_os(variable).map(PathBuf::from)
         && value.is_absolute()

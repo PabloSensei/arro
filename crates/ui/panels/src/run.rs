@@ -25,7 +25,7 @@ use ui_kit::*;
 use workspace::{DEBUG_TOOL, RUN_TOOL, RunControls, RunState, Workspace};
 use workspace_core::Delivery;
 
-use crate::ansi::{AnsiParser, Line, Style};
+use crate::ansi::{Line, OutputBuffers, Style};
 use crate::console_input::{ConsoleInput, ConsoleKey};
 
 mod tests;
@@ -137,7 +137,11 @@ pub struct RunPanel {
     problems: Vec<String>,
     title: SharedString,
     lines: VecDeque<Line>,
-    parser: AnsiParser,
+    /// The unfinished lines of the writers of the main console, each process and stream
+    /// on its own.
+    output: OutputBuffers,
+    /// The process whose output goes into the main console now.
+    console_process: Option<u32>,
     /// The last test run, see `run/tests.rs`.
     tests: TestView,
     test_provider: Option<Arc<dyn TestProvider>>,
@@ -158,8 +162,10 @@ pub struct RunPanel {
     /// The build process is still running; its late output may come after it ends.
     build_running: bool,
     /// The lines of a build run with a console of its own: the test console keeps its
-    /// own parser, so an unfinished line of one process cannot join the other.
-    build_parser: AnsiParser,
+    /// own buffers, so an unfinished line of one process cannot join the other.
+    build_output: OutputBuffers,
+    /// The process whose output goes into the build console now.
+    build_process: Option<u32>,
     /// The answer of a hot swap the last Build Project asked for.
     reload: Option<Receiver<ReloadOutcome>>,
     /// Bumped on every build file that changed: only the import after the last of a
@@ -177,7 +183,9 @@ struct DrainingConsole {
     /// `None` once its pipes have closed: the tab and its text stay.
     console: Option<Console>,
     lines: Vec<Line>,
-    parser: AnsiParser,
+    /// The last process of that console, for its unfinished line.
+    process: Option<u32>,
+    output: OutputBuffers,
 }
 
 impl RunPanel {
@@ -243,7 +251,8 @@ impl RunPanel {
                 problems: Vec::new(),
                 title: "Run".into(),
                 lines: VecDeque::new(),
-                parser: AnsiParser::default(),
+                output: OutputBuffers::default(),
+                console_process: None,
                 tests: TestView::new(),
                 test_provider: setup.tests,
                 debug_service: setup.debug,
@@ -255,7 +264,8 @@ impl RunPanel {
                 building_project: false,
                 build_console: None,
                 build_running: false,
-                build_parser: AnsiParser::default(),
+                build_output: OutputBuffers::default(),
+                build_process: None,
                 reload: None,
                 model_reload: 0,
                 console_input: ConsoleInput::new(),
@@ -470,7 +480,7 @@ impl RunPanel {
             .iter()
             .flat_map(|drain| {
                 let lines = drain.lines.iter().map(|line| line.text.clone());
-                lines.chain(Some(drain.parser.current().text.clone()))
+                lines.chain(drain.output.unfinished().map(|line| line.text.clone()))
             })
             .collect()
     }
@@ -488,7 +498,7 @@ impl RunPanel {
     /// Console text, for scripts.
     pub fn text(&self) -> Vec<String> {
         let lines = self.lines.iter().map(|line| line.text.clone());
-        let current = Some(self.parser.current().text.clone()).filter(|text| !text.is_empty());
+        let current = self.output.unfinished().map(|line| line.text.clone());
         lines.chain(current).collect()
     }
 
@@ -754,7 +764,8 @@ impl RunPanel {
             return;
         };
         let title = std::mem::take(&mut self.title);
-        let parser = std::mem::take(&mut self.parser);
+        let output = std::mem::take(&mut self.output);
+        let process = self.console_process.take();
         let lines = self.lines.drain(..).collect();
         // Old runs whose output has ended are kept as tabs, the latest few of them.
         while self.draining.len() >= MAX_OLD_RUNS {
@@ -771,7 +782,8 @@ impl RunPanel {
             title,
             console: Some(console),
             lines,
-            parser,
+            process,
+            output,
         });
         self.viewing = None;
         self.console_running = false;
@@ -1057,13 +1069,21 @@ impl RunPanel {
         self.send_console_line(&line, cx);
     }
 
+    /// Ends the unfinished lines of the process the main console had now.
+    fn finish_console_process(&mut self, done: &mut Vec<Line>) {
+        match self.console_process.take() {
+            Some(process) => self.output.finish(process, done),
+            None => self.output.finish_all(done),
+        }
+    }
+
     fn send_console_line(&mut self, line: &str, cx: &mut Context<Self>) {
         if let Some(console) = &self.console {
             console.send_line(line);
         }
         // A prompt the program left unfinished ends before the line the user typed.
         let mut done = Vec::new();
-        self.parser.finish(&mut done);
+        self.finish_console_process(&mut done);
         self.lines.extend(done);
         self.lines
             .push_back(Line::plain(line.to_owned(), input_style()));
@@ -1232,7 +1252,8 @@ impl RunPanel {
                 this.starting = false;
                 match plan {
                     Ok(plan) => {
-                        this.build_parser = AnsiParser::default();
+                        this.build_output = OutputBuffers::default();
+                        this.build_process = None;
                         this.build_console = Some(Console::start(plan));
                         this.build_running = true;
                     }
@@ -1262,7 +1283,8 @@ impl RunPanel {
         crate::history::put_label(&self.root, format!("Before running {title}"), cx);
         self.title = title.into();
         self.lines.clear();
-        self.parser = AnsiParser::default();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
         self.console_input.restart();
         self.program_started = false;
         self.tests.clear();
@@ -1406,7 +1428,8 @@ impl RunPanel {
         self.archive_console();
         self.title = title_of(&request).into();
         self.lines.clear();
-        self.parser = AnsiParser::default();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
         self.tests.begin(request.clone());
         self.starting = true;
         self.debugging_tests = true;
@@ -1491,7 +1514,9 @@ impl RunPanel {
         self.show_notice(cx);
         let mut changed = self.poll_sync(cx);
         let mut done = Vec::new();
-        let mut debug_lines: Vec<(String, bool)> = Vec::new();
+        // The test console of a debug run shows the lines the parser has completed, so a
+        // piece of a line held back here is not cut in two there.
+        let debug_from = self.debugging_tests.then_some(done.len());
         let mut exited: Option<Option<i32>> = None;
         let mut closed = false;
         let mut built = false;
@@ -1504,14 +1529,16 @@ impl RunPanel {
                 };
                 changed = true;
                 match event {
-                    ConsoleEvent::Output { stream, text } => {
-                        let error = stream == Stream::Stderr;
-                        if self.debugging_tests {
-                            debug_lines.push((text.clone(), error));
-                        }
-                        self.parser.push(&text, error, &mut done);
+                    ConsoleEvent::Output {
+                        process,
+                        stream,
+                        text,
+                    } => {
+                        self.output
+                            .push(process, stream == Stream::Stderr, &text, &mut done);
                     }
-                    ConsoleEvent::Started { step, .. } => {
+                    ConsoleEvent::Started { pid, step } => {
+                        self.console_process = Some(pid);
                         if step == Step::Before {
                             done.push(info("Building the project"));
                         }
@@ -1523,7 +1550,10 @@ impl RunPanel {
                         done.push(Line::plain(message, error_style()));
                     }
                     ConsoleEvent::Exited { code, step } => {
-                        self.parser.finish(&mut done);
+                        match self.console_process.take() {
+                            Some(process) => self.output.finish(process, &mut done),
+                            None => self.output.finish_all(&mut done),
+                        }
                         done.push(Line::default());
                         done.push(info(exit_text(code, step)));
                         self.console_running = false;
@@ -1534,7 +1564,8 @@ impl RunPanel {
                     }
                     // The pipes are closed: the last output, late as it was, is in.
                     ConsoleEvent::Closed => {
-                        self.parser.finish(&mut done);
+                        self.output.finish_all(&mut done);
+                        self.console_process = None;
                         closed = true;
                         self.console_running = false;
                         break;
@@ -1548,6 +1579,26 @@ impl RunPanel {
             changed = true;
             done.push(Line::plain(message, error_style()));
         }
+        if let Some(from) = debug_from {
+            let lines: Vec<(String, bool)> = done[from..]
+                .iter()
+                .filter(|line| !line.text.is_empty())
+                .map(|line| {
+                    let error = line.spans.first().is_some_and(|(_, style)| style.error);
+                    (line.text.clone(), error)
+                })
+                .collect();
+            if !lines.is_empty()
+                && let Some(debug) = cx.try_global::<crate::debug::ActiveDebug>()
+            {
+                let panel = debug.0.clone();
+                panel.update(cx, |panel, cx| {
+                    for (text, error) in lines {
+                        panel.push_output(text, error, cx);
+                    }
+                });
+            }
+        }
         let mut build_exited: Option<Option<i32>> = None;
         let mut build_closed = false;
         let mut build_done = Vec::new();
@@ -1558,16 +1609,27 @@ impl RunPanel {
                 };
                 changed = true;
                 match event {
-                    ConsoleEvent::Output { stream, text } => {
-                        self.build_parser
-                            .push(&text, stream == Stream::Stderr, &mut build_done);
+                    ConsoleEvent::Output {
+                        process,
+                        stream,
+                        text,
+                    } => {
+                        self.build_output.push(
+                            process,
+                            stream == Stream::Stderr,
+                            &text,
+                            &mut build_done,
+                        );
                     }
-                    ConsoleEvent::Started { .. } => {}
+                    ConsoleEvent::Started { pid, .. } => self.build_process = Some(pid),
                     ConsoleEvent::Failed { message } => {
                         build_done.push(Line::plain(message, error_style()));
                     }
                     ConsoleEvent::Exited { code, .. } => {
-                        self.build_parser.finish(&mut build_done);
+                        match self.build_process.take() {
+                            Some(process) => self.build_output.finish(process, &mut build_done),
+                            None => self.build_output.finish_all(&mut build_done),
+                        }
                         build_done.push(Line::default());
                         build_done.push(info(exit_text(code, Step::Program)));
                         self.build_running = false;
@@ -1575,7 +1637,8 @@ impl RunPanel {
                     }
                     // The build is over; a daemon may still hold its pipes.
                     ConsoleEvent::Closed => {
-                        self.build_parser.finish(&mut build_done);
+                        self.build_output.finish_all(&mut build_done);
+                        self.build_process = None;
                         build_closed = true;
                         break;
                     }
@@ -1596,17 +1659,29 @@ impl RunPanel {
                 };
                 changed = true;
                 match event {
-                    ConsoleEvent::Output { stream, text } => {
-                        drain
-                            .parser
-                            .push(&text, stream == Stream::Stderr, &mut drain.lines);
+                    ConsoleEvent::Output {
+                        process,
+                        stream,
+                        text,
+                    } => {
+                        drain.output.push(
+                            process,
+                            stream == Stream::Stderr,
+                            &text,
+                            &mut drain.lines,
+                        );
                     }
-                    ConsoleEvent::Started { .. } | ConsoleEvent::Exited { .. } => {}
+                    ConsoleEvent::Started { pid, .. } => drain.process = Some(pid),
+                    ConsoleEvent::Exited { .. } => match drain.process.take() {
+                        Some(process) => drain.output.finish(process, &mut drain.lines),
+                        None => drain.output.finish_all(&mut drain.lines),
+                    },
                     ConsoleEvent::Failed { message } => {
                         drain.lines.push(Line::plain(message, error_style()));
                     }
                     ConsoleEvent::Closed => {
-                        drain.parser.finish(&mut drain.lines);
+                        drain.output.finish_all(&mut drain.lines);
+                        drain.process = None;
                         closed = true;
                         break;
                     }
@@ -1645,17 +1720,6 @@ impl RunPanel {
         {
             self.mark_built();
             self.request_reload(cx);
-        }
-        if !debug_lines.is_empty()
-            && self.debugging_tests
-            && let Some(debug) = cx.try_global::<crate::debug::ActiveDebug>()
-        {
-            let panel = debug.0.clone();
-            panel.update(cx, |panel, cx| {
-                for (text, error) in debug_lines {
-                    panel.push_output(text, error, cx);
-                }
-            });
         }
         changed |= self.poll_tests(cx);
         changed |= self.poll_reload(cx);
@@ -1938,9 +2002,10 @@ impl RunPanel {
     ) -> Vec<AnyElement> {
         let drain = view.and_then(|index| self.draining.get(index));
         let current = match drain {
-            Some(drain) => drain.parser.current(),
-            None => self.parser.current(),
+            Some(drain) => drain.output.current(),
+            None => self.output.current(),
         };
+        let current = current.cloned().unwrap_or_default();
         let typed = self.takes_input().then_some(self.lines.len() + 1);
         range
             .map(|index| {
@@ -1951,7 +2016,7 @@ impl RunPanel {
                     Some(drain) => drain.lines.get(index),
                     None => self.lines.get(index),
                 };
-                let line = line.unwrap_or(current);
+                let line = line.unwrap_or(&current);
                 line_element(line, theme)
             })
             .collect()

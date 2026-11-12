@@ -8,6 +8,10 @@ use crate::{KeymapError, Shortcut};
 
 pub const IDEA_DEFAULT: &str = include_str!("../keymaps/idea-default.json");
 
+/// The same table for macOS: Command where Windows has Control, and the keys IDEA keeps on
+/// Control. Generated from [`IDEA_DEFAULT`] by `cargo xtask macos-keymap`.
+pub const IDEA_DEFAULT_MACOS: &str = include_str!("../keymaps/idea-default-macos.json");
+
 /// One deliberate difference from IDEA's default Windows keymap.
 #[derive(Clone, Copy, Debug)]
 pub struct Deviation {

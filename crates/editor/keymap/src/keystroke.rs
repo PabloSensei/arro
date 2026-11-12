@@ -7,6 +7,9 @@ pub struct Keystroke {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+    /// The Command key of macOS. The other systems have no key of their own here, so a
+    /// binding with it never fires.
+    pub cmd: bool,
     /// Lower case key name: `a`, `/`, `enter`, `up`, `numpad_add`.
     pub key: String,
 }
@@ -25,6 +28,7 @@ impl Keystroke {
                 "ctrl" => stroke.ctrl = true,
                 "alt" => stroke.alt = true,
                 "shift" => stroke.shift = true,
+                "cmd" => stroke.cmd = true,
                 _ => return Err(invalid()),
             }
             rest = tail;
@@ -99,6 +103,7 @@ impl fmt::Display for Keystroke {
             (self.ctrl, "ctrl-"),
             (self.alt, "alt-"),
             (self.shift, "shift-"),
+            (self.cmd, "cmd-"),
         ] {
             if on {
                 f.write_str(name)?;

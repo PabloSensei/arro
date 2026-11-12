@@ -15,7 +15,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{SERVICES_TOOL, TERMINAL_TOOL, Workspace};
 
-use crate::ansi::{AnsiParser, Line};
+use crate::ansi::{Line, OutputBuffers};
 use crate::run::{error_style, info, line_element};
 use crate::terminal_panel::ActiveTerminal;
 
@@ -64,7 +64,8 @@ pub struct DockerPanel {
     console: Option<Console>,
     log_title: SharedString,
     lines: VecDeque<Line>,
-    parser: AnsiParser,
+    output: OutputBuffers,
+    process: Option<u32>,
     /// The panel drains the watch and the log while this runs.
     polling: bool,
 }
@@ -131,7 +132,8 @@ impl DockerPanel {
                 console: None,
                 log_title: "Logs".into(),
                 lines: VecDeque::new(),
-                parser: AnsiParser::default(),
+                output: OutputBuffers::default(),
+                process: None,
                 polling: false,
             };
             if let Some(workspace) = observer.upgrade() {
@@ -297,20 +299,32 @@ impl DockerPanel {
                 };
                 changed = true;
                 match event {
-                    ConsoleEvent::Output { stream, text } => {
-                        self.parser.push(&text, stream == Stream::Stderr, &mut done);
+                    ConsoleEvent::Output {
+                        process,
+                        stream,
+                        text,
+                    } => {
+                        self.output
+                            .push(process, stream == Stream::Stderr, &text, &mut done);
                     }
-                    ConsoleEvent::Started { .. } => {}
+                    ConsoleEvent::Started { pid, .. } => self.process = Some(pid),
                     ConsoleEvent::Failed { message } => {
                         done.push(Line::plain(message, error_style()));
                     }
                     ConsoleEvent::Exited { .. } => {
-                        self.parser.finish(&mut done);
+                        match self.process.take() {
+                            Some(process) => self.output.finish(process, &mut done),
+                            None => self.output.finish_all(&mut done),
+                        }
                         done.push(info("The log ended"));
                         ended = true;
                         break;
                     }
-                    ConsoleEvent::Closed => break,
+                    ConsoleEvent::Closed => {
+                        self.output.finish_all(&mut done);
+                        self.process = None;
+                        break;
+                    }
                 }
             }
         }
@@ -389,7 +403,8 @@ impl DockerPanel {
         }
         self.log_title = format!("Logs: {}", container.name).into();
         self.lines.clear();
-        self.parser = AnsiParser::default();
+        self.output = OutputBuffers::default();
+        self.process = None;
         self.console = Some(Console::start(RunPlan {
             before: None,
             program: cli.logs(&container.id),
@@ -623,10 +638,11 @@ impl DockerPanel {
     }
 
     fn rows(&self, range: std::ops::Range<usize>, theme: &Theme) -> Vec<AnyElement> {
-        let current = self.parser.current();
+        let current = self.output.current();
+        let current = current.cloned().unwrap_or_default();
         range
             .map(|index| {
-                let line = self.lines.get(index).unwrap_or(current);
+                let line = self.lines.get(index).unwrap_or(&current);
                 line_element(line, theme)
             })
             .collect()

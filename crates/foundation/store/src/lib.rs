@@ -14,16 +14,25 @@ mod trust;
 const MIGRATIONS: &[&str] = &["CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);"];
 
 /// Where the state of `app` lives: `%LOCALAPPDATA%` on Windows, `$XDG_DATA_HOME` or
-/// `~/.local/share` on Unix, the temporary folder as a fallback.
+/// `~/.local/share` on Unix, `~/Library/Application Support` on macOS, the temporary
+/// folder as a fallback.
 pub fn state_dir(app: &str) -> PathBuf {
     #[cfg(windows)]
     let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
         })
         .unwrap_or_else(std::env::temp_dir);
     base.join(app)

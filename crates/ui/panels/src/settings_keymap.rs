@@ -12,32 +12,10 @@ use workspace::Workspace;
 use crate::prompt::TextField;
 use crate::settings::SettingsView;
 
-/// A keyboard shortcut as the page writes it: `Ctrl+Shift+N`, `Ctrl+K, Ctrl+C`.
+/// A keyboard shortcut as the page writes it: `Ctrl+Shift+N`, `Ctrl+K, Ctrl+C`, and the
+/// glyphs of macOS.
 fn present(shortcut: &Shortcut) -> String {
-    match shortcut {
-        Shortcut::Double(keymap::Modifier::Ctrl) => return "Double Ctrl".to_owned(),
-        Shortcut::Double(keymap::Modifier::Alt) => return "Double Alt".to_owned(),
-        Shortcut::Double(keymap::Modifier::Shift) => return "Double Shift".to_owned(),
-        Shortcut::Keys(_) => {}
-    }
-    let part = |part: &str| match part {
-        "ctrl" => "Ctrl".to_owned(),
-        "alt" => "Alt".to_owned(),
-        "shift" => "Shift".to_owned(),
-        other => {
-            let mut chars = other.chars();
-            chars
-                .next()
-                .map(|first| first.to_uppercase().chain(chars).collect())
-                .unwrap_or_default()
-        }
-    };
-    shortcut
-        .to_string()
-        .split(' ')
-        .map(|step| step.split('-').map(part).collect::<Vec<_>>().join("+"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    keymap::shortcut_label(&shortcut.to_string(), keymap::platform())
 }
 
 /// The last part of an action id, as one debug selector: `keymap-row-editor-copy`.
@@ -188,6 +166,7 @@ impl KeymapPage {
                     ctrl: modifiers.control,
                     alt: modifiers.alt,
                     shift: modifiers.shift,
+                    cmd: modifiers.platform,
                     key: key.to_lowercase(),
                 });
             }

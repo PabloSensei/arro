@@ -34,24 +34,18 @@ pub enum Stream {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConsoleEvent {
     /// A step of the plan started.
-    Started {
-        pid: u32,
-        step: Step,
-    },
+    Started { pid: u32, step: Step },
     Output {
+        /// The process that wrote it, so a reader can keep an unfinished line apart.
+        process: u32,
         stream: Stream,
         text: String,
     },
     /// Could not start a step.
-    Failed {
-        message: String,
-    },
+    Failed { message: String },
     /// The process of the plan ended. Output that a child or a server still writes may
     /// come after it, until [`ConsoleEvent::Closed`].
-    Exited {
-        code: Option<i32>,
-        step: Step,
-    },
+    Exited { code: Option<i32>, step: Step },
     /// The last event: the pipes are closed and no more output will come.
     Closed,
 }
@@ -466,12 +460,14 @@ fn run_step(
     let readers = vec![
         read_pipe(
             process.take_stdout(),
+            pid,
             Stream::Stdout,
             events.clone(),
             watch.clone(),
         ),
         read_pipe(
             process.take_stderr(),
+            pid,
             Stream::Stderr,
             events.clone(),
             watch.clone(),
@@ -524,6 +520,7 @@ fn wait(process: &mut Process, grace: Duration, stop: &Cancel) -> Result<Option<
 
 fn read_pipe(
     pipe: Option<impl Read + Send + 'static>,
+    process: u32,
     stream: Stream,
     events: SyncSender<ConsoleEvent>,
     watch: Arc<OutputWatch>,
@@ -536,7 +533,7 @@ fn read_pipe(
             let text = decoder.push(&chunk[..count]);
             if !text.is_empty() {
                 watch.observe(&text);
-                if !deliver(&events, stream, text) {
+                if !deliver(&events, process, stream, text) {
                     return;
                 }
             }
@@ -544,14 +541,18 @@ fn read_pipe(
         let text = decoder.finish();
         if !text.is_empty() {
             watch.observe(&text);
-            deliver(&events, stream, text);
+            deliver(&events, process, stream, text);
         }
     })
 }
 
 /// False when nobody reads any more.
-fn deliver(events: &SyncSender<ConsoleEvent>, stream: Stream, text: String) -> bool {
-    let event = ConsoleEvent::Output { stream, text };
+fn deliver(events: &SyncSender<ConsoleEvent>, process: u32, stream: Stream, text: String) -> bool {
+    let event = ConsoleEvent::Output {
+        process,
+        stream,
+        text,
+    };
     match events.try_send(event) {
         Ok(()) => true,
         Err(TrySendError::Full(event)) => events.send(event).is_ok(),

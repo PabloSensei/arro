@@ -16,18 +16,18 @@ use crate::window::{
     AI_TOOL, BalloonAction, BuildProject, COMMIT_TOOL, ChooseDebugConfiguration,
     ChooseRunConfiguration, CloseTab, Compile, CopyElement, DEBUG_TOOL, Debug, Dismiss, DockSide,
     EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto,
-    ForceStepOver, FullyExpandTreeNode, GotoRelated, HideToolWindow, LOG_TOOL, MoveToOtherGroup,
-    NewElementSamePlace, NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay,
-    PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem, PreviousProjectWindow, ProjectStructure,
-    PushChanges, QuickEvaluate, RUN_TOOL, ReopenTab, Rerun, RerunTests, ResizeStep,
-    ResizeToolWindowDown, ResizeToolWindowLeft, ResizeToolWindowRight, ResizeToolWindowUp, Resume,
-    Run, RunToCursor, SERVICES_TOOL, STRUCTURE_TOOL, SaveAll, ShowBranches, ShowCommit,
-    ShowExecutionPoint, ShowSearch, ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto,
-    StepOut, StepOver, Stop, StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL,
-    TabLeft, TabRight, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleDebug, ToggleLog,
-    ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTemporaryLineBreakpoint,
-    ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList,
-    ViewBreakpoints, Workspace,
+    ForceStepOver, FullyExpandTreeNode, GotoRelated, HideToolWindow, LOG_TOOL, MenuRow,
+    MoveToOtherGroup, NewElementSamePlace, NextProblem, NextProjectWindow, NextTab, OpenFolder,
+    Overlay, PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem, PreviousProjectWindow,
+    ProjectStructure, PushChanges, QuickEvaluate, QuitApp, RUN_TOOL, ReopenTab, Rerun, RerunTests,
+    ResizeStep, ResizeToolWindowDown, ResizeToolWindowLeft, ResizeToolWindowRight,
+    ResizeToolWindowUp, Resume, Run, RunToCursor, SERVICES_TOOL, STRUCTURE_TOOL, SaveAll,
+    ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch, ShowSettings, SmartStepInto,
+    SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop, StopBackgroundProcesses, Synchronize,
+    TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi, ToggleBreakpoint, ToggleCommit,
+    ToggleDebug, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
+    ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
+    UpdateProject, VcsQuickList, ViewBreakpoints, Workspace,
 };
 use crate::window::{TODO_TOOL, ToggleProblems, ToggleTodo};
 
@@ -72,6 +72,16 @@ const TOOLBAR_SLACK: f32 = SPACE_M;
 const MENU_MNEMONICS: [char; 11] = ['F', 'E', 'V', 'N', 'C', 'R', 'B', 'U', 'G', 'W', 'H'];
 /// The bar item of the sections that did not fit, in `MenuEntry` paths.
 const MENU_OVERFLOW: usize = usize::MAX;
+/// What the left side of the toolbar keeps for the traffic lights of a macOS window.
+const TRAFFIC_LIGHTS_ROOM: f32 = 62.;
+
+/// Whether the window draws the menu bar and the window buttons itself. macOS keeps both in
+/// the system: the menu in the menu bar of the screen, the buttons as the traffic lights.
+/// The test platform of GPUI has neither, so a test window keeps the in-window chrome and
+/// can press it.
+fn own_chrome() -> bool {
+    !cfg!(target_os = "macos") || cfg!(feature = "test-support")
+}
 
 #[derive(Clone, Copy)]
 struct DraggedEdge(DockSide);
@@ -196,6 +206,18 @@ fn path_parts(root: &Path, path: &Path) -> Vec<String> {
     parts
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
         .collect()
+}
+
+/// The row a path of the menu of the screen names: the section, then the row, then the row
+/// of its submenu, and so on.
+fn row_at<'a>(entries: &'a mut [MenuEntry], path: &[usize]) -> Option<&'a MenuEntry> {
+    let (index, rest) = path.split_first()?;
+    let entry = entries.get_mut(*index)?;
+    if rest.is_empty() {
+        Some(entry)
+    } else {
+        row_at(&mut entry.submenu, rest)
+    }
 }
 
 /// A menu row that runs on the workspace.
@@ -636,7 +658,7 @@ impl Workspace {
                     .bg(theme.border),
             )
             .child(tools)
-            .child(window_buttons);
+            .children(own_chrome().then_some(window_buttons));
 
         #[cfg(unix)]
         let titlebar_drag = Some(
@@ -668,121 +690,18 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .h_full()
-                    .pl(px(SPACE_M))
-                    .child(self.menu_bar(window, theme, cx))
+                    .pl(px(if own_chrome() {
+                        SPACE_M
+                    } else {
+                        TRAFFIC_LIGHTS_ROOM + SPACE_M
+                    }))
+                    .children(own_chrome().then(|| self.menu_bar(window, theme, cx)))
                     .child(project.ml(px(SPACE_L)))
                     .child(channel.ml(px(SPACE_XS)))
                     .children(branch.map(|branch| branch.ml(px(SPACE_L)))),
             )
             .children(titlebar_drag)
             .child(right)
-    }
-
-    fn tab_bar(
-        &self,
-        pane: usize,
-        theme: &Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let active = self.panes[pane].active;
-        let selection = theme.selection;
-        let tabs = self.panes[pane]
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let id = tab_id(pane, index);
-                let dirty = (item.editor.status)(cx).dirty;
-                let pinned = item.pinned;
-                let style = TabStyle {
-                    id: ("tab", id).into(),
-                    close_id: ("tab-close", id).into(),
-                    group: format!("tab-{id}").into(),
-                    label: item.title.clone(),
-                    icon: item.icon,
-                    selected: index == active,
-                    dirty,
-                    pinned,
-                };
-                // The dot of a pinned tab unpins it, the cross of another one closes it.
-                let close = cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    if pinned {
-                        this.toggle_pin(pane, index, window, cx);
-                    } else {
-                        this.close_tab(pane, index, window, cx);
-                    }
-                });
-                let dragged = DraggedTab {
-                    pane,
-                    index,
-                    title: item.title.clone(),
-                };
-                tab(style, close, theme)
-                    .debug_selector(move || format!("tab-{pane}-{index}"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_tab(pane, index, window, cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(move |this, _, window, cx| {
-                            this.close_tab(pane, index, window, cx)
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.show_tab_menu(pane, index, event.position, cx)
-                        }),
-                    )
-                    .on_drag(dragged, |dragged, _, _, cx| {
-                        let title = dragged.title.clone();
-                        cx.new(|_| TabDragPreview(title))
-                    })
-                    .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(selection))
-                    .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-                        let from = (dragged.pane, dragged.index);
-                        this.move_tab(from, (pane, index), window, cx)
-                    }))
-            });
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(HEADER_HEIGHT))
-            .px(px(SPACE_M))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                scrollable(
-                    ("tabs", pane),
-                    &self.panes[pane].scroll,
-                    div()
-                        .id(("tabs", pane))
-                        .debug_selector(move || format!("tabs-{pane}"))
-                        .flex()
-                        .items_center()
-                        .gap(px(2.))
-                        .overflow_x_scroll()
-                        .track_scroll(&self.panes[pane].scroll)
-                        .children(tabs)
-                        .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(selection))
-                        .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-                            let end = this.panes[pane].tabs.len();
-                            let from = (dragged.pane, dragged.index);
-                            this.move_tab(from, (pane, end), window, cx)
-                        })),
-                    theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .items_center(),
-            )
     }
 
     /// The configuration list, Run, Debug, and Stop while something runs.
@@ -1078,6 +997,33 @@ impl Workspace {
             Some(anchor) => self.show_menu_under(anchor, entries, window, cx),
             None => self.show_menu(window.mouse_position(), entries, cx),
         }
+    }
+
+    /// Runs the row the menu of the screen names by its path. The menu of the window may
+    /// have changed since it was built, so a path that no longer names a row does nothing.
+    pub(crate) fn run_menu_row(
+        &mut self,
+        row: &MenuRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut entries = self.main_menu(cx);
+        let run = row_at(&mut entries, &row.path).and_then(|entry| entry.on_click.clone());
+        if let Some(run) = run {
+            run(window, cx);
+        }
+    }
+
+    /// The menu bar of the screen, which is the menu of the window on macOS. The other
+    /// systems have none: their window draws the bar.
+    pub(crate) fn refresh_platform_menus(&self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let sections = self.main_menu(cx);
+            cx.set_menus(crate::native_menu::menus(self.info().name, &sections));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = cx;
     }
 
     /// The sections of the main menu, in IDEA's order, with the rows the window can run.
@@ -1757,6 +1703,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // macOS has no mnemonics in its menu bar of the screen.
+        if !own_chrome() {
+            return false;
+        }
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         // GPUI reports a lone modifier that went down and up as a key of its own.
@@ -2004,7 +1954,6 @@ impl Workspace {
         &self,
         pane: usize,
         theme: &Theme,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let tab = self.panes[pane].active_tab();
@@ -2048,6 +1997,10 @@ impl Workspace {
             None => body.child(self.welcome(theme)).into_any_element(),
         };
         let down = self.split_down;
+        let bar = self.panes[pane]
+            .bar
+            .clone()
+            .map_or_else(|| div().into_any_element(), |bar| bar.into_any_element());
         island(theme)
             .flex_1()
             .min_w_0()
@@ -2055,18 +2008,13 @@ impl Workspace {
             .when(down, |this| this.w_full())
             .when(!down, |this| this.h_full())
             .bg(theme.editor_bg)
-            .child(self.tab_bar(pane, theme, window, cx))
+            .child(bar)
             .child(body)
     }
 
-    fn editor_area(
-        &self,
-        theme: &Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn editor_area(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let panes: Vec<_> = (0..self.panes.len())
-            .map(|pane| self.pane_view(pane, theme, window, cx))
+            .map(|pane| self.pane_view(pane, theme, cx))
             .collect();
         div()
             .flex()
@@ -2113,149 +2061,6 @@ impl Workspace {
             Some(tool) => tool.view.clone().into_any_element(),
             None => island(theme).size_full().into_any_element(),
         }
-    }
-
-    fn status_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut path = div()
-            .flex()
-            .items_center()
-            .gap(px(SPACE_XS))
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden();
-        path = path.child(crumb(
-            0usize,
-            Some("nodes/module"),
-            self.name.clone(),
-            theme,
-        ));
-        if let Some(tab) = self.active_tab() {
-            let parts = path_parts(&self.root, &tab.path);
-            let count = parts.len();
-            for (index, part) in parts.into_iter().enumerate() {
-                let leading = (index + 1 == count).then_some(tab.icon);
-                path = path.child(crumb_separator(theme)).child(crumb(
-                    index + 1,
-                    leading,
-                    part,
-                    theme,
-                ));
-            }
-        }
-        let language = self.language_status.clone().map(|text| {
-            let widget = status_widget("st-language", text, theme)
-                .debug_selector(|| "st-language".to_owned());
-            if self.language_details.is_some() {
-                widget
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.show_language_help(cx)))
-            } else {
-                widget
-            }
-        });
-        let branch = self.branch.clone().map(|branch| {
-            status_widget("st-branch", branch, theme)
-                .relative()
-                .child(self.st_branch_anchor.canvas())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if let Some(anchor) = this.st_branch_anchor.bounds() {
-                        this.set_action_menu_anchor(anchor);
-                    }
-                    window.dispatch_action(Box::new(ShowBranches), cx);
-                }))
-                .tooltip(|_, cx| tooltip("Git Branches", None, cx))
-                .tooltip_show_delay(ui_kit::tooltip_show_delay())
-        });
-        let editor = self.active_status(cx).map(|status| {
-            let (indent_tabs, indent_size) = (status.indent_tabs, status.indent_size);
-            let language_name = status.language.clone();
-            let read_only = status.read_only;
-            let eol = status_widget("st-eol", status.eol, theme)
-                .debug_selector(|| "st-eol".to_owned())
-                .relative()
-                .child(self.st_eol_anchor.canvas())
-                .tooltip(|_, cx| tooltip("Line Separator", None, cx))
-                .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                    let anchor = this.st_eol_anchor.bounds();
-                    this.show_format_menu(&LINE_ENDS, anchor, event.position(), window, cx)
-                }));
-            let encoding = status_widget("st-enc", status.encoding, theme)
-                .debug_selector(|| "st-enc".to_owned())
-                .relative()
-                .child(self.st_enc_anchor.canvas())
-                .tooltip(|_, cx| tooltip("File Encoding", None, cx))
-                .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                    let anchor = this.st_enc_anchor.bounds();
-                    this.show_format_menu(&ENCODINGS, anchor, event.position(), window, cx)
-                }));
-            div()
-                .flex()
-                .items_center()
-                .gap(px(SPACE_L))
-                .child(
-                    status_widget("st-caret", status.caret, theme)
-                        .debug_selector(|| "st-caret".to_owned()),
-                )
-                .child(eol)
-                .child(encoding)
-                .child(
-                    status_widget("st-indent", status.indent, theme)
-                        .debug_selector(|| "st-indent".to_owned())
-                        .relative()
-                        .child(self.st_indent_anchor.canvas())
-                        .tooltip(|_, cx| tooltip("Indent", None, cx))
-                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            let placement = MenuPlacement {
-                                anchor: this.st_indent_anchor.bounds(),
-                                position: event.position(),
-                            };
-                            this.show_indent_menu(
-                                placement,
-                                indent_tabs,
-                                indent_size,
-                                language_name.as_ref().map(|name| name.to_string()),
-                                window,
-                                cx,
-                            )
-                        })),
-                )
-                .child(
-                    status_widget("st-insert", status.insert, theme)
-                        .debug_selector(|| "st-insert".to_owned()),
-                )
-                .children(read_only.then(|| {
-                    status_widget("st-readonly", "Read-only", theme)
-                        .debug_selector(|| "st-readonly".to_owned())
-                        .cursor_pointer()
-                        .tooltip(|_, cx| tooltip("Read-Only Attribute", None, cx))
-                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.run_command("editor.toggle_read_only", window, cx);
-                        }))
-                }))
-        });
-        let widgets = div()
-            .flex()
-            .items_center()
-            .gap(px(SPACE_L))
-            .children(language)
-            .children(editor);
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(STATUS_HEIGHT))
-            .gap(px(SPACE_L))
-            .px(px(SPACE_M))
-            .text_size(px(TEXT_SMALL))
-            .text_color(theme.text_muted)
-            .child(path)
-            .children(branch)
-            .child(widgets)
     }
 
     fn overlay_element(
@@ -2430,6 +2235,12 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.state_revision != self.counted_revision {
+            self.counted_revision = self.state_revision;
+            let count = cx.default_global::<crate::window::WindowRenderCount>();
+            count.0.set(count.0.get() + 1);
+        }
         if self.step_animations(cx) {
             window.request_animation_frame();
         }
@@ -2477,7 +2288,7 @@ impl Render for Workspace {
                     )
                     .child(self.edge_grip(DockSide::Left)),
             )
-            .child(self.editor_area(&theme, window, cx))
+            .child(self.editor_area(&theme, cx))
             .child(
                 div()
                     .relative()
@@ -2631,6 +2442,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ShowSearch, window, cx| this.show_search(window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(
+                cx.listener(|this, row: &MenuRow, window, cx| this.run_menu_row(row, window, cx)),
+            )
+            .on_action(cx.listener(|_, _: &QuitApp, _, cx| cx.quit()))
+            .on_action(
                 cx.listener(|this, _: &HideToolWindow, window, cx| {
                     this.hide_active_tool(window, cx)
                 }),
@@ -2737,9 +2552,460 @@ impl Render for Workspace {
                     )
                     .child(self.right_stripe(&theme, cx)),
             )
-            .child(self.status_bar(&theme, cx))
+            .child(self.status_view.clone().into_any_element())
             .children(self.overlay_element(&theme, window, cx))
             .children(self.balloon_element(&theme, cx))
+    }
+}
+
+/// Told that the text, the caret or the dirty state of an editor changed. The views that
+/// show them listen here, so a keystroke redraws only what it changes.
+#[derive(Clone, Copy)]
+pub(crate) struct EditorChromeChanged;
+
+/// The signal that the editor events of the window go through.
+pub(crate) struct EditorChromeSignal;
+
+impl EventEmitter<EditorChromeChanged> for EditorChromeSignal {}
+
+impl EditorChromeSignal {
+    pub(crate) fn changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(EditorChromeChanged);
+    }
+}
+
+/// The tabs of one group. It follows the active editor and the state of the group
+/// without redrawing the window.
+pub(crate) struct TabBarView {
+    workspace: WeakEntity<Workspace>,
+    pane: usize,
+    _changed: Subscription,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) shown_dirty: Vec<bool>,
+}
+
+impl TabBarView {
+    pub(crate) fn create(
+        workspace: WeakEntity<Workspace>,
+        signal: Entity<EditorChromeSignal>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            let changed = cx.subscribe(&signal, |_, _, _: &EditorChromeChanged, cx| cx.notify());
+            cx.observe_global::<Theme>(|_, cx| cx.notify()).detach();
+            Self {
+                workspace,
+                pane: 0,
+                _changed: changed,
+                #[cfg(any(test, feature = "test-support"))]
+                shown_dirty: Vec::new(),
+            }
+        })
+    }
+
+    pub(crate) fn set_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
+        if self.pane != pane {
+            self.pane = pane;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for TabBarView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let selection = theme.selection;
+        let Some(workspace) = self.workspace.upgrade() else {
+            return div().into_any_element();
+        };
+        let (active, scroll, tabs) = {
+            let workspace = workspace.read(cx);
+            let Some(pane) = workspace.panes.get(self.pane) else {
+                return div().into_any_element();
+            };
+            let tabs = pane
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    (
+                        index,
+                        (item.editor.status)(cx).dirty,
+                        item.pinned,
+                        item.title.clone(),
+                        item.icon,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (pane.active, pane.scroll.clone(), tabs)
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.shown_dirty = tabs.iter().map(|tab| tab.1).collect();
+        }
+        let pane = self.pane;
+        let items = tabs.into_iter().map(|(index, dirty, pinned, title, icon)| {
+            let id = tab_id(pane, index);
+            let style = TabStyle {
+                id: ("tab", id).into(),
+                close_id: ("tab-close", id).into(),
+                group: format!("tab-{id}").into(),
+                label: title.clone(),
+                icon,
+                selected: index == active,
+                dirty,
+                pinned,
+            };
+            // The dot of a pinned tab unpins it, the cross of another one closes it.
+            let close_workspace = self.workspace.clone();
+            let close = cx.listener(move |_, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                close_workspace
+                    .update(cx, |workspace, cx| {
+                        if pinned {
+                            workspace.toggle_pin(pane, index, window, cx);
+                        } else {
+                            workspace.close_tab(pane, index, window, cx);
+                        }
+                    })
+                    .ok();
+            });
+            let dragged = DraggedTab { pane, index, title };
+            let select_workspace = self.workspace.clone();
+            let middle_workspace = self.workspace.clone();
+            let menu_workspace = self.workspace.clone();
+            let drop_workspace = self.workspace.clone();
+            tab(style, close, &theme)
+                .debug_selector(move || format!("tab-{pane}-{index}"))
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    select_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.select_tab(pane, index, window, cx)
+                        })
+                        .ok();
+                }))
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |_, _, window, cx| {
+                        middle_workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.close_tab(pane, index, window, cx)
+                            })
+                            .ok();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                        menu_workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_tab_menu(pane, index, event.position, cx)
+                            })
+                            .ok();
+                    }),
+                )
+                .on_drag(dragged, |dragged, _, _, cx| {
+                    let title = dragged.title.clone();
+                    cx.new(|_| TabDragPreview(title))
+                })
+                .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(selection))
+                .on_drop(cx.listener(move |_, dragged: &DraggedTab, window, cx| {
+                    let from = (dragged.pane, dragged.index);
+                    drop_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.move_tab(from, (pane, index), window, cx)
+                        })
+                        .ok();
+                }))
+        });
+        let end_workspace = self.workspace.clone();
+        let strip = div()
+            .id(("tabs", pane))
+            .debug_selector(move || format!("tabs-{pane}"))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .overflow_x_scroll()
+            .track_scroll(&scroll)
+            .children(items)
+            .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(selection))
+            .on_drop(cx.listener(move |_, dragged: &DraggedTab, window, cx| {
+                let from = (dragged.pane, dragged.index);
+                end_workspace
+                    .update(cx, |workspace, cx| {
+                        let end = workspace.panes[pane].tabs.len();
+                        workspace.move_tab(from, (pane, end), window, cx);
+                    })
+                    .ok();
+            }));
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .h(px(HEADER_HEIGHT))
+            .px(px(SPACE_M))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                scrollable(("tabs", pane), &scroll, strip, &theme, window, cx)
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .items_center(),
+            )
+            .into_any_element()
+    }
+}
+
+/// The status bar of the window. It shows the active tab, the branch and the state of the
+/// editor, and follows them without redrawing the window.
+pub(crate) struct StatusBarView {
+    workspace: WeakEntity<Workspace>,
+    _changed: Subscription,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) shown_caret: Option<String>,
+}
+
+impl StatusBarView {
+    pub(crate) fn create(
+        workspace: WeakEntity<Workspace>,
+        signal: Entity<EditorChromeSignal>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            let changed = cx.subscribe(&signal, |_, _, _: &EditorChromeChanged, cx| cx.notify());
+            cx.observe_global::<Theme>(|_, cx| cx.notify()).detach();
+            Self {
+                workspace,
+                _changed: changed,
+                #[cfg(any(test, feature = "test-support"))]
+                shown_caret: None,
+            }
+        })
+    }
+}
+
+impl Render for StatusBarView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return div().into_any_element();
+        };
+        let (
+            name,
+            root,
+            active,
+            language_status,
+            language_details,
+            branch,
+            status,
+            branch_anchor,
+            eol_anchor,
+            enc_anchor,
+            indent_anchor,
+        ) = {
+            let workspace = workspace.read(cx);
+            (
+                workspace.name.clone(),
+                workspace.root.clone(),
+                workspace
+                    .active_tab()
+                    .map(|tab| (tab.path.clone(), tab.icon)),
+                workspace.language_status.clone(),
+                workspace.language_details.is_some(),
+                workspace.branch.clone(),
+                workspace.active_status(cx),
+                workspace.st_branch_anchor.clone(),
+                workspace.st_eol_anchor.clone(),
+                workspace.st_enc_anchor.clone(),
+                workspace.st_indent_anchor.clone(),
+            )
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.shown_caret = status.as_ref().map(|status| status.caret.clone());
+        }
+        let mut path = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden();
+        path = path.child(crumb(0usize, Some("nodes/module"), name, &theme));
+        if let Some((file, icon)) = &active {
+            let parts = path_parts(&root, file);
+            let count = parts.len();
+            for (index, part) in parts.into_iter().enumerate() {
+                let leading = (index + 1 == count).then_some(*icon);
+                path = path.child(crumb_separator(&theme)).child(crumb(
+                    index + 1,
+                    leading,
+                    part,
+                    &theme,
+                ));
+            }
+        }
+        let language = language_status.map(|text| {
+            let widget = status_widget("st-language", text, &theme)
+                .debug_selector(|| "st-language".to_owned());
+            if language_details {
+                let workspace = self.workspace.clone();
+                widget
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| workspace.show_language_help(cx))
+                            .ok();
+                    }))
+            } else {
+                widget
+            }
+        });
+        let branch = branch.map(|branch| {
+            let workspace = self.workspace.clone();
+            let anchor = branch_anchor.clone();
+            status_widget("st-branch", branch, &theme)
+                .relative()
+                .child(anchor.canvas())
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    if let Some(bounds) = anchor.bounds() {
+                        workspace
+                            .update(cx, |workspace, _| workspace.set_action_menu_anchor(bounds))
+                            .ok();
+                    }
+                    window.dispatch_action(Box::new(ShowBranches), cx);
+                }))
+                .tooltip(|_, cx| tooltip("Git Branches", None, cx))
+                .tooltip_show_delay(ui_kit::tooltip_show_delay())
+        });
+        let editor = status.map(|status| {
+            let (indent_tabs, indent_size) = (status.indent_tabs, status.indent_size);
+            let language_name = status.language.clone();
+            let read_only = status.read_only;
+            let eol_workspace = self.workspace.clone();
+            let eol_anchor = eol_anchor.clone();
+            let eol = status_widget("st-eol", status.eol, &theme)
+                .debug_selector(|| "st-eol".to_owned())
+                .relative()
+                .child(eol_anchor.canvas())
+                .tooltip(|_, cx| tooltip("Line Separator", None, cx))
+                .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                .on_click(cx.listener(move |_, event: &ClickEvent, window, cx| {
+                    let anchor = eol_anchor.bounds();
+                    eol_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_format_menu(
+                                &LINE_ENDS,
+                                anchor,
+                                event.position(),
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                }));
+            let enc_workspace = self.workspace.clone();
+            let enc_anchor = enc_anchor.clone();
+            let encoding = status_widget("st-enc", status.encoding, &theme)
+                .debug_selector(|| "st-enc".to_owned())
+                .relative()
+                .child(enc_anchor.canvas())
+                .tooltip(|_, cx| tooltip("File Encoding", None, cx))
+                .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                .on_click(cx.listener(move |_, event: &ClickEvent, window, cx| {
+                    let anchor = enc_anchor.bounds();
+                    enc_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_format_menu(
+                                &ENCODINGS,
+                                anchor,
+                                event.position(),
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                }));
+            let indent_workspace = self.workspace.clone();
+            let indent_anchor = indent_anchor.clone();
+            let indent = status_widget("st-indent", status.indent, &theme)
+                .debug_selector(|| "st-indent".to_owned())
+                .relative()
+                .child(indent_anchor.canvas())
+                .tooltip(|_, cx| tooltip("Indent", None, cx))
+                .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                .on_click(cx.listener(move |_, event: &ClickEvent, window, cx| {
+                    let placement = MenuPlacement {
+                        anchor: indent_anchor.bounds(),
+                        position: event.position(),
+                    };
+                    let language = language_name.as_ref().map(|name| name.to_string());
+                    indent_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_indent_menu(
+                                placement,
+                                indent_tabs,
+                                indent_size,
+                                language,
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                }));
+            let read_only_workspace = self.workspace.clone();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_L))
+                .child(
+                    status_widget("st-caret", status.caret, &theme)
+                        .debug_selector(|| "st-caret".to_owned()),
+                )
+                .child(eol)
+                .child(encoding)
+                .child(indent)
+                .child(
+                    status_widget("st-insert", status.insert, &theme)
+                        .debug_selector(|| "st-insert".to_owned()),
+                )
+                .children(read_only.then(|| {
+                    status_widget("st-readonly", "Read-only", &theme)
+                        .debug_selector(|| "st-readonly".to_owned())
+                        .cursor_pointer()
+                        .tooltip(|_, cx| tooltip("Read-Only Attribute", None, cx))
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            read_only_workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.run_command("editor.toggle_read_only", window, cx);
+                                })
+                                .ok();
+                        }))
+                }))
+        });
+        let widgets = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_L))
+            .children(language)
+            .children(editor);
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .h(px(STATUS_HEIGHT))
+            .gap(px(SPACE_L))
+            .px(px(SPACE_M))
+            .text_size(px(TEXT_SMALL))
+            .text_color(theme.text_muted)
+            .child(path)
+            .children(branch)
+            .child(widgets)
+            .into_any_element()
     }
 }
 

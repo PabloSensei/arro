@@ -410,7 +410,8 @@ impl RunPanel {
         self.archive_console();
         self.title = title_of(&request).into();
         self.lines.clear();
-        self.parser = AnsiParser::default();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
         self.tests.begin(request.clone());
         self.starting = true;
         let plan = cx.background_executor().spawn(async move {

@@ -151,6 +151,12 @@ fn restored_bounds(
     Some((bounds, display.id()))
 }
 
+/// Tells the keymap and the hints which system this process follows: the Command key of
+/// macOS, the Control key of the others. Called once, before the first window opens.
+pub fn choose_platform_keymap() {
+    keymap::set_platform(keymap::Platform::current());
+}
+
 /// Runs the application until the window closes. `setup` adds the panels and must
 /// give the workspace its editor factory.
 pub fn run(
@@ -185,7 +191,9 @@ pub fn run(
             },
             |(bounds, display)| (bounds, Some(display)),
         );
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        let (title, decorations) = (Some("Arro".into()), None);
+        #[cfg(all(unix, not(target_os = "macos")))]
         let (title, decorations) = (Some("Arro".into()), Some(WindowDecorations::Client));
         #[cfg(windows)]
         let (title, decorations) = (None, None);

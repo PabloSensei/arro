@@ -1,4 +1,4 @@
-//! The Recycle Bin of Windows: a delete that the user can take back.
+//! The Recycle Bin of Windows and the trash of the desktop: a delete the user can take back.
 
 use std::io;
 use std::path::Path;
@@ -35,7 +35,7 @@ pub fn move_to_trash(path: &Path) -> io::Result<()> {
 
 /// Moves a file or a whole folder to the trash of the desktop: the `files` folder keeps
 /// the entry, the `info` folder keeps where it came from. Blocks: call it off the UI thread.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn move_to_trash(path: &Path) -> io::Result<()> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -47,8 +47,45 @@ pub fn move_to_trash(path: &Path) -> io::Result<()> {
     move_to_trash_in(path, &data.join("Trash"))
 }
 
+/// Moves a file or a whole folder to `$HOME/.Trash`, which is the trash Finder shows.
+/// Blocks: call it off the UI thread.
+#[cfg(target_os = "macos")]
+pub fn move_to_trash(path: &Path) -> io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home folder for a trash"))?;
+    move_into_trash(path, &home.join(".Trash"))
+}
+
+/// A trash folder of its own, the way the Trash of the Finder holds an entry under its
+/// name and renames it when the name is taken.
+#[cfg(target_os = "macos")]
+fn move_into_trash(path: &Path, trash: &Path) -> io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no name to put into the trash", path.display()),
+        )
+    })?;
+    std::fs::create_dir_all(trash)?;
+
+    // Finder writes `Report 2.pdf` next to `Report.pdf`; the first free number wins.
+    let mut target = trash.join(name);
+    let mut counter = 2;
+    while target.exists() {
+        let numbered = format!("{} {counter}", name.to_string_lossy());
+        target = trash.join(numbered);
+        counter += 1;
+    }
+    if std::fs::rename(path, &target).is_err() {
+        // The trash of another volume needs a copy; a failed copy leaves no half entry.
+        copy_then_remove(path, &target)?;
+    }
+    Ok(())
+}
+
 /// The freedesktop Trash specification, against an explicit trash folder.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn move_to_trash_in(path: &Path, trash: &Path) -> io::Result<()> {
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -96,7 +133,7 @@ fn move_to_trash_in(path: &Path, trash: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn percent_encode(text: &str, out: &mut String) {
     for byte in text.bytes() {
         match byte {
@@ -107,7 +144,7 @@ fn percent_encode(text: &str, out: &mut String) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -122,7 +159,7 @@ fn timestamp() -> String {
 }
 
 /// Days since 1970-01-01 to a calendar date, the same arithmetic as the build script.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -155,9 +192,11 @@ fn copy_then_remove(source: &Path, target: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::move_into_trash;
     #[cfg(windows)]
     use super::move_to_trash;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use super::move_to_trash_in;
 
     /// Deliberately puts one temporary file into the real Recycle Bin: this is the only
@@ -178,7 +217,7 @@ mod tests {
     }
 
     /// A trash folder of its own keeps the test away from the real trash of the user.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_file_gets_an_entry_of_the_freedesktop_trash() {
         let dir = std::env::temp_dir().join(format!("trash-test-{}", std::process::id()));
@@ -199,5 +238,30 @@ mod tests {
         assert!(info.starts_with("[Trash Info]\nPath="), "{info}");
         assert!(info.contains("DeletionDate="), "{info}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The Trash of the Finder keeps the file under its name and renames a second one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_goes_into_the_trash_of_the_finder() {
+        let dir = test_support::scratch("trash-test");
+        let trash = dir.join(".Trash");
+        let first = dir.join("taken-back.txt");
+        std::fs::write(&first, "one").unwrap();
+
+        move_into_trash(&first, &trash).unwrap();
+
+        assert!(!first.exists(), "the file left the folder");
+        assert_eq!(
+            std::fs::read_to_string(trash.join("taken-back.txt")).unwrap(),
+            "one"
+        );
+        let second = dir.join("taken-back.txt");
+        std::fs::write(&second, "two").unwrap();
+        move_into_trash(&second, &trash).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(trash.join("taken-back 2.txt")).unwrap(),
+            "two"
+        );
     }
 }

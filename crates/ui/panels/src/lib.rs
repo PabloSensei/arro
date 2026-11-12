@@ -266,6 +266,10 @@ mod window_tests_branches_tree;
 mod window_tests_diff_editor;
 #[cfg(test)]
 mod window_tests_diff_own_view;
+#[cfg(test)]
+mod window_tests_keystroke_repaint;
+#[cfg(test)]
+mod window_tests_run_output;
 
 mod choice;
 mod invalidate;

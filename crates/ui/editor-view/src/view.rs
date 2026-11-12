@@ -2211,7 +2211,9 @@ impl EditorView {
 
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let modifiers = event.keystroke.modifiers;
-        if modifiers.platform {
+        // Command is the primary modifier of macOS. On the other systems the Super key is
+        // not a shortcut of the editor.
+        if modifiers.platform && !cfg!(target_os = "macos") {
             return;
         }
         // The frame after this key finishes the measurement; a run of keys records each.
@@ -2220,6 +2222,7 @@ impl EditorView {
             ctrl: modifiers.control,
             alt: modifiers.alt,
             shift: modifiers.shift,
+            cmd: modifiers.platform,
             key: event.keystroke.key.to_lowercase(),
         }
         .normalized();

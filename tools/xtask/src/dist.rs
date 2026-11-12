@@ -18,7 +18,7 @@ const README_TEMPLATE: &str = include_str!("../../../dist/README.txt");
 const RUN_ARRO_TEMPLATE: &str = include_str!("../../../dist/run-arro.cmd");
 /// The Eclipse Public License 1.0 as published at https://www.eclipse.org/legal/epl-v10.html.
 /// The java-debug archive declares this license but carries no copy of it.
-const EPL_1_0: &str = include_str!("../../../dist/licenses/EPL-1.0.txt");
+pub(crate) const EPL_1_0: &str = include_str!("../../../dist/licenses/EPL-1.0.txt");
 
 /// The pinned archives of the language tools. The versions and hashes are part of
 /// the release, as they are for ConPTY; a different file is an error, not a warning.
@@ -37,8 +37,8 @@ const DEBUG_DOWNLOAD: &str =
 
 /// What the language tools take in the output folder.
 pub(crate) struct JavaTools {
-    jdtls: PathBuf,
-    debug: PathBuf,
+    pub(crate) jdtls: PathBuf,
+    pub(crate) debug: PathBuf,
 }
 
 pub fn run(
@@ -183,7 +183,7 @@ fn remove_old(out: &Path) -> Result {
 
 /// The folder with `download-jdtls` and `download-java-debug`: `--tools DIR` or
 /// `$IDE_CORPUS/tools`.
-fn tools_directory(tools: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn tools_directory(tools: Option<&Path>) -> Result<PathBuf> {
     match tools {
         Some(dir) => absolute(dir),
         None => {
@@ -205,6 +205,24 @@ pub(crate) fn install_java_tools(
     jdtls_sha256: &str,
     debug_sha256: &str,
 ) -> Result<JavaTools> {
+    install_java_tools_for(out, tools, jdtls_sha256, debug_sha256, "config_win")
+}
+
+/// The macOS bundle keeps the servers inside `Contents/Resources/tools`, with the
+/// configuration folder `config_mac`.
+pub(crate) fn install_java_tools_macos(out: &Path, tools: &Path) -> Result<JavaTools> {
+    install_java_tools_for(out, tools, JDTLS_SHA256, DEBUG_SHA256, "config_mac")
+}
+
+/// The same servers with the configuration folder of another system, which is all that
+/// differs between the releases of jdtls.
+pub(crate) fn install_java_tools_for(
+    out: &Path,
+    tools: &Path,
+    jdtls_sha256: &str,
+    debug_sha256: &str,
+    config: &str,
+) -> Result<JavaTools> {
     let jdtls_archive = tools.join("download-jdtls").join(JDTLS_ARCHIVE);
     let debug_archive = tools.join("download-java-debug").join(DEBUG_ARCHIVE);
     verify_archive(
@@ -224,7 +242,7 @@ pub(crate) fn install_java_tools(
     fs::create_dir_all(&base)?;
     let jdtls = base.join(format!("jdtls-{JDTLS_VERSION}"));
     let debug = base.join(format!("vscode-java-debug-{DEBUG_VERSION}"));
-    unpack_jdtls(out, &jdtls_archive, &jdtls)?;
+    unpack_jdtls(out, &jdtls_archive, &jdtls, config)?;
     unpack_debug(out, &debug_archive, &debug)?;
     println!("dist: {}", jdtls.display());
     println!("dist: {}", debug.display());
@@ -233,7 +251,7 @@ pub(crate) fn install_java_tools(
 
 /// A missing or different archive stops `dist`: the release must name the file the
 /// user has to fetch, not ship a different server.
-fn verify_archive(path: &Path, expected: &str, download: &str, what: &str) -> Result {
+pub(crate) fn verify_archive(path: &Path, expected: &str, download: &str, what: &str) -> Result {
     if !path.is_file() {
         return Err(format!(
             "{} is missing. Download {what} and put the archive there: {download}",
@@ -252,7 +270,7 @@ fn verify_archive(path: &Path, expected: &str, download: &str, what: &str) -> Re
     Ok(())
 }
 
-fn unpack_jdtls(out: &Path, archive: &Path, target: &Path) -> Result {
+fn unpack_jdtls(out: &Path, archive: &Path, target: &Path, config: &str) -> Result {
     let unpacked = out.join(format!(".unpack-jdtls-{}", std::process::id()));
     let _ = fs::remove_dir_all(&unpacked);
     let result = (|| -> Result {
@@ -261,7 +279,7 @@ fn unpack_jdtls(out: &Path, archive: &Path, target: &Path) -> Result {
         // license files of the root, so the notice can read it from the distribution.
         extract_epl(&unpacked);
         fs::create_dir_all(target)?;
-        for name in ["bin", "features", "plugins", "config_win"] {
+        for name in ["bin", "features", "plugins", config] {
             let from = unpacked.join(name);
             if from.is_dir() {
                 fs::rename(&from, target.join(name))?;
@@ -323,7 +341,7 @@ fn unpack_debug(out: &Path, archive: &Path, target: &Path) -> Result {
 
 /// Unpacks `archive` with the Windows `tar.exe`, which reads both `.tar.gz` and the zip
 /// inside a `.vsix`.
-fn unpack(archive: &Path, directory: &Path) -> Result {
+pub(crate) fn unpack(archive: &Path, directory: &Path) -> Result {
     fs::create_dir_all(directory)?;
     let mut command = Command::new(tar());
     command
@@ -370,7 +388,7 @@ fn is_license_file(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-fn build_release(root: &Path) -> Result {
+pub(crate) fn build_release(root: &Path) -> Result {
     let mut command = Command::new(cargo());
     command
         .args(["build", "--release", "--package", "ide"])
@@ -378,7 +396,7 @@ fn build_release(root: &Path) -> Result {
     check(&mut command)
 }
 
-fn target_directory(root: &Path) -> Result<PathBuf> {
+pub(crate) fn target_directory(root: &Path) -> Result<PathBuf> {
     let metadata = metadata(root, &["--no-deps"])?;
     let target = metadata["target_directory"]
         .as_str()
@@ -399,7 +417,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn write_text(path: &Path, text: &str) -> Result {
+pub(crate) fn write_text(path: &Path, text: &str) -> Result {
     let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
     fs::write(path, text)?;
     Ok(())
@@ -462,7 +480,12 @@ fn metadata(root: &Path, extra: &[&str]) -> Result<Value> {
 /// Every third-party crate in the graph of `ide`, grouped by the license expression that
 /// `cargo metadata` reports. Workspace members are our own code and stay out.
 pub(crate) fn third_party(root: &Path) -> Result<String> {
-    let metadata = metadata(root, &["--filter-platform", PLATFORM])?;
+    third_party_for(root, PLATFORM)
+}
+
+/// The same list for the graph of another system, which carries other crates.
+pub(crate) fn third_party_for(root: &Path, platform: &str) -> Result<String> {
+    let metadata = metadata(root, &["--filter-platform", platform])?;
     let packages = metadata["packages"]
         .as_array()
         .ok_or("cargo metadata has no packages")?;
@@ -606,7 +629,7 @@ fn render_third_party(groups: &BTreeMap<String, Vec<String>>) -> String {
 /// The part of `NOTICE.txt` about the bundled language tools. The full texts come
 /// from the archives themselves: the EPL-2.0 page extracted from the launcher feature
 /// and the MIT license of the java-debug extension.
-fn java_notice(tools: &JavaTools) -> String {
+pub(crate) fn java_notice(tools: &JavaTools) -> String {
     let mut text = String::new();
     text.push_str("\nJava language tools\n-------------------\n\n");
     text.push_str(&format!(

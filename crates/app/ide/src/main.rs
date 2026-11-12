@@ -466,6 +466,8 @@ fn inside(path: &Path, folder: &Path) -> bool {
 }
 
 fn main() -> ExitCode {
+    // The keys and the hints follow the system: Command on macOS, Control elsewhere.
+    workspace::choose_platform_keymap();
     let migration = migration::take_over_old_folders();
     let parsed = parse_args(std::env::args().skip(1));
     if let Ok(args) = &parsed {

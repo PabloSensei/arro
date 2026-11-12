@@ -201,12 +201,16 @@ fn open(
                             .ok();
                     }
                     // The status line and the star of the tab show the caret and the
-                    // text of the editor, so the window follows every keystroke too.
-                    runner.update(cx, |_, cx| cx.notify()).ok();
+                    // text of the editor; they redraw themselves, not the window.
+                    runner
+                        .update(cx, |workspace, cx| workspace.editor_chrome_changed(cx))
+                        .ok();
                 }
                 // The star of the tab goes away as soon as undo reaches the saved text.
                 EditorEvent::Dirty(_) | EditorEvent::Moved => {
-                    runner.update(cx, |_, cx| cx.notify()).ok();
+                    runner
+                        .update(cx, |workspace, cx| workspace.editor_chrome_changed(cx))
+                        .ok();
                 }
                 EditorEvent::ShowBookmarks => {
                     runner

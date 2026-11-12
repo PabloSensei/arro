@@ -1,6 +1,7 @@
 //! The low-memory signal of the whole process. Linux reports the numbers in
-//! `/proc/meminfo`; the watcher compares both the available physical memory and the
-//! commit room against the thresholds of the settings.
+//! `/proc/meminfo`, macOS in `host_statistics64` and `sysctl`; the watcher compares both
+//! the available physical memory and the commit room against the thresholds of the
+//! settings.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -86,7 +87,8 @@ pub fn physical_memory() -> u64 {
     state().map_or(0, |state| state.total_physical)
 }
 
-/// Reads the current numbers, or `None` when `/proc/meminfo` cannot be read.
+/// Reads the current numbers, or `None` when the memory of the machine cannot be read.
+#[cfg(target_os = "linux")]
 fn state() -> Option<MemoryState> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     parse_meminfo(&text)
@@ -94,6 +96,7 @@ fn state() -> Option<MemoryState> {
 
 /// The fields of `/proc/meminfo`, in bytes. A missing commit limit means the kernel does
 /// not account it, so the physical numbers alone decide.
+#[cfg(target_os = "linux")]
 fn parse_meminfo(text: &str) -> Option<MemoryState> {
     let mut total = None;
     let mut available = None;
@@ -129,6 +132,87 @@ fn parse_meminfo(text: &str) -> Option<MemoryState> {
         available_commit,
         commit_limit,
     })
+}
+
+/// macOS has no `/proc`: the total comes from `hw.memsize`, the free pages from
+/// `host_statistics64`, and the swap area from `vm.swapusage`. Inactive and speculative
+/// pages count as available, because the kernel reclaims them before it swaps.
+#[cfg(target_os = "macos")]
+fn state() -> Option<MemoryState> {
+    let total_physical = sysctl_u64(c"hw.memsize");
+    let mut counters: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = (std::mem::size_of::<libc::vm_statistics64>()
+        / std::mem::size_of::<libc::integer_t>())
+        as libc::mach_msg_type_number_t;
+    // SAFETY: the host port is a plain value and the counters are writable for as many
+    // integers as `count` names, which is the size of the structure.
+    let result = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            std::ptr::from_mut(&mut counters).cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+    let total_physical = total_physical?;
+    // SAFETY: a plain query of an unchanged system value.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64;
+    let free_pages = u64::from(counters.free_count)
+        + u64::from(counters.inactive_count)
+        + u64::from(counters.speculative_count);
+    let available_physical = free_pages.saturating_mul(page);
+    let (swap_total, swap_free) = swap_usage();
+    Some(MemoryState {
+        available_physical,
+        total_physical,
+        available_commit: available_physical.saturating_add(swap_free),
+        commit_limit: total_physical.saturating_add(swap_total),
+    })
+}
+
+/// One `sysctl` value that is a single 64-bit number, such as `hw.memsize`.
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+    let mut value = 0u64;
+    let mut length = std::mem::size_of::<u64>();
+    // SAFETY: the name is zero-terminated and the output is a writable `u64` of the
+    // length passed with it.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::from_mut(&mut value).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && length == std::mem::size_of::<u64>()).then_some(value)
+}
+
+/// The size of the swap area and the part of it that is free, in bytes. A machine
+/// without swap answers zeros.
+#[cfg(target_os = "macos")]
+fn swap_usage() -> (u64, u64) {
+    let mut usage: libc::xsw_usage = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::xsw_usage>();
+    // SAFETY: the name is zero-terminated and the output is a writable structure of the
+    // length passed with it.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"vm.swapusage".as_ptr(),
+            std::ptr::from_mut(&mut usage).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return (0, 0);
+    }
+    (usage.xsu_total, usage.xsu_avail)
 }
 
 /// The low-memory state of the whole process. One thread watches the numbers; every
@@ -196,12 +280,15 @@ fn observe(thresholds: Arc<Mutex<MemoryThresholds>>, mut low: bool, sender: watc
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryPressure, MemoryState, MemoryThresholds, parse_meminfo};
+    #[cfg(target_os = "linux")]
+    use super::parse_meminfo;
+    use super::{MemoryPressure, MemoryState, MemoryThresholds};
 
     fn gigabytes(count: u64) -> u64 {
         count * 1024 * 1024 * 1024
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn meminfo_is_read_in_bytes() {
         let text = "MemTotal:       16384000 kB\n\
@@ -267,5 +354,21 @@ mod tests {
         assert!(machine(megabytes(600)).low_state(thresholds, true));
         assert!(!machine(megabytes(650)).low_state(thresholds, true));
         assert!(!machine(gigabytes(1) + gigabytes(2) / 10).low_state(thresholds, false));
+    }
+
+    /// The numbers of the machine this runs on: a system that cannot answer would leave
+    /// every server running with no memory left.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_machine_reports_its_memory() {
+        let state = super::state().expect("macOS reports the memory");
+        assert!(state.total_physical > gigabytes(1), "{state:?}");
+        assert!(state.available_physical > 0, "{state:?}");
+        assert!(
+            state.available_physical <= state.available_commit,
+            "{state:?}"
+        );
+        assert!(state.commit_limit >= state.total_physical, "{state:?}");
+        assert!(state.commit_limit >= state.available_commit, "{state:?}");
     }
 }

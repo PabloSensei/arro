@@ -6,6 +6,7 @@ mod editor;
 mod invalidate;
 mod launch;
 mod layout;
+mod native_menu;
 mod pane;
 mod run;
 mod settings;
@@ -16,7 +17,9 @@ mod about;
 pub use about::AboutView;
 pub use editor::{EditorFactory, EditorStatus, EditorTab, FileIcons, IndentChoice, IndentSetter};
 pub use invalidate::{apply_pending_invalidation, pending_invalidation, schedule_invalidation};
-pub use launch::{AppInfo, Launch, StartContext, run, spawn_project, start_context};
+pub use launch::{
+    AppInfo, Launch, StartContext, choose_platform_keymap, run, spawn_project, start_context,
+};
 pub use layout::{DockState, Layout, PaneState, WindowPlacement};
 pub use run::{DebugControls, DebugRunState, RunControls, RunState};
 pub use settings::{
@@ -28,8 +31,8 @@ pub use settings::{
 pub use window::{
     AI_TOOL, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP, COMMIT_TOOL, CloseTab, CommandFn,
     DEBUG_TOOL, DOCUMENTATION_TOOL, Debug, Dismiss, DockSide, Evaluate, INSPECTION_TOOL, LOG_TOOL,
-    METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE, MIN_EDITOR_SIZE, MenuShortcut, NextProblem, NextTab,
-    PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, PreviousProblem, ProjectOpener,
+    METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE, MIN_EDITOR_SIZE, MenuRow, MenuShortcut, NextProblem,
+    NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, PreviousProblem, ProjectOpener,
     ProjectStructure, PushChanges, RUN_TOOL, RerunInspection, Resume, RevertChange, Run,
     SERVICES_TOOL, STRUCTURE_TOOL, SelectInProject, ShowBranches, ShowCommit, ShowSearch,
     ShowSettings, SplitRight, StepInto, StepOut, StepOver, Stop, TASKS_TOOL, TERMINAL_TOOL,
@@ -38,3 +41,6 @@ pub use window::{
     ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, WINDOW_KEYS,
     WindowKey, Workspace, bind_keys, build_date, build_version, window_step,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+pub use window::window_render_count;
