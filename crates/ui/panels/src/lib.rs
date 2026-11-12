@@ -249,7 +249,8 @@ mod window_tests_templates_settings;
 #[cfg(test)]
 mod window_tests_tool_resize;
 
-#[cfg(test)]
+// The program of these tests is powershell.exe.
+#[cfg(all(test, windows))]
 mod window_tests_console_input;
 #[cfg(test)]
 mod window_tests_debug_input;

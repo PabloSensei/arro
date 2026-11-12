@@ -146,6 +146,9 @@ fn state() -> Option<MemoryState> {
         as libc::mach_msg_type_number_t;
     // SAFETY: the host port is a plain value and the counters are writable for as many
     // integers as `count` names, which is the size of the structure.
+    // `mach_host_self` is deprecated in libc in favour of the mach2 crate; the call is the
+    // same and one call does not earn a dependency.
+    #[allow(deprecated)]
     let result = unsafe {
         libc::host_statistics64(
             libc::mach_host_self(),

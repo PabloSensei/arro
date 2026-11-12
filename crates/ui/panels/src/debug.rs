@@ -3495,6 +3495,8 @@ mod tests {
         })
     }
 
+    // ping.exe and cmd.exe stand in for the build and the program.
+    #[cfg(windows)]
     #[ui_kit::gpui::test]
     fn stop_during_the_build_of_a_debug_launch_does_not_start_the_program(cx: &mut TestAppContext) {
         let starts = Arc::new(AtomicUsize::new(0));

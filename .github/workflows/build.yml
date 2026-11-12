@@ -47,6 +47,14 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev
 
+      # Every window test watches its project folder, and one test process opens hundreds
+      # of windows; the runner allows 128 inotify instances per user.
+      - name: Linux inotify limits
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w fs.inotify.max_user_instances=8192
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+
       # The toolchain, its components and its targets come from rust-toolchain.toml.
       - name: Toolchain
         run: rustup show active-toolchain && cargo --version
@@ -59,4 +67,4 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
