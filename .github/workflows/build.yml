@@ -76,7 +76,25 @@ jobs:
       # The Windows runner names its temporary folder in the short 8.3 form (RUNNER~1),
       # while the paths the program reads back are long; the tests compare both.
       - name: Tests
+        if: runner.os != 'macOS'
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: cargo test --workspace --no-fail-fast
+
+      # One test process of the panels opens hundreds of windows, and late in the run
+      # macOS no longer starts an FSEvents stream for a new watcher. The tests that need
+      # the file watcher run in a process of their own.
+      - name: Tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --workspace --no-fail-fast -- \
+            --skip window_tests_m11::a_new_and_a_removed_build_file_reach_the_language \
+            --skip window_tests_tool_resize::a_new_build_file_in_a_subfolder_imports_the_project_again \
+            --skip window_tests_ui::reload_and_autosave_take_and_write_the_disk_text \
+            --skip window_tests_templates_settings::a_templates_file_written_on_disk_reaches_the_editor
+          cargo test -p panels --lib -- \
+            window_tests_m11::a_new_and_a_removed_build_file_reach_the_language \
+            window_tests_tool_resize::a_new_build_file_in_a_subfolder_imports_the_project_again \
+            window_tests_ui::reload_and_autosave_take_and_write_the_disk_text \
+            window_tests_templates_settings::a_templates_file_written_on_disk_reaches_the_editor

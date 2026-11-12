@@ -5,6 +5,7 @@
 //! The frames here are drawn without `Window::refresh`, which would bypass the cache of
 //! every view, so the counters show what the cache actually rebuilt.
 
+#[cfg(windows)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,9 +16,11 @@ use workspace::{PROJECT_TOOL, RUN_TOOL, Workspace, view_render_count};
 
 use crate::project::ActiveProjectPanel;
 use crate::window_tests::{
-    click, draw, open_path, open_sample_window, open_window_with, press, sample_project,
-    wait_for_project_tree,
+    click, draw, open_path, open_sample_window, press, wait_for_project_tree,
 };
+#[cfg(windows)]
+use crate::window_tests::{open_window_with, sample_project};
+#[cfg(windows)]
 use crate::window_tests_run::{EchoRun, run_panel, setup, wait_for};
 
 /// The number of draws of one heavy view.
@@ -152,6 +155,8 @@ fn a_click_and_an_expanded_folder_rebuild_the_project_tree(cx: &mut TestAppConte
     assert_eq!(selected, Some(file), "the clicked row is selected");
 }
 
+// The program of the run is cmd.exe, as in the other Run window tests.
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn run_output_rebuilds_the_run_panel(cx: &mut TestAppContext) {
     let root = sample_project("cached-run");

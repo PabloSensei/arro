@@ -63,6 +63,8 @@ enum Row {
 
 pub struct Finder {
     files: Entity<Arc<Vec<PathBuf>>>,
+    /// The hint follows the list of files while the user keeps the mask empty.
+    _files_changed: Subscription,
     root: Arc<PathBuf>,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -110,6 +112,10 @@ impl Finder {
         let weak = cx.weak_entity();
         let mask_hint = project_mask(files.read(cx).as_slice(), cx);
         let view = cx.new(|cx| Self {
+            // The list of files may arrive after the dialog: the hint waits for it.
+            _files_changed: cx.observe(&files, |finder: &mut Self, _, cx| {
+                finder.follow_mask_hint(cx);
+            }),
             files,
             root,
             workspace: weak,
@@ -186,6 +192,8 @@ impl Finder {
         self.cancel = Cancel::new();
         self.task = None;
         self.message = None;
+        // The subscription keeps the hint up to date; a keystroke does not read the
+        // whole list of files again.
         if self.mask_hint.is_empty() {
             self.mask_hint = project_mask(self.files.read(cx).as_slice(), cx);
         }
@@ -245,6 +253,20 @@ impl Finder {
                 .ok();
         }));
         cx.notify();
+    }
+
+    /// The hint of the mask follows the list of files of the project until the user
+    /// types a mask: the list may arrive after the dialog is open, and a stale hint of a
+    /// half-read project misleads.
+    fn follow_mask_hint(&mut self, cx: &mut Context<Self>) {
+        if !self.mask.text.is_empty() {
+            return;
+        }
+        let hint = project_mask(self.files.read(cx).as_slice(), cx);
+        if hint != self.mask_hint {
+            self.mask_hint = hint;
+            cx.notify();
+        }
     }
 
     fn arrived(&mut self, serial: usize, (result, mut found): Found, cx: &mut Context<Self>) {
@@ -587,6 +609,12 @@ impl Finder {
     #[cfg(test)]
     pub(crate) fn mask_hint(&self) -> &str {
         &self.mask_hint
+    }
+
+    /// The mask the user typed, for tests.
+    #[cfg(test)]
+    pub(crate) fn mask_text(&self) -> &str {
+        &self.mask.text
     }
 
     /// The list of files it searches, so a test waits until the index has reached it

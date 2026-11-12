@@ -57,6 +57,19 @@ pub fn move_to_trash(path: &Path) -> io::Result<()> {
     move_into_trash(path, &home.join(".Trash"))
 }
 
+/// `Report 2.pdf` for `Report.pdf`, and `notes 2` for a name without an extension.
+#[cfg(target_os = "macos")]
+fn numbered_name(name: &Path, counter: usize) -> String {
+    let stem = name
+        .file_stem()
+        .unwrap_or(name.as_os_str())
+        .to_string_lossy();
+    match name.extension() {
+        Some(extension) => format!("{stem} {counter}.{}", extension.to_string_lossy()),
+        None => format!("{stem} {counter}"),
+    }
+}
+
 /// A trash folder of its own, the way the Trash of the Finder holds an entry under its
 /// name and renames it when the name is taken.
 #[cfg(target_os = "macos")]
@@ -73,8 +86,7 @@ fn move_into_trash(path: &Path, trash: &Path) -> io::Result<()> {
     let mut target = trash.join(name);
     let mut counter = 2;
     while target.exists() {
-        let numbered = format!("{} {counter}", name.to_string_lossy());
-        target = trash.join(numbered);
+        target = trash.join(numbered_name(Path::new(name), counter));
         counter += 1;
     }
     if std::fs::rename(path, &target).is_err() {

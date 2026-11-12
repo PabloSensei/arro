@@ -275,6 +275,9 @@ mod window_tests_run_output;
 #[cfg(test)]
 mod window_tests_cached_views;
 
+#[cfg(test)]
+mod window_tests_mask_hint;
+
 mod choice;
 mod invalidate;
 
