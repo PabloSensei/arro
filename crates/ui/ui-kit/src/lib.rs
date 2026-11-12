@@ -20,6 +20,8 @@ pub use embedded::{Assets, app, init};
 pub use motions::{Slide, smoothstep};
 pub use palette::Theme;
 pub use popups::*;
+// GPUI has a `surface` element of its own on macOS; the popup surface is the one meant.
+pub use popups::surface;
 pub use rows::*;
 pub use scrollbars::*;
 pub use text_field::{TextField, text_field_children};

@@ -63,8 +63,20 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # The license tests of xtask run cargo-deny on Windows.
+      - name: cargo-deny
+        if: runner.os == 'Windows'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The Windows runner names its temporary folder in the short 8.3 form (RUNNER~1),
+      # while the paths the program reads back are long; the tests compare both.
       - name: Tests
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: cargo test --workspace --no-fail-fast
