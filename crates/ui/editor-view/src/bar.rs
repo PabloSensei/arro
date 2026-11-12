@@ -164,6 +164,9 @@ impl EditorView {
             .as_ref()
             .and_then(|bar| bar.current.and_then(|at| bar.matches.get(at)))
             .cloned();
+        if let Some(range) = &range {
+            self.reveal_rendered_doc(range.clone(), cx);
+        }
         if let (Some(range), Some(state)) = (range, &mut self.state) {
             state.select_range(range);
             self.autoscroll = true;

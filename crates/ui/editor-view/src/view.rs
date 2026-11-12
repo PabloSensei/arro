@@ -13,7 +13,7 @@ use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt;
 use keymap::{Keymap, Keystroke, Lookup, default_keymap, editor as actions};
 use lang_api::{DiagnosticEntry, NavigationKind, Severity, SourceSpan};
-use syntax::{DocumentId, LanguageConfig, SyntaxService};
+use syntax::{DocumentId, HighlightSpan, LanguageConfig, SyntaxService};
 use templates::{ExpandWith, FileTemplateDefinition, TemplateLanguage, TemplateOverrides};
 use text_core::{Change, FileFormat, RopeStore, Selection, TextStore, read_file};
 use ui_kit::gpui::EntityId;
@@ -32,6 +32,9 @@ use crate::state::{Conflict, EditorState, LoadError, Saved};
 use crate::style::EditorStyle;
 
 const BLINK: Duration = Duration::from_millis(530);
+
+/// Names the syntax documents of the views that paint text outside an editor.
+static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 
 /// Which language a file is. Set by the application, the editor knows none.
 pub struct Languages {
@@ -78,6 +81,27 @@ struct Keys(Rc<Keymap>);
 /// the user changes what the editor runs at once.
 pub fn install_keymap(cx: &mut App, keymap: Rc<Keymap>) {
     cx.set_global(Keys(keymap));
+}
+
+/// The syntax colours of `text` as the editor of `path` would paint them, for a view
+/// that shows the same file or an earlier version of it outside the editor. `None`
+/// when the path has no grammar.
+pub fn highlight_text(path: &Path, text: String, cx: &mut App) -> Option<Task<Vec<HighlightSpan>>> {
+    let language = cx
+        .try_global::<Languages>()
+        .and_then(|languages| (languages.resolve)(path))?;
+    let syntax = cx.default_global::<SyntaxThread>().0.clone();
+    Some(cx.background_executor().spawn(async move {
+        let id = DocumentId(NEXT_SOURCE.fetch_add(1, Ordering::Relaxed));
+        let (sender, mut receiver) = unbounded();
+        syntax.open(id, language, move |snapshot| {
+            sender.unbounded_send(snapshot).ok();
+        });
+        syntax.update(id, 1, RopeStore::from_text(&text), &Change::default());
+        let snapshot = receiver.next().await;
+        syntax.close(id);
+        snapshot.map_or_else(Vec::new, |snapshot| snapshot.highlights)
+    }))
 }
 
 impl Global for Keys {}
@@ -460,6 +484,8 @@ pub struct EditorOptions {
     pub code_vision_usages: bool,
     /// The implementations or inheritors of a declaration above it.
     pub code_vision_implementations: bool,
+    /// Documentation comments of the language show as rendered text.
+    pub render_doc_comments: bool,
 }
 
 impl Default for EditorOptions {
@@ -483,6 +509,7 @@ impl Default for EditorOptions {
             quick_doc_on_hover: true,
             code_vision_usages: true,
             code_vision_implementations: true,
+            render_doc_comments: false,
         }
     }
 }
@@ -585,6 +612,8 @@ pub struct EditorView {
     pub(crate) code_lens_resolved: Vec<usize>,
     /// The open code lens question; a new one cancels the old at the server.
     pub(crate) code_lens_task: Option<Task<()>>,
+    /// The documentation comments of the language and the choices made for each.
+    pub(crate) docs: crate::rendered_doc::RenderedDocs,
     /// Keys waiting for the next frame, so the latency of a key includes the paint.
     pending_frames: Vec<Instant>,
 }
@@ -721,6 +750,7 @@ impl EditorView {
             code_lens_asked: 0,
             code_lens_resolved: Vec::new(),
             code_lens_task: None,
+            docs: crate::rendered_doc::RenderedDocs::default(),
             pending_frames: Vec::with_capacity(8),
         }
     }
@@ -1229,6 +1259,7 @@ impl EditorView {
             || self.options.inlay_type_hints != options.inlay_type_hints;
         let code_vision_changed = self.options.code_vision_usages != options.code_vision_usages
             || self.options.code_vision_implementations != options.code_vision_implementations;
+        let docs_changed = self.options.render_doc_comments != options.render_doc_comments;
         self.options = options;
         if let Some(state) = &mut self.state {
             state.set_save_options(self.options.save);
@@ -1284,6 +1315,9 @@ impl EditorView {
         }
         if !self.options.caret_blink {
             self.caret_on = true;
+        }
+        if docs_changed {
+            self.apply_doc_comments(cx);
         }
         cx.notify();
     }
@@ -1457,7 +1491,9 @@ impl EditorView {
             self.request_code_lens(crate::semantic::INLAY_TYPING_DELAY, cx);
             if let Some(change) = &change {
                 self.shift_code_lens(change, cx);
+                self.shift_doc_comments(change);
             }
+            self.request_doc_comments(cx);
         } else {
             self.inlays_if_needed(cx);
         }
@@ -2166,6 +2202,17 @@ impl EditorView {
         }
     }
 
+    /// Feeds a key to the editor as if it had the focus. A view that shows the buffer
+    /// elsewhere uses this to edit the same text without a second editor.
+    pub fn handle_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_key(event, window, cx);
+    }
+
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
         if self.quick_doc_open() {
@@ -2214,6 +2261,10 @@ impl EditorView {
                 return self.navigate(NavigationKind::Implementation, cx);
             }
             actions::QUICK_DOC => return self.quick_doc(cx),
+            actions::TOGGLE_RENDERED_DOC => {
+                self.toggle_rendered_doc_at_caret(cx);
+                return;
+            }
             actions::NEXT_ERROR => return self.next_error(cx),
             actions::ERROR_DESCRIPTION => return self.error_description(cx),
             actions::FIND_USAGES_IN_FILE => return self.highlight_usages(cx),
@@ -2600,6 +2651,25 @@ impl EditorView {
         let Some((shown, column)) = self.hit(event.position) else {
             return;
         };
+        if layout.rows[shown].is_doc {
+            if let Some(link) = layout.rows[shown]
+                .doc_links
+                .iter()
+                .find(|link| inside(link.bounds, event.position))
+            {
+                self.open_doc_link(link.target.clone(), cx);
+                return;
+            }
+            if let Some(range) = layout.rows[shown].doc_range.clone() {
+                self.toggle_rendered_doc_at(range.clone(), cx);
+                if let Some(state) = &mut self.state {
+                    state.select_range(range.start..range.start);
+                }
+                self.caret_on = true;
+                cx.notify();
+            }
+            return;
+        }
         if layout.rows[shown].is_block {
             if let Some((index, label)) = layout.rows[shown]
                 .block_labels
@@ -2654,6 +2724,18 @@ impl EditorView {
             };
             cx.emit(event);
             return;
+        }
+        if let Some(buffer_line) = run_line
+            && !line.continuation
+            && layout.rows[shown].doc_icon.is_some()
+        {
+            let x = event.position.x - layout.bounds.left();
+            if x >= px(crate::element::FOLD_X) && x < px(crate::element::FOLD_X + 16.) {
+                if let Some(range) = self.doc_range_at_line(buffer_line) {
+                    self.toggle_rendered_doc_at(range, cx);
+                }
+                return;
+            }
         }
         let Some(state) = &mut self.state else {
             return;

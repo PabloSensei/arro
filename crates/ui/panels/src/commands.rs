@@ -16,7 +16,7 @@ use crate::finder::{ActiveFinder, Finder};
 use crate::git::ActiveGit;
 use crate::git_log::{self, ActiveGitLog};
 use crate::history_view::HistoryView;
-use crate::index::ProjectIndex;
+use crate::index::{ActiveIndex, ProjectIndex};
 use crate::marks;
 use crate::navigation;
 use crate::palette::{Mode, Palette};
@@ -432,13 +432,13 @@ pub fn register(
         };
         cx.defer(move |cx| git.update(cx, |git, cx| git.show_previous_change(cx)));
     });
-    workspace.register_command("workspace.synchronize", "Synchronize", |_, _, cx| {
-        let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
-            return;
-        };
-        // The key runs inside the update of the window; the files are read after it.
-        cx.defer(move |cx| git.update(cx, |git, cx| git.reload_everything(cx)));
-    });
+    workspace.register_command(
+        "workspace.synchronize",
+        "Synchronize",
+        |workspace, window, cx| {
+            reload_all_now(workspace, window, cx);
+        },
+    );
     workspace.register_command(
         "git.quick_list",
         "VCS Operations...",
@@ -1036,6 +1036,16 @@ fn reload_all_now(workspace: &mut Workspace, _window: &mut Window, cx: &mut Cont
     if let Some(panel) = cx.try_global::<ActiveProjectPanel>() {
         let panel = panel.0.clone();
         panel.update(cx, |panel, cx| panel.reload(cx));
+    }
+    // The walk catches whatever the watcher missed: the file list of the search, the
+    // folders of the tree, and the build scripts the language server is told about.
+    if let Some(index) = cx.try_global::<ActiveIndex>() {
+        index.0.rescan();
+    }
+    // The working tree may be different from what the status line and the diff show.
+    if let Some(git) = cx.try_global::<ActiveGit>() {
+        let git = git.0.clone();
+        git.update(cx, |git, cx| git.repository_changed(cx));
     }
 }
 

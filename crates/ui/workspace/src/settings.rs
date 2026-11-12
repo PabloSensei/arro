@@ -207,6 +207,8 @@ pub struct Settings {
     pub code_vision_usages: bool,
     /// The implementations or inheritors of a declaration above it.
     pub code_vision_implementations: bool,
+    /// Documentation comments show as rendered text in the editor.
+    pub render_doc_comments: bool,
     /// Unsaved files are written when the window loses the focus or the tab changes.
     pub autosave: bool,
     /// The home of the runtime that runs the project; empty means the one found by the
@@ -266,6 +268,8 @@ pub struct Settings {
     pub terminal_start_directory: String,
     /// Variables of a new terminal, one `NAME=value` per line.
     pub terminal_environment: String,
+    /// The diff shows the two versions side by side rather than as one list.
+    pub diff_side_by_side: bool,
 }
 
 impl Default for Settings {
@@ -294,6 +298,7 @@ impl Default for Settings {
             inlay_type_hints: false,
             code_vision_usages: true,
             code_vision_implementations: true,
+            render_doc_comments: false,
             autosave: true,
             runtime_home: String::new(),
             memory_low_percent: DEFAULT_MEMORY_LOW_PERCENT,
@@ -326,6 +331,7 @@ impl Default for Settings {
             terminal_shell: String::new(),
             terminal_start_directory: String::new(),
             terminal_environment: String::new(),
+            diff_side_by_side: true,
         }
     }
 }

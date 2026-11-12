@@ -378,7 +378,7 @@ impl Render for DocumentationPanel {
         island(&theme)
             .id(DOCUMENTATION_TOOL)
             .debug_selector(|| "documentation-window".to_owned())
-            .key_context("DocumentationWindow")
+            .key_context("DocumentationWindow ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

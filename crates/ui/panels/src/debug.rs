@@ -2645,7 +2645,7 @@ impl Render for DebugPanel {
             .child(self.render_side(&theme, window, cx));
         island(&theme)
             .id("debug-panel")
-            .key_context(CONTEXT)
+            .key_context("DebugPanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

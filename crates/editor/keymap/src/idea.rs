@@ -97,10 +97,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
     ),
     ("ContextHelp", "MVP-1 has no in-product help."),
     (
-        "Diff.FocusOppositePane",
-        "The diff is one list; it has no opposite pane.",
-    ),
-    (
         "Diff.ShowSettingsPopup",
         "The diff shows context lines always; settings popup is not in MVP-1.",
     ),
@@ -173,14 +169,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "The folder chooser is the native Windows dialog.",
     ),
     (
-        "ForceRefresh",
-        "Synchronize and the file watcher keep the project current; no forced refresh.",
-    ),
-    (
-        "FullyExpandTreeNode",
-        "Ctrl+= expands the whole tree; no separate fully-expand key.",
-    ),
-    (
         "MainMenuButton.ShowMenu",
         "The main menu opens from the window toolbar.",
     ),
@@ -195,26 +183,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
     (
         "QuickActionPopup",
         "Ctrl+Alt+Enter starts a line; no quick action popup is in MVP-1.",
-    ),
-    (
-        "Refresh",
-        "The file watcher refreshes the tree; the key belongs to Rerun.",
-    ),
-    (
-        "ResizeToolWindowDown",
-        "Tool windows are resized by dragging; the key moves the focus between groups.",
-    ),
-    (
-        "ResizeToolWindowLeft",
-        "Tool windows are resized by dragging; the key moves the focus between groups.",
-    ),
-    (
-        "ResizeToolWindowRight",
-        "Tool windows are resized by dragging; the key moves the focus between groups.",
-    ),
-    (
-        "ResizeToolWindowUp",
-        "Tool windows are resized by dragging; the key moves the focus between groups.",
     ),
     (
         "SearchEverywhere.CompleteCommand",
@@ -255,10 +223,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "Ctrl+E opens Recent Files; the Switcher has no checkbox key.",
     ),
     ("TextSearchAction", "Search Everywhere covers text search."),
-    (
-        "ToggleRenderedDocPresentation",
-        "Documentation is plain text in MVP-1; rendered documentation is not in it.",
-    ),
     (
         "Vcs.MoveChangedLinesToChangelist",
         "Changelists are not in MVP-1.",

@@ -89,11 +89,16 @@ impl SyntaxProvider for JavaSyntax {
     }
 }
 
+impl lang_api::DocumentationCommentProvider for JavaProject {
+    fn documentation_comments(&self, text: &str) -> Vec<lang_api::DocumentationComment> {
+        crate::documentation_comments(text)
+    }
+}
+
 impl LanguageSupport for JavaProject {
     fn id(&self) -> LanguageId {
         LANGUAGE_ID
     }
-
     fn matches(&self, path: &Path) -> bool {
         path.extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
@@ -209,6 +214,10 @@ impl LanguageSupport for JavaProject {
 
     fn code_lens_resolve(&self) -> Option<&lang_api::CodeLensResolveProvider> {
         Some(self.providers.as_ref())
+    }
+
+    fn documentation_comments(&self) -> Option<&dyn lang_api::DocumentationCommentProvider> {
+        Some(self)
     }
 
     fn set_code_vision_settings(&self, settings: lang_api::CodeVisionSettings) {

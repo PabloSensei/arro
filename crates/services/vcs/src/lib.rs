@@ -12,7 +12,10 @@ mod status;
 
 pub use askpass::{ASKPASS_PORT, ASKPASS_TOKEN, AskpassServer, ask};
 pub use blob::BlobReader;
-pub use diff::{Hunk, LineChange, LineChangeKind, TextEdit, gutter, line_hunks, revert_hunk};
+pub use diff::{
+    Hunk, LineChange, LineChangeKind, TextEdit, WordChanges, gutter, line_hunks, revert_hunk,
+    word_changes,
+};
 pub use git::GitRunner;
 pub use repo::{
     Branch, Commit, CommitOptions, CommitRequest, Compare, ConflictSide, FileDiff, Operation,

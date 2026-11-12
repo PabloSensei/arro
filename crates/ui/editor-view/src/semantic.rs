@@ -1179,6 +1179,7 @@ impl EditorView {
         }
         self.request_inlays(Duration::ZERO, cx);
         self.request_code_lens(Duration::ZERO, cx);
+        self.request_doc_comments(cx);
     }
 
     /// Asks for the semantic tokens once the file is open. The whole document is asked

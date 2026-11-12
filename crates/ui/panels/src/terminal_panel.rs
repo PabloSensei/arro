@@ -213,7 +213,7 @@ impl Render for TerminalPanel {
         let focused = self.focus.is_focused(window);
         let body = div()
             .id("terminal")
-            .key_context("Terminal")
+            .key_context("Terminal ToolWindow")
             .track_focus(&self.focus)
             .flex()
             .flex_col()

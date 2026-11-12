@@ -85,6 +85,7 @@ fn options_of(cx: &App) -> EditorOptions {
         quick_doc_on_hover: settings.quick_doc_on_hover,
         code_vision_usages: settings.code_vision_usages,
         code_vision_implementations: settings.code_vision_implementations,
+        render_doc_comments: settings.render_doc_comments,
     }
 }
 

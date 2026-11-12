@@ -315,6 +315,7 @@ pub mod editor {
     pub const GOTO_DECLARATION: &str = "editor.goto_declaration";
     pub const GOTO_IMPLEMENTATION: &str = "editor.goto_implementation";
     pub const QUICK_DOC: &str = "editor.quick_doc";
+    pub const TOGGLE_RENDERED_DOC: &str = "editor.toggle_rendered_doc";
     pub const NEXT_ERROR: &str = "editor.next_error";
     pub const ERROR_DESCRIPTION: &str = "editor.error_description";
     pub const REFORMAT: &str = "editor.reformat";
@@ -559,6 +560,7 @@ pub mod editor {
         ("GotoDeclaration", GOTO_DECLARATION),
         ("GotoImplementation", GOTO_IMPLEMENTATION),
         ("QuickJavaDoc", QUICK_DOC),
+        ("ToggleRenderedDocPresentation", TOGGLE_RENDERED_DOC),
         ("GotoNextError", NEXT_ERROR),
         ("ShowErrorDescription", ERROR_DESCRIPTION),
         ("ReformatCode", REFORMAT),
@@ -700,6 +702,7 @@ pub mod editor {
         ("NextOccurence", NEXT_OCCURRENCE),
         ("PreviousOccurence", PREVIOUS_OCCURRENCE),
         ("ShowTypeBookmarks", SHOW_TYPE_BOOKMARKS),
+        ("ToggleRenderedDocPresentation", TOGGLE_RENDERED_DOC),
     ];
 
     /// IDEA actions the editor handles inside its key handling rather than through a
@@ -771,6 +774,7 @@ pub mod workspace {
     pub const EXPAND_ALL: &str = "workspace.expand_all";
     pub const COLLAPSE_ALL: &str = "workspace.collapse_all";
     pub const EXPAND_TREE_NODE: &str = "workspace.expand_tree_node";
+    pub const FULLY_EXPAND_TREE_NODE: &str = "workspace.fully_expand_tree_node";
     pub const COLLAPSE_TREE_NODE: &str = "workspace.collapse_tree_node";
     pub const INSPECT_CODE: &str = "workspace.inspect_code";
     pub const RUN_INSPECTION: &str = "workspace.run_inspection";
@@ -1023,6 +1027,7 @@ mod tests {
         ("ctrl-b", editor::GOTO_DECLARATION),
         ("ctrl-alt-b", editor::GOTO_IMPLEMENTATION),
         ("ctrl-q", editor::QUICK_DOC),
+        ("ctrl-alt-q", editor::TOGGLE_RENDERED_DOC),
         ("f2", editor::NEXT_ERROR),
         ("ctrl-f1", editor::ERROR_DESCRIPTION),
         ("ctrl-alt-l", editor::REFORMAT),

@@ -118,6 +118,11 @@ pub fn register(workspace: &mut Workspace, _window: &mut Window, cx: &mut Contex
         (keys::COLLAPSE_ALL, "Collapse All", false),
         (keys::EXPAND_TREE_NODE, "Expand Tree Node", true),
         (keys::COLLAPSE_TREE_NODE, "Collapse Tree Node", true),
+        (
+            keys::FULLY_EXPAND_TREE_NODE,
+            "Fully Expand Tree Node",
+            false,
+        ),
     ] {
         workspace.register_command(id, title, move |workspace, window, cx| {
             tree_command(workspace, window, cx, id, node)
@@ -225,7 +230,7 @@ fn tree_command(
         .is_some_and(|panel| panel.read(cx).focus().is_focused(window));
     if let Some(panel) = hierarchy.filter(|_| hierarchy_focused) {
         panel.update(cx, |panel, cx| match id {
-            keys::EXPAND_ALL => panel.expand_all(cx),
+            keys::EXPAND_ALL | keys::FULLY_EXPAND_TREE_NODE => panel.expand_all(cx),
             keys::COLLAPSE_ALL => panel.collapse_all(cx),
             _ => {}
         });
@@ -239,7 +244,7 @@ fn tree_command(
         .is_some_and(|panel| panel.read(cx).panel().read(cx).focus().is_focused(window));
     if let Some(panel) = method_hierarchy.filter(|_| method_focused) {
         panel.update(cx, |panel, cx| match id {
-            keys::EXPAND_ALL => panel.expand_all(cx),
+            keys::EXPAND_ALL | keys::FULLY_EXPAND_TREE_NODE => panel.expand_all(cx),
             keys::COLLAPSE_ALL => panel.collapse_all(cx),
             _ => {}
         });
@@ -254,6 +259,7 @@ fn tree_command(
     let state = panel.update(cx, |panel, cx| {
         match (id, node) {
             (keys::EXPAND_ALL, _) => panel.expand_all_quiet(cx),
+            (keys::FULLY_EXPAND_TREE_NODE, _) => panel.expand_fully(cx),
             (keys::COLLAPSE_ALL, _) => panel.collapse_all_quiet(cx),
             (keys::EXPAND_TREE_NODE, _) => panel.expand_node_quiet(cx),
             _ => panel.collapse_node_quiet(cx),

@@ -267,7 +267,7 @@ impl Render for ConflictView {
         let body = surface(&theme)
             .id("conflicts")
             .debug_selector(|| "conflicts".to_owned())
-            .key_context("Conflicts")
+            .key_context("Conflicts ToolWindow")
             .track_focus(&self.focus)
             .occlude()
             .w(width)

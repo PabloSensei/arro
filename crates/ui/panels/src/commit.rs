@@ -2401,7 +2401,7 @@ impl Render for CommitPanel {
         };
         island(&theme)
             .id("commit-panel")
-            .key_context(CONTEXT)
+            .key_context("CommitPanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

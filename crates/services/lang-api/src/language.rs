@@ -237,6 +237,12 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The documentation comments of a source file, read natively. The editor shows
+    /// them as rendered blocks.
+    fn documentation_comments(&self) -> Option<&dyn crate::DocumentationCommentProvider> {
+        None
+    }
+
     /// The command of a label the editor shows, when the server resolves labels apart.
     fn code_lens_resolve(&self) -> Option<&crate::CodeLensResolveProvider> {
         None

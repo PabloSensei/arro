@@ -634,7 +634,7 @@ impl Render for AgentsPanel {
         let focused = self.focus.is_focused(window);
         let body = div()
             .id("agent-terminal")
-            .key_context("AgentTerminal")
+            .key_context("AgentTerminal ToolWindow")
             .track_focus(&self.focus)
             .flex()
             .flex_col()

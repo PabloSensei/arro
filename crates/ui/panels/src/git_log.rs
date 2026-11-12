@@ -648,7 +648,7 @@ impl Render for GitLogPanel {
         div()
             .id("git-log")
             .debug_selector(|| "git-log".to_owned())
-            .key_context("GitLog")
+            .key_context("GitLog ToolWindow")
             .track_focus(&self.focus)
             .flex()
             .flex_col()

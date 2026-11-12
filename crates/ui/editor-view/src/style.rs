@@ -39,6 +39,8 @@ pub struct EditorStyle {
     pub inlay_background: Hsla,
     /// The labels above declarations, as the interface font draws them.
     pub code_vision: Hsla,
+    /// The background of a rendered documentation comment.
+    pub doc_background: Hsla,
     pub fold_background: Hsla,
     pub fold_text: Hsla,
     pub error_mark: Hsla,
@@ -105,6 +107,7 @@ impl EditorStyle {
             inlay: theme.inlay,
             inlay_background: theme.inlay_bg,
             code_vision: theme.text_muted,
+            doc_background: theme.fold_bg,
             fold_background: theme.fold_bg,
             fold_text: theme.fold_text,
             // No theme token yet: the red of an IDEA error stripe.
@@ -149,7 +152,7 @@ impl EditorStyle {
         Self::from_theme(&Theme::light())
     }
 
-    pub(crate) fn color_of(&self, kind: HighlightKind) -> Hsla {
+    pub fn color_of(&self, kind: HighlightKind) -> Hsla {
         match kind {
             HighlightKind::Keyword => self.keyword,
             HighlightKind::String => self.string,

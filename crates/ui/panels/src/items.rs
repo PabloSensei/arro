@@ -606,7 +606,7 @@ impl Render for ItemsPanel {
         island(&theme)
             .id(self.tool)
             .debug_selector(move || format!("items-{tool}"))
-            .key_context(CONTEXT)
+            .key_context("ItemsPanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

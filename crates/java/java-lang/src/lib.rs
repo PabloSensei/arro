@@ -2,6 +2,7 @@
 //! editor, and `lang-api` traits over one open project backed by jdtls.
 
 mod debug;
+mod doc;
 mod environment;
 mod file_templates;
 mod language;
@@ -13,6 +14,7 @@ mod session;
 mod setup;
 
 pub use debug::{DebugExtension, DebugSession, JavaDebugger, ResolvedMain};
+pub use doc::documentation_comments;
 pub use environment::{JavaEnvironment, project_environment};
 pub use file_templates::file_templates;
 

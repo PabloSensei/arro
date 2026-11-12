@@ -401,6 +401,11 @@ impl EditorState {
         self.map.blocks()
     }
 
+    /// The documentation comments shown as rendered rows in place of their text.
+    pub fn set_doc_comments(&mut self, comments: Vec<display_map::DocComment>) {
+        self.map.set_doc_comments(comments);
+    }
+
     pub fn map(&self) -> &DisplayMap {
         &self.map
     }

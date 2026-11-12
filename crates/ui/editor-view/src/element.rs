@@ -52,8 +52,22 @@ pub(crate) struct LaidOutRow {
     indent: usize,
     /// The row is a block above the text and holds no line of the buffer.
     pub(crate) is_block: bool,
+    /// The row is a rendered documentation comment, not a label.
+    pub(crate) is_doc: bool,
+    /// Whether the comment of this line is rendered, for its gutter icon.
+    pub(crate) doc_icon: Option<bool>,
+    /// The comment range of a rendered documentation row.
+    pub(crate) doc_range: Option<std::ops::Range<usize>>,
     /// The parts of a block row: each opens its list when clicked.
     pub(crate) block_labels: Vec<BlockLabel>,
+    /// The links of a rendered documentation row.
+    pub(crate) doc_links: Vec<DocLinkLabel>,
+}
+
+/// One clickable link of a rendered documentation row.
+pub(crate) struct DocLinkLabel {
+    pub target: String,
+    pub bounds: Bounds<Pixels>,
 }
 
 /// One clickable label of a block row.
@@ -690,8 +704,9 @@ impl Element for EditorElement {
 
             for (slot, (line, indent)) in lines.into_iter().zip(indents).enumerate() {
                 let row = first + slot;
-                let block = display.is_block_row(row);
-                let current = row == primary_row && !block;
+                let doc_row = display.doc_row(row);
+                let block = display.is_block_row(row) && doc_row.is_none();
+                let current = row == primary_row && !block && doc_row.is_none();
                 let buffer_line = store.offset_to_line(line.start_offset);
                 let continuation = line.continuation;
                 let indent = if block {
@@ -699,7 +714,7 @@ impl Element for EditorElement {
                 } else {
                     indent
                 };
-                let bookmark = if continuation || block {
+                let bookmark = if continuation || block || doc_row.is_some() {
                     None
                 } else {
                     state.bookmark_at_line(buffer_line)
@@ -707,12 +722,14 @@ impl Element for EditorElement {
                 // A named bookmark shows its letter where the number is.
                 let number_text: SharedString = match (continuation, bookmark) {
                     (_, _) if block => "".into(),
+                    (_, _) if doc_row.is_some() => "".into(),
                     (true, _) => "".into(),
                     (false, Some(Some(letter))) => letter.to_string().into(),
                     (false, _) if !options.line_numbers => "".into(),
                     (false, _) => (buffer_line + 1).to_string().into(),
                 };
                 let number_value = if block
+                    || doc_row.is_some()
                     || continuation
                     || matches!(bookmark, Some(Some(_)))
                     || !options.line_numbers
@@ -735,7 +752,52 @@ impl Element for EditorElement {
                 let number =
                     text_system.shape_line(number_text, px(NUMBER_SIZE), &number_run[..used], None);
 
-                let (text, block_labels) = if block {
+                let mut doc_links = Vec::new();
+                let (text, block_labels) = if let Some(doc) = doc_row {
+                    let y = bounds.top() + px(offset + slot as f32 * line_height);
+                    let mut label = String::new();
+                    let mut runs = Vec::with_capacity(doc.runs.len());
+                    let mut links: Vec<(usize, usize, String)> = Vec::new();
+                    for piece in &doc.runs {
+                        let start = label.len();
+                        label.push_str(&piece.text);
+                        let end = label.len();
+                        let mut font = match piece.kind {
+                            display_map::DocRunKind::Code => code_font.clone(),
+                            _ => ui_font.clone(),
+                        };
+                        let (color, italic, bold) = match piece.kind {
+                            display_map::DocRunKind::Text => (style.code, false, false),
+                            display_map::DocRunKind::Code => (style.code, false, false),
+                            display_map::DocRunKind::Strong => (style.doc_tag, false, true),
+                            display_map::DocRunKind::Emphasis => (style.doc_tag, true, false),
+                            display_map::DocRunKind::Link => (style.accent, false, false),
+                        };
+                        if bold {
+                            font.weight = FontWeight::SEMIBOLD;
+                        }
+                        runs.push(run(piece.text.len(), &font, color, italic));
+                        if piece.kind == display_map::DocRunKind::Link
+                            && let Some(target) = &piece.target
+                        {
+                            links.push((start, end, target.clone()));
+                        }
+                    }
+                    let shaped = text_system.shape_line(label.into(), font_size, &runs, None);
+                    let text_start = text_x + char_width * doc.indent as f32;
+                    for (start, end, target) in links {
+                        let left = shaped.x_for_index(start);
+                        let right = shaped.x_for_index(end).max(left + px(1.));
+                        doc_links.push(DocLinkLabel {
+                            target,
+                            bounds: Bounds::new(
+                                point(text_start + left, y),
+                                size(right - left, px(line_height)),
+                            ),
+                        });
+                    }
+                    (shaped, Vec::new())
+                } else if block {
                     let y = bounds.top() + px(offset + slot as f32 * line_height);
                     let labels = view.code_vision_labels(buffer_line);
                     let mut block_labels = Vec::with_capacity(labels.len());
@@ -769,7 +831,7 @@ impl Element for EditorElement {
                     (shaped, Vec::new())
                 };
                 let mut inlays = Vec::new();
-                if !block {
+                if !block && doc_row.is_none() {
                     let code_baseline = baseline(&text, px(line_height));
                     for (range, chunk) in &line.chunks {
                         if !matches!(chunk, DisplayChunk::Inlay { .. }) {
@@ -801,12 +863,13 @@ impl Element for EditorElement {
                     .iter()
                     .any(|(_, chunk)| matches!(chunk, DisplayChunk::Placeholder { .. }));
                 let foldable = !block
+                    && doc_row.is_none()
                     && state
                         .map()
                         .folds
                         .candidate_on_line(store, buffer_line)
                         .is_some();
-                let fold = if continuation || block {
+                let fold = if continuation || block || doc_row.is_some() {
                     None
                 } else if collapsed {
                     Some(true)
@@ -816,8 +879,17 @@ impl Element for EditorElement {
                 let run = view
                     .run_marks
                     .iter()
-                    .find(|mark| !block && !continuation && mark.line as usize == buffer_line)
+                    .find(|mark| {
+                        !block
+                            && doc_row.is_none()
+                            && !continuation
+                            && mark.line as usize == buffer_line
+                    })
                     .map(|mark| (mark.state, mark.color));
+                let doc_icon = (!continuation)
+                    .then(|| view.rendered_doc_at_line(buffer_line))
+                    .flatten();
+                let doc_range = display.doc_range(row);
                 rows.push(LaidOutRow {
                     row,
                     buffer_line,
@@ -832,8 +904,12 @@ impl Element for EditorElement {
                     bookmark: !block && matches!(bookmark, Some(None)),
                     current,
                     indent,
-                    is_block: block,
+                    is_block: block || doc_row.is_some(),
+                    is_doc: doc_row.is_some(),
+                    doc_icon,
+                    doc_range,
                     block_labels,
+                    doc_links,
                 });
             }
 
@@ -1333,6 +1409,10 @@ impl Element for EditorElement {
             row.block_labels
                 .iter()
                 .any(|label| inside(label.bounds, pointer))
+                || row
+                    .doc_links
+                    .iter()
+                    .any(|link| inside(link.bounds, pointer))
         });
         if over_code_vision {
             window.set_cursor_style(CursorStyle::PointingHand, &prepaint.hitbox);
@@ -1433,11 +1513,11 @@ impl Element for EditorElement {
             }
 
             for shown in &prepaint.layout.rows {
-                if shown.is_block {
+                if shown.is_block && !shown.is_doc {
                     continue;
                 }
                 let line = shown.buffer_line as u32;
-                if breakpoints.contains(&line) {
+                if !shown.is_doc && breakpoints.contains(&line) {
                     let dot = Bounds::new(
                         point(bounds.left() + px(RUN_X + 3.), shown.y + px(5.)),
                         size(px(10.), px(10.)),
@@ -1494,6 +1574,25 @@ impl Element for EditorElement {
                         )
                         .ok();
                 }
+                if let Some(rendered) = shown.doc_icon {
+                    let name = if rendered { "hide" } else { "show" };
+                    let suffix = if style.dark { "_dark" } else { "" };
+                    let icon = Bounds::new(
+                        point(bounds.left() + px(FOLD_X), shown.y + px(3.)),
+                        size(px(16.), px(16.)),
+                    );
+                    let path: SharedString = format!("icons/general/{name}{suffix}.svg").into();
+                    window
+                        .paint_svg(
+                            icon,
+                            path,
+                            None,
+                            TransformationMatrix::unit(),
+                            style.line_number_current,
+                            cx,
+                        )
+                        .ok();
+                }
                 if let Some(collapsed) = shown.fold {
                     let name = if collapsed {
                         "chevronRight"
@@ -1539,6 +1638,34 @@ impl Element for EditorElement {
                 }
 
                 for shown in &prepaint.layout.rows {
+                    if shown.is_doc {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(text_x, shown.y),
+                                size(prepaint.text_mask.size.width, height),
+                            ),
+                            style.doc_background,
+                        ));
+                        shown
+                            .text
+                            .paint(
+                                point(text_x + prepaint.char_width * shown.indent as f32, shown.y),
+                                height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                        for link in &shown.doc_links {
+                            let underline = Bounds::new(
+                                point(link.bounds.origin.x, link.bounds.origin.y + height - px(1.)),
+                                size(link.bounds.size.width, px(1.)),
+                            );
+                            window.paint_quad(fill(underline, style.accent));
+                        }
+                        continue;
+                    }
                     if shown.is_block {
                         for (index, label) in shown.block_labels.iter().enumerate() {
                             label

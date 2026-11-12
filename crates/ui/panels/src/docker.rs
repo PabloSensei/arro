@@ -753,6 +753,7 @@ impl Render for DockerPanel {
             );
         island(&theme)
             .id("docker-panel")
+            .key_context("ServicesPanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

@@ -24,7 +24,6 @@ use workspace::{INSPECTION_TOOL, RerunInspection, Workspace};
 use crate::git::ActiveGit;
 use crate::items::open_at;
 
-const CONTEXT: &str = "InspectionResults";
 const GROUP: &str = "bottom-panel";
 const WIDTH: f32 = 560.;
 
@@ -2084,7 +2083,7 @@ impl Render for InspectPanel {
         island(&theme)
             .id(INSPECTION_TOOL)
             .debug_selector(|| "inspection-results".to_owned())
-            .key_context(CONTEXT)
+            .key_context("InspectionResults ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

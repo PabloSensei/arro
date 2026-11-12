@@ -72,6 +72,10 @@ impl FileTree {
         &self.rows
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn expanded(&self) -> Vec<PathBuf> {
         self.expanded.iter().cloned().collect()
     }
@@ -100,6 +104,15 @@ impl FileTree {
 
     pub fn set_listing(&mut self, folder: PathBuf, children: Vec<Child>) {
         self.listings.insert(folder, children);
+        self.rebuild();
+    }
+
+    /// Replaces several listings and opens them in one rebuild, for Fully Expand.
+    pub fn set_expanded_listings(&mut self, listings: Vec<(PathBuf, Vec<Child>)>) {
+        for (folder, children) in listings {
+            self.expanded.insert(folder.clone());
+            self.listings.insert(folder, children);
+        }
         self.rebuild();
     }
 

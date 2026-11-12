@@ -5,6 +5,7 @@
 
 mod answer;
 mod code_lens;
+mod documentation;
 mod hierarchy;
 mod inlay;
 mod language;
@@ -17,6 +18,9 @@ pub use answer::{Answer, Confidence, SourceId};
 pub use code_lens::{
     CodeLensCommand, CodeLensEntry, CodeLensKind, CodeLensProvider, CodeLensQuery,
     CodeLensResolveProvider, CodeLensResolveQuery, CodeVisionSettings, kind_of,
+};
+pub use documentation::{
+    DocumentationBlock, DocumentationComment, DocumentationCommentProvider, DocumentationInline,
 };
 pub use hierarchy::{
     AddOverridableMethodsProvider, AddOverridableMethodsRequest, CallDirection, CallHierarchyItem,

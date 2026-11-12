@@ -31,6 +31,13 @@ pub struct TextEdit {
     pub text: String,
 }
 
+/// The words of two lines that differ, as byte ranges inside each line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WordChanges {
+    pub before: Vec<Range<usize>>,
+    pub after: Vec<Range<usize>>,
+}
+
 /// Lines that differ, compared line by line with the histogram algorithm git uses too.
 pub fn line_hunks(before: &str, after: &str) -> Vec<Hunk> {
     let input = InternedInput::new(before, after);
@@ -56,6 +63,64 @@ pub fn gutter(hunks: &[Hunk]) -> Vec<LineChange> {
         }
     };
     hunks.iter().map(change).collect()
+}
+
+/// The words that differ between two lines, for the word marks inside a changed line.
+/// Words are runs of letters, digits and `_`; punctuation and spaces split them and are
+/// never marked on their own.
+pub fn word_changes(before: &str, after: &str) -> WordChanges {
+    let before_words = word_spans(before);
+    let after_words = word_spans(after);
+    let mut input: InternedInput<&str> = InternedInput::default();
+    input.update_before(before_words.iter().map(|range| &before[range.clone()]));
+    input.update_after(after_words.iter().map(|range| &after[range.clone()]));
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+    let mut changes = WordChanges::default();
+    for hunk in diff.hunks() {
+        for range in &before_words[hunk.before.start as usize..hunk.before.end as usize] {
+            if is_word(&before[range.clone()]) {
+                changes.before.push(range.clone());
+            }
+        }
+        for range in &after_words[hunk.after.start as usize..hunk.after.end as usize] {
+            if is_word(&after[range.clone()]) {
+                changes.after.push(range.clone());
+            }
+        }
+    }
+    changes
+}
+
+/// The runs of a line that hold together for the word diff: words and the separators
+/// between them, so that a moved word keeps its place.
+fn word_spans(text: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut word = None;
+    for (at, character) in text.char_indices() {
+        let is_word = character.is_alphanumeric() || character == '_';
+        match word {
+            Some(previous) if previous == is_word => {}
+            Some(_) => {
+                spans.push(start..at);
+                start = at;
+                word = Some(is_word);
+            }
+            None => {
+                start = at;
+                word = Some(is_word);
+            }
+        }
+    }
+    if word.is_some() {
+        spans.push(start..text.len());
+    }
+    spans
+}
+
+fn is_word(text: &str) -> bool {
+    text.chars()
+        .any(|character| character.is_alphanumeric() || character == '_')
 }
 
 /// The edit that puts the base lines of `hunk` back into the current text. Lines are

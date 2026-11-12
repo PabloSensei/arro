@@ -61,6 +61,9 @@ pub struct ProjectSetup {
 /// How long a build step gets to finish after Stop before it is ended.
 const TASK_GRACE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
+/// A build file that changes on disk waits this long for the others of the same batch,
+/// as a branch switch makes many, and then the project is imported once.
+const MODEL_RELOAD_DELAY: Duration = Duration::from_millis(500);
 /// Console lines kept; older ones go first.
 const MAX_LINES: usize = 50_000;
 /// Tabs of earlier runs kept beside the current one.
@@ -158,6 +161,9 @@ pub struct RunPanel {
     build_parser: AnsiParser,
     /// The answer of a hot swap the last Build Project asked for.
     reload: Option<Receiver<ReloadOutcome>>,
+    /// Bumped on every build file that changed: only the import after the last of a
+    /// batch runs.
+    model_reload: u64,
     /// The line the user types into the console, when its program reads input.
     console_input: TextField,
     /// The lines sent to this console, oldest first.
@@ -256,6 +262,7 @@ impl RunPanel {
                 build_running: false,
                 build_parser: AnsiParser::default(),
                 reload: None,
+                model_reload: 0,
                 console_input: TextField::default(),
                 console_history: Vec::new(),
                 history_at: None,
@@ -403,6 +410,27 @@ impl RunPanel {
         self.sync = Some(sync);
         self.loading = true;
         self.changed(cx);
+    }
+
+    /// A file the language watches, such as a build script, appeared, vanished or
+    /// changed: the project model may name other modules now. A batch of changes, as a
+    /// branch switch makes, settles into one import after [`MODEL_RELOAD_DELAY`].
+    pub fn model_file_changed(&mut self, cx: &mut Context<Self>) {
+        if self.tool.is_none() {
+            return;
+        }
+        self.model_reload = self.model_reload.wrapping_add(1);
+        let mine = self.model_reload;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MODEL_RELOAD_DELAY).await;
+            this.update(cx, |this, cx| {
+                if this.model_reload == mine {
+                    this.reload_project(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The modules of the imported project, for the scope of an inspection.
@@ -2266,6 +2294,7 @@ impl Render for RunPanel {
         };
         island(&theme)
             .id("run-panel")
+            .key_context("RunPanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

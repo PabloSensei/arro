@@ -188,6 +188,8 @@ pub enum SettingField {
     TerminalShell,
     TerminalStartDirectory,
     TerminalEnvironment,
+    RenderDocComments,
+    DiffSideBySide,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -604,6 +606,22 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::TerminalEnvironment,
         keywords: "environment variables terminal",
     },
+    Setting {
+        id: "render_doc_comments",
+        title: "Render documentation comments",
+        page: SettingsPage::Editor,
+        kind: SettingKind::Toggle,
+        field: SettingField::RenderDocComments,
+        keywords: "documentation comments doc rendered javadoc editor appearance",
+    },
+    Setting {
+        id: "diff_side_by_side",
+        title: "Show diffs side by side",
+        page: SettingsPage::Editor,
+        kind: SettingKind::Toggle,
+        field: SettingField::DiffSideBySide,
+        keywords: "diff side by side unified compare version control editor",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -620,6 +638,7 @@ pub fn find(id: &str) -> Option<&'static Setting> {
 /// rows into named groups.
 pub fn section_of(id: &str) -> Option<&'static str> {
     match id {
+        "render_doc_comments" => Some("Appearance"),
         "code_vision_usages" | "code_vision_implementations" => Some("Code Vision"),
         _ => None,
     }
@@ -659,10 +678,12 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::InlayTypeHints => Some(settings.inlay_type_hints),
         SettingField::CodeVisionUsages => Some(settings.code_vision_usages),
         SettingField::CodeVisionImplementations => Some(settings.code_vision_implementations),
+        SettingField::RenderDocComments => Some(settings.render_doc_comments),
         SettingField::Autosave => Some(settings.autosave),
         SettingField::UpdatesCheckAutomatically => Some(settings.updates_check_automatically),
         SettingField::SemanticHighlighting => Some(settings.semantic_highlighting),
         SettingField::QuickDocOnHover => Some(settings.quick_doc_on_hover),
+        SettingField::DiffSideBySide => Some(settings.diff_side_by_side),
         SettingField::BuildToolFirstOffline => Some(settings.build_tools.first.offline),
         SettingField::BuildToolFirstUpdateSnapshots => {
             Some(settings.build_tools.first.update_snapshots)
@@ -731,6 +752,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         Some(SettingField::CodeVisionImplementations) => {
             settings.code_vision_implementations = !settings.code_vision_implementations;
         }
+        Some(SettingField::RenderDocComments) => {
+            settings.render_doc_comments = !settings.render_doc_comments;
+        }
         Some(SettingField::Autosave) => settings.autosave = !settings.autosave,
         Some(SettingField::UpdatesCheckAutomatically) => {
             settings.updates_check_automatically = !settings.updates_check_automatically;
@@ -740,6 +764,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::QuickDocOnHover) => {
             settings.quick_doc_on_hover = !settings.quick_doc_on_hover;
+        }
+        Some(SettingField::DiffSideBySide) => {
+            settings.diff_side_by_side = !settings.diff_side_by_side;
         }
         Some(SettingField::BuildToolFirstOffline) => {
             settings.build_tools.first.offline = !settings.build_tools.first.offline;

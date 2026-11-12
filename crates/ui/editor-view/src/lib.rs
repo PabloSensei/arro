@@ -15,6 +15,7 @@ mod live;
 mod quick_doc;
 mod refactor;
 mod regions;
+mod rendered_doc;
 mod scrollbar;
 mod semantic;
 mod state;
@@ -38,11 +39,11 @@ pub use state::{Conflict, EditorState, LoadError, SaveOptions, Saved, TrimTraili
 pub use style::{EditorStyle, SemanticLook};
 // The language data a caller needs to describe its files to the editor, and to build
 // one in a test.
-pub use syntax::{FoldStyle, LanguageConfig, StatementRules};
+pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
     BookmarkEntry, DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView,
     GutterKind, GutterMark, InlayPaint, Languages, OutlineItem, OutlineKind, ProblemSummary,
     RowPaint, RunMark, RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate, bookmarks,
-    clipboard_history, install_keymap,
+    clipboard_history, highlight_text, install_keymap,
 };

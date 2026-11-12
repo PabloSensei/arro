@@ -209,7 +209,7 @@ impl Render for StructurePanel {
                 .collect();
         island(&theme)
             .id("structure-panel")
-            .key_context("StructurePanel")
+            .key_context("StructurePanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

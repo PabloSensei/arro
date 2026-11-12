@@ -239,12 +239,18 @@ mod window_tests_code_vision;
 #[cfg(test)]
 mod window_tests_editor_polish;
 #[cfg(test)]
+mod window_tests_rendered_doc;
+#[cfg(test)]
 mod window_tests_template_engine;
 #[cfg(test)]
 mod window_tests_templates_settings;
+#[cfg(test)]
+mod window_tests_tool_resize;
 
 #[cfg(test)]
 mod window_tests_console_input;
+#[cfg(test)]
+mod window_tests_diff_side;
 
 mod choice;
 mod invalidate;
@@ -958,6 +964,7 @@ fn watched_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context
 fn disk_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context<Workspace>) {
     // The language server registered the files it watches, such as build scripts. A
     // save of one comes through the watcher even when no editor is open on it.
+    let mut model_changed = false;
     if let Some(semantic) = cx.try_global::<Semantic>() {
         let support = semantic.0.clone();
         if let Some(server) = support.server() {
@@ -972,9 +979,16 @@ fn disk_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context<Wo
                     && let Ok(path) = CanonPath::new(path)
                 {
                     server.file_changed(&path.to_uri(), kind);
+                    model_changed = true;
                 }
             }
         }
+    }
+    // A new, removed or changed build script can name other modules: the window reads
+    // the model again as it does when the build tool window asks for a reload.
+    if model_changed {
+        let panel = cx.global::<script::ActiveRunPanel>().0.clone();
+        panel.update(cx, |panel, cx| panel.model_file_changed(cx));
     }
     let mut folders = Vec::new();
     for change in changes {

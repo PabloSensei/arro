@@ -71,6 +71,11 @@ actions!(
         MoveToOtherGroup,
         FocusNextGroup,
         FocusPreviousGroup,
+        ResizeToolWindowLeft,
+        ResizeToolWindowRight,
+        ResizeToolWindowUp,
+        ResizeToolWindowDown,
+        FullyExpandTreeNode,
         ReopenTab,
         TabLeft,
         TabRight,
@@ -212,6 +217,18 @@ window_keys![
     ("ctrl-f5", RerunInspection, Some("InspectionResults"), None),
     ("ctrl-alt-shift-s", ProjectStructure, None, Some("ShowProjectStructureSettings")),
     ("ctrl-shift-`", ShowBranches, None, None),
+    ("ctrl-alt-shift-left", ResizeToolWindowLeft, Some("ToolWindow"), Some("ResizeToolWindowLeft")),
+    ("ctrl-alt-shift-right", ResizeToolWindowRight, Some("ToolWindow"), Some("ResizeToolWindowRight")),
+    ("ctrl-alt-shift-up", ResizeToolWindowUp, Some("ToolWindow"), Some("ResizeToolWindowUp")),
+    ("ctrl-alt-shift-down", ResizeToolWindowDown, Some("ToolWindow"), Some("ResizeToolWindowDown")),
+    ("ctrl-shift-left", ResizeToolWindowLeft, Some("ToolWindow"), None),
+    ("ctrl-shift-right", ResizeToolWindowRight, Some("ToolWindow"), None),
+    ("ctrl-shift-up", ResizeToolWindowUp, Some("ToolWindow"), None),
+    ("ctrl-shift-down", ResizeToolWindowDown, Some("ToolWindow"), None),
+    ("numpad_multiply", FullyExpandTreeNode, Some("ToolWindow"), Some("FullyExpandTreeNode")),
+    ("shift-numpad_add", FullyExpandTreeNode, Some("ToolWindow"), None),
+    ("ctrl-f5", Synchronize, Some("ProjectPanel"), Some("Refresh")),
+    ("ctrl-shift-f5", Synchronize, Some("ProjectPanel"), Some("ForceRefresh")),
 ];
 
 /// The index of the window a project switch goes to. `None` when there is no other one.
@@ -258,15 +275,26 @@ fn shortcut_label(text: &str) -> String {
     };
     text.split('-').map(part).collect::<Vec<_>>().join("+")
 }
-const MIN_DOCK_SIZE: f32 = 160.;
+pub const MIN_DOCK_SIZE: f32 = 160.;
 /// What a dock leaves to the editor when it is dragged to the limit.
-const MIN_EDITOR_SIZE: f32 = 320.;
+pub const MIN_EDITOR_SIZE: f32 = 320.;
+/// How much one press of a resize key changes a dock.
+const KEYBOARD_RESIZE_STEP: f32 = 40.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockSide {
     Left,
     Right,
     Bottom,
+}
+
+/// The arrow of a resize key: where the edge of the tool window moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResizeStep {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// Tool windows that come with the product. Their stripe buttons are always there.
@@ -1079,6 +1107,16 @@ impl Workspace {
         &self.layout
     }
 
+    /// The layout as it stands now, the one that is saved.
+    pub fn current_layout(&self, cx: &App) -> Layout {
+        self.capture(cx)
+    }
+
+    /// The width or height of a dock, for scripts and tests.
+    pub fn dock_size(&self, side: DockSide) -> f32 {
+        self.dock(side).size
+    }
+
     pub fn icons(&self) -> &FileIcons {
         &self.icons
     }
@@ -1843,6 +1881,40 @@ impl Workspace {
         };
         let most = (limit - MIN_EDITOR_SIZE).max(MIN_DOCK_SIZE);
         self.dock_mut(side).size = size.clamp(MIN_DOCK_SIZE, most);
+        self.layout_changed(cx);
+        cx.notify();
+    }
+
+    /// The dock that holds the focus changes its size by one step, within the same
+    /// limits as a drag of its edge.
+    pub(crate) fn resize_focused_dock(
+        &mut self,
+        step: ResizeStep,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(side) = self.focused_dock(window, cx) else {
+            return;
+        };
+        let delta = match (side, step) {
+            (DockSide::Left, ResizeStep::Left) | (DockSide::Right, ResizeStep::Right) => {
+                -KEYBOARD_RESIZE_STEP
+            }
+            (DockSide::Left, ResizeStep::Right) | (DockSide::Right, ResizeStep::Left) => {
+                KEYBOARD_RESIZE_STEP
+            }
+            (DockSide::Bottom, ResizeStep::Up) => KEYBOARD_RESIZE_STEP,
+            (DockSide::Bottom, ResizeStep::Down) => -KEYBOARD_RESIZE_STEP,
+            _ => return,
+        };
+        let viewport = window.viewport_size();
+        let limit = match side {
+            DockSide::Left | DockSide::Right => f32::from(viewport.width),
+            DockSide::Bottom => f32::from(viewport.height),
+        };
+        let most = (limit - MIN_EDITOR_SIZE).max(MIN_DOCK_SIZE);
+        let dock = self.dock_mut(side);
+        dock.size = (dock.size + delta).clamp(MIN_DOCK_SIZE, most);
         self.layout_changed(cx);
         cx.notify();
     }

@@ -1,5 +1,6 @@
 //! The project tree tool window on a virtual list.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -49,6 +50,11 @@ const ROOT_ICON: &str = "nodes/module";
 const ROW_MARGIN: f32 = SPACE_L;
 /// A pause this long starts a new speed search rather than adding to the old one.
 const SEARCH_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Fully Expand reads this many folder levels from the root.
+pub(crate) const FULL_EXPAND_MAX_DEPTH: usize = 8;
+/// Fully Expand reads no more folders than this, so a folder with many children cannot
+/// hold the window with thousands of reads.
+pub(crate) const FULL_EXPAND_MAX_FOLDERS: usize = 256;
 
 /// A row on its way to another folder by the pointer.
 #[derive(Clone)]
@@ -152,6 +158,30 @@ fn copy_path(from: &Path, to: &Path) -> std::io::Result<()> {
     } else {
         std::fs::copy(from, to).map(|_| ())
     }
+}
+
+/// Reads the folders fully expand opens, in breadth-first order, and stops at the
+/// depth and folder limits. Runs off the window thread.
+fn read_tree_fully(root: &Path) -> Vec<(PathBuf, Vec<Child>)> {
+    let mut listings = Vec::new();
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    while let Some((folder, depth)) = queue.pop_front() {
+        if listings.len() >= FULL_EXPAND_MAX_FOLDERS {
+            break;
+        }
+        let Ok(children) = read_folder(&folder) else {
+            continue;
+        };
+        if depth + 1 < FULL_EXPAND_MAX_DEPTH {
+            for child in &children {
+                if child.folder {
+                    queue.push_back((child.path.clone(), depth + 1));
+                }
+            }
+        }
+        listings.push((folder, children));
+    }
+    listings
 }
 
 /// Alt+F1 in the editor: shows the file of the tab in the project tree.
@@ -547,6 +577,27 @@ impl ProjectPanel {
             None => 0,
         };
         self.extend_selection(next as usize, cx);
+    }
+
+    /// NumPad * and Shift+NumPad +: every folder opens, level by level, down to
+    /// [`FULL_EXPAND_MAX_DEPTH`] and no more than [`FULL_EXPAND_MAX_FOLDERS`] folders.
+    /// The disk is read in the background; a folder with many children cannot block the
+    /// window.
+    pub fn expand_fully(&mut self, cx: &mut Context<Self>) {
+        let root = self.tree.root().to_path_buf();
+        let read = cx
+            .background_executor()
+            .spawn(async move { read_tree_fully(&root) });
+        cx.spawn(async move |this, cx| {
+            let listings = read.await;
+            this.update(cx, |this, cx| {
+                this.listings += listings.len() as u64;
+                this.tree.set_expanded_listings(listings);
+                this.state_changed(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Ctrl+Equal: every folder opens, the files keep their places.
@@ -1869,7 +1920,7 @@ impl Render for ProjectPanel {
         };
         island(&theme)
             .id("project-panel")
-            .key_context(CONTEXT)
+            .key_context("ProjectPanel ToolWindow")
             .track_focus(&self.focus)
             .group("left-panel")
             .h_full()

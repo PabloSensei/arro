@@ -564,7 +564,7 @@ impl Render for PerformancePanel {
         island(&theme)
             .id(PERFORMANCE_TOOL)
             .debug_selector(|| "performance".to_owned())
-            .key_context("PerformanceMonitor")
+            .key_context("PerformanceMonitor ToolWindow")
             .track_focus(&self.focus)
             .group("bottom-panel")
             .h_full()

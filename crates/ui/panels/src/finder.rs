@@ -900,7 +900,7 @@ impl Render for Finder {
         let body = surface(&theme)
             .id("finder")
             .debug_selector(|| "finder".to_owned())
-            .key_context(CONTEXT)
+            .key_context("FindInFiles ToolWindow")
             .track_focus(&self.focus)
             .occlude()
             .w(width)

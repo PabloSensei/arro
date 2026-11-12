@@ -769,7 +769,7 @@ impl Render for BuildPanel {
         };
         island(&theme)
             .id("build-panel")
-            .key_context("BuildPanel")
+            .key_context("BuildPanel ToolWindow")
             .relative()
             .track_focus(&self.focus)
             .group(GROUP)

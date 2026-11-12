@@ -16,16 +16,18 @@ use crate::window::{
     AI_TOOL, BalloonAction, BuildProject, COMMIT_TOOL, ChooseDebugConfiguration,
     ChooseRunConfiguration, CloseTab, Compile, CopyElement, DEBUG_TOOL, Debug, Dismiss, DockSide,
     EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto,
-    ForceStepOver, GotoRelated, HideToolWindow, LOG_TOOL, MoveToOtherGroup, NewElementSamePlace,
-    NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL,
-    PinTab, PreviousProblem, PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate,
-    RUN_TOOL, ReopenTab, Rerun, RerunTests, Resume, Run, RunToCursor, SERVICES_TOOL,
-    STRUCTURE_TOOL, SaveAll, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
-    ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop,
-    StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi,
-    ToggleBreakpoint, ToggleCommit, ToggleDebug, ToggleLog, ToggleProject, ToggleRun,
-    ToggleServices, ToggleStructure, ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme,
-    ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, Workspace,
+    ForceStepOver, FullyExpandTreeNode, GotoRelated, HideToolWindow, LOG_TOOL, MoveToOtherGroup,
+    NewElementSamePlace, NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay,
+    PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem, PreviousProjectWindow, ProjectStructure,
+    PushChanges, QuickEvaluate, RUN_TOOL, ReopenTab, Rerun, RerunTests, ResizeStep,
+    ResizeToolWindowDown, ResizeToolWindowLeft, ResizeToolWindowRight, ResizeToolWindowUp, Resume,
+    Run, RunToCursor, SERVICES_TOOL, STRUCTURE_TOOL, SaveAll, ShowBranches, ShowCommit,
+    ShowExecutionPoint, ShowSearch, ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto,
+    StepOut, StepOver, Stop, StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL,
+    TabLeft, TabRight, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleDebug, ToggleLog,
+    ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTemporaryLineBreakpoint,
+    ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList,
+    ViewBreakpoints, Workspace,
 };
 use crate::window::{TODO_TOOL, ToggleProblems, ToggleTodo};
 
@@ -2599,6 +2601,21 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &FocusPreviousGroup, window, cx| {
                 this.focus_group(-1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResizeToolWindowLeft, window, cx| {
+                this.resize_focused_dock(ResizeStep::Left, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResizeToolWindowRight, window, cx| {
+                this.resize_focused_dock(ResizeStep::Right, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResizeToolWindowUp, window, cx| {
+                this.resize_focused_dock(ResizeStep::Up, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResizeToolWindowDown, window, cx| {
+                this.resize_focused_dock(ResizeStep::Down, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FullyExpandTreeNode, window, cx| {
+                this.run_command("workspace.fully_expand_tree_node", window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &ReopenTab, window, cx| this.reopen_closed_tab(window, cx)),

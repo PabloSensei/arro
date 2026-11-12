@@ -535,7 +535,7 @@ impl Render for CallHierarchyPanel {
             );
         island(&theme)
             .id("call-hierarchy-panel")
-            .key_context("CallHierarchyPanel")
+            .key_context("CallHierarchyPanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()

@@ -66,6 +66,8 @@ pub struct CommitOptions {
 pub struct FileDiff {
     /// Empty for a file the last commit does not have.
     pub base: String,
+    /// The version the diff compares against `base`.
+    pub current: String,
     pub hunks: Vec<Hunk>,
 }
 
@@ -192,7 +194,11 @@ impl Repository {
             .unwrap_or_default();
         let base = String::from_utf8_lossy(&base).replace("\r\n", "\n");
         let hunks = line_hunks(&base, current);
-        Ok(FileDiff { base, hunks })
+        Ok(FileDiff {
+            base,
+            current: current.to_owned(),
+            hunks,
+        })
     }
 
     /// Takes the chosen files as they are on disk, new and deleted ones too, and nothing
@@ -711,7 +717,11 @@ impl Repository {
         let current = blobs.read(&format!("{commit}:{path}"))?.unwrap_or_default();
         let current = String::from_utf8_lossy(&current).replace("\r\n", "\n");
         let hunks = line_hunks(&base, &current);
-        Ok(FileDiff { base, hunks })
+        Ok(FileDiff {
+            base,
+            current,
+            hunks,
+        })
     }
 
     /// The log of one file, newest first.
