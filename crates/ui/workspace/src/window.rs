@@ -18,7 +18,7 @@ use ui_kit::*;
 use workspace_core::CommandRegistry;
 
 use crate::about::AboutView;
-use crate::chrome::{EditorChromeSignal, StatusBarView, TabBarView};
+use crate::chrome::{ChromeView, EditorChromeSignal, StatusBarView, TabBarView};
 use crate::editor::{EditorFactory, EditorStatus, FileIcons};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{DockState, Layout, PaneState, WindowPlacement, save_dark_theme, save_layout};
@@ -284,6 +284,30 @@ pub fn window_render_count(cx: &App) -> usize {
         .map_or(0, |count| count.0.get())
 }
 
+/// How many times each heavy view drew itself, by the name of the view, for tests that
+/// check which changes rebuild a cached view and which do not.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub struct ViewRenderCounts(pub RefCell<HashMap<&'static str, usize>>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Global for ViewRenderCounts {}
+
+/// Counts one draw of the view with this name, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn note_view_render(cx: &mut App, view: &'static str) {
+    let counts = cx.default_global::<ViewRenderCounts>();
+    *counts.0.borrow_mut().entry(view).or_default() += 1;
+}
+
+/// The number of draws of the view with this name, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn view_render_count(cx: &App, view: &str) -> usize {
+    cx.try_global::<ViewRenderCounts>()
+        .and_then(|counts| counts.0.borrow().get(view).copied())
+        .unwrap_or(0)
+}
+
 /// `ctrl-shift-n` as the menus write it: `Ctrl+Shift+N`, or `⇧⌘N` on macOS.
 fn shortcut_label(text: &str) -> String {
     keymap::shortcut_label(text, keymap::platform())
@@ -478,6 +502,11 @@ pub struct Workspace {
     pub(crate) chrome_signal: Entity<EditorChromeSignal>,
     /// The status bar, which follows the active editor on its own.
     pub(crate) status_view: Entity<StatusBarView>,
+    /// The title bar, kept out of the window's own frames.
+    pub(crate) title_view: Entity<ChromeView>,
+    /// The stripes of the tool window docks.
+    pub(crate) left_stripe_view: Entity<ChromeView>,
+    pub(crate) right_stripe_view: Entity<ChromeView>,
     /// The status bar and the tabs follow the changes of the window once it is built.
     chrome_started: bool,
     /// The number of changes of what the window itself shows, for tests.
@@ -663,6 +692,9 @@ impl Workspace {
         let chrome_weak = cx.weak_entity();
         let chrome_signal = cx.new(|_| EditorChromeSignal);
         let status_view = StatusBarView::create(chrome_weak.clone(), chrome_signal.clone(), cx);
+        let title_view = ChromeView::title_bar(chrome_weak.clone(), cx);
+        let left_stripe_view = ChromeView::left_stripe(chrome_weak.clone(), cx);
+        let right_stripe_view = ChromeView::right_stripe(chrome_weak.clone(), cx);
         let bounds = cx.observe_window_bounds(window, |this, window, cx| {
             this.placement = placement_of(window).or(this.placement);
             this.layout_changed(cx);
@@ -741,6 +773,9 @@ impl Workspace {
             focus_handle,
             chrome_signal,
             status_view,
+            title_view,
+            left_stripe_view,
+            right_stripe_view,
             chrome_started: false,
             #[cfg(any(test, feature = "test-support"))]
             state_revision: 0,
@@ -1199,18 +1234,32 @@ impl Workspace {
         self.notify_chrome_views(cx);
     }
 
-    /// The status bar and the tab strips show what the window itself shows, such as the
-    /// active tab or the layout, so they redraw with it.
+    /// The status bar, the tab strips, the title bar, the stripes and the tool windows
+    /// show what the window itself shows, such as the active tab or the layout, so they
+    /// redraw with it.
     fn notify_chrome_views(&mut self, cx: &mut Context<Self>) {
         #[cfg(any(test, feature = "test-support"))]
         {
             self.state_revision += 1;
         }
         self.status_view.update(cx, |_, cx| cx.notify());
+        self.title_view.update(cx, |_, cx| cx.notify());
+        self.left_stripe_view.update(cx, |_, cx| cx.notify());
+        self.right_stripe_view.update(cx, |_, cx| cx.notify());
         for pane in &self.panes {
             if let Some(bar) = &pane.bar {
                 bar.update(cx, |_, cx| cx.notify());
             }
+        }
+        // A tool window may show what the window holds (the branch, the open editors,
+        // the project model), and its cached frame would keep the old one. A keystroke
+        // does not notify the window, so typing still leaves the tool windows alone.
+        let tools: Vec<_> = [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.tools.iter().map(|tool| tool.view.entity_id()))
+            .collect();
+        for tool in tools {
+            App::notify(cx, tool);
         }
     }
 
@@ -1244,14 +1293,18 @@ impl Workspace {
         }
     }
 
-    /// Puts a tool window into a dock, in place of one with the same id.
+    /// Puts a tool window into a dock, in place of one with the same id. The window keeps
+    /// the last frame of the tool window until the tool window itself changes, the theme
+    /// or the scale changes, or the window changes what it shows.
     pub fn set_dock(
         &mut self,
         side: DockSide,
         id: &'static str,
         view: AnyView,
         focus: Option<FocusHandle>,
+        cx: &mut App,
     ) {
+        let view = ChromeView::tool(view, cx);
         let restore = side == DockSide::Bottom && self.layout.bottom_tool.as_deref() == Some(id);
         let dock = self.dock_mut(side);
         let tool = DockTool { id, view, focus };

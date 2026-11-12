@@ -2,7 +2,10 @@
 //! Recent Files and Show Content of a tool window, without a real window.
 
 use std::fs;
+use std::path::PathBuf;
 
+use lang_api::SymbolKind;
+use search::{SymbolRow, Target};
 use ui_kit::gpui;
 use ui_kit::gpui::{ModifiersChangedEvent, TestAppContext, VisualTestContext, WindowHandle};
 use ui_kit::{Modifiers, px};
@@ -13,7 +16,9 @@ use crate::window_tests::{
     active_path, bounds_of, click, draw, open_path, open_sample_window, press, type_text,
     wait_for_signal,
 };
-use crate::window_tests_ui::{double_shift, navigation_project, wait_for_symbols};
+use crate::window_tests_ui::{
+    double_shift, navigation_project, open_test_window, wait_for_symbols,
+};
 
 fn palette(cx: &TestAppContext, window: WindowHandle<Workspace>) -> gpui::Entity<Palette> {
     let view = window
@@ -54,7 +59,7 @@ fn header(rows: &[(String, String)], title: &str) -> usize {
 fn group_keys_walk_the_groups_of_search_everywhere(cx: &mut TestAppContext) {
     let root = navigation_project("navigation-groups");
     fs::write(root.join("src").join("Owner.txt"), "alpha\n").unwrap();
-    let window = crate::window_tests_ui::open_test_window(cx, root.clone());
+    let window = open_test_window(cx, root.clone());
     cx.run_until_parked();
     draw(cx, window);
     let sample = root.join("src").join("Sample.txt");
@@ -67,8 +72,12 @@ fn group_keys_walk_the_groups_of_search_everywhere(cx: &mut TestAppContext) {
         if !has_selector(cx, window, "palette") {
             return false;
         }
-        let rows = palette(cx, window).read_with(cx, |palette, _| palette.rows_text());
-        rows.iter().any(|(row, _)| row == "Classes") && rows.iter().any(|(row, _)| row == "Files")
+        let view = palette(cx, window);
+        let settled = view.read_with(cx, |palette, _| palette.replies_settled());
+        let rows = view.read_with(cx, |palette, _| palette.rows_text());
+        settled
+            && rows.iter().any(|(row, _)| row == "Classes")
+            && rows.iter().any(|(row, _)| row == "Files")
     });
     let rows = palette(cx, window).read_with(cx, |palette, _| palette.rows_text());
     let classes = header(&rows, "Classes");
@@ -110,9 +119,12 @@ fn group_keys_walk_the_groups_of_search_everywhere(cx: &mut TestAppContext) {
     double_shift(cx, window);
     type_text(cx, window, "notes");
     wait_for_signal(cx, "the single group", |cx| {
-        !palette(cx, window)
-            .read_with(cx, |palette, _| palette.rows_text())
-            .is_empty()
+        let view = palette(cx, window);
+        let settled = view.read_with(cx, |palette, _| palette.replies_settled());
+        settled
+            && !view
+                .read_with(cx, |palette, _| palette.rows_text())
+                .is_empty()
     });
     let rows = palette(cx, window).read_with(cx, |palette, _| palette.rows_text());
     let files = header(&rows, "Files");
@@ -128,6 +140,58 @@ fn group_keys_walk_the_groups_of_search_everywhere(cx: &mut TestAppContext) {
         selected,
         "there is no next group"
     );
+    press(cx, window, "escape");
+}
+
+#[ui_kit::gpui::test]
+fn a_late_group_keeps_the_row_the_keys_chose(cx: &mut TestAppContext) {
+    let root = navigation_project("navigation-late-group");
+    fs::write(root.join("src").join("Owner.txt"), "alpha\n").unwrap();
+    let window = open_test_window(cx, root.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    let sample = root.join("src").join("Sample.txt");
+    wait_for_symbols(cx, window, &sample);
+
+    double_shift(cx, window);
+    type_text(cx, window, "Owner");
+    wait_for_signal(cx, "the groups of Search Everywhere", |cx| {
+        let view = palette(cx, window);
+        let settled = view.read_with(cx, |palette, _| palette.replies_settled());
+        let rows = view.read_with(cx, |palette, _| palette.rows_text());
+        settled
+            && rows.iter().any(|(row, _)| row == "Classes")
+            && rows.iter().any(|(row, _)| row == "Files")
+    });
+    press(cx, window, "down");
+    let (index, title) = palette(cx, window).read_with(cx, |palette, _| {
+        let index = palette.selected_row();
+        (index, palette.rows_text()[index].0.clone())
+    });
+
+    // A last answer of the class source puts a class above the row the keys are on: the
+    // row itself stays selected, as it does for the user.
+    palette(cx, window).update(cx, |palette, cx| {
+        palette.apply_late_symbols(
+            vec![SymbolRow {
+                name: "OwnerLate".to_owned(),
+                kind: SymbolKind::Class,
+                container: None,
+                target: Target::Offset {
+                    path: PathBuf::from("src/Late.txt"),
+                    offset: 0,
+                },
+                score: u32::MAX,
+            }],
+            cx,
+        );
+    });
+    let (moved, still) = palette(cx, window).read_with(cx, |palette, _| {
+        let index = palette.selected_row();
+        (index, palette.rows_text()[index].0.clone())
+    });
+    assert_eq!(moved, index + 1, "the class above moves the rows down");
+    assert_eq!(still, title, "the row the keys chose stays selected");
     press(cx, window, "escape");
 }
 

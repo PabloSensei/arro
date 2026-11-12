@@ -613,6 +613,8 @@ pub fn show_file(
 
 impl Render for GitLogPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        workspace::note_view_render(cx, "git-log");
         let theme = *cx.global::<Theme>();
         let commits = self.commit_rows(&theme, cx);
         let files = self.file_rows(&theme, cx);

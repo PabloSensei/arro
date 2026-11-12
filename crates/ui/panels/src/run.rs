@@ -168,6 +168,11 @@ pub struct RunPanel {
     build_process: Option<u32>,
     /// The answer of a hot swap the last Build Project asked for.
     reload: Option<Receiver<ReloadOutcome>>,
+    /// Bumped when a program of this panel ended and its console is fully read, or when
+    /// a test run ended and its results are all in, for a test that waits for the
+    /// process instead of a clock.
+    #[cfg(test)]
+    finished: u64,
     /// Bumped on every build file that changed: only the import after the last of a
     /// batch runs.
     model_reload: u64,
@@ -267,6 +272,8 @@ impl RunPanel {
                 build_output: OutputBuffers::default(),
                 build_process: None,
                 reload: None,
+                #[cfg(test)]
+                finished: 0,
                 model_reload: 0,
                 console_input: ConsoleInput::new(),
                 program_started: false,
@@ -1721,7 +1728,16 @@ impl RunPanel {
             self.mark_built();
             self.request_reload(cx);
         }
+        #[cfg(test)]
+        let tests_ran = self.tests.run.is_some();
         changed |= self.poll_tests(cx);
+        // A test that waits for a process waits for this, not for a clock: the console is
+        // closed, so every line of the program is in, and a test run is over only when
+        // its result stream is.
+        #[cfg(test)]
+        if (closed && main_console) || (tests_ran && self.tests.run.is_none()) {
+            self.finished += 1;
+        }
         changed |= self.poll_reload(cx);
         if self.debugging_tests && !self.starting {
             let ended = cx
@@ -2166,6 +2182,8 @@ fn tab_button(
 
 impl Render for RunPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        workspace::note_view_render(cx, "run");
         let theme = *cx.global::<Theme>();
         let view = self.viewing.filter(|index| *index < self.draining.len());
         let count = match view {

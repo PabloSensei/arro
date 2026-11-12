@@ -2267,6 +2267,8 @@ impl Render for AnalysisDialog {
 
 impl Render for CommitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        workspace::note_view_render(cx, "commit");
         let theme = *cx.global::<Theme>();
         let count = self.visible_files(cx).len();
         let busy = self.git.read(cx).busy();

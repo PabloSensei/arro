@@ -589,6 +589,13 @@ impl Finder {
         &self.mask_hint
     }
 
+    /// The list of files it searches, so a test waits until the index has reached it
+    /// before it reads the mask of the project.
+    #[cfg(test)]
+    pub(crate) fn files(&self) -> &Entity<Arc<Vec<PathBuf>>> {
+        &self.files
+    }
+
     fn input(&self, field: Field, value: &TextField, label: &str, theme: &Theme) -> Div {
         let active = field == self.field;
         let selector = match field {

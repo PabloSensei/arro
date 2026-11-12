@@ -43,4 +43,4 @@ pub use window::{
 };
 
 #[cfg(any(test, feature = "test-support"))]
-pub use window::window_render_count;
+pub use window::{note_view_render, view_render_count, window_render_count};

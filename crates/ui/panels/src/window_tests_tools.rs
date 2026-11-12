@@ -342,16 +342,19 @@ fn the_test_tree_of_the_run_window_walks_and_opens_the_source(cx: &mut TestAppCo
     let view = editor_of(cx, window, &source);
     view.update(cx, |view, cx| view.restore_caret(1, 0, cx));
     draw(cx, window);
+    let finished = panel.read_with(cx, |panel, _| panel.finished_generation());
     press(cx, window, "ctrl-shift-f10");
-    wait_for_process(cx, "the finished tests", |cx| {
-        panel.read_with(cx, |panel, _| {
-            panel.idle()
-                && panel
-                    .test_report()
-                    .iter()
-                    .any(|line| line.contains("failed") && line.contains("fails"))
-        })
+    wait_for_process(cx, |cx| {
+        panel.read_with(cx, |panel, _| panel.finished_generation() > finished)
     });
+    let report = panel.read_with(cx, |panel, _| panel.test_report());
+    assert!(
+        report
+            .iter()
+            .any(|line| line.contains("failed") && line.contains("fails")),
+        "the tree has the failed test: {report:?}"
+    );
+    assert!(panel.read_with(cx, |panel, _| panel.idle()));
 
     show_tool(cx, window, RUN_TOOL);
     press(cx, window, "up down");

@@ -345,8 +345,13 @@ fn the_find_in_files_mask_comes_from_the_language_of_the_project(cx: &mut TestAp
                 .is_some_and(|global| global.0.is_some())
         })
     });
-    type_text(cx, window, "a");
     let finder = finder(cx);
+    // The hint is taken from the files the project has when the query first runs: a
+    // typing before the index reaches the search would read an empty project.
+    wait_for(cx, "the file list of the project", |cx| {
+        finder.read_with(cx, |finder, cx| finder.files().read(cx).len() >= 4)
+    });
+    type_text(cx, window, "a");
     assert_eq!(
         finder.read_with(cx, |finder, _| finder.mask_hint().to_owned()),
         "*.kt !*Test.kt"

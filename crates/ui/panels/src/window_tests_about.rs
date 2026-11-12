@@ -151,10 +151,20 @@ impl Drop for Server {
 }
 
 fn answer(mut stream: TcpStream, body: &str) {
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    // On Windows the accepted socket inherits the non-blocking mode of the listener, and
+    // a socket closed with an unread request resets the connection: read the whole head
+    // of the request first, however slow a loaded machine sends it.
+    stream.set_nonblocking(false).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut line = String::new();
-    reader.read_line(&mut line).ok();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.trim_end().is_empty() => break,
+            Ok(_) => {}
+        }
+    }
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()

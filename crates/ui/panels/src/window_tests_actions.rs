@@ -774,26 +774,32 @@ fn rerun_failed_tests_from_find_action_runs_only_the_failures(cx: &mut TestAppCo
     let view = editor_of(cx, window, &source);
     view.update(cx, |view, cx| view.restore_caret(1, 0, cx));
     draw(cx, window);
+    let finished = panel.read_with(cx, |panel, _| panel.finished_generation());
     press(cx, window, "ctrl-shift-f10");
-    wait_for_process(cx, "the first run", |cx| {
+    wait_for_process(cx, |cx| {
         requests
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .len()
             == 1
-            && panel.read_with(cx, |panel, _| panel.idle())
+            && panel.read_with(cx, |panel, _| {
+                panel.finished_generation() > finished && panel.idle()
+            })
     });
     let first = requests.lock().unwrap_or_else(|error| error.into_inner())[0].clone();
     assert_eq!(first.case.as_deref(), Some("fails"));
 
+    let finished = panel.read_with(cx, |panel, _| panel.finished_generation());
     find_action(cx, window, "rerun failed tests");
-    wait_for_process(cx, "the rerun", |cx| {
+    wait_for_process(cx, |cx| {
         requests
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .len()
             == 2
-            && panel.read_with(cx, |panel, _| panel.idle())
+            && panel.read_with(cx, |panel, _| {
+                panel.finished_generation() > finished && panel.idle()
+            })
     });
     let second = requests.lock().unwrap_or_else(|error| error.into_inner())[1].clone();
     assert_eq!(

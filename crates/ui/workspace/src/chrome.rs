@@ -1997,10 +1997,18 @@ impl Workspace {
             None => body.child(self.welcome(theme)).into_any_element(),
         };
         let down = self.split_down;
-        let bar = self.panes[pane]
-            .bar
-            .clone()
-            .map_or_else(|| div().into_any_element(), |bar| bar.into_any_element());
+        let bar = self.panes[pane].bar.clone().map_or_else(
+            || div().into_any_element(),
+            |bar| {
+                bar.cached(
+                    StyleRefinement::default()
+                        .w_full()
+                        .h(px(HEADER_HEIGHT))
+                        .flex_none(),
+                )
+                .into_any_element()
+            },
+        );
         island(theme)
             .flex_1()
             .min_w_0()
@@ -2058,7 +2066,11 @@ impl Workspace {
 
     fn dock_body(&self, side: DockSide, theme: &Theme) -> AnyElement {
         match self.dock(side).active_tool() {
-            Some(tool) => tool.view.clone().into_any_element(),
+            Some(tool) => tool
+                .view
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element(),
             None => island(theme).size_full().into_any_element(),
         }
     }
@@ -2534,13 +2546,33 @@ impl Render for Workspace {
                     this.resize_dock(side, event.event.position, window, cx);
                 }),
             )
-            .child(self.toolbar(window, &theme, cx))
+            .child(
+                self.title_view
+                    .clone()
+                    .cached(
+                        StyleRefinement::default()
+                            .w_full()
+                            .h(px(TOOLBAR_HEIGHT))
+                            .flex_none(),
+                    )
+                    .into_any_element(),
+            )
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.left_stripe(&theme, cx))
+                    .child(
+                        self.left_stripe_view
+                            .clone()
+                            .cached(
+                                StyleRefinement::default()
+                                    .w(px(STRIPE_WIDTH))
+                                    .h_full()
+                                    .flex_none(),
+                            )
+                            .into_any_element(),
+                    )
                     .child(
                         div()
                             .flex()
@@ -2550,11 +2582,123 @@ impl Render for Workspace {
                             .child(upper)
                             .child(lower),
                     )
-                    .child(self.right_stripe(&theme, cx)),
+                    .child(
+                        self.right_stripe_view
+                            .clone()
+                            .cached(
+                                StyleRefinement::default()
+                                    .w(px(RIGHT_STRIPE_WIDTH))
+                                    .h_full()
+                                    .flex_none(),
+                            )
+                            .into_any_element(),
+                    ),
             )
-            .child(self.status_view.clone().into_any_element())
+            .child(
+                self.status_view
+                    .clone()
+                    .cached(
+                        StyleRefinement::default()
+                            .w_full()
+                            .h(px(STATUS_HEIGHT))
+                            .flex_none(),
+                    )
+                    .into_any_element(),
+            )
             .children(self.overlay_element(&theme, window, cx))
             .children(self.balloon_element(&theme, cx))
+    }
+}
+
+/// A piece of the window chrome or a tool window that draws itself apart from the
+/// window. The window embeds it as a cached view, so a keystroke in the editor only
+/// rebuilds the editor: the piece redraws when its own view changes, when the window
+/// changes what it shows, or when the theme or the interface scale changes.
+pub(crate) enum ChromePart {
+    TitleBar,
+    LeftStripe,
+    RightStripe,
+    /// A tool window, drawn by its own entity.
+    Tool(AnyView),
+}
+
+pub(crate) struct ChromeView {
+    /// The window that the chrome of this piece reads; `None` for a tool window.
+    workspace: Option<WeakEntity<Workspace>>,
+    part: ChromePart,
+}
+
+impl ChromeView {
+    fn create(
+        workspace: Option<WeakEntity<Workspace>>,
+        part: ChromePart,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            // A theme fade changes the global on every frame of the animation, and the
+            // scale changes every size of the chrome: both have to redraw the cache.
+            cx.observe_global::<Theme>(|_, cx| cx.notify()).detach();
+            cx.observe_global::<Settings>(|_, cx| cx.notify()).detach();
+            Self { workspace, part }
+        })
+    }
+
+    pub(crate) fn title_bar(workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<Self> {
+        Self::create(Some(workspace), ChromePart::TitleBar, cx)
+    }
+
+    pub(crate) fn left_stripe(workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<Self> {
+        Self::create(Some(workspace), ChromePart::LeftStripe, cx)
+    }
+
+    pub(crate) fn right_stripe(workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<Self> {
+        Self::create(Some(workspace), ChromePart::RightStripe, cx)
+    }
+
+    /// Wraps a tool window of the docks, so that the window can keep its last frame
+    /// while the tool window itself did not change.
+    pub(crate) fn tool(view: AnyView, cx: &mut App) -> AnyView {
+        Self::create(None, ChromePart::Tool(view), cx).into()
+    }
+}
+
+impl Render for ChromeView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let content = match &self.part {
+            ChromePart::Tool(view) => view.clone().into_any_element(),
+            _ => {
+                let Some(workspace) = self.workspace.as_ref().and_then(|weak| weak.upgrade())
+                else {
+                    return div().size_full().into_any_element();
+                };
+                match &self.part {
+                    ChromePart::TitleBar => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        crate::window::note_view_render(cx, "title");
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.toolbar(window, &theme, cx).into_any_element()
+                            })
+                            .into_any_element()
+                    }
+                    ChromePart::LeftStripe => workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.left_stripe(&theme, cx).into_any_element()
+                        })
+                        .into_any_element(),
+                    ChromePart::RightStripe => workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.right_stripe(&theme, cx).into_any_element()
+                        })
+                        .into_any_element(),
+                    ChromePart::Tool(_) => div().into_any_element(),
+                }
+            }
+        };
+        // A cached view is laid out as a root at the size the window gave it, so its
+        // content has to fill that size instead of measuring itself.
+        div().size_full().child(content).into_any_element()
     }
 }
 
@@ -2743,6 +2887,7 @@ impl Render for TabBarView {
             .items_center()
             .justify_between()
             .flex_none()
+            .w_full()
             .h(px(HEADER_HEIGHT))
             .px(px(SPACE_M))
             .border_b_1()
@@ -2997,6 +3142,7 @@ impl Render for StatusBarView {
             .items_center()
             .justify_between()
             .flex_none()
+            .w_full()
             .h(px(STATUS_HEIGHT))
             .gap(px(SPACE_L))
             .px(px(SPACE_M))

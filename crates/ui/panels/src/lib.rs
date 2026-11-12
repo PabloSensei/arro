@@ -272,6 +272,9 @@ mod window_tests_keystroke_repaint;
 #[cfg(test)]
 mod window_tests_run_output;
 
+#[cfg(test)]
+mod window_tests_cached_views;
+
 mod choice;
 mod invalidate;
 
@@ -651,12 +654,19 @@ fn install(
         PROJECT_TOOL,
         panel.clone().into(),
         Some(focus),
+        cx,
     );
     project::bind_actions(panel.clone(), weak.clone(), window.window_handle(), cx);
     cx.set_global(project::ActiveProjectPanel(panel));
     let log = git_log::GitLogPanel::create(git.clone(), weak.clone(), cx);
     let focus = log.read(cx).focus();
-    workspace.set_dock(DockSide::Bottom, LOG_TOOL, log.clone().into(), Some(focus));
+    workspace.set_dock(
+        DockSide::Bottom,
+        LOG_TOOL,
+        log.clone().into(),
+        Some(focus),
+        cx,
+    );
     cx.set_global(git_log::ActiveGitLog(log));
     let root = workspace.root().to_path_buf();
     let commit = commit::CommitPanel::create(
@@ -674,6 +684,7 @@ fn install(
         COMMIT_TOOL,
         commit.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(script::ActiveCommitPanel(commit));
     let structure = structure::StructurePanel::create(weak.clone(), cx);
@@ -683,6 +694,7 @@ fn install(
         STRUCTURE_TOOL,
         structure.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(structure::ActiveStructure(structure));
 
@@ -697,6 +709,7 @@ fn install(
         TERMINAL_TOOL,
         terminal.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(terminal_panel::ActiveTerminal(terminal));
 
@@ -708,13 +721,20 @@ fn install(
         SERVICES_TOOL,
         services.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(docker::ActiveDocker(services));
 
     let root = workspace.root().to_path_buf();
     let runs = run::RunPanel::create(root, project.clone(), weak.clone(), cx);
     let focus = runs.read(cx).focus();
-    workspace.set_dock(DockSide::Bottom, RUN_TOOL, runs.clone().into(), Some(focus));
+    workspace.set_dock(
+        DockSide::Bottom,
+        RUN_TOOL,
+        runs.clone().into(),
+        Some(focus),
+        cx,
+    );
     workspace.set_run_controls(run::RunPanel::controls(&runs));
     cx.set_global(script::ActiveRunPanel(runs.clone()));
 
@@ -730,8 +750,21 @@ fn install(
         DEBUG_TOOL,
         debug.clone().into(),
         Some(focus),
+        cx,
     );
     workspace.set_debug_controls(debug::controls(&debug, &runs));
+    // The Stop button of the title bar follows the debug session, and the title bar is a
+    // cached view that redraws with the window: the window redraws when the session
+    // starts, stops or ends.
+    let mut shown = debug.read(cx).state();
+    cx.observe(&debug, move |_, debug, cx| {
+        let state = debug.read(cx).state();
+        if state != shown {
+            shown = state;
+            cx.notify();
+        }
+    })
+    .detach();
     cx.set_global(debug::ActiveDebug(debug));
 
     let hub = Arc::new(debug::DebugHub::default());
@@ -752,6 +785,7 @@ fn install(
         AI_TOOL,
         agent_panel.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(agents::ActiveAgents(agent_panel));
 
@@ -762,6 +796,7 @@ fn install(
         TASKS_TOOL,
         tasks.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(script::ActiveBuildPanel(tasks));
 
@@ -778,6 +813,7 @@ fn install(
         TODO_TOOL,
         todo_panel.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(todo::ActiveTodo(todo_panel));
 
@@ -789,6 +825,7 @@ fn install(
         PROBLEMS_TOOL,
         problems_panel.into(),
         Some(focus),
+        cx,
     );
     problems::bind_actions(problems.clone(), weak.clone(), window.window_handle(), cx);
     cx.set_global(problems::ActiveProblems(problems));
@@ -801,6 +838,7 @@ fn install(
         USAGES_TOOL,
         usages.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(usages::ActiveUsages(usages));
 
@@ -811,6 +849,7 @@ fn install(
         PERFORMANCE_TOOL,
         performance.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(performance::ActivePerformance(performance));
 
@@ -821,6 +860,7 @@ fn install(
         DOCUMENTATION_TOOL,
         documentation.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(documentation::ActiveDocumentation(documentation));
 
@@ -831,6 +871,7 @@ fn install(
         workspace::CALL_HIERARCHY_TOOL,
         call_hierarchy.clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(call_hierarchy::ActiveCallHierarchy(call_hierarchy));
 
@@ -841,6 +882,7 @@ fn install(
         workspace::METHOD_HIERARCHY_TOOL,
         method_hierarchy.read(cx).panel().clone().into(),
         Some(focus),
+        cx,
     );
     cx.set_global(method_hierarchy::ActiveMethodHierarchy(method_hierarchy));
 
@@ -863,7 +905,13 @@ fn install(
     );
     let panel = inspect.read(cx).panel().clone();
     let focus = panel.read(cx).focus();
-    workspace.set_dock(DockSide::Bottom, INSPECTION_TOOL, panel.into(), Some(focus));
+    workspace.set_dock(
+        DockSide::Bottom,
+        INSPECTION_TOOL,
+        panel.into(),
+        Some(focus),
+        cx,
+    );
     cx.set_global(inspect::ActiveInspect(inspect.clone()));
     inspect::bind_commands(inspect, workspace, cx);
     reformat::bind_commands(workspace, cx);

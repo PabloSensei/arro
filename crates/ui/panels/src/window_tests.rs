@@ -216,14 +216,32 @@ pub(crate) fn wait_for_parse_signal(
     });
 }
 
-/// Waits for a step of a real program or test process. Only this wait needs a limit of
-/// its own: the signal it looks for comes from outside the window.
+/// How long a process of a test may take on a loaded machine before the test fails
+/// instead of hanging the whole run.
+const PROCESS_LIMIT: Duration = Duration::from_secs(600);
+
+/// Runs `check` until it holds, letting a real program or test process of the window
+/// work. The check reads a signal the panel raises when the process has ended, so the
+/// wait lasts as long as a loaded machine needs; the generous limit only keeps a broken
+/// test from hanging the run.
 pub(crate) fn wait_for_process(
     cx: &mut TestAppContext,
-    what: &str,
-    check: impl FnMut(&mut TestAppContext) -> bool,
+    mut check: impl FnMut(&mut TestAppContext) -> bool,
 ) {
-    wait_for_signal(cx, what, check);
+    let started = std::time::Instant::now();
+    loop {
+        if check(cx) {
+            return;
+        }
+        assert!(
+            started.elapsed() < PROCESS_LIMIT,
+            "the process of the test did not end in {} s",
+            PROCESS_LIMIT.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        cx.executor().advance_clock(SIGNAL_TICK);
+        cx.run_until_parked();
+    }
 }
 
 /// Draws one frame, so that the render of the workspace and of the open tool window runs.

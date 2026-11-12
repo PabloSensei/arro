@@ -140,7 +140,7 @@ struct ActionEntry {
     shortcut: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum Item {
     File {
         path: PathBuf,
@@ -257,6 +257,11 @@ pub struct Palette {
     /// Answers of the symbol sources for the query on screen, by scope and source.
     symbol_batches: HashMap<(usize, usize), Vec<SymbolRow>>,
     serial: usize,
+    /// The keys moved the selection: a late group keeps that row, not the first one.
+    navigated: bool,
+    /// The reply streams of the query on screen that are not over yet, for a test that
+    /// reads the rows: only the last answer of a group may still change them.
+    pending_replies: usize,
     tasks: Vec<Task<()>>,
 }
 
@@ -319,6 +324,8 @@ impl Palette {
                 structure,
                 symbol_batches: HashMap::new(),
                 serial: 0,
+                navigated: false,
+                pending_replies: 0,
                 tasks: Vec::new(),
             };
             palette.refresh(cx);
@@ -363,6 +370,8 @@ impl Palette {
         self.serial += 1;
         self.tasks.clear();
         self.symbol_batches.clear();
+        self.pending_replies = 0;
+        self.navigated = false;
         self.rebuild(cx);
         if let Mode::Everywhere(tab) = self.mode
             && !self.command_query()
@@ -401,6 +410,7 @@ impl Palette {
                 scope,
                 limit,
             };
+            self.pending_replies += 1;
             let mut replies = ask(&**source, request);
             let task = cx.spawn(async move |this, cx| {
                 while let Some(answer) = replies.next().await {
@@ -409,11 +419,21 @@ impl Palette {
                         this.symbols_arrived((scope_at, source_at), serial, rows, cx)
                     });
                     if arrived.is_err() {
-                        break;
+                        return;
                     }
                 }
+                this.update(cx, |this, _| this.replies_finished(serial))
+                    .ok();
             });
             self.tasks.push(task);
+        }
+    }
+
+    /// One stream of the query on screen is over: its group has all the rows it will
+    /// send.
+    fn replies_finished(&mut self, serial: usize) {
+        if serial == self.serial {
+            self.pending_replies = self.pending_replies.saturating_sub(1);
         }
     }
 
@@ -428,7 +448,7 @@ impl Palette {
             return;
         }
         self.symbol_batches.insert(key, rows);
-        self.rebuild(cx);
+        self.rebuild_keeping_selection(cx);
     }
 
     fn batches_of(&self, scope_at: usize) -> Vec<Vec<SymbolRow>> {
@@ -717,6 +737,23 @@ impl Palette {
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_keeping(false, cx);
+    }
+
+    /// Rows from a late answer: the row the user is on stays selected, even when the
+    /// answer puts rows above it. Another query starts again from the first row.
+    fn rebuild_keeping_selection(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_keeping(true, cx);
+    }
+
+    fn rebuild_keeping(&mut self, keep_selection: bool, cx: &mut Context<Self>) {
+        let previous = (keep_selection && self.navigated)
+            .then(|| {
+                self.rows
+                    .get(self.selected)
+                    .and_then(|row| row.item.clone())
+            })
+            .flatten();
         let mut rows = Vec::new();
         match self.mode {
             Mode::Recent | Mode::RecentChanged => rows = self.file_rows(cx, MAX_ROWS),
@@ -737,66 +774,70 @@ impl Palette {
             Mode::Everywhere(tab) => {
                 if self.command_query() {
                     rows = self.command_rows();
-                    self.rows = rows;
-                    self.selected = self.first_selectable();
-                    cx.notify();
-                    return;
-                }
-                let all = tab == Tab::All;
-                let limit = if all { GROUP_ROWS } else { MAX_ROWS };
-                let searching = !GotoQuery::parse(&self.query.text).pattern.is_empty();
-                let group = |title: &str, found: Vec<RowData>, rows: &mut Vec<RowData>| {
-                    if found.is_empty() {
-                        return;
+                } else {
+                    let all = tab == Tab::All;
+                    let limit = if all { GROUP_ROWS } else { MAX_ROWS };
+                    let searching = !GotoQuery::parse(&self.query.text).pattern.is_empty();
+                    let group = |title: &str, found: Vec<RowData>, rows: &mut Vec<RowData>| {
+                        if found.is_empty() {
+                            return;
+                        }
+                        if all {
+                            rows.push(RowData::header(title));
+                        }
+                        rows.extend(found);
+                    };
+                    if matches!(tab, Tab::All | Tab::Classes) && searching {
+                        group("Classes", self.symbol_rows(0, limit), &mut rows);
                     }
-                    if all {
-                        rows.push(RowData::header(title));
+                    if matches!(tab, Tab::All | Tab::Files) && (searching || tab == Tab::Files) {
+                        group("Files", self.file_rows(cx, limit), &mut rows);
                     }
-                    rows.extend(found);
-                };
-                if matches!(tab, Tab::All | Tab::Classes) && searching {
-                    group("Classes", self.symbol_rows(0, limit), &mut rows);
-                }
-                if matches!(tab, Tab::All | Tab::Files) && (searching || tab == Tab::Files) {
-                    group("Files", self.file_rows(cx, limit), &mut rows);
-                }
-                if matches!(tab, Tab::All | Tab::Symbols) && searching {
-                    let at = usize::from(all);
-                    group("Symbols", self.symbol_rows(at, limit), &mut rows);
-                }
-                if matches!(tab, Tab::All | Tab::Actions) && searching {
-                    let settings = self.setting_rows(limit, cx);
-                    if all {
-                        group("Settings", settings, &mut rows);
-                    } else {
-                        // Find Action lists settings before commands, as IDEA does.
-                        rows.extend(settings);
+                    if matches!(tab, Tab::All | Tab::Symbols) && searching {
+                        let at = usize::from(all);
+                        group("Symbols", self.symbol_rows(at, limit), &mut rows);
                     }
-                }
-                if matches!(tab, Tab::All | Tab::Actions) && searching {
-                    group("Actions", self.action_rows(limit), &mut rows);
-                }
-                if tab == Tab::Actions && !searching {
-                    rows = self.action_rows(MAX_ROWS);
-                    rows.extend(self.setting_rows(MAX_ROWS, cx));
+                    if matches!(tab, Tab::All | Tab::Actions) && searching {
+                        let settings = self.setting_rows(limit, cx);
+                        if all {
+                            group("Settings", settings, &mut rows);
+                        } else {
+                            // Find Action lists settings before commands, as IDEA does.
+                            rows.extend(settings);
+                        }
+                    }
+                    if matches!(tab, Tab::All | Tab::Actions) && searching {
+                        group("Actions", self.action_rows(limit), &mut rows);
+                    }
+                    if tab == Tab::Actions && !searching {
+                        rows = self.action_rows(MAX_ROWS);
+                        rows.extend(self.setting_rows(MAX_ROWS, cx));
+                    }
                 }
             }
         }
         self.rows = rows;
         let first = self.first_selectable();
-        self.selected = match (self.mode, self.query.text.is_empty()) {
-            // The previous file, so that a second Ctrl+E or Ctrl+Tab goes back.
-            (Mode::Recent | Mode::RecentChanged, true) if self.rows.len() > 1 => 1,
-            // The Switcher starts on the previous file; with one file it stays on the
-            // current one and the first Tab reaches the tool windows.
-            (Mode::Switcher, true) => self
-                .rows
+        self.selected = match previous.and_then(|item| {
+            self.rows
                 .iter()
-                .enumerate()
-                .skip(1)
-                .find(|(_, row)| matches!(row.item, Some(Item::File { .. })))
-                .map_or(first, |(index, _)| index),
-            _ => first,
+                .position(|row| row.item.as_ref() == Some(&item))
+        }) {
+            Some(index) => index,
+            None => match (self.mode, self.query.text.is_empty()) {
+                // The previous file, so that a second Ctrl+E or Ctrl+Tab goes back.
+                (Mode::Recent | Mode::RecentChanged, true) if self.rows.len() > 1 => 1,
+                // The Switcher starts on the previous file; with one file it stays on the
+                // current one and the first Tab reaches the tool windows.
+                (Mode::Switcher, true) => self
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, row)| matches!(row.item, Some(Item::File { .. })))
+                    .map_or(first, |(index, _)| index),
+                _ => first,
+            },
         };
         cx.notify();
     }
@@ -866,6 +907,21 @@ impl Palette {
     #[cfg(test)]
     pub(crate) fn selected_row(&self) -> usize {
         self.selected
+    }
+
+    /// Whether every source has answered for the query on screen, for a test that reads
+    /// the rows: a late group would move them.
+    #[cfg(test)]
+    pub(crate) fn replies_settled(&self) -> bool {
+        self.pending_replies == 0
+    }
+
+    /// A late answer of the class source for the query on screen, for the test of a list
+    /// that grows after a key moved the selection.
+    #[cfg(test)]
+    pub(crate) fn apply_late_symbols(&mut self, rows: Vec<SymbolRow>, cx: &mut Context<Self>) {
+        let serial = self.serial;
+        self.symbols_arrived((0, usize::MAX), serial, rows, cx);
     }
 
     /// The keys that toggle the checkbox of Recent Files: Ctrl+E there does not reopen
@@ -952,6 +1008,7 @@ impl Palette {
             return;
         };
         self.selected = header + 1;
+        self.navigated = true;
         self.scroll.scroll_to_item(self.selected);
         cx.notify();
     }
@@ -966,6 +1023,7 @@ impl Palette {
             at = (at + delta).rem_euclid(count as isize);
             if self.rows[at as usize].item.is_some() {
                 self.selected = at as usize;
+                self.navigated = true;
                 break;
             }
         }
@@ -1004,6 +1062,7 @@ impl Palette {
             match self.rows.get(at as usize).filter(|_| at >= 0) {
                 Some(row) if row.item.is_some() => {
                     self.selected = at as usize;
+                    self.navigated = true;
                     break;
                 }
                 Some(_) => continue,

@@ -441,14 +441,21 @@ fn run_shift_f10_shows_the_output_and_the_exit_code(cx: &mut TestAppContext) {
     let panel = run_panel(cx);
 
     wait_for_config(cx, &panel);
+    let finished = panel.read_with(cx, |panel, _| panel.finished_generation());
     press(cx, window, "shift-f10");
-    wait_for_process(cx, "the end of the program", |cx| {
-        let text = run_text(cx, &panel);
-        text.iter().any(|line| line.contains("hello from run"))
-            && text
-                .iter()
-                .any(|line| line.contains("Process finished with exit code 0"))
+    wait_for_process(cx, |cx| {
+        panel.read_with(cx, |panel, _| panel.finished_generation() > finished)
     });
+    let text = run_text(cx, &panel);
+    assert!(
+        text.iter().any(|line| line.contains("hello from run")),
+        "the output of the program is in the console: {text:?}"
+    );
+    assert!(
+        text.iter()
+            .any(|line| line.contains("Process finished with exit code 0")),
+        "the exit code is in the console: {text:?}"
+    );
     assert!(!run_state(cx, &panel).running, "the program has finished");
 }
 

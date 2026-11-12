@@ -336,6 +336,14 @@ impl RunPanel {
             || self.tests.run.is_some())
     }
 
+    /// A signal for a test: a program of this panel ended and every line of its console
+    /// is read, or a test run ended and its results are all in. A wait for a real process
+    /// ends here, not on a clock.
+    #[cfg(test)]
+    pub(crate) fn finished_generation(&self) -> u64 {
+        self.finished
+    }
+
     /// The tree and the failure as text, for scripts.
     pub fn test_report(&self) -> Vec<String> {
         if !self.tests.active() {

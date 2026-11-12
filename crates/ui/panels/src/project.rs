@@ -1970,6 +1970,8 @@ impl ProjectPanel {
 
 impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        workspace::note_view_render(cx, "project");
         let theme = *cx.global::<Theme>();
         let count = self.tree.rows().len();
         let workspace = self.workspace.clone();
