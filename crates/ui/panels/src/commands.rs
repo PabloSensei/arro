@@ -27,7 +27,7 @@ use crate::project_structure::ProjectStructureDialog;
 use crate::prompt::Prompt;
 use crate::run::RunPanel;
 use crate::run_configs::RunConfigDialog;
-use crate::script::ActiveRunPanel;
+use crate::script::{ActiveCommitPanel, ActiveRunPanel};
 use crate::todo::ActiveTodo;
 use crate::usages::{self, ActiveUsages};
 
@@ -84,7 +84,7 @@ pub fn register(
         ),
         (keys::RUN_ANYTHING, "Run Anything", Mode::RunAnything),
         (keys::RECENT_FILES, "Recent Files", Mode::Recent),
-        (keys::SWITCHER, "Switcher", Mode::Recent),
+        (keys::SWITCHER, "Switcher", Mode::Switcher),
         (keys::FILE_STRUCTURE, "File Structure", Mode::Structure),
     ];
     for (id, title, mode) in palettes {
@@ -194,6 +194,7 @@ pub fn register(
     workspace.register_command("window.show_bookmarks", "Bookmarks", places::show_bookmarks);
     workspace.register_command(keys::BACK, "Back", navigation::back);
     workspace.register_command(keys::FORWARD, "Forward", navigation::forward);
+    workspace.register_command(keys::SHOW_CONTENT, "Show Content", show_content);
 
     for action in editor_keys::IDEA_IDS
         .iter()
@@ -502,6 +503,92 @@ fn set_todo_packages(settings: &mut workspace::Settings) {
 }
 fn set_todo_flatten(settings: &mut workspace::Settings) {
     settings.todo_flatten_packages = !settings.todo_flatten_packages;
+}
+
+/// Alt+Down: the tabs of the tool window in front, as a popup. The tool windows with
+/// tabs are Run, Usages and Commit.
+fn show_content(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let tools = [RUN_TOOL, workspace::USAGES_TOOL, workspace::COMMIT_TOOL];
+    let tool = workspace
+        .focused_tool_id(window, cx)
+        .filter(|id| tools.contains(id))
+        .or_else(|| tools.into_iter().find(|id| workspace.tool_open(id)));
+    let Some(tool) = tool else {
+        return;
+    };
+    let entries = match tool {
+        RUN_TOOL => run_content(cx),
+        workspace::USAGES_TOOL => usages_content(cx),
+        workspace::COMMIT_TOOL => commit_content(cx),
+        _ => return,
+    };
+    if entries.is_empty() {
+        return;
+    }
+    workspace.show_menu(popup_anchor(workspace, window, cx), entries, cx);
+}
+
+fn run_content(cx: &App) -> Vec<MenuEntry> {
+    let Some(panel) = cx
+        .try_global::<ActiveRunPanel>()
+        .map(|active| active.0.clone())
+    else {
+        return Vec::new();
+    };
+    panel
+        .read(cx)
+        .content_tabs()
+        .into_iter()
+        .enumerate()
+        .map(|(index, title)| {
+            let panel = panel.clone();
+            MenuEntry::new(title, move |_, cx| {
+                panel.update(cx, |panel, cx| panel.select_content(index, cx));
+            })
+        })
+        .collect()
+}
+
+fn usages_content(cx: &App) -> Vec<MenuEntry> {
+    let Some(hub) = cx
+        .try_global::<ActiveUsages>()
+        .map(|active| active.0.clone())
+    else {
+        return Vec::new();
+    };
+    hub.read(cx)
+        .tab_names()
+        .into_iter()
+        .enumerate()
+        .map(|(index, title)| {
+            let hub = hub.clone();
+            MenuEntry::new(title, move |_, cx| {
+                hub.update(cx, |hub, cx| hub.select_tab(index, cx));
+            })
+        })
+        .collect()
+}
+
+fn commit_content(cx: &App) -> Vec<MenuEntry> {
+    let Some(panel) = cx
+        .try_global::<ActiveCommitPanel>()
+        .map(|active| active.0.clone())
+    else {
+        return Vec::new();
+    };
+    [crate::commit::Tab::Commit, crate::commit::Tab::Shelf]
+        .into_iter()
+        .map(|tab| {
+            let panel = panel.clone();
+            let label = match tab {
+                crate::commit::Tab::Commit => "Commit",
+                crate::commit::Tab::Shelf => "Shelf",
+            };
+            MenuEntry::new(label, move |_, cx| {
+                panel.update(cx, |panel, cx| panel.set_tab(tab, cx));
+            })
+        })
+        .collect()
 }
 
 fn with_usages(cx: &mut Context<Workspace>, change: fn(&mut workspace::Settings)) {

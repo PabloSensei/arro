@@ -10,6 +10,7 @@ use text_core::TextStore;
 use ui_kit::metrics::UI_FONT;
 use ui_kit::*;
 
+use crate::decor::PaneDecor;
 use crate::scrollbar::{self, Bar};
 use crate::semantic::TokenSpan;
 use crate::style::EditorStyle;
@@ -128,11 +129,22 @@ pub(crate) struct Layout {
 
 pub(crate) struct EditorElement {
     view: Entity<EditorView>,
+    /// The rows and backgrounds of this view alone; plain for the editor of a tab.
+    decor: PaneDecor,
 }
 
 impl EditorElement {
     pub fn new(view: Entity<EditorView>) -> Self {
-        Self { view }
+        Self {
+            view,
+            decor: PaneDecor::default(),
+        }
+    }
+
+    /// The text with the rows and backgrounds of one view, for a view that shows the
+    /// text beside another one.
+    pub fn with_decor(view: Entity<EditorView>, decor: PaneDecor) -> Self {
+        Self { view, decor }
     }
 }
 
@@ -223,6 +235,9 @@ pub(crate) struct EditorPrepaint {
     underlines: Vec<(Bounds<Pixels>, Hsla)>,
     gutter_marks: Vec<(Bounds<Pixels>, Hsla)>,
     occurrences: Vec<Bounds<Pixels>>,
+    /// Backgrounds of whole lines and of byte ranges, under the text and the selection.
+    line_tints: Vec<(Bounds<Pixels>, Hsla)>,
+    range_tints: Vec<(Bounds<Pixels>, Hsla)>,
     hitbox: Hitbox,
     text_hitbox: Hitbox,
     char_width: Pixels,
@@ -578,6 +593,7 @@ impl Element for EditorElement {
         text_bounds.size.width -= px(GUTTER_WIDTH + scrollbar::BAND);
         let text_hitbox = window.insert_hitbox(text_bounds, HitboxBehavior::Normal);
 
+        let decor = self.decor.clone();
         self.view.update(cx, |view, _| {
             view.viewport = bounds.size;
             let columns = (f32::from(text_width) / f32::from(char_width).max(1.)).floor() as usize;
@@ -594,7 +610,8 @@ impl Element for EditorElement {
                 view.horizontal_bar = false;
                 return;
             };
-            let display = state.display();
+            let blocks = decor.blocks(state.store());
+            let display = state.map().snapshot_with_blocks(state.store(), &blocks);
             let widest = if wrap.is_none() {
                 longest_line_width(&display, f32::from(char_width))
             } else {
@@ -631,8 +648,20 @@ impl Element for EditorElement {
         });
 
         let view = self.view.read(cx);
+        let filler_blocks = view
+            .state
+            .as_ref()
+            .map(|state| self.decor.blocks(state.store()))
+            .unwrap_or_default();
+        let display = view.state.as_ref().map(|state| {
+            state
+                .map()
+                .snapshot_with_blocks(state.store(), &filler_blocks)
+        });
         let mut rows = Vec::new();
         let mut highlights = Vec::new();
+        let mut line_tints = Vec::new();
+        let mut range_tints = Vec::new();
         let mut sticky = Vec::new();
         let mut inlay_paints = Vec::new();
         let mut selections = Vec::new();
@@ -654,8 +683,9 @@ impl Element for EditorElement {
                 0.
             };
 
-        if let Some(state) = &view.state {
-            let display = state.display();
+        if let Some(state) = &view.state
+            && let Some(display) = &display
+        {
             let store = state.store();
             let primary_row = display.to_display(state.selections().primary().head).row;
             let first = (view.scroll_top / line_height) as usize;
@@ -1014,6 +1044,38 @@ impl Element for EditorElement {
                     }
                 }
             }
+            for (line, color) in &self.decor.lines {
+                for shown in &rows {
+                    if shown.is_block || shown.buffer_line != *line {
+                        continue;
+                    }
+                    line_tints.push((
+                        Bounds::new(
+                            point(bounds.left(), shown.y),
+                            size(bounds.size.width, height),
+                        ),
+                        *color,
+                    ));
+                }
+            }
+            for (range, color) in &self.decor.ranges {
+                for shown in &rows {
+                    if shown.is_block {
+                        continue;
+                    }
+                    let (start, end) = (shown.line.start_offset, shown.line.end_offset);
+                    if range.end <= start || range.start >= end {
+                        continue;
+                    }
+                    let column = |offset: usize| shown.line.column_of(offset.clamp(start, end));
+                    let left = shown.text.x_for_index(column(range.start));
+                    let right = shown.text.x_for_index(column(range.end));
+                    range_tints.push((
+                        Bounds::new(point(origin_x + left, shown.y), size(right - left, height)),
+                        *color,
+                    ));
+                }
+            }
             for shown in &rows {
                 if shown.is_block {
                     continue;
@@ -1172,15 +1234,16 @@ impl Element for EditorElement {
             }
         }
 
-        if let Some(state) = &view.state {
-            let display = state.display();
+        if let Some(state) = &view.state
+            && let Some(display) = &display
+        {
             let store = state.store();
             let row_count = display.row_count().max(1);
             let horizontal_viewport = f32::from(text_width);
             let widest = if view.soft_wrap() {
                 0.
             } else {
-                longest_line_width(&display, f32::from(char_width))
+                longest_line_width(display, f32::from(char_width))
             };
             let horizontal_track_start = f32::from(text_x);
             let horizontal_track_len = f32::from(text_width);
@@ -1262,7 +1325,7 @@ impl Element for EditorElement {
                         add_stripe(
                             &mut stripes,
                             &mut seen,
-                            &display,
+                            display,
                             bar,
                             x,
                             width,
@@ -1277,7 +1340,7 @@ impl Element for EditorElement {
                 add_stripe(
                     &mut stripes,
                     &mut seen,
-                    &display,
+                    display,
                     bar,
                     x,
                     width,
@@ -1300,7 +1363,7 @@ impl Element for EditorElement {
                         add_stripe(
                             &mut stripes,
                             &mut seen,
-                            &display,
+                            display,
                             bar,
                             x,
                             width,
@@ -1363,6 +1426,8 @@ impl Element for EditorElement {
             underlines,
             gutter_marks,
             occurrences,
+            line_tints,
+            range_tints,
             hitbox,
             text_hitbox,
             char_width,
@@ -1497,6 +1562,10 @@ impl Element for EditorElement {
                 )
             };
 
+            for (area, color) in &prepaint.line_tints {
+                window.paint_quad(fill(*area, *color));
+            }
+
             for shown in prepaint
                 .layout
                 .rows
@@ -1627,6 +1696,9 @@ impl Element for EditorElement {
             window.with_content_mask(Some(ContentMask { bounds: text_mask }), |window| {
                 window.paint_quad(vertical(text_x + char_width * RIGHT_MARGIN_COLUMN));
 
+                for (area, color) in &prepaint.range_tints {
+                    window.paint_quad(fill(*area, *color));
+                }
                 for (area, color) in &prepaint.highlights {
                     window.paint_quad(fill(*area, *color));
                 }

@@ -1,4 +1,4 @@
-//! The changes of one file against the last commit: two panes, the version before on
+//! The changes of one file against the last commit: two editors, the version before on
 //! the left and the working text on the right, with the words that differ marked and a
 //! strip between the panes that takes one hunk back. Unified is the other layout: one
 //! list of lines with the same hunk actions.
@@ -6,23 +6,25 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use editor_view::{EditorStyle, EditorView, HighlightKind, HighlightSpan};
+use editor_view::{EditorEvent, EditorView, PaneDecor};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::{Hunk, TextEdit};
 use workspace::{Settings, Workspace};
 
+use crate::editor_tab::{options_of, style_of};
 use crate::git::{GitState, Kind, relative_of};
 
 const WIDTH: f32 = 1180.;
 const CONTEXT_LINES: usize = 2;
 const LINE_HEIGHT: f32 = 20.;
-const LINE_NUMBER_WIDTH: f32 = 44.;
 const STRIP_WIDTH: f32 = 68.;
-/// The advance of the code font at the default size, for the caret of the right pane.
-const CHAR_WIDTH: f32 = 8.4;
 const CONTEXT: &str = "DiffView";
+/// The keys of the popup while one of its editors has the focus. The editor is deeper
+/// than the popup in the key contexts, so the keys of the diff win over the keys of the
+/// window there.
+const EDITOR_CONTEXT: &str = "DiffEditor";
 
 actions!(
     diff_view,
@@ -47,9 +49,15 @@ pub(crate) struct DiffKey {
 
 macro_rules! diff_keys {
     ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
-        /// The diff keys, while the popup has the focus.
+        /// The diff keys, while the popup has the focus, and while one of its editors
+        /// has it.
         pub(crate) fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+            cx.bind_keys([
+                $(
+                    KeyBinding::new($keys, $action, Some(CONTEXT)),
+                    KeyBinding::new($keys, $action, Some(EDITOR_CONTEXT)),
+                )*
+            ]);
         }
 
         #[cfg(test)]
@@ -88,6 +96,7 @@ enum Pane {
 pub struct DiffView {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
+    window: AnyWindowHandle,
     path: PathBuf,
     focus: FocusHandle,
     changes: Changes,
@@ -98,23 +107,21 @@ pub struct DiffView {
     index: usize,
     /// The hunk the diff keys act on.
     selected: usize,
-    /// The open editor of the file, whose buffer the right pane edits.
-    editor: Option<Entity<EditorView>>,
+    /// The open tab of the file. The right pane shows its buffer when it is there.
+    tab: Option<Entity<EditorView>>,
+    /// The version before, read only.
+    left: Entity<EditorView>,
+    /// The working text: the buffer of the tab, or an editor of its own.
+    right: Entity<EditorView>,
     /// Side by side when the setting says so, one list otherwise.
     side_by_side: bool,
     /// The pane the keys work in.
     pane: Pane,
-    /// The syntax colours of the two versions, once the syntax thread has read them.
-    left_spans: Vec<HighlightSpan>,
-    right_spans: Vec<HighlightSpan>,
-    /// Tells a late syntax answer which version of the text it belongs to.
-    spans_serial: u64,
     /// Tells a late diff answer which edit it belongs to.
     serial: u64,
-    /// The window x of the text of the right pane, for a click at a column.
-    right_text_x: f32,
+    /// A scroll of one pane is being copied to the other, so it must not copy back.
+    syncing: bool,
     scroll: ScrollHandle,
-    side_scroll: ScrollHandle,
 }
 
 /// What the diff is taken from: the working tree, one commit, or the clipboard.
@@ -154,92 +161,22 @@ impl Changes {
     }
 }
 
-/// One line of one pane: its own number, the text, the syntax colours and the words
-/// that differ from the line on the other side.
-struct DiffLine {
+/// One line of one pane: its own number, the text and the words that differ from the
+/// line on the other side.
+pub(crate) struct DiffLine {
     number: usize,
     text: String,
-    syntax: Vec<(Range<usize>, HighlightKind)>,
     words: Vec<Range<usize>>,
 }
 
 /// One row of the side-by-side view. A line missing on a side means that side has no
 /// text there, so both sides stay on the same height and the hunks line up.
-struct DiffRow {
+pub(crate) struct DiffRow {
     left: Option<DiffLine>,
     right: Option<DiffLine>,
     /// The hunk the row belongs to; `None` is unchanged context.
-    hunk: Option<usize>,
+    pub(crate) hunk: Option<usize>,
     kind: Option<Kind>,
-}
-
-/// Registers the popup as the text input of the window while the right pane has the
-/// keys, so that typing reaches the buffer of the open editor.
-struct DiffInput {
-    view: Entity<DiffView>,
-    focus: FocusHandle,
-}
-
-impl IntoElement for DiffInput {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl Element for DiffInput {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = relative(1.).into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut Window,
-        _: &mut App,
-    ) {
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        window.handle_input(
-            &self.focus,
-            ElementInputHandler::new(bounds, self.view.clone()),
-            cx,
-        );
-    }
 }
 
 /// The text of the file as the user sees it: the open editor, or the disk.
@@ -263,39 +200,16 @@ fn editor_of(
     view.downcast::<EditorView>().ok()
 }
 
-/// The lines of a text, without the empty line a trailing newline would add.
+/// The lines of a text as the editor shows them: the empty line after a trailing newline
+/// is a line of its own.
 fn lines_of(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut lines: Vec<&str> = text.split('\n').collect();
-    if text.ends_with('\n') {
-        lines.pop();
-    }
-    lines.into_iter().map(str::to_owned).collect()
+    text.split('\n').map(str::to_owned).collect()
 }
 
 /// The byte offset of the start of every line.
 fn line_starts(text: &str) -> Vec<usize> {
     std::iter::once(0)
         .chain(text.match_indices('\n').map(|(index, _)| index + 1))
-        .collect()
-}
-
-/// The syntax spans of one line, moved to offsets inside the line.
-fn line_syntax(
-    spans: &[HighlightSpan],
-    start: usize,
-    end: usize,
-) -> Vec<(Range<usize>, HighlightKind)> {
-    spans
-        .iter()
-        .filter(|span| (span.start as usize) < end && (span.end as usize) > start)
-        .map(|span| {
-            let from = (span.start as usize).max(start) - start;
-            let to = (span.end as usize).min(end) - start;
-            (from..to, span.kind)
-        })
         .collect()
 }
 
@@ -326,55 +240,177 @@ fn word_tint(kind: Option<Kind>, right: bool, theme: &Theme) -> Option<Hsla> {
     })
 }
 
-/// A line of code with its syntax colours and the background of its changed words.
-fn styled_line(
-    text: &str,
-    syntax: &[(Range<usize>, HighlightKind)],
-    words: &[Range<usize>],
-    word_color: Option<Hsla>,
-    style: &EditorStyle,
-) -> StyledText {
-    let mut points = vec![0, text.len()];
-    for (range, _) in syntax {
-        points.push(range.start);
-        points.push(range.end);
-    }
-    for range in words {
-        points.push(range.start);
-        points.push(range.end);
-    }
-    points.retain(|point| *point <= text.len());
-    points.sort_unstable();
-    points.dedup();
+/// The rows of the side-by-side view: the whole file on both sides, with the lines of
+/// one hunk facing each other and blank lines where a side has none.
+pub(crate) fn rows_of(base: &str, current: &str, hunks: &[Hunk]) -> Vec<DiffRow> {
+    let before = lines_of(base);
+    let after = lines_of(current);
+    let line = |number: usize, text: &str| DiffLine {
+        number,
+        text: text.to_owned(),
+        words: Vec::new(),
+    };
+    let mut rows = Vec::new();
+    let (mut b, mut a) = (0, 0);
 
-    let mut highlights = Vec::new();
-    for pair in points.windows(2) {
-        let (from, to) = (pair[0], pair[1]);
-        if from == to {
-            continue;
+    let push_unchanged = |rows: &mut Vec<DiffRow>, b: usize, a: usize| {
+        rows.push(DiffRow {
+            left: before.get(b).map(|text| line(b + 1, text)),
+            right: after.get(a).map(|text| line(a + 1, text)),
+            hunk: None,
+            kind: None,
+        });
+    };
+
+    for (index, hunk) in hunks.iter().enumerate() {
+        let b_from = (hunk.before.start as usize).min(before.len());
+        let a_from = (hunk.after.start as usize).min(after.len());
+        while b < b_from && a < a_from {
+            push_unchanged(&mut rows, b, a);
+            b += 1;
+            a += 1;
         }
-        let kind = syntax
-            .iter()
-            .find(|(range, _)| range.start <= from && from < range.end)
-            .map(|(_, kind)| *kind);
-        let color = kind.map_or(style.code, |kind| style.color_of(kind));
-        let background = words
-            .iter()
-            .any(|range| range.start <= from && from < range.end)
-            .then_some(word_color)
-            .flatten();
-        if color != style.code || background.is_some() {
-            highlights.push((
-                from..to,
-                HighlightStyle {
-                    color: Some(color),
-                    background_color: background,
-                    ..HighlightStyle::default()
-                },
-            ));
+        while b < b_from {
+            push_unchanged(&mut rows, b, a);
+            b += 1;
+        }
+        while a < a_from {
+            push_unchanged(&mut rows, b, a);
+            a += 1;
+        }
+
+        let b_to = (hunk.before.end as usize).min(before.len()).max(b_from);
+        let a_to = (hunk.after.end as usize).min(after.len()).max(a_from);
+        let kind = hunk_kind(hunk);
+        let count = (b_to - b_from).max(a_to - a_from);
+        for offset in 0..count {
+            let left_index = b_from + offset;
+            let right_index = a_from + offset;
+            let mut left = before
+                .get(left_index)
+                .map(|text| line(left_index + 1, text));
+            let mut right = after
+                .get(right_index)
+                .map(|text| line(right_index + 1, text));
+            let same = match (&left, &right) {
+                (Some(left), Some(right)) => left.text == right.text,
+                (None, None) => true,
+                _ => false,
+            };
+            if kind == Kind::Modified
+                && let (Some(left), Some(right)) = (&mut left, &mut right)
+                && !same
+            {
+                let changes = vcs::word_changes(&left.text, &right.text);
+                left.words = changes.before;
+                right.words = changes.after;
+            }
+            rows.push(DiffRow {
+                left,
+                right,
+                hunk: Some(index),
+                kind: (!same).then_some(kind),
+            });
+        }
+        b = b_to;
+        a = a_to;
+    }
+
+    while b < before.len() || a < after.len() {
+        push_unchanged(&mut rows, b, a);
+        b += 1;
+        a += 1;
+    }
+    rows
+}
+
+/// The empty rows and the backgrounds of both panes, so that the rows of a hunk face
+/// each other and the words that differ stand out.
+pub(crate) fn decorations_of(
+    rows: &[DiffRow],
+    base: &str,
+    current: &str,
+    selected: usize,
+    theme: &Theme,
+) -> (PaneDecor, PaneDecor) {
+    let base_starts = line_starts(base);
+    let current_starts = line_starts(current);
+    let mut left = PaneDecor::default();
+    let mut right = PaneDecor::default();
+    let mut left_missing = 0;
+    let mut right_missing = 0;
+    for row in rows {
+        if let Some(line) = &row.left {
+            if left_missing > 0 {
+                left.fillers.push((line.number - 1, left_missing));
+                left_missing = 0;
+            }
+            let start = base_starts
+                .get(line.number - 1)
+                .copied()
+                .unwrap_or_default();
+            if let Some(color) = line_color(row, false, selected, theme) {
+                left.lines.push((line.number - 1, color));
+            }
+            if let Some(color) = word_tint(row.kind, false, theme) {
+                for range in &line.words {
+                    left.ranges
+                        .push((start + range.start..start + range.end, color));
+                }
+            }
+        } else {
+            left_missing += 1;
+        }
+        if let Some(line) = &row.right {
+            if right_missing > 0 {
+                right.fillers.push((line.number - 1, right_missing));
+                right_missing = 0;
+            }
+            let start = current_starts
+                .get(line.number - 1)
+                .copied()
+                .unwrap_or_default();
+            if let Some(color) = line_color(row, true, selected, theme) {
+                right.lines.push((line.number - 1, color));
+            }
+            if let Some(color) = word_tint(row.kind, true, theme) {
+                for range in &line.words {
+                    right
+                        .ranges
+                        .push((start + range.start..start + range.end, color));
+                }
+            }
+        } else {
+            right_missing += 1;
         }
     }
-    StyledText::new(text.to_owned()).with_highlights(highlights)
+    left.trailing_fillers = left_missing;
+    right.trailing_fillers = right_missing;
+    (left, right)
+}
+
+fn line_color(row: &DiffRow, right: bool, selected: usize, theme: &Theme) -> Option<Hsla> {
+    let tint = line_tint(row.kind, right, theme);
+    if row.hunk == Some(selected) {
+        tint.map(|tint| tint.opacity(0.28))
+            .or(Some(theme.selection_inactive))
+    } else {
+        tint.map(|tint| tint.opacity(0.18))
+    }
+}
+
+/// The first and last row of every hunk, for the strip.
+pub(crate) fn hunk_row_spans(rows: &[DiffRow], hunks: usize) -> Vec<Option<(usize, usize)>> {
+    (0..hunks)
+        .map(|hunk| {
+            let first = rows.iter().position(|row| row.hunk == Some(hunk))?;
+            let last = rows
+                .iter()
+                .rposition(|row| row.hunk == Some(hunk))
+                .unwrap_or(first);
+            Some((first, last))
+        })
+        .collect()
 }
 
 impl DiffView {
@@ -672,19 +708,54 @@ impl DiffView {
             return;
         };
         let weak = workspace.clone();
-        let editor = editor_of(&workspace, &path, cx);
+        let tab = editor_of(&workspace, &path, cx);
+        let side_by_side = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.diff_side_by_side);
+        let pane = if source == Source::WorkingTree {
+            Pane::Right
+        } else {
+            Pane::Left
+        };
+        let style = style_of(cx);
+        let options = options_of(cx);
+        let left = {
+            let path = path.clone();
+            let base = base.clone();
+            let style = style.clone();
+            let options = options.clone();
+            cx.new(move |cx| {
+                let mut view = EditorView::open_text(path, base, true, style, cx);
+                view.set_options(options, cx);
+                view
+            })
+        };
+        let right = match (&tab, source == Source::WorkingTree) {
+            (Some(tab), true) => tab.clone(),
+            _ => {
+                let text = current.clone();
+                let read_only = source != Source::WorkingTree;
+                let path = path.clone();
+                let style = style.clone();
+                cx.new(move |cx| {
+                    let mut view = EditorView::open_text(path, text, read_only, style, cx);
+                    view.set_options(options, cx);
+                    view
+                })
+            }
+        };
+        let top = right.read(cx).scroll_top();
+        left.update(cx, |left, cx| left.scroll_to_top(top, cx));
+        let pane_focus = match pane {
+            Pane::Left => left.read(cx).focus_handle(cx),
+            Pane::Right => right.read(cx).focus_handle(cx),
+        };
+        let window_handle = window.window_handle();
         shared.update(cx, |workspace, cx| {
-            let side_by_side = cx
-                .try_global::<Settings>()
-                .is_none_or(|settings| settings.diff_side_by_side);
-            let pane = if editor.is_some() && source == Source::WorkingTree {
-                Pane::Right
-            } else {
-                Pane::Left
-            };
             let view = cx.new(|cx| Self {
                 git,
                 workspace: weak,
+                window: window_handle,
                 path,
                 focus: cx.focus_handle(),
                 changes: Changes {
@@ -696,39 +767,97 @@ impl DiffView {
                 files,
                 index,
                 selected: 0,
-                editor,
+                tab,
+                left,
+                right,
                 side_by_side,
                 pane,
-                left_spans: Vec::new(),
-                right_spans: Vec::new(),
-                spans_serial: 0,
                 serial: 0,
-                right_text_x: 0.,
+                syncing: false,
                 scroll: ScrollHandle::new(),
-                side_scroll: ScrollHandle::new(),
             });
+            view.update(cx, |view, cx| view.subscribe_editors(cx));
             let focus = view.read(cx).focus.clone();
-            view.update(cx, |view, cx| view.start_highlighting(cx));
             workspace.show_overlay(view.into(), focus, window, cx);
         });
+        if side_by_side {
+            window.focus(&pane_focus, cx);
+            // The editor joins the dispatch tree with the first frame: the keys are its
+            // own once it is there.
+            let focus = pane_focus.clone();
+            window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        }
     }
 
     fn revertable(&self) -> bool {
         self.source == Source::WorkingTree
     }
 
-    /// The buffer the right pane edits, when it is the pane with the keys.
-    fn editing_editor(&self) -> Option<Entity<EditorView>> {
-        (self.side_by_side && self.pane == Pane::Right && self.revertable())
-            .then(|| self.editor.clone())
-            .flatten()
+    /// Follows the text of the right pane and the scroll of both panes.
+    fn subscribe_editors(&mut self, cx: &mut Context<Self>) {
+        cx.subscribe(&self.left, |this, _, event: &EditorEvent, cx| {
+            this.editor_event(Pane::Left, event, cx)
+        })
+        .detach();
+        cx.subscribe(&self.right, |this, _, event: &EditorEvent, cx| {
+            this.editor_event(Pane::Right, event, cx)
+        })
+        .detach();
+    }
+
+    fn editor_event(&mut self, from: Pane, event: &EditorEvent, cx: &mut Context<Self>) {
+        match event {
+            EditorEvent::Changed if from == Pane::Right => self.text_changed(cx),
+            EditorEvent::Scrolled(top) => self.scrolled(from, *top, cx),
+            _ => {}
+        }
+    }
+
+    /// The text of the right pane changed: the tab takes the same text, and the hunks
+    /// are read again.
+    fn text_changed(&mut self, cx: &mut Context<Self>) {
+        if self.syncing {
+            return;
+        }
+        let right = self.right.read(cx).text().unwrap_or_default();
+        if let Some(tab) = self.tab.clone()
+            && tab != self.right
+        {
+            let tab_text = tab.read(cx).text().unwrap_or_default();
+            if tab_text != right
+                && let Some(edit) = text_core::difference(&tab_text, &right)
+            {
+                self.syncing = true;
+                tab.update(cx, |tab, cx| tab.apply_edits(vec![edit], cx));
+                self.syncing = false;
+            }
+        }
+        self.reread(cx);
+    }
+
+    /// One pane scrolled: the other one follows, so the hunks stay face to face.
+    fn scrolled(&mut self, from: Pane, top: f32, cx: &mut Context<Self>) {
+        if self.syncing {
+            return;
+        }
+        let other = match from {
+            Pane::Left => &self.right,
+            Pane::Right => &self.left,
+        };
+        if (other.read(cx).scroll_top() - top).abs() <= 0.5 {
+            return;
+        }
+        self.syncing = true;
+        other.update(cx, |other, cx| other.scroll_to_top(top, cx));
+        self.syncing = false;
+        cx.notify();
     }
 
     /// F7 and Shift+F7: the next or previous hunk; the last one goes to the next file.
     fn next_diff(&mut self, cx: &mut Context<Self>) {
         if self.selected + 1 < self.changes.hunks.len() {
             self.selected += 1;
-            self.scroll_to_selected();
+            self.scroll_to_selected(cx);
             cx.notify();
         } else {
             self.move_file(1, false, cx);
@@ -738,7 +867,7 @@ impl DiffView {
     fn previous_diff(&mut self, cx: &mut Context<Self>) {
         if self.selected > 0 {
             self.selected -= 1;
-            self.scroll_to_selected();
+            self.scroll_to_selected(cx);
             cx.notify();
         } else {
             self.move_file(-1, true, cx);
@@ -754,19 +883,28 @@ impl DiffView {
         self.move_file(-1, true, cx);
     }
 
-    /// Scrolls the pane of the selected hunk so that the hunk comes into sight.
-    fn scroll_to_selected(&self) {
-        if self.side_by_side {
-            if let Some(row) = self
-                .rows()
-                .iter()
-                .position(|row| row.hunk == Some(self.selected))
-            {
-                self.side_scroll.scroll_to_item(row);
-            }
-        } else {
+    /// Scrolls both panes so that the selected hunk comes into sight, with two lines of
+    /// the hunk above the top of the pane.
+    fn scroll_to_selected(&mut self, cx: &mut Context<Self>) {
+        if !self.side_by_side {
             self.scroll.scroll_to_item(self.selected);
+            return;
         }
+        let Some(row) = self
+            .rows()
+            .iter()
+            .position(|row| row.hunk == Some(self.selected))
+        else {
+            return;
+        };
+        let line_height = self.right.read(cx).line_height().max(1.);
+        let top = (row as f32 * line_height - line_height * 2.).max(0.);
+        self.syncing = true;
+        for editor in [&self.left, &self.right] {
+            editor.update(cx, |editor, cx| editor.scroll_to_top(top, cx));
+        }
+        self.syncing = false;
+        cx.notify();
     }
 
     /// Shows another file of the list. `last` selects the last hunk, as going back does.
@@ -789,9 +927,9 @@ impl DiffView {
             return;
         };
         let source = self.source.clone();
-        let editor = editor_of(&self.workspace, &path, cx);
+        let tab = editor_of(&self.workspace, &path, cx);
         let current = match source {
-            Source::WorkingTree | Source::Branch(_) => current_text(&path, editor.as_ref(), cx),
+            Source::WorkingTree | Source::Branch(_) => current_text(&path, tab.as_ref(), cx),
             _ => String::new(),
         };
         let (job_path, job_text) = (path.clone(), current.clone());
@@ -829,7 +967,8 @@ impl DiffView {
                 } else {
                     current
                 };
-                this.editor = editor_of(&this.workspace, &path, cx);
+                this.tab = editor_of(&this.workspace, &path, cx);
+                this.set_text(&path, &diff.base, &current, cx);
                 this.path = path;
                 this.changes = Changes {
                     current,
@@ -838,7 +977,16 @@ impl DiffView {
                 };
                 this.index = index;
                 this.selected = selected;
-                this.start_highlighting(cx);
+                if this.side_by_side {
+                    let editor = match this.pane {
+                        Pane::Left => &this.left,
+                        Pane::Right => &this.right,
+                    };
+                    let focus = editor.read(cx).focus_handle(cx);
+                    this.window
+                        .update(cx, |_, window, cx| window.focus(&focus, cx))
+                        .ok();
+                }
                 cx.notify();
             })
             .ok();
@@ -850,8 +998,7 @@ impl DiffView {
         if !self.revertable() {
             return;
         }
-        let editor = editor_of(&self.workspace, &self.path, cx);
-        let text_now = current_text(&self.path, editor.as_ref(), cx);
+        let text_now = self.right.read(cx).text().unwrap_or_default();
         let Some(TextEdit { range, text }) = self.changes.revert(index, &text_now) else {
             // The text moved while the popup was open: the old hunk may land in the wrong
             // place, so read the diff again and say why nothing was taken back.
@@ -862,31 +1009,31 @@ impl DiffView {
             return;
         };
         let path = self.path.clone();
-        match editor {
-            Some(editor) => {
-                let bytes = editor.read(cx).file_bytes();
-                let cause = local_history::Cause::BeforeGitRevert;
-                crate::history::snapshot_bytes(&path, bytes, cause, cx);
-                editor.update(cx, |editor, cx| {
-                    editor.replace_text(range.clone(), &text, cx)
-                });
-                self.workspace
-                    .update(cx, |workspace, cx| workspace.save_editor(&path, cx))
-                    .ok();
+        if let Some(tab) = self.tab.clone() {
+            let bytes = tab.read(cx).file_bytes();
+            let cause = local_history::Cause::BeforeGitRevert;
+            crate::history::snapshot_bytes(&path, bytes, cause, cx);
+            self.syncing = true;
+            tab.update(cx, |tab, cx| tab.replace_text(range.clone(), &text, cx));
+            self.syncing = false;
+            self.workspace
+                .update(cx, |workspace, cx| workspace.save_editor(&path, cx))
+                .ok();
+        } else {
+            // The right pane is an editor of its own: it writes the file when it saves.
+            if let Some(history) = crate::history::get(cx) {
+                let _ = history.record_file(&path, local_history::Cause::BeforeGitRevert);
             }
-            None => {
-                // A small file, read and written here anyway: the snapshot goes first.
-                if let Some(history) = crate::history::get(cx) {
-                    let _ = history.record_file(&path, local_history::Cause::BeforeGitRevert);
-                }
-                let mut next = text_now;
-                next.replace_range(range, &text);
-                if let Err(error) = std::fs::write(&path, next) {
-                    let message = format!("{}: {error}", path.display());
-                    self.git
-                        .update(cx, |git, cx| git.report("Revert", message, cx));
-                    return;
-                }
+            let right = self.right.clone();
+            self.syncing = true;
+            right.update(cx, |right, cx| right.replace_text(range, &text, cx));
+            let error = right.update(cx, |right, cx| right.save_blocking(cx));
+            self.syncing = false;
+            if let Some(error) = error {
+                let message = format!("{}: {error}", path.display());
+                self.git
+                    .update(cx, |git, cx| git.report("Revert", message, cx));
+                return;
             }
         }
         self.reread(cx);
@@ -917,106 +1064,47 @@ impl DiffView {
             Pane::Left => Pane::Right,
             Pane::Right => Pane::Left,
         };
-        window.focus(&self.focus, cx);
-        if self.pane == Pane::Right {
-            self.focus_right_editor(cx);
-        }
+        self.focus_pane(window, cx);
+        self.scroll_to_selected(cx);
         cx.notify();
     }
 
-    /// Puts the caret of the shared buffer on the first line of the selected hunk, so
-    /// that typing in the right pane changes the text the diff shows.
-    fn focus_right_editor(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.editor.clone() else {
-            return;
-        };
-        let line = self
-            .changes
-            .hunks
-            .get(self.selected)
-            .map_or(0, |hunk| hunk.after.start as usize);
-        editor.update(cx, |editor, cx| {
-            let column = editor.caret().1;
-            editor.restore_caret(line, column, cx);
-        });
-    }
-
-    /// Feeds typing and movement to the buffer behind the right pane.
-    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.side_by_side || self.pane != Pane::Right || !self.revertable() {
-            return;
-        }
-        let key = event.keystroke.key.as_str();
-        let modifiers = event.keystroke.modifiers;
-        if modifiers.alt || modifiers.platform {
-            return;
-        }
-        let typed = !modifiers.control
-            && event
-                .keystroke
-                .key_char
-                .as_deref()
-                .is_some_and(|text| !text.is_empty() && !text.chars().all(char::is_control));
-        let action = matches!(
-            key,
-            "backspace"
-                | "delete"
-                | "enter"
-                | "left"
-                | "right"
-                | "up"
-                | "down"
-                | "home"
-                | "end"
-                | "pageup"
-                | "pagedown"
-                | "tab"
-        );
-        if !typed && !action {
-            return;
-        }
-        let Some(editor) = self.editor.clone() else {
-            return;
-        };
-        let before = editor.read(cx).text().unwrap_or_default();
-        editor.update(cx, |editor, cx| editor.handle_key(event, window, cx));
-        let after = editor.read(cx).text().unwrap_or_default();
-        if action {
-            // The editor changed the text itself; the platform must not type the key again.
-            cx.stop_propagation();
-        }
-        if after != before {
-            self.reread(cx);
-        }
-    }
-
-    /// A click puts the keys in one pane; on the right it places the caret of the buffer.
-    fn click_line(
+    /// The keys of the diff while a pane has the focus. The bindings of the popup work
+    /// when the popup itself has the keys; an editor inside it takes the keys first, so
+    /// the keys are read here as well.
+    fn diff_key(
         &mut self,
-        side: Pane,
-        line: Option<usize>,
-        x: f32,
+        event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if !self.side_by_side {
-            return;
+    ) -> bool {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        match (key, modifiers.control, modifiers.alt, modifiers.shift) {
+            ("f7", false, false, false) => self.next_diff(cx),
+            ("f7", false, false, true) => self.previous_diff(cx),
+            ("right", false, true, true) => self.next_change(cx),
+            ("left", false, true, true) => self.previous_change(cx),
+            ("r", true, true, false) => self.apply_left(cx),
+            ("a", true, true, false) => self.apply_right(cx),
+            ("tab", true, false, true) => self.focus_opposite(window, cx),
+            _ => return false,
         }
-        self.pane = side;
-        window.focus(&self.focus, cx);
-        if side == Pane::Right
-            && let Some(editor) = self.editor.clone()
-            && self.revertable()
-            && let Some(line) = line
-        {
-            let column = ((x - self.right_text_x) / CHAR_WIDTH).max(0.) as usize;
-            editor.update(cx, |editor, cx| editor.restore_caret(line, column, cx));
-        }
-        cx.notify();
+        true
+    }
+
+    /// Gives the keys to the pane the diff works in.
+    fn focus_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = match self.pane {
+            Pane::Left => &self.left,
+            Pane::Right => &self.right,
+        };
+        let focus = editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
     }
 
     /// Switch Side-by-side / Unified and keep it in the settings file.
-    fn toggle_layout(&mut self, cx: &mut Context<Self>) {
+    fn toggle_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.side_by_side = !self.side_by_side;
         let side_by_side = self.side_by_side;
         self.workspace
@@ -1024,44 +1112,12 @@ impl DiffView {
                 workspace.update_settings(|settings| settings.diff_side_by_side = side_by_side, cx)
             })
             .ok();
+        if side_by_side {
+            self.focus_pane(window, cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
         cx.notify();
-    }
-
-    /// Asks the syntax thread for the colours of both versions.
-    fn start_highlighting(&mut self, cx: &mut Context<Self>) {
-        self.spans_serial += 1;
-        let serial = self.spans_serial;
-        self.left_spans.clear();
-        self.right_spans.clear();
-        let path = self.path.clone();
-        if let Some(task) = editor_view::highlight_text(&path, self.changes.base.clone(), cx) {
-            cx.spawn(async move |this, cx| {
-                let spans = task.await;
-                this.update(cx, |this, cx| {
-                    if this.spans_serial != serial {
-                        return;
-                    }
-                    this.left_spans = spans;
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
-        if let Some(task) = editor_view::highlight_text(&path, self.changes.current.clone(), cx) {
-            cx.spawn(async move |this, cx| {
-                let spans = task.await;
-                this.update(cx, |this, cx| {
-                    if this.spans_serial != serial {
-                        return;
-                    }
-                    this.right_spans = spans;
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
     }
 
     /// Takes the diff again after a change.
@@ -1072,8 +1128,12 @@ impl DiffView {
         let Some(repo) = self.git.read(cx).repo() else {
             return;
         };
-        let editor = editor_of(&self.workspace, &self.path, cx);
-        let current = current_text(&self.path, editor.as_ref(), cx);
+        let current = self
+            .right
+            .read(cx)
+            .text()
+            .map(|text| text.replace("\r\n", "\n"))
+            .unwrap_or_default();
         let (path, text) = (self.path.clone(), current.clone());
         let job = cx.background_executor().spawn(async move {
             let relative = relative_of(repo.root(), &path);
@@ -1090,7 +1150,7 @@ impl DiffView {
                 if this.serial != serial {
                     return;
                 }
-                this.editor = editor_of(&this.workspace, &this.path, cx);
+                this.tab = editor_of(&this.workspace, &this.path, cx);
                 this.changes = Changes {
                     current,
                     base: diff.base,
@@ -1099,13 +1159,46 @@ impl DiffView {
                 this.selected = this
                     .selected
                     .min(this.changes.hunks.len().saturating_sub(1));
-                this.start_highlighting(cx);
                 this.git.update(cx, |git, cx| git.refresh(cx));
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Replaces both panes with editors of `base` and `current`, and follows them.
+    fn set_text(&mut self, path: &Path, base: &str, current: &str, cx: &mut Context<Self>) {
+        let style = style_of(cx);
+        let options = options_of(cx);
+        let left = {
+            let path = path.to_path_buf();
+            let base = base.to_owned();
+            let style = style.clone();
+            let options = options.clone();
+            cx.new(move |cx| {
+                let mut view = EditorView::open_text(path, base, true, style, cx);
+                view.set_options(options, cx);
+                view
+            })
+        };
+        let right = match (&self.tab, self.source == Source::WorkingTree) {
+            (Some(tab), true) => tab.clone(),
+            _ => {
+                let path = path.to_path_buf();
+                let current = current.to_owned();
+                let read_only = self.source != Source::WorkingTree;
+                let style = style.clone();
+                cx.new(move |cx| {
+                    let mut view = EditorView::open_text(path, current, read_only, style, cx);
+                    view.set_options(options, cx);
+                    view
+                })
+            }
+        };
+        self.left = left;
+        self.right = right;
+        self.subscribe_editors(cx);
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1153,6 +1246,18 @@ impl DiffView {
         &self.changes.current
     }
 
+    /// The editor of the left pane, for tests.
+    #[cfg(test)]
+    pub(crate) fn left_editor(&self) -> Entity<EditorView> {
+        self.left.clone()
+    }
+
+    /// The editor of the right pane, for tests.
+    #[cfg(test)]
+    pub(crate) fn right_editor(&self) -> Entity<EditorView> {
+        self.right.clone()
+    }
+
     /// The text of every side-by-side row, for tests.
     #[cfg(test)]
     pub(crate) fn side_rows_text(&self) -> Vec<(Option<String>, Option<String>)> {
@@ -1193,112 +1298,11 @@ impl DiffView {
     /// The rows of the side-by-side view: the whole file on both sides, with the lines
     /// of one hunk facing each other and blank lines where a side has none.
     fn rows(&self) -> Vec<DiffRow> {
-        let before = lines_of(&self.changes.base);
-        let after = lines_of(&self.changes.current);
-        let before_starts = line_starts(&self.changes.base);
-        let after_starts = line_starts(&self.changes.current);
-        let line = |number: usize, text: &str, start: usize, spans: &[HighlightSpan]| DiffLine {
-            number,
-            text: text.to_owned(),
-            syntax: line_syntax(spans, start, start + text.len()),
-            words: Vec::new(),
-        };
-        let mut rows = Vec::new();
-        let (mut b, mut a) = (0, 0);
-
-        let push_unchanged = |rows: &mut Vec<DiffRow>, b: usize, a: usize| {
-            rows.push(DiffRow {
-                left: before.get(b).map(|text| {
-                    line(
-                        b + 1,
-                        text,
-                        before_starts.get(b).copied().unwrap_or_default(),
-                        &self.left_spans,
-                    )
-                }),
-                right: after.get(a).map(|text| {
-                    line(
-                        a + 1,
-                        text,
-                        after_starts.get(a).copied().unwrap_or_default(),
-                        &self.right_spans,
-                    )
-                }),
-                hunk: None,
-                kind: None,
-            });
-        };
-
-        for (index, hunk) in self.changes.hunks.iter().enumerate() {
-            let b_from = (hunk.before.start as usize).min(before.len());
-            let a_from = (hunk.after.start as usize).min(after.len());
-            while b < b_from && a < a_from {
-                push_unchanged(&mut rows, b, a);
-                b += 1;
-                a += 1;
-            }
-            while b < b_from {
-                push_unchanged(&mut rows, b, a);
-                b += 1;
-            }
-            while a < a_from {
-                push_unchanged(&mut rows, b, a);
-                a += 1;
-            }
-
-            let b_to = (hunk.before.end as usize).min(before.len()).max(b_from);
-            let a_to = (hunk.after.end as usize).min(after.len()).max(a_from);
-            let kind = hunk_kind(hunk);
-            let count = (b_to - b_from).max(a_to - a_from);
-            for offset in 0..count {
-                let left_index = b_from + offset;
-                let right_index = a_from + offset;
-                let mut left = before.get(left_index).map(|text| {
-                    line(
-                        left_index + 1,
-                        text,
-                        before_starts.get(left_index).copied().unwrap_or_default(),
-                        &self.left_spans,
-                    )
-                });
-                let mut right = after.get(right_index).map(|text| {
-                    line(
-                        right_index + 1,
-                        text,
-                        after_starts.get(right_index).copied().unwrap_or_default(),
-                        &self.right_spans,
-                    )
-                });
-                let same = match (&left, &right) {
-                    (Some(left), Some(right)) => left.text == right.text,
-                    (None, None) => true,
-                    _ => false,
-                };
-                if kind == Kind::Modified
-                    && let (Some(left), Some(right)) = (&mut left, &mut right)
-                    && !same
-                {
-                    let changes = vcs::word_changes(&left.text, &right.text);
-                    left.words = changes.before;
-                    right.words = changes.after;
-                }
-                rows.push(DiffRow {
-                    left,
-                    right,
-                    hunk: Some(index),
-                    kind: (!same).then_some(kind),
-                });
-            }
-            b = b_to;
-            a = a_to;
-        }
-
-        while b < before.len() || a < after.len() {
-            push_unchanged(&mut rows, b, a);
-            b += 1;
-            a += 1;
-        }
-        rows
+        rows_of(
+            &self.changes.base,
+            &self.changes.current,
+            &self.changes.hunks,
+        )
     }
 
     fn hunk_rows(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -1343,108 +1347,51 @@ impl DiffView {
             .child(rows)
     }
 
-    /// One row of the two panes with its strip cell.
-    fn side_row(
-        &self,
-        row: &DiffRow,
-        first_of_hunk: bool,
-        caret: Option<(usize, usize)>,
-        style: &EditorStyle,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let selected = row.hunk == Some(self.selected);
-        let tint = |right: bool| {
-            let tint = line_tint(row.kind, right, theme);
-            if selected {
-                tint.map(|tint| tint.opacity(0.28))
-                    .or(Some(theme.selection_inactive))
-            } else {
-                tint.map(|tint| tint.opacity(0.18))
-            }
-        };
-        let cell = |line: Option<&DiffLine>, right: bool| {
-            let mut cell = div()
-                .flex()
-                .items_center()
-                .flex_1()
-                .min_w_0()
-                .relative()
-                .h(px(LINE_HEIGHT))
-                .overflow_hidden()
-                .when_some(tint(right), |this, tint| this.bg(tint));
-            let Some(line) = line else {
-                return cell.child(div().w(px(LINE_NUMBER_WIDTH)).flex_none());
-            };
-            let side = if right { Pane::Right } else { Pane::Left };
-            let number = line.number;
-            let line_index = number - 1;
-            cell = cell
-                .child(
-                    div()
-                        .w(px(LINE_NUMBER_WIDTH))
-                        .flex_none()
-                        .pr(px(SPACE_S))
-                        .text_color(theme.line_number)
-                        .child(format!("{number}")),
-                )
-                .child(div().whitespace_nowrap().child(styled_line(
-                    &line.text,
-                    &line.syntax,
-                    &line.words,
-                    word_tint(row.kind, right, theme),
-                    style,
-                )));
-            if right
-                && self.side_by_side
-                && self.pane == Pane::Right
-                && caret.is_some_and(|(line, _)| line == line_index)
-            {
-                let column = caret.map_or(0, |(_, column)| column) as f32;
-                cell = cell.child(
-                    div()
-                        .absolute()
-                        .left(px(LINE_NUMBER_WIDTH + column * CHAR_WIDTH))
-                        .top(px(SPACE_XS))
-                        .w(px(1.))
-                        .h(px(LINE_HEIGHT - SPACE_S))
-                        .bg(theme.caret),
-                );
-            }
-            cell.on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.click_line(
-                        side,
-                        Some(line_index),
-                        f32::from(event.position.x),
-                        window,
-                        cx,
-                    )
-                }),
-            )
-        };
+    /// The empty rows and the backgrounds of both panes, so that the rows of a hunk face
+    /// each other and the words that differ stand out.
+    fn decorations(&self, rows: &[DiffRow], theme: &Theme) -> (PaneDecor, PaneDecor) {
+        decorations_of(
+            rows,
+            &self.changes.base,
+            &self.changes.current,
+            self.selected,
+            theme,
+        )
+    }
 
+    /// The strip between the panes: a band for every hunk and its buttons, at the rows
+    /// the two panes show.
+    fn strip(&self, rows: &[DiffRow], theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let line_height = self.right.read(cx).line_height().max(1.);
+        let top = self.right.read(cx).scroll_top();
         let mut strip = div()
             .relative()
             .flex_none()
             .w(px(STRIP_WIDTH))
-            .h(px(LINE_HEIGHT))
-            .flex()
-            .items_center()
-            .justify_center();
-        if let Some(kind) = row.kind {
+            .h_full()
+            .overflow_hidden();
+        for hunk in 0..self.changes.hunks.len() {
+            let Some(first) = rows.iter().position(|row| row.hunk == Some(hunk)) else {
+                continue;
+            };
+            let last = rows
+                .iter()
+                .rposition(|row| row.hunk == Some(hunk))
+                .unwrap_or(first);
+            let y = first as f32 * line_height - top;
+            let height = (last - first + 1) as f32 * line_height;
+            let kind = hunk_kind(&self.changes.hunks[hunk]);
             strip = strip.child(
                 div()
                     .absolute()
+                    .left(px((STRIP_WIDTH - 4.) / 2.))
+                    .top(px(y))
                     .w(px(4.))
-                    .h_full()
+                    .h(px(height))
                     .rounded(px(CONTROL_RADIUS))
                     .bg(kind.color(theme.dark))
                     .opacity(0.8),
             );
-        }
-        if first_of_hunk && let Some(hunk) = row.hunk {
             let apply_left = div()
                 .id(("diff-apply-left", hunk))
                 .debug_selector(move || format!("diff-apply-left-{hunk}"))
@@ -1504,6 +1451,9 @@ impl DiffView {
                 .on_click(cx.listener(move |this, _, _, cx| this.revert(hunk, cx)));
             strip = strip.child(
                 div()
+                    .absolute()
+                    .left(px(SPACE_XS))
+                    .top(px(y))
                     .flex()
                     .items_center()
                     .gap(px(SPACE_XS))
@@ -1512,14 +1462,7 @@ impl DiffView {
                     .child(discard),
             );
         }
-
-        div()
-            .flex()
-            .flex_none()
-            .h(px(LINE_HEIGHT))
-            .child(cell(row.left.as_ref(), false))
-            .child(strip)
-            .child(cell(row.right.as_ref(), true))
+        strip
     }
 
     /// The title of a side: what the version on that side is.
@@ -1565,7 +1508,7 @@ impl DiffView {
             })
             .tooltip(|_, cx| tooltip("Toggle between side-by-side and unified", None, cx))
             .child(label)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_layout(cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_layout(window, cx)))
     }
 }
 
@@ -1653,21 +1596,15 @@ impl Render for DiffView {
             }
             Source::Shelf(shelf) => format!("HEAD and {title} in shelf {shelf}"),
         };
-        self.right_text_x = f32::from(left)
-            + f32::from((width - px(STRIP_WIDTH)) / 2.)
-            + STRIP_WIDTH
-            + LINE_NUMBER_WIDTH;
-        let caret = self.editor.as_ref().map(|editor| editor.read(cx).caret());
-        let style = EditorStyle::from_theme(&theme);
         let pane: AnyElement = if self.side_by_side {
             let side_rows = self.rows();
-            let mut previous = None;
-            let mut rows = Vec::with_capacity(side_rows.len());
-            for row in &side_rows {
-                let first = row.hunk.is_some() && previous != row.hunk;
-                previous = row.hunk;
-                rows.push(self.side_row(row, first, caret, &style, &theme, cx));
-            }
+            let (left_decor, right_decor) = self.decorations(&side_rows, &theme);
+            let left_pane = self.left.update(cx, |editor, cx| {
+                editor.pane(left_decor, Some(EDITOR_CONTEXT), window, cx)
+            });
+            let right_pane = self.right.update(cx, |editor, cx| {
+                editor.pane(right_decor, Some(EDITOR_CONTEXT), window, cx)
+            });
             let empty = side_rows.is_empty();
             let header = div()
                 .flex()
@@ -1690,39 +1627,54 @@ impl Render for DiffView {
                         .truncate()
                         .child(self.side_title(false)),
                 );
+            let panes = div()
+                .id("diff-side")
+                .debug_selector(|| "diff-side-by-side".to_owned())
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if this.diff_key(event, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(
+                    div()
+                        .debug_selector(|| "diff-pane-left".to_owned())
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(left_pane),
+                )
+                .child(self.strip(&side_rows, &theme, cx))
+                .child(
+                    div()
+                        .debug_selector(|| "diff-pane-right".to_owned())
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(right_pane),
+                );
+            let panes = if empty {
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.text_secondary)
+                    .child("No changes")
+                    .into_any_element()
+            } else {
+                panes.into_any_element()
+            };
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
                 .child(header)
-                .child(
-                    scrollable(
-                        "diff-side-list",
-                        &self.side_scroll,
-                        div()
-                            .id("diff-side-list")
-                            .debug_selector(|| "diff-side-by-side".to_owned())
-                            .flex()
-                            .flex_col()
-                            .font_family(MONO_FONT)
-                            .text_size(px(CODE_SIZE))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.side_scroll)
-                            .children(rows)
-                            .when(empty, |this| {
-                                this.items_center()
-                                    .justify_center()
-                                    .text_color(theme.text_secondary)
-                                    .child("No changes")
-                            }),
-                        &theme,
-                        window,
-                        cx,
-                    )
-                    .flex_1()
-                    .min_h_0(),
-                )
+                .child(panes)
                 .into_any_element()
         } else {
             let rows: Vec<Div> = (0..self.changes.hunks.len())
@@ -1757,10 +1709,6 @@ impl Render for DiffView {
             .min_h_0()
             .into_any_element()
         };
-        let input = (self.side_by_side && self.pane == Pane::Right).then(|| DiffInput {
-            view: cx.entity(),
-            focus: self.focus.clone(),
-        });
         let body = surface(&theme)
             .id("diff")
             .track_focus(&self.focus)
@@ -1774,7 +1722,6 @@ impl Render for DiffView {
             .on_action(cx.listener(|this, _: &FocusOppositePane, window, cx| {
                 this.focus_opposite(window, cx)
             }))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key_down(event, window, cx)))
             .occlude()
             .w(width)
             .h(height)
@@ -1792,120 +1739,12 @@ impl Render for DiffView {
                     .child(title)
                     .child(self.layout_button(&theme, cx)),
             )
-            .child(pane)
-            .when_some(input, |this, input| {
-                this.child(div().absolute().size_full().child(input))
-            });
+            .child(pane);
         div()
             .absolute()
             .left(left)
             .top(top)
             .child(enter("diff-enter", body))
-    }
-}
-
-impl EntityInputHandler for DiffView {
-    fn text_for_range(
-        &mut self,
-        range: Range<usize>,
-        adjusted: &mut Option<Range<usize>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let editor = self.editing_editor()?;
-        editor.update(cx, |editor, cx| {
-            editor.text_for_range(range, adjusted, window, cx)
-        })
-    }
-
-    fn selected_text_range(
-        &mut self,
-        ignore_disabled_input: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let editor = self.editing_editor()?;
-        editor.update(cx, |editor, cx| {
-            editor.selected_text_range(ignore_disabled_input, window, cx)
-        })
-    }
-
-    fn marked_text_range(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        let editor = self.editing_editor()?;
-        editor.update(cx, |editor, cx| editor.marked_text_range(window, cx))
-    }
-
-    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.editing_editor() else {
-            return;
-        };
-        editor.update(cx, |editor, cx| editor.unmark_text(window, cx));
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(editor) = self.editing_editor() else {
-            return;
-        };
-        let before = editor.read(cx).text().unwrap_or_default();
-        editor.update(cx, |editor, cx| {
-            editor.replace_text_in_range(range, text, window, cx)
-        });
-        let after = editor.read(cx).text().unwrap_or_default();
-        if after != before {
-            self.reread(cx);
-        }
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range: Option<Range<usize>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(editor) = self.editing_editor() else {
-            return;
-        };
-        editor.update(cx, |editor, cx| {
-            editor.replace_and_mark_text_in_range(range, new_text, new_selected_range, window, cx)
-        });
-        self.reread(cx);
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        range: Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        let editor = self.editing_editor()?;
-        editor.update(cx, |editor, cx| {
-            editor.bounds_for_range(range, element_bounds, window, cx)
-        })
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        point: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        let editor = self.editing_editor()?;
-        editor.update(cx, |editor, cx| {
-            editor.character_index_for_point(point, window, cx)
-        })
     }
 }
 

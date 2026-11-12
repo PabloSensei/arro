@@ -8,6 +8,7 @@ fn block(offset: usize, text: &str, indent: usize) -> Block {
         offset,
         text: text.to_owned(),
         indent,
+        after: false,
     }
 }
 
@@ -112,6 +113,65 @@ fn soft_wrap_and_the_rows_of_the_scroll_bar_count_the_block() {
         "the last line stands after the block"
     );
     assert_eq!(snapshot.text_row(without - 2, 1), Some(without));
+}
+
+#[test]
+fn empty_blocks_before_one_line_give_each_its_own_row() {
+    let store = RopeStore::from_text("one\ntwo");
+    let mut map = DisplayMap::default();
+    map.set_blocks(vec![
+        block(4, "", 0),
+        block(4, "", 0),
+        block(4, "2 usages", 0),
+    ]);
+
+    let snapshot = map.snapshot(&store);
+    assert_eq!(snapshot.row_count(), 5);
+    assert!(snapshot.is_block_row(1));
+    assert!(snapshot.is_block_row(2));
+    assert!(snapshot.is_block_row(3));
+    assert_eq!(snapshot.line(3).text, "2 usages");
+    assert_eq!(snapshot.line_to_row(1), 4, "the text follows the rows");
+}
+
+#[test]
+fn a_block_that_stands_after_the_last_line_comes_after_the_text() {
+    let store = RopeStore::from_text("one\ntwo");
+    let mut map = DisplayMap::default();
+    map.set_blocks(vec![
+        Block {
+            offset: store.len(),
+            text: String::new(),
+            indent: 0,
+            after: true,
+        },
+        Block {
+            offset: store.len(),
+            text: String::new(),
+            indent: 0,
+            after: true,
+        },
+    ]);
+
+    let snapshot = map.snapshot(&store);
+    assert_eq!(snapshot.row_count(), 4);
+    assert_eq!(snapshot.line(1).text, "two");
+    assert!(snapshot.is_block_row(2));
+    assert!(snapshot.is_block_row(3));
+}
+
+#[test]
+fn a_view_adds_rows_without_changing_the_rows_of_the_map() {
+    let store = RopeStore::from_text("one\ntwo");
+    let mut map = DisplayMap::default();
+    map.set_blocks(vec![block(4, "2 usages", 0)]);
+
+    let plain = map.snapshot(&store);
+    let extra = [block(4, "", 0), block(4, "", 0)];
+    let view = map.snapshot_with_blocks(&store, &extra);
+    assert_eq!(plain.row_count(), 3);
+    assert_eq!(view.row_count(), 5);
+    assert_eq!(map.snapshot(&store).row_count(), 3);
 }
 
 #[test]

@@ -13,6 +13,7 @@ mod commands;
 mod commit;
 mod compare;
 mod conflict;
+mod console_input;
 mod copy_class;
 mod debug;
 mod diff_view;
@@ -22,6 +23,7 @@ mod editor_menu;
 mod editor_tab;
 mod file_tree;
 mod finder;
+mod folder_compare;
 mod git;
 mod git_log;
 mod history;
@@ -250,7 +252,16 @@ mod window_tests_tool_resize;
 #[cfg(test)]
 mod window_tests_console_input;
 #[cfg(test)]
+mod window_tests_debug_input;
+#[cfg(test)]
 mod window_tests_diff_side;
+#[cfg(test)]
+mod window_tests_folder_compare;
+#[cfg(test)]
+mod window_tests_navigation_polish;
+
+#[cfg(test)]
+mod window_tests_diff_editor;
 
 mod choice;
 mod invalidate;
@@ -590,6 +601,7 @@ fn install(
     // The open editors take a keymap file of the user as soon as it is applied.
     workspace.set_keymap_listener(editor_view::install_keymap);
     project::bind_keys(cx);
+    folder_compare::bind_keys(cx);
     items::bind_keys(cx);
     palette::bind_keys(cx);
     finder::bind_keys(cx);

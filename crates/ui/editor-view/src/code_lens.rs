@@ -67,7 +67,7 @@ impl EditorView {
         self.code_lens_task = None;
         if !self.options.code_vision_usages && !self.options.code_vision_implementations {
             if let Some(state) = &mut self.state {
-                state.set_blocks(Vec::new());
+                state.set_labels(Vec::new());
             }
             self.code_lens.clear();
             self.code_vision_labels.clear();
@@ -210,10 +210,11 @@ impl EditorView {
                 offset: store.line_to_offset(line),
                 text,
                 indent,
+                after: false,
             });
             labels.push((line, parts));
         }
-        state.set_blocks(blocks);
+        state.set_labels(blocks);
         self.code_vision_labels = labels;
         self.code_vision_hovered = None;
         cx.notify();

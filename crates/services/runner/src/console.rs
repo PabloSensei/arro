@@ -1,16 +1,14 @@
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::process::ChildStdin;
+use std::io::Read;
 use std::sync::mpsc::{
-    Receiver, RecvError, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
-    sync_channel,
+    Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use base::Cancel;
-use proc_sup::{Process, ProcessSpec};
+use proc_sup::{Input, InputWriter, Process, ProcessSpec};
 
 use crate::RunPlan;
 
@@ -72,17 +70,7 @@ pub struct Console {
     keeper: Option<thread::JoinHandle<()>>,
     watch: Arc<OutputWatch>,
     /// The program reads its input; `None` when nothing was open to write to.
-    input: Option<Sender<Input>>,
-    /// What the writer of the input could not do, for the window to show as a line.
-    input_error: Arc<Mutex<Option<String>>>,
-}
-
-/// One message for the standard input of the program.
-enum Input {
-    /// Text to write as it is; a line carries its own line break.
-    Line(String),
-    /// The program sees the end of its input, as Ctrl+D does in IDEA.
-    Eof,
+    input: Option<Input>,
 }
 
 /// The events of a console, with what [`Console::wait_for_output`] took aside while it
@@ -244,24 +232,15 @@ impl Console {
         let cancel = stop.clone();
         let watch = Arc::new(OutputWatch::default());
         let keeper_watch = watch.clone();
-        let input_error = Arc::new(Mutex::new(None));
-        let keeper_error = input_error.clone();
-        let (input, input_messages) = match work.reads_input() {
+        let (input, writer) = match work.reads_input() {
             true => {
-                let (messages, receiver) = channel();
-                (Some(messages), Some(receiver))
+                let (input, writer) = Input::channel();
+                (Some(input), Some(writer))
             }
             false => (None, None),
         };
         let keeper = thread::spawn(move || {
-            keep(
-                work,
-                &cancel,
-                &sender,
-                &keeper_watch,
-                input_messages,
-                &keeper_error,
-            );
+            keep(work, &cancel, &sender, &keeper_watch, writer);
             keeper_watch.end();
         });
         Self {
@@ -271,7 +250,6 @@ impl Console {
             keeper: Some(keeper),
             watch,
             input,
-            input_error,
         }
     }
 
@@ -284,39 +262,24 @@ impl Console {
     /// Sends a line to the program with the line break that Enter adds. The write happens
     /// on a thread of its own, so the window never waits for the pipe.
     pub fn send_line(&self, line: &str) {
-        self.send_input(Input::Line(format!("{line}\n")));
+        if let Some(input) = &self.input {
+            input.send_line(line);
+        }
     }
 
     /// The program sees the end of its input, as Send EOF of the console does.
     pub fn send_eof(&self) {
-        self.send_input(Input::Eof);
-    }
-
-    fn send_input(&self, message: Input) {
-        let Some(input) = &self.input else {
-            return;
-        };
-        if input.send(message).is_err() {
-            // The program is gone and its input with it; a line says so, nothing panics.
-            self.report_input_error("the program has exited");
+        if let Some(input) = &self.input {
+            input.send_eof();
         }
-    }
-
-    fn report_input_error(&self, reason: &str) {
-        let message = format!("Cannot send input to the program: {reason}");
-        let mut slot = self
-            .input_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *slot = Some(message);
     }
 
     /// What went wrong with the input since the last call, for a line in the console.
     pub fn take_input_error(&self) -> Option<String> {
-        self.input_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+        self.input
+            .as_ref()
+            .and_then(Input::take_error)
+            .map(|reason| format!("Cannot send input to the program: {reason}"))
     }
 
     pub fn events(&self) -> ConsoleEvents<'_> {
@@ -387,13 +350,12 @@ fn keep(
     stop: &Cancel,
     events: &SyncSender<ConsoleEvent>,
     watch: &Arc<OutputWatch>,
-    input: Option<Receiver<Input>>,
-    input_error: &Arc<Mutex<Option<String>>>,
+    input: Option<InputWriter>,
 ) {
     match work {
-        Work::Plan(plan) => keep_plan(plan, stop, events, watch, input, input_error),
+        Work::Plan(plan) => keep_plan(plan, stop, events, watch, input),
         Work::Single { spec, step, grace } => {
-            let end = run_step(&spec, step, grace, stop, events, watch, None, input_error);
+            let end = run_step(&spec, step, grace, stop, events, watch, None);
             let _ = events.send(ConsoleEvent::Exited {
                 code: end.code,
                 step,
@@ -411,20 +373,10 @@ fn keep_plan(
     stop: &Cancel,
     events: &SyncSender<ConsoleEvent>,
     watch: &Arc<OutputWatch>,
-    input: Option<Receiver<Input>>,
-    input_error: &Arc<Mutex<Option<String>>>,
+    input: Option<InputWriter>,
 ) {
     if let Some(before) = &plan.before {
-        let end = run_step(
-            before,
-            Step::Before,
-            plan.grace,
-            stop,
-            events,
-            watch,
-            None,
-            input_error,
-        );
+        let end = run_step(before, Step::Before, plan.grace, stop, events, watch, None);
         if end.code != Some(0) || stop.is_cancelled() {
             let step = Step::Before;
             let _ = events.send(ConsoleEvent::Exited {
@@ -446,7 +398,6 @@ fn keep_plan(
         events,
         watch,
         input,
-        input_error,
     );
     let step = Step::Program;
     let _ = events.send(ConsoleEvent::Exited {
@@ -491,8 +442,7 @@ fn run_step(
     stop: &Cancel,
     events: &SyncSender<ConsoleEvent>,
     watch: &Arc<OutputWatch>,
-    input: Option<Receiver<Input>>,
-    input_error: &Arc<Mutex<Option<String>>>,
+    input: Option<InputWriter>,
 ) -> StepEnd {
     let mut process = match spec.start() {
         Ok(process) => process,
@@ -508,8 +458,8 @@ fn run_step(
     };
     let pid = process.pid();
     let _ = events.send(ConsoleEvent::Started { pid, step });
-    match input.and_then(|input| process.take_stdin().map(|stdin| (stdin, input))) {
-        Some((stdin, input)) => write_input(stdin, input, input_error.clone()),
+    match input.and_then(|writer| process.take_stdin().map(|stdin| (writer, stdin))) {
+        Some((writer, stdin)) => writer.start(stdin),
         // A build, a test or a program that reads nothing: the pipe closes at once.
         None => drop(process.take_stdin()),
     }
@@ -607,28 +557,6 @@ fn deliver(events: &SyncSender<ConsoleEvent>, stream: Stream, text: String) -> b
         Err(TrySendError::Full(event)) => events.send(event).is_ok(),
         Err(TrySendError::Disconnected(_)) => false,
     }
-}
-
-/// Feeds the standard input of the program from its own thread: the window only hands a
-/// line over. Ends with Send EOF, when the program is gone, or with the console.
-fn write_input(mut stdin: ChildStdin, input: Receiver<Input>, error: Arc<Mutex<Option<String>>>) {
-    thread::spawn(move || {
-        while let Ok(message) = input.recv() {
-            let result = match message {
-                Input::Line(text) => stdin
-                    .write_all(text.as_bytes())
-                    .and_then(|()| stdin.flush()),
-                Input::Eof => return,
-            };
-            if let Err(failure) = result {
-                let mut slot = error
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *slot = Some(format!("Cannot send input to the program: {failure}"));
-                return;
-            }
-        }
-    });
 }
 
 /// A read may end in the middle of a character, which must not turn into garbage.

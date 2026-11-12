@@ -16,6 +16,8 @@ pub struct Block {
     pub text: String,
     /// The leading columns of the line under the block.
     pub indent: usize,
+    /// The block stands after the last line of the text, not above a line.
+    pub after: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,17 +35,21 @@ impl BlockRows {
         self.blocks.is_empty()
     }
 
-    /// Replaces the blocks. Two blocks on one line become one row, their labels joined
-    /// by two spaces.
+    /// Replaces the blocks. Two labelled blocks on one line become one row, their labels
+    /// joined by two spaces; an empty block is a row of its own, so a view can keep two
+    /// texts on the same lines with empty rows.
     pub fn set(&mut self, mut blocks: Vec<Block>) {
-        blocks.sort_by_key(|block| block.offset);
+        blocks.sort_by_key(|block| (block.offset, block.after));
         let mut joined: Vec<Block> = Vec::with_capacity(blocks.len());
         for block in blocks {
             match joined.last_mut() {
-                Some(last) if last.offset == block.offset => {
-                    if !last.text.is_empty() && !block.text.is_empty() {
-                        last.text.push_str("  ");
-                    }
+                Some(last)
+                    if last.offset == block.offset
+                        && last.after == block.after
+                        && !last.text.is_empty()
+                        && !block.text.is_empty() =>
+                {
+                    last.text.push_str("  ");
                     last.text.push_str(&block.text);
                 }
                 _ => joined.push(block),
@@ -82,6 +88,7 @@ mod tests {
             offset,
             text: text.to_owned(),
             indent: 0,
+            after: false,
         }
     }
 
@@ -101,5 +108,13 @@ mod tests {
         blocks.set(vec![block(0, "2 usages"), block(0, "1 implementation")]);
         assert_eq!(blocks.as_slice().len(), 1);
         assert_eq!(blocks.as_slice()[0].text, "2 usages  1 implementation");
+    }
+
+    #[test]
+    fn empty_blocks_of_one_line_stay_separate_rows() {
+        let mut blocks = BlockRows::default();
+        blocks.set(vec![block(4, ""), block(4, ""), block(4, "2 usages")]);
+        assert_eq!(blocks.as_slice().len(), 3, "each empty block is a row");
+        assert_eq!(blocks.as_slice()[2].text, "2 usages");
     }
 }

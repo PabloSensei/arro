@@ -84,6 +84,17 @@ impl DisplayMap {
     }
 
     pub fn snapshot<'a, S: TextStore>(&'a self, store: &'a S) -> DisplaySnapshot<'a, S> {
+        self.snapshot_with_blocks(store, &[])
+    }
+
+    /// The map at one text version with rows of one view added over the rows of the map.
+    /// A view that keeps two texts on the same lines gives its empty rows here, so the
+    /// rows of the map itself stay the rows of the text.
+    pub fn snapshot_with_blocks<'a, S: TextStore>(
+        &'a self,
+        store: &'a S,
+        extra: &'a [Block],
+    ) -> DisplaySnapshot<'a, S> {
         let mut visible = self.folds.visible_lines(store);
         if !self.docs.is_empty() {
             visible.retain(|line| self.docs.covering_line(store, *line as usize).is_none());
@@ -91,6 +102,7 @@ impl DisplayMap {
         let mut snapshot = DisplaySnapshot {
             map: self,
             store,
+            extra,
             visible,
             wrapped: None,
             blocks_before: Vec::new(),
@@ -122,11 +134,13 @@ struct Wrapped {
 pub struct DisplaySnapshot<'a, S: TextStore> {
     map: &'a DisplayMap,
     store: &'a S,
+    /// Blocks of this view alone, standing over the blocks of the map.
+    extra: &'a [Block],
     /// Buffer line of each row before the wrap and block layers.
     visible: Vec<u32>,
     wrapped: Option<Wrapped>,
-    /// The block shown before each wrap row, as an index into the block list.
-    blocks_before: Vec<Option<usize>>,
+    /// The blocks shown before each wrap row, in the order they paint.
+    blocks_before: Vec<Vec<&'a Block>>,
     /// The rendered documentation rows that stand before each group. A group is a wrap
     /// row and the rows of its block and text; the last group stands after all of them.
     group_docs: Vec<Vec<(usize, usize)>>,
@@ -134,16 +148,20 @@ pub struct DisplaySnapshot<'a, S: TextStore> {
     group_start: Vec<usize>,
 }
 
-impl<S: TextStore> DisplaySnapshot<'_, S> {
+impl<'a, S: TextStore> DisplaySnapshot<'a, S> {
     /// Places the blocks above their lines and the rendered comments before the rows
-    /// that follow them. A block or a comment on a line the folds hide has no row.
+    /// that follow them. A block or a comment on a line the folds hide has no row. The
+    /// rows of this view come before the rows of the map, so a label stands right above
+    /// the line it belongs to.
     fn place_groups(&mut self) {
         let rows = self.base_rows();
-        self.blocks_before = vec![None; rows];
+        self.blocks_before = vec![Vec::new(); rows + 1];
         self.group_docs = vec![Vec::new(); rows + 1];
-        if rows > 0 {
-            let mut placed = vec![None; rows];
-            for (index, block) in self.map.block.as_slice().iter().enumerate() {
+        let mut placed: Vec<(usize, &'a Block)> = Vec::new();
+        for block in self.extra.iter().chain(self.map.block.as_slice()) {
+            let row = if block.after {
+                rows
+            } else {
                 let line = self
                     .store
                     .offset_to_line(block.offset.min(self.store.len()));
@@ -154,21 +172,19 @@ impl<S: TextStore> DisplaySnapshot<'_, S> {
                 if self.visible.get(fold_row).copied() != Some(line as u32) {
                     continue;
                 }
-                let wrap_row = match &self.wrapped {
+                match &self.wrapped {
                     Some(wrapped) => wrapped
                         .first
                         .get(fold_row)
                         .copied()
                         .map_or(0, |row| row as usize),
                     None => fold_row,
-                };
-                if let Some(row) = placed.get_mut(wrap_row) {
-                    *row = Some(index);
                 }
-            }
-            for (row, block) in placed.into_iter().enumerate() {
-                self.blocks_before[row] = block;
-            }
+            };
+            placed.push((row, block));
+        }
+        for (row, block) in placed {
+            self.blocks_before[row].push(block);
         }
         for (index, comment) in self.map.docs.as_slice().iter().enumerate() {
             let last = comment.range.end.saturating_sub(1).min(self.store.len());
@@ -190,10 +206,10 @@ impl<S: TextStore> DisplaySnapshot<'_, S> {
         }
         self.group_start = vec![0; rows + 2];
         for group in 0..=rows {
-            let block = usize::from(self.blocks_before.get(group).is_some_and(Option::is_some));
+            let blocks = self.blocks_before.get(group).map_or(0, Vec::len);
             let text = usize::from(group < rows);
             self.group_start[group + 1] =
-                self.group_start[group] + self.group_docs[group].len() + block + text;
+                self.group_start[group] + self.group_docs[group].len() + blocks + text;
         }
     }
 
@@ -204,9 +220,12 @@ impl<S: TextStore> DisplaySnapshot<'_, S> {
         }
     }
 
-    fn block_at(&self, group: usize) -> Option<&Block> {
-        let index = (*self.blocks_before.get(group)?)?;
-        self.map.block.as_slice().get(index)
+    /// The block a display row of a group shows, `None` for the text and rendered rows.
+    fn block_at(&self, group: usize, row: usize) -> Option<&'a Block> {
+        let start = self.group_start.get(group).copied().unwrap_or(0)
+            + self.group_docs.get(group).map_or(0, Vec::len);
+        let slot = row.checked_sub(start)?;
+        self.blocks_before.get(group)?.get(slot).copied()
     }
 
     pub fn row_count(&self) -> usize {
@@ -252,17 +271,17 @@ impl<S: TextStore> DisplaySnapshot<'_, S> {
             return true;
         }
         let group = self.group_of(row);
-        self.blocks_before.get(group).is_some_and(Option::is_some)
-            && row
-                == self.group_start.get(group).copied().unwrap_or(0)
-                    + self.group_docs.get(group).map_or(0, Vec::len)
+        let start = self.group_start.get(group).copied().unwrap_or(0)
+            + self.group_docs.get(group).map_or(0, Vec::len);
+        let blocks = self.blocks_before.get(group).map_or(0, Vec::len);
+        row >= start && row < start + blocks
     }
 
-    /// The display row that shows a group, with the rendered rows and the block counted.
+    /// The display row that shows a group, with the rendered rows and the blocks counted.
     fn display_row(&self, group: usize) -> usize {
         self.group_start.get(group).copied().unwrap_or(0)
             + self.group_docs.get(group).map_or(0, Vec::len)
-            + usize::from(self.blocks_before.get(group).is_some_and(Option::is_some))
+            + self.blocks_before.get(group).map_or(0, Vec::len)
     }
 
     /// The first display row of the comment that covers `line`.
@@ -293,7 +312,7 @@ impl<S: TextStore> DisplaySnapshot<'_, S> {
             return self.store.offset_to_line(range.start.min(self.store.len()));
         }
         if self.is_block_row(row)
-            && let Some(block) = self.block_at(group)
+            && let Some(block) = self.block_at(group, row)
         {
             return self
                 .store
@@ -405,7 +424,7 @@ impl<S: TextStore> DisplaySnapshot<'_, S> {
             };
         }
         if self.is_block_row(row)
-            && let Some(block) = self.block_at(group)
+            && let Some(block) = self.block_at(group, row)
         {
             return DisplayLine {
                 text: block.text.clone(),

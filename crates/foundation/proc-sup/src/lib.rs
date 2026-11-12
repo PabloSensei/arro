@@ -10,7 +10,9 @@
 //! ```
 
 mod capture;
+mod input;
 mod process;
 
 pub use capture::{CaptureError, Captured, capture};
+pub use input::{Input, InputWriter};
 pub use process::{Process, ProcessClass, ProcessSpec};

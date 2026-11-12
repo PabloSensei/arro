@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use proc_sup::Input;
 use serde_json::Value;
 
 /// Where a session is.
@@ -260,6 +261,9 @@ pub struct Debugger {
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
     snapshots:
         std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<std::sync::Arc<Snapshot>>>>,
+    /// The standard input of a program this session launched; a session that attaches
+    /// to somebody else's program has none.
+    input: Option<Input>,
 }
 
 impl Debugger {
@@ -272,7 +276,39 @@ impl Debugger {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             commands,
             snapshots: std::sync::Arc::new(std::sync::Mutex::new(snapshots)),
+            input: None,
         }
+    }
+
+    /// Gives the session the standard input of the program it launched, so the console
+    /// can type into it.
+    pub fn with_input(mut self, input: Input) -> Self {
+        self.input = Some(input);
+        self
+    }
+
+    /// Whether the program of this session reads its standard input from the console.
+    pub fn takes_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// A line for the program, with the line break that Enter adds.
+    pub fn send_line(&self, line: &str) {
+        if let Some(input) = &self.input {
+            input.send_line(line);
+        }
+    }
+
+    /// The program sees the end of its input.
+    pub fn send_eof(&self) {
+        if let Some(input) = &self.input {
+            input.send_eof();
+        }
+    }
+
+    /// Why the last write of the input failed, since the last call.
+    pub fn take_input_error(&self) -> Option<String> {
+        self.input.as_ref().and_then(Input::take_error)
     }
 
     /// A number of this session that no later session has, so a caller can keep state

@@ -554,9 +554,8 @@ impl UsagesHub {
         }
     }
 
-    /// The symbols of the tabs, for the tests.
-    #[cfg(test)]
-    pub(crate) fn tab_names(&self) -> Vec<String> {
+    /// The symbols of the tabs, as the list of the tool window and the tests read them.
+    pub fn tab_names(&self) -> Vec<String> {
         self.tabs.iter().map(|tab| tab.name.clone()).collect()
     }
 

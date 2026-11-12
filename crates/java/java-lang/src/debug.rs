@@ -411,6 +411,18 @@ impl JavaDebugger {
     }
 }
 
+/// Takes the standard input of the debuggee and gives its writer to the session, so the
+/// console can type into the program. The pipe stays open until Send EOF, the end of the
+/// process or the end of the session.
+fn with_program_input(debugger: Debugger, process: &mut proc_sup::Process) -> Debugger {
+    let Some(stdin) = process.take_stdin() else {
+        return debugger;
+    };
+    let (input, writer) = proc_sup::Input::channel();
+    writer.start(stdin);
+    debugger.with_input(input)
+}
+
 impl DebugService for JavaDebugger {
     fn start(
         &self,
@@ -441,7 +453,7 @@ impl DebugService for JavaDebugger {
 
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (snapshots, incoming) = channel();
-        let debugger = Debugger::new(commands, incoming);
+        let debugger = with_program_input(Debugger::new(commands, incoming), &mut process);
         let extension = self.extension();
         extension.session_started(&debugger);
         let failures = snapshots.clone();
@@ -716,6 +728,8 @@ fn listening_port(line: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use serde_json::json;
 
     use super::*;
@@ -863,6 +877,41 @@ mod tests {
         let empty = reload_outcome(&json!({"errorMessage": null}));
         assert!(empty.reloaded.is_empty());
         assert_eq!(empty.error, None);
+    }
+
+    #[test]
+    fn the_standard_input_of_the_debuggee_stays_open_at_start() {
+        let program = ProcessSpec::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$line = [Console]::In.ReadLine(); \
+                 if ($line -eq $null) { Write-Output 'closed' } \
+                 else { Write-Output ('got:' + $line) }",
+            ])
+            .input();
+        let mut process = program.start().unwrap();
+        let mut stdout = process.take_stdout().unwrap();
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_snapshots, incoming) = channel();
+        let debugger = with_program_input(Debugger::new(commands, incoming), &mut process);
+        assert!(
+            debugger.takes_input(),
+            "the console may type into the program"
+        );
+
+        // A program whose input was closed at the start would read the end of the input
+        // and exit.
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            process.try_wait().unwrap().is_none(),
+            "the program still waits for its input"
+        );
+
+        debugger.send_line("hello");
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).unwrap();
+        assert!(text.contains("got:hello"), "{text:?}");
     }
 
     /// The request of the plugin goes to a trial adapter and its answer is read here.

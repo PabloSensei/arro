@@ -29,7 +29,7 @@ pub struct PendingSafeDelete(pub Option<(PathBuf, usize)>);
 impl Global for PendingSafeDelete {}
 
 /// The theme's colours with the font size of Settings; the line follows the size.
-fn style_of(cx: &App) -> EditorStyle {
+pub(crate) fn style_of(cx: &App) -> EditorStyle {
     let mut style = EditorStyle::from_theme(cx.global::<Theme>());
     if let Some(settings) = cx.try_global::<Settings>() {
         let ratio = style.line_height / style.font_size;
@@ -47,7 +47,7 @@ fn style_of(cx: &App) -> EditorStyle {
 }
 
 /// What Settings turns on and off in an open editor.
-fn options_of(cx: &App) -> EditorOptions {
+pub(crate) fn options_of(cx: &App) -> EditorOptions {
     let Some(settings) = cx.try_global::<Settings>() else {
         return EditorOptions::default();
     };

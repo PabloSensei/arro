@@ -5,6 +5,7 @@ mod actions;
 mod bar;
 mod blocks;
 mod code_lens;
+mod decor;
 mod delete;
 mod element;
 mod generate;
@@ -22,6 +23,7 @@ mod state;
 mod style;
 mod view;
 
+pub use decor::PaneDecor;
 pub use element::StripeKind;
 pub use live::{KeyUse, LiveTemplates, TemplateList};
 pub use quick_doc::{

@@ -617,7 +617,7 @@ impl CommitPanel {
         self.lists.save(self.store.as_deref(), &self.lists_key);
     }
 
-    fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if self.tab == tab {
             return;
         }

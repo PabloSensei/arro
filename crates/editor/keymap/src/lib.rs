@@ -757,6 +757,7 @@ pub mod workspace {
     pub const OPEN_IN_RIGHT_SPLIT: &str = "workspace.open_in_right_split";
     pub const SAVE_AS: &str = "workspace.save_as";
     pub const HIDE_ALL_WINDOWS: &str = "workspace.hide_all_windows";
+    pub const SHOW_CONTENT: &str = "workspace.show_content";
     pub const MAXIMIZE_TOOL_WINDOW: &str = "workspace.maximize_tool_window";
     pub const JUMP_TO_LAST_WINDOW: &str = "workspace.jump_to_last_window";
     pub const RESTORE_DEFAULT_LAYOUT: &str = "workspace.restore_default_layout";
@@ -852,7 +853,6 @@ pub mod workspace {
         ("RunInspection", RUN_INSPECTION),
         ("ShowReformatFileDialog", SHOW_REFORMAT_DIALOG),
         ("ShowFilterPopup", FIND_USAGE_FILTER_POPUP),
-        ("ShowSearchHistory", SHOW_SEARCH_HISTORY),
         ("ToggleFindInSelection", TOGGLE_FIND_IN_SELECTION),
         ("UsageFiltering.Imports", USAGE_FILTER_IMPORTS),
         ("UsageFiltering.ReadAccess", USAGE_FILTER_READ),
@@ -872,6 +872,7 @@ pub mod workspace {
         ("Console.Execute", CONSOLE_EXECUTE),
         ("Console.Execute.Multiline", CONSOLE_EXECUTE_MULTILINE),
         ("SendEOF", SEND_EOF),
+        ("ShowContent", SHOW_CONTENT),
     ];
 
     /// IDEA actions the window has without a key of their own, because IDEA gives the
@@ -888,6 +889,16 @@ pub mod workspace {
         // Ctrl+Alt+E is Toggle Find in Selection, Ctrl+Shift+F10 is Run Class.
         ("Console.History.Browse", CONSOLE_HISTORY_BROWSE),
         ("Console.Open", CONSOLE_OPEN),
+        // IDEA gives Tab to both actions: Next Tab moves the selection, and the same key
+        // completes a `/` command in Search Everywhere. Ctrl+Tab iterates the Switcher.
+        (
+            "SearchEverywhere.CompleteCommand",
+            "search_everywhere::next_tab",
+        ),
+        ("SwitcherIterateItems", "search_everywhere::next_tab"),
+        // IDEA gives Alt+Down to the search history in the Find window and to the content
+        // of a tool window. The history of the finder keeps it in its own key handling.
+        ("ShowSearchHistory", SHOW_SEARCH_HISTORY),
     ];
 }
 

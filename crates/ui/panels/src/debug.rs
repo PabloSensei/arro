@@ -22,6 +22,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{DEBUG_TOOL, Workspace};
 
+use crate::console_input::{ConsoleInput, ConsoleKey};
 use crate::navigation;
 use crate::prompt::Prompt;
 
@@ -241,6 +242,11 @@ pub struct DebugPanel {
     shown_breakpoints: Vec<Breakpoint>,
     /// Output of the build step and of a test run, before the adapter's own console.
     local_console: Vec<ConsoleLine>,
+    /// The console the adapter sent last, to keep the shown log in order as the lines the
+    /// user types join it.
+    seen_console: Vec<ConsoleLine>,
+    /// The line the user types into the console, while the program reads input.
+    console_input: ConsoleInput,
     /// The build step of a debug launch, before the debuggee starts.
     build: Option<Console>,
     pending: Option<PendingLaunch>,
@@ -291,6 +297,8 @@ impl DebugPanel {
             expanded: BTreeSet::new(),
             shown_breakpoints: Vec::new(),
             local_console: Vec::new(),
+            seen_console: Vec::new(),
+            console_input: ConsoleInput::new(),
             build: None,
             pending: None,
             session: None,
@@ -509,6 +517,8 @@ impl DebugPanel {
         self.asking_targets = false;
         self.asking_targets_window = None;
         self.local_console.clear();
+        self.seen_console.clear();
+        self.console_input.restart();
         self.build = None;
         self.pending = None;
         self.session = None;
@@ -763,7 +773,11 @@ impl DebugPanel {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
-        let build_changed = self.poll_build(cx);
+        let mut build_changed = self.poll_build(cx);
+        if let Some(reason) = self.debugger.as_ref().and_then(Debugger::take_input_error) {
+            self.input_error_line(&reason);
+            build_changed = true;
+        }
         let Some(debugger) = &self.debugger else {
             if matches!(self.snapshot.state, DebugState::Terminated) {
                 self.session = None;
@@ -790,6 +804,7 @@ impl DebugPanel {
         // A snapshot is only sent when something changed; comparing two lists of ten
         // thousand threads here would be the work the grouping avoids.
         self.snapshot = (*snapshot).clone();
+        self.merge_console();
         if matches!(self.snapshot.state, DebugState::Terminated) {
             self.session = None;
         }
@@ -900,11 +915,88 @@ impl DebugPanel {
                     .push(ConsoleLine::new(line.to_owned(), error));
             }
         }
+        self.trim_console();
+        cx.notify();
+    }
+
+    /// Appends the lines the adapter sent since the last snapshot, so a line the user
+    /// typed and the output that follows it stay in the order they came.
+    fn merge_console(&mut self) {
+        let keep = console_overlap(&self.seen_console, &self.snapshot.console);
+        let appended: Vec<ConsoleLine> =
+            self.snapshot.console[keep.min(self.snapshot.console.len())..].to_vec();
+        self.seen_console.clone_from(&self.snapshot.console);
+        if !appended.is_empty() {
+            self.local_console.extend(appended);
+            self.trim_console();
+        }
+    }
+
+    /// A write into the program failed: the line says why, the console keeps working.
+    fn input_error_line(&mut self, reason: &str) {
+        self.local_console.push(ConsoleLine::new(
+            format!("Cannot send input to the program: {reason}"),
+            true,
+        ));
+        self.trim_console();
+    }
+
+    fn trim_console(&mut self) {
         let extra = self.local_console.len().saturating_sub(MAX_CONSOLE);
         if extra > 0 {
             self.local_console.drain(..extra);
         }
+    }
+
+    /// Whether the console waits for a line: the program reads its input and the input
+    /// did not end.
+    pub(crate) fn takes_input(&self) -> bool {
+        self.console_input.is_open() && self.debugger.as_ref().is_some_and(Debugger::takes_input)
+    }
+
+    /// The line typed into the console, for tests.
+    #[cfg(test)]
+    pub(crate) fn input_text(&self) -> &str {
+        self.console_input.text()
+    }
+
+    fn send_console_line(&mut self, line: &str, cx: &mut Context<Self>) {
+        if let Some(debugger) = &self.debugger {
+            debugger.send_line(line);
+        }
+        self.local_console
+            .push(ConsoleLine::new(line.to_owned(), false));
+        self.trim_console();
+        self.console_input.remember(line);
         cx.notify();
+    }
+
+    /// Send EOF: the program sees the end of its input, and nothing more is typed.
+    fn send_eof(&mut self, cx: &mut Context<Self>) {
+        if !self.takes_input() {
+            return;
+        }
+        if let Some(debugger) = &self.debugger {
+            debugger.send_eof();
+        }
+        self.console_input.close();
+        cx.notify();
+    }
+
+    /// The context menu of the console: Send EOF, as IDEA has it.
+    fn console_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.takes_input() {
+            return;
+        }
+        let panel = cx.weak_entity();
+        let entry = MenuEntry::new("Send EOF", move |_, cx| {
+            panel.update(cx, |panel, cx| panel.send_eof(cx)).ok();
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![entry], cx)
+            })
+            .ok();
     }
 
     pub fn resume(&mut self, _cx: &mut Context<Self>) {
@@ -1780,20 +1872,14 @@ impl DebugPanel {
     ) -> AnyElement {
         let mut rows: Vec<AnyElement> = Vec::new();
         rows.push(section("Console", theme));
-        let total = self.local_console.len() + self.snapshot.console.len();
-        let skip = total.saturating_sub(MAX_CONSOLE);
-        let lines = self
-            .local_console
-            .iter()
-            .chain(self.snapshot.console.iter())
-            .skip(skip);
-        for line in lines {
+        let mut console_rows: Vec<AnyElement> = Vec::new();
+        for line in &self.local_console {
             let color = if line.error {
                 theme.warning_mark
             } else {
                 theme.code
             };
-            rows.push(
+            console_rows.push(
                 div()
                     .px(px(SPACE_M))
                     .py(px(SPACE_XS))
@@ -1804,6 +1890,21 @@ impl DebugPanel {
                     .into_any_element(),
             );
         }
+        rows.push(
+            div()
+                .id("debug-console")
+                .debug_selector(|| "debug-console".to_owned())
+                .flex()
+                .flex_col()
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.console_menu(event.position, cx)
+                    }),
+                )
+                .children(console_rows)
+                .into_any_element(),
+        );
         rows.push(section("Breakpoints", theme));
         for (index, breakpoint) in self.breakpoints.iter().enumerate() {
             rows.push(
@@ -1813,7 +1914,7 @@ impl DebugPanel {
                     .into_any_element(),
             );
         }
-        scrollable(
+        let scrolled = scrollable(
             "debug-side",
             &self.scroll_side,
             div()
@@ -1829,8 +1930,30 @@ impl DebugPanel {
         )
         .flex_1()
         .min_w_0()
-        .h_full()
-        .into_any_element()
+        .min_h_0();
+        // The line the user types stays at the bottom of the panel, so it is at hand
+        // however far the output above has scrolled.
+        let mut side = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(scrolled);
+        if self.takes_input() {
+            side = side.child(
+                div()
+                    .id("debug-console-input-row")
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.console_menu(event.position, cx)
+                        }),
+                    )
+                    .child(self.console_input.element("debug-console-input", theme)),
+            );
+        }
+        side.into_any_element()
     }
 
     fn breakpoint_row(
@@ -2016,6 +2139,28 @@ impl DebugPanel {
                 cx.notify();
             }
             return;
+        }
+        if self.takes_input() {
+            match self.console_input.key(event, cx) {
+                ConsoleKey::Ignored => {}
+                ConsoleKey::Edited => {
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                ConsoleKey::Lines(lines) => {
+                    cx.stop_propagation();
+                    for line in lines {
+                        self.send_console_line(&line, cx);
+                    }
+                    return;
+                }
+                ConsoleKey::Eof => {
+                    cx.stop_propagation();
+                    self.send_eof(cx);
+                    return;
+                }
+            }
         }
         // Escape keeps its meaning of the window when no field is open.
         if key.key == "escape" {
@@ -2501,6 +2646,19 @@ impl Render for StepTargetsView {
 
 fn code_text(code: Option<i32>) -> String {
     code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+}
+
+/// How many leading lines of `new` were the tail of `old`: the adapter sends the whole
+/// console each time and may drop the oldest lines of it.
+fn console_overlap(old: &[ConsoleLine], new: &[ConsoleLine]) -> usize {
+    if old.len() <= new.len() && new[..old.len()] == *old {
+        return old.len();
+    }
+    let most = old.len().min(new.len());
+    (0..=most)
+        .rev()
+        .find(|&keep| old[old.len() - keep..] == new[..keep])
+        .unwrap_or(0)
 }
 
 fn indent(depth: usize) -> String {
@@ -3289,6 +3447,8 @@ mod tests {
                 expanded: BTreeSet::new(),
                 shown_breakpoints: Vec::new(),
                 local_console: Vec::new(),
+                seen_console: Vec::new(),
+                console_input: crate::console_input::ConsoleInput::new(),
                 build: None,
                 pending: None,
                 session: None,

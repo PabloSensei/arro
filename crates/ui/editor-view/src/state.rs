@@ -397,6 +397,20 @@ impl EditorState {
         self.map.set_blocks(blocks);
     }
 
+    /// Replaces the labelled rows and keeps the empty rows a view added to line up with
+    /// another text.
+    pub fn set_labels(&mut self, labels: Vec<display_map::Block>) {
+        let mut blocks: Vec<display_map::Block> = self
+            .map
+            .blocks()
+            .iter()
+            .filter(|block| block.text.is_empty())
+            .cloned()
+            .collect();
+        blocks.extend(labels);
+        self.map.set_blocks(blocks);
+    }
+
     pub fn blocks(&self) -> &[display_map::Block] {
         self.map.blocks()
     }

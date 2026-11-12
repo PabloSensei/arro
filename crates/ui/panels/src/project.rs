@@ -341,17 +341,32 @@ impl ProjectPanel {
         point(viewport.left() + px(8.), top + item - px(4.))
     }
 
-    /// Ctrl+D: compares the selected file with the clipboard.
-    /// Ctrl+D: two selected files against each other, one against the clipboard.
-    fn compare_with_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ctrl+D: two selected files against each other, one against the clipboard, and
+    /// two folders in the folder compare. A single folder asks for the other one.
+    fn compare_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.selected_paths();
-        let Some(git) = cx
+        let git = cx
             .try_global::<crate::git::ActiveGit>()
-            .map(|git| git.0.clone())
-        else {
-            return;
-        };
+            .map(|git| git.0.clone());
         if let [left, right] = selected.as_slice() {
+            if left.is_dir() && right.is_dir() {
+                let workspace = self.workspace.clone();
+                let (left, right) = (left.clone(), right.clone());
+                workspace
+                    .update(cx, |workspace, cx| {
+                        crate::folder_compare::FolderCompareView::open(
+                            left, right, workspace, window, cx,
+                        )
+                    })
+                    .ok();
+                return;
+            }
+            let Some(git) = git else {
+                return;
+            };
+            if left.is_dir() || right.is_dir() {
+                return;
+            }
             crate::diff_view::DiffView::compare_files(
                 git,
                 self.workspace.clone(),
@@ -363,6 +378,13 @@ impl ProjectPanel {
             return;
         }
         let [path] = selected.as_slice() else {
+            return;
+        };
+        if path.is_dir() {
+            self.compare_with_folder(path.clone(), window, cx);
+            return;
+        }
+        let Some(git) = git else {
             return;
         };
         let path = path.clone();
@@ -383,6 +405,35 @@ impl ProjectPanel {
             window,
             cx,
         );
+    }
+
+    /// Compare With... of one folder: the other folder comes from the folder picker.
+    fn compare_with_folder(&mut self, left: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        let workspace = self.workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let chosen = paths.await.ok().and_then(Result::ok).flatten();
+                let Some(right) = chosen.and_then(|paths| paths.into_iter().next()) else {
+                    return;
+                };
+                cx.update(|window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            crate::folder_compare::FolderCompareView::open(
+                                left, right, workspace, window, cx,
+                            )
+                        })
+                        .ok();
+                })
+                .ok();
+            })
+            .detach();
     }
 
     pub fn tree(&self) -> &FileTree {
@@ -1785,6 +1836,17 @@ impl ProjectPanel {
             });
             entries.push(open.shortcut("F4"));
         }
+        if is_folder {
+            let (compare_panel, compare_left) = (panel.clone(), path.clone());
+            let compare = MenuEntry::new("Compare With...", move |window, cx| {
+                let left = compare_left.clone();
+                let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    this.compare_with_folder(left, window, cx)
+                };
+                Self::later(window, compare_panel.clone(), cx, ask);
+            });
+            entries.push(compare.shortcut("Ctrl+D"));
+        }
         if !is_root {
             let (rename_panel, rename_path) = (panel.clone(), path.clone());
             let rename = MenuEntry::new("Rename...", move |window, cx| {
@@ -1947,7 +2009,7 @@ impl Render for ProjectPanel {
             }))
             .on_action(cx.listener(|this, _: &NewItem, _, cx| this.show_new_menu(cx)))
             .on_action(cx.listener(|this, _: &CompareTwoFiles, window, cx| {
-                this.compare_with_clipboard(window, cx)
+                this.compare_selection(window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenRow, window, cx| {
                 if let Some(index) = this.selected_index() {

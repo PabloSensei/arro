@@ -26,6 +26,7 @@ use workspace::{DEBUG_TOOL, RUN_TOOL, RunControls, RunState, Workspace};
 use workspace_core::Delivery;
 
 use crate::ansi::{AnsiParser, Line, Style};
+use crate::console_input::{ConsoleInput, ConsoleKey};
 
 mod tests;
 
@@ -165,13 +166,7 @@ pub struct RunPanel {
     /// batch runs.
     model_reload: u64,
     /// The line the user types into the console, when its program reads input.
-    console_input: TextField,
-    /// The lines sent to this console, oldest first.
-    console_history: Vec<String>,
-    /// Where the walk through the history stands; `None` while the line is the live one.
-    history_at: Option<usize>,
-    /// The program was told that its input ended.
-    input_closed: bool,
+    console_input: ConsoleInput,
     /// The program step of the console started; a build step before it reads nothing.
     program_started: bool,
 }
@@ -263,10 +258,7 @@ impl RunPanel {
                 build_parser: AnsiParser::default(),
                 reload: None,
                 model_reload: 0,
-                console_input: TextField::default(),
-                console_history: Vec::new(),
-                history_at: None,
-                input_closed: false,
+                console_input: ConsoleInput::new(),
                 program_started: false,
             }
         })
@@ -439,6 +431,30 @@ impl RunPanel {
             .as_ref()
             .and_then(ProjectSession::model)
             .map_or_else(Vec::new, |model| model.modules.clone())
+    }
+
+    /// The tabs of the console: the run of this window first, then the old runs.
+    pub fn content_tabs(&self) -> Vec<String> {
+        let current = if self.title.is_empty() {
+            "Run".to_owned()
+        } else {
+            self.title.to_string()
+        };
+        let mut tabs = vec![current];
+        tabs.extend(self.draining.iter().map(|drain| drain.title.to_string()));
+        tabs
+    }
+
+    /// Shows the console tab at `index`, as a click on it does.
+    pub fn select_content(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == 0 {
+            self.viewing = None;
+        } else if index <= self.draining.len() {
+            self.viewing = Some(index - 1);
+        } else {
+            return;
+        }
+        cx.notify();
     }
 
     /// What went wrong so far, for scripts.
@@ -759,7 +775,7 @@ impl RunPanel {
         self.viewing = None;
         self.console_running = false;
         self.program_started = false;
-        self.input_closed = false;
+        self.console_input.restart();
     }
 
     /// The workspace shows the tool window: this may run inside a workspace update.
@@ -1020,14 +1036,14 @@ impl RunPanel {
     pub(crate) fn takes_input(&self) -> bool {
         self.viewing.is_none()
             && self.program_started
-            && !self.input_closed
+            && self.console_input.is_open()
             && self.console.as_ref().is_some_and(Console::takes_input)
     }
 
     /// The line typed into the console, for tests.
     #[cfg(test)]
     pub(crate) fn input_text(&self) -> &str {
-        &self.console_input.text
+        self.console_input.text()
     }
 
     /// Enter in the console: the line goes to the program with the line break after it and
@@ -1036,7 +1052,7 @@ impl RunPanel {
         if !self.takes_input() {
             return;
         }
-        let line = self.console_input.text.clone();
+        let line = self.console_input.take_line();
         self.send_console_line(&line, cx);
     }
 
@@ -1050,11 +1066,7 @@ impl RunPanel {
         self.lines.extend(done);
         self.lines
             .push_back(Line::plain(line.to_owned(), input_style()));
-        if !line.is_empty() && self.console_history.last().is_none_or(|last| last != line) {
-            self.console_history.push(line.to_owned());
-        }
-        self.console_input = TextField::default();
-        self.history_at = None;
+        self.console_input.remember(line);
         self.changed(cx);
     }
 
@@ -1066,9 +1078,7 @@ impl RunPanel {
         if let Some(console) = &self.console {
             console.send_eof();
         }
-        self.input_closed = true;
-        self.console_input = TextField::default();
-        self.history_at = None;
+        self.console_input.close();
         self.changed(cx);
     }
 
@@ -1077,43 +1087,9 @@ impl RunPanel {
         if !self.takes_input() {
             return;
         }
-        let len = self.console_history.len();
-        if len == 0 {
-            return;
-        }
-        let next = match self.history_at {
-            None if !older => return,
-            None => Some(len - 1),
-            Some(index) if older => index.checked_sub(1),
-            Some(index) if index + 1 < len => Some(index + 1),
-            Some(_) => None,
-        };
-        self.history_at = next;
-        let text = next.map_or("", |index| self.console_history[index].as_str());
-        self.console_input = TextField::from_text(text);
-        cx.notify();
-    }
-
-    /// Ctrl+V: the complete lines of the clipboard go to the program one after another;
-    /// what follows the last line break stays in the input line.
-    fn paste_into_console(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
-        };
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let Some(at) = text.rfind('\n') else {
-            self.console_input.insert_text(&text);
+        if self.console_input.browse_history(older) {
             cx.notify();
-            return;
-        };
-        for line in text[..at].split('\n') {
-            self.send_console_line(line, cx);
         }
-        let rest = &text[at + 1..];
-        if !rest.is_empty() {
-            self.console_input.insert_text(rest);
-        }
-        cx.notify();
     }
 
     /// The keys of the console input line while the console waits for one. True when the
@@ -1122,43 +1098,26 @@ impl RunPanel {
         if !self.takes_input() {
             return false;
         }
-        let key = event.keystroke.key.as_str();
-        let modifiers = event.keystroke.modifiers;
-        let primary = modifiers.control || modifiers.platform;
-        if primary && !modifiers.alt && !modifiers.shift {
-            match key {
-                "d" => {
-                    cx.stop_propagation();
-                    self.send_eof(cx);
-                    return true;
+        match self.console_input.key(event, cx) {
+            ConsoleKey::Ignored => false,
+            ConsoleKey::Edited => {
+                cx.stop_propagation();
+                cx.notify();
+                true
+            }
+            ConsoleKey::Lines(lines) => {
+                cx.stop_propagation();
+                for line in lines {
+                    self.send_console_line(&line, cx);
                 }
-                "v" => {
-                    cx.stop_propagation();
-                    self.paste_into_console(cx);
-                    return true;
-                }
-                _ => {}
+                true
+            }
+            ConsoleKey::Eof => {
+                cx.stop_propagation();
+                self.send_eof(cx);
+                true
             }
         }
-        if !modifiers.alt && !modifiers.shift && matches!(key, "up" | "down") {
-            cx.stop_propagation();
-            self.browse_history(key == "up", cx);
-            return true;
-        }
-        if !modifiers.alt && !modifiers.shift && key == "enter" {
-            cx.stop_propagation();
-            self.execute_input(cx);
-            return true;
-        }
-        if self.console_input.key_with_clipboard(event, false, cx) {
-            if key == "backspace" || key == "delete" || event.keystroke.key_char.is_some() {
-                self.history_at = None;
-            }
-            cx.stop_propagation();
-            cx.notify();
-            return true;
-        }
-        false
     }
 
     /// A key of the tool window: the console takes it while it waits for a line, the tree
@@ -1303,10 +1262,7 @@ impl RunPanel {
         self.title = title.into();
         self.lines.clear();
         self.parser = AnsiParser::default();
-        self.console_input = TextField::default();
-        self.console_history.clear();
-        self.history_at = None;
-        self.input_closed = false;
+        self.console_input.restart();
         self.program_started = false;
         self.tests.clear();
         cx.emit(TestsChanged);
@@ -1988,7 +1944,7 @@ impl RunPanel {
         range
             .map(|index| {
                 if typed == Some(index) {
-                    return self.input_element(theme);
+                    return self.console_input.element("run-console-input", theme);
                 }
                 let line = match drain {
                     Some(drain) => drain.lines.get(index),
@@ -1998,28 +1954,6 @@ impl RunPanel {
                 line_element(line, theme)
             })
             .collect()
-    }
-
-    /// The line the user types, with the caret after it: the console waits for input at
-    /// the end of the output, and output that arrives meanwhile goes above it.
-    fn input_element(&self, theme: &Theme) -> AnyElement {
-        div()
-            .debug_selector(|| "run-console-input".to_owned())
-            .flex()
-            .items_center()
-            .h(px(CODE_LINE_HEIGHT))
-            .px(px(LINE_PAD))
-            .whitespace_nowrap()
-            .text_color(theme.console_input)
-            .child(self.console_input.text.clone())
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(1.))
-                    .h(px(CODE_SIZE))
-                    .bg(theme.console_input),
-            )
-            .into_any_element()
     }
 }
 

@@ -91,22 +91,10 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "CollapseExpandableComponent",
         "A generic expandable component key is not in MVP-1; trees have their own keys.",
     ),
-    (
-        "Compare.SameVersion",
-        "Comparing two versions of a file is not in MVP-1.",
-    ),
     ("ContextHelp", "MVP-1 has no in-product help."),
     (
         "Diff.ShowSettingsPopup",
         "The diff shows context lines always; settings popup is not in MVP-1.",
-    ),
-    (
-        "DirDiffMenu.SynchronizeDiff",
-        "Folder diff is not in MVP-1.",
-    ),
-    (
-        "DirDiffMenu.SynchronizeDiff.All",
-        "Folder diff is not in MVP-1.",
     ),
     (
         "DumpLookupElementWeights",
@@ -185,18 +173,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "Ctrl+Alt+Enter starts a line; no quick action popup is in MVP-1.",
     ),
     (
-        "SearchEverywhere.CompleteCommand",
-        "Search Everywhere has no command completion.",
-    ),
-    (
-        "SearchEverywhere.NavigateToNextGroup",
-        "Search Everywhere lists groups without group navigation.",
-    ),
-    (
-        "SearchEverywhere.NavigateToPrevGroup",
-        "Search Everywhere lists groups without group navigation.",
-    ),
-    (
         "SelectVirtualTemplateElement",
         "Virtual template elements are not in MVP-1.",
     ),
@@ -208,20 +184,8 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "ServiceView.ShowServices",
         "The Services window lists what it has; no filter action.",
     ),
-    (
-        "ShowContent",
-        "The navigation popups open a file directly; no content preview.",
-    ),
     ("SwitchCoverage", "Coverage is not in MVP-1."),
     ("SwitchHeaderSource", "Java has no header and source pair."),
-    (
-        "SwitcherIterateItems",
-        "Ctrl+E opens Recent Files; the Switcher has no iterate key.",
-    ),
-    (
-        "SwitcherRecentEditedChangedToggleCheckBox",
-        "Ctrl+E opens Recent Files; the Switcher has no checkbox key.",
-    ),
     ("TextSearchAction", "Search Everywhere covers text search."),
     (
         "Vcs.MoveChangedLinesToChangelist",

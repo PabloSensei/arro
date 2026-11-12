@@ -398,6 +398,8 @@ pub enum EditorEvent {
     ShowUsages(UsagesUpdate),
     /// A right click in the text: the window shows the menu of the editor here.
     ContextMenu(Point<Pixels>),
+    /// The text scrolled: the first visible row in pixels, for a view that follows it.
+    Scrolled(f32),
 }
 
 /// What the Documentation tool window asks about the symbol at the caret: the place, the
@@ -628,21 +630,17 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        static NEXT_DOCUMENT: AtomicU64 = AtomicU64::new(1);
-
+        let view = Self::empty(path, style, cx);
         let language = cx
             .try_global::<Languages>()
-            .and_then(|languages| (languages.resolve)(&path));
-        let templates = cx
-            .try_global::<Languages>()
-            .and_then(|languages| (languages.templates)(&path));
-        match Self::source_text(&path, cx) {
+            .and_then(|languages| (languages.resolve)(&view.path));
+        match Self::source_text(&view.path, cx) {
             Some(text) => {
                 let state = EditorState::new(&text, FileFormat::default(), language, true);
                 cx.defer_in(window, |this, _, cx| this.loaded(Ok(state), cx));
             }
             None => {
-                let load = path.clone();
+                let load = view.path.clone();
                 let task = cx.background_spawn(async move { EditorState::load(&load, language) });
                 cx.spawn_in(window, async move |this, cx| {
                     let result = task.await;
@@ -653,28 +651,48 @@ impl EditorView {
         }
         cx.observe_global::<Reveals>(|this, cx| this.reveal(cx))
             .detach();
+        view.start_blink(window, cx);
+        view
+    }
 
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(BLINK).await;
-                let alive = this.update_in(cx, |this, window, cx| {
-                    if this.focus_handle.is_focused(window) && window.is_window_active() {
-                        if this.options.caret_blink {
-                            this.caret_on = !this.caret_on;
-                            cx.notify();
-                        } else if !this.caret_on {
-                            this.caret_on = true;
-                            cx.notify();
-                        }
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+    /// Opens `text` over `path` at once, for a view of text that is not the file on disk:
+    /// the other side of a comparison, or a version from the local history. The language
+    /// comes from the path, so the text is coloured as the file would be.
+    pub fn open_text(
+        path: PathBuf,
+        text: String,
+        read_only: bool,
+        style: EditorStyle,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::empty(path, style, cx);
+        let language = cx
+            .try_global::<Languages>()
+            .and_then(|languages| (languages.resolve)(&view.path));
+        let mut state = EditorState::new(&text, FileFormat::default(), language, read_only);
+        state.set_save_options(view.options.save);
+        state.apply_indent_defaults(
+            view.options.use_tabs,
+            view.options.indent_size,
+            view.options.tab_size,
+        );
+        if let Some(language) = state.language() {
+            view.start_syntax(language.clone(), &state, cx);
+        }
+        view.state = Some(state);
+        view.attach(cx);
+        view.remember_text(cx);
+        cx.notify();
+        view
+    }
 
+    /// The fields of a view before it has text. The file or the text comes next.
+    fn empty(path: PathBuf, style: EditorStyle, cx: &mut Context<Self>) -> Self {
+        static NEXT_DOCUMENT: AtomicU64 = AtomicU64::new(1);
+
+        let templates = cx
+            .try_global::<Languages>()
+            .and_then(|languages| (languages.templates)(&path));
         if !cx.has_global::<Keys>() {
             cx.set_global(Keys(Rc::new(default_keymap().1)));
             // The window binds Ctrl+Alt+Shift+Left and Right to the split groups. The
@@ -753,6 +771,96 @@ impl EditorView {
             docs: crate::rendered_doc::RenderedDocs::default(),
             pending_frames: Vec::with_capacity(8),
         }
+    }
+
+    /// Blinks the caret while the editor has the focus.
+    fn start_blink(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK).await;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if this.focus_handle.is_focused(window) && window.is_window_active() {
+                        if this.options.caret_blink {
+                            this.caret_on = !this.caret_on;
+                            cx.notify();
+                        } else if !this.caret_on {
+                            this.caret_on = true;
+                            cx.notify();
+                        }
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The text of the editor alone, without its bar, crumbs and problem widget, for a
+    /// view that shows it beside another one. Keys and the input handler stay those of
+    /// this editor, so the pane is a full editor. `context` names the keys of the view
+    /// that holds the pane; it is deeper than `Editor`, so its keys win over the keys of
+    /// the window.
+    pub fn pane(
+        &self,
+        decor: crate::PaneDecor,
+        context: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut focus = div()
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .child(EditorElement::with_decor(cx.entity(), decor));
+        if let Some(context) = context {
+            focus = focus.key_context(context);
+        }
+        let popups = self.popups(window, cx);
+        let theme = *cx.global::<Theme>();
+        // The find bar stands over the first rows, so a pane beside another one keeps
+        // its rows on the same lines while the bar is open.
+        let bar = self.render_bar(cx).map(|bar| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bg(theme.popup_bg)
+                .child(bar)
+        });
+        div()
+            .key_context("Editor")
+            .relative()
+            .size_full()
+            .bg(self.style.background)
+            .text_color(self.style.code)
+            .on_action(cx.listener(|this, _: &MoveElementLeft, _, cx| {
+                if !this.move_element_action(false, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MoveElementRight, _, cx| {
+                if !this.move_element_action(true, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_key_down(cx.listener(Self::on_key))
+            .child(focus)
+            .children(bar)
+            .children(popups)
+            .children(self.template_popup(cx))
+            .into_any_element()
+    }
+
+    /// The height of one row of the text.
+    pub fn line_height(&self) -> f32 {
+        self.style.line_height
+    }
+
+    /// Puts the first visible row at `top`, as a drag of the vertical bar does.
+    pub fn scroll_to_top(&mut self, top: f32, cx: &mut Context<Self>) {
+        self.set_scroll_top(top, cx);
     }
 
     /// Moves the caret and shows it. Before the file is read the move waits for it.
@@ -2497,6 +2605,7 @@ impl EditorView {
         self.scroll_left = (self.scroll_left - f32::from(delta.x)).max(0.);
         self.semantic_tokens_scrolled(cx);
         self.inlays_if_needed(cx);
+        cx.emit(EditorEvent::Scrolled(self.scroll_top));
         cx.notify();
     }
 
@@ -2522,6 +2631,7 @@ impl EditorView {
         self.caret_on = true;
         self.semantic_tokens_scrolled(cx);
         self.inlays_if_needed(cx);
+        cx.emit(EditorEvent::Scrolled(self.scroll_top));
         cx.notify();
     }
 

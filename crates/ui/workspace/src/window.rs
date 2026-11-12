@@ -1440,6 +1440,12 @@ impl Workspace {
         self.bottom.active_tool().map(|tool| tool.id)
     }
 
+    /// The id of the tool window that has the focus, if any.
+    pub fn focused_tool_id(&self, window: &Window, cx: &App) -> Option<&'static str> {
+        let side = self.focused_dock(window, cx)?;
+        self.dock(side).active_tool().map(|tool| tool.id)
+    }
+
     /// Whether the tool window is the one shown in an open dock.
     pub fn tool_open(&self, id: &str) -> bool {
         self.find_tool(id).is_some_and(|(side, index)| {

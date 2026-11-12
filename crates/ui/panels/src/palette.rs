@@ -17,7 +17,10 @@ use search::{
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{FileIcons, RUN_TOOL, Settings, Workspace};
+use workspace::{
+    AI_TOOL, COMMIT_TOOL, DEBUG_TOOL, FileIcons, LOG_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL,
+    SERVICES_TOOL, STRUCTURE_TOOL, Settings, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+};
 
 use crate::index::ProjectIndex;
 use crate::navigation;
@@ -32,7 +35,17 @@ const MAX_ROWS: usize = 200;
 
 actions!(
     search_everywhere,
-    [Previous, Next, Open, OpenDebug, NextTab, PreviousTab]
+    [
+        Previous,
+        Next,
+        Open,
+        OpenDebug,
+        NextTab,
+        PreviousTab,
+        NextGroup,
+        PreviousGroup,
+        ToggleEdited
+    ]
 );
 
 /// One key of the Search Everywhere popup and the IDEA action it implements, if any.
@@ -67,6 +80,34 @@ palette_keys![
     ("shift-enter", OpenDebug, None),
     ("tab", NextTab, Some("SearchEverywhere.NextTab")),
     ("shift-tab", PreviousTab, Some("SearchEverywhere.PrevTab")),
+    (
+        "pagedown",
+        NextGroup,
+        Some("SearchEverywhere.NavigateToNextGroup")
+    ),
+    (
+        "ctrl-down",
+        NextGroup,
+        Some("SearchEverywhere.NavigateToNextGroup")
+    ),
+    (
+        "pageup",
+        PreviousGroup,
+        Some("SearchEverywhere.NavigateToPrevGroup")
+    ),
+    (
+        "ctrl-up",
+        PreviousGroup,
+        Some("SearchEverywhere.NavigateToPrevGroup")
+    ),
+    // While Ctrl is held the Switcher keeps its list under the same keys.
+    ("ctrl-tab", NextTab, None),
+    ("ctrl-shift-tab", PreviousTab, None),
+    (
+        "ctrl-e",
+        ToggleEdited,
+        Some("SwitcherRecentEditedChangedToggleCheckBox")
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +116,9 @@ pub enum Mode {
     /// Ctrl+E lists the files recently active, Ctrl+Tab does the same and starts on the
     /// previous one.
     Recent,
+    /// Ctrl+Tab while Ctrl is held: the recent files and the tool windows. Releasing
+    /// Ctrl opens what is selected.
+    Switcher,
     /// The declarations of the file that is open.
     Structure,
     /// Double Ctrl lists the run configurations of the project.
@@ -108,6 +152,8 @@ enum Item {
     Setting(&'static str),
     /// A run configuration of the project, by name.
     RunConfig(String),
+    /// A tool window of the Switcher, by id.
+    Tool(&'static str),
 }
 
 /// A row on screen: a group header when `item` is empty.
@@ -145,6 +191,34 @@ const TABS: [(Tab, &str); 5] = [
     (Tab::Actions, "Actions"),
 ];
 
+/// The tool windows the Switcher lists, in the order they appear there.
+const TOOLS: [(&str, &str, &str); 12] = [
+    (PROJECT_TOOL, "Project", "toolwindows/project"),
+    (COMMIT_TOOL, "Commit", "toolwindows/commit"),
+    (LOG_TOOL, "Git Log", "general/vcs"),
+    (STRUCTURE_TOOL, "Structure", "toolwindows/structure"),
+    (RUN_TOOL, "Run", "toolwindows/run"),
+    (DEBUG_TOOL, "Debug", "toolwindows/debug"),
+    (TERMINAL_TOOL, "Terminal", "toolwindows/terminal"),
+    (SERVICES_TOOL, "Services", "toolwindows/services"),
+    (TODO_TOOL, "TODO", "status/info"),
+    (PROBLEMS_TOOL, "Problems", "toolwindows/problems"),
+    (USAGES_TOOL, "Usages", "codeInsight/search"),
+    (AI_TOOL, "AI Sessions", "own/aiSessions"),
+];
+
+/// The commands of Search Everywhere that begin with `/`.
+const COMMANDS: [(&str, &str); 8] = [
+    ("file", "workspace.goto_file"),
+    ("class", "workspace.goto_class"),
+    ("symbol", "workspace.goto_symbol"),
+    ("search", "workspace.search_everywhere"),
+    ("action", "workspace.find_action"),
+    ("run", "workspace.run_anything"),
+    ("recent", "workspace.recent_files"),
+    ("switcher", "workspace.switcher"),
+];
+
 fn kind_icon(kind: SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Module => "nodes/package",
@@ -170,6 +244,10 @@ pub struct Palette {
     rows: Vec<RowData>,
     actions: Vec<ActionEntry>,
     recent: Vec<PathBuf>,
+    /// The files of the open tabs, which is what the Switcher lists.
+    open_tabs: Vec<PathBuf>,
+    /// The Recent Files checkbox: only the open files with unsaved text.
+    edited_only: bool,
     structure: Option<(PathBuf, Arc<[OutlineItem]>)>,
     /// Answers of the symbol sources for the query on screen, by scope and source.
     symbol_batches: HashMap<(usize, usize), Vec<SymbolRow>>,
@@ -196,6 +274,7 @@ impl Palette {
             })
             .collect();
         let recent = navigation::recent(cx);
+        let open_tabs: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
         // The open editor knows the signatures the language sent; the project index only
         // has names, so it is the fallback for a tab that is not an editor.
         let structure = workspace
@@ -227,6 +306,8 @@ impl Palette {
                 rows: Vec::new(),
                 actions,
                 recent,
+                open_tabs,
+                edited_only: false,
                 structure,
                 symbol_batches: HashMap::new(),
                 serial: 0,
@@ -242,10 +323,15 @@ impl Palette {
     fn tab(&self) -> Tab {
         match self.mode {
             Mode::Everywhere(tab) => tab,
-            Mode::Recent => Tab::Files,
+            Mode::Recent | Mode::Switcher => Tab::Files,
             Mode::Structure => Tab::Symbols,
             Mode::RunAnything | Mode::ChooseRun { .. } => Tab::Actions,
         }
+    }
+
+    /// Whether the query is `/` or `/name`: the list of commands.
+    fn command_query(&self) -> bool {
+        self.query.text.trim_start().starts_with('/')
     }
 
     fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -270,7 +356,9 @@ impl Palette {
         self.tasks.clear();
         self.symbol_batches.clear();
         self.rebuild(cx);
-        if let Mode::Everywhere(tab) = self.mode {
+        if let Mode::Everywhere(tab) = self.mode
+            && !self.command_query()
+        {
             let scopes: &[SymbolScope] = match tab {
                 Tab::All => &[SymbolScope::Types, SymbolScope::Members],
                 Tab::Classes => &[SymbolScope::Types],
@@ -366,6 +454,15 @@ impl Palette {
                 .map(|ranked| ranked.item)
                 .collect()
         };
+        let paths: Vec<PathBuf> = if self.edited_only {
+            let dirty = self.dirty_paths(cx);
+            paths
+                .into_iter()
+                .filter(|path| dirty.iter().any(|open| open == path))
+                .collect()
+        } else {
+            paths
+        };
         paths
             .into_iter()
             .map(|path| {
@@ -389,6 +486,71 @@ impl Palette {
                     indent: 0,
                     toggle: None,
                     item: Some(Item::File { path, spot }),
+                }
+            })
+            .collect()
+    }
+
+    /// The open files that have unsaved text, for the "Show edited only" checkbox.
+    fn dirty_paths(&self, cx: &App) -> Vec<PathBuf> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Vec::new();
+        };
+        workspace
+            .read(cx)
+            .open_editors()
+            .into_iter()
+            .filter(|(_, view)| {
+                view.clone()
+                    .downcast::<EditorView>()
+                    .is_ok_and(|editor| editor.read(cx).is_dirty())
+            })
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    /// The tool windows of the Switcher, with the rows of the recent files.
+    fn tool_rows(&self) -> Vec<RowData> {
+        TOOLS
+            .iter()
+            .map(|(id, title, icon)| RowData {
+                title: (*title).to_owned(),
+                detail: String::new(),
+                icon,
+                shortcut: None,
+                indent: 0,
+                toggle: None,
+                item: Some(Item::Tool(id)),
+            })
+            .collect()
+    }
+
+    /// The commands of a query that begins with `/`.
+    fn command_rows(&self) -> Vec<RowData> {
+        let prefix = self
+            .query
+            .text
+            .trim_start()
+            .trim_start_matches('/')
+            .to_lowercase();
+        COMMANDS
+            .iter()
+            .filter(|(token, _)| token.starts_with(&prefix))
+            .map(|(token, id)| {
+                let detail = self
+                    .actions
+                    .iter()
+                    .find(|action| action.id == *id)
+                    .map(|action| action.title.clone())
+                    .unwrap_or_default();
+                RowData {
+                    title: format!("/{token}"),
+                    detail,
+                    icon: "",
+                    shortcut: None,
+                    indent: 0,
+                    toggle: None,
+                    item: Some(Item::Action(id)),
                 }
             })
             .collect()
@@ -560,9 +722,24 @@ impl Palette {
         let mut rows = Vec::new();
         match self.mode {
             Mode::Recent => rows = self.file_rows(cx, MAX_ROWS),
+            Mode::Switcher => {
+                rows = self.file_rows(cx, MAX_ROWS);
+                rows.retain(|row| match &row.item {
+                    Some(Item::File { path, .. }) => self.open_tabs.contains(path),
+                    _ => true,
+                });
+                rows.extend(self.tool_rows());
+            }
             Mode::Structure => rows = self.structure_rows(),
             Mode::RunAnything | Mode::ChooseRun { .. } => rows = self.run_rows(MAX_ROWS, cx),
             Mode::Everywhere(tab) => {
+                if self.command_query() {
+                    rows = self.command_rows();
+                    self.rows = rows;
+                    self.selected = self.first_selectable();
+                    cx.notify();
+                    return;
+                }
                 let all = tab == Tab::All;
                 let limit = if all { GROUP_ROWS } else { MAX_ROWS };
                 let searching = !GotoQuery::parse(&self.query.text).pattern.is_empty();
@@ -608,6 +785,15 @@ impl Palette {
         self.selected = match (self.mode, self.query.text.is_empty()) {
             // The previous file, so that a second Ctrl+E or Ctrl+Tab goes back.
             (Mode::Recent, true) if self.rows.len() > 1 => 1,
+            // The Switcher starts on the previous file; with one file it stays on the
+            // current one and the first Tab reaches the tool windows.
+            (Mode::Switcher, true) => self
+                .rows
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, row)| matches!(row.item, Some(Item::File { .. })))
+                .map_or(first, |(index, _)| index),
             _ => first,
         };
         cx.notify();
@@ -672,6 +858,121 @@ impl Palette {
             .iter()
             .map(|row| (row.title.clone(), row.detail.clone()))
             .collect()
+    }
+
+    /// The row the keys act on, for scripts and tests.
+    #[cfg(test)]
+    pub(crate) fn selected_row(&self) -> usize {
+        self.selected
+    }
+
+    /// The keys that toggle the checkbox of Recent Files: Ctrl+E there does not reopen
+    /// the list it is already in.
+    fn toggle_edited(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.mode, Mode::Recent | Mode::Switcher) {
+            return;
+        }
+        self.edited_only = !self.edited_only;
+        self.rebuild(cx);
+    }
+
+    /// Tab, Shift+Tab and the arrow keys: the Switcher walks its list, the other lists
+    /// of Search Everywhere keep Tab for their tabs.
+    fn iterate(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.mode == Mode::Switcher {
+            self.move_selection_wrapping(delta, cx);
+            return;
+        }
+        if delta > 0 && self.complete_command(cx) {
+            return;
+        }
+        self.cycle_tab(delta, cx);
+    }
+
+    /// Tab after `/`: the selected command replaces the name of the command in the query.
+    fn complete_command(&mut self, cx: &mut Context<Self>) -> bool {
+        if !matches!(self.mode, Mode::Everywhere(_)) || !self.command_query() {
+            return false;
+        }
+        let Some(Item::Action(id)) = self
+            .rows
+            .get(self.selected)
+            .and_then(|row| row.item.clone())
+        else {
+            return false;
+        };
+        let Some((token, _)) = COMMANDS.iter().find(|(_, command)| *command == id) else {
+            return false;
+        };
+        self.query.select_all();
+        self.query.insert_text(&format!("/{token}"));
+        self.refresh(cx);
+        true
+    }
+
+    /// PgDn and Ctrl+Down: the first row of the next group of Search Everywhere. The
+    /// groups that find nothing are not in the list at all.
+    fn next_group(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.mode == Mode::Switcher {
+            self.move_selection_wrapping(delta, cx);
+            return;
+        }
+        let headers: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.item.is_none())
+            .map(|(index, _)| index)
+            .collect();
+        let target = if delta > 0 {
+            headers
+                .iter()
+                .copied()
+                .find(|header| *header > self.selected)
+        } else {
+            let current = headers
+                .iter()
+                .copied()
+                .filter(|header| *header <= self.selected)
+                .max();
+            current.and_then(|current| {
+                headers
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|header| *header < current)
+            })
+        };
+        let Some(header) = target else {
+            return;
+        };
+        self.selected = header + 1;
+        self.scroll.scroll_to_item(self.selected);
+        cx.notify();
+    }
+
+    fn move_selection_wrapping(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.rows.len();
+        if count == 0 {
+            return;
+        }
+        let mut at = self.selected as isize;
+        for _ in 0..count {
+            at = (at + delta).rem_euclid(count as isize);
+            if self.rows[at as usize].item.is_some() {
+                self.selected = at as usize;
+                break;
+            }
+        }
+        self.scroll.scroll_to_item(self.selected);
+        cx.notify();
+    }
+
+    /// Ctrl released: the Switcher opens what its list points at.
+    fn ctrl_released(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Switcher {
+            self.open(self.selected, false, window, cx);
+        }
     }
 
     fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -744,6 +1045,7 @@ impl Palette {
                     Item::Setting(id) => {
                         SettingsView::show_at(workspace, window, cx, Some(id));
                     }
+                    Item::Tool(id) => workspace.show_tool(id, window, cx),
                     Item::RunConfig(name) => {
                         let Some(runs) = cx
                             .try_global::<crate::script::ActiveRunPanel>()
@@ -938,6 +1240,7 @@ impl Render for Palette {
             .map_or("All", |(_, name)| *name);
         let heading = match self.mode {
             Mode::Recent => Some("Recent Files"),
+            Mode::Switcher => Some("Switcher"),
             Mode::Structure => Some("File Structure"),
             Mode::RunAnything => Some("Run Anything"),
             Mode::ChooseRun { debug: false } => Some("Choose Run Configuration"),
@@ -983,8 +1286,18 @@ impl Render for Palette {
             .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
             .on_action(cx.listener(|this, _: &Previous, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &Next, _, cx| this.move_selection(1, cx)))
-            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(1, cx)))
-            .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(-1, cx)))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.iterate(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.iterate(-1, cx)))
+            .on_action(cx.listener(|this, _: &NextGroup, _, cx| this.next_group(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousGroup, _, cx| this.next_group(-1, cx)))
+            .on_action(cx.listener(|this, _: &ToggleEdited, _, cx| this.toggle_edited(cx)))
+            .on_modifiers_changed(
+                cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
+                    if !event.modifiers.control {
+                        this.ctrl_released(window, cx);
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &Open, window, cx| {
                     this.open(this.selected, false, window, cx)
@@ -1037,6 +1350,25 @@ impl Render for Palette {
                             )),
                     ),
             )
+            .when(matches!(self.mode, Mode::Recent | Mode::Switcher), |this| {
+                this.child(
+                    div()
+                        .id("palette-edited-only")
+                        .debug_selector(|| "palette-edited-only".to_owned())
+                        .flex()
+                        .items_center()
+                        .flex_none()
+                        .gap(px(SPACE_S))
+                        .h(px(ROW_HEIGHT))
+                        .mb(px(SPACE_S))
+                        .px(px(ROW_PADDING_X))
+                        .rounded(px(ROW_RADIUS))
+                        .hover(move |style| style.bg(theme.selection_hover))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_edited(cx)))
+                        .child(checkbox(self.edited_only, &theme))
+                        .child("Show edited only"),
+                )
+            })
             .when(!collapsed, |this| {
                 this.child(
                     scrollable(

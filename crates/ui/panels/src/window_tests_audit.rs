@@ -73,6 +73,11 @@ fn implemented_ids() -> HashSet<&'static str> {
     ids.extend(crate::git_log::KEYS.iter().filter_map(|row| row.idea));
     ids.extend(crate::debug::KEYS.iter().filter_map(|row| row.idea));
     ids.extend(crate::palette::KEYS.iter().filter_map(|row| row.idea));
+    ids.extend(
+        crate::folder_compare::KEYS
+            .iter()
+            .filter_map(|row| row.idea),
+    );
     ids.extend(crate::git::BRANCH_KEYS.iter().map(|(_, id)| *id));
     ids
 }
@@ -114,6 +119,11 @@ fn keyed_rows() -> Vec<(&'static str, &'static str, &'static str)> {
     );
     rows.extend(
         crate::palette::KEYS
+            .iter()
+            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
+    );
+    rows.extend(
+        crate::folder_compare::KEYS
             .iter()
             .filter_map(|row| Some((row.keys, row.action, row.idea?))),
     );
