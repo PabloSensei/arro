@@ -3,18 +3,23 @@
 //! network.
 
 use super::*;
+#[cfg(windows)]
 use std::io::{BufRead, BufReader};
+#[cfg(windows)]
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
 use std::thread::JoinHandle;
 
+#[cfg(windows)]
 struct Server {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(windows)]
 impl Server {
     /// The routes are built once the address is known, so an answer may name it.
     fn start_with(build: impl FnOnce(SocketAddr) -> Vec<(String, Vec<u8>)>) -> Self {
@@ -47,6 +52,7 @@ impl Server {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -56,6 +62,7 @@ impl Drop for Server {
     }
 }
 
+#[cfg(windows)]
 fn answer(mut stream: TcpStream, routes: &[(String, Vec<u8>)]) {
     stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
@@ -82,14 +89,7 @@ fn answer(mut stream: TcpStream, routes: &[(String, Vec<u8>)]) {
 }
 
 fn temp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "arro-update-{}-{name}-{}",
-        std::process::id(),
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    test_support::scratch(&format!("update-{name}"))
 }
 
 fn write_zip(path: &Path, files: Vec<(String, String)>) {
@@ -103,10 +103,12 @@ fn write_zip(path: &Path, files: Vec<(String, String)>) {
     writer.finish().unwrap();
 }
 
+#[cfg(windows)]
 fn version(text: &str) -> Version {
     Version::parse(text).unwrap()
 }
 
+#[cfg(windows)]
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
@@ -137,7 +139,6 @@ fn the_manifest_lists_the_files_of_the_installed_release() {
             PathBuf::from("tools/engine-1.63.0/plugins/server.jar")
         ]
     );
-    fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -167,7 +168,6 @@ fn the_first_start_removes_old_files_and_tools_that_the_manifest_does_not_list()
             .is_file()
     );
     assert!(!tools.join("stale").exists());
-    fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -179,7 +179,6 @@ fn a_folder_without_a_manifest_keeps_its_tools() {
 
     assert_eq!(remove_stale_tools(&dir).unwrap(), 0);
     assert!(tool.is_file());
-    fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -345,5 +344,4 @@ fn an_update_from_the_release_server_replaces_files_and_cleans_up_the_old_releas
             .is_file()
     );
     drop(held);
-    fs::remove_dir_all(dir).ok();
 }

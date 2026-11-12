@@ -1,6 +1,6 @@
 //! The language tools against a language that answers through `lang-api` like a server would.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -147,15 +147,13 @@ impl LanguageSupport for FakeLanguage {
 }
 
 struct Fixture {
-    project: PathBuf,
     gateway: ToolGateway,
     scope: SessionScope,
 }
 
 impl Fixture {
     fn new(name: &str, language: Option<Arc<FakeLanguage>>) -> Self {
-        let project = std::env::temp_dir().join(format!("ide-lang-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&project).unwrap();
+        let project = test_support::scratch(&format!("lang-{name}"));
         std::fs::write(
             project.join("Hello.fake"),
             "void greet(String name) {}\n  😀greet();\n",
@@ -171,11 +169,7 @@ impl Fixture {
             project: project.clone(),
             cwd: project.clone(),
         };
-        Self {
-            project,
-            gateway,
-            scope,
-        }
+        Self { gateway, scope }
     }
 
     fn call(&self, tool: &str, input: serde_json::Value) -> Result<String, ToolError> {
@@ -183,12 +177,7 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.project);
-    }
-}
-
+#[cfg(windows)]
 #[test]
 fn symbol_info_asks_the_server_in_utf16_and_shows_the_declaration() {
     let language = FakeLanguage::new(true, Confidence::Certain);

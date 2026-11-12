@@ -324,10 +324,7 @@ mod tests {
     }
 
     fn directory(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("changes-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("changes-{name}"))
     }
 
     fn file_uri(path: &Path) -> String {
@@ -410,7 +407,6 @@ mod tests {
         let failed = apply_to_files(&[(path.clone(), vec![replace(0, 0, 3, "1")])]);
         assert!(failed.is_empty(), "{failed:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"\xEF\xBB\xBF1\r\ntwo\r\n");
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -439,7 +435,6 @@ mod tests {
         let mut permissions = std::fs::metadata(&second).unwrap().permissions();
         permissions.set_readonly(false);
         std::fs::set_permissions(&second, permissions).unwrap();
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -454,7 +449,6 @@ mod tests {
         assert!(error.contains("already exists"), "{error}");
         assert_eq!(std::fs::read(&from).unwrap(), b"from");
         assert_eq!(std::fs::read(&to).unwrap(), b"to");
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -495,7 +489,6 @@ mod tests {
         let mut permissions = std::fs::metadata(&closed).unwrap().permissions();
         permissions.set_readonly(false);
         std::fs::set_permissions(&closed, permissions).unwrap();
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -531,7 +524,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&closed).unwrap(), "closed");
         assert_eq!(std::fs::read_to_string(&from).unwrap(), "from");
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "taken");
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -558,7 +550,6 @@ mod tests {
         assert!(!buffers.text.contains_key(&from));
         assert_eq!(buffers.disk.get(&to).map(String::as_str), Some("new text"));
         assert_eq!(buffers.moved, vec![(from.clone(), to.clone())]);
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -591,6 +582,5 @@ mod tests {
         );
         assert!(buffers.moved.is_empty(), "{:?}", buffers.moved);
         assert_eq!(buffers.saved, vec![from.clone(), from.clone()]);
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

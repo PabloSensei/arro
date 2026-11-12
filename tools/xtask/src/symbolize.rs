@@ -101,9 +101,13 @@ fn frame_offset(line: &str, module: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_offset, symbolize_text};
+    use super::frame_offset;
+    #[cfg(windows)]
+    use super::symbolize_text;
+    #[cfg(windows)]
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
+    #[cfg(windows)]
     #[test]
     fn a_test_binary_frame_resolves_to_its_function_and_file() {
         let exe = std::env::current_exe().unwrap();

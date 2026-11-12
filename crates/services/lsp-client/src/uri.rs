@@ -33,12 +33,14 @@ fn decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+#[cfg(windows)]
 fn is_drive(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// The path of a URI from a server, `None` for any scheme but `file:`.
+#[cfg(windows)]
 pub fn file_path(uri: &Uri) -> Option<PathBuf> {
     let rest = uri.as_str().strip_prefix("file://")?;
     let rest = decode(rest)?;
@@ -54,6 +56,16 @@ pub fn file_path(uri: &Uri) -> Option<PathBuf> {
         },
     );
     Some(PathBuf::from(path))
+}
+
+/// The path of a URI from a server, `None` for any scheme but `file:`. A Unix path starts
+/// at the root, so everything after `file://` belongs to it; a server that names a host
+/// still has a path from the root.
+#[cfg(unix)]
+pub fn file_path(uri: &Uri) -> Option<PathBuf> {
+    let rest = uri.as_str().strip_prefix("file://")?;
+    let rest = decode(rest)?;
+    Some(PathBuf::from(format!("/{}", rest.trim_start_matches('/'))))
 }
 
 #[cfg(test)]
@@ -73,23 +85,34 @@ mod tests {
         file_path(&Uri::from_str(uri).unwrap()).unwrap()
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_canonical_path_becomes_a_valid_uri() {
         assert_eq!(uri(r"z:\missing\.\a b.txt"), "file:///Z:/missing/a%20b.txt");
     }
 
+    #[cfg(windows)]
     #[test]
     fn drive_letters_are_upper_case_and_percent_decoded() {
         assert_eq!(path("file:///c:/src/A.txt"), Path::new(r"C:\src\A.txt"));
         assert_eq!(path("file:///c%3A/src/A.txt"), Path::new(r"C:\src\A.txt"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_path_survives_the_way_there_and_back() {
         let text = r"Z:\Проекты\a b\c#d+e.txt";
         assert_eq!(path(&uri(text)), Path::new(text));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_path_survives_the_way_there_and_back() {
+        let text = "/home/user/Проекты/a b/c#d+e.txt";
+        assert_eq!(path(&uri(text)), Path::new(text));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn unc_paths_use_the_authority() {
         assert_eq!(

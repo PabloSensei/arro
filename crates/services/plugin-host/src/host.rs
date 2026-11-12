@@ -23,9 +23,14 @@ const PASSED_ENV: &[&str] = &[
     "APPDATA",
     "COMPUTERNAME",
     "ComSpec",
+    "DISPLAY",
+    "HOME",
     "HOMEDRIVE",
     "HOMEPATH",
+    "LANG",
+    "LC_ALL",
     "LOCALAPPDATA",
+    "LOGNAME",
     "NUMBER_OF_PROCESSORS",
     "OS",
     "PATH",
@@ -34,12 +39,19 @@ const PASSED_ENV: &[&str] = &[
     "ProgramData",
     "ProgramFiles",
     "ProgramFiles(x86)",
+    "SHELL",
     "SystemDrive",
     "SystemRoot",
     "TEMP",
     "TMP",
+    "TMPDIR",
+    "USER",
     "USERNAME",
     "USERPROFILE",
+    "WAYLAND_DISPLAY",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XAUTHORITY",
     "windir",
 ];
 
@@ -49,8 +61,7 @@ pub fn default_plugins_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("IDE_PLUGINS_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let appdata = std::env::var_os("APPDATA")?;
-    Some(base::app::folder_under(Path::new(&appdata)).join("plugins"))
+    Some(base::app::folder("APPDATA").join("plugins"))
 }
 
 #[derive(Clone, Copy, Debug)]

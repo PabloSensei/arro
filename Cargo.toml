@@ -1,11 +1,17 @@
 [workspace]
 resolver = "3"
 # Not "tools/*": tools/corpus and tools/measure are not workspace crates.
-members = ["crates/*/*", "tools/xtask", "tools/lang-fixture", "tools/window-language"]
+members = [
+    "crates/*/*",
+    "tools/xtask",
+    "tools/lang-fixture",
+    "tools/window-language",
+    "tools/test-support",
+]
 exclude = ["spikes", "vendor"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 publish = false
 

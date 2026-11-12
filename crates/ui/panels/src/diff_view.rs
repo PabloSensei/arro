@@ -93,6 +93,15 @@ enum Pane {
     Right,
 }
 
+/// Which editor an event came from: one of the panes, or the tab the right pane shares
+/// its buffer with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorSide {
+    Left,
+    Right,
+    Tab,
+}
+
 pub struct DiffView {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
@@ -324,27 +333,58 @@ pub(crate) fn rows_of(base: &str, current: &str, hunks: &[Hunk]) -> Vec<DiffRow>
     rows
 }
 
-/// The empty rows and the backgrounds of both panes, so that the rows of a hunk face
-/// each other and the words that differ stand out.
-pub(crate) fn decorations_of(
+/// The decorations of two panes whose folds may hide some buffer lines. The rows that
+/// stand in for a line the other side has, or for rows a fold took away, are counted in
+/// display rows, so the first row of every hunk stays on the same height on both sides.
+pub(crate) fn decorations_with_visible(
     rows: &[DiffRow],
     base: &str,
     current: &str,
     selected: usize,
     theme: &Theme,
+    left_visible: &[usize],
+    right_visible: &[usize],
 ) -> (PaneDecor, PaneDecor) {
+    use std::collections::BTreeMap;
+
     let base_starts = line_starts(base);
     let current_starts = line_starts(current);
+    let left_shown = shown_lines(lines_of(base).len(), left_visible);
+    let right_shown = shown_lines(lines_of(current).len(), right_visible);
+    let left_anchor = anchors(
+        rows,
+        |row| row.left.as_ref().map(|line| line.number - 1),
+        &left_shown,
+    );
+    let right_anchor = anchors(
+        rows,
+        |row| row.right.as_ref().map(|line| line.number - 1),
+        &right_shown,
+    );
     let mut left = PaneDecor::default();
     let mut right = PaneDecor::default();
-    let mut left_missing = 0;
-    let mut right_missing = 0;
-    for row in rows {
+    let mut left_fillers = BTreeMap::new();
+    let mut right_fillers = BTreeMap::new();
+    let (mut left_rows, mut right_rows) = (0usize, 0usize);
+    for (index, row) in rows.iter().enumerate() {
+        if left_rows < right_rows {
+            put_filler(
+                &mut left_fillers,
+                &mut left.trailing_fillers,
+                left_anchor[index],
+                right_rows - left_rows,
+            );
+            left_rows = right_rows;
+        } else if right_rows < left_rows {
+            put_filler(
+                &mut right_fillers,
+                &mut right.trailing_fillers,
+                right_anchor[index],
+                left_rows - right_rows,
+            );
+            right_rows = left_rows;
+        }
         if let Some(line) = &row.left {
-            if left_missing > 0 {
-                left.fillers.push((line.number - 1, left_missing));
-                left_missing = 0;
-            }
             let start = base_starts
                 .get(line.number - 1)
                 .copied()
@@ -358,14 +398,11 @@ pub(crate) fn decorations_of(
                         .push((start + range.start..start + range.end, color));
                 }
             }
-        } else {
-            left_missing += 1;
+            if left_shown.get(line.number - 1).copied().unwrap_or(false) {
+                left_rows += 1;
+            }
         }
         if let Some(line) = &row.right {
-            if right_missing > 0 {
-                right.fillers.push((line.number - 1, right_missing));
-                right_missing = 0;
-            }
             let start = current_starts
                 .get(line.number - 1)
                 .copied()
@@ -380,13 +417,61 @@ pub(crate) fn decorations_of(
                         .push((start + range.start..start + range.end, color));
                 }
             }
-        } else {
-            right_missing += 1;
+            if right_shown.get(line.number - 1).copied().unwrap_or(false) {
+                right_rows += 1;
+            }
         }
     }
-    left.trailing_fillers = left_missing;
-    right.trailing_fillers = right_missing;
+    if left_rows < right_rows {
+        left.trailing_fillers += right_rows - left_rows;
+    } else if right_rows < left_rows {
+        right.trailing_fillers += left_rows - right_rows;
+    }
+    left.fillers = left_fillers.into_iter().collect();
+    right.fillers = right_fillers.into_iter().collect();
     (left, right)
+}
+
+/// Which buffer lines the display has a row for, by their number from zero.
+fn shown_lines(count: usize, visible: &[usize]) -> Vec<bool> {
+    let mut shown = vec![false; count];
+    for line in visible {
+        if let Some(slot) = shown.get_mut(*line) {
+            *slot = true;
+        }
+    }
+    shown
+}
+
+/// The first visible line at or after each row, for an empty row of that side.
+fn anchors(
+    rows: &[DiffRow],
+    line: impl Fn(&DiffRow) -> Option<usize>,
+    shown: &[bool],
+) -> Vec<Option<usize>> {
+    let mut found = vec![None; rows.len()];
+    let mut next = None;
+    for index in (0..rows.len()).rev() {
+        if let Some(line) = line(&rows[index])
+            && shown.get(line).copied().unwrap_or(false)
+        {
+            next = Some(line);
+        }
+        found[index] = next;
+    }
+    found
+}
+
+fn put_filler(
+    fillers: &mut std::collections::BTreeMap<usize, usize>,
+    trailing: &mut usize,
+    anchor: Option<usize>,
+    count: usize,
+) {
+    match anchor {
+        Some(line) => *fillers.entry(line).or_default() += count,
+        None => *trailing += count,
+    }
 }
 
 fn line_color(row: &DiffRow, right: bool, selected: usize, theme: &Theme) -> Option<Hsla> {
@@ -731,7 +816,18 @@ impl DiffView {
             })
         };
         let right = match (&tab, source == Source::WorkingTree) {
-            (Some(tab), true) => tab.clone(),
+            (Some(tab), true) => EditorView::open_shared(tab, cx).unwrap_or_else(|| {
+                let text = current.clone();
+                let path = path.clone();
+                let style = style.clone();
+                let options = options.clone();
+                cx.new(move |cx| {
+                    let mut view = EditorView::open_text(path, text, false, style, cx);
+                    view.set_options(options, cx);
+                    view.lock_soft_wrap();
+                    view
+                })
+            }),
             _ => {
                 let text = current.clone();
                 let read_only = source != Source::WorkingTree;
@@ -740,10 +836,12 @@ impl DiffView {
                 cx.new(move |cx| {
                     let mut view = EditorView::open_text(path, text, read_only, style, cx);
                     view.set_options(options, cx);
+                    view.lock_soft_wrap();
                     view
                 })
             }
         };
+        left.update(cx, |left, _| left.lock_soft_wrap());
         let top = right.read(cx).scroll_top();
         left.update(cx, |left, cx| left.scroll_to_top(top, cx));
         let pane_focus = match pane {
@@ -793,46 +891,98 @@ impl DiffView {
         self.source == Source::WorkingTree
     }
 
-    /// Follows the text of the right pane and the scroll of both panes.
+    /// Follows the text of the right pane and the scroll of both panes. The tab shares
+    /// its buffer with the right pane, so an edit in either one comes here.
     fn subscribe_editors(&mut self, cx: &mut Context<Self>) {
-        cx.subscribe(&self.left, |this, _, event: &EditorEvent, cx| {
-            this.editor_event(Pane::Left, event, cx)
-        })
+        cx.subscribe(
+            &self.left,
+            |this: &mut Self, source: Entity<EditorView>, event: &EditorEvent, cx| {
+                if this.left == source {
+                    this.editor_event(EditorSide::Left, event, cx);
+                }
+            },
+        )
         .detach();
-        cx.subscribe(&self.right, |this, _, event: &EditorEvent, cx| {
-            this.editor_event(Pane::Right, event, cx)
-        })
+        cx.subscribe(
+            &self.right,
+            |this: &mut Self, source: Entity<EditorView>, event: &EditorEvent, cx| {
+                if this.right == source {
+                    this.editor_event(EditorSide::Right, event, cx);
+                }
+            },
+        )
         .detach();
+        if let Some(tab) = self.tab.clone()
+            && tab != self.right
+        {
+            cx.subscribe(
+                &tab,
+                |this: &mut Self, source: Entity<EditorView>, event: &EditorEvent, cx| {
+                    if this.tab.as_ref() == Some(&source) {
+                        this.editor_event(EditorSide::Tab, event, cx);
+                    }
+                },
+            )
+            .detach();
+        }
     }
 
-    fn editor_event(&mut self, from: Pane, event: &EditorEvent, cx: &mut Context<Self>) {
+    fn editor_event(&mut self, from: EditorSide, event: &EditorEvent, cx: &mut Context<Self>) {
         match event {
-            EditorEvent::Changed if from == Pane::Right => self.text_changed(cx),
-            EditorEvent::Scrolled(top) => self.scrolled(from, *top, cx),
+            EditorEvent::Changed => self.text_changed(from, cx),
+            EditorEvent::Scrolled(top) if from != EditorSide::Tab => {
+                let pane = if from == EditorSide::Left {
+                    Pane::Left
+                } else {
+                    Pane::Right
+                };
+                self.scrolled(pane, *top, cx);
+            }
+            // A fold, an unfold or a caret move changes the rows a pane shows, and with
+            // them the empty rows that keep the hunks face to face.
+            EditorEvent::Moved if from != EditorSide::Left => cx.notify(),
             _ => {}
         }
     }
 
-    /// The text of the right pane changed: the tab takes the same text, and the hunks
-    /// are read again.
-    fn text_changed(&mut self, cx: &mut Context<Self>) {
+    /// The text of one view of the buffer changed: the other view takes the same text,
+    /// and the hunks are read again.
+    fn text_changed(&mut self, from: EditorSide, cx: &mut Context<Self>) {
         if self.syncing {
             return;
         }
-        let right = self.right.read(cx).text().unwrap_or_default();
-        if let Some(tab) = self.tab.clone()
-            && tab != self.right
-        {
-            let tab_text = tab.read(cx).text().unwrap_or_default();
-            if tab_text != right
-                && let Some(edit) = text_core::difference(&tab_text, &right)
-            {
-                self.syncing = true;
-                tab.update(cx, |tab, cx| tab.apply_edits(vec![edit], cx));
-                self.syncing = false;
+        if from == EditorSide::Right {
+            let path = self.path.clone();
+            self.workspace
+                .update(cx, |workspace, cx| workspace.remember_edited(&path, cx))
+                .ok();
+        }
+        let Some((source, target)) = self.synced_pair(from) else {
+            if from != EditorSide::Left {
+                self.reread(cx);
             }
+            return;
+        };
+        let source_text = source.read(cx).text().unwrap_or_default();
+        let target_text = target.read(cx).text().unwrap_or_default();
+        if target_text != source_text
+            && let Some(edit) = text_core::difference(&target_text, &source_text)
+        {
+            self.syncing = true;
+            target.update(cx, |target, cx| target.follow_edits(vec![edit], cx));
+            self.syncing = false;
         }
         self.reread(cx);
+    }
+
+    /// The two editors that share one buffer, when the tab of the file is open.
+    fn synced_pair(&self, from: EditorSide) -> Option<(Entity<EditorView>, Entity<EditorView>)> {
+        let tab = self.tab.clone().filter(|tab| tab != &self.right)?;
+        match from {
+            EditorSide::Tab => Some((tab, self.right.clone())),
+            EditorSide::Right => Some((self.right.clone(), tab)),
+            EditorSide::Left => None,
+        }
     }
 
     /// One pane scrolled: the other one follows, so the hunks stay face to face.
@@ -1183,7 +1333,18 @@ impl DiffView {
             })
         };
         let right = match (&self.tab, self.source == Source::WorkingTree) {
-            (Some(tab), true) => tab.clone(),
+            (Some(tab), true) => EditorView::open_shared(tab, cx).unwrap_or_else(|| {
+                let path = path.to_path_buf();
+                let current = current.to_owned();
+                let style = style.clone();
+                let options = options.clone();
+                cx.new(move |cx| {
+                    let mut view = EditorView::open_text(path, current, false, style, cx);
+                    view.set_options(options, cx);
+                    view.lock_soft_wrap();
+                    view
+                })
+            }),
             _ => {
                 let path = path.to_path_buf();
                 let current = current.to_owned();
@@ -1192,10 +1353,12 @@ impl DiffView {
                 cx.new(move |cx| {
                     let mut view = EditorView::open_text(path, current, read_only, style, cx);
                     view.set_options(options, cx);
+                    view.lock_soft_wrap();
                     view
                 })
             }
         };
+        left.update(cx, |left, _| left.lock_soft_wrap());
         self.left = left;
         self.right = right;
         self.subscribe_editors(cx);
@@ -1256,6 +1419,26 @@ impl DiffView {
     #[cfg(test)]
     pub(crate) fn right_editor(&self) -> Entity<EditorView> {
         self.right.clone()
+    }
+
+    /// The buffer line, from zero, of the first row of every hunk on both sides, for
+    /// tests of the row alignment.
+    #[cfg(test)]
+    pub(crate) fn hunk_starts(&self) -> Vec<(Option<usize>, Option<usize>)> {
+        let rows = self.rows();
+        hunk_row_spans(&rows, self.changes.hunks.len())
+            .into_iter()
+            .map(|span| {
+                let (left, right) = span.map_or((None, None), |(first, _)| {
+                    let row = &rows[first];
+                    (
+                        row.left.as_ref().map(|line| line.number - 1),
+                        row.right.as_ref().map(|line| line.number - 1),
+                    )
+                });
+                (left, right)
+            })
+            .collect()
     }
 
     /// The text of every side-by-side row, for tests.
@@ -1348,14 +1531,19 @@ impl DiffView {
     }
 
     /// The empty rows and the backgrounds of both panes, so that the rows of a hunk face
-    /// each other and the words that differ stand out.
-    fn decorations(&self, rows: &[DiffRow], theme: &Theme) -> (PaneDecor, PaneDecor) {
-        decorations_of(
+    /// each other and the words that differ stand out. A fold takes rows away, so the
+    /// empty rows are counted on the rows the panes show now.
+    fn decorations(&self, rows: &[DiffRow], theme: &Theme, cx: &App) -> (PaneDecor, PaneDecor) {
+        let left_visible = self.left.read(cx).shown_lines();
+        let right_visible = self.right.read(cx).shown_lines();
+        decorations_with_visible(
             rows,
             &self.changes.base,
             &self.changes.current,
             self.selected,
             theme,
+            &left_visible,
+            &right_visible,
         )
     }
 
@@ -1598,7 +1786,7 @@ impl Render for DiffView {
         };
         let pane: AnyElement = if self.side_by_side {
             let side_rows = self.rows();
-            let (left_decor, right_decor) = self.decorations(&side_rows, &theme);
+            let (left_decor, right_decor) = self.decorations(&side_rows, &theme, cx);
             let left_pane = self.left.update(cx, |editor, cx| {
                 editor.pane(left_decor, Some(EDITOR_CONTEXT), window, cx)
             });

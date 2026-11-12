@@ -762,14 +762,7 @@ mod tests {
     }
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "arro-updater-{}-{name}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        test_support::scratch(&format!("updater-{name}"))
     }
 
     fn write_zip(path: &Path, files: &[(&str, &str)]) {
@@ -891,7 +884,6 @@ mod tests {
         assert!(matches!(error, Error::Checksum { .. }), "{error}");
         assert!(!dir.join(&release.archive.name).exists());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        fs::remove_dir_all(dir).ok();
     }
 
     fn server_source(server: &Server) -> UpdateSource {
@@ -911,7 +903,6 @@ mod tests {
         let dir = temp("interrupted");
         assert!(server_source(&server).download(&release, &dir).is_err());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -935,7 +926,6 @@ mod tests {
             .unwrap();
         assert_eq!(file, download.join(&release.archive.name));
         assert!(file.is_file());
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -962,7 +952,6 @@ mod tests {
             .download(&release, &dir.join("download"))
             .unwrap();
         assert_eq!(fs::metadata(&file).unwrap().len(), bytes.len() as u64);
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -994,7 +983,6 @@ mod tests {
             fs::read_to_string(install.join("data.txt")).unwrap(),
             "old data"
         );
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1026,7 +1014,6 @@ mod tests {
         );
         assert!(!install.join("ide.exe.old").exists());
         assert!(!install.join("sub/inner.txt").exists());
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1053,7 +1040,6 @@ mod tests {
             "jar"
         );
         assert!(!install.join("arro-0.2.0-windows-x86_64").exists());
-        fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(windows)]
@@ -1083,7 +1069,6 @@ mod tests {
             "new exe"
         );
         drop(_held);
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1094,7 +1079,6 @@ mod tests {
         assert_eq!(remove_old(&dir).unwrap(), 1);
         assert!(!dir.join("ide.exe.old").exists());
         assert!(dir.join("keep.txt").exists());
-        fs::remove_dir_all(dir).ok();
     }
 }
 

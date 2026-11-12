@@ -1,6 +1,7 @@
 //! The layout of the window title bar and of the tool window stripes: the groups of
 //! controls, their gaps and the one place the metrics come from.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use std::sync::Arc;
 
 use ui_kit::VisualTestContext;
@@ -13,9 +14,10 @@ use workspace::Workspace;
 use crate::run::RunPanel;
 use crate::window_tests::{bounds_of, click, draw, open_sample_window, press, sample_project};
 use crate::window_tests_run::{
-    EchoRun, LongRun, MockService, debug_panel, long_image, open_with, run_panel, setup, snapshot,
-    wait_for,
+    EchoRun, MockService, debug_panel, open_with, run_panel, setup, snapshot, wait_for,
 };
+#[cfg(windows)]
+use crate::window_tests_run::{LongRun, long_image};
 
 /// The tolerance of a measured gap: layout rounds logical pixels to device pixels.
 const TOLERANCE: f32 = 0.5;
@@ -121,6 +123,7 @@ fn the_toolbar_controls_share_their_sizes(cx: &mut TestAppContext) {
     }
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn stop_appears_right_of_debug_without_moving_run_and_debug(cx: &mut TestAppContext) {
     let root = sample_project("chrome-stop");

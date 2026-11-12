@@ -16,3 +16,4 @@ encoding_rs.workspace = true
 text-core = { path = "../../editor/text-core" }
 futures-executor = "0.3"
 futures-util = "0.3"
+test-support = { path = "../../../tools/test-support" }

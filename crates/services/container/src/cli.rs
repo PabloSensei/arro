@@ -13,6 +13,7 @@ use serde::Deserialize;
 /// Docker Desktop that is still starting may keep the CLI waiting.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Where Docker Desktop puts its CLI, for a PATH without it.
+#[cfg(windows)]
 const DESKTOP_CLI: &str = "C:/Program Files/Docker/Docker/resources/bin/docker.exe";
 /// How many lines of a log come before the live ones.
 const LOG_TAIL: &str = "500";
@@ -160,9 +161,14 @@ impl DockerCli {
     /// `docker` from PATH, then the one of Docker Desktop.
     pub fn find() -> Option<Self> {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let in_path = std::env::split_paths(&path).map(|directory| directory.join("docker.exe"));
-        let mut candidates = in_path.chain([PathBuf::from(DESKTOP_CLI)]);
-        candidates.find(|file| file.is_file()).map(Self::new)
+        let name = base::program::executable("docker");
+        let in_path = std::env::split_paths(&path).map(|directory| directory.join(&name));
+        #[cfg(windows)]
+        let in_path = in_path.chain([PathBuf::from(DESKTOP_CLI)]);
+        in_path
+            .into_iter()
+            .find(|file| file.is_file())
+            .map(Self::new)
     }
 
     pub fn with_context(mut self, context: Option<String>) -> Self {

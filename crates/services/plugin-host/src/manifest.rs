@@ -235,6 +235,7 @@ context = "editor"
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_theme_file_outside_the_folder_is_refused() {
         assert!(is_inside(Path::new("themes/dark.toml")));

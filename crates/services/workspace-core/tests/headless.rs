@@ -1,10 +1,10 @@
 //! The whole path without a window: open a file, edit it, get the events, save it.
 
 use std::fs;
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 use platform::CanonPath;
@@ -16,28 +16,18 @@ use workspace_core::{
 
 const AGENT: EditSource = EditSource::Agent(7);
 
-struct TempDir(PathBuf);
+struct TempDir(PathBuf, #[allow(dead_code)] test_support::TempDir);
 
 impl TempDir {
     fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
-        let name = format!("workspace-core-{}-{unique}", std::process::id());
-        let path = std::env::temp_dir().join(name);
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
+        let folder = test_support::TempDir::new("workspace-core");
+        Self(folder.path().to_path_buf(), folder)
     }
 
     fn file(&self, name: &str, text: &str) -> PathBuf {
         let path = self.0.join(name);
         fs::write(&path, text).unwrap();
         path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -303,6 +293,7 @@ fn a_save_leaves_only_the_file() {
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
 }
 
+#[cfg(windows)]
 #[test]
 fn a_save_that_fails_keeps_the_old_file_and_the_edits() {
     let directory = TempDir::new();

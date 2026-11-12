@@ -75,9 +75,7 @@ impl LocalRepositories {
 }
 
 fn user_home() -> Option<PathBuf> {
-    env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
+    base::program::home_dir()
 }
 
 fn dedup(paths: &mut Vec<PathBuf>) {

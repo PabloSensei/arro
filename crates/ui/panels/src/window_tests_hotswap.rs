@@ -1,6 +1,7 @@
 //! Build Project and hot swap without a real window: the build tool and the adapter are
 //! replaced, the Run panel and the Debug panel are the ones the application builds.
 
+#![cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -312,6 +313,7 @@ fn wait_for_project(cx: &mut TestAppContext, panel: &gpui::Entity<RunPanel>) {
     });
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn ctrl_f9_builds_the_project_without_debugging(cx: &mut TestAppContext) {
     let root = sample_project("hotswap-build");
@@ -341,6 +343,7 @@ fn ctrl_f9_builds_the_project_without_debugging(cx: &mut TestAppContext) {
     );
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn ctrl_f9_during_debugging_reloads_classes_and_tells_the_user(cx: &mut TestAppContext) {
     let root = sample_project("hotswap-debug");

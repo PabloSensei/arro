@@ -35,13 +35,7 @@ indent_size = 2
 ";
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ide-java-editorconfig-{}-{name}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    test_support::scratch(&format!("java-editorconfig-{name}"))
 }
 
 fn write(root: &Path, relative: &str, text: &str) -> PathBuf {

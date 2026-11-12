@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn plugins_are_listed_by_folder_with_their_switch() {
-        let dir = std::env::temp_dir().join(format!("settings-plugins-{}", std::process::id()));
+        let dir = test_support::scratch("settings-plugins");
         std::fs::create_dir_all(dir.join("good")).unwrap();
         std::fs::create_dir_all(dir.join("broken")).unwrap();
         std::fs::write(

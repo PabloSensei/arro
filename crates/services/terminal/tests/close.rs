@@ -1,4 +1,5 @@
 //! Alone in its test binary: it counts the children of this process, conhost among them.
+#![cfg(windows)]
 
 use std::process::Command;
 use std::thread::sleep;
@@ -30,8 +31,7 @@ fn wait_for(check: impl Fn() -> bool) -> bool {
 
 #[test]
 fn closing_a_session_leaves_no_process_behind() {
-    let ready = std::env::temp_dir().join(format!("term-close-{}", std::process::id()));
-    let _ = std::fs::remove_file(&ready);
+    let ready = test_support::scratch("term-close").join("ready");
     let session = TerminalSession::spawn(&SpawnSpec {
         command_line: "cmd.exe /q".to_string(),
         cwd: None,
@@ -56,5 +56,4 @@ fn closing_a_session_leaves_no_process_behind() {
 
     let left = wait_for(|| children().is_empty());
     assert!(left, "still running: {:?}", children());
-    let _ = std::fs::remove_file(&ready);
 }

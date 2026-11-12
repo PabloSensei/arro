@@ -11,9 +11,39 @@ pub fn folder_under(base: &Path) -> PathBuf {
 }
 
 /// `FOLDER` under the profile variable, the temporary folder when the variable is missing.
+/// On Unix the two Windows variables map to the folders of the desktop: `APPDATA` to the
+/// configuration folder and `LOCALAPPDATA` to the data folder.
 pub fn folder(variable: &str) -> PathBuf {
-    let base = std::env::var_os(variable).map_or_else(std::env::temp_dir, PathBuf::from);
-    folder_under(&base)
+    #[cfg(unix)]
+    {
+        let base = match variable {
+            "APPDATA" => xdg("XDG_CONFIG_HOME", ".config"),
+            "LOCALAPPDATA" => xdg("XDG_DATA_HOME", ".local/share"),
+            other => std::env::var_os(other)
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        };
+        folder_under(&base)
+    }
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os(variable).map_or_else(std::env::temp_dir, PathBuf::from);
+        folder_under(&base)
+    }
+}
+
+/// `$XDG_...` when it is absolute, else the folder of the same name under the home folder.
+#[cfg(unix)]
+fn xdg(variable: &str, fallback: &str) -> PathBuf {
+    if let Some(value) = std::env::var_os(variable).map(PathBuf::from)
+        && value.is_absolute()
+    {
+        return value;
+    }
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => home.join(fallback),
+        None => std::env::temp_dir(),
+    }
 }
 
 /// Moves the folder of an old name to `FOLDER` when the new folder is absent. `legacy` lists

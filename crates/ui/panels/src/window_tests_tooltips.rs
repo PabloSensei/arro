@@ -1,6 +1,8 @@
 //! Every icon button of the title bar, the tool window stripes and the Run and Debug
 //! panels names itself in a tooltip; a button with a key shows the key too.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+#[cfg(windows)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +10,10 @@ use ui_kit::gpui::{self, Modifiers, TestAppContext, VisualTestContext, WindowHan
 use ui_kit::{TOOLTIP_DELAY, clear_shown_tooltips, shown_tooltips};
 use workspace::{DEBUG_TOOL, RUN_TOOL, Workspace};
 
-use crate::window_tests::{bounds_of, draw, open_sample_window, press, sample_project};
+use crate::window_tests::{bounds_of, draw, open_sample_window};
+#[cfg(windows)]
+use crate::window_tests::{press, sample_project};
+#[cfg(windows)]
 use crate::window_tests_run::{LongRun, long_image, open_with, run_panel, setup, wait_for};
 
 /// Hovers the middle of an element and returns the tooltip it shows.
@@ -44,6 +49,7 @@ fn assert_tooltip(
     assert_eq!(shown_key.as_deref(), key, "{selector} shows its key");
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn title_bar_buttons_name_themselves_and_run_shows_shift_f10(cx: &mut TestAppContext) {
     let root = sample_project("tooltips-title");

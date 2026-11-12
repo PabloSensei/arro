@@ -375,11 +375,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("java-exec-run-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("exec-run-{name}"))
     }
 
     fn provider(cache: &Path) -> JavaProvider {
@@ -435,7 +431,6 @@ mod tests {
         let target: JavaTarget = configs[0].settings.clone().try_into().unwrap();
         assert_eq!(target.main_class, "demo.App");
         assert!(target.spring_boot);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -454,7 +449,6 @@ mod tests {
         assert_eq!(points[1].line, 4, "the line of main");
         assert_eq!(points[0].config, discovered[0]);
         assert_eq!(points[1].config, discovered[0]);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -467,7 +461,6 @@ mod tests {
         assert!(provider.plan(&config, &model).unwrap().before.is_some());
         config.assemble_first = false;
         assert!(provider.plan(&config, &model).unwrap().before.is_none());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -479,7 +472,6 @@ mod tests {
         model.resolved = false;
 
         assert!(provider.plan(&config, &model).is_err());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -493,7 +485,6 @@ mod tests {
         let error = provider.plan(&config, &model).err().unwrap();
 
         assert!(error.to_string().contains("no module app"), "{error}");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     fn arguments(spec: &ProcessSpec) -> Vec<String> {
@@ -560,7 +551,6 @@ mod tests {
 
         provider.write_field(&mut config, FIELD_WORKING_DIR, " ");
         assert_eq!(provider.read_field(&config, FIELD_WORKING_DIR), "");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -630,7 +620,6 @@ mod tests {
                 .any(|arg| arg.starts_with("-agentlib:jdwp")),
             "the debug plan starts with the agent"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -651,6 +640,5 @@ mod tests {
         assert_eq!(target.module, "app");
         assert_eq!(target.main_class, "");
         assert!(provider.create_config("unknown", &model).is_err());
-        let _ = std::fs::remove_dir_all(root);
     }
 }

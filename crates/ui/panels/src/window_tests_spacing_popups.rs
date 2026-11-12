@@ -1,19 +1,28 @@
 //! Popups and dialogs on the spacing scale: one field and one row inset in the search
 //! popups, one padding in the dialogs, and the configuration menu under its button.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+#[cfg(windows)]
 use std::sync::Arc;
 
 use keymap::workspace as keys;
 use ui_kit::gpui;
 use ui_kit::gpui::{TestAppContext, WindowHandle};
-use ui_kit::metrics::{CONTROL_HEIGHT, DIALOG_PADDING, POPUP_PADDING, SPACE_XS};
-use ui_kit::{point, px};
+#[cfg(windows)]
+use ui_kit::metrics::SPACE_XS;
+use ui_kit::metrics::{CONTROL_HEIGHT, DIALOG_PADDING, POPUP_PADDING};
+#[cfg(windows)]
+use ui_kit::point;
+use ui_kit::px;
 use workspace::Workspace;
 
+#[cfg(windows)]
+use crate::window_tests::sample_project;
 use crate::window_tests::{
-    bounds_of, click, draw, open_palette, open_path, open_sample_window, press, sample_project,
-    type_text, wait_for_file_index,
+    bounds_of, click, draw, open_palette, open_path, open_sample_window, press, type_text,
+    wait_for_file_index,
 };
+#[cfg(windows)]
 use crate::window_tests_run::{EchoRun, open_with, run_panel, setup as run_setup, wait_for};
 
 /// The hairline of `popup_frame`, outside the padding it measures from.
@@ -92,6 +101,7 @@ fn the_dialogs_keep_the_padding_and_one_button_height(cx: &mut TestAppContext) {
 
 /// Alt+Shift+F10 opens the configuration menu in the place a click on `t-config` opens it,
 /// highlights the first row, and Enter runs that configuration.
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn alt_shift_f10_opens_the_configuration_menu_under_its_button(cx: &mut TestAppContext) {
     let root = sample_project("spacing-choose-run");

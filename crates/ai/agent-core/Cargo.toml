@@ -5,7 +5,12 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+base.workspace = true
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 terminal.workspace = true
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

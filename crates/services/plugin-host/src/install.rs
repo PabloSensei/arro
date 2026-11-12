@@ -64,8 +64,7 @@ mod tests {
 
     #[test]
     fn plugin_commands_reach_the_registry_and_the_keymap() {
-        let dir = std::env::temp_dir().join(format!("plugin-install-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_support::scratch("plugin-install");
         fs::create_dir_all(dir.join("hello")).unwrap();
         let manifest = r#"
 id = "hello"
@@ -110,6 +109,5 @@ command = "no.such-command"
         );
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("unknown action"), "{problems:?}");
-        let _ = fs::remove_dir_all(&dir);
     }
 }

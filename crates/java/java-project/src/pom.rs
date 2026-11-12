@@ -174,11 +174,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("java-project-pom-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("project-pom-{name}"))
     }
 
     fn write_pom(directory: &Path, text: &str) {
@@ -208,7 +204,6 @@ mod tests {
         assert_eq!(pom.group.as_deref(), Some("demo"));
         assert_eq!(pom.artifact.as_deref(), Some("core"));
         assert_eq!(pom.version.as_deref(), Some("1.0"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -222,7 +217,6 @@ mod tests {
         let pom = read_pom(&root.join("pom.xml")).unwrap();
 
         assert_eq!(pom.java_release.as_deref(), Some("21"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -252,7 +246,6 @@ mod tests {
             main.output_dirs,
             [root.join("core").join("target").join("classes")]
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -265,7 +258,6 @@ mod tests {
 
         assert_eq!(model.modules.len(), 1);
         assert_eq!(model.problems.len(), 2);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -278,7 +270,6 @@ mod tests {
         let model = scan_poms(&root).unwrap();
 
         assert!(model.modules.len() <= 2);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -286,6 +277,5 @@ mod tests {
         let root = temp_dir("missing");
 
         assert!(scan_poms(&root).is_err());
-        let _ = fs::remove_dir_all(root);
     }
 }

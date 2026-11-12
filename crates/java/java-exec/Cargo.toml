@@ -18,3 +18,4 @@ zip = { version = "9", default-features = false }
 
 [dev-dependencies]
 workspace-core.workspace = true
+test-support = { path = "../../../tools/test-support" }

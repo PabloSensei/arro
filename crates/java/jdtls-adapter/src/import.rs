@@ -269,6 +269,7 @@ mod tests {
         assert!(!super::is_build_file(Path::new("notes.txt")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_error_on_a_build_script_names_the_file_line_and_cause() {
         let (failures, watch) = watch::channel(None);
@@ -321,6 +322,7 @@ mod tests {
         assert!(watch.borrow().is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_empty_list_of_a_script_clears_its_failure_and_keeps_another() {
         let (failures, watch) = watch::channel(Some(ImportFailure {
@@ -356,6 +358,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_marker_report_in_the_log_names_the_script_its_line_and_cause() {
         let (failures, watch) = watch::channel(None);
@@ -392,6 +395,7 @@ mod tests {
         assert!(watch.borrow().is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_report_without_the_marker_names_the_script_line_and_deepest_cause() {
         let (failures, watch) = watch::channel(None);

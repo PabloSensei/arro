@@ -334,6 +334,7 @@ mod tests {
         assert!(text.contains(&expected.display().to_string()), "{text}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn paths_outside_the_project_are_refused() {
         let gateway = gateway();

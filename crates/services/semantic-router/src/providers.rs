@@ -3049,16 +3049,19 @@ impl SemanticServer for LspProviders {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::path::PathBuf;
 
     use lang_api::ActionKind;
     use lsp_client::lsp_types as lsp;
     use serde_json::json;
 
+    #[cfg(windows)]
+    use super::destination_folder;
     use super::{
-        TextPoint, TextSpan, action_entry, completion_entry, destination_folder, diagnostic,
-        documentation_url, expected_type_from_declaration, inlay_hints, parameter_type,
-        return_type_of, signature_help_info, usage_kind,
+        TextPoint, TextSpan, action_entry, completion_entry, diagnostic, documentation_url,
+        expected_type_from_declaration, inlay_hints, parameter_type, return_type_of,
+        signature_help_info, usage_kind,
     };
 
     fn action(value: serde_json::Value) -> lsp::CodeActionOrCommand {
@@ -3170,6 +3173,7 @@ mod tests {
         assert_eq!(return_type_of(&json!({"name": "name"})), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_destination_carries_the_folder_of_its_uri() {
         let folder = destination_folder(&json!({

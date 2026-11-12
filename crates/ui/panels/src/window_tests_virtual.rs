@@ -170,8 +170,7 @@ fn a_large_thread_list_is_grouped_and_only_the_selected_thread_has_a_stack() {
 fn ten_thousand_virtual_threads_stop_without_hanging_the_answer() {
     let started = Instant::now();
     let corpus = window_language::corpus_dir();
-    let root = std::env::temp_dir().join(format!("ide-ds-t0068-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = test_support::scratch("ds-t0068");
     window_language::prepare_project(&corpus.join("src/petclinic"), &root);
     let state = root.join("state");
     let probe = window_language::install_virtual_threads_probe(&root, &state, 10_000)

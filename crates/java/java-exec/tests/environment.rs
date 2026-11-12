@@ -1,5 +1,6 @@
 //! The run and the build take the SDK the user chose in Project Structure, not the one
 //! the build file asks for. Files only: no build tool and no SDK starts.
+#![cfg(windows)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,10 +13,7 @@ use project_model::{BuildSystem, MAIN_UNIT, Module, ProjectModel, Unit};
 use runner::{RunConfig, RunConfigProvider};
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("java-exec-env-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+    test_support::scratch(&format!("exec-env-{name}"))
 }
 
 fn sdk(root: &Path, name: &str, version: &str) -> PathBuf {

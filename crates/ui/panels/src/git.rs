@@ -1815,11 +1815,14 @@ pub fn bind_actions(git: Entity<GitState>, window: AnyWindowHandle, cx: &mut App
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::path::Path;
 
     use vcs::{Change, FileStatus, Hunk};
 
-    use super::{Kind, hunk_at, relative_of};
+    #[cfg(windows)]
+    use super::relative_of;
+    use super::{Kind, hunk_at};
 
     fn file(index: Change, worktree: Change) -> FileStatus {
         FileStatus {
@@ -1860,6 +1863,7 @@ mod tests {
         assert_eq!(hunk_at(&hunks, 5), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn paths_are_relative_with_forward_slashes() {
         let root = Path::new("C:/repo");

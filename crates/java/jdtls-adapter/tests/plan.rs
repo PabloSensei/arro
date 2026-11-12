@@ -4,16 +4,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use jdtls_adapter::{Jdtls, JdtlsConfig};
 use sidecar::ServerSpec;
 
 fn project() -> (Jdtls, PathBuf) {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("jdtls-plan-{}-{n}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = test_support::scratch("jdtls-plan");
     let plugins = root.join("home").join("plugins");
     fs::create_dir_all(&plugins).unwrap();
     fs::write(plugins.join("org.eclipse.equinox.launcher_1.8.0.jar"), b"").unwrap();
@@ -39,7 +35,7 @@ fn project() -> (Jdtls, PathBuf) {
 
 #[test]
 fn the_plan_has_the_collector_that_returns_memory() {
-    let (jdtls, root) = project();
+    let (jdtls, _root) = project();
     let args = jdtls.plan().args;
 
     for setting in [
@@ -66,12 +62,11 @@ fn the_plan_has_the_collector_that_returns_memory() {
         "the launcher jar comes after the JVM arguments"
     );
     drop(jdtls);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn the_gradle_import_gets_a_ten_minute_daemon_timeout() {
-    let (jdtls, root) = project();
+    let (jdtls, _root) = project();
     let arguments = jdtls.settings()["java"]["import"]["gradle"]["arguments"]
         .as_str()
         .unwrap()
@@ -83,5 +78,4 @@ fn the_gradle_import_gets_a_ten_minute_daemon_timeout() {
     );
     assert!(arguments.contains("--no-scan"), "{arguments}");
     drop(jdtls);
-    let _ = fs::remove_dir_all(root);
 }

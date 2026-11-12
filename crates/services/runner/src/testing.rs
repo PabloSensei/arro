@@ -493,9 +493,12 @@ impl TestTree {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::fs;
     use std::io::Write;
+    #[cfg(windows)]
     use std::path::{Path, PathBuf};
+    #[cfg(windows)]
     use std::process::Command;
     use std::time::Instant;
 
@@ -590,10 +593,12 @@ mod tests {
     }
 
     /// A provider whose test JVM starts and never announces its debug port.
+    #[cfg(windows)]
     struct SilentDebug {
         program: ProcessSpec,
     }
 
+    #[cfg(windows)]
     impl TestProvider for SilentDebug {
         fn plan(
             &self,
@@ -625,10 +630,11 @@ mod tests {
 
     /// A copy of a program that runs far longer than the test, under a name of its own:
     /// other tests start the same program, and only this image tells the process apart.
+    #[cfg(windows)]
     fn silent_program(name: &str) -> (ProcessSpec, PathBuf) {
         let system_root = std::env::var_os("SystemRoot").expect("a Windows machine");
         let source = PathBuf::from(system_root).join("System32").join("ping.exe");
-        let image = std::env::temp_dir().join(format!("runner-{}-{name}.exe", std::process::id()));
+        let image = test_support::scratch(&format!("runner-{name}")).join("program.exe");
         fs::copy(&source, &image).expect("the program is copied");
         let spec = ProcessSpec::new(&image)
             .args(["-n", "120", "127.0.0.1"])
@@ -637,6 +643,7 @@ mod tests {
         (spec, image)
     }
 
+    #[cfg(windows)]
     fn is_running(image: &Path) -> bool {
         let name = image.file_name().unwrap().to_string_lossy().into_owned();
         let list = Command::new("tasklist")
@@ -646,6 +653,7 @@ mod tests {
         String::from_utf8_lossy(&list.stdout).contains(&name)
     }
 
+    #[cfg(windows)]
     fn wait_until(mut condition: impl FnMut() -> bool) {
         let start = Instant::now();
         while !condition() {
@@ -657,6 +665,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn stop_during_the_wait_for_the_debug_line_ends_the_run_at_once() {
         let (program, image) = silent_program("debug-stop");
@@ -689,6 +698,5 @@ mod tests {
         );
         assert_eq!(outcome, Err(STOPPED_BY_USER.to_owned()));
         assert!(!is_running(&image), "the stopped process still runs");
-        let _ = fs::remove_file(&image);
     }
 }

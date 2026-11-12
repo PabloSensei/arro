@@ -4,6 +4,7 @@
 //!
 //! cargo test -p panels window_tests_m11
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,6 +37,7 @@ use crate::window_tests_git::{
     conflicting_repository, git_state, has_selector, wait_for_repository,
 };
 use crate::window_tests_lang::{FakeLanguage, open_window_with, project, span_in};
+#[cfg(windows)]
 use crate::window_tests_run::{open_with, run_panel, snapshot, wait_for as wait_run};
 use crate::{AgentOptions, LanguageServer, connect, install};
 
@@ -461,6 +463,7 @@ fn probe_setup(root: &Path, builds: Arc<Mutex<Vec<bool>>>) -> ProjectSetup {
     }
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn ctrl_f9_builds_both_class_sets_during_a_debug_test_run(cx: &mut TestAppContext) {
     let root = sample_project("m11-debug-test-build");
@@ -775,6 +778,7 @@ fn notification(cx: &TestAppContext, window: WindowHandle<Workspace>) -> String 
         .unwrap_or_default()
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn a_finished_run_frees_the_panel_and_keeps_late_output_in_its_own_console(
     cx: &mut TestAppContext,

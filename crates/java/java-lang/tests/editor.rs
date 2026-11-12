@@ -1,7 +1,6 @@
 //! The editor commands end to end, without a window.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -14,14 +13,7 @@ const JAVA: &str =
     "import a.B;\nimport a.C;\n\nclass A {\n    void run() {\n        int size = 1;\n    }\n}\n";
 
 fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let folder = std::env::temp_dir().join(format!(
-        "editor-view-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&folder).unwrap();
-    let path = folder.join(name);
+    let path = test_support::scratch(&format!("editor-view-{name}")).join(name);
     std::fs::write(&path, bytes).unwrap();
     path
 }

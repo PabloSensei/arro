@@ -48,6 +48,8 @@ workspace-core.workspace = true
 dockerfile-syntax = { path = "../../editor/dockerfile-syntax" }
 # The mock debug adapter of the fixture language, for the debug window tests.
 lang-fixture = { path = "../../../tools/lang-fixture" }
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }
 # The real language and debugger, for the ignored window tests of a real project.
 window-language = { path = "../../../tools/window-language" }
 # A runtime for the debug session of those tests, on the same client as the application.

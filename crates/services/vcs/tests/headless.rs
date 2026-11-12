@@ -15,10 +15,7 @@ fn git() -> GitRunner {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("vcs-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+    test_support::scratch(&format!("vcs-{name}"))
 }
 
 /// Plain git, the way a harness or the user in a terminal calls it.
@@ -165,7 +162,6 @@ fn edit_status_diff_commit_and_push() {
     plain_ok(&clone, &["push", "-q"]);
     repo.update().unwrap();
     assert_eq!(repo.log(1, 0).unwrap()[0].subject, "from the clone");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -186,7 +182,6 @@ fn branches_are_listed_created_switched_and_deleted() {
     assert_eq!(repo.status().unwrap().branch.as_deref(), Some("main"));
     repo.delete_branch("фича").unwrap();
     assert_eq!(repo.branches().unwrap().len(), 1);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -195,7 +190,6 @@ fn an_empty_repository_has_an_empty_log() {
     let repo = new_repository(&root);
 
     assert!(repo.log(10, 0).unwrap().is_empty());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -208,7 +202,6 @@ fn a_bad_commit_reports_what_git_said() {
     let error = repo.commit(&request("nothing to commit", &[])).unwrap_err();
 
     assert!(error.to_string().starts_with("git:"), "{error}");
-    let _ = fs::remove_dir_all(root);
 }
 
 /// Our status and diff run while a harness commits in the same repository. Ours must not
@@ -255,5 +248,4 @@ fn a_harness_running_git_at_the_same_time_sees_no_lock_errors() {
 
     assert!(failures.is_empty(), "{failures:?}");
     assert!(calls > 10, "only {calls} reads ran alongside");
-    let _ = fs::remove_dir_all(root);
 }

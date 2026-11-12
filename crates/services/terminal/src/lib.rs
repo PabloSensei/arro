@@ -1,13 +1,25 @@
-//! Terminal sessions on ConPTY: a program in a pseudoconsole, the screen as immutable snapshots
-//! and input that never blocks the caller. Nothing here knows which program runs inside.
+//! Terminal sessions in a pseudoterminal: the screen as immutable snapshots and input that
+//! never blocks the caller. Nothing here knows which program runs inside.
 
+#[cfg(windows)]
 mod conpty;
+#[cfg(unix)]
+#[path = "pty_unix.rs"]
+mod conpty;
+#[cfg(windows)]
+mod console;
+#[cfg(unix)]
+#[path = "console_unix.rs"]
 mod console;
 mod engine;
 mod env;
 mod keys;
 mod screen;
 mod session;
+#[cfg(windows)]
+mod shell;
+#[cfg(unix)]
+#[path = "shell_unix.rs"]
 mod shell;
 
 pub use conpty::{Backend, command_line};

@@ -5,10 +5,7 @@ use std::time::Duration;
 use local_history::{Cause, Limits, LocalHistory};
 
 fn temp(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("qa-lh-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    test_support::scratch(&format!("qa-lh-{name}"))
 }
 
 #[test]
@@ -40,7 +37,6 @@ fn restore_overwrites_a_file_that_came_back_without_keeping_it() {
     );
     assert_eq!(on_disk, b"old version");
     assert!(kept, "restore destroyed the newer file and kept no copy");
-    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -68,5 +64,4 @@ fn one_big_version_does_not_wipe_the_other_files_history() {
         "after one oversized version: small file revisions {small_left}, big file revisions {big_left}"
     );
     assert_eq!(small_left, 1, "the history of an unrelated file was wiped");
-    let _ = fs::remove_dir_all(&root);
 }

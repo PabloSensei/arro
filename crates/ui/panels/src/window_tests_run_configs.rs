@@ -1,6 +1,7 @@
 //! The Run/Debug Configurations dialog without a real window and with a substitute
 //! provider: the list of configurations, the fields it edits and the file it writes.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -220,6 +221,7 @@ fn the_configuration_menu_opens_the_dialog(cx: &mut TestAppContext) {
     );
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn arguments_typed_in_the_dialog_reach_the_file_and_the_next_run(cx: &mut TestAppContext) {
     let (root, planned, window, panel) = open_run(cx, "run-configs-args");
@@ -389,6 +391,7 @@ fn a_broken_file_is_not_overwritten(cx: &mut TestAppContext) {
     );
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn a_configuration_written_on_disk_reaches_the_list(cx: &mut TestAppContext) {
     let (root, _planned, _window, panel) = open_run(cx, "run-configs-reload");

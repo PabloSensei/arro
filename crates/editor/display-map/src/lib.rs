@@ -232,6 +232,11 @@ impl<'a, S: TextStore> DisplaySnapshot<'a, S> {
         self.group_start.last().copied().unwrap_or(0)
     }
 
+    /// The buffer lines of the rows the folds do not hide, from zero.
+    pub fn visible_lines(&self) -> &[u32] {
+        &self.visible
+    }
+
     /// The group a display row belongs to: its rendered rows, its block and its text.
     fn group_of(&self, row: usize) -> usize {
         let row = row.min(self.row_count().saturating_sub(1));

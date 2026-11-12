@@ -40,3 +40,4 @@ lang-fixture = { path = "../../../tools/lang-fixture" }
 text-core = { path = "../../editor/text-core" }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }
 workspace-core.workspace = true
+test-support = { path = "../../../tools/test-support" }

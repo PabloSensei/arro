@@ -28,3 +28,10 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Wdk_System_SystemServices",
 ]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

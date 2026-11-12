@@ -3,6 +3,7 @@
 //! the Git windows it opens. The language is the sample one of `window_tests_ui`, the
 //! debuggee is the mock adapter of the fixture language.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use std::fs;
 use std::io::Write;
 use std::net::TcpStream;
@@ -29,7 +30,9 @@ use crate::window_tests::{
     open_path, open_sample_window, open_window, open_window_with, press, sample_project, scratch,
     type_text, wait_for_outline_signal, wait_for_process, wait_for_project_index,
 };
-use crate::window_tests_run::{EchoRun, setup};
+#[cfg(windows)]
+use crate::window_tests_run::EchoRun;
+use crate::window_tests_run::setup;
 use crate::window_tests_ui::{
     double_shift, navigation_project, open_test_window, wait_for, wait_for_files, wait_for_outline,
     wait_for_symbols,
@@ -73,6 +76,7 @@ fn open_test_root(cx: &mut TestAppContext, root: PathBuf) -> WindowHandle<Worksp
 }
 
 /// Double Shift and Double Ctrl, the way the platform reports the held modifiers.
+#[cfg(windows)]
 fn double_modifier(cx: &mut TestAppContext, window: WindowHandle<Workspace>, held: Modifiers) {
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let change = |modifiers| ModifiersChangedEvent {
@@ -337,6 +341,7 @@ fn find_in_files_and_replace_in_files_with_undo(cx: &mut TestAppContext) {
     assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\nalpha\n");
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn run_anything_by_double_ctrl_runs_the_configuration(cx: &mut TestAppContext) {
     let root = sample_project("actions-run-anything");

@@ -65,10 +65,7 @@ fn find_mvn(folder: &Path, depth: usize) -> Option<PathBuf> {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let path = env::temp_dir().join(format!("ide-fast-run-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+    test_support::scratch(&format!("fast-run-{name}"))
 }
 
 fn project(root: &Path) {
@@ -189,8 +186,6 @@ fn a_second_run_of_an_unchanged_gradle_project_needs_no_gradle() {
         tool.assemble_if_needed(&root).unwrap().is_some(),
         "a source change builds again"
     );
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -232,6 +227,4 @@ fn a_second_run_of_an_unchanged_maven_project_needs_no_maven() {
         tool.assemble_if_needed(&root).unwrap().is_some(),
         "a source change builds again"
     );
-
-    let _ = fs::remove_dir_all(root);
 }

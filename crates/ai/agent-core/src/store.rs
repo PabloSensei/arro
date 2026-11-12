@@ -96,24 +96,20 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
-    use std::env::temp_dir;
-
     use super::*;
 
-    struct TempFile(PathBuf);
+    struct TempFile {
+        path: PathBuf,
+        _folder: test_support::TempDir,
+    }
 
     impl TempFile {
         fn new(name: &str) -> Self {
-            let name = format!("sessions-{name}-{}.json", std::process::id());
-            let path = temp_dir().join(name);
-            let _ = fs::remove_file(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
+            let folder = test_support::TempDir::new(&format!("sessions-{name}"));
+            Self {
+                path: folder.join("sessions.json"),
+                _folder: folder,
+            }
         }
     }
 
@@ -133,10 +129,10 @@ mod tests {
     #[test]
     fn sessions_survive_a_restart_as_finished() {
         let file = TempFile::new("restart");
-        let mut store = SessionStore::open(&file.0);
+        let mut store = SessionStore::open(&file.path);
         store.upsert(record("a", "one", 10)).expect("save");
 
-        let reopened = SessionStore::open(&file.0);
+        let reopened = SessionStore::open(&file.path);
 
         assert_eq!(reopened.records().len(), 1);
         assert_eq!(reopened.records()[0].status, SessionStatus::Done);
@@ -145,7 +141,7 @@ mod tests {
     #[test]
     fn a_project_lists_its_own_sessions_latest_first() {
         let file = TempFile::new("project");
-        let mut store = SessionStore::open(&file.0);
+        let mut store = SessionStore::open(&file.path);
         store.upsert(record("old", "one", 10)).expect("save");
         store.upsert(record("new", "one", 20)).expect("save");
         store.upsert(record("other", "two", 30)).expect("save");
@@ -162,15 +158,15 @@ mod tests {
     #[test]
     fn a_broken_file_starts_an_empty_list() {
         let file = TempFile::new("broken");
-        fs::write(&file.0, "{not json").expect("write");
+        fs::write(&file.path, "{not json").expect("write");
 
-        assert!(SessionStore::open(&file.0).records().is_empty());
+        assert!(SessionStore::open(&file.path).records().is_empty());
     }
 
     #[test]
     fn status_changes_and_removal_are_saved() {
         let file = TempFile::new("status");
-        let mut store = SessionStore::open(&file.0);
+        let mut store = SessionStore::open(&file.path);
         store.upsert(record("a", "one", 10)).expect("save");
         store.upsert(record("b", "one", 10)).expect("save");
 
@@ -179,7 +175,7 @@ mod tests {
             .expect("save");
         store.remove("b").expect("save");
 
-        let reopened = SessionStore::open(&file.0);
+        let reopened = SessionStore::open(&file.path);
         assert_eq!(reopened.records().len(), 1);
         assert_eq!(reopened.records()[0].status, SessionStatus::Error);
         assert_eq!(reopened.records()[0].updated_ms, 20);

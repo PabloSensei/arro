@@ -12,6 +12,8 @@ serde_json = "1"
 
 [dev-dependencies]
 runner.workspace = true
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }
 
 [[bin]]
 # A stand-in for the docker CLI in the tests, for machines without a running daemon.
@@ -19,3 +21,4 @@ name = "container-fake-docker"
 path = "src/bin/fake_docker.rs"
 test = false
 doc = false
+

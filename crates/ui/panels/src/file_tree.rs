@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn folders_go_first_and_case_is_ignored() {
-        let root = std::env::temp_dir().join(format!("file-tree-{}", std::process::id()));
+        let root = test_support::scratch("file-tree");
         std::fs::create_dir_all(root.join("zeta")).unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join("Beta.txt"), "").unwrap();
@@ -343,7 +343,6 @@ mod tests {
             .into_iter()
             .map(|c| c.name)
             .collect();
-        std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(names, ["zeta", "alpha.txt", "Beta.txt"]);
     }
 }

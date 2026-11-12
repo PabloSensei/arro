@@ -185,15 +185,24 @@ pub fn run(
             },
             |(bounds, display)| (bounds, Some(display)),
         );
+        #[cfg(unix)]
+        let (title, decorations) = (Some("Arro".into()), Some(WindowDecorations::Client));
+        #[cfg(windows)]
+        let (title, decorations) = (None, None);
         let options = WindowOptions {
             window_bounds: Some(window_bounds),
             display_id,
             focus,
             titlebar: Some(TitlebarOptions {
-                title: None,
+                title,
                 appears_transparent: true,
                 traffic_light_position: None,
             }),
+            // Wayland and X11 have no titlebar of their own here: the window keeps the
+            // toolbar of the application as its titlebar.
+            window_decorations: decorations,
+            #[cfg(unix)]
+            app_owns_titlebar_drag: true,
             ..Default::default()
         };
         cx.open_window(options, move |window, cx| {

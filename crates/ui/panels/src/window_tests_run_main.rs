@@ -1,6 +1,7 @@
 //! Run marks of a program in the gutter, Run at the caret and temporary configurations,
 //! without a real window: a substitute provider says which lines start a program.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -579,6 +580,7 @@ fn create_run_configuration_from_the_build_window_makes_a_task(cx: &mut TestAppC
     );
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn a_run_file_changed_on_disk_reaches_the_list_without_polling(cx: &mut TestAppContext) {
     let root = sample_project("run-main-watch");

@@ -344,8 +344,7 @@ mod tests {
     use super::*;
 
     fn temp_file(name: &str) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join(format!("runner-{}", std::process::id()));
-        directory.join(name)
+        test_support::scratch("runner-config").join(name)
     }
 
     #[test]

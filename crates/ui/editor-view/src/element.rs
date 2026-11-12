@@ -573,6 +573,14 @@ impl Element for EditorElement {
         };
         let mut code_font = font(style.font_family.clone());
         code_font.features = FontFeatures::disable_ligatures();
+        #[cfg(unix)]
+        {
+            // A distribution does not always ship JetBrains Mono.
+            code_font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+                "DejaVu Sans Mono".to_owned(),
+                "monospace".to_owned(),
+            ]));
+        }
         let ui_font = font(UI_FONT);
         let font_size = px(snapped_size(style.font_size, window.scale_factor()));
         let inlay_size = px((f32::from(font_size) * 0.82).max(9.));

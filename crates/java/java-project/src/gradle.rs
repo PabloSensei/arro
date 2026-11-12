@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base::program::bat_script;
 use base::{Cancel, Result};
 use proc_sup::{ProcessClass, ProcessSpec};
 use project_model::{
@@ -123,8 +124,8 @@ impl Gradle {
         })
     }
 
-    /// The real client and not `gradlew.bat`: the batch file would be the process to stop
-    /// and own, with the client behind it. Works with no job around it, so that the
+    /// The real client and not the wrapper script: the script would be the process to
+    /// stop and own, with the client behind it. Works with no job around it, so that the
     /// server outlives the client.
     pub(crate) fn command(&self, root: &Path) -> Result<ProcessSpec> {
         let settings = &self.env.build_tools.second;
@@ -137,9 +138,9 @@ impl Gradle {
         let wrapper = root.join(WRAPPER_JAR);
         let timeout = daemon_idle_timeout(root);
         let spec = if let Some(home) = settings.home_path() {
-            let program = Path::new(home).join("bin").join("gradle.bat");
+            let program = Path::new(home).join("bin").join(bat_script("gradle"));
             if !program.is_file() {
-                return Err(format!("no gradle.bat in {}", program.display()).into());
+                return Err(format!("no {} in {}", bat_script("gradle"), program.display()).into());
             }
             let spec = ProcessSpec::new(program);
             match timeout {
@@ -178,8 +179,9 @@ impl Gradle {
 
 fn find_in_path() -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
+    let name = bat_script("gradle");
     env::split_paths(&path)
-        .map(|directory| directory.join("gradle.bat"))
+        .map(|directory| directory.join(&name))
         .find(|file| file.is_file())
 }
 
@@ -622,8 +624,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_project_after_a_successful_build_needs_no_gradle() {
-        let root = std::env::temp_dir().join(format!("gradle-fast-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("gradle-fast");
         fs::create_dir_all(root.join("src/main/java/demo")).unwrap();
         fs::write(root.join("build.gradle"), "plugins { id 'java' }").unwrap();
         fs::write(root.join("src/main/java/demo/App.java"), "class App {}").unwrap();
@@ -654,27 +655,21 @@ mod tests {
             read_stamp(&tool.stamp_file(&root)).unwrap(),
             "a changed source makes the stamp old"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn the_wrapper_version_is_read_from_its_url() {
-        let root = std::env::temp_dir().join(format!("java-project-gradle-{}", std::process::id()));
+        let root = test_support::scratch("project-gradle");
         fs::create_dir_all(root.join("gradle/wrapper")).unwrap();
         let text =
             "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.5.1-bin.zip\n";
         fs::write(root.join(WRAPPER_PROPERTIES), text).unwrap();
 
         assert_eq!(wrapper_version(&root), Some((9, 5)));
-        let _ = fs::remove_dir_all(root);
     }
 
     fn tree_project(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "java-project-gradle-tree-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch(&format!("project-gradle-tree-{name}"));
         fs::create_dir_all(root.join("app")).unwrap();
         fs::write(root.join("build.gradle"), "plugins { id 'application' }").unwrap();
         fs::write(
@@ -768,13 +763,11 @@ mod tests {
                 .find(|task| task.name == "bootRun")
                 .is_some_and(|task| task.program)
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_build_shortens_the_daemon_idle_timeout_unless_the_project_sets_one() {
-        let root = std::env::temp_dir().join(format!("gradle-daemon-idle-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("gradle-daemon-idle");
         fs::create_dir_all(&root).unwrap();
 
         assert_eq!(
@@ -802,14 +795,11 @@ mod tests {
             daemon_idle_timeout(&root).is_some(),
             "a commented property is not a choice"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn without_the_plugin_there_is_no_run_task_for_the_boot() {
-        let root =
-            std::env::temp_dir().join(format!("java-project-gradle-plain-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("project-gradle-plain");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("build.gradle"), "plugins { id 'java' }").unwrap();
         let model = ProjectModel {
@@ -833,6 +823,5 @@ mod tests {
             .find(|group| group.name == "application")
             .unwrap();
         assert!(application.tasks.is_empty());
-        let _ = fs::remove_dir_all(root);
     }
 }

@@ -348,7 +348,10 @@ fn the_right_pane_holds_the_keys_and_the_left_pane_is_read_only(cx: &mut TestApp
         "the tab keeps the saved text"
     );
     let right = view.read_with(cx, |view, _| view.right_editor());
-    assert_eq!(right, tab, "the right pane is the tab of the file");
+    assert_ne!(
+        right, tab,
+        "the right pane is a view of its own over the buffer of the tab"
+    );
     assert_eq!(
         right.read_with(cx, |view, _| view.text()),
         Some("ALPHA\nbeta\n".to_owned()),

@@ -37,8 +37,13 @@ pub struct TerminalPanel {
 /// ones the project decides, so that its SDK is the SDK of the build.
 fn shell_spec(root: PathBuf, variables: Vec<(String, String)>, settings: &Settings) -> SpawnSpec {
     let shell = match settings.terminal_shell.trim() {
-        "" => terminal::default_shell()
-            .unwrap_or_else(|| std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string())),
+        "" => terminal::default_shell().unwrap_or_else(|| {
+            if cfg!(windows) {
+                std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string())
+            } else {
+                "/bin/sh".to_string()
+            }
+        }),
         configured => configured.to_owned(),
     };
     let cwd = start_directory(settings, &root);

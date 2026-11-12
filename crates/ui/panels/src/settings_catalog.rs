@@ -190,6 +190,7 @@ pub enum SettingField {
     TerminalEnvironment,
     RenderDocComments,
     DiffSideBySide,
+    GitGroupByDirectory,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -622,6 +623,14 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::DiffSideBySide,
         keywords: "diff side by side unified compare version control editor",
     },
+    Setting {
+        id: "git_group_by_directory",
+        title: "Group by Directory",
+        page: SettingsPage::Git,
+        kind: SettingKind::Toggle,
+        field: SettingField::GitGroupByDirectory,
+        keywords: "branch popup folders group directory remote version control",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -684,6 +693,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::SemanticHighlighting => Some(settings.semantic_highlighting),
         SettingField::QuickDocOnHover => Some(settings.quick_doc_on_hover),
         SettingField::DiffSideBySide => Some(settings.diff_side_by_side),
+        SettingField::GitGroupByDirectory => Some(settings.git_group_by_directory),
         SettingField::BuildToolFirstOffline => Some(settings.build_tools.first.offline),
         SettingField::BuildToolFirstUpdateSnapshots => {
             Some(settings.build_tools.first.update_snapshots)
@@ -767,6 +777,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::DiffSideBySide) => {
             settings.diff_side_by_side = !settings.diff_side_by_side;
+        }
+        Some(SettingField::GitGroupByDirectory) => {
+            settings.git_group_by_directory = !settings.git_group_by_directory;
         }
         Some(SettingField::BuildToolFirstOffline) => {
             settings.build_tools.first.offline = !settings.build_tools.first.offline;

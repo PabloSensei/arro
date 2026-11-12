@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use base::Cancel;
 use lang_api::{Symbol, SymbolKind, SymbolProvider};
@@ -14,19 +13,12 @@ use search::{
 };
 use workspace_core::{DocumentStore, EditSource, LoadedFile, TextStore, WorkspaceTransaction};
 
-struct Project(PathBuf);
+struct Project(PathBuf, #[allow(dead_code)] test_support::TempDir);
 
 impl Project {
     fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let name = format!(
-            "search-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = std::env::temp_dir().join(name);
-        fs::create_dir_all(&path).unwrap();
-        Self(fs::canonicalize(path).unwrap())
+        let folder = test_support::TempDir::new("search");
+        Self(fs::canonicalize(&folder).unwrap(), folder)
     }
 
     fn file(&self, name: &str, text: &str) -> PathBuf {
@@ -34,12 +26,6 @@ impl Project {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, text).unwrap();
         path
-    }
-}
-
-impl Drop for Project {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

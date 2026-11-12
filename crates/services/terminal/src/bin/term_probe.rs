@@ -3,21 +3,29 @@
 //! READY into a file and waits, `children <pid>` lists the children of a process, `attach <line>`
 //! hosts a command in this console.
 
-use std::io::{self, BufRead, Write};
+#[cfg(windows)]
+use std::io::Write;
+use std::io::{self, BufRead};
+#[cfg(windows)]
 use std::mem::{size_of, zeroed};
+#[cfg(windows)]
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(windows)]
 use terminal::{ShiftEnter, SpawnSpec, TerminalSession, allowlisted, attach_console, console_size};
-
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
 use windows_sys::Win32::System::Console::{
     GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 
+#[cfg(windows)]
 const KEY_EVENT: u16 = 1;
 
 fn sleep(file: &str) {
@@ -25,6 +33,7 @@ fn sleep(file: &str) {
     std::thread::sleep(Duration::from_secs(600));
 }
 
+#[cfg(windows)]
 fn children(parent: u32) {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -59,6 +68,7 @@ fn lines() {
     println!("TOTAL {bytes} {hash:016x}");
 }
 
+#[cfg(windows)]
 fn keys() {
     println!("READY");
     io::stdout().flush().expect("stdout");
@@ -88,6 +98,7 @@ fn keys() {
     }
 }
 
+#[cfg(windows)]
 fn attach(command_line: &str) {
     let (cols, rows) = console_size().expect("a console");
     let session = TerminalSession::spawn(&SpawnSpec {
@@ -107,9 +118,12 @@ fn main() {
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match arguments.as_slice() {
         ["lines"] => lines(),
-        ["keys"] => keys(),
         ["sleep", file] => sleep(file),
+        #[cfg(windows)]
+        ["keys"] => keys(),
+        #[cfg(windows)]
         ["children", pid] => children(pid.parse().expect("pid")),
+        #[cfg(windows)]
         ["attach", line] => attach(line),
         _ => eprintln!("usage: term-probe lines|keys|sleep <file>|children <pid>|attach <line>"),
     }

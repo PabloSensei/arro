@@ -92,6 +92,40 @@ impl Render for NoDragPreview {
     }
 }
 
+/// Windows answers the hit test of the window buttons itself; a Unix window with client
+/// decorations needs a handler of its own for each control.
+#[cfg(unix)]
+fn minimize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
+    button.on_click(|_: &ClickEvent, window: &mut Window, _: &mut App| window.minimize_window())
+}
+
+#[cfg(windows)]
+fn minimize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
+    button
+}
+
+#[cfg(unix)]
+fn maximize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
+    button.on_click(|_: &ClickEvent, window: &mut Window, _: &mut App| window.zoom_window())
+}
+
+#[cfg(windows)]
+fn maximize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
+    button
+}
+
+#[cfg(unix)]
+fn close_button(button: Stateful<Div>, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+        this.close_window(window, cx);
+    }))
+}
+
+#[cfg(windows)]
+fn close_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
+    button
+}
+
 /// A tab on its way to another place, by the pointer.
 #[derive(Clone)]
 struct DraggedTab {
@@ -544,33 +578,42 @@ impl Workspace {
             .flex()
             .items_center()
             .ml(px(window_gap))
-            .child(window_button(
-                "w-min",
-                "windows/minimizeSmall",
-                "Minimize",
-                WindowControlArea::Min,
-                false,
-                theme,
+            .child(minimize_button(
+                window_button(
+                    "w-min",
+                    "windows/minimizeSmall",
+                    "Minimize",
+                    WindowControlArea::Min,
+                    false,
+                    theme,
+                ),
+                cx,
             ))
-            .child(window_button(
-                "w-max",
-                maximize,
-                if window.is_maximized() {
-                    "Restore"
-                } else {
-                    "Maximize"
-                },
-                WindowControlArea::Max,
-                false,
-                theme,
+            .child(maximize_button(
+                window_button(
+                    "w-max",
+                    maximize,
+                    if window.is_maximized() {
+                        "Restore"
+                    } else {
+                        "Maximize"
+                    },
+                    WindowControlArea::Max,
+                    false,
+                    theme,
+                ),
+                cx,
             ))
-            .child(window_button(
-                "w-close",
-                "windows/closeSmall",
-                "Close",
-                WindowControlArea::Close,
-                true,
-                theme,
+            .child(close_button(
+                window_button(
+                    "w-close",
+                    "windows/closeSmall",
+                    "Close",
+                    WindowControlArea::Close,
+                    true,
+                    theme,
+                ),
+                cx,
             ));
         let tools = div()
             .id("tools-group")
@@ -595,6 +638,19 @@ impl Workspace {
             .child(tools)
             .child(window_buttons);
 
+        #[cfg(unix)]
+        let titlebar_drag = Some(
+            div()
+                .id("titlebar-drag")
+                .flex_1()
+                .h_full()
+                .on_mouse_down(MouseButton::Left, |_, window: &mut Window, _: &mut App| {
+                    window.start_window_move()
+                }),
+        );
+        #[cfg(windows)]
+        let titlebar_drag: Option<Div> = None;
+
         div()
             .id("toolbar")
             .debug_selector(|| "toolbar".to_owned())
@@ -618,6 +674,7 @@ impl Workspace {
                     .child(channel.ml(px(SPACE_XS)))
                     .children(branch.map(|branch| branch.ml(px(SPACE_L)))),
             )
+            .children(titlebar_drag)
             .child(right)
     }
 

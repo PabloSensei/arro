@@ -2,21 +2,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use vcs::{CommitRequest, GitRunner, Repository};
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
 fn scratch(name: &str) -> PathBuf {
-    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ide-vcs-shelf-{}-{serial}-{name}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+    test_support::scratch(&format!("vcs-shelf-{name}"))
 }
 
 fn run(root: &Path, args: &[&str]) -> String {

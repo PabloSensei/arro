@@ -11,8 +11,7 @@ fn noise(seed: u32, len: usize) -> Vec<u8> {
 
 #[test]
 fn a_deleted_file_can_still_be_restored_when_the_size_limit_bites() {
-    let root = std::env::temp_dir().join(format!("qa-tomb-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = test_support::scratch("qa-tomb");
     fs::create_dir_all(root.join("p")).unwrap();
     let limits = Limits {
         max_age: Duration::from_secs(3600),
@@ -45,5 +44,4 @@ fn a_deleted_file_can_still_be_restored_when_the_size_limit_bites() {
     let b_left = history.file_history(&b).len();
     eprintln!("deleted files still restorable: {left}; B revisions: {b_left}");
     assert_eq!(left, 1, "the deleted file fell out of the history");
-    let _ = fs::remove_dir_all(&root);
 }

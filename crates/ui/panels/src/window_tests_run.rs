@@ -2,6 +2,7 @@
 //! world replaced: short commands, a test listener in a thread and the mock adapter of
 //! the fixture language.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -22,9 +23,11 @@ use workspace::Workspace;
 use crate::debug::ActiveDebug;
 use crate::run::{ProjectSetup, RunPanel};
 use crate::script::ActiveRunPanel;
+#[cfg(windows)]
+use crate::window_tests::{active_path, wait_for_process};
 use crate::window_tests::{
-    active_path, bounds_of, click, draw, editor_of, open_path, open_window_with, press,
-    sample_project, scratch, type_text, wait_for_process,
+    bounds_of, click, draw, editor_of, open_path, open_window_with, press, sample_project, scratch,
+    type_text,
 };
 
 /// How long a test waits for an external process, a poll of the panel or the adapter.
@@ -169,13 +172,12 @@ impl RunConfigProvider for LongRun {
     }
 }
 
-/// A copy of a program that outlives the test, under a name of its own: only this image
-/// tells the process apart from the other copies of the same program.
+/// A copy of a program under a name of its own: only this image tells the process apart
+/// from the other copies of the same program. The folder of the test removes it.
 pub(crate) fn long_image(name: &str) -> PathBuf {
     let system_root = std::env::var_os("SystemRoot").expect("a Windows machine");
     let source = PathBuf::from(system_root).join("System32").join("ping.exe");
-    let image =
-        std::env::temp_dir().join(format!("ide-window-run-{}-{name}.exe", std::process::id()));
+    let image = test_support::scratch("window-run").join(format!("{name}.exe"));
     std::fs::copy(&source, &image).expect("the program is copied");
     image
 }
@@ -429,6 +431,7 @@ fn wait_for_config(cx: &mut TestAppContext, panel: &gpui::Entity<RunPanel>) {
     });
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn run_shift_f10_shows_the_output_and_the_exit_code(cx: &mut TestAppContext) {
     let root = sample_project("run-output");
@@ -449,6 +452,7 @@ fn run_shift_f10_shows_the_output_and_the_exit_code(cx: &mut TestAppContext) {
     assert!(!run_state(cx, &panel).running, "the program has finished");
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn stop_ctrl_f2_ends_a_long_run(cx: &mut TestAppContext) {
     let root = sample_project("run-stop");
@@ -478,6 +482,7 @@ fn stop_ctrl_f2_ends_a_long_run(cx: &mut TestAppContext) {
     let _ = std::fs::remove_file(&image);
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn ctrl_shift_f10_runs_the_test_at_the_caret_and_the_tree_shows_the_results(
     cx: &mut TestAppContext,
@@ -669,6 +674,7 @@ fn debug_shift_f9_stops_on_a_breakpoint_and_the_window_shows_the_session(cx: &mu
     service.join();
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn stop_during_the_debug_start_of_a_test_from_the_tree(cx: &mut TestAppContext) {
     crate::tree_ops::use_temporary_delete();

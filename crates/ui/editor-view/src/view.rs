@@ -539,6 +539,9 @@ pub struct EditorView {
     pub(crate) last_find: LastFind,
     column_mode: bool,
     soft_wrap: bool,
+    /// A pane of a comparison keeps its rows on the lines of the other pane, so soft
+    /// wrap stays off there.
+    wrap_locked: bool,
     show_whitespace: bool,
     outline: Vec<OutlineItem>,
     outline_serial: u64,
@@ -686,6 +689,47 @@ impl EditorView {
         view
     }
 
+    /// Opens another view of the buffer `source` shows. Edits and the undo history are
+    /// shared with `source`; the carets, selections, folds and scroll are this view's
+    /// own, so one view moving never moves the other.
+    pub fn open_shared(source: &Entity<EditorView>, cx: &mut App) -> Option<Entity<EditorView>> {
+        let (state, path, style, options, zoom) = {
+            let source = source.read(cx);
+            let state = source.state.as_ref()?.fork();
+            (
+                state,
+                source.path.clone(),
+                source.base_style.clone(),
+                source.options.clone(),
+                source.zoom,
+            )
+        };
+        let view = cx.new(|cx| {
+            let mut view = Self::empty(path, style, cx);
+            view.options = options;
+            view.zoom = zoom;
+            view.lock_soft_wrap();
+            if let Some(language) = state.language() {
+                view.start_syntax(language.clone(), &state, cx);
+            }
+            view.state = Some(state);
+            view.attach(cx);
+            view.remember_text(cx);
+            view
+        });
+        Some(view)
+    }
+
+    /// Takes the edits the other view of the buffer made, without adding an undo step:
+    /// the history they belong to is shared.
+    pub fn follow_edits(&mut self, edits: Vec<text_core::Edit>, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let change = state.follow(edits);
+        self.changed(change, cx);
+    }
+
     /// The fields of a view before it has text. The file or the text comes next.
     fn empty(path: PathBuf, style: EditorStyle, cx: &mut Context<Self>) -> Self {
         static NEXT_DOCUMENT: AtomicU64 = AtomicU64::new(1);
@@ -720,6 +764,7 @@ impl EditorView {
             last_find: LastFind::default(),
             column_mode: false,
             soft_wrap: false,
+            wrap_locked: false,
             show_whitespace: false,
             outline: Vec::new(),
             outline_serial: 0,
@@ -1823,6 +1868,24 @@ impl EditorView {
         self.soft_wrap
     }
 
+    /// Keeps the rows of this view on the lines of the text: a comparison pane turns
+    /// soft wrap off and the key that toggles it does nothing here.
+    pub fn lock_soft_wrap(&mut self) {
+        self.soft_wrap = false;
+        self.wrap_locked = true;
+    }
+
+    /// The buffer lines the display has rows for, without the ones a fold hides.
+    pub fn shown_lines(&self) -> Vec<usize> {
+        self.state.as_ref().map_or_else(Vec::new, |state| {
+            state
+                .visible_lines()
+                .into_iter()
+                .map(|line| line as usize)
+                .collect()
+        })
+    }
+
     /// Insert replaces the character under the caret, as the status bar says.
     pub fn overwrite(&self) -> bool {
         self.state.as_ref().is_some_and(|state| state.overwrite())
@@ -2531,8 +2594,10 @@ impl EditorView {
             }
             actions::PASTE_HISTORY => return cx.emit(EditorEvent::PasteHistory),
             actions::TOGGLE_SOFT_WRAP => {
-                self.soft_wrap = !self.soft_wrap;
-                self.scroll_left = 0.;
+                if !self.wrap_locked {
+                    self.soft_wrap = !self.soft_wrap;
+                    self.scroll_left = 0.;
+                }
                 return cx.notify();
             }
             actions::TOGGLE_WHITESPACE => {

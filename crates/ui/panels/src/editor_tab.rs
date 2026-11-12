@@ -195,6 +195,10 @@ fn open(
                     outline::refresh(&view, matches!(event, EditorEvent::Changed), cx);
                     if matches!(event, EditorEvent::Changed) {
                         places::remember(&view, cx);
+                        let path = view.read(cx).path().to_path_buf();
+                        runner
+                            .update(cx, |workspace, cx| workspace.remember_edited(&path, cx))
+                            .ok();
                     }
                     // The status line and the star of the tab show the caret and the
                     // text of the editor, so the window follows every keystroke too.

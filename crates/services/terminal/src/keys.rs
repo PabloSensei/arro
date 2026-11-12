@@ -1,16 +1,22 @@
 //! Key presses to bytes. ConPTY asks for win32-input-mode (9001) as soon as it starts, and only
 //! its records carry modifiers an xterm sequence cannot express, such as Shift+Enter in a console
-//! program. Everything else is the plain xterm encoding.
+//! program. Everything else is the plain xterm encoding. A Unix pseudoterminal has no 9001 mode,
+//! so there the plain xterm encoding is the whole answer.
 
+#[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MAPVK_VK_TO_VSC, MapVirtualKeyW, VkKeyScanW,
 };
 
 use crate::screen::Modes;
 
+#[cfg(windows)]
 const SHIFT_PRESSED: u32 = 0x10;
+#[cfg(windows)]
 const LEFT_CTRL_PRESSED: u32 = 0x08;
+#[cfg(windows)]
 const LEFT_ALT_PRESSED: u32 = 0x02;
+#[cfg(windows)]
 const ENHANCED_KEY: u32 = 0x100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +64,7 @@ impl Mods {
         alt: true,
     };
 
+    #[cfg(windows)]
     fn control_state(self) -> u32 {
         let flag = |on: bool, bit: u32| if on { bit } else { 0 };
         flag(self.shift, SHIFT_PRESSED)
@@ -100,12 +107,14 @@ pub enum ShiftEnter {
     CsiU,
 }
 
+#[cfg(windows)]
 struct Record {
     vk: u16,
     unicode: u16,
     control: u32,
 }
 
+#[cfg(windows)]
 impl Record {
     fn write(&self, out: &mut Vec<u8>, down: bool) {
         let Record {
@@ -120,6 +129,7 @@ impl Record {
     }
 }
 
+#[cfg(windows)]
 fn virtual_key(ch: char) -> u16 {
     if ch.is_ascii_alphanumeric() {
         return ch.to_ascii_uppercase() as u16;
@@ -139,6 +149,7 @@ fn control_code(ch: char) -> Option<u8> {
     }
 }
 
+#[cfg(windows)]
 fn record(event: KeyEvent) -> Record {
     let KeyEvent { key, mods } = event;
     let mut control = mods.control_state();
@@ -182,33 +193,42 @@ fn record(event: KeyEvent) -> Record {
 /// turns any other character the keyboard layout has no key for into Alt and numpad presses, `{`
 /// on a Russian layout for one, and programs that ignore key releases lose it. A record of our
 /// own carries the character itself, whatever the layout.
+#[cfg(windows)]
 fn passes_as_text(ch: char) -> bool {
     ch.is_alphanumeric() || ch == ' ' || ch.is_control()
 }
 
 /// Text for the program, sent the way no keyboard layout can change.
 pub fn encode_text(text: &str, modes: Modes) -> Vec<u8> {
-    if !modes.win32_input {
-        return text.as_bytes().to_vec();
-    }
-    let mut out = Vec::with_capacity(text.len());
-    let mut units = [0; 2];
-    for ch in text.chars() {
-        if passes_as_text(ch) {
-            out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
-            continue;
+    #[cfg(windows)]
+    {
+        if !modes.win32_input {
+            return text.as_bytes().to_vec();
         }
-        for &unicode in ch.encode_utf16(&mut units).iter() {
-            let record = Record {
-                vk: 0,
-                unicode,
-                control: 0,
-            };
-            record.write(&mut out, true);
-            record.write(&mut out, false);
+        let mut out = Vec::with_capacity(text.len());
+        let mut units = [0; 2];
+        for ch in text.chars() {
+            if passes_as_text(ch) {
+                out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                continue;
+            }
+            for &unicode in ch.encode_utf16(&mut units).iter() {
+                let record = Record {
+                    vk: 0,
+                    unicode,
+                    control: 0,
+                };
+                record.write(&mut out, true);
+                record.write(&mut out, false);
+            }
         }
+        out
     }
-    out
+    #[cfg(unix)]
+    {
+        let _ = modes;
+        text.as_bytes().to_vec()
+    }
 }
 
 /// `CSI 1 ; m X` with modifiers, otherwise `CSI X`, or `SS3 X` in application mode.
@@ -286,10 +306,18 @@ pub fn encode(event: KeyEvent, modes: Modes, shift_enter: ShiftEnter) -> Vec<u8>
         legacy(&mut out, event, modes);
         return out;
     }
-    let record = record(event);
-    record.write(&mut out, true);
-    record.write(&mut out, false);
-    out
+    #[cfg(windows)]
+    {
+        let record = record(event);
+        record.write(&mut out, true);
+        record.write(&mut out, false);
+        out
+    }
+    #[cfg(unix)]
+    {
+        legacy(&mut out, event, modes);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -314,11 +342,13 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    #[cfg(windows)]
     fn record(key: Key, mods: Mods) -> String {
         let bytes = encode(KeyEvent::new(key, mods), WIN32, ShiftEnter::Win32Record);
         String::from_utf8(bytes).unwrap()
     }
 
+    #[cfg(windows)]
     #[test]
     fn punctuation_goes_as_a_record_and_letters_as_text() {
         let text = String::from_utf8(encode_text("a{ж\r", WIN32)).unwrap();
@@ -332,6 +362,7 @@ mod tests {
         assert_eq!(legacy(Key::Backspace, Mods::CTRL), "\x08");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_record_says_press_and_release() {
         let enter = record(Key::Enter, Mods::SHIFT);
@@ -339,6 +370,7 @@ mod tests {
         assert_eq!(enter, "\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_");
     }
 
+    #[cfg(windows)]
     #[test]
     fn backspace_records_are_the_reverse_of_the_keyboard() {
         assert!(record(Key::Backspace, Mods::default()).starts_with("\x1b[8;14;8;1;0;1_"));
@@ -353,6 +385,7 @@ mod tests {
         assert_ne!(encode(event, WIN32, ShiftEnter::Win32Record), b"\x1b[13;2u");
     }
 
+    #[cfg(windows)]
     #[test]
     fn letters_stay_plain_and_symbols_carry_their_utf16() {
         assert_eq!(record(Key::Char('я'), Mods::SHIFT), "я");
@@ -361,6 +394,7 @@ mod tests {
         assert!(emoji.ends_with("\x1b[0;0;56832;0;0;1_"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn ctrl_c_is_a_record_with_the_control_code() {
         assert!(record(Key::Char('c'), Mods::CTRL).starts_with("\x1b[67;46;3;1;8;1_"));

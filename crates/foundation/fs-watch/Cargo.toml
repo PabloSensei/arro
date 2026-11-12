@@ -7,3 +7,7 @@ publish.workspace = true
 [dependencies]
 ignore.workspace = true
 notify.workspace = true
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

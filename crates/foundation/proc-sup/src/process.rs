@@ -1,20 +1,28 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use base::perf;
-use platform::{Job, NO_WINDOW, SUSPENDED_NO_WINDOW, allow_ctrl_c_in_children, resume_process};
+use platform::{Job, allow_ctrl_c_in_children};
+#[cfg(windows)]
+use platform::{NO_WINDOW, SUSPENDED_NO_WINDOW, resume_process};
 
 /// Exit code of a tree ended by [`Process::stop`], the one `taskkill` uses.
+#[cfg(windows)]
 const STOPPED: u32 = 1;
 /// How often [`Process::shut_down`] looks whether the process has gone.
 const POLL: Duration = Duration::from_millis(20);
 /// The helper that delivers console signals, next to the IDE executable.
+#[cfg(windows)]
 const CTRL_HELPER: &str = "ide-ctrl.exe";
 
 /// How a process relates to its owner.
@@ -141,17 +149,26 @@ impl ProcessSpec {
     }
 
     fn command(&self) -> Command {
-        let flags = match self.class {
-            ProcessClass::Owned => SUSPENDED_NO_WINDOW,
-            ProcessClass::Client => NO_WINDOW,
-        };
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(flags);
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            let flags = match self.class {
+                ProcessClass::Owned => SUSPENDED_NO_WINDOW,
+                ProcessClass::Client => NO_WINDOW,
+            };
+            command.creation_flags(flags);
+        }
+        #[cfg(unix)]
+        if self.class == ProcessClass::Owned {
+            // A group of its own is what [`Job`] signals and what keeps a shell and its
+            // children from surviving their owner.
+            command.process_group(0);
+        }
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
@@ -173,6 +190,7 @@ impl ProcessSpec {
 pub struct Process {
     child: Child,
     job: Option<Job>,
+    #[cfg_attr(unix, allow(dead_code))]
     ctrl_helper: Option<PathBuf>,
 }
 
@@ -193,7 +211,10 @@ impl Process {
         let mut child = spec.command().spawn()?;
         if let Some(job) = &job {
             // In the job before its first instruction, so that no grandchild can slip out.
+            #[cfg(windows)]
             let resumed = job.assign(&child).and_then(|()| resume_process(&child));
+            #[cfg(unix)]
+            let resumed = job.assign(child.id());
             if let Err(error) = resumed {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -252,23 +273,34 @@ impl Process {
     }
 
     fn signal(&self, signal: &str) -> io::Result<()> {
-        let helper = match &self.ctrl_helper {
-            Some(helper) => helper.clone(),
-            None => std::env::current_exe()?.with_file_name(CTRL_HELPER),
-        };
-        let output = Command::new(helper)
-            .arg(signal)
-            .arg(self.pid().to_string())
-            .creation_flags(NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()?;
-        if !output.status.success() {
-            let message = String::from_utf8_lossy(&output.stderr);
-            return Err(io::Error::other(message.trim().to_owned()));
+        #[cfg(unix)]
+        {
+            let signal = match signal {
+                "--ctrl-break" => platform::ConsoleSignal::CtrlBreak,
+                _ => platform::ConsoleSignal::CtrlC,
+            };
+            platform::signal_console_of(self.pid(), signal)
         }
-        Ok(())
+        #[cfg(windows)]
+        {
+            let helper = match &self.ctrl_helper {
+                Some(helper) => helper.clone(),
+                None => std::env::current_exe()?.with_file_name(CTRL_HELPER),
+            };
+            let output = Command::new(helper)
+                .arg(signal)
+                .arg(self.pid().to_string())
+                .creation_flags(NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()?;
+            if !output.status.success() {
+                let message = String::from_utf8_lossy(&output.stderr);
+                return Err(io::Error::other(message.trim().to_owned()));
+            }
+            Ok(())
+        }
     }
 
     /// Asks the process to stop, and ends it by force after `grace`. Blocks for that long,
@@ -296,7 +328,10 @@ impl Process {
 
     fn end_tree(&mut self) -> io::Result<()> {
         match &self.job {
+            #[cfg(windows)]
             Some(job) => job.terminate(STOPPED),
+            #[cfg(unix)]
+            Some(job) => job.terminate(1),
             // Already gone is what was asked for.
             None => self.child.kill().or(Ok(())),
         }

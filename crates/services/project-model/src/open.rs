@@ -244,10 +244,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("project-model-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        path
+        test_support::scratch(&format!("project-model-{name}"))
     }
 
     fn tool_of(session: &ProjectSession) -> String {
@@ -267,7 +264,6 @@ mod tests {
         release.send(Ok(named(&root, "synced"))).unwrap();
         assert_eq!(next(&mut events), SyncEvent::Synced);
         assert_eq!(tool_of(&session), "synced");
-        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]
@@ -286,7 +282,6 @@ mod tests {
 
         assert_eq!(next(&mut events), SyncEvent::Preliminary);
         assert_eq!(tool_of(&session), "synced");
-        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]
@@ -300,7 +295,6 @@ mod tests {
         assert_eq!(next(&mut events), SyncEvent::Preliminary);
         assert_eq!(next(&mut events), SyncEvent::Failed("broken".into()));
         assert_eq!(tool_of(&session), "scanned");
-        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]
@@ -316,6 +310,5 @@ mod tests {
 
         assert_eq!(next(&mut events), SyncEvent::Preliminary);
         assert_eq!(tool_of(&session), "scanned");
-        let _ = std::fs::remove_dir_all(cache);
     }
 }

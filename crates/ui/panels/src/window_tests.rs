@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use editor_view::{EditorView, Languages, Usage};
@@ -35,17 +34,10 @@ use crate::start::{ProjectTemplate, StartScreen};
 use crate::usages::ActiveUsages;
 use crate::{AgentOptions, LanguageServer, connect, install, tree_ops::FileTemplate};
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
-/// A folder of its own for one part of one test. The project source of the test lives
-/// here too, so a run without `IDE_CORPUS` works the same.
+/// A folder of its own for one part of one test, removed when the test ends. The project
+/// source of the test lives here too, so a run without `IDE_CORPUS` works the same.
 pub(crate) fn scratch(name: &str) -> PathBuf {
-    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("ide-window-{}-{serial}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    test_support::scratch(&format!("window-{name}"))
 }
 
 pub(crate) fn sample_project(name: &str) -> PathBuf {

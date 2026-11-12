@@ -3,8 +3,11 @@
 
 use std::env::split_paths;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 
+use base::program::executable;
 use terminal::command_line;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -62,11 +65,12 @@ fn find(path: &OsStr, file: &str) -> Option<PathBuf> {
 }
 
 /// Same entry point as the npm `codex` shim, minus the shell around it.
+#[cfg(windows)]
 fn codex_script(path: &OsStr, shim: &Path) -> Option<Installed> {
     let script = shim
         .parent()?
         .join("node_modules/@openai/codex/bin/codex.js");
-    let node = find(path, "node.exe")?;
+    let node = find(path, &executable("node"))?;
     script.is_file().then(|| Installed {
         harness: Harness::Codex,
         program: node,
@@ -77,7 +81,7 @@ fn codex_script(path: &OsStr, shim: &Path) -> Option<Installed> {
 
 fn locate(path: &OsStr, harness: Harness) -> Option<Installed> {
     let stem = harness.stem();
-    if let Some(program) = find(path, &format!("{stem}.exe")) {
+    if let Some(program) = find(path, &executable(stem)) {
         return Some(Installed {
             harness,
             program,
@@ -85,16 +89,26 @@ fn locate(path: &OsStr, harness: Harness) -> Option<Installed> {
             through_shell: false,
         });
     }
-    let shim = find(path, &format!("{stem}.cmd"))?;
-    let direct = (harness == Harness::Codex)
-        .then(|| codex_script(path, &shim))
-        .flatten();
-    Some(direct.unwrap_or(Installed {
-        harness,
-        program: shim,
-        prefix: Vec::new(),
-        through_shell: true,
-    }))
+    // An npm install puts a batch file of the same name on PATH on Windows only; on
+    // Unix the package manager links the entry point itself.
+    #[cfg(windows)]
+    {
+        let shim = find(path, &format!("{stem}.cmd"))?;
+        let direct = (harness == Harness::Codex)
+            .then(|| codex_script(path, &shim))
+            .flatten();
+        Some(direct.unwrap_or(Installed {
+            harness,
+            program: shim,
+            prefix: Vec::new(),
+            through_shell: true,
+        }))
+    }
+    #[cfg(unix)]
+    {
+        let _ = harness;
+        None
+    }
 }
 
 /// Every known harness on the given PATH value.
@@ -105,30 +119,23 @@ pub fn detect(path: &OsStr) -> Vec<Installed> {
 
 #[cfg(test)]
 mod tests {
-    use std::env::temp_dir;
+    #[cfg(windows)]
     use std::fs;
 
     use super::*;
 
-    struct Directory(PathBuf);
+    struct Directory(test_support::TempDir);
 
     impl Directory {
         fn new(name: &str) -> Self {
-            let path = temp_dir().join(format!("harness-{name}-{}", std::process::id()));
-            fs::create_dir_all(&path).expect("directory");
-            Self(path)
+            Self(test_support::TempDir::new(&format!("harness-{name}")))
         }
 
+        #[cfg(windows)]
         fn touch(&self, relative: &str) {
             let file = self.0.join(relative);
             fs::create_dir_all(file.parent().expect("parent")).expect("directory");
             fs::write(file, "").expect("file");
-        }
-    }
-
-    impl Drop for Directory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -139,6 +146,7 @@ mod tests {
         assert!(detect(directory.0.as_os_str()).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_exe_wins_over_a_shim() {
         let directory = Directory::new("exe");
@@ -152,6 +160,7 @@ mod tests {
         assert!(!found[0].through_shell);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_codex_shim_resolves_to_node_and_script() {
         let directory = Directory::new("codex");
@@ -166,6 +175,7 @@ mod tests {
         assert!(found[0].prefix[0].ends_with("codex.js"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_plain_shim_runs_through_the_shell() {
         let directory = Directory::new("opencode");

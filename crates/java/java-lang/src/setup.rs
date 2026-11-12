@@ -97,15 +97,26 @@ impl Search {
     /// folders. `exe_dir` is the folder of `arro.exe`.
     pub fn from_env(exe_dir: Option<&Path>) -> Self {
         let var = |name| env::var_os(name).map(PathBuf::from);
-        let program_files = var("IDE_PROGRAM_FILES").or_else(|| var("ProgramFiles"));
         let mut jdk_roots = Vec::new();
-        if let Some(base) = program_files {
-            jdk_roots.push(base.join("Amazon Corretto"));
-            jdk_roots.push(base.join("Java"));
-            jdk_roots.push(base.join("Eclipse Adoptium"));
+        #[cfg(windows)]
+        {
+            let program_files = var("IDE_PROGRAM_FILES").or_else(|| var("ProgramFiles"));
+            if let Some(base) = program_files {
+                jdk_roots.push(base.join("Amazon Corretto"));
+                jdk_roots.push(base.join("Java"));
+                jdk_roots.push(base.join("Eclipse Adoptium"));
+            }
+            if let Some(base) = var("LOCALAPPDATA") {
+                jdk_roots.push(base.join("Programs"));
+            }
         }
-        if let Some(base) = var("LOCALAPPDATA") {
-            jdk_roots.push(base.join("Programs"));
+        #[cfg(unix)]
+        {
+            jdk_roots.push(PathBuf::from("/usr/lib/jvm"));
+            if let Some(home) = base::program::home_dir() {
+                jdk_roots.push(home.join(".sdkman").join("candidates").join("java"));
+                jdk_roots.push(home.join(".jdks"));
+            }
         }
         Self {
             exe_dir: exe_dir.map(Path::to_path_buf),
@@ -262,13 +273,9 @@ fn name_is(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process;
 
     fn scratch(name: &str) -> PathBuf {
-        let path = env::temp_dir().join(format!("java-lang-setup-{}-{name}", process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("lang-setup-{name}"))
     }
 
     fn release(home: &Path, version: &str) {

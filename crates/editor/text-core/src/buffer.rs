@@ -1,5 +1,7 @@
 //! A document: text, carets, history and the format it has on disk.
 
+use std::sync::{Arc, Mutex};
+
 use crate::edit::{Edit, EditKind, EditSource};
 use crate::encoding::{EolPatch, FileFormat, normalize_newlines};
 use crate::history::{History, Step};
@@ -20,11 +22,12 @@ impl Change {
     }
 }
 
-pub struct Buffer<S: TextStore = RopeStore> {
-    store: S,
-    selections: SelectionSet,
+/// What every view of one file shares: the undo history and the version that tells a
+/// saved text from an edited one. Each [`Buffer`] holds the text and the carets of one
+/// view, so two views stay in step when their buffers take the same edits.
+#[derive(Default)]
+struct Shared {
     history: History,
-    format: FileFormat,
     /// Grows with every change, also with undo. Stale background results compare it.
     version: u64,
     /// Identifies the text: undo returns to an earlier state, new edits take a new one.
@@ -33,17 +36,35 @@ pub struct Buffer<S: TextStore = RopeStore> {
     saved_state: u64,
 }
 
+pub struct Buffer<S: TextStore = RopeStore> {
+    store: S,
+    selections: SelectionSet,
+    format: FileFormat,
+    shared: Arc<Mutex<Shared>>,
+}
+
 impl<S: TextStore> Buffer<S> {
     pub fn new(text: &str, format: FileFormat) -> Self {
         Self {
             store: S::from_text(text),
             selections: SelectionSet::default(),
-            history: History::default(),
             format,
-            version: 0,
-            state: 0,
-            next_state: 1,
-            saved_state: 0,
+            shared: Arc::new(Mutex::new(Shared {
+                next_state: 1,
+                ..Shared::default()
+            })),
+        }
+    }
+
+    /// Another view of the same text: the store starts as a copy and the two buffers
+    /// take the same edits, but the carets and the folds belong to each view. The undo
+    /// history and the saved state are shared.
+    pub fn fork(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            selections: SelectionSet::default(),
+            format: self.format.clone(),
+            shared: self.shared.clone(),
         }
     }
 
@@ -70,9 +91,10 @@ impl<S: TextStore> Buffer<S> {
             return;
         }
         self.format = format;
-        self.state = self.next_state;
-        self.next_state += 1;
-        self.version += 1;
+        let mut shared = self.shared.lock().unwrap();
+        shared.state = shared.next_state;
+        shared.next_state += 1;
+        shared.version += 1;
     }
 
     pub fn selections(&self) -> &SelectionSet {
@@ -80,26 +102,24 @@ impl<S: TextStore> Buffer<S> {
     }
 
     pub fn version(&self) -> u64 {
-        self.version
+        self.shared.lock().unwrap().version
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.state != self.saved_state
+        let shared = self.shared.lock().unwrap();
+        shared.state != shared.saved_state
     }
 
     pub fn mark_saved(&mut self) {
-        self.saved_state = self.state;
-        self.history.seal();
-    }
-
-    pub fn history(&self) -> &History {
-        &self.history
+        let mut shared = self.shared.lock().unwrap();
+        shared.saved_state = shared.state;
+        shared.history.seal();
     }
 
     /// Moves the carets.
     pub fn set_selections(&mut self, selections: SelectionSet) {
         self.set_selections_keeping_history(selections);
-        self.history.seal();
+        self.shared.lock().unwrap().history.seal();
     }
 
     /// Offsets are snapped to character boundaries inside the text.
@@ -134,17 +154,48 @@ impl<S: TextStore> Buffer<S> {
         let after = after.unwrap_or_else(|| before.transformed(&edits));
         self.set_selections_keeping_history(after.clone());
 
-        let state_before = self.state;
-        self.state = self.next_state;
-        self.next_state += 1;
+        let (state_before, state_after) = {
+            let mut shared = self.shared.lock().unwrap();
+            let state_before = shared.state;
+            shared.state = shared.next_state;
+            shared.next_state += 1;
+            (state_before, shared.state)
+        };
         let step = Step {
             edits: edits.clone(),
             inverse,
             eol,
             state_before,
-            state_after: self.state,
+            state_after,
         };
-        self.history.record(step, before, after, source, kind);
+        self.shared
+            .lock()
+            .unwrap()
+            .history
+            .record(step, before, after, source, kind);
+        Change { steps: vec![edits] }
+    }
+
+    /// Takes edits another view of the same buffer already made. They are not an undo
+    /// step of their own: the shared history has the change from the view that made it.
+    /// The carets of this view follow the text.
+    pub fn follow(&mut self, edits: Vec<Edit>) -> Change {
+        let edits = self.prepare(edits);
+        if edits.is_empty() {
+            return Change::default();
+        }
+        let after = self.selections.transformed(&edits);
+        for edit in edits.iter().rev() {
+            let first_line = self.store.offset_to_line(edit.range.start);
+            let removed = self.store.slice(edit.range.clone());
+            let removed_lines = removed.bytes().filter(|byte| *byte == b'\n').count();
+            let inserted_lines = edit.text.bytes().filter(|byte| *byte == b'\n').count();
+            self.format
+                .eol
+                .splice(first_line, removed_lines, inserted_lines);
+            self.store.replace(edit.range.clone(), &edit.text);
+        }
+        self.selections = after;
         Change { steps: vec![edits] }
     }
 
@@ -162,7 +213,7 @@ impl<S: TextStore> Buffer<S> {
             combined.steps.extend(change.steps);
         }
         if applied > 1 {
-            self.history.merge_last(applied);
+            self.shared.lock().unwrap().history.merge_last(applied);
         }
         combined
     }
@@ -170,41 +221,41 @@ impl<S: TextStore> Buffer<S> {
     /// Joins the last `count` undo steps into one, so a late answer that belongs to an
     /// earlier insertion comes back with it.
     pub fn merge_last_undo(&mut self, count: usize) {
-        self.history.merge_last(count);
+        self.shared.lock().unwrap().history.merge_last(count);
     }
 
     /// Stops grouping, so the next change starts an undo step of its own.
     pub fn seal_undo(&mut self) {
-        self.history.seal();
+        self.shared.lock().unwrap().history.seal();
     }
 
     /// Reverts the latest transaction, or returns `None` when there is nothing to revert.
     pub fn undo(&mut self) -> Option<Change> {
-        let transaction = self.history.pop_undo()?;
+        let transaction = self.shared.lock().unwrap().history.pop_undo()?;
         let mut steps = Vec::with_capacity(transaction.steps.len());
         for step in transaction.steps.iter().rev() {
             self.replace_text(&step.inverse);
             for patch in step.eol.iter().rev() {
                 self.format.eol.restore(patch);
             }
-            self.state = step.state_before;
+            self.shared.lock().unwrap().state = step.state_before;
             steps.push(step.inverse.clone());
         }
         self.set_selections_keeping_history(transaction.before.clone());
-        self.history.push_redo(transaction);
+        self.shared.lock().unwrap().history.push_redo(transaction);
         Some(Change { steps })
     }
 
     pub fn redo(&mut self) -> Option<Change> {
-        let transaction = self.history.pop_redo()?;
+        let transaction = self.shared.lock().unwrap().history.pop_redo()?;
         let mut steps = Vec::with_capacity(transaction.steps.len());
         for step in &transaction.steps {
             self.replace(&step.edits);
-            self.state = step.state_after;
+            self.shared.lock().unwrap().state = step.state_after;
             steps.push(step.edits.clone());
         }
         self.set_selections_keeping_history(transaction.after.clone());
-        self.history.push_undo(transaction);
+        self.shared.lock().unwrap().history.push_undo(transaction);
         Some(Change { steps })
     }
 
@@ -260,7 +311,7 @@ impl<S: TextStore> Buffer<S> {
         for edit in edits.iter().rev() {
             self.store.replace(edit.range.clone(), &edit.text);
         }
-        self.version += 1;
+        self.shared.lock().unwrap().version += 1;
     }
 }
 

@@ -55,6 +55,8 @@ const WIN32_CRATES: &[&str] = &[
 ];
 /// `extern "C"` reaches the same functions on x86-64, so the link attribute matters too.
 const WIN32_SOURCE_MARKERS: &[&str] = &["extern \"system\"", "#[link(", "raw-dylib"];
+/// Unix system calls live in the same crates as the Win32 ones.
+const UNIX_SOURCE_MARKERS: &[&str] = &["libc::", "std::os::unix"];
 
 const AI_ALLOWED_GROUPS: &[&str] = &["ai", "foundation", "services"];
 
@@ -256,6 +258,7 @@ impl Graph {
                 }
                 if rust && !win32 {
                     violations.extend(scan.foreign_abi());
+                    violations.extend(scan.unix_abi());
                 }
             }
         }
@@ -351,6 +354,20 @@ impl FileScan<'_> {
             .map(|(index, _)| {
                 let location = format!("{}:{}", self.file.display(), index + 1);
                 format!("{location}: Win32 lives in platform, proc-sup and terminal")
+            })
+            .collect()
+    }
+
+    fn unix_abi(&self) -> Vec<String> {
+        let lines = self.text.lines().enumerate();
+        let calls = lines.filter(|(_, line)| {
+            let mut markers = UNIX_SOURCE_MARKERS.iter();
+            markers.any(|marker| line.contains(marker))
+        });
+        calls
+            .map(|(index, _)| {
+                let location = format!("{}:{}", self.file.display(), index + 1);
+                format!("{location}: Unix calls live in platform, proc-sup and terminal")
             })
             .collect()
     }

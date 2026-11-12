@@ -1,4 +1,5 @@
 //! Real programs in a real pseudoconsole.
+#![cfg(windows)]
 
 use std::path::Path;
 use std::time::Duration;

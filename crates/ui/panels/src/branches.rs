@@ -3,7 +3,7 @@
 //! branch in a submenu. The list comes from `git for-each-ref` off the UI thread.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -45,12 +45,23 @@ enum Row {
     Header(&'static str),
     Separator,
     Command(Command),
+    /// A remote or a folder of the branch tree. `key` is the same across rebuilds, so
+    /// the node keeps its state while the search changes.
+    Node {
+        key: String,
+        label: String,
+        depth: usize,
+    },
     Branch {
         /// The branch in [`BranchPopup::branches`].
         index: usize,
         /// The id of a row of Local or Remote in the `menu-N` form of the tests and
         /// scripts; a row of Recent repeats a branch and has an id of its own.
         menu: Option<usize>,
+        /// What the row shows; `None` is the name of the branch as git gives it.
+        display: Option<String>,
+        /// The depth of the row in the tree; zero for a branch outside a folder.
+        depth: usize,
     },
 }
 
@@ -64,6 +75,7 @@ enum Command {
     Update,
     Stash,
     Unstash,
+    GroupByDirectory,
 }
 
 pub struct BranchPopup {
@@ -78,6 +90,14 @@ pub struct BranchPopup {
     query: TextField,
     rows: Vec<Row>,
     selected: usize,
+    /// The nodes of the tree the user folded; a node not in the set is open.
+    collapsed: HashSet<String>,
+    /// The text the rows were built for, so that a change of the search opens the
+    /// nodes with the matches.
+    last_query: String,
+    /// Local and remote branches sit in folders of their names; the switch of the menu
+    /// mirrors the Git page of Settings.
+    group_by_directory: bool,
     /// What git waits for when the popup opened, for the Continue and Abort rows.
     operation: Operation,
     /// The row of the branch whose actions are open.
@@ -105,6 +125,9 @@ impl BranchPopup {
     ) {
         let weak = cx.weak_entity();
         let operation = git.read(cx).operation();
+        let group_by_directory = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.git_group_by_directory);
         let view = cx.new(|cx| {
             let mut popup = Self {
                 git,
@@ -117,6 +140,9 @@ impl BranchPopup {
                 query: TextField::default(),
                 rows: Vec::new(),
                 selected: 0,
+                collapsed: HashSet::new(),
+                last_query: String::new(),
+                group_by_directory,
                 operation,
                 submenu: None,
                 submenu_entries: Vec::new(),
@@ -145,10 +171,10 @@ impl BranchPopup {
                 Row::Header(label) => Some(MenuEntry::disabled(*label)),
                 Row::Separator => None,
                 Row::Command(command) => Some(MenuEntry::disabled(command_label(*command))),
-                Row::Branch { index, .. } => self
-                    .branches
-                    .get(*index)
-                    .map(|branch| MenuEntry::disabled(branch.name.clone())),
+                Row::Node { label, .. } => Some(MenuEntry::disabled(label.clone())),
+                Row::Branch { index, display, .. } => self.branches.get(*index).map(|branch| {
+                    MenuEntry::disabled(display.clone().unwrap_or_else(|| branch.name.clone()))
+                }),
             })
             .collect()
     }
@@ -160,6 +186,42 @@ impl BranchPopup {
             .iter()
             .filter_map(|row| match row {
                 Row::Branch { index, .. } => Some(self.branches.get(*index)?.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The labels of the tree as the popup shows them, with the depth of each, for a
+    /// test: nodes and branches only.
+    #[cfg(test)]
+    pub(crate) fn tree(&self) -> Vec<(usize, String)> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Node { label, depth, .. } => Some((*depth, label.clone())),
+                Row::Branch {
+                    index,
+                    display,
+                    depth,
+                    ..
+                } => self.branches.get(*index).map(|branch| {
+                    (
+                        *depth,
+                        display.clone().unwrap_or_else(|| branch.name.clone()),
+                    )
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The labels of the nodes of the tree, for a test.
+    #[cfg(test)]
+    pub(crate) fn nodes(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Node { label, .. } => Some(label.clone()),
                 _ => None,
             })
             .collect()
@@ -190,6 +252,17 @@ impl BranchPopup {
 
     /// Builds the rows of the list for the text of the search field.
     fn rebuild(&mut self) {
+        let query = self.query.text.trim().to_lowercase();
+        if query != self.last_query {
+            self.last_query = query;
+            // The search shows the nodes with the branches it keeps, folded or not.
+            self.collapsed.clear();
+        }
+        let selected_name = self
+            .rows
+            .get(self.selected)
+            .and_then(|row| self.branch_name(row));
+        let selected_node = self.rows.get(self.selected).and_then(node_key);
         self.rows_bounds.borrow_mut().clear();
         self.rows.clear();
         let mut rows = Vec::new();
@@ -214,7 +287,12 @@ impl BranchPopup {
         if !recent.is_empty() {
             rows.push(Row::Header("Recent"));
             for index in recent {
-                rows.push(Row::Branch { index, menu: None });
+                rows.push(Row::Branch {
+                    index,
+                    menu: None,
+                    display: None,
+                    depth: 0,
+                });
             }
         }
         let local: Vec<usize> = (0..self.branches.len())
@@ -222,12 +300,32 @@ impl BranchPopup {
             .collect();
         if !local.is_empty() {
             rows.push(Row::Header("Local"));
-            for index in local {
-                rows.push(Row::Branch {
-                    index,
-                    menu: Some(menu),
-                });
-                menu += 1;
+            if self.group_by_directory {
+                let mut tree = FolderTree::default();
+                for index in &local {
+                    let name = &self.branches[*index].name;
+                    let parts: Vec<&str> = name.split('/').collect();
+                    tree.insert(&parts, *index);
+                }
+                emit_tree(
+                    &tree,
+                    "local",
+                    0,
+                    &mut rows,
+                    &self.collapsed,
+                    &mut menu,
+                    &self.branches,
+                );
+            } else {
+                for index in local {
+                    rows.push(Row::Branch {
+                        index,
+                        menu: Some(menu),
+                        display: None,
+                        depth: 0,
+                    });
+                    menu += 1;
+                }
             }
         }
         let remote: Vec<usize> = (0..self.branches.len())
@@ -235,40 +333,89 @@ impl BranchPopup {
             .collect();
         if !remote.is_empty() {
             rows.push(Row::Header("Remote"));
-            for index in remote {
-                rows.push(Row::Branch {
-                    index,
-                    menu: Some(menu),
-                });
-                menu += 1;
+            if self.group_by_directory {
+                let mut remotes: Vec<(String, FolderTree)> = Vec::new();
+                for index in &remote {
+                    let name = &self.branches[*index].name;
+                    let Some((remote_name, rest)) = name.split_once('/') else {
+                        continue;
+                    };
+                    let position = remotes
+                        .iter()
+                        .position(|(known, _)| known == remote_name)
+                        .unwrap_or_else(|| {
+                            remotes.push((remote_name.to_owned(), FolderTree::default()));
+                            remotes.len() - 1
+                        });
+                    let parts: Vec<&str> = rest.split('/').collect();
+                    remotes[position].1.insert(&parts, *index);
+                }
+                for (remote_name, tree) in &remotes {
+                    let key = format!("remote/{remote_name}");
+                    rows.push(Row::Node {
+                        key: key.clone(),
+                        label: remote_name.clone(),
+                        depth: 0,
+                    });
+                    if !self.collapsed.contains(&key) {
+                        emit_tree(
+                            tree,
+                            &key,
+                            1,
+                            &mut rows,
+                            &self.collapsed,
+                            &mut menu,
+                            &self.branches,
+                        );
+                    }
+                }
+            } else {
+                for index in remote {
+                    rows.push(Row::Branch {
+                        index,
+                        menu: Some(menu),
+                        display: None,
+                        depth: 0,
+                    });
+                    menu += 1;
+                }
             }
         }
         if rows.is_empty() {
             rows.push(Row::Header("No branches match"));
         }
         rows.push(Row::Separator);
+        rows.push(Row::Command(Command::GroupByDirectory));
         rows.push(Row::Command(Command::NewBranch));
         rows.push(Row::Command(Command::Fetch));
         rows.push(Row::Command(Command::Update));
         rows.push(Row::Command(Command::Stash));
         rows.push(Row::Command(Command::Unstash));
         self.rows = rows;
-        self.keep_selection();
+        self.keep_selection(selected_name, selected_node);
     }
 
-    /// The selection stays on its branch across a change of the search, or moves to the
-    /// current branch, or to the first row.
-    fn keep_selection(&mut self) {
-        let selected_name = self
-            .rows
-            .get(self.selected)
-            .and_then(|row| self.branch_name(row));
+    /// The selection stays on its branch or node across a change of the search, or moves
+    /// to the current branch, or to the first branch, or to the first row.
+    fn keep_selection(&mut self, selected_name: Option<String>, selected_node: Option<String>) {
         let current = self.current();
         let wanted = selected_name.unwrap_or(current);
         let found = self.rows.iter().position(|row| {
             self.branch_name(row).is_some_and(|name| name == wanted) && row_selectable(row)
         });
         self.selected = found
+            .or_else(|| {
+                selected_node.and_then(|key| {
+                    self.rows
+                        .iter()
+                        .position(|row| node_key(row).is_some_and(|known| known == key))
+                })
+            })
+            .or_else(|| {
+                self.rows
+                    .iter()
+                    .position(|row| matches!(row, Row::Branch { .. }))
+            })
             .or_else(|| self.rows.iter().position(row_selectable))
             .unwrap_or(0);
     }
@@ -294,6 +441,53 @@ impl BranchPopup {
                 return;
             }
         }
+    }
+
+    /// Folds a node or opens it, keeping the selection on it.
+    fn set_node_open(&mut self, row: usize, open: bool, cx: &mut Context<Self>) {
+        let Some(key) = self.rows.get(row).and_then(node_key) else {
+            return;
+        };
+        let was_open = !self.collapsed.contains(&key);
+        if was_open == open {
+            return;
+        }
+        if open {
+            self.collapsed.remove(&key);
+        } else {
+            self.collapsed.insert(key.clone());
+        }
+        self.rebuild();
+        if let Some(at) = self
+            .rows
+            .iter()
+            .position(|row| node_key(row).is_some_and(|known| known == key))
+        {
+            self.selected = at;
+        }
+        cx.notify();
+    }
+
+    fn toggle_node(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(key) = self.rows.get(row).and_then(node_key) else {
+            return;
+        };
+        let open = self.collapsed.contains(&key);
+        self.set_node_open(row, open, cx);
+    }
+
+    /// The switch of the menu and of the Git page of Settings: the popup folds the
+    /// branches into the folders of their names or lists them flat.
+    fn toggle_group_by_directory(&mut self, cx: &mut Context<Self>) {
+        let group = !self.group_by_directory;
+        self.group_by_directory = group;
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.update_settings(|settings| settings.git_group_by_directory = group, cx)
+            });
+        }
+        self.rebuild();
+        cx.notify();
     }
 
     /// Right: the actions of the selected branch.
@@ -481,6 +675,10 @@ impl BranchPopup {
     }
 
     fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        if command == Command::GroupByDirectory {
+            self.toggle_group_by_directory(cx);
+            return;
+        }
         let position = self.position;
         let git = self.git.clone();
         self.dismiss(window, cx);
@@ -496,6 +694,7 @@ impl BranchPopup {
             Command::Update => git.update_project(position, cx),
             Command::Stash => git.ask_stash_message(window, cx),
             Command::Unstash => git.show_stashes(position, cx),
+            Command::GroupByDirectory => {}
         })
     }
 
@@ -612,17 +811,26 @@ impl BranchPopup {
                 cx.stop_propagation();
             }
             "right" => {
-                self.open_submenu(cx);
+                if node_key_at(&self.rows, self.selected).is_some() {
+                    self.set_node_open(self.selected, true, cx);
+                } else {
+                    self.open_submenu(cx);
+                }
                 cx.stop_propagation();
             }
             "left" => {
                 if !self.close_submenu(cx) {
-                    self.move_selection(-1, cx);
+                    if node_key_at(&self.rows, self.selected).is_some() {
+                        self.set_node_open(self.selected, false, cx);
+                    } else {
+                        self.move_selection(-1, cx);
+                    }
                 }
                 cx.stop_propagation();
             }
             "enter" => {
                 match self.rows.get(self.selected) {
+                    Some(Row::Node { .. }) => self.toggle_node(self.selected, cx),
                     Some(Row::Branch { .. }) => self.checkout_row(self.selected, window, cx),
                     Some(Row::Command(command)) => {
                         let command = *command;
@@ -682,7 +890,7 @@ impl BranchPopup {
         index: usize,
         command: Command,
         label: &str,
-        icon_name: &'static str,
+        icon_name: Option<&'static str>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -695,6 +903,7 @@ impl BranchPopup {
             Command::Update => "branch-update".to_owned(),
             Command::Stash => "branch-stash".to_owned(),
             Command::Unstash => "branch-unstash".to_owned(),
+            Command::GroupByDirectory => "branch-group-directories".to_owned(),
         };
         let chosen = self.selected == index;
         div()
@@ -716,7 +925,7 @@ impl BranchPopup {
                 div()
                     .size(px(16.))
                     .flex_none()
-                    .child(icon(icon_name, theme)),
+                    .children(icon_name.map(|name| icon(name, theme))),
             )
             .child(label.to_owned())
             .on_click(cx.listener(move |this, _, window, cx| this.run_command(command, window, cx)))
@@ -728,6 +937,8 @@ impl BranchPopup {
         row: usize,
         index: usize,
         menu: Option<usize>,
+        label: String,
+        depth: usize,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -743,11 +954,11 @@ impl BranchPopup {
         };
         let chosen = self.selected == row;
         let open = self.submenu == Some(row);
-        let label = branch.name.clone();
         let selector = match menu {
             Some(menu) => format!("menu-{menu}"),
             None => format!("branch-recent-{row}"),
         };
+        let indent = ROW_PADDING_X + depth as f32 * SPACE_L;
         let measure = {
             let bounds = self.rows_bounds.clone();
             canvas(
@@ -770,7 +981,8 @@ impl BranchPopup {
             .gap(px(SPACE_S))
             .flex_none()
             .h(px(ROW_HEIGHT))
-            .px(px(ROW_PADDING_X))
+            .pl(px(indent))
+            .pr(px(ROW_PADDING_X))
             .rounded(px(ROW_RADIUS))
             .when(chosen || open, |this| this.bg(theme.selection))
             .hover({
@@ -817,10 +1029,130 @@ impl BranchPopup {
             .on_hover(cx.listener(move |this, hovered, _, cx| this.row_hover(row, *hovered, cx)))
             .on_click(cx.listener(move |this, _, window, cx| this.checkout_row(row, window, cx)))
     }
+
+    fn node_row(
+        &self,
+        row: usize,
+        label: &str,
+        depth: usize,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let chosen = self.selected == row;
+        let indent = ROW_PADDING_X + depth as f32 * SPACE_L;
+        let arrow = if open {
+            "general/chevronDown"
+        } else {
+            "general/chevronRight"
+        };
+        div()
+            .id(("branch-node", row))
+            .debug_selector(move || format!("branch-node-{row}"))
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .pl(px(indent))
+            .pr(px(ROW_PADDING_X))
+            .rounded(px(ROW_RADIUS))
+            .when(chosen, |this| this.bg(theme.selection))
+            .hover({
+                let hover = theme.hover;
+                move |style| style.bg(hover)
+            })
+            .child(
+                div()
+                    .size(px(14.))
+                    .flex_none()
+                    .child(icon_sized(arrow, 10., theme)),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(label.to_owned()))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_node(row, cx)))
+    }
 }
 
 fn row_selectable(row: &Row) -> bool {
-    matches!(row, Row::Command(_) | Row::Branch { .. })
+    matches!(row, Row::Command(_) | Row::Node { .. } | Row::Branch { .. })
+}
+
+/// The key of a node of the tree, for the fold state that outlives a rebuild.
+fn node_key(row: &Row) -> Option<String> {
+    match row {
+        Row::Node { key, .. } => Some(key.clone()),
+        _ => None,
+    }
+}
+
+fn node_key_at(rows: &[Row], at: usize) -> Option<String> {
+    rows.get(at).and_then(node_key)
+}
+
+/// A folder of branch names: `feature/login` and `feature/signup` sit under `feature`,
+/// and a deeper name adds a deeper folder.
+#[derive(Default)]
+struct FolderTree {
+    folders: Vec<(String, FolderTree)>,
+    leaves: Vec<usize>,
+}
+
+impl FolderTree {
+    fn insert(&mut self, path: &[&str], index: usize) {
+        let Some((head, rest)) = path.split_first() else {
+            return;
+        };
+        if rest.is_empty() {
+            self.leaves.push(index);
+            return;
+        }
+        if let Some(at) = self.folders.iter().position(|(name, _)| name == head) {
+            self.folders[at].1.insert(rest, index);
+            return;
+        }
+        let mut tree = Self::default();
+        tree.insert(rest, index);
+        self.folders.push(((*head).to_owned(), tree));
+    }
+}
+
+/// Adds a node and its open children to the rows, then the branches of the folder.
+#[allow(clippy::too_many_arguments)]
+fn emit_tree(
+    tree: &FolderTree,
+    prefix: &str,
+    depth: usize,
+    rows: &mut Vec<Row>,
+    collapsed: &HashSet<String>,
+    menu: &mut usize,
+    branches: &[Branch],
+) {
+    for (name, child) in &tree.folders {
+        let key = format!("{prefix}/{name}");
+        rows.push(Row::Node {
+            key: key.clone(),
+            label: name.clone(),
+            depth,
+        });
+        if !collapsed.contains(&key) {
+            emit_tree(child, &key, depth + 1, rows, collapsed, menu, branches);
+        }
+    }
+    for index in &tree.leaves {
+        let head = branches[*index]
+            .name
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        rows.push(Row::Branch {
+            index: *index,
+            menu: Some(*menu),
+            display: Some(head),
+            depth,
+        });
+        *menu += 1;
+    }
 }
 
 fn command_label(command: Command) -> &'static str {
@@ -833,6 +1165,7 @@ fn command_label(command: Command) -> &'static str {
         Command::Update => "Update Project",
         Command::Stash => "Stash Changes...",
         Command::Unstash => "Unstash Changes...",
+        Command::GroupByDirectory => "Group by Directory",
     }
 }
 
@@ -866,24 +1199,44 @@ impl Render for BranchPopup {
                 ),
                 Row::Command(command) => {
                     let (label, icon_name) = match command {
-                        Command::NewBranch => ("New Branch...", "general/add"),
-                        Command::Continue => ("Continue", "general/vcs"),
-                        Command::Abort => ("Abort", "general/delete"),
-                        Command::Conflicts => ("Conflicts...", "general/vcs"),
-                        Command::Fetch => ("Fetch", "general/vcs"),
-                        Command::Update => ("Update Project", "general/vcs"),
-                        Command::Stash => ("Stash Changes...", "general/vcs"),
-                        Command::Unstash => ("Unstash Changes...", "general/vcs"),
+                        Command::NewBranch => ("New Branch...", Some("general/add")),
+                        Command::Continue => ("Continue", Some("general/vcs")),
+                        Command::Abort => ("Abort", Some("general/delete")),
+                        Command::Conflicts => ("Conflicts...", Some("general/vcs")),
+                        Command::Fetch => ("Fetch", Some("general/vcs")),
+                        Command::Update => ("Update Project", Some("general/vcs")),
+                        Command::Stash => ("Stash Changes...", Some("general/vcs")),
+                        Command::Unstash => ("Unstash Changes...", Some("general/vcs")),
+                        Command::GroupByDirectory => (
+                            "Group by Directory",
+                            self.group_by_directory.then_some("general/check"),
+                        ),
                     };
                     list.push(
                         self.command_row(at, *command, label, icon_name, &theme, cx)
                             .into_any_element(),
                     );
                 }
-                Row::Branch { index, menu } => {
-                    let (branch, menu) = (*index, *menu);
+                Row::Node {
+                    label, depth, key, ..
+                } => {
+                    let (label, depth, key) = (label.clone(), *depth, key.clone());
+                    let open = !self.collapsed.contains(&key);
                     list.push(
-                        self.branch_row(at, branch, menu, &theme, cx)
+                        self.node_row(at, &label, depth, open, &theme, cx)
+                            .into_any_element(),
+                    );
+                }
+                Row::Branch {
+                    index,
+                    menu,
+                    display,
+                    depth,
+                } => {
+                    let (branch, menu, display, depth) = (*index, *menu, display.clone(), *depth);
+                    let label = display.unwrap_or_else(|| self.branches[branch].name.clone());
+                    list.push(
+                        self.branch_row(at, branch, menu, label, depth, &theme, cx)
                             .into_any_element(),
                     );
                 }

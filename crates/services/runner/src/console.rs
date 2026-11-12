@@ -591,10 +591,12 @@ mod tests {
 
     const PATIENCE: Duration = Duration::from_secs(10);
 
+    #[cfg(windows)]
     fn shell(line: &str) -> ProcessSpec {
         ProcessSpec::new("cmd.exe").args(["/d", "/c", line])
     }
 
+    #[cfg(windows)]
     fn long_program() -> ProcessSpec {
         ProcessSpec::new("ping.exe")
             .args(["-n", "120", "127.0.0.1"])
@@ -621,6 +623,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn output_and_exit_code_arrive_in_order() {
         let console = Console::start(plan(None, shell("echo hello& exit /b 3")));
@@ -631,6 +634,7 @@ mod tests {
         assert_eq!((code, step), (Some(3), Step::Program));
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_program_follows_a_step_that_succeeded() {
         let console = Console::start(plan(Some(shell("echo first")), shell("echo second")));
@@ -644,6 +648,7 @@ mod tests {
         assert_eq!(code, Some(0));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_step_that_failed_keeps_the_program_from_starting() {
         let console = Console::start(plan(Some(shell("exit /b 7")), shell("echo second")));
@@ -665,6 +670,7 @@ mod tests {
         assert_eq!(code, None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn stop_ends_the_program_and_reports_it() {
         let console = Console::start(plan(None, long_program()));
@@ -675,6 +681,7 @@ mod tests {
         assert_eq!(code, Some(1));
     }
 
+    #[cfg(windows)]
     #[test]
     fn stop_during_the_first_step_skips_the_program() {
         let console = Console::start(plan(Some(long_program()), shell("echo second")));
@@ -686,6 +693,7 @@ mod tests {
         assert!(!text.contains("second"), "{text}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn dropping_the_console_ends_the_program() {
         let console = Console::start(plan(None, long_program()));
@@ -696,6 +704,7 @@ mod tests {
         assert!(start.elapsed() < PATIENCE);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_marker_in_the_output_is_seen_without_taking_events() {
         let console = Console::start(plan(None, shell("echo ready-marker")));
@@ -707,6 +716,7 @@ mod tests {
         assert_eq!(code, Some(0));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_marker_that_never_comes_ends_with_the_plan() {
         let console = Console::start(plan(None, shell("echo other")));
@@ -716,6 +726,7 @@ mod tests {
 
     /// The parent exits after starting a child that keeps its output pipe and writes
     /// later, as a server started by a program does.
+    #[cfg(windows)]
     fn late_writer() -> ProcessSpec {
         ProcessSpec::new("powershell.exe").args([
             "-NoProfile",
@@ -725,6 +736,7 @@ mod tests {
         ])
     }
 
+    #[cfg(windows)]
     #[test]
     fn output_written_after_the_program_ended_is_still_read() {
         let console = Console::start(plan(None, late_writer()));
@@ -747,6 +759,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn stop_ends_the_wait_for_a_pipe_a_child_keeps_open() {
         let console = Console::start(plan(None, late_writer()));
@@ -764,6 +777,7 @@ mod tests {
     }
 
     /// A program that reads one line of its input and prints it back.
+    #[cfg(windows)]
     fn echo_line() -> ProcessSpec {
         ProcessSpec::new("powershell.exe")
             .args([
@@ -775,6 +789,7 @@ mod tests {
     }
 
     /// A program that reads its input to the end and says so.
+    #[cfg(windows)]
     fn read_to_end() -> ProcessSpec {
         ProcessSpec::new("powershell.exe")
             .args([
@@ -785,6 +800,7 @@ mod tests {
             .input()
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_line_of_the_console_reaches_the_program() {
         let console = Console::start(plan(None, echo_line()));
@@ -797,6 +813,7 @@ mod tests {
         assert_eq!(code, Some(0));
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_end_of_input_closes_stdin_of_the_program() {
         let console = Console::start(plan(None, read_to_end()));
@@ -809,6 +826,7 @@ mod tests {
         assert_eq!(code, Some(0));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_step_that_is_not_the_program_takes_no_input() {
         let console = Console::start_step(shell("exit /b 0"), Step::Before, Duration::ZERO);
@@ -821,6 +839,7 @@ mod tests {
         assert_eq!((code, step), (Some(0), Step::Before));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_line_sent_after_the_program_exited_is_a_line_not_a_panic() {
         let console = Console::start(plan(None, shell("exit /b 0").input()));

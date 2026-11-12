@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -7,6 +8,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use base::perf;
+use base::program::executable;
+#[cfg(windows)]
 use platform::NO_WINDOW;
 
 /// Before the subcommand on every call. Reads must not take `index.lock`, or a harness
@@ -42,7 +45,8 @@ impl GitRunner {
 
     /// `git.exe` on the given PATH value.
     pub fn find(path: &OsStr) -> Option<Self> {
-        let mut candidates = std::env::split_paths(path).map(|directory| directory.join("git.exe"));
+        let name = executable("git");
+        let mut candidates = std::env::split_paths(path).map(|directory| directory.join(&name));
         let program = candidates.find(|file| file.is_file())?;
         Some(Self::new(program))
     }
@@ -62,10 +66,10 @@ impl GitRunner {
         // A `.cmd` path of the user also starts here: the standard library runs it
         // through the command interpreter and refuses arguments it cannot quote safely.
         let mut command = Command::new(&self.program);
+        command.current_dir(cwd).args(GLOBAL_ARGS);
+        #[cfg(windows)]
+        command.creation_flags(NO_WINDOW);
         command
-            .current_dir(cwd)
-            .creation_flags(NO_WINDOW)
-            .args(GLOBAL_ARGS)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .stdin(Stdio::null());

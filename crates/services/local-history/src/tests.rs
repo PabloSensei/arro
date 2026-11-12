@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use super::*;
 
 /// A fresh folder with a project and a history inside, gone after the test.
@@ -9,13 +7,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "local-history-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("local-history");
         fs::create_dir_all(root.join("project/src")).unwrap();
         Self { root }
     }
@@ -26,12 +18,6 @@ impl Fixture {
 
     fn history(&self, limits: Limits) -> LocalHistory {
         LocalHistory::open(&self.root.join("history"), limits).unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

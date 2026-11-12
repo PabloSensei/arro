@@ -54,6 +54,30 @@ pub fn run(root: &Path) -> Result {
     scrollbars::run(root)
 }
 
+/// The checks that make sense on a Unix machine: no Windows formatting of line endings,
+/// no `cargo deny` target of another system, but the same lints and the same tests.
+pub fn run_linux(root: &Path) -> Result {
+    let mut steps = vec![CLIPPY];
+    if has_other_members(root)? {
+        steps.push(TEST_OTHERS);
+    }
+    steps.push(TEST_XTASK);
+
+    for step in steps {
+        println!("==> cargo {}", step.join(" "));
+        let status = Command::new(cargo())
+            .args(step)
+            .current_dir(root)
+            .env("ARRO_NO_BROWSER", "1")
+            .status()?;
+        if !status.success() {
+            return Err(format!("cargo {} failed", step.join(" ")).into());
+        }
+    }
+    println!("==> check-layers");
+    layers::run(root)
+}
+
 fn has_other_members(root: &Path) -> Result<bool> {
     let output = Command::new(cargo())
         .args(["metadata", "--format-version", "1", "--no-deps"])

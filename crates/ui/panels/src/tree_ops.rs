@@ -313,14 +313,9 @@ pub(crate) fn use_temporary_delete() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = DELETE_HOOK.set(|path| {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            let target = std::env::temp_dir().join(format!(
-                "ide-deleted-{}-{serial}-{name}",
-                std::process::id()
-            ));
+            // The folder of the test removes what the callback did not.
+            let target = test_support::scratch("deleted").join(name.as_ref());
             std::fs::rename(path, &target)?;
             if target.is_dir() {
                 std::fs::remove_dir_all(&target)
@@ -447,9 +442,7 @@ mod tests {
 
     #[test]
     fn a_copy_beside_its_source_gets_a_numbered_name() {
-        let root = std::env::temp_dir().join(format!("paste-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_support::scratch("paste");
         let source = root.join("Name.txt");
         std::fs::write(&source, "one").unwrap();
 
@@ -476,7 +469,6 @@ mod tests {
             plan_paste(&source, &other, true).unwrap(),
             Some(other.join("Name.txt"))
         );
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -494,8 +486,7 @@ mod tests {
     fn files_are_created_renamed_and_deleted_on_disk_without_overwriting() {
         // The delete below must not put anything in the Recycle Bin of the machine.
         use_temporary_delete();
-        let root = std::env::temp_dir().join(format!("tree-ops-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_support::scratch("tree-ops");
         let template = &basic_templates()[0];
         let made = plan_creation(template, &root, &root, "A.txt").unwrap();
         create_on_disk(&made).unwrap();
@@ -514,6 +505,5 @@ mod tests {
         delete_on_disk(&moved).unwrap();
         delete_on_disk(&root.join("x")).unwrap();
         assert!(!moved.exists() && !root.join("x").exists());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

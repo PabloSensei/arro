@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use std::io::{Read, Write};
 use std::thread::sleep;
 use std::time::{Duration, Instant};

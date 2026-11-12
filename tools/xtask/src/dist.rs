@@ -664,36 +664,19 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::os::windows::process::CommandExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    use test_support::TempDir;
 
-    struct TempDir(PathBuf);
+    trait Script {
+        /// The launcher script of the test, inside the folder of the test.
+        fn write_script(&self) -> PathBuf;
+    }
 
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path =
-                env::temp_dir().join(format!("xtask-dist-{}-{name}-{id}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-
+    impl Script for TempDir {
         fn write_script(&self) -> PathBuf {
             let script = self.path().join("run-arro.cmd");
             write_text(&script, RUN_ARRO_TEMPLATE).unwrap();
             script
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 

@@ -4,10 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use base::Result;
+use base::program::{executable, home_dir};
 
 use crate::pom::read_pom;
 
 /// Vendors install into these directories, each holds one JDK per subdirectory.
+#[cfg(windows)]
 const INSTALL_ROOTS: &[&str] = &[
     "Java",
     "Eclipse Adoptium",
@@ -30,7 +32,7 @@ pub struct Jdk {
 impl Jdk {
     /// A JDK needs `javac` as well: a plain runtime can run a program but not build one.
     pub fn at(home: &Path) -> Option<Self> {
-        if !home.join("bin/javac.exe").is_file() {
+        if !home.join("bin").join(executable("javac")).is_file() {
             return None;
         }
         let release = fs::read_to_string(home.join("release")).ok()?;
@@ -46,7 +48,7 @@ impl Jdk {
     }
 
     pub fn java(&self) -> PathBuf {
-        self.home.join("bin/java.exe")
+        self.home.join("bin").join(executable("java"))
     }
 }
 
@@ -76,27 +78,47 @@ fn candidates() -> Vec<PathBuf> {
         .map(PathBuf::from)
         .into_iter()
         .collect();
+    let compiler = executable("javac");
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path) {
-            if directory.join("javac.exe").is_file()
+            if directory.join(&compiler).is_file()
                 && let Some(home) = directory.parent()
             {
                 homes.push(home.to_owned());
             }
         }
     }
-    let mut roots = Vec::new();
-    for variable in ["ProgramW6432", "ProgramFiles"] {
-        if let Some(base) = env::var_os(variable).map(PathBuf::from) {
-            roots.extend(INSTALL_ROOTS.iter().map(|root| base.join(root)));
+    #[cfg(windows)]
+    {
+        let mut roots = Vec::new();
+        for variable in ["ProgramW6432", "ProgramFiles"] {
+            if let Some(base) = env::var_os(variable).map(PathBuf::from) {
+                roots.extend(INSTALL_ROOTS.iter().map(|root| base.join(root)));
+            }
         }
+        if let Some(base) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            roots.push(base.join("Programs"));
+        }
+        if let Some(base) = home_dir() {
+            roots.push(base.join(".jdks"));
+        }
+        homes.extend(homes_under(roots));
     }
-    if let Some(base) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-        roots.push(base.join("Programs"));
+    #[cfg(unix)]
+    {
+        let mut roots = vec![PathBuf::from("/usr/lib/jvm")];
+        if let Some(home) = home_dir() {
+            roots.push(home.join(".sdkman").join("candidates").join("java"));
+            roots.push(home.join(".jdks"));
+        }
+        homes.extend(homes_under(roots));
     }
-    if let Some(base) = env::var_os("USERPROFILE").map(PathBuf::from) {
-        roots.push(base.join(".jdks"));
-    }
+    homes
+}
+
+/// One JDK per subdirectory of every root that can be read.
+fn homes_under(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
     for root in roots {
         let Ok(entries) = fs::read_dir(root) else {
             continue;
@@ -210,10 +232,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path = env::temp_dir().join(format!("java-project-jdk-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("project-jdk-{name}"))
     }
 
     #[test]
@@ -233,6 +252,7 @@ mod tests {
         assert_eq!(feature_of("system"), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_release_file_gives_the_version() {
         let home = temp_dir("home");
@@ -247,7 +267,6 @@ mod tests {
         let found = Jdk::at(&home).unwrap();
 
         assert_eq!((found.version.as_str(), found.feature), ("1.8.0_492", 8));
-        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -256,7 +275,6 @@ mod tests {
         fs::write(home.join("release"), "JAVA_VERSION=\"17.0.1\"\n").unwrap();
 
         assert_eq!(Jdk::at(&home), None);
-        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -312,7 +330,6 @@ mod tests {
 
         fs::write(root.join(".java-version"), "temurin-8.0.1\n").unwrap();
         assert_eq!(requested_jdk(&root), Requested::Feature(8));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

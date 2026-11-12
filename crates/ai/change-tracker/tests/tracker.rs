@@ -11,15 +11,13 @@ use change_tracker::{ChangeKind, ChangeSet, ChangeTracker, GitRunner, TrackerSta
 const WAIT: Duration = Duration::from_secs(30);
 
 struct Fixture {
-    root: PathBuf,
     project: PathBuf,
     tracker: ChangeTracker,
 }
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("ide-tracker-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch(&format!("tracker-{name}"));
         let project = root.join("project");
         fs::create_dir_all(project.join("src")).expect("project");
         fs::write(project.join(".gitignore"), "output/\n").expect("ignore");
@@ -30,11 +28,7 @@ impl Fixture {
         let git = GitRunner::find(&path).expect("git on PATH");
         let tracker = ChangeTracker::open(git, &root.join("state"), &project).expect("open");
         wait_for(&tracker, |changes| changes.state == TrackerState::Ready);
-        Self {
-            root,
-            project,
-            tracker,
-        }
+        Self { project, tracker }
     }
 
     fn write(&self, path: &str, text: &str) {
@@ -51,12 +45,6 @@ impl Fixture {
         let started = self.tracker.changes().version;
         self.tracker.observe(&AgentEvent::TurnEnded);
         wait_for(&self.tracker, |changes| changes.version > started)
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -157,8 +145,7 @@ fn the_repository_of_the_user_stays_untouched() {
 
 #[test]
 fn a_missing_git_is_reported_and_not_hidden() {
-    let root = std::env::temp_dir().join(format!("ide-tracker-nogit-{}", std::process::id()));
-    fs::create_dir_all(&root).expect("root");
+    let root = test_support::scratch("tracker-nogit");
     let git = GitRunner::new(root.join("no-such-git.exe"));
 
     let tracker = ChangeTracker::open(git, &root.join("state"), &root).expect("open");
@@ -166,5 +153,4 @@ fn a_missing_git_is_reported_and_not_hidden() {
     wait_for(&tracker, |changes| {
         matches!(changes.state, TrackerState::Failed(_))
     });
-    let _ = fs::remove_dir_all(&root);
 }

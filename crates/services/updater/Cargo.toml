@@ -17,3 +17,7 @@ ureq = { version = "3", default-features = false, features = [
 zip = { version = "9", default-features = false, features = [
     "deflate-flate2-zlib-rs",
 ] }
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

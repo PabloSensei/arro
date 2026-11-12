@@ -10,3 +10,4 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 text-core = { path = "../../editor/text-core" }
+test-support = { path = "../../../tools/test-support" }

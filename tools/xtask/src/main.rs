@@ -29,6 +29,7 @@ const USAGE: &str = "usage: cargo xtask <command>
 commands:
   ci                         fmt, clippy, tests, cargo deny, check-layers, check-budgets,
                              check-spacing, check-tooltips, check-scrollbars
+  ci-linux                   clippy, tests and check-layers, for a Unix machine
   check-layers [--root DIR]  dependency graph and forbidden words, ARCHITECTURE.md section 4
   check-budgets              budgets.toml structure
   check-spacing              padding, margins and gaps in the UI crates are on the spacing scale
@@ -55,6 +56,7 @@ fn main() -> ExitCode {
     let root = workspace_root();
     let result = match args.as_slice() {
         ["ci"] => ci::run(&root),
+        ["ci-linux"] => ci::run_linux(&root),
         ["check-layers"] => layers::run(&root),
         ["check-layers", "--root", other] => layers::run(Path::new(other)),
         ["check-budgets"] => budgets::run(&root),

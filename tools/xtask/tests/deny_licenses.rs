@@ -1,4 +1,5 @@
 //! Runs the real cargo-deny with the repository's deny.toml against small fixtures.
+#![cfg(windows)]
 
 mod support;
 

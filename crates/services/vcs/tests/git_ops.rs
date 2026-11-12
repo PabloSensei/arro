@@ -13,10 +13,7 @@ fn git() -> GitRunner {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("vcs-ops-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+    test_support::scratch(&format!("vcs-ops-{name}"))
 }
 
 fn plain_git(cwd: &Path, args: &[&str]) -> Output {
@@ -131,7 +128,6 @@ fn stash_is_pushed_listed_applied_popped_and_dropped() {
     repo.stash_pop(0).unwrap();
     assert_eq!(read(&root.join("a.txt")), "one\nTHREE\n");
     assert!(repo.stash_list().unwrap().is_empty(), "pop drops it");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -150,7 +146,6 @@ fn fetch_brings_the_remote_branch_without_touching_the_worktree() {
     assert_eq!((status.ahead, status.behind), (0, 1));
     assert!(!work.join("remote.txt").exists(), "fetch does not merge");
     assert_eq!(read(&work.join("main.txt")), "base\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -174,7 +169,6 @@ fn a_diverged_branch_merges_without_a_conflict() {
     assert_eq!(log[0].parents.len(), 2, "the update made a merge commit");
     assert_eq!(read(&work.join("remote.txt")), "remote\n");
     assert_eq!(read(&work.join("local.txt")), "local\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -198,7 +192,6 @@ fn uncommitted_changes_are_stashed_around_the_update_and_come_back() {
     assert!(repo.stash_list().unwrap().is_empty(), "the stash came back");
     assert_eq!(read(&work.join("main.txt")), "uncommitted\n");
     assert_eq!(read(&work.join("remote.txt")), "remote\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -231,7 +224,6 @@ fn a_merge_conflict_takes_a_side_and_ends_with_a_merge_commit() {
     assert_eq!(log[0].subject, "Merge the remote change");
     assert_eq!(log[0].parents.len(), 2);
     assert_eq!(read(&work.join("main.txt")), "other\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -262,7 +254,6 @@ fn a_rebase_conflict_continues_after_a_side_is_taken() {
     );
     assert_eq!(log[0].parents.len(), 1);
     assert_eq!(read(&work.join("main.txt")), "local\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -285,7 +276,6 @@ fn abort_puts_the_branch_back_as_it_was() {
     assert_eq!(repo.operation().unwrap(), Operation::None);
     assert_eq!(repo.log(1, 0).unwrap()[0].subject, "local change");
     assert_eq!(read(&work.join("main.txt")), "local\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -322,7 +312,6 @@ fn the_log_the_file_log_and_a_commit_diff_name_what_changed() {
     assert!(diff.base != "one\ntwo\n", "the first commit is the base");
     let root_commit = repo.commit_files(&first).unwrap();
     assert_eq!(root_commit, ["a.txt"], "the root commit lists its files");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -337,7 +326,6 @@ fn an_ordinary_change_shows_as_conflicted_until_it_is_resolved() {
     repo.mark_resolved("a.txt").unwrap();
     let status = repo.status().unwrap();
     assert_eq!(status.files[0].index, Change::Modified);
-    let _ = fs::remove_dir_all(root);
 }
 
 /// A diverged branch with a conflict in `main.txt` and a tracked `keep.txt` that the local
@@ -363,7 +351,7 @@ fn repository_with_a_conflict_and_a_local_change(
 
 #[test]
 fn the_autostash_of_a_merge_conflict_comes_back_after_the_merge_commit() {
-    let (root, _bare, work, repo) =
+    let (_root, _bare, work, repo) =
         repository_with_a_conflict_and_a_local_change("merge-autostash");
 
     let report = repo.update_with(UpdateMode::Merge).unwrap();
@@ -385,12 +373,11 @@ fn the_autostash_of_a_merge_conflict_comes_back_after_the_merge_commit() {
     assert!(repo.stash_list().unwrap().is_empty());
     assert_eq!(read(&work.join("keep.txt")), "uncommitted\n");
     assert_eq!(read(&work.join("main.txt")), "other\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn the_autostash_of_a_merge_conflict_comes_back_after_abort() {
-    let (root, _bare, work, repo) =
+    let (_root, _bare, work, repo) =
         repository_with_a_conflict_and_a_local_change("merge-autostash-abort");
 
     let report = repo.update_with(UpdateMode::Merge).unwrap();
@@ -406,12 +393,11 @@ fn the_autostash_of_a_merge_conflict_comes_back_after_abort() {
     assert_eq!(log[0].subject, "local change", "HEAD is where it was");
     assert_eq!(log[0].parents.len(), 1);
     assert!(repo.stash_list().unwrap().is_empty());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn the_autostash_of_a_rebase_conflict_comes_back_after_continue() {
-    let (root, _bare, work, repo) =
+    let (_root, _bare, work, repo) =
         repository_with_a_conflict_and_a_local_change("rebase-autostash");
 
     let report = repo.update_with(UpdateMode::Rebase).unwrap();
@@ -426,12 +412,11 @@ fn the_autostash_of_a_rebase_conflict_comes_back_after_continue() {
     assert!(!repo.autostash().unwrap());
     assert_eq!(read(&work.join("keep.txt")), "uncommitted\n");
     assert!(repo.stash_list().unwrap().is_empty());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn the_autostash_of_a_rebase_conflict_comes_back_after_abort() {
-    let (root, _bare, work, repo) =
+    let (_root, _bare, work, repo) =
         repository_with_a_conflict_and_a_local_change("rebase-autostash-abort");
 
     let report = repo.update_with(UpdateMode::Rebase).unwrap();
@@ -446,7 +431,6 @@ fn the_autostash_of_a_rebase_conflict_comes_back_after_abort() {
     let log = repo.log(1, 0).unwrap();
     assert_eq!(log[0].subject, "local change");
     assert!(repo.stash_list().unwrap().is_empty());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -478,7 +462,6 @@ fn an_older_user_stash_stays_untouched_through_the_update() {
     assert_eq!(stashes.len(), 1, "the user stash is not applied or dropped");
     assert_eq!(stashes[0].message, "On main: my work");
     assert_eq!(read(&work.join("keep.txt")), "uncommitted\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -512,7 +495,6 @@ fn a_merge_that_cannot_put_the_local_change_back_reports_its_stash() {
         "the failed apply leaves the markers for the user"
     );
     assert!(repo.conflicts().unwrap().contains(&"main.txt".to_owned()));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -549,7 +531,6 @@ fn a_rebase_continue_that_cannot_put_the_local_change_back_reports_its_stash() {
     assert_eq!(repo.operation().unwrap(), Operation::None);
     assert_eq!(repo.stash_list().unwrap().len(), 1);
     assert!(read(&work.join("main.txt")).contains("<<<<<<<"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -589,13 +570,12 @@ fn branches_name_their_remote_and_count_the_commits_on_both_sides() {
         .find(|branch| branch.name == "main")
         .unwrap();
     assert_eq!((main.ahead, main.behind), (1, 1));
-    let _ = fs::remove_dir_all(root);
     let _ = bare;
 }
 
 #[test]
 fn an_unmerged_branch_is_deleted_only_by_force_and_comes_back_by_its_head() {
-    let (root, _bare, work, repo) = repository_with_origin("branch-delete");
+    let (_root, _bare, work, repo) = repository_with_origin("branch-delete");
     fs::write(work.join("side.txt"), "side\n").unwrap();
     commit(&repo, "side change", &[]);
     plain_ok(&work, &["branch", "side"]);
@@ -631,12 +611,11 @@ fn an_unmerged_branch_is_deleted_only_by_force_and_comes_back_by_its_head() {
             .iter()
             .all(|branch| branch.name != "side")
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn a_branch_merges_and_rebases_into_the_current_one() {
-    let (root, _bare, work, repo) = repository_with_origin("branch-merge");
+    let (_root, _bare, work, repo) = repository_with_origin("branch-merge");
     plain_ok(&work, &["switch", "-q", "-c", "side"]);
     fs::write(work.join("side.txt"), "side\n").unwrap();
     plain_ok(&work, &["add", "side.txt"]);
@@ -651,9 +630,8 @@ fn a_branch_merges_and_rebases_into_the_current_one() {
     let log = repo.log(1, 0).unwrap();
     assert_eq!(log[0].parents.len(), 2, "a merge commit was made");
     assert_eq!(read(&work.join("side.txt")), "side\n");
-    let _ = fs::remove_dir_all(root);
 
-    let (root, _bare, work, repo) = repository_with_origin("branch-rebase");
+    let (_root, _bare, work, repo) = repository_with_origin("branch-rebase");
     plain_ok(&work, &["switch", "-q", "-c", "side"]);
     fs::write(work.join("side.txt"), "side\n").unwrap();
     plain_ok(&work, &["add", "side.txt"]);
@@ -670,12 +648,11 @@ fn a_branch_merges_and_rebases_into_the_current_one() {
     assert_eq!(log[0].parents.len(), 1, "the commit was replayed");
     assert_eq!(read(&work.join("main.txt")), "main\n");
     assert_eq!(read(&work.join("side.txt")), "side\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn compare_shows_the_commits_and_files_of_both_branches() {
-    let (root, _bare, work, repo) = repository_with_origin("branch-compare");
+    let (_root, _bare, work, repo) = repository_with_origin("branch-compare");
     plain_ok(&work, &["switch", "-q", "-c", "side"]);
     fs::write(work.join("side.txt"), "side\n").unwrap();
     plain_ok(&work, &["add", "side.txt"]);
@@ -707,5 +684,4 @@ fn compare_shows_the_commits_and_files_of_both_branches() {
     let compare = repo.working_tree_compare("side").unwrap();
     assert_eq!(compare.only_current, Vec::new());
     assert!(compare.files.contains(&"main.txt".to_owned()));
-    let _ = fs::remove_dir_all(root);
 }

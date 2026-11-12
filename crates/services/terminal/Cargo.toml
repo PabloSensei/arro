@@ -25,3 +25,10 @@ windows-sys = { version = "0.61", features = [
 name = "term-probe"
 path = "src/bin/term_probe.rs"
 test = false
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

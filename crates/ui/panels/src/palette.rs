@@ -116,6 +116,9 @@ pub enum Mode {
     /// Ctrl+E lists the files recently active, Ctrl+Tab does the same and starts on the
     /// previous one.
     Recent,
+    /// The files that were edited, the latest first, with the checkbox of Recent Files
+    /// already on.
+    RecentChanged,
     /// Ctrl+Tab while Ctrl is held: the recent files and the tool windows. Releasing
     /// Ctrl opens what is selected.
     Switcher,
@@ -244,9 +247,11 @@ pub struct Palette {
     rows: Vec<RowData>,
     actions: Vec<ActionEntry>,
     recent: Vec<PathBuf>,
+    /// The files that were edited in the project, the latest first.
+    edited: Vec<PathBuf>,
     /// The files of the open tabs, which is what the Switcher lists.
     open_tabs: Vec<PathBuf>,
-    /// The Recent Files checkbox: only the open files with unsaved text.
+    /// The Recent Files checkbox: only the files that were edited in the project.
     edited_only: bool,
     structure: Option<(PathBuf, Arc<[OutlineItem]>)>,
     /// Answers of the symbol sources for the query on screen, by scope and source.
@@ -274,6 +279,7 @@ impl Palette {
             })
             .collect();
         let recent = navigation::recent(cx);
+        let edited = workspace.recent_edited().to_vec();
         let open_tabs: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
         // The open editor knows the signatures the language sent; the project index only
         // has names, so it is the fallback for a tab that is not an editor.
@@ -292,6 +298,7 @@ impl Palette {
             });
         let weak = cx.weak_entity();
         let icons = workspace.icons().clone();
+        let edited_only = mode == Mode::RecentChanged;
         let view = cx.new(|cx| {
             let mut palette = Self {
                 project,
@@ -306,8 +313,9 @@ impl Palette {
                 rows: Vec::new(),
                 actions,
                 recent,
+                edited,
                 open_tabs,
-                edited_only: false,
+                edited_only,
                 structure,
                 symbol_batches: HashMap::new(),
                 serial: 0,
@@ -323,7 +331,7 @@ impl Palette {
     fn tab(&self) -> Tab {
         match self.mode {
             Mode::Everywhere(tab) => tab,
-            Mode::Recent | Mode::Switcher => Tab::Files,
+            Mode::Recent | Mode::RecentChanged | Mode::Switcher => Tab::Files,
             Mode::Structure => Tab::Symbols,
             Mode::RunAnything | Mode::ChooseRun { .. } => Tab::Actions,
         }
@@ -444,24 +452,27 @@ impl Palette {
                 .map_or(0, |column| (column as usize).saturating_sub(1)),
         });
         let root = self.project.root.as_path();
+        // The edited list outlives the tabs and the saves: a file lands there on the
+        // first edit and stays after the tab is closed.
+        let edited = self.edited_only.then(|| self.edited_paths());
         let paths: Vec<PathBuf> = if query.pattern.is_empty() {
-            self.recent.iter().take(limit).cloned().collect()
+            match &edited {
+                Some(edited) => edited.iter().take(limit).cloned().collect(),
+                None => self.recent.iter().take(limit).cloned().collect(),
+            }
         } else {
-            let files = self.files.read(cx).clone();
-            let all = files.iter().map(PathBuf::as_path);
+            let files;
+            let all: Box<dyn Iterator<Item = &std::path::Path>> = match &edited {
+                Some(edited) => Box::new(edited.iter().map(PathBuf::as_path)),
+                None => {
+                    files = self.files.read(cx).clone();
+                    Box::new(files.iter().map(PathBuf::as_path))
+                }
+            };
             rank_files(&query.pattern, root, all, limit)
                 .into_iter()
                 .map(|ranked| ranked.item)
                 .collect()
-        };
-        let paths: Vec<PathBuf> = if self.edited_only {
-            let dirty = self.dirty_paths(cx);
-            paths
-                .into_iter()
-                .filter(|path| dirty.iter().any(|open| open == path))
-                .collect()
-        } else {
-            paths
         };
         paths
             .into_iter()
@@ -491,22 +502,9 @@ impl Palette {
             .collect()
     }
 
-    /// The open files that have unsaved text, for the "Show edited only" checkbox.
-    fn dirty_paths(&self, cx: &App) -> Vec<PathBuf> {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return Vec::new();
-        };
-        workspace
-            .read(cx)
-            .open_editors()
-            .into_iter()
-            .filter(|(_, view)| {
-                view.clone()
-                    .downcast::<EditorView>()
-                    .is_ok_and(|editor| editor.read(cx).is_dirty())
-            })
-            .map(|(path, _)| path)
-            .collect()
+    /// The files that were edited in the project, for the "Show edited only" checkbox.
+    fn edited_paths(&self) -> Vec<PathBuf> {
+        self.edited.clone()
     }
 
     /// The tool windows of the Switcher, with the rows of the recent files.
@@ -721,13 +719,17 @@ impl Palette {
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let mut rows = Vec::new();
         match self.mode {
-            Mode::Recent => rows = self.file_rows(cx, MAX_ROWS),
+            Mode::Recent | Mode::RecentChanged => rows = self.file_rows(cx, MAX_ROWS),
             Mode::Switcher => {
                 rows = self.file_rows(cx, MAX_ROWS);
-                rows.retain(|row| match &row.item {
-                    Some(Item::File { path, .. }) => self.open_tabs.contains(path),
-                    _ => true,
-                });
+                // The checkbox brings the whole edited list, also the files whose tab
+                // is closed; without it the Switcher lists the open tabs.
+                if !self.edited_only {
+                    rows.retain(|row| match &row.item {
+                        Some(Item::File { path, .. }) => self.open_tabs.contains(path),
+                        _ => true,
+                    });
+                }
                 rows.extend(self.tool_rows());
             }
             Mode::Structure => rows = self.structure_rows(),
@@ -784,7 +786,7 @@ impl Palette {
         let first = self.first_selectable();
         self.selected = match (self.mode, self.query.text.is_empty()) {
             // The previous file, so that a second Ctrl+E or Ctrl+Tab goes back.
-            (Mode::Recent, true) if self.rows.len() > 1 => 1,
+            (Mode::Recent | Mode::RecentChanged, true) if self.rows.len() > 1 => 1,
             // The Switcher starts on the previous file; with one file it stays on the
             // current one and the first Tab reaches the tool windows.
             (Mode::Switcher, true) => self
@@ -869,7 +871,10 @@ impl Palette {
     /// The keys that toggle the checkbox of Recent Files: Ctrl+E there does not reopen
     /// the list it is already in.
     fn toggle_edited(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.mode, Mode::Recent | Mode::Switcher) {
+        if !matches!(
+            self.mode,
+            Mode::Recent | Mode::RecentChanged | Mode::Switcher
+        ) {
             return;
         }
         self.edited_only = !self.edited_only;
@@ -1240,6 +1245,7 @@ impl Render for Palette {
             .map_or("All", |(_, name)| *name);
         let heading = match self.mode {
             Mode::Recent => Some("Recent Files"),
+            Mode::RecentChanged => Some("Recently Changed Files"),
             Mode::Switcher => Some("Switcher"),
             Mode::Structure => Some("File Structure"),
             Mode::RunAnything => Some("Run Anything"),
@@ -1350,25 +1356,31 @@ impl Render for Palette {
                             )),
                     ),
             )
-            .when(matches!(self.mode, Mode::Recent | Mode::Switcher), |this| {
-                this.child(
-                    div()
-                        .id("palette-edited-only")
-                        .debug_selector(|| "palette-edited-only".to_owned())
-                        .flex()
-                        .items_center()
-                        .flex_none()
-                        .gap(px(SPACE_S))
-                        .h(px(ROW_HEIGHT))
-                        .mb(px(SPACE_S))
-                        .px(px(ROW_PADDING_X))
-                        .rounded(px(ROW_RADIUS))
-                        .hover(move |style| style.bg(theme.selection_hover))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_edited(cx)))
-                        .child(checkbox(self.edited_only, &theme))
-                        .child("Show edited only"),
-                )
-            })
+            .when(
+                matches!(
+                    self.mode,
+                    Mode::Recent | Mode::RecentChanged | Mode::Switcher
+                ),
+                |this| {
+                    this.child(
+                        div()
+                            .id("palette-edited-only")
+                            .debug_selector(|| "palette-edited-only".to_owned())
+                            .flex()
+                            .items_center()
+                            .flex_none()
+                            .gap(px(SPACE_S))
+                            .h(px(ROW_HEIGHT))
+                            .mb(px(SPACE_S))
+                            .px(px(ROW_PADDING_X))
+                            .rounded(px(ROW_RADIUS))
+                            .hover(move |style| style.bg(theme.selection_hover))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_edited(cx)))
+                            .child(checkbox(self.edited_only, &theme))
+                            .child("Show edited only"),
+                    )
+                },
+            )
             .when(!collapsed, |this| {
                 this.child(
                     scrollable(

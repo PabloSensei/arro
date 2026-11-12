@@ -116,8 +116,7 @@ mod tests {
     use super::{crash_reason, java_version, version_problem};
 
     fn jdk(name: &str, release: &str) -> std::path::PathBuf {
-        let home =
-            std::env::temp_dir().join(format!("jdtls-startup-{}-{name}", std::process::id()));
+        let home = test_support::scratch(&format!("jdtls-startup-{name}"));
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("release"), release).unwrap();
         home
@@ -153,8 +152,7 @@ mod tests {
 
     #[test]
     fn the_first_capability_line_of_the_log_is_the_cause() {
-        let dir = std::env::temp_dir().join(format!("jdtls-log-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_support::scratch("jdtls-log");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("1678886400000.log");
         fs::write(
@@ -178,8 +176,7 @@ mod tests {
 
     #[test]
     fn a_log_without_the_capability_gives_the_first_error_message() {
-        let dir = std::env::temp_dir().join(format!("jdtls-log-error-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_support::scratch("jdtls-log-error");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("1.log"),
@@ -196,8 +193,7 @@ mod tests {
 
     #[test]
     fn a_log_written_before_the_start_is_not_the_cause() {
-        let dir = std::env::temp_dir().join(format!("jdtls-log-old-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_support::scratch("jdtls-log-old");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("1.log"),

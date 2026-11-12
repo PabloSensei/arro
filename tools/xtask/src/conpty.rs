@@ -275,32 +275,8 @@ pub(crate) fn install(root: &Path, out: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path =
-                env::temp_dir().join(format!("xtask-conpty-{}-{name}-{id}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use test_support::TempDir;
 
     fn write_tree(root: &Path, dll: &[u8], exe: &[u8]) {
         let dll_path = root.join(CONPTY_DLL);

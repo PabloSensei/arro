@@ -1,5 +1,6 @@
 //! Plugins live in the folder of the IDE only. An opened project may carry `plugin.toml`
 //! or a `plugins` folder with a plugin, and none of it is ever loaded.
+#![cfg(windows)]
 
 use std::fs;
 use std::path::Path;
@@ -19,8 +20,7 @@ fn ids(host: &PluginHost) -> Vec<String> {
 #[test]
 fn plugins_come_from_the_ide_folder_and_never_from_the_project() {
     let cwd = std::env::current_dir().unwrap();
-    let root = std::env::temp_dir().join(format!("plugin-isolation-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = test_support::scratch("plugin-isolation");
     let appdata = root.join("appdata");
     let project = root.join("project");
     let ide_plugins = appdata.join("Arro").join("plugins");
@@ -51,5 +51,4 @@ fn plugins_come_from_the_ide_folder_and_never_from_the_project() {
     assert_eq!(ids(&host), ["test"]);
 
     std::env::set_current_dir(cwd).unwrap();
-    let _ = fs::remove_dir_all(&root);
 }

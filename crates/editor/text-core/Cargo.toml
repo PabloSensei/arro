@@ -12,3 +12,4 @@ ropey = { workspace = true, features = ["metric_lines_lf", "metric_utf16"] }
 
 [dev-dependencies]
 proptest.workspace = true
+test-support = { path = "../../../tools/test-support" }

@@ -18,3 +18,7 @@ store = { path = "../../foundation/store" }
 ui-kit = { path = "../ui-kit" }
 updater.workspace = true
 workspace-core.workspace = true
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

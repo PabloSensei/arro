@@ -84,6 +84,11 @@ pub fn register(
         ),
         (keys::RUN_ANYTHING, "Run Anything", Mode::RunAnything),
         (keys::RECENT_FILES, "Recent Files", Mode::Recent),
+        (
+            keys::RECENT_CHANGED_FILES,
+            "Recently Changed Files",
+            Mode::RecentChanged,
+        ),
         (keys::SWITCHER, "Switcher", Mode::Switcher),
         (keys::FILE_STRUCTURE, "File Structure", Mode::Structure),
     ];

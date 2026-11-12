@@ -4,6 +4,7 @@
 //! with a command, the update notification and the activation of the window are all
 //! pressed here. A panic of any of them fails the test.
 
+#![cfg(windows)]
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -191,6 +192,7 @@ fn git(cx: &TestAppContext) -> gpui::Entity<crate::git::GitState> {
     cx.read(|cx| cx.global::<ActiveGit>().0.clone())
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn every_action_of_the_chrome_leaves_the_workspace_free(cx: &mut TestAppContext) {
     let _env = crate::window_tests_about::ENV_LOCK

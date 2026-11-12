@@ -355,10 +355,13 @@ fn refresh_symbols(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::path::PathBuf;
 
+    #[cfg(windows)]
     use super::{FsChange, is_repository_object};
 
+    #[cfg(windows)]
     #[test]
     fn object_files_of_the_metadata_are_left_out() {
         let change = |path: &str| FsChange::Changed(PathBuf::from(path));

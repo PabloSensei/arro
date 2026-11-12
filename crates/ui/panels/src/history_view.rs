@@ -17,7 +17,7 @@ use ui_kit::*;
 use vcs::{Hunk, TextEdit, line_hunks, revert_hunk};
 use workspace::Workspace;
 
-use crate::diff_view::{decorations_of, hunk_row_spans, rows_of};
+use crate::diff_view::{decorations_with_visible, hunk_row_spans, rows_of};
 use crate::editor_tab::{options_of, style_of};
 use crate::history::{self, snapshot_bytes};
 
@@ -276,6 +276,7 @@ impl HistoryView {
             cx.new(move |cx| {
                 let mut view = EditorView::open_text(path, old, true, style, cx);
                 view.set_options(options, cx);
+                view.lock_soft_wrap();
                 view
             })
         };
@@ -289,6 +290,7 @@ impl HistoryView {
                 cx.new(move |cx| {
                     let mut view = EditorView::open_text(path, current, false, style, cx);
                     view.set_options(options, cx);
+                    view.lock_soft_wrap();
                     view
                 })
             }),
@@ -299,6 +301,7 @@ impl HistoryView {
                 cx.new(move |cx| {
                     let mut view = EditorView::open_text(path, current, false, style, cx);
                     view.set_options(options, cx);
+                    view.lock_soft_wrap();
                     view
                 })
             }
@@ -678,8 +681,17 @@ impl HistoryView {
         };
         let rows = rows_of(&shown.old, &shown.current, &shown.hunks);
         let selected = self.selected.unwrap_or(0);
-        let (left_decor, right_decor) =
-            decorations_of(&rows, &shown.old, &shown.current, selected, theme);
+        let left_visible = left.read(cx).shown_lines();
+        let right_visible = right.read(cx).shown_lines();
+        let (left_decor, right_decor) = decorations_with_visible(
+            &rows,
+            &shown.old,
+            &shown.current,
+            selected,
+            theme,
+            &left_visible,
+            &right_visible,
+        );
         let left_pane = left.update(cx, |editor, cx| editor.pane(left_decor, None, window, cx));
         let right_pane = right.update(cx, |editor, cx| editor.pane(right_decor, None, window, cx));
         let line_height = right.read(cx).line_height().max(1.);

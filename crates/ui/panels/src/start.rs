@@ -113,7 +113,7 @@ impl StartScreen {
         templates: Vec<ProjectTemplate>,
         focus: FocusHandle,
     ) -> Self {
-        let home = std::env::var_os("USERPROFILE").map_or_else(std::env::temp_dir, PathBuf::from);
+        let home = ::base::program::home_dir().unwrap_or_else(std::env::temp_dir);
         Self {
             recent,
             state_dir,
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn a_new_project_is_written_with_its_folders_and_never_over_another() {
-        let root = std::env::temp_dir().join(format!("start-project-{}", std::process::id()));
+        let root = test_support::scratch("start-project");
         let folder = root.join("shop");
         let files = vec![
             ("a.txt".to_string(), "one".to_string()),
@@ -565,6 +565,5 @@ mod tests {
             "two"
         );
         assert!(write_project(&folder, &files).is_err(), "the folder exists");
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

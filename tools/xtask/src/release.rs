@@ -70,10 +70,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("xtask-release-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        test_support::scratch(&format!("release-{name}"))
     }
 
     #[test]
@@ -109,13 +106,11 @@ mod tests {
         assert!(status.success());
         assert_eq!(fs::read(unpacked.join("ide.exe")).unwrap(), b"program");
         assert_eq!(fs::read(unpacked.join("helpers/one.jar")).unwrap(), b"jar");
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn a_missing_folder_is_an_error() {
         let root = scratch("missing");
         assert!(assets(&root.join("nothing")).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 }

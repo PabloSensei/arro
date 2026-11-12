@@ -5,6 +5,7 @@ mod cancel;
 mod error;
 mod id;
 pub mod perf;
+pub mod program;
 mod snapshot;
 
 pub use cancel::{Cancel, Cancelled};

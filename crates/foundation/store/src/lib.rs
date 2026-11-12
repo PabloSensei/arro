@@ -13,10 +13,19 @@ mod trust;
 /// Applied in order, `PRAGMA user_version` remembers how many.
 const MIGRATIONS: &[&str] = &["CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);"];
 
-/// Where the state of `app` lives: `%LOCALAPPDATA%` on Windows, the temporary folder
-/// as a fallback.
+/// Where the state of `app` lives: `%LOCALAPPDATA%` on Windows, `$XDG_DATA_HOME` or
+/// `~/.local/share` on Unix, the temporary folder as a fallback.
 pub fn state_dir(app: &str) -> PathBuf {
+    #[cfg(windows)]
     let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
+    #[cfg(unix)]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
     base.join(app)
 }
 
@@ -89,12 +98,11 @@ mod tests {
 
     #[test]
     fn values_survive_reopening_and_migrations_run_once() {
-        let folder = std::env::temp_dir().join(format!("store-{}", std::process::id()));
+        let folder = test_support::scratch("store");
         let path = folder.join("nested").join("state.sqlite");
         Store::open(&path).unwrap().put("key", "value").unwrap();
         let reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.get("key").unwrap().as_deref(), Some("value"));
         drop(reopened);
-        std::fs::remove_dir_all(folder).unwrap();
     }
 }

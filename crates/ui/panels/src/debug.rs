@@ -956,6 +956,7 @@ impl DebugPanel {
 
     /// The line typed into the console, for tests.
     #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn input_text(&self) -> &str {
         self.console_input.text()
     }

@@ -19,3 +19,7 @@ name = "plugin-host-toy"
 path = "src/bin/toy.rs"
 test = false
 doc = false
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

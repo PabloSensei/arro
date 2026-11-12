@@ -397,8 +397,7 @@ mod tests {
 
     #[test]
     fn sources_are_found_on_disk() {
-        let root = std::env::temp_dir().join(format!("java-exec-mains-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("exec-mains");
         fs::create_dir_all(root.join("demo")).unwrap();
         let main = "package demo; public class B { public static void main(String[] a) {} }";
         fs::write(root.join("demo/B.java"), main).unwrap();
@@ -410,6 +409,5 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].class, "demo.B");
         assert_eq!(found[0].file, root.join("demo").join("B.java"));
-        let _ = fs::remove_dir_all(root);
     }
 }

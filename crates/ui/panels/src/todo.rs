@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn the_scan_reads_text_files_and_skips_binary_and_build_output() {
-        let root = std::env::temp_dir().join(format!("todo-scan-{}", std::process::id()));
+        let root = test_support::scratch("todo-scan");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("out")).unwrap();
         std::fs::write(root.join("src/A.txt"), "ok\n// TODO one\n").unwrap();
@@ -400,7 +400,6 @@ mod tests {
 
         let found = scan(&root, &["out".to_string()]);
         let items = items_of(&root, found);
-        std::fs::remove_dir_all(&root).unwrap();
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "TODO one");

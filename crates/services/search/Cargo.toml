@@ -18,3 +18,4 @@ text-core = { path = "../../editor/text-core" }
 futures-executor = "0.3"
 futures-util = "0.3"
 workspace-core.workspace = true
+test-support = { path = "../../../tools/test-support" }

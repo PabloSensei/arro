@@ -1060,6 +1060,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn names(found: &[MoveDestination]) -> Vec<&str> {
         found
             .iter()
@@ -1132,6 +1133,7 @@ mod tests {
         assert!(!under_source_root(&[owner], docs));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_new_package_folder_lies_under_a_source_root() {
         let owner = destination(
@@ -1149,6 +1151,7 @@ mod tests {
         assert!(under_source_root(&[owner], new_package));
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_detail_alone_finds_the_folder_of_the_server_notation() {
         let folder = Path::new(r"C:\work\shop\src\main\source\com\shop\api");

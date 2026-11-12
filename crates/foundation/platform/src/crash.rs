@@ -468,19 +468,11 @@ mod tests {
         KEEP_CRASHES, WriteGate, Writer, dump_name, prune, report_name, report_text, write_crash,
         write_dump,
     };
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "platform-crash-{}-{label}-{unique}",
-            std::process::id()
-        ))
+    fn temp_dir(label: &str) -> test_support::TempDir {
+        test_support::TempDir::new(&format!("platform-crash-{label}"))
     }
 
     #[test]
@@ -494,7 +486,6 @@ mod tests {
     #[test]
     fn only_the_newest_crashes_stay() {
         let dir = temp_dir("prune");
-        std::fs::create_dir_all(&dir).unwrap();
         for millis in 1..=12u128 {
             std::fs::write(dir.join(format!("crash-{millis}.dmp")), b"dump").unwrap();
             std::fs::write(dir.join(format!("crash-{millis}.log")), b"text").unwrap();
@@ -510,7 +501,6 @@ mod tests {
             assert!(dir.join(format!("crash-{millis}.log")).exists());
         }
         assert!(dir.join("panic-1.log").exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -519,13 +509,11 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let dir = temp_dir("dump");
-        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("current.dmp");
         let thread_id = unsafe { GetCurrentThreadId() };
         write_dump(&path, std::ptr::null(), thread_id).unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size > 0, "the dump is {size} bytes");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -534,8 +522,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let dir = temp_dir("writer");
-        std::fs::create_dir_all(&dir).unwrap();
-        let writer = Writer::spawn(dir.clone()).unwrap();
+        let writer = Writer::spawn(dir.to_path_buf()).unwrap();
         let thread_id = unsafe { GetCurrentThreadId() };
         writer.request(std::ptr::null(), thread_id);
         assert!(writer.wait(), "the writer thread did not finish");
@@ -546,7 +533,6 @@ mod tests {
             .expect("a dump was written");
         let size = std::fs::metadata(dump).unwrap().len();
         assert!(size > 0, "the dump is {size} bytes");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -596,6 +582,5 @@ mod tests {
             .collect();
         assert!(names.iter().any(|name| name.ends_with(".dmp")));
         assert!(names.iter().any(|name| name.ends_with(".log")));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

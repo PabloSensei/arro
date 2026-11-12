@@ -2,38 +2,30 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use fs_watch::{FileTable, FsChange, FsWatcher};
 
-struct TempDir(PathBuf);
+struct TempDir {
+    path: PathBuf,
+    _folder: test_support::TempDir,
+}
 
 impl TempDir {
     fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let name = format!(
-            "fs-watch-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = std::env::temp_dir().join(name);
-        fs::create_dir_all(&path).unwrap();
-        Self(fs::canonicalize(path).unwrap())
+        let folder = test_support::TempDir::new("fs-watch");
+        Self {
+            path: fs::canonicalize(&folder).unwrap(),
+            _folder: folder,
+        }
     }
 
     fn file(&self, name: &str, text: &str) -> PathBuf {
-        let path = self.0.join(name);
+        let path = self.path.join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, text).unwrap();
         path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -49,7 +41,7 @@ fn names(table: &FileTable) -> Vec<String> {
 }
 
 fn scan(directory: &TempDir, excludes: Vec<PathBuf>) -> FileTable {
-    FileTable::scan(&directory.0, excludes).unwrap()
+    FileTable::scan(&directory.path, excludes).unwrap()
 }
 
 /// Waits until the table has seen a change that `done` accepts.
@@ -89,7 +81,7 @@ fn a_scan_honours_gitignore_and_excluded_folders() {
     directory.file("gen/skip.txt", "");
     directory.file(".git/config", "");
 
-    let table = scan(&directory, vec![directory.0.join("gen")]);
+    let table = scan(&directory, vec![directory.path.join("gen")]);
 
     assert_eq!(
         names(&table),
@@ -102,7 +94,7 @@ fn the_watcher_reports_new_changed_and_removed_files() {
     let directory = TempDir::new();
     let file = directory.file("a.txt", "one");
     let mut table = scan(&directory, Vec::new());
-    let (_watcher, batches) = watch(&directory.0);
+    let (_watcher, batches) = watch(&directory.path);
 
     let new = directory.file("b.txt", "two");
     let seen = wait_for(&mut table, &batches, |table| table.contains(&new));
@@ -142,7 +134,7 @@ fn a_new_folder_expands_and_a_removed_one_takes_its_files() {
     let directory = TempDir::new();
     let mut table = scan(&directory, Vec::new());
     let inner = directory.file("pack/inner/a.txt", "");
-    let folder = directory.0.join("pack");
+    let folder = directory.path.join("pack");
 
     let applied = table.apply(vec![FsChange::Created(folder.clone())]);
     assert_eq!(applied, [FsChange::Created(inner.clone())]);

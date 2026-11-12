@@ -166,6 +166,55 @@ impl EditorState {
         }
     }
 
+    /// Another view of the same buffer: the text and its undo history are shared, while
+    /// the carets, folds, scroll and selections belong to this view alone.
+    pub fn fork(&self) -> Self {
+        let mut map = DisplayMap::default();
+        map.tab_size = self.map.tab_size;
+        Self {
+            buffer: self.buffer.fork(),
+            map,
+            language: self.language.clone(),
+            parsed: None,
+            spans: self.spans.clone(),
+            tokens: self.tokens.clone(),
+            opened_folds: false,
+            goal: None,
+            grown: Vec::new(),
+            marked: None,
+            read_only: self.read_only,
+            attribute_read_only: self.attribute_read_only,
+            places: Vec::new(),
+            place_cursor: None,
+            bookmarks: self.bookmarks.clone(),
+            overwrite: false,
+            auto_closers: Vec::new(),
+            properties: self.properties.clone(),
+            indent: self.indent.clone(),
+            new_file: self.new_file,
+            saved_text: self.saved_text.clone(),
+            save: self.save,
+        }
+    }
+
+    /// Takes edits the other view of the buffer already made: no undo step is added,
+    /// because the shared history has it, and the carets here follow the text.
+    pub fn follow(&mut self, edits: Vec<Edit>) -> Option<Change> {
+        if self.is_read_only() {
+            return None;
+        }
+        let change = self.buffer.follow(edits);
+        self.finish_with(change, false)
+    }
+
+    /// The buffer lines the display shows, without the ones a fold hides.
+    pub fn visible_lines(&self) -> Vec<u32> {
+        self.map
+            .snapshot(self.buffer.store())
+            .visible_lines()
+            .to_vec()
+    }
+
     /// Reads and decodes the file, and reads the `.editorconfig` files around it. Blocks:
     /// not for the UI thread.
     pub fn load(path: &Path, language: Option<LanguageConfig>) -> Result<Self, LoadError> {

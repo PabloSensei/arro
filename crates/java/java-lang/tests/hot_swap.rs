@@ -141,12 +141,7 @@ public class App {
 
 /// Writes a small project of the tool into a folder of its own and returns its root.
 fn write_project(tool: Tool) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "ide-hot-swap-{}-{}",
-        tool.name(),
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = test_support::scratch(&format!("hot-swap-{}", tool.name()));
     let sources = root.join("src/main/java/demo");
     fs::create_dir_all(&sources).unwrap();
     fs::write(sources.join("App.java"), SOURCE).unwrap();
@@ -310,11 +305,7 @@ fn fixture(tool: Tool) -> Fixture {
     touch_path(&root.join("src/main/java/demo/App.java"));
     run(&tool_system, &root, false);
     let outputs = tool.outputs(&root);
-    let run_classes = root.with_file_name(format!(
-        "{}-run",
-        root.file_name().unwrap().to_string_lossy()
-    ));
-    let _ = fs::remove_dir_all(&run_classes);
+    let run_classes = test_support::scratch(&format!("hot-swap-{}-run", tool.name()));
     copy_tree(&outputs[0], &run_classes);
     Fixture {
         outputs,

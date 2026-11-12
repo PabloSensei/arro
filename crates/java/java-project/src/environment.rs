@@ -282,13 +282,10 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("java-project-env-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("project-env-{name}"))
     }
 
+    #[cfg(windows)]
     fn jdk(root: &Path, name: &str, version: &str) -> Jdk {
         let home = root.join(name);
         fs::create_dir_all(home.join("bin")).unwrap();
@@ -309,6 +306,7 @@ mod tests {
         fs::write(root.join("pom.xml"), text).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_choice_of_the_user_wins_over_the_build_file() {
         let root = scratch("user");
@@ -335,6 +333,7 @@ mod tests {
         assert!(resolved.notice.is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_folder_that_is_gone_falls_back_and_says_so() {
         let root = scratch("gone");
@@ -357,6 +356,7 @@ mod tests {
         assert!(notice.contains("missing"), "{notice}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_build_file_names_the_reason() {
         let root = scratch("project");
@@ -370,6 +370,7 @@ mod tests {
         assert_eq!(resolved.reason, RuntimeReason::Project);
     }
 
+    #[cfg(windows)]
     #[test]
     fn without_build_files_the_default_reason_is_reported() {
         let root = scratch("default");
@@ -385,6 +386,7 @@ mod tests {
         assert_eq!(resolved.reason, RuntimeReason::Default);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_folder_added_by_hand_keeps_its_mark() {
         let root = scratch("added");

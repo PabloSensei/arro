@@ -464,6 +464,7 @@ impl RunPanel {
 
     /// The text of the runs that already ended but still receive late output, for tests.
     #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn draining_text(&self) -> Vec<String> {
         self.draining
             .iter()

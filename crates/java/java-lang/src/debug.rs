@@ -728,6 +728,7 @@ fn listening_port(line: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::io::Read;
 
     use serde_json::json;
@@ -828,8 +829,7 @@ mod tests {
 
     #[test]
     fn only_classes_a_build_wrote_after_the_check_are_reloaded() {
-        let root = std::env::temp_dir().join(format!("java-hot-swap-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("hot-swap");
         let nested = root.join("demo");
         fs::create_dir_all(&nested).unwrap();
         let old = root.join("Old.class");
@@ -855,7 +855,6 @@ mod tests {
         let found = changed_class_files(&[root.clone(), root.join("missing")], then);
 
         assert_eq!(found, vec![new]);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -879,6 +878,7 @@ mod tests {
         assert_eq!(empty.error, None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_standard_input_of_the_debuggee_stays_open_at_start() {
         let program = ProcessSpec::new("powershell.exe")

@@ -6,3 +6,7 @@ publish.workspace = true
 
 [dependencies]
 serde_json = "1"
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

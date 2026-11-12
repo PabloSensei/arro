@@ -534,15 +534,12 @@ mod tests {
         assert_eq!(line(&[r"C:\plain\"]), r"tool.exe C:\plain\");
     }
 
-    struct TempDir(PathBuf);
+    struct TempDir(PathBuf, #[allow(dead_code)] test_support::TempDir);
 
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("term-conpty-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            let folder = test_support::TempDir::new(&format!("term-conpty-{name}"));
+            Self(folder.path().to_path_buf(), folder)
         }
 
         fn with_files(&self, dll: &[u8], exe: &[u8]) -> Pins {
@@ -552,12 +549,6 @@ mod tests {
                 conpty_dll: Some(sha256(dll).unwrap()),
                 open_console_exe: Some(sha256(exe).unwrap()),
             }
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

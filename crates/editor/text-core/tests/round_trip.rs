@@ -140,8 +140,7 @@ fn deleting_a_line_end_and_undo_restore_a_mixed_file() {
 
 #[test]
 fn saved_file_has_the_same_bytes() {
-    let directory = std::env::temp_dir().join(format!("text-core-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = test_support::scratch("text-core");
     let path = directory.join("Sample.txt");
     let bytes = b"one\r\ntwo\nthree";
     std::fs::write(&path, bytes).unwrap();
@@ -152,15 +151,12 @@ fn saved_file_has_the_same_bytes() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     let leftovers = std::fs::read_dir(&directory).unwrap().count();
     assert_eq!(leftovers, 1);
-    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]
 #[allow(clippy::permissions_set_readonly_false)]
 fn a_batch_of_files_is_written_all_or_none() {
-    let directory = std::env::temp_dir().join(format!("text-core-batch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = test_support::scratch("text-core-batch");
     let first = directory.join("a.txt");
     let second = directory.join("b.txt");
     std::fs::write(&first, b"one\r\none").unwrap();
@@ -208,7 +204,6 @@ fn a_batch_of_files_is_written_all_or_none() {
     let mut permissions = std::fs::metadata(&second).unwrap().permissions();
     permissions.set_readonly(false);
     std::fs::set_permissions(&second, permissions).unwrap();
-    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 proptest! {

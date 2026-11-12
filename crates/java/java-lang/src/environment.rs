@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use base::program::executable;
 use java_project::{
     Jdk, LocalRepositories, ProjectSettings, language_level, resolve_environment, runtime_info,
     save_settings,
@@ -90,10 +91,12 @@ impl JavaEnvironment {
 
 /// The folder is not an SDK unless it holds the launcher and the version file.
 fn check_folder(home: &Path) -> Result<Jdk, String> {
-    if !home.join("bin/java.exe").is_file() {
+    let launcher = home.join("bin").join(executable("java"));
+    if !launcher.is_file() {
         return Err(format!(
-            "The folder is not a JDK: {} has no bin\\java.exe",
-            home.display()
+            "The folder is not a JDK: {} has no {}",
+            home.display(),
+            launcher.display()
         ));
     }
     Jdk::at(home).ok_or_else(|| {
@@ -180,13 +183,10 @@ mod tests {
     use std::fs;
 
     fn scratch(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("java-lang-env-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("lang-env-{name}"))
     }
 
+    #[cfg(windows)]
     fn jdk(root: &Path, name: &str, version: &str) -> PathBuf {
         let home = root.join(name);
         fs::create_dir_all(home.join("bin")).unwrap();
@@ -200,6 +200,7 @@ mod tests {
         home
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_folder_without_the_launcher_is_refused() {
         let root = scratch("bad");
@@ -210,10 +211,30 @@ mod tests {
         assert!(error.contains("bin\\java.exe"), "{error}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_runtime_has_the_name_and_version_of_its_folder() {
         let root = scratch("good");
         let home = jdk(&root, "sdk-21", "21.0.2");
+        let environment = JavaEnvironment::new(root, None);
+
+        let runtime = environment.runtime_at(&home).unwrap();
+
+        assert_eq!(runtime.name, "sdk-21");
+        assert_eq!(runtime.version, "21.0.2");
+        assert_eq!(runtime.feature, 21);
+        assert!(runtime.added);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_has_the_name_and_version_of_its_folder() {
+        let root = scratch("good-unix");
+        let home = root.join("sdk-21");
+        fs::create_dir_all(home.join("bin")).unwrap();
+        fs::write(home.join("bin").join(executable("java")), "").unwrap();
+        fs::write(home.join("bin").join(executable("javac")), "").unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.2\"\n").unwrap();
         let environment = JavaEnvironment::new(root, None);
 
         let runtime = environment.runtime_at(&home).unwrap();

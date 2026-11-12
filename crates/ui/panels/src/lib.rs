@@ -261,7 +261,11 @@ mod window_tests_folder_compare;
 mod window_tests_navigation_polish;
 
 #[cfg(test)]
+mod window_tests_branches_tree;
+#[cfg(test)]
 mod window_tests_diff_editor;
+#[cfg(test)]
+mod window_tests_diff_own_view;
 
 mod choice;
 mod invalidate;

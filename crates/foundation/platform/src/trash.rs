@@ -2,6 +2,8 @@
 
 use std::io;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Moves a file or a whole folder to the Recycle Bin. Blocks: call it off the UI thread.
 #[cfg(windows)]
@@ -31,34 +33,171 @@ pub fn move_to_trash(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Other systems have no Recycle Bin; the caller has to ask before deleting for good.
-#[cfg(not(windows))]
-pub fn move_to_trash(_: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the Recycle Bin is only on Windows",
-    ))
+/// Moves a file or a whole folder to the trash of the desktop: the `files` folder keeps
+/// the entry, the `info` folder keeps where it came from. Blocks: call it off the UI thread.
+#[cfg(unix)]
+pub fn move_to_trash(path: &Path) -> io::Result<()> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home folder for a trash"))?;
+    move_to_trash_in(path, &data.join("Trash"))
+}
+
+/// The freedesktop Trash specification, against an explicit trash folder.
+#[cfg(unix)]
+fn move_to_trash_in(path: &Path, trash: &Path) -> io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no name to put into the trash", path.display()),
+        )
+    })?;
+    let files = trash.join("files");
+    let info = trash.join("info");
+    std::fs::create_dir_all(&files)?;
+    std::fs::create_dir_all(&info)?;
+
+    // Another entry with the same name keeps its place; the new one gets a suffix.
+    let mut target = files.join(name);
+    let mut entry = info.join(format!("{}.trashinfo", name.to_string_lossy()));
+    let mut counter = 1;
+    while target.exists() || entry.exists() {
+        let numbered = format!("{}.{counter}", name.to_string_lossy());
+        target = files.join(&numbered);
+        entry = info.join(format!("{numbered}.trashinfo"));
+        counter += 1;
+    }
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut content = String::from("[Trash Info]\nPath=");
+    percent_encode(&absolute.to_string_lossy(), &mut content);
+    content.push_str("\nDeletionDate=");
+    content.push_str(&timestamp());
+    content.push('\n');
+    std::fs::write(&entry, content)?;
+    if let Err(error) = std::fs::rename(path, &target) {
+        // A trash on another disk needs a copy; a failed copy leaves no half entry.
+        if let Err(copy) = copy_then_remove(path, &target) {
+            let _ = std::fs::remove_file(&entry);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("{}: {error}; the copy failed too: {copy}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn percent_encode(text: &str, out: &mut String) {
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(byte as char),
+            b'-' | b'_' | b'.' | b'~' | b'/' | b':' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs()) as i64;
+    let days = seconds / 86_400;
+    let remaining = seconds % 86_400;
+    let (hour, minute, second) = (remaining / 3600, remaining % 3600 / 60, remaining % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+}
+
+/// Days since 1970-01-01 to a calendar date, the same arithmetic as the build script.
+#[cfg(unix)]
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month as u32, day as u32)
+}
+
+#[cfg(unix)]
+fn copy_then_remove(source: &Path, target: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_then_remove(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        std::fs::remove_dir(source)
+    } else {
+        std::fs::copy(source, target)?;
+        std::fs::remove_file(source)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::move_to_trash;
+    #[cfg(unix)]
+    use super::move_to_trash_in;
 
     /// Deliberately puts one temporary file into the real Recycle Bin: this is the only
     /// test of the binary that does, so every `cargo test` checks the Win32 call itself.
+    #[cfg(windows)]
     #[test]
     fn a_file_goes_to_the_recycle_bin() {
         let _guard = crate::WIN32_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let dir = std::env::temp_dir().join(format!("trash-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("trash-test");
         let file = dir.join("taken-back.txt");
         std::fs::write(&file, "text").unwrap();
 
         move_to_trash(&file).unwrap();
 
         assert!(!file.exists(), "the file left the folder");
+    }
+
+    /// A trash folder of its own keeps the test away from the real trash of the user.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_gets_an_entry_of_the_freedesktop_trash() {
+        let dir = std::env::temp_dir().join(format!("trash-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("taken-back.txt");
+        std::fs::write(&file, "text").unwrap();
+        let trash = dir.join("Trash");
+
+        move_to_trash_in(&file, &trash).unwrap();
+
+        assert!(!file.exists(), "the file left the folder");
+        assert_eq!(
+            std::fs::read_to_string(trash.join("files/taken-back.txt")).unwrap(),
+            "text"
+        );
+        let info = std::fs::read_to_string(trash.join("info/taken-back.txt.trashinfo")).unwrap();
+        assert!(info.starts_with("[Trash Info]\nPath="), "{info}");
+        assert!(info.contains("DeletionDate="), "{info}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -13,7 +13,7 @@ const FAKE: &str = env!("CARGO_BIN_EXE_container-fake-docker");
 const PATIENCE: Duration = Duration::from_secs(20);
 
 fn state_file() -> PathBuf {
-    let file = std::env::temp_dir().join(format!("fake-docker-{}.json", std::process::id()));
+    let file = test_support::scratch("fake-docker").join("state.json");
     let state = json!({
         "up": true,
         "containers": [],

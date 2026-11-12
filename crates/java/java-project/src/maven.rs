@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base::program::cmd_script;
 use base::{Cancel, Result};
 use proc_sup::ProcessSpec;
 use project_model::{
@@ -28,13 +29,23 @@ const PHASES: &[&str] = &[
 
 /// `mvnw` of the project first: it pins the version the project was written for.
 pub fn find_maven(root: &Path) -> Option<PathBuf> {
-    let wrapper = root.join("mvnw.cmd");
+    let wrapper = root.join(cmd_script("mvnw"));
     if wrapper.is_file() {
         return Some(wrapper);
     }
+    let names: &[&str] = if cfg!(windows) {
+        &["mvn.cmd", "mvn.bat"]
+    } else {
+        &["mvn"]
+    };
     let path = env::var_os("PATH")?;
     env::split_paths(&path)
-        .flat_map(|directory| ["mvn.cmd", "mvn.bat"].map(|name| directory.join(name)))
+        .flat_map(|directory| {
+            names
+                .iter()
+                .map(move |name| directory.join(name))
+                .collect::<Vec<_>>()
+        })
         .find(|file| file.is_file())
 }
 
@@ -56,14 +67,19 @@ impl Maven {
         let settings = &self.env.build_tools.first;
         let maven = match settings.home_path() {
             Some(home) => {
-                let program = Path::new(home).join("bin").join("mvn.cmd");
+                let program = Path::new(home).join("bin").join(cmd_script("mvn"));
                 if !program.is_file() {
-                    return Err(format!("no mvn.cmd in {}", program.display()).into());
+                    return Err(format!("no {} in {}", cmd_script("mvn"), program.display()).into());
                 }
                 program
             }
-            None => find_maven(root)
-                .ok_or_else(|| format!("no mvnw.cmd in {} and no mvn in PATH", root.display()))?,
+            None => find_maven(root).ok_or_else(|| {
+                format!(
+                    "no {} in {} and no mvn in PATH",
+                    cmd_script("mvnw"),
+                    root.display()
+                )
+            })?,
         };
         let jdk = self.env.project_jdk(root)?;
         let mut spec = ProcessSpec::new(maven)
@@ -438,8 +454,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_project_after_a_successful_build_needs_no_maven() {
-        let root = std::env::temp_dir().join(format!("maven-fast-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("maven-fast");
         fs::create_dir_all(root.join("src/main/java/demo")).unwrap();
         fs::write(root.join("pom.xml"), "<project/>").unwrap();
         fs::write(root.join("src/main/java/demo/App.java"), "class App {}").unwrap();
@@ -466,7 +481,6 @@ mod tests {
             read_stamp(&tool.stamp_file(&root)).unwrap(),
             "a changed source makes the stamp old"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -508,11 +522,7 @@ mod tests {
     }
 
     fn multi_module(name: &str, core_plugin: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "java-project-maven-tree-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch(&format!("project-maven-tree-{name}"));
         fs::create_dir_all(root.join("core")).unwrap();
         fs::create_dir_all(root.join("app")).unwrap();
         fs::write(
@@ -559,7 +569,6 @@ mod tests {
             !tree[1].groups.iter().any(|group| group.name == "Plugins"),
             "no plugin means no run goal"
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -584,7 +593,6 @@ mod tests {
         assert!(plugins.tasks[0].program);
         let app = tree.iter().find(|module| module.name == "app").unwrap();
         assert!(!app.groups.iter().any(|group| group.name == "Plugins"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

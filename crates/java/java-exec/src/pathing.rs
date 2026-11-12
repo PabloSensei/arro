@@ -99,10 +99,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("java-exec-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+        test_support::scratch(&format!("exec-{name}"))
     }
 
     /// What a manifest reader sees: continuation lines glued back together.
@@ -143,7 +140,6 @@ mod tests {
 
         assert!(url_of(&directory).ends_with('/'));
         assert!(url_of(&file).ends_with("a.jar"));
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -184,6 +180,5 @@ mod tests {
         assert_eq!(first, again);
         assert_eq!(fs::metadata(&again).unwrap().modified().unwrap(), written);
         assert_ne!(first, other);
-        let _ = fs::remove_dir_all(cache);
     }
 }

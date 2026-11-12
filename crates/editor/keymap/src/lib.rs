@@ -737,6 +737,8 @@ pub mod workspace {
     pub const FIND_ACTION: &str = "workspace.find_action";
     pub const RUN_ANYTHING: &str = "workspace.run_anything";
     pub const RECENT_FILES: &str = "workspace.recent_files";
+    /// Recent Files with the "Show edited only" checkbox already on.
+    pub const RECENT_CHANGED_FILES: &str = "workspace.recent_changed_files";
     pub const SWITCHER: &str = "workspace.switcher";
     pub const FIND_IN_FILES: &str = "workspace.find_in_files";
     pub const REPLACE_IN_FILES: &str = "workspace.replace_in_files";
@@ -1347,15 +1349,7 @@ mod tests {
     }
 
     fn temp_keymap(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "keymap-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |time| time.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(KEYMAP_FILE)
+        test_support::scratch(&format!("keymap-{name}")).join(KEYMAP_FILE)
     }
 
     #[test]
@@ -1376,8 +1370,6 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"version\": 1"), "{text}");
         assert!(text.contains("editor.copy"), "{text}");
-
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -1455,7 +1447,6 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

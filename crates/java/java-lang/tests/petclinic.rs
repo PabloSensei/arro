@@ -177,8 +177,7 @@ fn a_change_on_disk_reaches_the_open_document() {
     let root = petclinic();
     // A copy, so the corpus stays as it is.
     let source = root.join("src/main/java/org/springframework/samples/petclinic/owner/Pet.java");
-    let directory = std::env::temp_dir().join(format!("petclinic-watch-{}", std::process::id()));
-    fs::create_dir_all(&directory).unwrap();
+    let directory = test_support::scratch("petclinic-watch");
     let directory = fs::canonicalize(directory).unwrap();
     let path = directory.join("Pet.java");
     fs::copy(&source, &path).unwrap();
@@ -218,5 +217,4 @@ fn a_change_on_disk_reaches_the_open_document() {
     assert!(matches!(reloaded, Some(Reload::Changed { .. })));
     let text = store.state(document).unwrap().text.text();
     assert!(text.contains("class Pet /* edited */ "));
-    let _ = fs::remove_dir_all(&directory);
 }

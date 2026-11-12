@@ -270,6 +270,8 @@ pub struct Settings {
     pub terminal_environment: String,
     /// The diff shows the two versions side by side rather than as one list.
     pub diff_side_by_side: bool,
+    /// The branch popup groups local and remote branches by the folders of their names.
+    pub git_group_by_directory: bool,
 }
 
 impl Default for Settings {
@@ -332,6 +334,7 @@ impl Default for Settings {
             terminal_start_directory: String::new(),
             terminal_environment: String::new(),
             diff_side_by_side: true,
+            git_group_by_directory: true,
         }
     }
 }
@@ -430,18 +433,16 @@ mod tests {
 
     #[test]
     fn a_missing_or_damaged_file_gives_the_defaults() {
-        let dir = std::env::temp_dir().join(format!("settings-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("settings");
         let file = dir.join("settings.json");
         assert_eq!(Settings::load(&file), Settings::default());
         std::fs::write(&file, "{broken").unwrap();
         assert_eq!(Settings::load(&file), Settings::default());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn settings_round_trip_and_a_partial_file_keeps_the_other_defaults() {
-        let dir = std::env::temp_dir().join(format!("settings-rt-{}", std::process::id()));
+        let dir = test_support::scratch("settings-rt");
         let file = dir.join("ide").join("settings.json");
         let settings = Settings {
             font_size: 16.,
@@ -456,7 +457,6 @@ mod tests {
         let partial = Settings::load(&file);
         assert!(partial.soft_wrap);
         assert!(partial.autosave, "the default stays");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -474,8 +474,7 @@ mod tests {
 
     #[test]
     fn the_editor_settings_round_trip_and_an_old_file_gets_the_defaults() {
-        let dir = std::env::temp_dir().join(format!("settings-editor-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("settings-editor");
         let file = dir.join("settings.json");
         let settings = Settings {
             editor_font_family: "Consolas".into(),
@@ -516,13 +515,11 @@ mod tests {
         assert_eq!(old.completion_case, CompletionCase::None);
         assert!(old.completion_auto_popup);
         assert_eq!(old.completion_delay_ms, 0);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_new_numbers_stay_in_their_limits() {
-        let dir = std::env::temp_dir().join(format!("settings-limits-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("settings-limits");
         let file = dir.join("settings.json");
         let settings = Settings {
             line_spacing: 0.2,
@@ -534,7 +531,6 @@ mod tests {
         };
         settings.save(&file).unwrap();
         let clamped = Settings::load(&file);
-        std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(clamped.line_spacing, MIN_LINE_SPACING);
         assert_eq!(clamped.tab_size, 1);
         assert_eq!(clamped.indent_size, MAX_INDENT_SIZE as u32);

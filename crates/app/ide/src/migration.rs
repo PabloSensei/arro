@@ -31,7 +31,7 @@ fn drop_jdtls_caches(state: &std::path::Path) -> Option<String> {
         .map(|error| format!("could not remove {}: {error}", jdtls.display()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::take_over_old_folders;
     use std::path::PathBuf;
@@ -65,10 +65,10 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_old_folders_move_once_and_the_new_name_wins() {
-        let root = std::env::temp_dir().join(format!("app-folders-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = test_support::scratch("app-folders");
         let appdata = root.join("appdata");
         let local = root.join("local");
         std::fs::create_dir_all(appdata.join("ide").join("plugins")).unwrap();
@@ -103,7 +103,5 @@ mod tests {
         assert!(take_over_old_folders().is_empty());
         assert!(base::app::folder_under(&local).join("projects").is_dir());
         assert!(!local.join("ide").exists());
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

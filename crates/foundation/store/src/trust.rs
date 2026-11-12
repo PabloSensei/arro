@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn trust_is_remembered_per_folder() {
-        let dir = std::env::temp_dir().join(format!("trust-{}", std::process::id()));
+        let dir = test_support::scratch("trust");
         let list = TrustList::new(&dir);
         let project = Path::new(r"C:\work\Demo");
         assert!(!list.is_trusted(project));
@@ -63,7 +63,6 @@ mod tests {
         assert!(list.is_trusted(Path::new(r"c:\work\demo")));
         assert!(!list.is_trusted(Path::new(r"C:\work\Other")));
         let text = fs::read_to_string(dir.join(FILE)).unwrap();
-        fs::remove_dir_all(&dir).unwrap();
         assert_eq!(text.lines().count(), 1);
     }
 }

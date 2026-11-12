@@ -1169,8 +1169,7 @@ mod tests {
 
     #[test]
     fn replace_on_disk_writes_every_file_or_none() {
-        let directory = std::env::temp_dir().join(format!("finder-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = test_support::scratch("finder");
         let first = directory.join("a.txt");
         let second = directory.join("b.txt");
         std::fs::write(&first, "one two\r\none").unwrap();
@@ -1186,16 +1185,12 @@ mod tests {
         let failed = replace_on_disk(&TextQuery::plain("1"), "x", &[first.clone(), missing]);
         assert!(failed.is_err());
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "1 two\r\n1");
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
     #[allow(clippy::permissions_set_readonly_false)]
     fn replace_on_disk_leaves_every_file_when_one_is_read_only() {
-        let directory =
-            std::env::temp_dir().join(format!("finder-read-only-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = test_support::scratch("finder-read-only");
         let first = directory.join("a.txt");
         let second = directory.join("b.txt");
         std::fs::write(&first, "one two\r\none").unwrap();
@@ -1218,6 +1213,5 @@ mod tests {
         let mut permissions = std::fs::metadata(&second).unwrap().permissions();
         permissions.set_readonly(false);
         std::fs::set_permissions(&second, permissions).unwrap();
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

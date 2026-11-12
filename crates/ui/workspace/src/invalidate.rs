@@ -87,12 +87,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("arro-invalidate-tests")
-            .join(format!("{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        test_support::scratch(&format!("invalidate-{name}"))
     }
 
     #[test]

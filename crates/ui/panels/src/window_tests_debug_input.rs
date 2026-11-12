@@ -4,6 +4,7 @@
 //!
 //! `cargo test -p panels window_tests_debug_input`
 
+#![cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -243,6 +244,7 @@ fn right_click_at(
     draw(cx, window);
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn a_typed_line_reaches_the_program_and_its_history_stays(cx: &mut TestAppContext) {
     let (fixture, debug) = started(cx, "debug-input");
@@ -291,6 +293,7 @@ fn a_typed_line_reaches_the_program_and_its_history_stays(cx: &mut TestAppContex
     );
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn send_eof_in_the_console_menu_ends_the_input_of_the_program(cx: &mut TestAppContext) {
     let (fixture, debug) = started(cx, "debug-eof");

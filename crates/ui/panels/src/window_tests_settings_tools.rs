@@ -2,6 +2,7 @@
 //! Git and the terminal. Every test here proves that a value of the page reaches the
 //! program that runs, without a real window.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +13,9 @@ use ui_kit::gpui;
 use ui_kit::gpui::{TestAppContext, WindowHandle};
 use workspace::{Launch, Layout, Settings, Workspace};
 
-use crate::window_tests::{press, project_setup, scratch, wait_for_signal};
+#[cfg(windows)]
+use crate::window_tests::wait_for_signal;
+use crate::window_tests::{press, project_setup, scratch};
 use crate::window_tests_git::{git_state, repository_with_origin, wait_for};
 use crate::{AgentOptions, LanguageServer, SearchSetup};
 
@@ -196,6 +199,7 @@ fn first_tool_settings() -> Settings {
     settings
 }
 
+#[cfg(windows)]
 #[test]
 fn work_offline_reaches_the_build_tool_command_and_the_server_settings() {
     let settings = first_tool_settings();
@@ -303,6 +307,7 @@ fn the_second_build_tool_takes_its_distribution_and_user_home() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn the_second_build_tool_command_takes_the_offline_flag_and_the_user_home() {
     install_names();
@@ -348,6 +353,7 @@ fn the_second_build_tool_command_takes_the_offline_flag_and_the_user_home() {
     );
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn the_git_path_of_the_settings_runs_the_git_of_the_window(cx: &mut TestAppContext) {
     install_names();
@@ -426,6 +432,7 @@ fn update_project_rebases_when_the_page_says_rebase(cx: &mut TestAppContext) {
     assert_eq!(local.replace("\r\n", "\n"), "local\n");
 }
 
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn the_shell_of_the_terminal_page_starts_the_new_tab_in_its_folder(cx: &mut TestAppContext) {
     install_names();

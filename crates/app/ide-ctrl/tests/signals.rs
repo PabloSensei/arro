@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! Stopping real processes through the helper. Lives here because a test of this package is
 //! the one place cargo builds the helper for.
 

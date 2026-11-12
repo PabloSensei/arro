@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use base::program::executable;
 use lsp_client::lsp_types::notification::{DidChangeConfiguration, Notification};
 use lsp_client::lsp_types::{
     ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, TraceValue, WorkspaceFolder,
@@ -95,6 +96,15 @@ const LAUNCH_SETTINGS: &[&str] = &[
 ];
 
 const LOG_FILE: &str = "jdtls-stderr.log";
+
+/// The configuration folder of the jdtls release for this system.
+const CONFIG_DIRECTORY: &str = if cfg!(windows) {
+    "config_win"
+} else if cfg!(target_os = "macos") {
+    "config_mac"
+} else {
+    "config_linux"
+};
 
 /// The Gradle daemon of an import stops after ten idle minutes instead of the three
 /// hours it keeps by default. The property travels as an import argument, as S9 did.
@@ -805,7 +815,7 @@ impl ServerSpec for Jdtls {
             .collect();
         args.push(format!(
             "-Dosgi.sharedConfiguration.area={}",
-            config.jdtls_home.join("config_win").display()
+            config.jdtls_home.join(CONFIG_DIRECTORY).display()
         ));
         args.extend(JVM_SETTINGS.iter().map(|arg| (*arg).to_owned()));
         args.extend(memory_arguments());
@@ -828,7 +838,7 @@ impl ServerSpec for Jdtls {
             config.state_dir.join("workspace").display().to_string(),
         ]);
         Plan {
-            program: config.java_home.join("bin").join("java.exe"),
+            program: config.java_home.join("bin").join(executable("java")),
             args,
             env: config.environment.clone(),
             directory: Some(config.state_dir.clone()),
@@ -938,9 +948,7 @@ mod tests {
     use super::*;
 
     fn jdtls() -> (Jdtls, PathBuf) {
-        static NEXT_ROOT: AtomicU32 = AtomicU32::new(0);
-        let n = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("jdtls-adapter-{}-{n}", std::process::id()));
+        let root = test_support::scratch("jdtls-adapter");
         let plugins = root.join("home").join("plugins");
         fs::create_dir_all(&plugins).unwrap();
         fs::write(plugins.join("org.eclipse.equinox.launcher_1.8.0.jar"), b"").unwrap();
@@ -967,11 +975,7 @@ mod tests {
     }
 
     fn jdtls_on(project_root: PathBuf) -> (Jdtls, PathBuf) {
-        static NEXT_PROJECT: AtomicU32 = AtomicU32::new(0);
-        let n = NEXT_PROJECT.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("jdtls-adapter-proj-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = test_support::scratch("jdtls-adapter-proj");
         let plugins = root.join("home").join("plugins");
         fs::create_dir_all(&plugins).unwrap();
         fs::write(plugins.join("org.eclipse.equinox.launcher_1.8.0.jar"), b"").unwrap();
@@ -995,12 +999,10 @@ mod tests {
 
     #[test]
     fn the_import_shortens_the_gradle_daemon_idle_timeout_unless_the_project_sets_one() {
-        let project =
-            std::env::temp_dir().join(format!("jdtls-adapter-gradle-props-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&project);
+        let project = test_support::scratch("jdtls-adapter-gradle-props");
         fs::create_dir_all(&project).unwrap();
         fs::write(project.join("build.gradle"), "plugins { id 'java' }\n").unwrap();
-        let (jdtls, root) = jdtls_on(project.clone());
+        let (jdtls, _root) = jdtls_on(project.clone());
         let arguments = || {
             jdtls.settings()["java"]["import"]["gradle"]["arguments"]
                 .as_str()
@@ -1035,8 +1037,6 @@ mod tests {
             "{}",
             arguments()
         );
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&project);
     }
 
     #[test]
@@ -1197,6 +1197,7 @@ mod tests {
         let _ = root;
     }
 
+    #[cfg(windows)]
     #[test]
     fn plan_runs_java_with_the_one_setting_and_the_launcher_jar() {
         let (jdtls, root) = jdtls();
@@ -1221,6 +1222,7 @@ mod tests {
         assert!(equinox_launcher(&config_home).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn initialize_carries_bundles_runtimes_and_extended_capabilities() {
         let (jdtls, _) = jdtls();
@@ -1279,6 +1281,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_project_status_is_not_a_lifecycle_step_and_a_build_error_is_kept() {
         let (jdtls, _) = jdtls();

@@ -395,8 +395,7 @@ mod tests {
 
     #[test]
     fn a_jdk_release_file_names_the_runtime() {
-        let home = std::env::temp_dir().join("java-lang-release-test");
-        fs::create_dir_all(&home).unwrap();
+        let home = test_support::scratch("lang-release");
         fs::write(
             home.join("release"),
             "IMPLEMENTOR=\"x\"\nJAVA_VERSION=\"25.0.1\"\n",
@@ -407,6 +406,7 @@ mod tests {
         assert!(runtime.default);
     }
 
+    #[cfg(windows)]
     #[test]
     fn projects_get_separate_state_folders() {
         let state = Path::new(r"C:\state");

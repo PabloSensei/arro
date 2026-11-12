@@ -241,6 +241,8 @@ pub fn window_step(len: usize, current: usize, step: isize) -> Option<usize> {
 }
 
 const SAVE_DELAY: Duration = Duration::from_millis(300);
+/// Files the edited list keeps.
+const RECENT_EDITED_LIMIT: usize = 50;
 /// The automatic update check waits for the window to settle first.
 const UPDATE_DELAY: Duration = Duration::from_secs(10);
 /// After the check at the start, a window that stays open asks again this often.
@@ -462,6 +464,8 @@ pub struct Workspace {
     closed: Vec<PathBuf>,
     /// Projects opened before, for the main menu.
     pub(crate) recent: Vec<PathBuf>,
+    /// Files edited in this project, the latest first, for Recent Files.
+    recent_edited: Vec<PathBuf>,
     state_dir: PathBuf,
     settings_dir: PathBuf,
     pub(crate) overlay: Option<Overlay>,
@@ -703,6 +707,7 @@ impl Workspace {
             split_down: layout.split_down,
             closed: Vec::new(),
             recent,
+            recent_edited: layout.recent_edited.clone(),
             state_dir,
             settings_dir,
             overlay: None,
@@ -2060,6 +2065,28 @@ impl Workspace {
         for tab in self.panes.iter().flat_map(|pane| &pane.tabs) {
             (tab.editor.save)(cx);
         }
+    }
+
+    /// The files edited in this project, the latest first. Opening a file alone does
+    /// not put it here.
+    pub fn recent_edited(&self) -> &[PathBuf] {
+        &self.recent_edited
+    }
+
+    /// A buffer of `path` was edited: the file goes to the front of the edited list and
+    /// the layout is written a moment later, so the list outlives the window.
+    pub fn remember_edited(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self
+            .recent_edited
+            .first()
+            .is_some_and(|known| known == path)
+        {
+            return;
+        }
+        self.recent_edited.retain(|known| known != path);
+        self.recent_edited.insert(0, path.to_path_buf());
+        self.recent_edited.truncate(RECENT_EDITED_LIMIT);
+        self.layout_changed(cx);
     }
 
     /// The folder with the settings file, and what plugins and keys add to it.
@@ -3636,6 +3663,7 @@ impl Workspace {
             tree_expanded: self.layout.tree_expanded.clone(),
             tree_selected: self.layout.tree_selected.clone(),
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
+            recent_edited: self.recent_edited.clone(),
         }
     }
 

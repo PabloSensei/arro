@@ -14,8 +14,7 @@ use plugin_host::{
 const TOY: &str = env!("CARGO_BIN_EXE_plugin-host-toy");
 
 fn plugins_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("plugin-host-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = test_support::scratch("plugin-host");
     let write = |path: &str, text: &str| {
         let path = dir.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -198,14 +197,11 @@ fn a_toy_plugin_runs_edits_hangs_and_crashes_while_the_host_goes_on() {
 
     host.shutdown();
     assert_eq!(state(&host, "toy"), PluginState::NotStarted);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn settings_survive_a_save_and_a_missing_file_means_all_on() {
-    let path = std::env::temp_dir()
-        .join(format!("plugin-settings-{}", std::process::id()))
-        .join("plugins.toml");
+    let path = test_support::scratch("plugin-settings").join("plugins.toml");
     assert_eq!(
         PluginSettings::load(&path).unwrap(),
         PluginSettings::default()
@@ -217,7 +213,6 @@ fn settings_survive_a_save_and_a_missing_file_means_all_on() {
     settings.save(&path).unwrap();
 
     assert_eq!(PluginSettings::load(&path).unwrap(), settings);
-    let _ = fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// The example from `examples/plugins/hello`, as a user would install it. Needs Node.
@@ -229,8 +224,7 @@ fn the_hello_example_upper_cases_the_selection() {
         return;
     }
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../examples/plugins/hello");
-    let dir = std::env::temp_dir().join(format!("plugin-hello-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = test_support::scratch("plugin-hello");
     for file in ["plugin.toml", "main.js", "themes/dusk.toml"] {
         let target = dir.join("hello").join(file);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -263,5 +257,4 @@ fn the_hello_example_upper_cases_the_selection() {
 
     assert_eq!(*text.lock().unwrap(), "let ЁЛКА = 1;");
     host.shutdown();
-    let _ = fs::remove_dir_all(&dir);
 }
