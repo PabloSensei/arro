@@ -94,11 +94,12 @@ impl Pty {
             master
         };
         let name = slave_name(&master)?;
-        set_size(&master, spec.cols, spec.rows)?;
         let slave = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&name)?;
+        // macOS refuses the size of a terminal whose slave side nobody has opened yet.
+        set_size(&master, spec.cols, spec.rows)?;
 
         let mut command = Command::new("/bin/sh");
         command

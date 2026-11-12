@@ -97,7 +97,19 @@ pub fn scratch(name: &str) -> PathBuf {
 
 /// The root of all test folders, `<system temp>/arro-tests`.
 pub fn root() -> PathBuf {
-    std::env::temp_dir().join(ROOT)
+    system_temp().join(ROOT)
+}
+
+/// The system temp folder as the file system names it. On macOS it is `/var/folders/...`,
+/// a link to `/private/var/folders/...`, and git and the file watcher report the real
+/// path, which the tests compare with the one they made.
+fn system_temp() -> PathBuf {
+    let temp = std::env::temp_dir();
+    #[cfg(target_os = "macos")]
+    if let Ok(real) = std::fs::canonicalize(&temp) {
+        return real;
+    }
+    temp
 }
 
 /// A name that is safe in a path: the characters of a test name stay, the rest becomes `-`.
