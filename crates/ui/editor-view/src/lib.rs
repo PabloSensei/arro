@@ -4,6 +4,7 @@
 mod actions;
 mod bar;
 mod blocks;
+mod code_lens;
 mod delete;
 mod element;
 mod generate;
@@ -11,6 +12,7 @@ mod hierarchy;
 mod hippie;
 mod input;
 mod live;
+mod quick_doc;
 mod refactor;
 mod regions;
 mod scrollbar;
@@ -21,6 +23,11 @@ mod view;
 
 pub use element::StripeKind;
 pub use live::{KeyUse, LiveTemplates, TemplateList};
+pub use quick_doc::{
+    DocAlign, DocBlock, DocHost, DocInline, DocLinkHandler, DocSelectEvent, DocSelectHandler,
+    display_text as display_documentation, parse as parse_documentation, render_document,
+    split_line_fragment,
+};
 pub use refactor::FolderMove;
 pub use semantic::{
     CompletionCase, CompletionSources, ExternalLinks, ExternalOpener, LocalCompletions, Semantic,
@@ -34,7 +41,8 @@ pub use style::{EditorStyle, SemanticLook};
 pub use syntax::{FoldStyle, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
-    BookmarkEntry, DetailedUsage, EditorEvent, EditorOptions, EditorView, GutterKind, GutterMark,
-    Languages, OutlineItem, OutlineKind, ProblemSummary, RunMark, RunMarkState, Spot, Usage,
-    UsagesUpdate, bookmarks, clipboard_history, install_keymap,
+    BookmarkEntry, DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView,
+    GutterKind, GutterMark, InlayPaint, Languages, OutlineItem, OutlineKind, ProblemSummary,
+    RowPaint, RunMark, RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate, bookmarks,
+    clipboard_history, install_keymap,
 };

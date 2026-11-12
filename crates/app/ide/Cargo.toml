@@ -26,4 +26,5 @@ panels = { path = "../../ui/panels" }
 platform.workspace = true
 store = { path = "../../foundation/store" }
 syntax = { path = "../../editor/syntax" }
+updater.workspace = true
 workspace = { path = "../../ui/workspace" }

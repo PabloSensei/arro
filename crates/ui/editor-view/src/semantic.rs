@@ -886,6 +886,8 @@ pub(crate) struct Lsp {
     pub received: bool,
     pub completion: Option<Completion>,
     pub note: Option<Note>,
+    /// Ctrl+Q and the hover popup: the documentation with its blocks and links.
+    pub quick: Option<crate::quick_doc::QuickDoc>,
     pub actions: Option<ActionMenu>,
     pub rename: Option<RenameField>,
     pub move_to: Option<MoveField>,
@@ -931,6 +933,16 @@ pub(crate) fn inlay_settings(options: &crate::view::EditorOptions) -> lang_api::
     lang_api::InlayHintSettings {
         parameter_names: options.inlay_parameter_names,
         type_hints: options.inlay_type_hints,
+    }
+}
+
+/// What Settings shows above declarations, for the language and its server.
+pub(crate) fn code_vision_settings(
+    options: &crate::view::EditorOptions,
+) -> lang_api::CodeVisionSettings {
+    lang_api::CodeVisionSettings {
+        usages: options.code_vision_usages,
+        implementations: options.code_vision_implementations,
     }
 }
 
@@ -1000,6 +1012,7 @@ impl EditorView {
     /// A scroll or a jump asks for the hints of the new part unless the last answer
     /// already covers it.
     pub(crate) fn inlays_if_needed(&mut self, cx: &mut Context<Self>) {
+        self.resolve_visible_code_lens(cx);
         let range = {
             let Some(state) = &self.state else {
                 return;
@@ -1141,6 +1154,7 @@ impl EditorView {
             received: !follows_diagnostics,
             completion: None,
             note: None,
+            quick: None,
             actions: None,
             rename: None,
             move_to: None,
@@ -1160,8 +1174,11 @@ impl EditorView {
         if let Some(lsp) = &self.lsp {
             lsp.support
                 .set_inlay_hint_settings(inlay_settings(&self.options));
+            lsp.support
+                .set_code_vision_settings(code_vision_settings(&self.options));
         }
         self.request_inlays(Duration::ZERO, cx);
+        self.request_code_lens(Duration::ZERO, cx);
     }
 
     /// Asks for the semantic tokens once the file is open. The whole document is asked
@@ -1454,6 +1471,16 @@ impl EditorView {
         Some((spot, caret))
     }
 
+    /// The place at `offset`, for a question that does not move the caret.
+    pub(crate) fn spot_at(&self, offset: usize) -> Option<DocumentSpot> {
+        let (lsp, state) = (self.lsp.as_ref()?, self.state.as_ref()?);
+        Some(DocumentSpot {
+            uri: lsp.uri.clone(),
+            version: state.version() as i32,
+            point: point_at(state.store(), offset),
+        })
+    }
+
     pub(crate) fn show_note(
         &mut self,
         at: usize,
@@ -1461,6 +1488,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         if let Some(lsp) = &mut self.lsp {
+            lsp.quick = None;
             lsp.note = Some(Note {
                 at,
                 text: text.into(),
@@ -1966,8 +1994,24 @@ impl EditorView {
         );
     }
 
-    /// Ctrl+Q.
+    /// The place, the problem and the language for the Documentation tool window.
+    pub fn documentation_query(&self) -> Option<crate::DocumentationQuery> {
+        let lsp = self.lsp.as_ref()?;
+        lsp.support.hover()?;
+        let (spot, offset) = self.spot()?;
+        Some(crate::DocumentationQuery {
+            spot,
+            offset,
+            diagnostic: self.diagnostic_at(offset),
+            support: lsp.support.clone(),
+        })
+    }
+
+    /// Ctrl+Q. The second press pins the popup to the Documentation tool window.
     pub(crate) fn quick_doc(&mut self, cx: &mut Context<Self>) {
+        if self.toggle_quick_doc(cx) {
+            return;
+        }
         let Some((spot, caret)) = self.spot() else {
             return;
         };
@@ -1978,7 +2022,11 @@ impl EditorView {
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
             this.update(cx, |this, cx| match answer {
-                Some((text, _)) if !text.0.trim().is_empty() => this.show_note(caret, text.0, cx),
+                Some((text, _)) if !text.0.trim().is_empty() => {
+                    let blocks = crate::quick_doc::parse(&text.0);
+                    let diagnostic = this.diagnostic_at(caret);
+                    this.show_quick_doc(caret, blocks, diagnostic, None, cx);
+                }
                 Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
                 Some(_) => this.show_note(caret, "No documentation found", cx),
                 None => {}

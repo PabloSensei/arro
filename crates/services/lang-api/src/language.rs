@@ -232,6 +232,22 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Labels above the declarations of a document, such as their number of usages.
+    fn code_lens(&self) -> Option<&crate::CodeLensProvider> {
+        None
+    }
+
+    /// The command of a label the editor shows, when the server resolves labels apart.
+    fn code_lens_resolve(&self) -> Option<&crate::CodeLensResolveProvider> {
+        None
+    }
+
+    /// Tells the language which labels Settings shows, so that its server can stop
+    /// sending the ones that are off.
+    fn set_code_vision_settings(&self, settings: crate::CodeVisionSettings) {
+        let _ = settings;
+    }
+
     /// Whether the provider colours a part of a document on its own. The editor then
     /// asks only for the visible part of a big file.
     fn semantic_tokens_range(&self) -> bool {

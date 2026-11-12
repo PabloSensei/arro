@@ -13,7 +13,8 @@
 //! run and `tests-idle` waits until nothing runs.
 //! `docker:ACTION:NAME` waits for an image (`run`) or a container (`start`, `stop`,
 //! `restart`, `remove`, `logs`, `exec`) of that name in the Services panel and acts on it,
-//! `docker-until:TEXT` waits for the panel to show the text.
+//! `docker-until:TEXT` waits for the panel to show the text. `wait-ready` waits until the
+//! language server reports the ready state, so a scenario needs no guessed timeout.
 //! `reopen-tab`, `pin`, `split-down`, `move-group`, `group:next|prev`, `previous-tab`, `save-all`,
 //! `format:CRLF|LF|UTF-8...`, `caret:LINE:COLUMN` (from 1, as the status bar shows it) work on the
 //! tabs; `new:LABEL:FOLDER:NAME`, `rename:PATH:NEW`, `delete:PATH` do what the project tree does.
@@ -117,6 +118,7 @@ pub enum Step {
     Agent(Harness),
     AgentInput(u64),
     Wait(u64),
+    WaitReady,
     Config(String),
     Task(String),
     Show(String),
@@ -243,6 +245,7 @@ fn parse_step(step: &str) -> Result<Step, String> {
             Step::Agent(*harness.ok_or(format!("unknown harness {value}"))?)
         }
         "wait" => Step::Wait(value.parse().map_err(|_| format!("bad wait {value}"))?),
+        "wait-ready" => Step::WaitReady,
         "config" => Step::Config(value.into()),
         "show" => Step::Show(value.into()),
         "message" => Step::Message(value.into()),
@@ -553,6 +556,7 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
         | Step::Key(_)
         | Step::Type(_)
         | Step::Wait(_)
+        | Step::WaitReady
         | Step::Config(_)
         | Step::Task(_)
         | Step::Message(_)
@@ -666,6 +670,40 @@ fn tree_step(step: &Step, window: &mut Window, cx: &mut App) {
     });
 }
 
+/// Whether a status line of the language says that its server is ready.
+fn language_ready(status: Option<&str>) -> bool {
+    // The line reads `Name: state` or `Name: state: error`, and the state is its last
+    // word before any error, so an error that mentions the word does not pass for it.
+    status.is_some_and(|text| {
+        let head = text.splitn(3, ':').take(2).collect::<Vec<_>>().join(":");
+        head.split(|character: char| !character.is_alphanumeric())
+            .rfind(|word| !word.is_empty())
+            .is_some_and(|word| word.eq_ignore_ascii_case("ready"))
+    })
+}
+
+/// A step that works on the text of the open file. The file is read in the background, so
+/// the step waits until the tab shows it: a key sent before that would go nowhere.
+fn waits_for_the_text(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::Goto(_)
+            | Step::Caret(..)
+            | Step::Mark(_)
+            | Step::Key(_)
+            | Step::Type(_)
+            | Step::Format(_)
+    )
+}
+
+/// Whether the tab in front holds its text, or is a view that takes no text at all.
+fn editor_ready(workspace: &Workspace, cx: &App) -> bool {
+    workspace
+        .active_view()
+        .and_then(|view| view.downcast::<editor_view::EditorView>().ok())
+        .is_none_or(|view| view.read(cx).is_ready())
+}
+
 fn check(step: &Step, cx: &mut App) -> bool {
     let panel = cx.global::<ActiveRunPanel>().0.clone();
     match step {
@@ -703,10 +741,41 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
     };
     cx.spawn_in(window, async move |this, cx| {
         for step in steps {
+            // A tab shows its text a moment after it opens: a key or a jump sent before
+            // that would go nowhere, and the caret would stay where the file starts.
+            if waits_for_the_text(&step) {
+                let started = Instant::now();
+                loop {
+                    let ready = this
+                        .update_in(cx, |workspace, _, cx| editor_ready(workspace, cx))
+                        .unwrap_or(false);
+                    if ready || started.elapsed() > PATIENCE {
+                        break;
+                    }
+                    cx.background_executor().timer(RECHECK).await;
+                }
+            }
             match &step {
                 Step::Wait(ms) => {
                     let delay = Duration::from_millis(*ms);
                     cx.background_executor().timer(delay).await;
+                    continue;
+                }
+                Step::WaitReady => {
+                    let started = Instant::now();
+                    loop {
+                        let ready = this
+                            .update_in(cx, |workspace, _, _| {
+                                language_ready(
+                                    workspace.language_status().map(|text| text.as_ref()),
+                                )
+                            })
+                            .unwrap_or(false);
+                        if ready || started.elapsed() > PATIENCE {
+                            break;
+                        }
+                        cx.background_executor().timer(RECHECK).await;
+                    }
                     continue;
                 }
                 Step::Config(_)

@@ -34,16 +34,41 @@ pub fn config_from_env(root: &Path, state_dir: &Path) -> Option<JdtlsConfig> {
         jdtls_home: var(JDTLS_HOME)?,
         debug_plugin: var(DEBUG_PLUGIN)?,
     };
-    Some(config_for(&toolchain, root, state_dir))
+    Some(config_for(
+        &toolchain,
+        root,
+        state_dir,
+        &project_model::BuildTools::default(),
+    ))
 }
 
 /// The settings for `root` from a toolchain that the search already found, which is
 /// what a start without `run-arro.cmd` uses.
 pub fn config_of(toolchain: &Toolchain, root: &Path, state_dir: &Path) -> JdtlsConfig {
-    config_for(toolchain, root, state_dir)
+    config_of_with(
+        toolchain,
+        root,
+        state_dir,
+        &project_model::BuildTools::default(),
+    )
 }
 
-fn config_for(toolchain: &Toolchain, root: &Path, state_dir: &Path) -> JdtlsConfig {
+/// The settings for `root`, with what the Settings pages say about the build tools.
+pub fn config_of_with(
+    toolchain: &Toolchain,
+    root: &Path,
+    state_dir: &Path,
+    build_tools: &project_model::BuildTools,
+) -> JdtlsConfig {
+    config_for(toolchain, root, state_dir, build_tools)
+}
+
+fn config_for(
+    toolchain: &Toolchain,
+    root: &Path,
+    state_dir: &Path,
+    build_tools: &project_model::BuildTools,
+) -> JdtlsConfig {
     let var = |name| std::env::var_os(name).map(PathBuf::from);
     // The project compiles on its own SDK; the one that runs the server is a separate
     // thing and may be newer. Without a project SDK the server's own one stands in.
@@ -51,9 +76,35 @@ fn config_for(toolchain: &Toolchain, root: &Path, state_dir: &Path) -> JdtlsConf
     let runtimes = runtimes_for(&environment, &toolchain.java_home);
     // Gradle runs on the project SDK only when the user chose one: Gradle 9 itself
     // needs 17 or newer, and an old project may ask for 8.
-    let gradle_java_home = (environment.reason == project_model::RuntimeReason::User)
-        .then(|| environment.selected.as_ref().map(|jdk| jdk.home.clone()))
-        .flatten();
+    let gradle_java_home = build_tools
+        .second
+        .runtime_home_path()
+        .map(PathBuf::from)
+        .or_else(|| {
+            (environment.reason == project_model::RuntimeReason::User)
+                .then(|| environment.selected.as_ref().map(|jdk| jdk.home.clone()))
+                .flatten()
+        });
+    let maven_settings = build_tools
+        .first
+        .settings_path()
+        .map(PathBuf::from)
+        .or_else(|| var(MAVEN_SETTINGS));
+    // The offline flag of the page of the tool that imports this project. Maven wins
+    // when a project carries both builds, as `detect_build_system` does.
+    let gradle_project = [
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    ]
+    .iter()
+    .any(|name| root.join(name).is_file());
+    let offline = if gradle_project {
+        build_tools.second.offline
+    } else {
+        build_tools.first.offline
+    };
     JdtlsConfig {
         jdtls_home: toolchain.jdtls_home.clone(),
         debug_plugin: toolchain.debug_plugin.clone(),
@@ -61,10 +112,11 @@ fn config_for(toolchain: &Toolchain, root: &Path, state_dir: &Path) -> JdtlsConf
         project_root: root.to_path_buf(),
         state_dir: project_state_dir(state_dir, root),
         runtimes,
-        maven_settings: var(MAVEN_SETTINGS),
-        gradle_user_home: None,
+        maven_settings,
+        gradle_home: build_tools.second.home_path().map(PathBuf::from),
+        gradle_user_home: build_tools.second.user_home_path().map(PathBuf::from),
         gradle_java_home,
-        offline: std::env::var_os(OFFLINE).is_some(),
+        offline: std::env::var_os(OFFLINE).is_some() || offline,
         environment: HashMap::new(),
     }
 }
@@ -376,6 +428,7 @@ mod tests {
             state_dir: missing,
             runtimes: Vec::new(),
             maven_settings: None,
+            gradle_home: None,
             gradle_user_home: None,
             gradle_java_home: None,
             offline: true,

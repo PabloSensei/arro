@@ -392,6 +392,15 @@ impl EditorState {
         self.map.inlays.as_slice()
     }
 
+    /// The rows above lines that hold a label of their own, not text of the buffer.
+    pub fn set_blocks(&mut self, blocks: Vec<display_map::Block>) {
+        self.map.set_blocks(blocks);
+    }
+
+    pub fn blocks(&self) -> &[display_map::Block] {
+        self.map.blocks()
+    }
+
     pub fn map(&self) -> &DisplayMap {
         &self.map
     }
@@ -1318,18 +1327,15 @@ impl EditorState {
         let goal = self
             .goal
             .unwrap_or_else(|| chars_in(&display.line(primary.row).text, primary.column));
-        let last = display.row_count().saturating_sub(1) as isize;
         let moved = self.buffer.selections().map(|selection| {
             let point = display.to_display(selection.head);
-            let row = point.row as isize + rows;
-            let head = if row < 0 {
-                0
-            } else if row > last {
-                self.buffer.store().len()
-            } else {
-                let row = row as usize;
-                let column = column_of_char(&display.line(row).text, goal);
-                display.to_offset(DisplayPoint { row, column }, Bias::Left)
+            let head = match display.text_row(point.row, rows) {
+                Some(row) => {
+                    let column = column_of_char(&display.line(row).text, goal);
+                    display.to_offset(DisplayPoint { row, column }, Bias::Left)
+                }
+                None if rows < 0 => 0,
+                None => self.buffer.store().len(),
             };
             if extend {
                 Selection::new(selection.anchor, head)

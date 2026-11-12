@@ -147,6 +147,7 @@ fn fixture(project: &str, name: &str, extra: &[(&str, &str)]) -> Fixture {
             runtime("JavaSE-25", "25", true),
         ],
         maven_settings: Some(settings),
+        gradle_home: None,
         gradle_user_home: gradle_home(),
         gradle_java_home: Some(fs::canonicalize(corpus.join("jdk").join("17")).unwrap()),
         offline: true,

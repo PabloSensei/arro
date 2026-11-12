@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 
+use templates::ExpandWith;
 use text_core::TextStore;
 use ui_kit::*;
 
@@ -69,6 +70,11 @@ impl EntityInputHandler for EditorView {
             || self.move_typed(text, cx)
             || self.rename_typed(text, cx)
         {
+            return;
+        }
+        // A space expands the template that chose Space when its abbreviation ends here,
+        // and the space itself is not inserted then.
+        if text == " " && self.template_expand_key(ExpandWith::Space, cx) {
             return;
         }
         let bytes = range.and_then(|range| self.to_utf8(&range));

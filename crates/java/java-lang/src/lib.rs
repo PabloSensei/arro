@@ -3,6 +3,7 @@
 
 mod debug;
 mod environment;
+mod file_templates;
 mod language;
 mod live_templates;
 mod lombok;
@@ -13,6 +14,7 @@ mod setup;
 
 pub use debug::{DebugExtension, DebugSession, JavaDebugger, ResolvedMain};
 pub use environment::{JavaEnvironment, project_environment};
+pub use file_templates::file_templates;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,9 +30,10 @@ pub use jdtls_adapter::{ImportFailure, JdtlsConfig, Runtime};
 pub use language::{JavaSyntax, LANGUAGE_ID};
 pub use live_templates::templates_for;
 pub use project::{JavaProject, OpenError};
+pub use project_model::BuildTools;
 pub use session::{
     DEBUG_PLUGIN, JAVA_HOME, JDTLS_HOME, JavaSession, MAVEN_SETTINGS, OFFLINE, config_from_env,
-    config_of, open_error_text, project_state_dir, status_text,
+    config_of, config_of_with, open_error_text, project_state_dir, status_text,
 };
 pub use setup::{Missing, Search, Toolchain, discover};
 pub use sidecar::{State, Status, Trust};
@@ -81,9 +84,14 @@ pub fn test_sites(source: &str, path: &Path) -> Vec<TestSite> {
 
 /// The build tool of the project in `root` and the provider of its run configurations.
 /// `cache_root` moves the model cache, the default is the user cache.
-pub fn project_build(root: &Path, cache_root: Option<PathBuf>) -> ProjectBuild {
+pub fn project_build(
+    root: &Path,
+    cache_root: Option<PathBuf>,
+    build_tools: project_model::BuildTools,
+) -> ProjectBuild {
     let env = BuildEnv {
         cache_root,
+        build_tools,
         ..BuildEnv::default()
     };
     let tool = detect_build_system(root, &env);
@@ -115,9 +123,19 @@ pub fn package_of(root: &Path, folder: &Path) -> String {
     inside.join(".")
 }
 
-/// The text of a new source file: `kind` is `class`, `interface`, `enum` or `record`.
+/// The text of a new source file: `kind` is `class`, `interface`, `enum`, `record`,
+/// `annotation` or `package-info`.
 pub fn new_source(kind: &str, root: &Path, folder: &Path, name: &str) -> String {
     let package = package_of(root, folder);
+    if let Some(text) = file_templates::default_file_text(kind) {
+        return templates::render_file_template(
+            text,
+            &package,
+            name,
+            &templates::user_name(),
+            &templates::today(),
+        );
+    }
     let header = if package.is_empty() {
         String::new()
     } else {
@@ -210,6 +228,7 @@ mod tests {
             state_dir: missing,
             runtimes: Vec::new(),
             maven_settings: None,
+            gradle_home: None,
             gradle_user_home: None,
             gradle_java_home: None,
             offline: true,

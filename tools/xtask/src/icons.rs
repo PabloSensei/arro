@@ -223,6 +223,24 @@ const ICONS: &[Icon] = &[
         paint: Paint::Main,
     },
     Icon {
+        name: "general/arrowLeft",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "arrow-left",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
+        name: "general/arrowRight",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "arrow-right",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
         name: "general/arrowUp",
         size: 16,
         shape: Shape::Lucide {
@@ -1071,7 +1089,7 @@ mod tests {
     fn every_icon_file_exists_and_has_the_expected_shape() {
         let directory = root().join(ICON_DIR);
         let files = expected_files();
-        assert_eq!(files.len(), 155);
+        assert_eq!(files.len(), 159);
         for (name, size) in files {
             let path = directory.join(&name);
             let text = fs::read_to_string(&path)

@@ -96,6 +96,7 @@ fn project(name: &str) -> (PathBuf, PathBuf, JdtlsConfig) {
         state_dir: state_dir.join("server"),
         runtimes: vec![runtime("JavaSE-17", "17", true)],
         maven_settings: Some(settings),
+        gradle_home: None,
         gradle_user_home: None,
         gradle_java_home: None,
         offline: true,

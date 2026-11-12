@@ -253,6 +253,7 @@ fn test_language() -> &'static TemplateLanguage {
         indent_unit: "    ",
         receiver_prefixes: &["new"],
         query: OnceLock::new(),
+        declarations: None,
     })
 }
 

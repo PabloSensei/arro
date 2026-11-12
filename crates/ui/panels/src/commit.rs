@@ -11,7 +11,7 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::{CommitOptions, CommitRequest};
-use workspace::{COMMIT_TOOL, Workspace};
+use workspace::{COMMIT_TOOL, Settings, Workspace};
 
 use crate::changelists::{Changelists, Grouping};
 use crate::diff_view::DiffView;
@@ -323,7 +323,9 @@ impl CommitPanel {
                 amend: false,
                 sign_off: false,
                 author: None,
-                analysis: false,
+                analysis: cx
+                    .try_global::<Settings>()
+                    .is_some_and(|settings| settings.git_analyze_before_commit),
                 tab: Tab::Commit,
                 lists,
                 lists_key,
@@ -1264,6 +1266,7 @@ impl CommitPanel {
     /// Commits the ticked files with the message, and sends them when `push` is set.
     pub fn commit(&mut self, push: bool, cx: &mut Context<Self>) {
         let paths = self.checked_paths(cx);
+        self.warn_crlf(&paths, cx);
         let open = self.open_files(cx);
         let request =
             match prepare_commit_with(&self.message.text, &paths, open, self.amend, |path| {
@@ -1287,6 +1290,37 @@ impl CommitPanel {
             return;
         }
         self.commit_now(request, push, options, cx);
+    }
+
+    /// Warns about CRLF line separators of the ticked files, as the settings ask. The
+    /// commit goes on: the warning is the point.
+    fn warn_crlf(&self, paths: &[String], cx: &mut Context<Self>) {
+        let warn = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.git_warn_crlf);
+        if !warn {
+            return;
+        }
+        let turned: Vec<&String> = paths
+            .iter()
+            .filter(|path| {
+                std::fs::read(self.root.join(path))
+                    .is_ok_and(|text| text.windows(2).any(|pair| pair == b"\r\n"))
+            })
+            .collect();
+        let text = match turned.as_slice() {
+            [] => return,
+            [path] => format!("{path} has CRLF line separators. The commit goes on."),
+            [_, ..] => format!(
+                "{} files have CRLF line separators. The commit goes on.",
+                turned.len()
+            ),
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user("Commit", text, cx)
+            })
+            .ok();
     }
 
     /// Sends the request to git. The message field stays as the user left it when git

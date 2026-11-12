@@ -37,6 +37,8 @@ pub struct EditorStyle {
     pub indent_guide: Hsla,
     pub inlay: Hsla,
     pub inlay_background: Hsla,
+    /// The labels above declarations, as the interface font draws them.
+    pub code_vision: Hsla,
     pub fold_background: Hsla,
     pub fold_text: Hsla,
     pub error_mark: Hsla,
@@ -102,6 +104,7 @@ impl EditorStyle {
             indent_guide: theme.indent_guide,
             inlay: theme.inlay,
             inlay_background: theme.inlay_bg,
+            code_vision: theme.text_muted,
             fold_background: theme.fold_bg,
             fold_text: theme.fold_text,
             // No theme token yet: the red of an IDEA error stripe.

@@ -611,14 +611,14 @@ fn doc_signature_type_and_hierarchy_keys_show_notes_and_lists(cx: &mut TestAppCo
     press(cx, window, "ctrl-q");
     draw(cx, window);
     assert!(
-        bounds_of(cx, window, "lsp-note").size.height > px(0.),
+        bounds_of(cx, window, "quick-doc").size.height > px(0.),
         "Ctrl+Q shows the documentation"
     );
 
     press(cx, window, "ctrl-p");
     draw(cx, window);
     assert!(
-        bounds_of(cx, window, "lsp-note").size.height > px(0.),
+        bounds_of(cx, window, "signature-popup").size.height > px(0.),
         "Ctrl+P shows the signature"
     );
 

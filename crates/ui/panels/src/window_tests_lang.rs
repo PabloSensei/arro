@@ -10,14 +10,15 @@ use std::sync::{Arc, Mutex};
 use editor_view::{Languages, uri_path};
 use keymap::workspace as keys;
 use lang_api::{
-    ActionEntry, ActionKind, ActionProvider, ActionQuery, Answer, CompletionEntry, CompletionList,
-    CompletionProvider, Confidence, DiagnosticEntry, DiagnosticsProvider, DiagnosticsQuery,
-    DocumentEdit, DocumentSpot, FormatProvider, FormatQuery, InlayHintEntry, InlayHintKind,
-    InlayHintProvider, InlayHintQuery, LanguageFn, LanguageId, LanguageSupport, MoveDestination,
-    MoveDestinationProvider, MoveOutcome, MoveProvider, MoveQuery, MoveRequest, NavigationProvider,
-    NavigationQuery, Provider, Queries, ReferencesProvider, RenameProvider, RenameQuery,
-    SemanticServer, Severity, SourceEdit, SourceId, SourceSpan, SyntaxProvider, TextPoint,
-    TextSpan, WorkspaceChange, offset_in,
+    ActionEntry, ActionKind, ActionProvider, ActionQuery, Answer, CodeLensCommand, CodeLensEntry,
+    CodeLensProvider, CodeLensQuery, CodeLensResolveProvider, CodeLensResolveQuery,
+    CompletionEntry, CompletionList, CompletionProvider, Confidence, DiagnosticEntry,
+    DiagnosticsProvider, DiagnosticsQuery, DocumentEdit, DocumentSpot, FormatProvider, FormatQuery,
+    InlayHintEntry, InlayHintKind, InlayHintProvider, InlayHintQuery, LanguageFn, LanguageId,
+    LanguageSupport, MoveDestination, MoveDestinationProvider, MoveOutcome, MoveProvider,
+    MoveQuery, MoveRequest, NavigationProvider, NavigationQuery, Provider, Queries,
+    ReferencesProvider, RenameProvider, RenameQuery, SemanticServer, Severity, SourceEdit,
+    SourceId, SourceSpan, SyntaxProvider, TextPoint, TextSpan, WorkspaceChange, offset_in,
 };
 use platform::CanonPath;
 use ui_kit::gpui;
@@ -123,6 +124,23 @@ fn move_inlays(hints: &mut Vec<(usize, String, InlayHintKind)>, old: &str, new: 
     });
 }
 
+/// A fake server moves the labels it keeps along the edits, as a client that sends
+/// changes to its server sees them.
+fn move_code_lens(lenses: &mut Vec<(usize, String, String)>, old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    let (start, old_end, new_end) = replaced_piece(old, new);
+    lenses.retain_mut(|(offset, _, _)| {
+        if *offset >= old_end {
+            *offset = new_end + (*offset - old_end);
+            true
+        } else {
+            *offset <= start
+        }
+    });
+}
+
 fn word_at(text: &str, point: TextPoint) -> Option<String> {
     let offset = offset_in(text, point);
     let mut start = offset;
@@ -176,6 +194,8 @@ pub(crate) struct FakeLanguage {
     references: Mutex<Vec<SourceSpan>>,
     /// Hints by the offset of their place in the text.
     inlays: Mutex<Vec<(usize, String, InlayHintKind)>>,
+    /// Labels by the offset of their declaration, with the command of their click.
+    code_lens: Mutex<Vec<(usize, String, String)>>,
     destinations: Mutex<Vec<MoveDestination>>,
     move_target: Mutex<Option<PathBuf>>,
     closed: Mutex<Option<PathBuf>>,
@@ -192,6 +212,7 @@ impl FakeLanguage {
             actions: Mutex::new(Vec::new()),
             references: Mutex::new(Vec::new()),
             inlays: Mutex::new(Vec::new()),
+            code_lens: Mutex::new(Vec::new()),
             destinations: Mutex::new(Vec::new()),
             move_target: Mutex::new(None),
             closed: Mutex::new(None),
@@ -224,6 +245,12 @@ impl FakeLanguage {
     /// The hints the fake server answers, by the byte offset of their place.
     pub(crate) fn set_inlays(&self, hints: Vec<(usize, String, InlayHintKind)>) {
         *self.inlays.lock().unwrap() = hints;
+    }
+
+    /// The labels the fake server answers, by the offset of their declaration and with
+    /// the command of a click.
+    pub(crate) fn set_code_lens(&self, lenses: Vec<(usize, String, String)>) {
+        *self.code_lens.lock().unwrap() = lenses;
     }
 
     pub(crate) fn set_move(&self, target: PathBuf, destinations: Vec<MoveDestination>) {
@@ -265,6 +292,7 @@ impl SemanticServer for FakeLanguage {
             .insert(uri.to_owned(), text.clone());
         if let Some(old) = old {
             move_inlays(&mut self.inlays.lock().unwrap(), &old, &text);
+            move_code_lens(&mut self.code_lens.lock().unwrap(), &old, &text);
         }
     }
 
@@ -352,6 +380,51 @@ impl Provider<InlayHintQuery, Vec<InlayHintEntry>> for FakeLanguage {
             })
             .collect();
         let _ = reply.send(self.answer(entries));
+    }
+}
+
+impl Provider<CodeLensQuery, Vec<CodeLensEntry>> for FakeLanguage {
+    fn start(
+        &self,
+        query: CodeLensQuery,
+        _: base::Cancel,
+        mut reply: lang_api::Reply<Vec<CodeLensEntry>>,
+    ) {
+        let text = self.text_of(&query.uri).unwrap_or_default();
+        let entries = self
+            .code_lens
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(offset, title, command)| {
+                let offset = (*offset).min(text.len());
+                let start = point_in(&text, offset);
+                let end = point_in(&text, (offset + title.len()).min(text.len()));
+                CodeLensEntry {
+                    span: TextSpan { start, end },
+                    title: title.clone(),
+                    kind: lang_api::kind_of(title, Some(command.as_str())),
+                    resolve: None,
+                    command: Some(CodeLensCommand {
+                        title: title.clone(),
+                        command: command.clone(),
+                        arguments: None,
+                    }),
+                }
+            })
+            .collect();
+        let _ = reply.send(self.answer(entries));
+    }
+}
+
+impl Provider<CodeLensResolveQuery, CodeLensEntry> for FakeLanguage {
+    fn start(
+        &self,
+        query: CodeLensResolveQuery,
+        _: base::Cancel,
+        mut reply: lang_api::Reply<CodeLensEntry>,
+    ) {
+        let _ = reply.send(self.answer(query.lens));
     }
 }
 
@@ -518,6 +591,14 @@ impl LanguageSupport for FakeLanguage {
     }
 
     fn inlay_hints(&self) -> Option<&InlayHintProvider> {
+        Some(self)
+    }
+
+    fn code_lens(&self) -> Option<&CodeLensProvider> {
+        Some(self)
+    }
+
+    fn code_lens_resolve(&self) -> Option<&CodeLensResolveProvider> {
         Some(self)
     }
 

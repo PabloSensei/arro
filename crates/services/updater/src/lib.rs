@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::Deserialize;
@@ -19,9 +19,14 @@ pub const UPDATE_URL_ENV: &str = "ARRO_UPDATE_URL";
 pub const NO_UPDATE_CHECK_ENV: &str = "ARRO_NO_UPDATE_CHECK";
 /// The asset suffix of the only platform the distribution is made for.
 pub const PLATFORM: &str = "windows-x86_64";
+/// The list of files the installed release brought, one relative path per line. It
+/// tells the first start after an update which folders of the old release are gone.
+pub const MANIFEST_FILE: &str = "install.manifest";
 
 const USER_AGENT: &str = "Arro";
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a wait asks whether a process or a file is gone.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One file of a release.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,14 +245,54 @@ fn stage_as(zip: &Path, install_dir: &Path, running: Option<&str>) -> Result<(),
     };
 
     let mut transaction = Transaction::default();
-    let result = transaction.replace(&staged, install_dir, &temp, &files, running);
-    if let Err(error) = result {
+    if let Err(error) = transaction.replace(&staged, install_dir, &temp, &files, running) {
         transaction.rollback();
         let _ = fs::remove_dir_all(&temp);
         return Err(error);
     }
+    // The start of the new version reads this list to remove the folders of the old
+    // one, so a failure here takes the replacement back too.
+    if let Err(error) = write_manifest(install_dir, &files) {
+        transaction.rollback();
+        let _ = fs::remove_file(install_dir.join(MANIFEST_FILE));
+        let _ = fs::remove_dir_all(&temp);
+        return Err(error.into());
+    }
     let _ = fs::remove_dir_all(&temp);
     Ok(())
+}
+
+/// Writes the files of the installed release, relative to `install_dir`, into
+/// [`MANIFEST_FILE`].
+fn write_manifest(install_dir: &Path, files: &[PathBuf]) -> io::Result<()> {
+    let mut listed: Vec<String> = files
+        .iter()
+        .map(|file| file.to_string_lossy().replace('\\', "/"))
+        .collect();
+    listed.sort();
+    let mut text = String::new();
+    for file in listed {
+        text.push_str(&file);
+        text.push('\n');
+    }
+    fs::write(install_dir.join(MANIFEST_FILE), text)
+}
+
+/// The files of the release that installed this folder, or `None` when the installer
+/// left no list.
+pub fn read_manifest(install_dir: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    let text = match fs::read_to_string(install_dir.join(MANIFEST_FILE)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+    ))
 }
 
 /// Deletes the `*.old` files an earlier update left next to the executable.
@@ -266,6 +311,68 @@ pub fn remove_old(install_dir: &Path) -> io::Result<usize> {
         }
     }
     Ok(removed)
+}
+
+/// Removes the folders under `tools` that the manifest of the installed release does
+/// not name. A tool that the new release still ships keeps its folder. An entry that
+/// cannot be removed goes to the journal and does not stop the others.
+pub fn remove_stale_tools(install_dir: &Path) -> io::Result<usize> {
+    let Some(files) = read_manifest(install_dir)? else {
+        return Ok(0);
+    };
+    let listed: Vec<String> = files
+        .iter()
+        .map(|file| file.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let entries = match fs::read_dir(install_dir.join("tools")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let prefix = format!("tools/{name}/");
+        if listed.iter().any(|file| file.starts_with(&prefix)) {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => eprintln!("{} is not removed: {error}", path.display()),
+        }
+    }
+    Ok(removed)
+}
+
+/// The work of the first start after an update: the `*.old` files and the tool folders
+/// of an older release. Errors go to the journal and do not stop the others.
+pub fn cleanup(install_dir: &Path) -> io::Result<usize> {
+    let mut removed = remove_old(install_dir)?;
+    match remove_stale_tools(install_dir) {
+        Ok(stale) => removed += stale,
+        Err(error) => eprintln!("the tools of an older release are not removed: {error}"),
+    }
+    Ok(removed)
+}
+
+/// Polls `gone` until it returns true, for at most `timeout`. True when it returned
+/// true before the timeout. Waits on the calling thread, so a caller keeps it off the
+/// interface.
+pub fn wait_until(mut gone: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if gone() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 #[derive(Deserialize)]
@@ -946,3 +1053,6 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 }
+
+#[cfg(test)]
+mod update_tests;

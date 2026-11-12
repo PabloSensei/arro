@@ -83,6 +83,18 @@ pub fn plan_creation(
     root: &Path,
     input: &str,
 ) -> Result<Creation, String> {
+    plan_creation_with_template(template, folder, root, input, None)
+}
+
+/// [`plan_creation`] with the text of a new file from the templates of the user. Without
+/// a definition the content function of the template makes the text.
+pub fn plan_creation_with_template(
+    template: &FileTemplate,
+    folder: &Path,
+    root: &Path,
+    input: &str,
+    definition: Option<&templates::FileTemplateDefinition>,
+) -> Result<Creation, String> {
     let input = input.trim();
     match template.creates {
         Creates::File => {
@@ -100,7 +112,10 @@ pub fn plan_creation(
                 .file_stem()
                 .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
             check_name(&stem)?;
-            let text = (template.content)(folder, root, &stem);
+            let text = match definition {
+                Some(definition) => definition.render(root, folder, &stem),
+                None => (template.content)(folder, root, &stem),
+            };
             Ok(Creation {
                 path: folder.join(name),
                 content: Some(text),

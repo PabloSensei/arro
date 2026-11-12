@@ -276,6 +276,7 @@ fn fixture(tool: Tool) -> Fixture {
             runtime("JavaSE-21", "21", true),
         ],
         maven_settings: (tool == Tool::Maven).then_some(settings),
+        gradle_home: None,
         gradle_user_home: gradle_home(),
         gradle_java_home: Some(jdk21.home.clone()),
         offline: tool == Tool::Maven,

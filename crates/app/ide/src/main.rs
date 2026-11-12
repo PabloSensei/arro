@@ -1,7 +1,8 @@
-//! The Arro binary: `arro [--state-dir DIR] [--script STEPS] [--mock-agents] [PATH]`. `PATH` is
-//! a project folder, or a file, which opens in the folder that holds it. `--mock-agents` runs
-//! harnesses in an empty home against a local model API, in builds with the `mock-agents`
-//! feature only.
+//! The Arro binary: `arro [--state-dir DIR] [--script STEPS] [--mock-agents]
+//! [--after-update PID] [PATH]`. `PATH` is a project folder, or a file, which opens in
+//! the folder that holds it. `--mock-agents` runs harnesses in an empty home against a
+//! local model API, in builds with the `mock-agents` feature only. `--after-update` is
+//! set by a restart and waits for the old process before the project opens.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -10,17 +11,21 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use editor_view::Languages;
-use java_lang::{JavaSession, Missing, Toolchain, Trust};
+use java_lang::{BuildTools, JavaSession, Missing, Toolchain, Trust};
 use lang_api::LanguageSupport;
 use panels::LanguageServer;
-use panels::{Creates, FileTemplate, ProjectSetup, ProjectTemplate};
+use panels::{Creates, FileTemplate, ProjectSetup, ProjectTemplate, TemplatesSetup};
 use syntax::LanguageConfig;
-use workspace::{AppInfo, FileIcons, Launch};
+use workspace::{AppInfo, FileIcons, Launch, Settings};
 
 mod migration;
 mod panic_log;
+
+/// The text of a new file from its folder, the project root and its name.
+type FileContent = fn(&Path, &Path, &str) -> String;
 
 fn file_icons() -> FileIcons {
     FileIcons {
@@ -55,28 +60,42 @@ fn record_text(folder: &Path, root: &Path, name: &str) -> String {
     java_lang::new_source("record", root, folder, name)
 }
 
+fn annotation_text(folder: &Path, root: &Path, name: &str) -> String {
+    java_lang::new_source("annotation", root, folder, name)
+}
+
+fn package_info_text(folder: &Path, root: &Path, name: &str) -> String {
+    java_lang::new_source("package-info", root, folder, name)
+}
+
 /// What the project tree creates besides a plain file and folder.
 fn file_templates() -> Vec<FileTemplate> {
-    let source = |label, icon, content| FileTemplate {
-        label,
-        icon,
-        extension: "java",
-        creates: Creates::File,
-        content,
-    };
-    vec![
-        source("Java Class", "nodes/class", class_text),
-        source("Interface", "nodes/interface", interface_text),
-        source("Enum", "nodes/enum", enum_text),
-        source("Record", "nodes/record", record_text),
-        FileTemplate {
-            label: "Package",
-            icon: "nodes/package",
-            extension: "",
-            creates: Creates::Folder { dotted: true },
-            content: |_, _, _| String::new(),
-        },
-    ]
+    let mut templates = Vec::new();
+    for definition in java_lang::file_templates() {
+        let (icon, content): (&'static str, FileContent) = match definition.id.as_str() {
+            "interface" => ("nodes/interface", interface_text),
+            "enum" => ("nodes/enum", enum_text),
+            "record" => ("nodes/record", record_text),
+            "annotation" => ("fileTypes/text", annotation_text),
+            "package-info" => ("fileTypes/text", package_info_text),
+            _ => ("nodes/class", class_text),
+        };
+        templates.push(FileTemplate {
+            label: Box::leak(definition.label.into_boxed_str()),
+            icon,
+            extension: "java",
+            creates: Creates::File,
+            content,
+        });
+    }
+    templates.push(FileTemplate {
+        label: "Package",
+        icon: "nodes/package",
+        extension: "",
+        creates: Creates::Folder { dotted: true },
+        content: |_, _, _| String::new(),
+    });
+    templates
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -85,6 +104,8 @@ struct Args {
     state_dir: Option<PathBuf>,
     script: Option<String>,
     mock_agents: bool,
+    /// The process this one replaces, set by a restart after an update.
+    after_update: Option<u32>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -95,6 +116,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--state-dir" => parsed.state_dir = Some(value("--state-dir")?.into()),
             "--script" => parsed.script = Some(value("--script")?),
+            "--after-update" => {
+                let text = value("--after-update")?;
+                parsed.after_update = Some(
+                    text.parse()
+                        .map_err(|_| format!("--after-update needs a process id: {text}"))?,
+                );
+            }
             "--mock-agents" if cfg!(feature = "mock-agents") => parsed.mock_agents = true,
             flag if flag.starts_with("--") => return Err(format!("unknown argument {flag}")),
             path => parsed.path = Some(path.into()),
@@ -113,8 +141,12 @@ fn canonical(path: &Path) -> PathBuf {
 
 /// The build tool of the project and what runs it. With `--state-dir` the model cache
 /// moves there too, so that a scripted run leaves nothing behind.
-fn project_setup(root: &Path, state_dir: Option<&Path>) -> ProjectSetup {
-    let build = java_lang::project_build(root, state_dir.map(|dir| dir.join("projects")));
+fn project_setup(root: &Path, state_dir: Option<&Path>, build_tools: &BuildTools) -> ProjectSetup {
+    let build = java_lang::project_build(
+        root,
+        state_dir.map(|dir| dir.join("projects")),
+        build_tools.clone(),
+    );
     ProjectSetup {
         tool: build.tool,
         providers: build.providers,
@@ -193,7 +225,14 @@ fn launch(args: Args) -> Result<(Launch, ProjectSetup, Args), String> {
     for failure in workspace::apply_pending_invalidation(&launch.state_dir, &[&launch.state_dir]) {
         eprintln!("a cache is not invalidated: {failure}");
     }
-    let project = project_setup(&launch.root, args.state_dir.as_deref());
+    // The build tools need the settings before the project model opens, and the windows
+    // need the names of those tools before the Settings window can be shown.
+    let settings = Settings::load(&launch.settings_dir.join(workspace::SETTINGS_FILE));
+    let project = project_setup(
+        &launch.root,
+        args.state_dir.as_deref(),
+        &settings.build_tools,
+    );
     Ok((launch, project, args))
 }
 
@@ -223,6 +262,7 @@ fn find_toolchain() -> thread::JoinHandle<Result<Toolchain, Missing>> {
 fn language_server(
     launch: &Launch,
     toolchain: Result<Toolchain, Missing>,
+    build_tools: &BuildTools,
 ) -> (
     Option<JavaSession>,
     LanguageServer,
@@ -250,13 +290,15 @@ fn language_server(
                 check: Some(Box::new(JavaSetupCheck {
                     root: launch.root.clone(),
                     state_dir: launch.state_dir.clone(),
+                    build_tools: build_tools.clone(),
                     session: Arc::new(Mutex::new(None)),
                 })),
             };
             return (None, none(status), Some(setup));
         }
     };
-    let config = java_lang::config_of(&toolchain, &launch.root, &launch.state_dir);
+    let config =
+        java_lang::config_of_with(&toolchain, &launch.root, &launch.state_dir, build_tools);
     match JavaSession::open(config, trust_of(&launch.root)) {
         Ok(session) => {
             session.watch_status(move |text| {
@@ -283,6 +325,7 @@ fn language_server(
 struct JavaSetupCheck {
     root: PathBuf,
     state_dir: PathBuf,
+    build_tools: BuildTools,
     session: Arc<Mutex<Option<JavaSession>>>,
 }
 
@@ -293,6 +336,7 @@ impl panels::SetupCheck for JavaSetupCheck {
     ) {
         let root = self.root.clone();
         let state_dir = self.state_dir.clone();
+        let build_tools = self.build_tools.clone();
         let session = Arc::clone(&self.session);
         thread::spawn(move || {
             let exe = std::env::current_exe().ok();
@@ -301,7 +345,7 @@ impl panels::SetupCheck for JavaSetupCheck {
                 let _ = started.unbounded_send(None);
                 return;
             };
-            let config = java_lang::config_of(&toolchain, &root, &state_dir);
+            let config = java_lang::config_of_with(&toolchain, &root, &state_dir, &build_tools);
             let Ok(started_session) = JavaSession::open(config, Trust::Trusted) else {
                 let _ = started.unbounded_send(None);
                 return;
@@ -350,15 +394,86 @@ fn project_templates() -> Vec<ProjectTemplate> {
 
 /// Without a project and without a script the window is the start screen.
 fn start_screen(args: &Args) {
+    panels::set_build_tool_names("Maven", "Gradle");
     let state_dir = args.state_dir.clone().unwrap_or_else(state_folder);
     let settings_dir = args.state_dir.clone().unwrap_or_else(settings_folder);
     let context = workspace::start_context(&state_dir, &settings_dir);
     panels::run_start(context, state_dir, project_templates(), false);
 }
 
+/// How long the new process of a restart waits for the one it replaces.
+const AFTER_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits for the process that started this one, so that its language server has let
+/// go of the project folder before this one opens it. The window opens after the
+/// wait, and a stuck process loses the argument after [`AFTER_UPDATE_TIMEOUT`].
+fn wait_for_old_process(process_id: Option<u32>) {
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let waiter = match platform::ProcessWaiter::open(process_id) {
+        Ok(Some(waiter)) => waiter,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("the previous process is not waited for: {error}");
+            return;
+        }
+    };
+    let ended = updater::wait_until(
+        || waiter.wait(Duration::from_millis(50)).unwrap_or(true),
+        AFTER_UPDATE_TIMEOUT,
+    );
+    if !ended {
+        eprintln!(
+            "the previous process did not end in {} seconds",
+            AFTER_UPDATE_TIMEOUT.as_secs()
+        );
+    }
+}
+
+/// The old process passes its environment to this one, including the tool folders of
+/// the release that was just replaced. A variable that names a folder inside the
+/// program folder is dropped, so the search reads the new release; a folder the user
+/// chose elsewhere stays.
+fn forget_replaced_tools() {
+    let Some(install) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    for name in [java_lang::JDTLS_HOME, java_lang::DEBUG_PLUGIN] {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        if !inside(Path::new(&value), &install) {
+            continue;
+        }
+        // SAFETY: this runs at the start, before any thread reads the variables.
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+/// Whether `path` lies in `folder`, comparing the spelling of the disk.
+fn inside(path: &Path, folder: &Path) -> bool {
+    match (
+        platform::CanonPath::new(path),
+        platform::CanonPath::new(folder),
+    ) {
+        (Ok(path), Ok(folder)) => path.as_path().starts_with(folder.as_path()),
+        _ => path.starts_with(folder),
+    }
+}
+
 fn main() -> ExitCode {
     let migration = migration::take_over_old_folders();
     let parsed = parse_args(std::env::args().skip(1));
+    if let Ok(args) = &parsed {
+        if args.after_update.is_some() {
+            forget_replaced_tools();
+        }
+        wait_for_old_process(args.after_update);
+    }
     let state_dir = parsed
         .as_ref()
         .ok()
@@ -390,6 +505,7 @@ fn main() -> ExitCode {
             let toolchain = toolchain.join().unwrap_or(Err(Missing::Jdtls));
             let settings =
                 workspace::Settings::load(&launch.settings_dir.join(workspace::SETTINGS_FILE));
+            panels::set_build_tool_names("Maven", "Gradle");
             platform::MemoryPressure::configure(platform::MemoryThresholds::new(
                 settings.memory_low_percent,
                 settings.memory_low_megabytes,
@@ -398,7 +514,8 @@ fn main() -> ExitCode {
                 resolve: language_for,
                 templates: java_lang::templates_for,
             };
-            let (session, server, setup) = language_server(&launch, toolchain);
+            let (session, server, setup) =
+                language_server(&launch, toolchain, &settings.build_tools);
             let mut project = project;
             if let Some(session) = &session {
                 let debugger =
@@ -424,6 +541,10 @@ fn main() -> ExitCode {
                     &launch.root,
                 )),
             };
+            let templates = TemplatesSetup {
+                language: java_lang::templates_for(Path::new("Arro.java")),
+                files: java_lang::file_templates(),
+            };
             panels::run_with_setup(
                 launch,
                 languages,
@@ -432,6 +553,7 @@ fn main() -> ExitCode {
                 Some(server),
                 setup,
                 cache,
+                templates,
                 args.mock_agents,
                 args.script,
             );

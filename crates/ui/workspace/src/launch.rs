@@ -98,10 +98,23 @@ pub fn start_context(state_dir: &std::path::Path, settings_dir: &std::path::Path
 
 /// Starts the program of a project in a window of its own. Blocks only for the start.
 pub fn spawn_project(state_dir: &std::path::Path, folder: &std::path::Path) -> std::io::Result<()> {
+    spawn_project_after(state_dir, folder, None)
+}
+
+/// [`spawn_project`] with the process this one replaces. The new program waits for it
+/// to end before it opens the project, so that the same files and folders are free.
+pub fn spawn_project_after(
+    state_dir: &std::path::Path,
+    folder: &std::path::Path,
+    replaced: Option<u32>,
+) -> std::io::Result<()> {
     let program = std::env::current_exe()?;
     let mut command = std::process::Command::new(program);
-    command.arg("--state-dir").arg(state_dir).arg(folder);
-    command.spawn().map(|_| ())
+    command.arg("--state-dir").arg(state_dir);
+    if let Some(process_id) = replaced {
+        command.arg("--after-update").arg(process_id.to_string());
+    }
+    command.arg(folder).spawn().map(|_| ())
 }
 
 fn open_store(launch: &Launch) -> Option<Arc<Store>> {

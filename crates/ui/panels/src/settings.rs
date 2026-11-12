@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use plugin_host::{Manifest, PluginSettings, default_plugins_dir};
+use project_model::RuntimeInfo;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -14,6 +15,7 @@ use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog}
 use crate::prompt::TextField;
 use crate::settings_catalog::{self, Setting, SettingField, SettingKind, SettingsPage};
 use crate::settings_keymap::KeymapPage;
+use crate::settings_templates::TemplateSection;
 
 const WIDTH: f32 = 800.;
 
@@ -106,24 +108,60 @@ pub fn bind_actions(workspace: WeakEntity<Workspace>, window: AnyWindowHandle, c
     });
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Editing {
-    FontFamily,
+/// The settings helpers of the window that read and write files outside the UI thread.
+fn home_folder() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// The settings file the first build tool reads when the user names none.
+pub(crate) fn default_settings_file() -> PathBuf {
+    home_folder().join(".m2").join("settings.xml")
+}
+
+/// The repository a settings file names, or the default one of the first build tool.
+/// Blocks on the disk: not for the UI thread.
+fn local_repository(settings_file: &Path) -> String {
+    let chosen = std::fs::read_to_string(settings_file)
+        .ok()
+        .and_then(|text| {
+            let start = text.find("<localRepository>")? + "<localRepository>".len();
+            let end = text[start..].find("</localRepository>")?;
+            Some(text[start..start + end].trim().to_owned())
+        })
+        .filter(|path| !path.is_empty());
+    chosen.unwrap_or_else(|| {
+        home_folder()
+            .join(".m2")
+            .join("repository")
+            .display()
+            .to_string()
+    })
 }
 
 pub struct SettingsView {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
-    editing: Option<Editing>,
-    font_family: TextField,
+    editing: Option<&'static str>,
+    text_field: TextField,
     plugins: Vec<PluginRow>,
     plugin_file: PathBuf,
     pub(crate) keymap_page: KeymapPage,
+    pub(crate) templates_page: crate::settings_templates::TemplatesPage,
     page: SettingsPage,
     /// The row the window came for, drawn as chosen while the window is open.
     highlight: Option<&'static str>,
     /// The name of the SDK of the project, empty until the environment is read.
     sdk: String,
+    /// The SDKs the pages offer where a choice among them is needed.
+    runtimes: Vec<RuntimeInfo>,
+    /// The local repository the settings file names, read in the background.
+    repository: String,
+    /// What the Test button of the Git page found.
+    git_version: Option<String>,
+    testing_git: bool,
     scroll_pages: ScrollHandle,
     scroll_content: ScrollHandle,
 }
@@ -157,20 +195,44 @@ impl SettingsView {
             .try_global::<ProjectEnvironmentGlobal>()
             .and_then(|global| global.0.clone());
         let keymap_page = KeymapPage::new(weak.clone());
+        let repository = settings
+            .build_tools
+            .first
+            .settings_path()
+            .map_or_else(default_settings_file, PathBuf::from);
+        let templates_page = crate::settings_templates::page(weak.clone());
         let view = cx.new(|cx| Self {
             workspace: weak,
             focus: cx.focus_handle(),
             editing: None,
-            font_family: TextField::from_text(font_family),
+            text_field: TextField::from_text(font_family),
             plugins: Vec::new(),
             plugin_file: plugin_file.clone(),
             keymap_page,
+            templates_page,
             page,
             highlight: target,
             sdk: "not set".to_owned(),
+            runtimes: Vec::new(),
+            repository: String::new(),
+            git_version: None,
+            testing_git: false,
             scroll_pages: ScrollHandle::new(),
             scroll_content: ScrollHandle::new(),
         });
+        let read_repository = view.clone();
+        let repository_file = repository.clone();
+        let repository = cx
+            .background_executor()
+            .spawn(async move { local_repository(&repository_file) });
+        cx.spawn(async move |_, cx| {
+            let repository = repository.await;
+            read_repository.update(cx, |view, cx| {
+                view.repository = repository;
+                cx.notify();
+            });
+        })
+        .detach();
         if let Some(environment) = environment {
             let read = cx
                 .background_executor()
@@ -183,6 +245,7 @@ impl SettingsView {
                         .selected_runtime()
                         .map(|runtime| runtime.name.clone())
                         .unwrap_or_else(|| "not set".to_owned());
+                    view.runtimes = info.runtimes;
                     cx.notify();
                 })
                 .ok();
@@ -238,25 +301,94 @@ impl SettingsView {
     }
 
     fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        match self.editing {
-            Some(Editing::FontFamily) => {
-                if self.font_family.key_with_clipboard(event, false, cx) {
-                    let text = self.font_family.text.clone();
-                    self.change(
-                        |settings| {
-                            settings_catalog::set_text(settings, "editor_font_family", &text);
-                        },
-                        cx,
-                    );
-                    cx.stop_propagation();
+        if let Some(id) = self.editing {
+            if self.text_field.key_with_clipboard(event, false, cx) {
+                let text = self.text_field.text.clone();
+                self.change(
+                    |settings| {
+                        settings_catalog::set_text(settings, id, &text);
+                    },
+                    cx,
+                );
+                if id == "build_tool_first_settings_file" {
+                    self.refresh_repository(cx);
                 }
+                cx.stop_propagation();
             }
-            None => {
-                if self.page == SettingsPage::Keymap && self.keymap_page.key(event, cx) {
-                    cx.stop_propagation();
-                }
-            }
+            return;
         }
+        let keymap = self.page == SettingsPage::Keymap && self.keymap_page.key(event, cx);
+        let templates =
+            TemplateSection::section(self.page).is_some() && self.templates_page.key(event, cx);
+        if keymap || templates {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Reads the local repository of the settings file again, off the UI thread.
+    fn refresh_repository(&self, cx: &mut Context<Self>) {
+        let file = cx
+            .try_global::<Settings>()
+            .and_then(|settings| {
+                settings
+                    .build_tools
+                    .first
+                    .settings_path()
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(default_settings_file);
+        let read = cx
+            .background_executor()
+            .spawn(async move { local_repository(&file) });
+        let view = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let repository = read.await;
+            view.update(cx, |view, cx| {
+                view.repository = repository;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs `--version` of the configured Git in the background, so a path that is not
+    /// there shows its error instead of blocking the window.
+    fn test_git(&mut self, cx: &mut Context<Self>) {
+        if self.testing_git {
+            return;
+        }
+        let configured = cx
+            .try_global::<Settings>()
+            .map(|settings| settings.git_path.trim().to_owned())
+            .unwrap_or_default();
+        self.testing_git = true;
+        self.git_version = None;
+        cx.notify();
+        let run = cx.background_executor().spawn(async move {
+            let git = if configured.is_empty() {
+                vcs::GitRunner::from_env()
+            } else {
+                Some(vcs::GitRunner::new(PathBuf::from(configured)))
+            };
+            let Some(git) = git else {
+                return "Git is not on PATH".to_owned();
+            };
+            match git.run(Path::new("."), ["--version"]) {
+                Ok(output) => String::from_utf8_lossy(&output).trim().to_owned(),
+                Err(error) => error.to_string(),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let version = run.await;
+            this.update(cx, |this, cx| {
+                this.testing_git = false;
+                this.git_version = Some(version);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -310,6 +442,110 @@ fn row(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div {
         .min_h(px(30.))
         .child(div().text_color(theme.text).child(label))
         .child(control)
+}
+
+/// The grey text of an empty text field: the value applied when the field stays empty.
+fn text_hint(field: SettingField) -> &'static str {
+    match field {
+        SettingField::EditorFontFamily => "JetBrains Mono",
+        SettingField::BuildToolFirstHome => "Wrapper or bundled",
+        SettingField::BuildToolFirstSettingsFile => "~/.m2/settings.xml",
+        SettingField::BuildToolFirstVmOptions => "-Xmx2g",
+        SettingField::BuildToolSecondHome => "Wrapper",
+        SettingField::BuildToolSecondUserHome => "Default",
+        SettingField::GitPath => "Found on PATH",
+        SettingField::TerminalShell => "Detected automatically",
+        SettingField::TerminalStartDirectory => "Project root",
+        SettingField::TerminalEnvironment => "NAME=value per line",
+        _ => "",
+    }
+}
+
+/// The JVM of the second build tool as one choice among the SDKs of the project.
+fn runtime_pill(
+    entry: &'static Setting,
+    settings: &Settings,
+    runtimes: &[RuntimeInfo],
+    theme: &Theme,
+    cx: &mut Context<SettingsView>,
+) -> Stateful<Div> {
+    let chosen = &settings.build_tools.second.runtime_home;
+    let label = if chosen.trim().is_empty() {
+        "Project SDK".to_owned()
+    } else {
+        runtimes
+            .iter()
+            .find(|runtime| runtime.home.display().to_string() == *chosen)
+            .map(|runtime| runtime.name.clone())
+            .unwrap_or_else(|| chosen.clone())
+    };
+    let id = entry.id;
+    pill(id, &label, true, theme)
+        .debug_selector(move || format!("settings-{}", id.replace('_', "-")))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let settings = cx.global::<Settings>().clone();
+            let current = settings.build_tools.second.runtime_home.clone();
+            let mut homes = vec![String::new()];
+            homes.extend(
+                this.runtimes
+                    .iter()
+                    .map(|runtime| runtime.home.display().to_string()),
+            );
+            let next = homes
+                .iter()
+                .position(|home| home == &current)
+                .map_or(0, |index| (index + 1) % homes.len());
+            let next = homes[next].clone();
+            this.change(
+                |settings| {
+                    settings_catalog::set_text(settings, id, &next);
+                },
+                cx,
+            );
+        }))
+}
+
+/// The Test button of the Git page and the line it brings back.
+fn git_test_row(
+    version: &Option<String>,
+    testing: bool,
+    theme: &Theme,
+    cx: &mut Context<SettingsView>,
+) -> AnyElement {
+    let (hover, pressed) = (theme.hover, theme.pressed);
+    let label = if testing { "Testing…" } else { "Test" };
+    let button = div()
+        .id("settings-git-test")
+        .debug_selector(|| "settings-git-test".to_owned())
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .h(px(CONTROL_HEIGHT))
+        .px(px(SPACE_M))
+        .rounded(px(CONTROL_RADIUS))
+        .border_1()
+        .border_color(theme.control_border)
+        .text_color(theme.text)
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .child(label)
+        .on_click(cx.listener(|this, _, _, cx| this.test_git(cx)));
+    let found = version.clone().map(|version| {
+        div()
+            .debug_selector(|| "settings-git-version".to_owned())
+            .text_size(px(TEXT_SMALL))
+            .text_color(theme.text_secondary)
+            .child(version)
+    });
+    div()
+        .flex()
+        .items_center()
+        .gap(px(SPACE_S))
+        .flex_none()
+        .child(button)
+        .children(found)
+        .into_any_element()
 }
 
 fn heading(text: &'static str, theme: &Theme) -> Div {
@@ -475,7 +711,7 @@ impl Render for SettingsView {
                     })
                     .when(chosen, |this| this.bg(theme.tab_selected))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.page = page;
+                        this.page = page.target();
                         this.highlight = None;
                         this.editing = None;
                         cx.notify();
@@ -515,14 +751,40 @@ impl Render for SettingsView {
             SettingsPage::Keymap => {
                 content.push(self.keymap_page.render(window, cx));
             }
+            SettingsPage::EditorLiveTemplates => {
+                content.push(
+                    self.templates_page
+                        .render(TemplateSection::Live, window, cx),
+                );
+            }
+            SettingsPage::EditorPostfix => {
+                content.push(
+                    self.templates_page
+                        .render(TemplateSection::Postfix, window, cx),
+                );
+            }
+            SettingsPage::EditorFileTemplates => {
+                content.push(
+                    self.templates_page
+                        .render(TemplateSection::Files, window, cx),
+                );
+            }
             _ => {
                 if self.page == SettingsPage::Project {
                     content.push(div().child(project_sdk_row(&self.sdk, &theme, cx)));
                 }
+                let mut last_section: Option<&'static str> = None;
                 for entry in settings_catalog::all()
                     .iter()
                     .filter(|entry| entry.page == self.page)
                 {
+                    let section = settings_catalog::section_of(entry.id);
+                    if let Some(section) = section
+                        && section != last_section.unwrap_or_default()
+                    {
+                        content.push(heading(section, &theme));
+                        last_section = Some(section);
+                    }
                     let control = match entry.kind {
                         SettingKind::Choice => {
                             if entry.field == SettingField::Theme {
@@ -573,18 +835,58 @@ impl Render for SettingsView {
                                 .child(number_button(entry, true, step, &theme, cx))
                                 .into_any_element()
                         }
-                        SettingKind::Text => field(
-                            entry.id,
-                            &self.font_family.text,
-                            "JetBrains Mono",
-                            self.editing == Some(Editing::FontFamily),
-                            &theme,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.editing = Some(Editing::FontFamily);
-                            cx.notify();
-                        }))
-                        .into_any_element(),
+                        SettingKind::Text => {
+                            if entry.field == SettingField::BuildToolSecondRuntimeHome {
+                                runtime_pill(entry, &settings, &self.runtimes, &theme, cx)
+                                    .into_any_element()
+                            } else if entry.field == SettingField::BuildToolFirstRepository {
+                                field(
+                                    entry.id,
+                                    &self.repository,
+                                    "Read from the settings file",
+                                    false,
+                                    &theme,
+                                )
+                                .into_any_element()
+                            } else {
+                                let id = entry.id;
+                                let value =
+                                    settings_catalog::text(&settings, id).unwrap_or_default();
+                                let hint = text_hint(entry.field);
+                                let active = self.editing == Some(id);
+                                let start = value.clone();
+                                let test = if entry.field == SettingField::GitPath {
+                                    Some(git_test_row(
+                                        &self.git_version,
+                                        self.testing_git,
+                                        &theme,
+                                        cx,
+                                    ))
+                                } else {
+                                    None
+                                };
+                                let input = field(id, &value, hint, active, &theme)
+                                    .debug_selector(move || {
+                                        format!("settings-{}", id.replace('_', "-"))
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.editing = Some(id);
+                                        this.text_field = TextField::from_text(start.clone());
+                                        cx.notify();
+                                    }));
+                                match test {
+                                    Some(test) => div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(SPACE_S))
+                                        .flex_1()
+                                        .child(input)
+                                        .child(test)
+                                        .into_any_element(),
+                                    None => input.into_any_element(),
+                                }
+                            }
+                        }
                         SettingKind::Toggle => {
                             let on = settings_catalog::value(&settings, entry.id).unwrap_or(false);
                             toggle_button(entry.id, on, &theme, cx).into_any_element()
@@ -652,6 +954,10 @@ impl Render for SettingsView {
             .p(px(DIALOG_PADDING))
             .gap(px(SPACE_XS))
             .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
+            )
             .child(
                 div()
                     .debug_selector(|| "settings-title".to_owned())

@@ -179,6 +179,7 @@ fn config(root: PathBuf, state_dir: PathBuf) -> JdtlsConfig {
             runtime("JavaSE-25", "25", true),
         ],
         maven_settings: Some(settings),
+        gradle_home: None,
         gradle_user_home: None,
         gradle_java_home: None,
         offline: true,

@@ -376,7 +376,7 @@ impl EditorView {
         self.usages = (!ranges.is_empty()).then_some(ranges);
     }
 
-    fn usage_search(&mut self, popup: bool, cx: &mut Context<Self>) {
+    pub(crate) fn usage_search(&mut self, popup: bool, cx: &mut Context<Self>) {
         let Some((spot, caret)) = self.spot() else {
             return;
         };
@@ -525,7 +525,7 @@ impl EditorView {
     }
 
     /// The word under the caret, the name the usages popup shows.
-    fn word_at_caret(&self, caret: usize) -> String {
+    pub(crate) fn word_at_caret(&self, caret: usize) -> String {
         self.state
             .as_ref()
             .map(|state| {

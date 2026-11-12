@@ -21,6 +21,165 @@ use runner::{RunConfig, RunConfigProvider, RunPlan, TestSite};
 use syntax::LanguageConfig;
 use templates::TemplateLanguage;
 
+pub use java_lang::BuildTools;
+pub use java_project::{BuildEnv, Gradle, Jdk, Maven};
+pub use jdtls_adapter::{self, settings_of};
+
+/// The names the language gives its two build tools, in the order of their pages.
+pub fn build_tool_names() -> (String, String) {
+    ("Maven".to_owned(), "Gradle".to_owned())
+}
+
+/// The command the first build tool runs for `task` of the project, with the settings of
+/// its page.
+pub fn first_build_tool_command(
+    root: &Path,
+    build_tools: &BuildTools,
+    jdk: Jdk,
+    task: &str,
+) -> ProcessSpec {
+    let env = BuildEnv {
+        jdk: Some(jdk),
+        build_tools: build_tools.clone(),
+        ..BuildEnv::default()
+    };
+    Maven::new(env)
+        .task(root, task)
+        .expect("the command of the first build tool")
+}
+
+/// The command of the second build tool for `task` of the project.
+pub fn second_build_tool_command(root: &Path, build_tools: &BuildTools, task: &str) -> ProcessSpec {
+    let env = BuildEnv {
+        build_tools: build_tools.clone(),
+        ..BuildEnv::default()
+    };
+    Gradle::new(env)
+        .task(root, task)
+        .expect("the command of the second build tool")
+}
+
+/// Writes the few files that make a folder look like an installed JDK.
+pub fn write_fake_jdk(home: &Path) {
+    fs::create_dir_all(home.join("bin")).expect("the bin folder of the fake JDK");
+    fs::write(home.join("bin/javac.exe"), b"").expect("the compiler of the fake JDK");
+    fs::write(home.join("release"), "JAVA_VERSION=\"17.0.1\"\n")
+        .expect("the release file of the fake JDK");
+}
+
+/// Writes the build script of the second build tool into the project folder.
+pub fn write_second_tool_project(root: &Path) {
+    fs::write(root.join("build.gradle"), "plugins { id 'java' }\n")
+        .expect("the build script of the fake project");
+}
+
+/// Writes the launcher that makes a folder look like an installed build tool.
+pub fn write_fake_distribution(home: &Path) {
+    fs::create_dir_all(home.join("bin")).expect("the bin folder of the fake distribution");
+    fs::write(home.join("bin/gradle.bat"), b"").expect("the launcher of the fake distribution");
+}
+
+fn environment_value(spec: &ProcessSpec, name: &str) -> Option<String> {
+    spec.environment()
+        .iter()
+        .find(|(known, _)| known.to_string_lossy().eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.clone())
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+/// The options of the JVM that runs the first build tool.
+pub fn first_tool_vm_options(spec: &ProcessSpec) -> Option<String> {
+    environment_value(spec, "MAVEN_OPTS")
+}
+
+/// The user home of the second build tool in the environment of its command.
+pub fn second_tool_user_home(spec: &ProcessSpec) -> Option<String> {
+    environment_value(spec, "GRADLE_USER_HOME")
+}
+
+/// The runtime of the second build tool the server of `config` uses, if any.
+pub fn server_second_tool_jvm(config: &JdtlsConfig) -> Option<String> {
+    config
+        .gradle_java_home
+        .as_ref()
+        .map(|path| path.display().to_string())
+}
+
+/// A settings object of the language facade for `build_tools`, with a toolchain that
+/// only has to be present: the session does not start in the test.
+pub fn config_with(root: &Path, state_dir: &Path, build_tools: &BuildTools) -> JdtlsConfig {
+    let toolchain = java_lang::Toolchain {
+        java_home: root.join("jdk"),
+        jdtls_home: root.join("jdtls"),
+        debug_plugin: root.join("debug.jar"),
+    };
+    java_lang::config_of_with(&toolchain, root, state_dir, build_tools)
+}
+
+/// The settings file of the first build tool the server of `config` reads.
+pub fn server_first_tool_settings(config: &JdtlsConfig) -> Option<String> {
+    config
+        .maven_settings
+        .as_ref()
+        .map(|path| path.display().to_string())
+}
+
+/// The installation of the second build tool the server of `config` uses, if any.
+pub fn server_second_tool_home(config: &JdtlsConfig) -> Option<String> {
+    config
+        .gradle_home
+        .as_ref()
+        .map(|path| path.display().to_string())
+}
+
+/// The user home of the second build tool the server of `config` uses, if any.
+pub fn server_second_tool_user_home(config: &JdtlsConfig) -> Option<String> {
+    config
+        .gradle_user_home
+        .as_ref()
+        .map(|path| path.display().to_string())
+}
+
+/// No network for the dependencies of the first build tool.
+pub fn server_first_tool_offline(config: &JdtlsConfig) -> bool {
+    let json = settings_of(config);
+    json["java"]["import"]["maven"]["offline"]["enabled"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+/// The settings file in the server settings of the first build tool.
+pub fn server_first_tool_settings_setting(config: &JdtlsConfig) -> Option<String> {
+    let json = settings_of(config);
+    json["java"]["configuration"]["maven"]["userSettings"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// No network for the dependencies of the second build tool.
+pub fn server_second_tool_offline(config: &JdtlsConfig) -> bool {
+    let json = settings_of(config);
+    json["java"]["import"]["gradle"]["offline"]["enabled"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+/// Whether the server takes the wrapper of the second build tool.
+pub fn server_second_tool_wrapper(config: &JdtlsConfig) -> bool {
+    let json = settings_of(config);
+    json["java"]["import"]["gradle"]["wrapper"]["enabled"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+/// The installation in the server settings of the second build tool.
+pub fn server_second_tool_home_setting(config: &JdtlsConfig) -> Option<String> {
+    let json = settings_of(config);
+    json["java"]["import"]["gradle"]["home"]
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Folders of a build that the tests never look into.
 const SKIPPED: &[&str] = &[".git", "target", "build", "bin", ".gradle", "node_modules"];
 
@@ -76,6 +235,7 @@ impl RealLanguage {
                 },
             ],
             maven_settings: Some(settings),
+            gradle_home: None,
             gradle_user_home: None,
             gradle_java_home: None,
             offline: true,
@@ -109,6 +269,7 @@ impl RealLanguage {
                 },
             ],
             maven_settings: None,
+            gradle_home: None,
             gradle_user_home: gradle_home(),
             gradle_java_home: Some(jdk(&corpus, "17")),
             offline: false,
@@ -489,6 +650,46 @@ public class InlayCheck {
     )
 }
 
+/// A class with a method used twice and an interface with one implementation: the
+/// real server counts them above the declarations. Returns the class and the interface.
+pub fn write_code_vision_sample(root: &Path) -> (PathBuf, PathBuf) {
+    let class = write_source(
+        root,
+        "probe/CodeVision.java",
+        r#"package probe;
+
+public class CodeVision {
+
+    void used() {
+    }
+
+    void use() {
+        used();
+        used();
+    }
+}
+"#,
+    );
+    let interface = write_source(
+        root,
+        "probe/Shape.java",
+        r#"package probe;
+
+public interface Shape {
+
+    void area();
+}
+
+class Circle implements Shape {
+
+    public void area() {
+    }
+}
+"#,
+    );
+    (class, interface)
+}
+
 pub fn write_extract_sample(root: &Path) -> PathBuf {
     write_source(
         root,
@@ -500,6 +701,24 @@ public class Extract {
     int total(int a, int b) {
         int sum = a + b;
         return sum;
+    }
+}
+"#,
+    )
+}
+
+/// A class that calls the string formatter of the platform; the documentation of the
+/// call names the parameters, for the quick documentation test.
+pub fn write_documentation_sample(root: &Path) -> PathBuf {
+    write_source(
+        root,
+        "probe/DocSample.java",
+        r#"package probe;
+
+public class DocSample {
+
+    String run(String value) {
+        return String.format("%s", value);
     }
 }
 "#,

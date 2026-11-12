@@ -4,6 +4,7 @@
 //! may change: a new extension point appears here together with its first real caller.
 
 mod answer;
+mod code_lens;
 mod hierarchy;
 mod inlay;
 mod language;
@@ -13,6 +14,10 @@ mod symbol;
 mod syntax;
 
 pub use answer::{Answer, Confidence, SourceId};
+pub use code_lens::{
+    CodeLensCommand, CodeLensEntry, CodeLensKind, CodeLensProvider, CodeLensQuery,
+    CodeLensResolveProvider, CodeLensResolveQuery, CodeVisionSettings, kind_of,
+};
 pub use hierarchy::{
     AddOverridableMethodsProvider, AddOverridableMethodsRequest, CallDirection, CallHierarchyItem,
     CallHierarchyProvider, CallHierarchyQuery, DefinitionPreview, DefinitionPreviewProvider,

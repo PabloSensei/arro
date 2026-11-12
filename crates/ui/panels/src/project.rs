@@ -14,8 +14,8 @@ use workspace::{DockSide, FileIcons, PROJECT_TOOL, Workspace};
 use crate::file_tree::{Child, FileTree, read_folder};
 use crate::prompt::Prompt;
 use crate::tree_ops::{
-    Creation, FileTemplate, create_on_disk, delete_on_disk, plan_creation, plan_move, plan_paste,
-    rename_on_disk, renamed, target_folder,
+    Creation, FileTemplate, create_on_disk, delete_on_disk, plan_creation_with_template, plan_move,
+    plan_paste, rename_on_disk, renamed, target_folder,
 };
 
 actions!(
@@ -1161,7 +1161,17 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let plan = plan_creation(&template, &folder, &self.root_path(), &input);
+        let definition = crate::settings_templates::file_template(cx, template.label);
+        let plan = match definition.as_ref() {
+            Some(definition) => plan_creation_with_template(
+                &template,
+                &folder,
+                &self.root_path(),
+                &input,
+                Some(definition),
+            ),
+            None => crate::tree_ops::plan_creation(&template, &folder, &self.root_path(), &input),
+        };
         let plan = match plan {
             Ok(plan) => plan,
             Err(error) => return self.report("Cannot create", error, cx),

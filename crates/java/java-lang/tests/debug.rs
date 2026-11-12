@@ -189,6 +189,7 @@ fn fixture_for(build: Build) -> Fixture {
             runtime("JavaSE-25", "25", true),
         ],
         maven_settings: Some(settings.clone()),
+        gradle_home: None,
         gradle_user_home: None,
         gradle_java_home: None,
         offline: true,

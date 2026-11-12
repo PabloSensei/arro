@@ -73,7 +73,7 @@ fn end_of(range: Range, text: &str) -> Position {
 
 /// Where a hint at `position` lands after the text of `range` becomes the text that ends
 /// at `end`, or `None` when the hint was inside the replaced piece.
-fn move_position(position: Position, range: Range, end: Position) -> Option<Position> {
+pub fn move_position(position: Position, range: Range, end: Position) -> Option<Position> {
     if position <= range.start {
         return Some(position);
     }

@@ -162,25 +162,25 @@ pub fn discover(search: &Search) -> Result<Toolchain, Missing> {
     })
 }
 
-/// The newest `jdtls-*` folder of `root`, as the name orders it: `dir /o-n` of the
-/// script keeps the first of that order.
+/// The newest `jdtls-*` folder of `root`, by the numbers of its version: `1.10.0`
+/// comes after `1.9.0`, which a plain name order gets wrong.
 fn newest_named(root: &Path, prefix: &str) -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = entries(root)
         .into_iter()
         .filter(|path| path.is_dir() && name_is(path).starts_with(prefix))
         .collect();
-    found.sort_by_key(|path| name_is(path));
+    found.sort_by_cached_key(|path| version_order(&name_is(path)));
     found.pop()
 }
 
-/// The newest `vscode-java-debug-*` folder that has a plugin jar: the first folder of
-/// the name order wins, and inside it the newest jar.
+/// The newest `vscode-java-debug-*` folder that has a plugin jar, and inside it the
+/// newest jar, both by the numbers of their versions.
 fn newest_debug_plugin(root: &Path) -> Option<PathBuf> {
     let mut versions: Vec<PathBuf> = entries(root)
         .into_iter()
         .filter(|path| path.is_dir() && name_is(path).starts_with("vscode-java-debug-"))
         .collect();
-    versions.sort_by_key(|path| name_is(path));
+    versions.sort_by_cached_key(|path| version_order(&name_is(path)));
     versions.into_iter().rev().find_map(|dir| {
         let mut jars: Vec<PathBuf> = entries(&dir.join("extension").join("server"))
             .into_iter()
@@ -191,9 +191,20 @@ fn newest_debug_plugin(root: &Path) -> Option<PathBuf> {
                     && name.ends_with(".jar")
             })
             .collect();
-        jars.sort_by_key(|path| name_is(path));
+        jars.sort_by_cached_key(|path| version_order(&name_is(path)));
         jars.pop()
     })
+}
+
+/// The numbers of the version at the end of a file name: `jdtls-1.63.0` is
+/// `[1, 63, 0]`, and a name without numbers sorts first.
+fn version_order(name: &str) -> Vec<u64> {
+    let tail = name.rsplit('-').next().unwrap_or(name);
+    let tail = tail.strip_suffix(".jar").unwrap_or(tail);
+    tail.split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap_or(u64::MAX))
+        .collect()
 }
 
 /// The newest JDK of [`MIN_JAVA_VERSION`] or newer under the install roots; `JAVA_HOME`
@@ -491,5 +502,46 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn the_newest_jdtls_by_version_wins_over_a_plain_name_order() {
+        let exe = scratch("two-jdtls-versions");
+        let tools = exe.join("tools");
+        jdtls(&tools, "1.9.0");
+        let newest = jdtls(&tools, "1.10.0");
+        let mut found = search(&exe);
+        found.java_home = Some(PathBuf::from(r"C:\chosen\jdk"));
+        found.debug_plugin = Some(PathBuf::from(r"C:\chosen\debug.jar"));
+
+        let toolchain = discover(&found).unwrap();
+
+        assert_eq!(toolchain.jdtls_home, newest);
+    }
+
+    #[test]
+    fn the_newest_debug_folder_and_jar_by_version_win() {
+        let exe = scratch("two-debug-versions");
+        let tools = exe.join("tools");
+        debug_jar(&tools, "0.9.0");
+        let newest = debug_jar(&tools, "0.10.0");
+        let mut found = search(&exe);
+        found.jdtls_home = Some(PathBuf::from(r"C:\chosen\jdtls"));
+        found.java_home = Some(PathBuf::from(r"C:\chosen\jdk"));
+
+        assert_eq!(discover(&found).unwrap().debug_plugin, newest);
+
+        // Two jars in one folder: the newer plugin is the one the debugger takes.
+        let folder = tools
+            .join("vscode-java-debug-0.11.0")
+            .join("extension")
+            .join("server");
+        std::fs::create_dir_all(&folder).unwrap();
+        let older = folder.join("com.microsoft.java.debug.plugin-0.53.9.jar");
+        let newer = folder.join("com.microsoft.java.debug.plugin-0.54.0.jar");
+        std::fs::write(&older, "").unwrap();
+        std::fs::write(&newer, "").unwrap();
+
+        assert_eq!(discover(&found).unwrap().debug_plugin, newer);
     }
 }

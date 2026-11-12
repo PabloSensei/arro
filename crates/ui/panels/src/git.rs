@@ -14,11 +14,35 @@ use vcs::{
     Change, ConflictSide, FileStatus, GitRunner, Hunk, LineChangeKind, Operation, Repository,
     Stash, Status, UpdateMode, UpdateReport,
 };
-use workspace::{COMMIT_TOOL, VcsQuickList, Workspace};
+use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
 use crate::conflict::ConflictView;
 use crate::project::ActiveProjectPanel;
 use crate::prompt::Prompt;
+
+/// The Git of the settings: the configured program, or the one on `PATH`.
+pub(crate) fn configured_git(settings: &Settings) -> Option<GitRunner> {
+    let path = settings.git_path.trim();
+    if path.is_empty() {
+        GitRunner::from_env()
+    } else {
+        Some(GitRunner::new(PathBuf::from(path)))
+    }
+}
+
+/// How Update Project brings the upstream in, as the settings page chose.
+pub(crate) fn update_mode(settings: &Settings) -> UpdateMode {
+    match settings.git_update_method {
+        workspace::GitUpdateMethod::Merge => UpdateMode::Merge,
+        workspace::GitUpdateMethod::Rebase => UpdateMode::Rebase,
+    }
+}
+
+/// Whether git refused a push because the branch is behind its remote.
+fn push_rejected(error: &std::io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("rejected") || text.contains("non-fast-forward") || text.contains("fetch first")
+}
 
 /// A command that puts the branch of the last Delete back.
 pub const RESTORE_BRANCH_COMMAND: &str = "git.restore_deleted_branch";
@@ -146,8 +170,9 @@ impl GitState {
             stale: false,
             scheduled: false,
         });
+        let configured = cx.try_global::<Settings>().cloned().unwrap_or_default();
         let found = cx.background_executor().spawn(async move {
-            let git = GitRunner::from_env()?;
+            let git = configured_git(&configured)?;
             Repository::open(git, &root).ok().map(Arc::new)
         });
         let weak = git.downgrade();
@@ -503,9 +528,24 @@ impl GitState {
             self.report("Push", message, cx);
             return;
         }
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let auto = settings.git_auto_update_on_reject;
+        let mode = update_mode(&settings);
         self.run(
             "Push",
-            |repo| repo.push(),
+            move |repo| {
+                let first = repo.push();
+                if !auto {
+                    return first;
+                }
+                match first {
+                    Err(error) if push_rejected(&error) => {
+                        repo.update_with(mode)?;
+                        repo.push()
+                    }
+                    other => other,
+                }
+            },
             |this, (), cx| this.tell("Push", "Pushed to the remote", cx),
             cx,
         );
@@ -667,10 +707,14 @@ impl GitState {
                 repo.status()
             },
             move |this, status, cx| {
-                if status.upstream.is_some() && status.ahead > 0 && status.behind > 0 {
+                let settings = cx.global::<Settings>().clone();
+                let mode = update_mode(&settings);
+                let diverged = status.upstream.is_some() && status.ahead > 0 && status.behind > 0;
+                // A rebase is the answer of the page: the divergence needs no question.
+                if diverged && mode == UpdateMode::Merge {
                     this.show_update_choice(position, cx);
                 } else {
-                    this.update_with(UpdateMode::Merge, cx);
+                    this.update_with(mode, cx);
                 }
             },
             cx,

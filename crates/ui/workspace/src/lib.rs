@@ -20,14 +20,14 @@ pub use launch::{AppInfo, Launch, StartContext, run, spawn_project, start_contex
 pub use layout::{DockState, Layout, PaneState, WindowPlacement};
 pub use run::{DebugControls, DebugRunState, RunControls, RunState};
 pub use settings::{
-    COMPLETION_DELAY_STEP_MS, CompletionCase, DefaultLayout, InlayParameterNames,
+    COMPLETION_DELAY_STEP_MS, CompletionCase, DefaultLayout, GitUpdateMethod, InlayParameterNames,
     LINE_SPACING_STEP, MAX_COMPLETION_DELAY_MS, MAX_FONT_SIZE, MAX_INDENT_SIZE, MAX_LINE_SPACING,
     MAX_UI_SCALE, MIN_FONT_SIZE, MIN_LINE_SPACING, MIN_UI_SCALE, SETTINGS_FILE, Settings,
     TrimTrailingWhitespace, UI_SCALE_STEP,
 };
 pub use window::{
     AI_TOOL, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP, COMMIT_TOOL, CloseTab, CommandFn,
-    DEBUG_TOOL, Debug, Dismiss, DockSide, Evaluate, INSPECTION_TOOL, LOG_TOOL,
+    DEBUG_TOOL, DOCUMENTATION_TOOL, Debug, Dismiss, DockSide, Evaluate, INSPECTION_TOOL, LOG_TOOL,
     METHOD_HIERARCHY_TOOL, MenuShortcut, NextProblem, NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL,
     PROJECT_TOOL, PreviousProblem, ProjectOpener, ProjectStructure, PushChanges, RUN_TOOL,
     RerunInspection, Resume, RevertChange, Run, SERVICES_TOOL, STRUCTURE_TOOL, SelectInProject,

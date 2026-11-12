@@ -1140,6 +1140,7 @@ impl Workspace {
                 self.action_row("Debug", ToggleDebug),
                 self.action_row("Terminal", ToggleTerminal),
                 self.action_row("AI Assistant", ToggleAi),
+                command("window.show_documentation", "Documentation"),
             ],
         );
 

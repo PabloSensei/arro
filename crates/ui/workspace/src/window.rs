@@ -283,6 +283,7 @@ pub const USAGES_TOOL: &str = "usages";
 pub const TODO_TOOL: &str = "todo";
 pub const SERVICES_TOOL: &str = "services";
 pub const PERFORMANCE_TOOL: &str = "performance";
+pub const DOCUMENTATION_TOOL: &str = "documentation";
 pub const LOG_TOOL: &str = "log";
 pub const CALL_HIERARCHY_TOOL: &str = "call-hierarchy";
 pub const METHOD_HIERARCHY_TOOL: &str = "method-hierarchy";
@@ -782,7 +783,7 @@ impl Workspace {
         {
             let cleanup = cx
                 .background_executor()
-                .spawn(async move { updater::remove_old(&folder) });
+                .spawn(async move { updater::cleanup(&folder) });
             cx.spawn(async move |_, _| {
                 if let Err(error) = cleanup.await {
                     eprintln!("old update files are not removed: {error}");
@@ -994,7 +995,7 @@ impl Workspace {
             opener(&root, cx);
             return;
         }
-        match crate::launch::spawn_project(&self.state_dir, &root) {
+        match crate::launch::spawn_project_after(&self.state_dir, &root, Some(std::process::id())) {
             Ok(()) => cx.quit(),
             Err(error) => self.notify_user("Cannot restart the project", error.to_string(), cx),
         }
@@ -1009,15 +1010,8 @@ impl Workspace {
             eprintln!("layout is not saved: {error}");
         }
         let root = self.root.clone();
-        let started = std::env::current_exe()
-            .map_err(|error| error.to_string())
-            .and_then(|exe| {
-                std::process::Command::new(exe)
-                    .arg(root)
-                    .spawn()
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            });
+        let started =
+            crate::launch::spawn_project_after(&self.state_dir, &root, Some(std::process::id()));
         match started {
             Ok(()) => cx.quit(),
             Err(error) => self.notify_user(

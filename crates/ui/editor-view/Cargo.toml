@@ -11,6 +11,7 @@ futures-channel = "0.3"
 futures-util = "0.3"
 keymap = { path = "../../editor/keymap" }
 lang-api.workspace = true
+markdown = "1.0.0"
 lsp-client.workspace = true
 platform.workspace = true
 syntax = { path = "../../editor/syntax" }

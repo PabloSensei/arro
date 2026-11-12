@@ -41,6 +41,13 @@ pub enum DisplayChunk {
     },
 }
 
+/// The row of the block layer: a label of its own instead of buffer text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockText {
+    /// Leading columns, taken from the line under the block.
+    pub indent: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DisplayLine {
     pub text: String,
@@ -51,6 +58,8 @@ pub struct DisplayLine {
     pub start_offset: usize,
     /// The row goes on from the one above, which soft wrap broke.
     pub continuation: bool,
+    /// The row stands above the text: it holds this label, not bytes of the buffer.
+    pub block: Option<BlockText>,
 }
 
 impl DisplayLine {
@@ -89,6 +98,7 @@ impl DisplayLine {
                 self.offset_of(columns.end, Bias::Left)
             },
             continuation: columns.start > 0,
+            block: None,
         }
     }
 

@@ -203,6 +203,18 @@ impl LanguageSupport for JavaProject {
         self.providers.semantic_tokens_range()
     }
 
+    fn code_lens(&self) -> Option<&lang_api::CodeLensProvider> {
+        Some(self.providers.as_ref())
+    }
+
+    fn code_lens_resolve(&self) -> Option<&lang_api::CodeLensResolveProvider> {
+        Some(self.providers.as_ref())
+    }
+
+    fn set_code_vision_settings(&self, settings: lang_api::CodeVisionSettings) {
+        self.apply_code_vision_settings(settings);
+    }
+
     fn inlay_hints(&self) -> Option<&InlayHintProvider> {
         Some(self.providers.as_ref())
     }

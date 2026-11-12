@@ -28,6 +28,7 @@ fn project() -> (Jdtls, PathBuf) {
         state_dir: root.join("state"),
         runtimes: Vec::new(),
         maven_settings: None,
+        gradle_home: None,
         gradle_user_home: None,
         gradle_java_home: None,
         offline: true,

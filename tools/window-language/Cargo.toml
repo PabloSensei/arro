@@ -11,6 +11,8 @@ base.workspace = true
 dap-client.workspace = true
 java-exec.workspace = true
 java-lang = { path = "../../crates/java/java-lang" }
+java-project.workspace = true
+jdtls-adapter.workspace = true
 lang-api.workspace = true
 lsp-client.workspace = true
 platform.workspace = true

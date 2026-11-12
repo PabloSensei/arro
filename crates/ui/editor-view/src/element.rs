@@ -7,12 +7,15 @@ use display_map::{DisplayChunk, DisplayLine};
 use lang_api::Severity;
 use syntax::{HighlightKind, HighlightSpan};
 use text_core::TextStore;
+use ui_kit::metrics::UI_FONT;
 use ui_kit::*;
 
 use crate::scrollbar::{self, Bar};
 use crate::semantic::TokenSpan;
 use crate::style::EditorStyle;
-use crate::view::{EditorView, GutterKind, GutterMark, OutlineItem, RunMarkState};
+use crate::view::{
+    EditorView, GutterKind, GutterMark, InlayPaint, OutlineItem, RunMarkState, inside,
+};
 
 pub(crate) const GUTTER_WIDTH: f32 = 64.;
 pub(crate) const TEXT_INSET: f32 = 3.;
@@ -30,11 +33,13 @@ fn snapped_size(size: f32, scale_factor: f32) -> f32 {
 
 pub(crate) struct LaidOutRow {
     pub row: usize,
-    buffer_line: usize,
+    pub(crate) buffer_line: usize,
     pub y: Pixels,
     pub line: DisplayLine,
     pub text: ShapedLine,
     number: ShapedLine,
+    /// The number the gutter shows, when it shows one.
+    pub(crate) number_value: Option<usize>,
     /// The hints of the row, shaped at their own smaller size.
     inlays: Vec<InlayText>,
     /// A fold button: `true` when the fold is collapsed.
@@ -45,12 +50,28 @@ pub(crate) struct LaidOutRow {
     bookmark: bool,
     current: bool,
     indent: usize,
+    /// The row is a block above the text and holds no line of the buffer.
+    pub(crate) is_block: bool,
+    /// The parts of a block row: each opens its list when clicked.
+    pub(crate) block_labels: Vec<BlockLabel>,
 }
 
-/// A hint of a row: the columns it takes in the row text and its own shaped line.
+/// One clickable label of a block row.
+pub(crate) struct BlockLabel {
+    pub kind: lang_api::CodeLensKind,
+    pub text: ShapedLine,
+    pub bounds: Bounds<Pixels>,
+}
+
+/// A hint of a row: the columns it takes in the row text, its own shaped line and where
+/// the label and its pill go.
 struct InlayText {
     columns: Range<usize>,
     text: ShapedLine,
+    /// The height the label is painted at, so that its baseline is the code one.
+    height: Pixels,
+    /// The pill and the place of the label, `None` until the row has its columns.
+    paint: Option<InlayPaint>,
 }
 
 /// What a mark on the scrollbar stands for.
@@ -85,6 +106,10 @@ pub(crate) struct Layout {
     pub vertical_area: Option<Bounds<Pixels>>,
     pub horizontal_area: Option<Bounds<Pixels>>,
     pub stripes: Vec<StripeMark>,
+    /// The height of the panel of sticky lines, from zero when there is none.
+    pub sticky_height: f32,
+    /// The hints of the frame, for a test of their pills and baselines.
+    pub inlays: Vec<InlayPaint>,
 }
 
 pub(crate) struct EditorElement {
@@ -106,6 +131,9 @@ fn paint_marks(
     window: &mut Window,
 ) {
     for shown in rows {
+        if shown.is_block {
+            continue;
+        }
         let line = shown.buffer_line as u32;
         for mark in marks.iter().filter(|mark| match mark.kind {
             GutterKind::Deleted => mark.lines.start == line,
@@ -137,6 +165,18 @@ struct StickyRow {
 
 /// Declarations pinned at most.
 const STICKY_MAX: usize = 4;
+
+/// The room between the last pinned declaration and the first row of the text below it.
+const STICKY_GAP: f32 = 4.;
+
+/// The height of the panel of `count` pinned declarations.
+pub(crate) fn sticky_height(count: usize, line_height: f32) -> f32 {
+    if count == 0 {
+        0.
+    } else {
+        count as f32 * line_height + STICKY_GAP
+    }
+}
 
 /// The declarations whose first line is above `top_line` while their body still reaches
 /// it, outermost first, the innermost `STICKY_MAX` of them.
@@ -394,6 +434,9 @@ fn longest_line_width<S: TextStore>(
 ) -> f32 {
     let mut widest = 0f32;
     for row in 0..display.row_count() {
+        if display.is_block_row(row) {
+            continue;
+        }
         let columns = display.line(row).text.chars().count() as f32;
         widest = widest.max(columns * char_width);
     }
@@ -456,6 +499,11 @@ fn fill_blank_indents(indents: &[Option<usize>]) -> Vec<usize> {
         .collect()
 }
 
+/// Where the baseline of a line painted into a box of `height` stands, from its top.
+fn baseline(line: &ShapedLine, height: Pixels) -> Pixels {
+    (height - line.ascent - line.descent) * 0.5 + line.ascent
+}
+
 impl Element for EditorElement {
     type RequestLayoutState = ();
     type PrepaintState = EditorPrepaint;
@@ -496,8 +544,10 @@ impl Element for EditorElement {
         };
         let mut code_font = font(style.font_family.clone());
         code_font.features = FontFeatures::disable_ligatures();
+        let ui_font = font(UI_FONT);
         let font_size = px(snapped_size(style.font_size, window.scale_factor()));
         let inlay_size = px((f32::from(font_size) * 0.82).max(9.));
+        let block_size = inlay_size;
         let text_system = window.text_system().clone();
         let probe = [run(1, &code_font, style.code, false)];
         let char_width = text_system
@@ -570,6 +620,7 @@ impl Element for EditorElement {
         let mut rows = Vec::new();
         let mut highlights = Vec::new();
         let mut sticky = Vec::new();
+        let mut inlay_paints = Vec::new();
         let mut selections = Vec::new();
         let mut carets = Vec::new();
         let mut marked = None;
@@ -594,9 +645,22 @@ impl Element for EditorElement {
             let store = state.store();
             let primary_row = display.to_display(state.selections().primary().head).row;
             let first = (view.scroll_top / line_height) as usize;
-            let visible = (text_height / line_height).ceil() as usize + 1;
+            let line_of = |at: usize| store.offset_to_line(at.min(store.len()));
+            let top_line = if first < display.row_count() {
+                display.row_to_line(first)
+            } else {
+                store.line_count()
+            };
+            let pinned = pinned_items(view.outline(), top_line, line_of);
+            // The panel of pinned declarations takes whole rows and the gap under them:
+            // the text starts on a row boundary below it, so no letter is cut in half.
+            let offset = if pinned.is_empty() {
+                -(view.scroll_top % line_height)
+            } else {
+                STICKY_GAP
+            };
+            let visible = (text_height / line_height).ceil() as usize + pinned.len() + 1;
             let last = (first + visible).min(display.row_count());
-            let offset = -(view.scroll_top % line_height);
 
             let lines: Vec<DisplayLine> = (first..last).map(|row| display.line(row)).collect();
             let tokens: &[TokenSpan] = if view.options.semantic_highlighting {
@@ -626,20 +690,36 @@ impl Element for EditorElement {
 
             for (slot, (line, indent)) in lines.into_iter().zip(indents).enumerate() {
                 let row = first + slot;
-                let current = row == primary_row;
+                let block = display.is_block_row(row);
+                let current = row == primary_row && !block;
                 let buffer_line = store.offset_to_line(line.start_offset);
                 let continuation = line.continuation;
-                let bookmark = if continuation {
+                let indent = if block {
+                    line.block.as_ref().map_or(0, |block| block.indent)
+                } else {
+                    indent
+                };
+                let bookmark = if continuation || block {
                     None
                 } else {
                     state.bookmark_at_line(buffer_line)
                 };
                 // A named bookmark shows its letter where the number is.
                 let number_text: SharedString = match (continuation, bookmark) {
+                    (_, _) if block => "".into(),
                     (true, _) => "".into(),
                     (false, Some(Some(letter))) => letter.to_string().into(),
                     (false, _) if !options.line_numbers => "".into(),
                     (false, _) => (buffer_line + 1).to_string().into(),
+                };
+                let number_value = if block
+                    || continuation
+                    || matches!(bookmark, Some(Some(_)))
+                    || !options.line_numbers
+                {
+                    None
+                } else {
+                    Some(buffer_line + 1)
                 };
                 let number_color = match bookmark {
                     Some(Some(_)) => style.accent,
@@ -655,44 +735,78 @@ impl Element for EditorElement {
                 let number =
                     text_system.shape_line(number_text, px(NUMBER_SIZE), &number_run[..used], None);
 
-                let runs = runs_of(
-                    &line,
-                    state.spans(),
-                    tokens,
-                    &unnecessary,
-                    &style,
-                    &code_font,
-                );
-                let text = text_system.shape_line(line.text.clone().into(), font_size, &runs, None);
+                let (text, block_labels) = if block {
+                    let y = bounds.top() + px(offset + slot as f32 * line_height);
+                    let labels = view.code_vision_labels(buffer_line);
+                    let mut block_labels = Vec::with_capacity(labels.len());
+                    let mut x = char_width * indent as f32;
+                    for (kind, label) in labels {
+                        let runs = [run(label.len(), &ui_font, style.code_vision, false)];
+                        let shaped = text_system.shape_line(label.into(), block_size, &runs, None);
+                        let width = shaped.width();
+                        block_labels.push(BlockLabel {
+                            kind: *kind,
+                            text: shaped,
+                            bounds: Bounds::new(point(text_x + x, y), size(width, px(line_height))),
+                        });
+                        x += width + px(8.);
+                    }
+                    let runs = [run(line.text.len(), &ui_font, style.code_vision, false)];
+                    let shaped =
+                        text_system.shape_line(line.text.clone().into(), block_size, &runs, None);
+                    (shaped, block_labels)
+                } else {
+                    let runs = runs_of(
+                        &line,
+                        state.spans(),
+                        tokens,
+                        &unnecessary,
+                        &style,
+                        &code_font,
+                    );
+                    let shaped =
+                        text_system.shape_line(line.text.clone().into(), font_size, &runs, None);
+                    (shaped, Vec::new())
+                };
                 let mut inlays = Vec::new();
-                for (range, chunk) in &line.chunks {
-                    if !matches!(chunk, DisplayChunk::Inlay { .. }) {
-                        continue;
+                if !block {
+                    let code_baseline = baseline(&text, px(line_height));
+                    for (range, chunk) in &line.chunks {
+                        if !matches!(chunk, DisplayChunk::Inlay { .. }) {
+                            continue;
+                        }
+                        // The padding spaces of the server stay as columns around the pill,
+                        // the pill itself hugs the label.
+                        let hint = line.text[range.clone()].trim().to_owned();
+                        if hint.is_empty() {
+                            continue;
+                        }
+                        let runs = [run(hint.len(), &code_font, style.inlay, false)];
+                        let shaped = text_system.shape_line(hint.into(), inlay_size, &runs, None);
+                        // A smaller font centered in the row puts its baseline above the
+                        // one of the code: the label gets a box that lands on that line.
+                        let padding = (code_baseline - shaped.ascent).max(px(0.));
+                        let height = shaped.ascent + shaped.descent + padding * 2.;
+                        inlays.push(InlayText {
+                            columns: range.clone(),
+                            text: shaped,
+                            height,
+                            paint: None,
+                        });
                     }
-                    // The padding spaces of the server stay as columns around the pill,
-                    // the pill itself hugs the label.
-                    let hint = line.text[range.clone()].trim().to_owned();
-                    if hint.is_empty() {
-                        continue;
-                    }
-                    let runs = [run(hint.len(), &code_font, style.inlay, false)];
-                    let shaped = text_system.shape_line(hint.into(), inlay_size, &runs, None);
-                    inlays.push(InlayText {
-                        columns: range.clone(),
-                        text: shaped,
-                    });
                 }
 
                 let collapsed = line
                     .chunks
                     .iter()
                     .any(|(_, chunk)| matches!(chunk, DisplayChunk::Placeholder { .. }));
-                let foldable = state
-                    .map()
-                    .folds
-                    .candidate_on_line(store, buffer_line)
-                    .is_some();
-                let fold = if continuation {
+                let foldable = !block
+                    && state
+                        .map()
+                        .folds
+                        .candidate_on_line(store, buffer_line)
+                        .is_some();
+                let fold = if continuation || block {
                     None
                 } else if collapsed {
                     Some(true)
@@ -702,7 +816,7 @@ impl Element for EditorElement {
                 let run = view
                     .run_marks
                     .iter()
-                    .find(|mark| !continuation && mark.line as usize == buffer_line)
+                    .find(|mark| !block && !continuation && mark.line as usize == buffer_line)
                     .map(|mark| (mark.state, mark.color));
                 rows.push(LaidOutRow {
                     row,
@@ -711,12 +825,15 @@ impl Element for EditorElement {
                     line,
                     text,
                     number,
+                    number_value,
                     inlays,
                     fold,
                     run,
-                    bookmark: matches!(bookmark, Some(None)),
+                    bookmark: !block && matches!(bookmark, Some(None)),
                     current,
                     indent,
+                    is_block: block,
+                    block_labels,
                 });
             }
 
@@ -737,10 +854,8 @@ impl Element for EditorElement {
                 }
             }
 
-            if let Some(top) = rows.first() {
-                let top_line = top.buffer_line;
-                let line_of = |at: usize| store.offset_to_line(at.min(store.len()));
-                for item in pinned_items(view.outline(), top_line, line_of) {
+            if !pinned.is_empty() {
+                for item in &pinned {
                     let line = line_of(item.name_range.start);
                     let text = store.line_text(line);
                     let text = text.trim_end().replace('\t', "    ");
@@ -767,10 +882,45 @@ impl Element for EditorElement {
 
             let origin_x = text_x - px(scroll_left);
             let height = px(line_height);
+            for shown in rows.iter_mut() {
+                if shown.is_block {
+                    continue;
+                }
+                for inlay in &mut shown.inlays {
+                    let left = origin_x + shown.text.x_for_index(inlay.columns.start);
+                    let right = origin_x + shown.text.x_for_index(inlay.columns.end);
+                    let width = inlay.text.width();
+                    let x = left + ((right - left) - width).max(px(0.)) * 0.5;
+                    // The pill hugs the label but never covers the characters beside it.
+                    let pill_left = (x - px(3.)).max(left);
+                    let pill_right = (x + width + px(3.)).min(right).max(pill_left + px(1.));
+                    let pill = Bounds::new(
+                        point(pill_left, shown.y + px(2.)),
+                        size(pill_right - pill_left, height - px(4.)),
+                    );
+                    let label_baseline = (inlay.height - inlay.text.ascent - inlay.text.descent)
+                        * 0.5
+                        + inlay.text.ascent;
+                    inlay_paints.push(InlayPaint {
+                        line: shown.buffer_line,
+                        columns: inlay.columns.clone(),
+                        columns_left: left,
+                        columns_right: right,
+                        pill,
+                        label_x: x,
+                        baseline: f32::from(label_baseline),
+                        code_baseline: f32::from(baseline(&shown.text, height)),
+                    });
+                    inlay.paint = inlay_paints.last().cloned();
+                }
+            }
             if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
                 let visible = first.line.start_offset..last.line.end_offset;
                 for (range, color) in view.highlights(state, visible) {
                     for shown in &rows {
+                        if shown.is_block {
+                            continue;
+                        }
                         let (start, end) = (shown.line.start_offset, shown.line.end_offset);
                         if range.end <= start || range.start >= end {
                             continue;
@@ -789,6 +939,9 @@ impl Element for EditorElement {
                 }
             }
             for shown in &rows {
+                if shown.is_block {
+                    continue;
+                }
                 let (start, end) = (shown.line.start_offset, shown.line.end_offset);
                 for selection in state
                     .selections()
@@ -856,6 +1009,9 @@ impl Element for EditorElement {
         if let Some(usages) = &view.usages {
             for range in usages {
                 for shown in &rows {
+                    if shown.is_block {
+                        continue;
+                    }
                     let (start, end) = (shown.line.start_offset, shown.line.end_offset);
                     if range.end < start || range.start > end {
                         continue;
@@ -878,6 +1034,9 @@ impl Element for EditorElement {
             if view.usages.is_none() {
                 for range in &lsp.highlights {
                     for shown in &rows {
+                        if shown.is_block {
+                            continue;
+                        }
                         let (start, end) = (shown.line.start_offset, shown.line.end_offset);
                         if range.end < start || range.start > end {
                             continue;
@@ -905,6 +1064,9 @@ impl Element for EditorElement {
                     Severity::Information | Severity::Hint => continue,
                 };
                 for shown in &rows {
+                    if shown.is_block {
+                        continue;
+                    }
                     let (start, end) = (shown.line.start_offset, shown.line.end_offset);
                     if mark.range.end < start || mark.range.start > end {
                         continue;
@@ -1086,6 +1248,8 @@ impl Element for EditorElement {
             vertical_area,
             horizontal_area,
             stripes,
+            sticky_height: sticky_height(sticky.len(), line_height),
+            inlays: inlay_paints,
         });
         let shared = layout.clone();
         let sticky_lines: Vec<usize> = sticky.iter().map(|row: &StickyRow| row.line).collect();
@@ -1163,6 +1327,16 @@ impl Element for EditorElement {
         let temporary_breakpoints = self.view.read(cx).temporary_breakpoints.clone();
         let show_whitespace = self.view.read(cx).show_whitespace();
         let indent_columns = self.view.read(cx).indent_columns().max(1);
+        let code_vision_hovered = self.view.read(cx).code_vision_hovered;
+        let pointer = window.mouse_position();
+        let over_code_vision = prepaint.layout.rows.iter().any(|row| {
+            row.block_labels
+                .iter()
+                .any(|label| inside(label.bounds, pointer))
+        });
+        if over_code_vision {
+            window.set_cursor_style(CursorStyle::PointingHand, &prepaint.hitbox);
+        }
 
         let view = self.view.clone();
         let hitbox = prepaint.hitbox.clone();
@@ -1259,6 +1433,9 @@ impl Element for EditorElement {
             }
 
             for shown in &prepaint.layout.rows {
+                if shown.is_block {
+                    continue;
+                }
                 let line = shown.buffer_line as u32;
                 if breakpoints.contains(&line) {
                     let dot = Bounds::new(
@@ -1362,6 +1539,32 @@ impl Element for EditorElement {
                 }
 
                 for shown in &prepaint.layout.rows {
+                    if shown.is_block {
+                        for (index, label) in shown.block_labels.iter().enumerate() {
+                            label
+                                .text
+                                .paint(
+                                    label.bounds.origin,
+                                    height,
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .ok();
+                            if code_vision_hovered == Some((shown.row, index)) {
+                                let underline = Bounds::new(
+                                    point(
+                                        label.bounds.origin.x,
+                                        label.bounds.origin.y + height - px(2.),
+                                    ),
+                                    size(label.bounds.size.width, px(1.)),
+                                );
+                                window.paint_quad(fill(underline, style.code_vision));
+                            }
+                        }
+                        continue;
+                    }
                     if options.indent_guides {
                         for level in 1..(shown.indent / indent_columns) {
                             let x = text_x + char_width * (level * indent_columns) as f32;
@@ -1397,20 +1600,17 @@ impl Element for EditorElement {
                         )
                         .ok();
                     for inlay in &shown.inlays {
-                        let left = shown.text.x_for_index(inlay.columns.start);
-                        let right = shown.text.x_for_index(inlay.columns.end);
-                        let width = inlay.text.width();
-                        let x = left + ((right - left) - width).max(px(0.)) / 2.;
-                        let pill = Bounds::new(
-                            point(text_x + x - px(3.), shown.y + px(2.)),
-                            size(width + px(6.), height - px(4.)),
+                        let Some(paint) = &inlay.paint else {
+                            continue;
+                        };
+                        window.paint_quad(
+                            fill(paint.pill, style.inlay_background).corner_radii(px(3.)),
                         );
-                        window.paint_quad(fill(pill, style.inlay_background).corner_radii(px(3.)));
                         inlay
                             .text
                             .paint(
-                                point(text_x + x, shown.y),
-                                height,
+                                point(paint.label_x, shown.y),
+                                inlay.height,
                                 TextAlign::Left,
                                 None,
                                 window,
@@ -1469,42 +1669,50 @@ impl Element for EditorElement {
                 }
             });
 
-            for (index, row) in prepaint.sticky.iter().enumerate() {
-                let y = bounds.top() + height * index as f32;
+            if !prepaint.sticky.is_empty() {
+                let panel_height = px(prepaint.layout.sticky_height);
+                // The panel is opaque, so no text shows through it, and one thin line
+                // closes it at the bottom instead of a line under every pinned row.
                 window.paint_quad(fill(
-                    Bounds::new(point(bounds.left(), y), size(bounds.size.width, height)),
+                    Bounds::new(
+                        point(bounds.left(), bounds.top()),
+                        size(bounds.size.width, panel_height),
+                    ),
                     style.background,
                 ));
-                let number_x = bounds.left() + px(NUMBER_RIGHT) - row.number.width();
-                row.number
-                    .paint(
-                        point(number_x, y + px(2.)),
-                        px(18.),
-                        TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    )
-                    .ok();
-                let clip = Bounds::from_corners(
-                    point(gutter_right + px(1.), y),
-                    point(bounds.right(), y + height),
-                );
-                window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
-                    row.text
+                for (index, row) in prepaint.sticky.iter().enumerate() {
+                    let y = bounds.top() + height * index as f32;
+                    let number_x = bounds.left() + px(NUMBER_RIGHT) - row.number.width();
+                    row.number
                         .paint(
-                            point(gutter_right + px(TEXT_INSET), y),
-                            height,
+                            point(number_x, y + px(2.)),
+                            px(18.),
                             TextAlign::Left,
                             None,
                             window,
                             cx,
                         )
                         .ok();
-                });
+                    let clip = Bounds::from_corners(
+                        point(gutter_right + px(1.), y),
+                        point(bounds.right(), y + height),
+                    );
+                    window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                        row.text
+                            .paint(
+                                point(gutter_right + px(TEXT_INSET), y),
+                                height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                    });
+                }
                 window.paint_quad(fill(
                     Bounds::new(
-                        point(bounds.left(), y + height - px(1.)),
+                        point(bounds.left(), bounds.top() + panel_height - px(1.)),
                         size(bounds.size.width, px(1.)),
                     ),
                     style.indent_guide,

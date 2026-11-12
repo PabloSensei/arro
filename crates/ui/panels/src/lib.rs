@@ -17,6 +17,7 @@ mod copy_class;
 mod debug;
 mod diff_view;
 mod docker;
+mod documentation;
 mod editor_menu;
 mod editor_tab;
 mod file_tree;
@@ -48,6 +49,7 @@ mod script;
 mod settings;
 mod settings_catalog;
 mod settings_keymap;
+mod settings_templates;
 mod shelf;
 mod start;
 mod structure;
@@ -125,6 +127,8 @@ mod window_tests_virtual;
 #[cfg(test)]
 mod window_tests_window;
 
+#[cfg(test)]
+mod window_tests_doc_window;
 #[cfg(test)]
 mod window_tests_folding;
 #[cfg(test)]
@@ -223,7 +227,21 @@ mod window_tests_scrollbars;
 mod window_tests_semantic_tokens;
 
 #[cfg(test)]
+mod window_tests_settings_tools;
+
+#[cfg(test)]
 mod window_tests_editor_scrollbar;
+#[cfg(test)]
+mod window_tests_quick_doc;
+
+#[cfg(test)]
+mod window_tests_code_vision;
+#[cfg(test)]
+mod window_tests_editor_polish;
+#[cfg(test)]
+mod window_tests_template_engine;
+#[cfg(test)]
+mod window_tests_templates_settings;
 
 mod choice;
 mod invalidate;
@@ -240,8 +258,8 @@ use lang_api::{FileChange, LanguageSupport, ProjectProblemsQuery, ask};
 use tool_gateway::LanguageTools;
 use ui_kit::*;
 use workspace::{
-    AI_TOOL, COMMIT_TOOL, DEBUG_TOOL, DockSide, INSPECTION_TOOL, LOG_TOOL, Launch,
-    PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL,
+    AI_TOOL, COMMIT_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, INSPECTION_TOOL, LOG_TOOL,
+    Launch, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL,
     TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
 };
 
@@ -256,9 +274,15 @@ pub use invalidate::CacheLocations;
 pub use problems::{ActiveProblems, Problem, ProblemsHub, ProblemsState};
 pub use run::ProjectSetup;
 pub use script::parse_script;
+pub use settings_templates::TemplatesSetup;
 pub use start::{ProjectTemplate, run as run_start};
 pub use tree_ops::{Creates, FileTemplate};
 pub use usages::{ActiveUsages, UsagesHub};
+
+/// Names the build tools of the language for the pages and the search of Settings.
+pub fn set_build_tool_names(first: impl Into<String>, second: impl Into<String>) {
+    settings_catalog::set_build_tool_names(first, second);
+}
 
 /// The language server of the open project, started by the application.
 pub struct LanguageServer {
@@ -313,6 +337,7 @@ pub fn run(
         server,
         None,
         CacheLocations::default(),
+        TemplatesSetup::default(),
         mock_agents,
         script,
     )
@@ -329,6 +354,7 @@ pub fn run_with_setup(
     server: Option<LanguageServer>,
     setup: Option<LanguageSetup>,
     cache: CacheLocations,
+    templates: TemplatesSetup,
     mock_agents: bool,
     script: Option<String>,
 ) {
@@ -339,7 +365,9 @@ pub fn run_with_setup(
     workspace::run(launch, move |workspace, window, cx| {
         cx.set_global(languages);
         cx.set_global(cache);
+        cx.set_global(templates.initial());
         install(workspace, search, project, agents, window, cx);
+        settings_templates::load(workspace, cx);
         if let Some(server) = server {
             connect(workspace, server, cx);
         }
@@ -756,6 +784,16 @@ fn install(
     );
     cx.set_global(performance::ActivePerformance(performance));
 
+    let documentation = documentation::DocumentationPanel::create(weak.clone(), cx);
+    let focus = documentation.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Right,
+        DOCUMENTATION_TOOL,
+        documentation.clone().into(),
+        Some(focus),
+    );
+    cx.set_global(documentation::ActiveDocumentation(documentation));
+
     let call_hierarchy = call_hierarchy::CallHierarchyPanel::create(weak.clone(), cx);
     let focus = call_hierarchy.read(cx).focus();
     workspace.set_dock(
@@ -777,7 +815,9 @@ fn install(
     cx.set_global(method_hierarchy::ActiveMethodHierarchy(method_hierarchy));
 
     let keymap_file = workspace.keymap_path().to_path_buf();
-    let (index, events) = ProjectIndex::start(root.clone(), Some(keymap_file), search);
+    let templates_file = workspace.settings_dir().join(templates::TEMPLATES_FILE);
+    let (index, events) =
+        ProjectIndex::start(root.clone(), vec![keymap_file, templates_file], search);
     cx.set_global(crate::index::ActiveIndex(index.clone()));
     let files = cx.new(|_| Arc::new(Vec::new()));
     let runs = cx.global::<script::ActiveRunPanel>().0.clone();
@@ -815,6 +855,8 @@ fn install(
         cx.default_global::<Navigator>().activated(path);
         let panel = cx.global::<structure::ActiveStructure>().0.clone();
         panel.update(cx, |panel, cx| panel.show(path.to_path_buf(), cx));
+        let documentation = cx.global::<documentation::ActiveDocumentation>().0.clone();
+        documentation.update(cx, |panel, cx| panel.show_path(path.to_path_buf(), cx));
     });
     // What the watcher missed shows up when the window comes back to the front.
     let rescan = index.clone();
@@ -863,9 +905,12 @@ fn watch_project(
                     }
                 }
                 IndexEvent::Settings => {
-                    // The keymap file of the user changed on disk: the same read as an
-                    // edit of the Settings page, without a clock.
-                    let applied = this.update(cx, |workspace, cx| workspace.reload_keymap(cx));
+                    // A file of the settings folder changed on disk: the same read as
+                    // an edit of the Settings page, without a clock.
+                    let applied = this.update(cx, |workspace, cx| {
+                        workspace.reload_keymap(cx);
+                        settings_templates::load(workspace, cx);
+                    });
                     if applied.is_err() {
                         break;
                     }

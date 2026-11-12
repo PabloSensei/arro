@@ -6,11 +6,13 @@ mod client;
 mod error;
 mod framing;
 pub mod hints;
+mod lens;
 mod tokens;
 pub mod uri;
 pub mod utf16;
 
 pub use client::{Client, ServerEvents};
 pub use error::{Error, ResponseError};
+pub use lens::{CodeLensCapability, CodeLensSetup, CodeLenses};
 pub use lsp_types;
 pub use tokens::{SemanticTokensCapability, SemanticTokensSetup};

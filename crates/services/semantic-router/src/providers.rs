@@ -14,25 +14,26 @@ use base::Cancel;
 use lang_api::{
     ActionEntry, ActionKind, ActionQuery, AddOverridableMethodsRequest, Answer, CallDirection,
     CallHierarchyItem, CallHierarchyQuery, CallParameter, CallSignature, ChangeSignatureInfo,
-    ChangeSignatureOutcome, ChangeSignatureRequest, CommandQuery, CompletionCommand,
-    CompletionEntry, CompletionKind, CompletionLabelDetails, CompletionList, Confidence,
-    DiagnosticEntry, DiagnosticNote, DiagnosticsQuery, DocumentEdit, DocumentSpot, ExpectedType,
-    ExternalDoc, FileDiagnostics, FileRename, FormatQuery, GenerateApplyRequest, GenerateChoice,
-    GenerateKind, GenerateQuery, Generation, HierarchyDirection, HierarchyQuery, HoverText,
-    InlayHintEntry, InlayHintKind, InlayHintQuery, MethodSignature, MoveDestination, MoveKind,
-    MoveOutcome, MoveQuery, MoveRequest, NavigationKind, NavigationQuery, OverridableMethod,
-    OverridableMethods, OverridableMethodsQuery, Provider, RangeFormatQuery, RenameQuery, Reply,
-    SemanticServer, SemanticToken, SemanticTokenKind, SemanticTokenModifiers, SemanticTokensQuery,
-    Severity, SignatureException, SignatureHelp, SignatureParameter, SignatureQuery, SignatureText,
+    ChangeSignatureOutcome, ChangeSignatureRequest, CodeLensCommand, CodeLensEntry, CodeLensQuery,
+    CodeLensResolveQuery, CommandQuery, CompletionCommand, CompletionEntry, CompletionKind,
+    CompletionLabelDetails, CompletionList, Confidence, DiagnosticEntry, DiagnosticNote,
+    DiagnosticsQuery, DocumentEdit, DocumentSpot, ExpectedType, ExternalDoc, FileDiagnostics,
+    FileRename, FormatQuery, GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateQuery,
+    Generation, HierarchyDirection, HierarchyQuery, HoverText, InlayHintEntry, InlayHintKind,
+    InlayHintQuery, MethodSignature, MoveDestination, MoveKind, MoveOutcome, MoveQuery,
+    MoveRequest, NavigationKind, NavigationQuery, OverridableMethod, OverridableMethods,
+    OverridableMethodsQuery, Provider, RangeFormatQuery, RenameQuery, Reply, SemanticServer,
+    SemanticToken, SemanticTokenKind, SemanticTokenModifiers, SemanticTokensQuery, Severity,
+    SignatureException, SignatureHelp, SignatureParameter, SignatureQuery, SignatureText,
     SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery, TextPoint, TextSpan, UsageEntry,
     UsageKind, WorkspaceChange, WorkspaceDiagnosticsQuery, offset_in,
 };
 use lsp_client::SemanticTokensCapability;
 use lsp_client::lsp_types::{
-    self as lsp, CallHierarchyItem as LspCallHierarchyItem, CompletionResponse, DiagnosticSeverity,
-    DiagnosticTag, DocumentHighlightKind, DocumentSymbol, DocumentSymbolResponse,
-    GotoDefinitionResponse, Hover, HoverContents, MarkedString, NumberOrString, Position, Range,
-    TextDocumentContentChangeEvent, Uri, WorkspaceSymbolResponse,
+    self as lsp, CallHierarchyItem as LspCallHierarchyItem, CodeLens, CompletionResponse,
+    DiagnosticSeverity, DiagnosticTag, DocumentHighlightKind, DocumentSymbol,
+    DocumentSymbolResponse, GotoDefinitionResponse, Hover, HoverContents, MarkedString,
+    NumberOrString, Position, Range, TextDocumentContentChangeEvent, Uri, WorkspaceSymbolResponse,
 };
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -95,6 +96,8 @@ pub struct LspProviders {
     import_line: fn(&str) -> bool,
     /// The legend the server declared at `initialize`, when it has semantic tokens.
     semantic_tokens: Option<lsp_client::SemanticTokensSetup>,
+    /// What the server declared about its code lenses at `initialize`.
+    code_lens: Option<lsp_client::CodeLensSetup>,
 }
 
 fn point(position: Position) -> TextPoint {
@@ -1059,6 +1062,62 @@ async fn cancelled(cancel: &Cancel) {
     }
 }
 
+/// One label of an answer. A label without a command has no title yet: its kind comes
+/// from the command the server resolves later.
+fn code_lens_entry(lens: CodeLens) -> CodeLensEntry {
+    let title = lens
+        .command
+        .as_ref()
+        .map(|command| command.title.clone())
+        .unwrap_or_default();
+    let command = lens.command.as_ref().map(|command| CodeLensCommand {
+        title: command.title.clone(),
+        command: command.command.clone(),
+        arguments: command
+            .arguments
+            .as_ref()
+            .and_then(|arguments| serde_json::to_string(arguments).ok()),
+    });
+    let kind = lang_api::kind_of(
+        &title,
+        lens.command
+            .as_ref()
+            .map(|command| command.command.as_str()),
+    );
+    CodeLensEntry {
+        span: span(lens.range),
+        title,
+        kind,
+        resolve: serde_json::to_string(&lens).ok(),
+        command,
+    }
+}
+
+fn code_lens_entries(lenses: Option<Vec<CodeLens>>) -> Vec<CodeLensEntry> {
+    lenses.into_iter().flatten().map(code_lens_entry).collect()
+}
+
+/// How long a code lens request waits for the server to say what it can do. The answer
+/// to `initialize` comes before the first request of a document in practice.
+const CODE_LENS_READY_LIMIT: Duration = Duration::from_secs(15);
+const CODE_LENS_READY_POLL: Duration = Duration::from_millis(50);
+
+async fn code_lens_capability(
+    setup: &lsp_client::CodeLensSetup,
+) -> Option<lsp_client::CodeLensCapability> {
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(capability) = setup.get() {
+            return Some(capability);
+        }
+        if waited >= CODE_LENS_READY_LIMIT {
+            return None;
+        }
+        sleep(CODE_LENS_READY_POLL).await;
+        waited += CODE_LENS_READY_POLL;
+    }
+}
+
 impl LspProviders {
     pub fn new(
         router: Arc<Router>,
@@ -1090,7 +1149,15 @@ impl LspProviders {
             generate: None,
             import_line: |_| false,
             semantic_tokens: None,
+            code_lens: None,
         }
+    }
+
+    /// Takes what the server said about its code lenses at `initialize`. Without it the
+    /// provider asks for no labels.
+    pub fn with_code_lens(mut self, setup: lsp_client::CodeLensSetup) -> Self {
+        self.code_lens = Some(setup);
+        self
     }
 
     /// Takes the legend of the server's semantic tokens, which it declares at
@@ -1632,6 +1699,104 @@ impl Provider<DocumentSpot, Vec<SourceSpan>> for LspProviders {
                 found.into_iter().flatten().map(source_span).collect()
             };
             Some(found.map(spans))
+        });
+    }
+}
+
+impl Provider<CodeLensQuery, Vec<CodeLensEntry>> for LspProviders {
+    fn start(&self, query: CodeLensQuery, cancel: Cancel, mut reply: Reply<Vec<CodeLensEntry>>) {
+        let Some(setup) = self.code_lens.clone() else {
+            return;
+        };
+        let Ok(uri) = Uri::from_str(&query.uri) else {
+            return;
+        };
+        let router = self.router.clone();
+        let mut refreshes = self.published.code_lens_refresh();
+        let source = self.source;
+        self.runtime.spawn(async move {
+            // The server says at `initialize` whether it sends the labels resolved.
+            let Some(_capability) = code_lens_capability(&setup).await else {
+                return;
+            };
+            loop {
+                // Counts of usages need the imported project; a server that still
+                // imports is asked once it is ready.
+                let ready = tokio::select! {
+                    ready = router.ready_after(None) => ready,
+                    () = cancelled(&cancel) => return,
+                };
+                let Some(ready) = ready else {
+                    return;
+                };
+                let generation = Some(ready);
+                // The labels of the previous answer come first, already moved by the
+                // edits: the rows do not blink while the server thinks.
+                let cached = router.cached_code_lens(&uri, query.version);
+                if !cached.is_empty()
+                    && reply
+                        .send(Answer::new(
+                            code_lens_entries(Some(cached)),
+                            Confidence::Partial,
+                            source,
+                        ))
+                        .is_err()
+                {
+                    return;
+                }
+                let place = Place {
+                    uri: uri.clone(),
+                    version: query.version,
+                    position: Position::default(),
+                };
+                match router.code_lens(place).await {
+                    Ok(answer) => {
+                        let entries = code_lens_entries(answer);
+                        if reply
+                            .send(Answer::new(entries, Confidence::Certain, source))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(RouteError::Stale | RouteError::Superseded) => return,
+                    Err(_) => {
+                        if reply
+                            .send(Answer::new(Vec::new(), Confidence::Unknown, source))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                // A server that changed its labels asks for them again, and so does a
+                // new server after a restart.
+                tokio::select! {
+                    changed = refreshes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = router.ready_after(generation) => {}
+                    () = cancelled(&cancel) => return,
+                }
+            }
+        });
+    }
+}
+
+impl Provider<CodeLensResolveQuery, CodeLensEntry> for LspProviders {
+    fn start(&self, query: CodeLensResolveQuery, cancel: Cancel, reply: Reply<CodeLensEntry>) {
+        let router = self.router.clone();
+        self.answer(cancel, reply, async move {
+            let lens: CodeLens = serde_json::from_str(query.lens.resolve.as_deref()?).ok()?;
+            let place = Place {
+                uri: Uri::from_str(&query.uri).ok()?,
+                version: query.version,
+                position: Position::default(),
+            };
+            let resolved = router.code_lens_resolve(place, lens).await.ok()?;
+            Some(Ok(code_lens_entry(resolved)))
         });
     }
 }

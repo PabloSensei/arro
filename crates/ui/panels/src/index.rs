@@ -87,7 +87,7 @@ impl ProjectIndex {
     /// program reaches the window without a clock.
     pub fn start(
         root: PathBuf,
-        settings: Option<PathBuf>,
+        settings: Vec<PathBuf>,
         setup: SearchSetup,
     ) -> (Self, UnboundedReceiver<IndexEvent>) {
         let symbols = Arc::new(RwLock::new(SymbolIndex::new()));
@@ -155,7 +155,7 @@ impl ui_kit::Global for ActiveIndex {}
 #[allow(clippy::too_many_arguments)]
 fn run(
     root: PathBuf,
-    settings: Option<PathBuf>,
+    settings: Vec<PathBuf>,
     setup: SearchSetup,
     symbols: Arc<RwLock<SymbolIndex>>,
     commands: Sender<Command>,
@@ -181,29 +181,33 @@ fn run(
     })
     .map_err(|error| eprintln!("{} is not watched: {error}", root.display()))
     .ok();
-    // The settings folder is outside the project: the keymap file of the user gets a
-    // watcher of its own, and only that file wakes the window.
-    let _settings_watcher = settings.as_ref().and_then(|file| {
-        let folder = file.parent()?;
-        let watched = file.clone();
-        let settings = commands.clone();
-        FsWatcher::start(folder, move |batch| {
-            let touched: Vec<FsChange> = batch
-                .into_iter()
-                .filter(|change| match change {
-                    FsChange::Created(path) | FsChange::Changed(path) | FsChange::Removed(path) => {
-                        path == &watched
-                    }
-                    FsChange::Rescan => true,
-                })
-                .collect();
-            if !touched.is_empty() {
-                let _ = settings.send(Command::Settings);
-            }
-        })
-        .map_err(|error| eprintln!("{} is not watched: {error}", folder.display()))
-        .ok()
-    });
+    // The settings folder is outside the project: the files of the user get a watcher of
+    // their own, and only those files wake the window.
+    let _settings_watcher = settings
+        .first()
+        .and_then(|file| file.parent())
+        .and_then(|folder| {
+            let watched = settings.clone();
+            let settings = commands.clone();
+            FsWatcher::start(folder, move |batch| {
+                let touched: Vec<FsChange> = batch
+                    .into_iter()
+                    .filter(|change| match change {
+                        FsChange::Created(path)
+                        | FsChange::Changed(path)
+                        | FsChange::Removed(path) => watched.contains(path),
+                        // A rescan wakes the keymap and the templates only through a
+                        // file that really changed: it must not undo an edit in flight.
+                        FsChange::Rescan => false,
+                    })
+                    .collect();
+                if !touched.is_empty() {
+                    let _ = settings.send(Command::Settings);
+                }
+            })
+            .map_err(|error| eprintln!("{} is not watched: {error}", folder.display()))
+            .ok()
+        });
     let started = Instant::now();
     let mut table = match FileTable::scan(&root, setup.excludes.clone()) {
         Ok(table) => table,

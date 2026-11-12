@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use keymap::{Keymap, Keystroke, Lookup, default_keymap, editor as actions};
 use lang_api::{DiagnosticEntry, NavigationKind, Severity, SourceSpan};
 use syntax::{DocumentId, LanguageConfig, SyntaxService};
-use templates::TemplateLanguage;
+use templates::{ExpandWith, FileTemplateDefinition, TemplateLanguage, TemplateOverrides};
 use text_core::{Change, FileFormat, RopeStore, Selection, TextStore, read_file};
 use ui_kit::gpui::EntityId;
 use ui_kit::metrics::*;
@@ -41,6 +41,22 @@ pub struct Languages {
 }
 
 impl Global for Languages {}
+
+/// The live templates and the new-file templates of the user, over the built-ins of the
+/// languages. The Settings window writes it; every editor reads it before a template key.
+#[derive(Clone, Default)]
+pub struct TemplateSettings {
+    /// The language whose built-in templates the Settings window shows.
+    pub language: Option<&'static TemplateLanguage>,
+    /// The changes of `templates.json`.
+    pub overrides: std::sync::Arc<TemplateOverrides>,
+    /// The new-file templates with the text in force.
+    pub files: Vec<FileTemplateDefinition>,
+    /// Bumped on every change, so an editor resolves the templates once.
+    pub generation: usize,
+}
+
+impl Global for TemplateSettings {}
 
 #[derive(Default)]
 struct SyntaxThread(SyntaxService);
@@ -157,6 +173,39 @@ pub struct OutlineItem {
     /// The whole declaration.
     pub range: std::ops::Range<usize>,
     pub name_range: std::ops::Range<usize>,
+}
+
+/// One row of the last frame, for a test of what stands where: the line it shows, the top
+/// of the row and the number the gutter gives it. A block row holds a label of its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowPaint {
+    /// The buffer line of the row; a block speaks for the line under it.
+    pub line: usize,
+    /// The top of the row in pixels below the top of the editor.
+    pub top: f32,
+    /// The number the gutter shows, when it shows one.
+    pub number: Option<usize>,
+    pub block: bool,
+}
+
+/// A hint in the text of the last frame: the columns it takes and the pill behind it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlayPaint {
+    /// The buffer line of the row that holds the hint.
+    pub line: usize,
+    /// The columns the hint takes in the row text.
+    pub columns: std::ops::Range<usize>,
+    /// Where those columns begin and end, in window pixels.
+    pub columns_left: Pixels,
+    pub columns_right: Pixels,
+    /// The pill behind the label, never wider than the columns of the hint.
+    pub pill: Bounds<Pixels>,
+    /// Where the label itself begins.
+    pub label_x: Pixels,
+    /// The baseline of the label below the top of the row.
+    pub baseline: f32,
+    /// The baseline of the code of the same row, below the top of the row.
+    pub code_baseline: f32,
 }
 
 impl OutlineItem {
@@ -284,6 +333,8 @@ pub enum EditorEvent {
     ApplyChange(lang_api::WorkspaceChange),
     /// Ctrl+F6: the window shows the Change Signature form for this place.
     ChangeSignature(lang_api::DocumentSpot),
+    /// Ctrl+Q repeated or the pin button: the window shows the Documentation tool window.
+    ShowDocumentation,
     /// Ctrl+Alt+H: the window shows the call hierarchy of this place.
     CallHierarchy(lang_api::DocumentSpot),
     /// Ctrl+Shift+H: the window shows the hierarchy of the method at this place.
@@ -323,6 +374,15 @@ pub enum EditorEvent {
     ShowUsages(UsagesUpdate),
     /// A right click in the text: the window shows the menu of the editor here.
     ContextMenu(Point<Pixels>),
+}
+
+/// What the Documentation tool window asks about the symbol at the caret: the place, the
+/// problem above it and the language that answers.
+pub struct DocumentationQuery {
+    pub spot: lang_api::DocumentSpot,
+    pub offset: usize,
+    pub diagnostic: Option<String>,
+    pub support: std::sync::Arc<dyn lang_api::LanguageSupport>,
 }
 
 /// A place in a file to move the caret to.
@@ -394,6 +454,12 @@ pub struct EditorOptions {
     pub inlay_parameter_names: lang_api::InlayParameterNames,
     /// The type hints of the server.
     pub inlay_type_hints: bool,
+    /// The documentation popup opens under the pointer after a delay.
+    pub quick_doc_on_hover: bool,
+    /// The number of usages of a declaration above it.
+    pub code_vision_usages: bool,
+    /// The implementations or inheritors of a declaration above it.
+    pub code_vision_implementations: bool,
 }
 
 impl Default for EditorOptions {
@@ -414,6 +480,9 @@ impl Default for EditorOptions {
             semantic_highlighting: true,
             inlay_parameter_names: lang_api::InlayParameterNames::Literals,
             inlay_type_hints: false,
+            quick_doc_on_hover: true,
+            code_vision_usages: true,
+            code_vision_implementations: true,
         }
     }
 }
@@ -430,6 +499,13 @@ pub struct EditorView {
     pub(crate) completion_typed: u64,
     /// Grows with every semantic token request, so a late answer is dropped.
     pub(crate) tokens_asked: u64,
+    /// The name under the pointer, and a number that drops a late hover answer.
+    pub(crate) hover_word: Option<std::ops::Range<usize>>,
+    pub(crate) hover_serial: u64,
+    /// A number that drops a late close of the hover popup.
+    pub(crate) hover_close: u64,
+    /// Grows with every quick documentation popup, for late syntax answers.
+    pub(crate) quick_serial: u64,
     pub(crate) bar: Option<Bar>,
     pub(crate) last_find: LastFind,
     column_mode: bool,
@@ -497,6 +573,18 @@ pub struct EditorView {
     pub(crate) inlay_range: Option<(usize, usize)>,
     /// The open question for inlay hints; a new one cancels the old at the server.
     pub(crate) inlays_task: Option<Task<()>>,
+    /// The labels above declarations, as the language gave them for this text.
+    pub(crate) code_lens: Vec<crate::code_lens::CodeLensItem>,
+    /// The parts of each block row, in the order the row draws them.
+    pub(crate) code_vision_labels: Vec<(usize, Vec<(lang_api::CodeLensKind, String)>)>,
+    /// The label under the pointer: its display row and its place in the row.
+    pub(crate) code_vision_hovered: Option<(usize, usize)>,
+    /// Grows with every code lens question, so a late answer is dropped.
+    pub(crate) code_lens_asked: u64,
+    /// The offsets of the labels whose command was asked from the server already.
+    pub(crate) code_lens_resolved: Vec<usize>,
+    /// The open code lens question; a new one cancels the old at the server.
+    pub(crate) code_lens_task: Option<Task<()>>,
     /// Keys waiting for the next frame, so the latency of a key includes the paint.
     pending_frames: Vec<Instant>,
 }
@@ -577,6 +665,10 @@ impl EditorView {
             options: EditorOptions::default(),
             completion_typed: 0,
             tokens_asked: 0,
+            hover_word: None,
+            hover_serial: 0,
+            hover_close: 0,
+            quick_serial: 0,
             bar: None,
             last_find: LastFind::default(),
             column_mode: false,
@@ -623,6 +715,12 @@ impl EditorView {
             pending_spot: None,
             inlay_range: None,
             inlays_task: None,
+            code_lens: Vec::new(),
+            code_vision_labels: Vec::new(),
+            code_vision_hovered: None,
+            code_lens_asked: 0,
+            code_lens_resolved: Vec::new(),
+            code_lens_task: None,
             pending_frames: Vec::with_capacity(8),
         }
     }
@@ -755,6 +853,55 @@ impl EditorView {
             .iter()
             .find(|mark| mark.kind == kind && mark.line == line)
             .map(|mark| mark.bounds)
+    }
+
+    /// The rows of the last frame, from the top, with the number of each in the gutter.
+    pub fn row_paint(&self) -> Vec<RowPaint> {
+        let Some(layout) = &self.layout else {
+            return Vec::new();
+        };
+        layout
+            .rows
+            .iter()
+            .map(|row| RowPaint {
+                line: row.buffer_line,
+                top: f32::from(row.y - layout.bounds.top()),
+                number: row.number_value,
+                block: row.is_block,
+            })
+            .collect()
+    }
+
+    /// The height of the panel of sticky lines as the last frame painted it.
+    pub fn sticky_panel_height(&self) -> f32 {
+        self.layout
+            .as_ref()
+            .map_or(0., |layout| layout.sticky_height)
+    }
+
+    /// The thumb of the vertical bar as the last frame painted it, for a drag in a test.
+    pub fn vertical_thumb(&self) -> Option<Bounds<Pixels>> {
+        let layout = self.layout.as_ref()?;
+        let bar = layout.vertical?;
+        let area = layout.vertical_area?;
+        let width = if self.scrollbar_hovered {
+            crate::scrollbar::HOVER_WIDTH
+        } else {
+            crate::scrollbar::WIDTH
+        };
+        let thumb = bar.thumb(self.scroll_top)?;
+        let x = f32::from(area.right()) - width;
+        Some(Bounds::new(
+            point(px(x), px(bar.track_start + thumb.offset)),
+            size(px(width), px(thumb.len)),
+        ))
+    }
+
+    /// The hints of the last frame, with the pill and the baseline of each.
+    pub fn inlay_paint(&self) -> &[InlayPaint] {
+        self.layout
+            .as_ref()
+            .map_or(&[], |layout| layout.inlays.as_slice())
     }
 
     /// The caret in bytes, `None` before the file is read.
@@ -918,6 +1065,12 @@ impl EditorView {
         self.state.as_ref().map(EditorState::text)
     }
 
+    /// Whether the file is read, or the read failed. A script step that touches the text
+    /// of the open file waits for this.
+    pub fn is_ready(&self) -> bool {
+        self.state.is_some() || self.failed.is_some()
+    }
+
     /// The version of the text the language server has of this document.
     pub fn version(&self) -> Option<i32> {
         self.state.as_ref().map(|state| state.version() as i32)
@@ -1074,6 +1227,8 @@ impl EditorView {
         let tokens_changed = self.options.semantic_highlighting != options.semantic_highlighting;
         let inlays_changed = self.options.inlay_parameter_names != options.inlay_parameter_names
             || self.options.inlay_type_hints != options.inlay_type_hints;
+        let code_vision_changed = self.options.code_vision_usages != options.code_vision_usages
+            || self.options.code_vision_implementations != options.code_vision_implementations;
         self.options = options;
         if let Some(state) = &mut self.state {
             state.set_save_options(self.options.save);
@@ -1108,6 +1263,23 @@ impl EditorView {
             }
             if !off {
                 self.request_inlays(std::time::Duration::ZERO, cx);
+            }
+        }
+        if code_vision_changed {
+            if let Some(lsp) = &self.lsp {
+                lsp.support
+                    .set_code_vision_settings(crate::semantic::code_vision_settings(&self.options));
+            }
+            self.code_lens_task = None;
+            self.code_lens_resolved.clear();
+            if let Some(state) = &mut self.state {
+                state.set_blocks(Vec::new());
+            }
+            self.code_lens.clear();
+            self.code_vision_labels.clear();
+            self.code_vision_hovered = None;
+            if self.options.code_vision_usages || self.options.code_vision_implementations {
+                self.request_code_lens(std::time::Duration::ZERO, cx);
             }
         }
         if !self.options.caret_blink {
@@ -1282,6 +1454,10 @@ impl EditorView {
         if change.is_some() {
             self.semantic_tokens_later(cx);
             self.request_inlays(crate::semantic::INLAY_TYPING_DELAY, cx);
+            self.request_code_lens(crate::semantic::INLAY_TYPING_DELAY, cx);
+            if let Some(change) = &change {
+                self.shift_code_lens(change, cx);
+            }
         } else {
             self.inlays_if_needed(cx);
         }
@@ -1840,6 +2016,35 @@ impl EditorView {
             key: event.keystroke.key.to_lowercase(),
         }
         .normalized();
+        // Typing and Escape close the documentation; the second Ctrl+Q pins it.
+        let quick_key = stroke.ctrl && !stroke.alt && !stroke.shift && stroke.key == "q";
+        // Ctrl+A and Ctrl+C work on the text of the popup while it is open.
+        if self.quick_doc_open() && stroke.ctrl && !stroke.alt && !stroke.shift {
+            match stroke.key.as_str() {
+                "a" => {
+                    self.select_all_quick_doc(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "c" => {
+                    self.copy_quick_doc_selection(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if !quick_key {
+            self.cancel_hover();
+        }
+        if self.quick_doc_open() && !quick_key {
+            let escape = stroke.key == "escape" && !stroke.ctrl && !stroke.alt && !stroke.shift;
+            self.close_quick_doc(cx);
+            if escape {
+                cx.stop_propagation();
+                return;
+            }
+        }
         // Any key other than Alt+Q itself closes Context Info; Alt+Q opens it again.
         self.context_info = None;
         if std::mem::take(&mut self.awaiting_mnemonic) {
@@ -1903,6 +2108,12 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
+        // Enter expands a template that chose Enter, when its abbreviation ends here and
+        // no list of a popup is open.
+        if plain && stroke.key == "enter" && self.template_expand_key(ExpandWith::Enter, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if plain && (self.action_key(&stroke.key, cx) || self.completion_key(&stroke.key, cx)) {
             cx.stop_propagation();
             return;
@@ -1957,6 +2168,16 @@ impl EditorView {
 
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
+        if self.quick_doc_open() {
+            if action == actions::SELECT_ALL {
+                self.select_all_quick_doc(cx);
+                return;
+            }
+            if action == actions::COPY {
+                self.copy_quick_doc_selection(cx);
+                return;
+            }
+        }
         let action = match action {
             actions::NEXT_TEMPLATE_VARIABLE => {
                 if let Some(change) = self.template_field(true) {
@@ -2100,7 +2321,7 @@ impl EditorView {
             _ => {}
         }
         let rows = self.page_rows();
-        if let Some(change) = self.template_action(action) {
+        if let Some(change) = self.template_action(action, cx) {
             self.changed(change, cx);
             return;
         }
@@ -2211,6 +2432,10 @@ impl EditorView {
     }
 
     pub(crate) fn scroll_by(&mut self, delta: Point<Pixels>, cx: &mut Context<Self>) {
+        self.cancel_hover();
+        if self.quick_doc_open() {
+            self.close_quick_doc(cx);
+        }
         let line_height = self.style.line_height;
         let rows = self
             .state
@@ -2266,12 +2491,12 @@ impl EditorView {
     /// Row and text column under `position`. Outside the text it clamps to the nearest.
     pub(crate) fn hit(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
         let layout = self.layout.as_ref()?;
-        let top = position.y - layout.bounds.top() + px(self.scroll_top);
-        let row = (f32::from(top) / self.style.line_height).floor().max(0.) as usize;
+        let line_height = px(self.style.line_height);
+        // Rows stand where the frame put them: the panel of sticky lines moves them.
         let shown = layout
             .rows
             .iter()
-            .position(|laid_out| laid_out.row >= row)
+            .position(|laid_out| position.y < laid_out.y + line_height)
             .unwrap_or(layout.rows.len().checked_sub(1)?);
         let x = position.x - layout.bounds.left() - px(GUTTER_WIDTH + TEXT_INSET)
             + px(self.scroll_left);
@@ -2283,11 +2508,9 @@ impl EditorView {
 
     pub(crate) fn offset_at(&self, position: Point<Pixels>) -> Option<usize> {
         let (shown, column) = self.hit(position)?;
-        Some(
-            self.layout.as_ref()?.rows[shown]
-                .line
-                .offset_of(column, Bias::Left),
-        )
+        let row = self.layout.as_ref()?.rows.get(shown)?;
+        // A block row speaks for the line under it.
+        Some(row.line.offset_of(column, Bias::Left))
     }
 
     /// A press on a scroll bar: a mark goes to its line, the thumb is grabbed and the
@@ -2356,25 +2579,62 @@ impl EditorView {
     }
 
     pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.cancel_hover();
+        self.close_quick_doc(cx);
         let Some(layout) = self.layout.clone() else {
             return;
         };
         if self.bar_pressed(event.position, &layout, cx) {
             return;
         }
-        let Some((shown, column)) = self.hit(event.position) else {
-            return;
-        };
-        let line = &layout.rows[shown].line;
-        let sticky_height = self.sticky.len() as f32 * self.style.line_height;
-        if f32::from(event.position.y - layout.bounds.top()) < sticky_height {
+        let sticky_height =
+            crate::element::sticky_height(self.sticky.len(), self.style.line_height);
+        if sticky_height > 0. && f32::from(event.position.y - layout.bounds.top()) < sticky_height {
             let at = (f32::from(event.position.y - layout.bounds.top()) / self.style.line_height)
                 as usize;
             if let Some(line) = self.sticky.get(at).copied() {
                 self.go_to(Spot::Line { line, column: 0 }, cx);
+            }
+            return;
+        }
+        let Some((shown, column)) = self.hit(event.position) else {
+            return;
+        };
+        if layout.rows[shown].is_block {
+            if let Some((index, label)) = layout.rows[shown]
+                .block_labels
+                .iter()
+                .enumerate()
+                .find(|(_, label)| inside(label.bounds, event.position))
+            {
+                self.code_vision_hovered = Some((layout.rows[shown].row, index));
+                let kind = label.kind;
+                let line = layout.rows[shown].buffer_line;
+                self.activate_code_lens(line, kind, cx);
                 return;
             }
+            // An empty place of a block row belongs to the line under it.
+            let offset = layout.rows[shown].line.offset_of(column, Bias::Left);
+            let modifiers = event.modifiers;
+            let add_caret = modifiers.alt;
+            if let Some(state) = &mut self.state {
+                state.click(
+                    offset,
+                    modifiers.shift && !add_caret,
+                    add_caret,
+                    event.click_count,
+                );
+            }
+            if let Some(lsp) = &mut self.lsp {
+                lsp.actions = None;
+            }
+            self.selecting = true;
+            self.caret_on = true;
+            self.highlight_later(cx);
+            cx.notify();
+            return;
         }
+        let line = &layout.rows[shown].line;
         let run_line = self
             .state
             .as_ref()
@@ -2538,6 +2798,22 @@ impl EditorView {
             self.gutter_hovered = hovered;
             cx.notify();
         }
+        if !event.dragging() && !self.selecting {
+            self.hover_moved(event.position, cx);
+        }
+
+        let over_label = self.layout.as_ref().and_then(|layout| {
+            layout.rows.iter().find_map(|row| {
+                row.block_labels
+                    .iter()
+                    .position(|label| inside(label.bounds, event.position))
+                    .map(|index| (row.row, index))
+            })
+        });
+        if over_label != self.code_vision_hovered {
+            self.code_vision_hovered = over_label;
+            cx.notify();
+        }
         if !self.selecting || !event.dragging() {
             return;
         }
@@ -2565,7 +2841,7 @@ fn position_in_fold_column(position: Point<Pixels>, bounds: Bounds<Pixels>) -> b
 }
 
 /// Whether `position` is inside `area`, edges of the left and top included.
-fn inside(area: Bounds<Pixels>, position: Point<Pixels>) -> bool {
+pub(crate) fn inside(area: Bounds<Pixels>, position: Point<Pixels>) -> bool {
     position.x >= area.left()
         && position.x < area.right()
         && position.y >= area.top()
@@ -2719,7 +2995,7 @@ impl EditorView {
         ))
     }
 
-    fn popups(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn popups(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = *cx.global::<Theme>();
         let mut popups = Vec::new();
         if let Some(info) = &self.context_info
@@ -2771,6 +3047,9 @@ impl EditorView {
         let Some(lsp) = &self.lsp else {
             return popups;
         };
+        if let Some(doc) = &lsp.quick {
+            popups.push(self.render_quick_doc(doc, window, cx));
+        }
         if let Some(completion) = &lsp.completion
             && let Some(rows) = completion.window().len().checked_sub(1)
             && let Some((position, anchor)) = self.popup_position(
@@ -3410,7 +3689,7 @@ fn problems_text(errors: usize, warnings: usize) -> String {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for started in self.pending_frames.drain(..) {
             perf::observe("editor.keystroke", started.elapsed());
         }
@@ -3422,7 +3701,7 @@ impl Render for EditorView {
         {
             self.context_info = None;
         }
-        let popups = self.popups(cx);
+        let popups = self.popups(window, cx);
         let root = div()
             .id("editor-view")
             .key_context("Editor")

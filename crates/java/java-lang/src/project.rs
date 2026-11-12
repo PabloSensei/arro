@@ -392,6 +392,22 @@ impl JavaProject {
         );
     }
 
+    /// Applies the Code Vision settings of the window. The server stops sending the
+    /// labels that are off, and the editor removes the rows it already has.
+    pub(crate) fn apply_code_vision_settings(&self, settings: lang_api::CodeVisionSettings) {
+        if !self
+            .spec
+            .set_code_vision(settings.usages, settings.implementations)
+        {
+            return;
+        }
+        let settings = self.spec.settings();
+        self.router.notify(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({"settings": settings}),
+        );
+    }
+
     fn start(
         spec: Arc<Jdtls>,
         launcher: Arc<dyn Launcher>,
@@ -436,6 +452,7 @@ impl JavaProject {
                 SOURCE,
             )
             .with_semantic_tokens(spec.semantic_tokens())
+            .with_code_lens(spec.code_lens())
             .with_edit_command("java.apply.workspaceEdit")
             .with_super_request("java/findLinks")
             .with_refactor_action(

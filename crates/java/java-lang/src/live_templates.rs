@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use templates::{ANY, Kind, Template, TemplateLanguage};
+use templates::{ANY, Declarations, Kind, Template, TemplateLanguage};
 
 use crate::is_source;
 
@@ -267,12 +267,87 @@ fn language() -> &'static TemplateLanguage {
         indent_unit: "    ",
         receiver_prefixes: &["new"],
         query: OnceLock::new(),
+        declarations: Some(declarations),
     })
 }
 
 /// The templates for `path`, for the editor.
 pub fn templates_for(path: &Path) -> Option<&'static TemplateLanguage> {
     is_source(path).then(language)
+}
+
+/// The declarations around `offset`, for the variables of a live template: the
+/// innermost type, the method it holds and the package of the file.
+pub fn declarations(
+    _language: &TemplateLanguage,
+    text: &str,
+    tree: Option<&tree_sitter::Tree>,
+    offset: usize,
+) -> Declarations {
+    let parsed;
+    let tree = match tree {
+        Some(tree) => tree,
+        None => {
+            let mut parser = tree_sitter::Parser::new();
+            let grammar = tree_sitter_java_orchard::LANGUAGE.into();
+            if parser.set_language(&grammar).is_err() {
+                return Declarations::default();
+            }
+            let Some(tree) = parser.parse(text, None) else {
+                return Declarations::default();
+            };
+            parsed = tree;
+            &parsed
+        }
+    };
+    let mut declarations = Declarations::default();
+    let root = tree.root_node();
+    declarations.package_name = (0..root.named_child_count())
+        .filter_map(|index| root.named_child(index as u32))
+        .find(|child| child.kind() == "package_declaration")
+        .and_then(|declaration| {
+            (0..declaration.named_child_count())
+                .filter_map(|index| declaration.named_child(index as u32))
+                .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))
+        })
+        .map(|name| name.utf8_text(text.as_bytes()).unwrap_or_default())
+        .unwrap_or_default()
+        .to_owned();
+    let offset = offset.min(text.len());
+    let mut node = root.descendant_for_byte_range(offset, offset);
+    while let Some(current) = node {
+        match current.kind() {
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+                if declarations.method_name.is_empty() =>
+            {
+                if let Some(name) = current.child_by_field_name("name") {
+                    declarations.method_name = name
+                        .utf8_text(text.as_bytes())
+                        .unwrap_or_default()
+                        .to_owned();
+                }
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+                if declarations.class_name.is_empty() =>
+            {
+                if let Some(name) = current.child_by_field_name("name") {
+                    declarations.class_name = name
+                        .utf8_text(text.as_bytes())
+                        .unwrap_or_default()
+                        .to_owned();
+                }
+            }
+            _ => {}
+        }
+        node = current.parent();
+    }
+    declarations
 }
 
 #[cfg(test)]
@@ -319,5 +394,24 @@ mod tests {
         let sout = java.find(Kind::Abbreviation, "sout", "statement").unwrap();
         let expansion = expand(sout, "", "    ", None, None);
         assert_eq!(&expansion.text[..expansion.end], "System.out.println(");
+    }
+
+    #[test]
+    fn the_names_of_the_place_come_from_the_tree_and_the_text() {
+        let source =
+            "package com.shop;\nclass Order {\n    void total() {\n        int x = 1;\n    }\n}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java_orchard::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let offset = source.find("int x").unwrap() + 6;
+
+        let names = declarations(language(), source, Some(&tree), offset);
+
+        assert_eq!(names.package_name, "com.shop");
+        assert_eq!(names.class_name, "Order");
+        assert_eq!(names.method_name, "total");
+        assert!(declarations(language(), "package a.b;\n", None, 0).package_name == "a.b");
     }
 }

@@ -1,6 +1,6 @@
 //! The terminal tool window: the shell of the user in the project folder.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use project_model::EnvironmentProvider;
@@ -8,7 +8,7 @@ use terminal::{ShiftEnter, SpawnSpec, TERM_VARS, TerminalSession};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::ToggleTerminal;
+use workspace::{Settings, ToggleTerminal};
 
 use crate::term_grid::{every_frame, grid, scroll_lines, send_key};
 
@@ -35,8 +35,13 @@ pub struct TerminalPanel {
 
 /// The shell sees what the user sees in any console, plus the terminal variables and the
 /// ones the project decides, so that its SDK is the SDK of the build.
-fn shell_spec(root: PathBuf, variables: Vec<(String, String)>) -> SpawnSpec {
-    let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+fn shell_spec(root: PathBuf, variables: Vec<(String, String)>, settings: &Settings) -> SpawnSpec {
+    let shell = match settings.terminal_shell.trim() {
+        "" => terminal::default_shell()
+            .unwrap_or_else(|| std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string())),
+        configured => configured.to_owned(),
+    };
+    let cwd = start_directory(settings, &root);
     let mut env: Vec<(String, String)> = std::env::vars().collect();
     for (key, value) in TERM_VARS {
         env.retain(|(known, _)| !known.eq_ignore_ascii_case(key));
@@ -46,14 +51,51 @@ fn shell_spec(root: PathBuf, variables: Vec<(String, String)>) -> SpawnSpec {
         env.retain(|(known, _)| !known.eq_ignore_ascii_case(&key));
         env.push((key, value));
     }
+    for (key, value) in terminal_environment(&settings.terminal_environment) {
+        env.retain(|(known, _)| !known.eq_ignore_ascii_case(&key));
+        env.push((key, value));
+    }
     SpawnSpec {
         command_line: shell,
-        cwd: Some(root),
+        cwd: Some(cwd),
         env,
         cols: 120,
         rows: 12,
         shift_enter: ShiftEnter::default(),
     }
+}
+
+/// Where a new terminal starts: the setting, the root of the project when it is empty
+/// or gone. A relative path counts from the root.
+fn start_directory(settings: &Settings, root: &Path) -> PathBuf {
+    let chosen = settings.terminal_start_directory.trim();
+    if chosen.is_empty() {
+        return root.to_path_buf();
+    }
+    let path = PathBuf::from(chosen);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    if path.is_dir() {
+        path
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// The `NAME=value` lines of the setting, in their order. A line without `=` is skipped.
+pub(crate) fn terminal_environment(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| (name.to_owned(), value.trim().to_owned()))
+        })
+        .collect()
 }
 
 impl TerminalPanel {
@@ -109,11 +151,12 @@ impl TerminalPanel {
         self.state = State::Starting;
         let root = self.root.clone();
         let environment = self.environment.clone();
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
         let spawn = cx.background_executor().spawn(async move {
             let variables = environment
                 .map(|environment| environment.describe().variables)
                 .unwrap_or_default();
-            TerminalSession::spawn(&shell_spec(root, variables))
+            TerminalSession::spawn(&shell_spec(root, variables, &settings))
         });
         cx.spawn(async move |this, cx| {
             let result = spawn.await;

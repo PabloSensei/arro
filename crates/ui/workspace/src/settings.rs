@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+use project_model::BuildTools;
 use serde::{Deserialize, Serialize};
 use ui_kit::*;
 
@@ -130,6 +131,33 @@ impl InlayParameterNames {
     }
 }
 
+/// How Update Project brings the upstream of the current branch in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitUpdateMethod {
+    /// A merge commit joins the two histories.
+    #[default]
+    Merge,
+    /// The local commits move on top of the upstream.
+    Rebase,
+}
+
+impl GitUpdateMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            GitUpdateMethod::Merge => "Merge",
+            GitUpdateMethod::Rebase => "Rebase",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            GitUpdateMethod::Merge => GitUpdateMethod::Rebase,
+            GitUpdateMethod::Rebase => GitUpdateMethod::Merge,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -175,6 +203,10 @@ pub struct Settings {
     pub inlay_parameter_names: InlayParameterNames,
     /// The type hints of the language in the text.
     pub inlay_type_hints: bool,
+    /// The number of usages of a declaration above it.
+    pub code_vision_usages: bool,
+    /// The implementations or inheritors of a declaration above it.
+    pub code_vision_implementations: bool,
     /// Unsaved files are written when the window loses the focus or the tab changes.
     pub autosave: bool,
     /// The home of the runtime that runs the project; empty means the one found by the
@@ -214,6 +246,26 @@ pub struct Settings {
     pub default_layout: Option<DefaultLayout>,
     /// The language server's semantic tokens colour the names over the syntax colours.
     pub semantic_highlighting: bool,
+    /// The documentation popup opens under the pointer after a delay.
+    pub quick_doc_on_hover: bool,
+    /// How the build tools of the project start, in the order of their pages.
+    pub build_tools: BuildTools,
+    /// The program that runs Git; empty means the one on `PATH`.
+    pub git_path: String,
+    /// How Update Project brings the upstream in.
+    pub git_update_method: GitUpdateMethod,
+    /// A push the remote rejected fetches, updates and pushes again.
+    pub git_auto_update_on_reject: bool,
+    /// A commit whose files carry CRLF line separators warns first.
+    pub git_warn_crlf: bool,
+    /// The commit window starts with code analysis.
+    pub git_analyze_before_commit: bool,
+    /// The shell of a new terminal; empty means the one found on this machine.
+    pub terminal_shell: String,
+    /// Where a new terminal starts; empty means the root of the project.
+    pub terminal_start_directory: String,
+    /// Variables of a new terminal, one `NAME=value` per line.
+    pub terminal_environment: String,
 }
 
 impl Default for Settings {
@@ -240,6 +292,8 @@ impl Default for Settings {
             completion_delay_ms: 0,
             inlay_parameter_names: InlayParameterNames::Literals,
             inlay_type_hints: false,
+            code_vision_usages: true,
+            code_vision_implementations: true,
             autosave: true,
             runtime_home: String::new(),
             memory_low_percent: DEFAULT_MEMORY_LOW_PERCENT,
@@ -262,6 +316,16 @@ impl Default for Settings {
             updates_check_automatically: true,
             default_layout: None,
             semantic_highlighting: true,
+            quick_doc_on_hover: true,
+            build_tools: BuildTools::default(),
+            git_path: String::new(),
+            git_update_method: GitUpdateMethod::Merge,
+            git_auto_update_on_reject: false,
+            git_warn_crlf: true,
+            git_analyze_before_commit: false,
+            terminal_shell: String::new(),
+            terminal_start_directory: String::new(),
+            terminal_environment: String::new(),
         }
     }
 }

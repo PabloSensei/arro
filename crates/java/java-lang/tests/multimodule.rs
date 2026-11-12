@@ -211,6 +211,7 @@ fn fixture(project: &str, name: &str, extra: &[(&str, &str)]) -> Fixture {
             runtime("JavaSE-25", "25", true),
         ],
         maven_settings: Some(settings),
+        gradle_home: None,
         gradle_user_home: gradle_home(),
         gradle_java_home: Some(fs::canonicalize(corpus.join("jdk").join("17")).unwrap()),
         // The Gradle reactor needs one plugin artifact that the prepared cache may not
@@ -1008,6 +1009,7 @@ fn maven_reactor(name: &str, modules: &[&str]) -> Fixture {
             runtime("JavaSE-25", "25", false),
         ],
         maven_settings: Some(settings),
+        gradle_home: None,
         gradle_user_home: gradle_home(),
         gradle_java_home: Some(fs::canonicalize(corpus.join("jdk").join("17")).unwrap()),
         offline: true,

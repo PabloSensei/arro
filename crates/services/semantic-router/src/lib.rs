@@ -17,21 +17,21 @@ mod providers;
 use lsp_client::lsp_types::notification::{Notification, PublishDiagnostics};
 use lsp_client::lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
-    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
-    GotoDefinition, GotoImplementation, GotoImplementationParams, GotoTypeDefinition,
-    GotoTypeDefinitionParams, HoverRequest, InlayHintRefreshRequest, InlayHintRequest,
-    RangeFormatting, References, Rename, Request, SemanticTokensFullRequest,
-    SemanticTokensRangeRequest, SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes,
-    TypeHierarchySupertypes, WorkspaceSymbolRequest,
+    CodeActionRequest, CodeLensRefresh, CodeLensRequest, CodeLensResolve, Completion,
+    DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
+    GotoImplementation, GotoImplementationParams, GotoTypeDefinition, GotoTypeDefinitionParams,
+    HoverRequest, InlayHintRefreshRequest, InlayHintRequest, RangeFormatting, References, Rename,
+    Request, SemanticTokensFullRequest, SemanticTokensRangeRequest, SignatureHelpRequest,
+    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkspaceSymbolRequest,
 };
 use lsp_client::lsp_types::{
     CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams, CodeActionContext, CodeActionKind, CodeActionParams,
-    CodeActionResponse, CompletionParams, CompletionResponse, Diagnostic, DocumentFormattingParams,
-    DocumentHighlight, DocumentHighlightParams, DocumentRangeFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InlayHint, InlayHintParams, Location,
-    PartialResultParams, Position, PublishDiagnosticsParams, Range, ReferenceContext,
+    CodeActionResponse, CodeLens, CodeLensParams, CompletionParams, CompletionResponse, Diagnostic,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InlayHint, InlayHintParams,
+    Location, PartialResultParams, Position, PublishDiagnosticsParams, Range, ReferenceContext,
     ReferenceParams, RenameParams, SemanticTokens, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit,
@@ -119,8 +119,12 @@ struct Document {
     completion: Arc<watch::Sender<u64>>,
     /// A newer semantic token request replaces this one.
     tokens: Arc<watch::Sender<u64>>,
+    /// A newer code lens request replaces this one.
+    lenses_turns: Arc<watch::Sender<u64>>,
     /// The latest answer of `textDocument/inlayHint`, moved along with the edits.
     hints: Option<lsp_client::hints::InlayHints>,
+    /// The latest answer of `textDocument/codeLens`, moved along with the edits.
+    lenses: Option<lsp_client::CodeLenses>,
 }
 
 #[derive(Default)]
@@ -143,15 +147,20 @@ pub struct Published {
     /// A server that changed what hints it would give asks for them again.
     inlay_revision: AtomicU64,
     inlay_changed: Option<watch::Sender<u64>>,
+    /// A server that changed its code lenses asks for them again.
+    lens_revision: AtomicU64,
+    lens_changed: Option<watch::Sender<u64>>,
 }
 
 impl Published {
     pub fn new() -> (Arc<Self>, watch::Receiver<u64>) {
         let (sender, receiver) = watch::channel(0);
         let (inlay_changed, _) = watch::channel(0);
+        let (lens_changed, _) = watch::channel(0);
         let published = Self {
             changed: Some(sender),
             inlay_changed: Some(inlay_changed),
+            lens_changed: Some(lens_changed),
             ..Self::default()
         };
         (Arc::new(published), receiver)
@@ -181,6 +190,22 @@ impl Published {
         }
     }
 
+    /// Every refresh of the code lenses bumps this. The caller asks the server again
+    /// for the document.
+    pub fn code_lens_refresh(&self) -> watch::Receiver<u64> {
+        match &self.lens_changed {
+            Some(changed) => changed.subscribe(),
+            None => watch::channel(0).1,
+        }
+    }
+
+    fn code_lenses_changed(&self) {
+        let revision = self.lens_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(changed) = &self.lens_changed {
+            changed.send_replace(revision);
+        }
+    }
+
     /// The latest diagnostics of every document the server has published.
     pub fn all_diagnostics(&self) -> Vec<(Uri, Vec<Diagnostic>)> {
         let mut all: Vec<(Uri, Vec<Diagnostic>)> = lock(&self.diagnostics)
@@ -196,6 +221,10 @@ impl ServerEvents for Published {
     fn notification(&self, method: &str, params: Value) {
         if method == InlayHintRefreshRequest::METHOD {
             self.inlay_hints_changed();
+            return;
+        }
+        if method == CodeLensRefresh::METHOD {
+            self.code_lenses_changed();
             return;
         }
         if method != PublishDiagnostics::METHOD {
@@ -214,6 +243,10 @@ impl ServerEvents for Published {
     fn request(&self, method: &str, _params: Value) -> Result<Value, lsp_client::ResponseError> {
         if method == InlayHintRefreshRequest::METHOD {
             self.inlay_hints_changed();
+            return Ok(Value::Null);
+        }
+        if method == CodeLensRefresh::METHOD {
+            self.code_lenses_changed();
             return Ok(Value::Null);
         }
         Err(lsp_client::ResponseError::method_not_found(method))
@@ -293,13 +326,16 @@ impl Router {
     pub fn open(&self, uri: Uri, language: &str, version: i32, text: Arc<str>) {
         let (completion, _) = watch::channel(0);
         let (tokens, _) = watch::channel(0);
+        let (lenses_turns, _) = watch::channel(0);
         let document = Document {
             language: language.to_owned(),
             version,
             text: text.clone(),
             completion: Arc::new(completion),
             tokens: Arc::new(tokens),
+            lenses_turns: Arc::new(lenses_turns),
             hints: None,
+            lenses: None,
         };
         let mut documents = lock(&self.documents);
         documents.open.insert(uri.clone(), document);
@@ -327,6 +363,9 @@ impl Router {
         document.text = text;
         if let Some(hints) = &mut document.hints {
             hints.apply(version, &changes);
+        }
+        if let Some(lenses) = &mut document.lenses {
+            lenses.apply(version, &changes);
         }
         if let Some((client, generation)) = self.live_client()
             && synced == generation
@@ -615,6 +654,69 @@ impl Router {
             .filter(|hint| lsp_client::hints::in_range(range, hint.position))
             .cloned()
             .collect()
+    }
+
+    /// The code lenses of a whole document. Only the newest request of a document gets
+    /// an answer; the older ones are cancelled. The answer is kept, so that the editor
+    /// keeps showing its labels while the text changes under them.
+    pub async fn code_lens(&self, place: Place) -> Result<Option<Vec<CodeLens>>, RouteError> {
+        let turns = {
+            let documents = lock(&self.documents);
+            let document = documents.open.get(&place.uri).ok_or(RouteError::Stale)?;
+            document.lenses_turns.clone()
+        };
+        let mut turn = 0;
+        turns.send_modify(|current| {
+            *current += 1;
+            turn = *current;
+        });
+        let mut replaced = turns.subscribe();
+        let answer = async {
+            sleep(COALESCE).await;
+            let params = CodeLensParams {
+                text_document: TextDocumentIdentifier::new(place.uri.clone()),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            self.ask::<CodeLensRequest>(&place, params).await
+        };
+        let answer = tokio::select! {
+            result = answer => result?,
+            // Dropping the answer future sends `$/cancelRequest` if it was sent.
+            _ = replaced.wait_for(|current| *current != turn) => return Err(RouteError::Superseded),
+        };
+        let lenses = answer.clone().unwrap_or_default();
+        let mut documents = lock(&self.documents);
+        if let Some(document) = documents.open.get_mut(&place.uri) {
+            document.lenses = Some(lsp_client::CodeLenses::new(place.version, lenses));
+        }
+        Ok(answer)
+    }
+
+    /// The labels of the last answer for this version, already moved by the edits that
+    /// came after it.
+    pub fn cached_code_lens(&self, uri: &Uri, version: i32) -> Vec<CodeLens> {
+        let documents = lock(&self.documents);
+        let Some(lenses) = documents
+            .open
+            .get(uri)
+            .and_then(|document| document.lenses.as_ref())
+        else {
+            return Vec::new();
+        };
+        if !lenses.matches(version) {
+            return Vec::new();
+        }
+        lenses.lenses().to_vec()
+    }
+
+    /// The command of one label the editor shows.
+    pub async fn code_lens_resolve(
+        &self,
+        place: Place,
+        lens: CodeLens,
+    ) -> Result<CodeLens, RouteError> {
+        self.ask::<CodeLensResolve>(&place, lens).await
     }
 
     pub async fn signature_help(&self, place: Place) -> Result<Option<SignatureHelp>, RouteError> {

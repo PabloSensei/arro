@@ -115,6 +115,7 @@ fn the_daemon_of_the_import_stops_after_its_idle_timeout() {
             },
         ],
         maven_settings: None,
+        gradle_home: None,
         gradle_user_home: gradle_home(),
         gradle_java_home: Some(jdk("17")),
         offline: false,

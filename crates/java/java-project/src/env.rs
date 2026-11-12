@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use base::{Cancel, Result};
 use proc_sup::{ProcessSpec, capture};
-use project_model::{BuildSystem, default_cache_root};
+use project_model::{BuildSystem, BuildTools, default_cache_root};
 
 use crate::{Gradle, Jdk, Maven};
 
@@ -18,6 +18,8 @@ pub struct BuildEnv {
     pub vars: Vec<(OsString, OsString)>,
     /// Added to every Maven command line.
     pub maven_args: Vec<String>,
+    /// What the Settings page says about each build tool.
+    pub build_tools: BuildTools,
     /// Where tools write their reports and the model cache lives.
     pub cache_root: Option<PathBuf>,
     /// Where `maven-ext.jar` lies, `helpers` next to the executable if not set.

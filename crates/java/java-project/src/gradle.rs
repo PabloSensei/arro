@@ -127,10 +127,26 @@ impl Gradle {
     /// and own, with the client behind it. Works with no job around it, so that the
     /// server outlives the client.
     pub(crate) fn command(&self, root: &Path) -> Result<ProcessSpec> {
-        let jdk = self.tool_jdk(root)?;
+        let settings = &self.env.build_tools.second;
+        let jdk = match settings.runtime_home_path() {
+            Some(home) => Jdk::at(Path::new(home)).ok_or_else(|| {
+                format!("no JDK of the settings at {home}, so the build tool cannot start")
+            })?,
+            None => self.tool_jdk(root)?,
+        };
         let wrapper = root.join(WRAPPER_JAR);
         let timeout = daemon_idle_timeout(root);
-        let spec = if wrapper.is_file() {
+        let spec = if let Some(home) = settings.home_path() {
+            let program = Path::new(home).join("bin").join("gradle.bat");
+            if !program.is_file() {
+                return Err(format!("no gradle.bat in {}", program.display()).into());
+            }
+            let spec = ProcessSpec::new(program);
+            match timeout {
+                Some(timeout) => spec.arg(timeout),
+                None => spec,
+            }
+        } else if wrapper.is_file() {
             ProcessSpec::new(jdk.java())
                 .args(CLIENT_JVM_ARGS)
                 .args(timeout)
@@ -145,11 +161,17 @@ impl Gradle {
                 None => spec,
             }
         };
-        let spec = spec
+        let mut spec = spec
             .cwd(root)
             .class(ProcessClass::Client)
             .args(COMMON_ARGS)
             .label("Build tool");
+        if settings.offline {
+            spec = spec.arg("--offline");
+        }
+        if let Some(home) = settings.user_home_path() {
+            spec = spec.env("GRADLE_USER_HOME", home);
+        }
         Ok(self.env.apply(spec, &jdk))
     }
 }

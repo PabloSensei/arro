@@ -10,9 +10,11 @@ use editor_view::{
 use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{
-    EditorFactory, EditorStatus, EditorTab, IndentChoice, Settings, USAGES_TOOL, Workspace,
+    DOCUMENTATION_TOOL, EditorFactory, EditorStatus, EditorTab, IndentChoice, Settings,
+    USAGES_TOOL, Workspace,
 };
 
+use crate::documentation::ActiveDocumentation;
 use crate::outline::{self, OpenEditors};
 use crate::problems::ActiveProblems;
 use crate::run::TestsChanged;
@@ -80,6 +82,9 @@ fn options_of(cx: &App) -> EditorOptions {
             workspace::InlayParameterNames::All => lang_api::InlayParameterNames::All,
         },
         inlay_type_hints: settings.inlay_type_hints,
+        quick_doc_on_hover: settings.quick_doc_on_hover,
+        code_vision_usages: settings.code_vision_usages,
+        code_vision_implementations: settings.code_vision_implementations,
     }
 }
 
@@ -219,6 +224,19 @@ fn open(
                     runner
                         .update(cx, |workspace, cx| {
                             clipboard::ClipboardPopup::show(editor, workspace, window, cx)
+                        })
+                        .ok();
+                }
+                EditorEvent::ShowDocumentation => {
+                    let editor = view.clone();
+                    runner
+                        .update(cx, |workspace, cx| {
+                            workspace.show_tool(DOCUMENTATION_TOOL, window, cx);
+                            if let Some(panel) = cx.try_global::<ActiveDocumentation>() {
+                                let panel = panel.0.clone();
+                                panel.update(cx, |panel, cx| panel.show_editor(editor.clone(), cx));
+                            }
+                            workspace.focus_editor(window, cx);
                         })
                         .ok();
                 }

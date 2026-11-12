@@ -16,7 +16,10 @@ use lsp_client::lsp_types::{
     ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, TraceValue, WorkspaceFolder,
 };
 use lsp_client::uri::file_uri;
-use lsp_client::{Client, ResponseError, SemanticTokensCapability, SemanticTokensSetup};
+use lsp_client::{
+    Client, CodeLensCapability, CodeLensSetup, ResponseError, SemanticTokensCapability,
+    SemanticTokensSetup,
+};
 use platform::CanonPath;
 use serde_json::{Value, json};
 use sidecar::{Plan, ServerSpec, State};
@@ -158,6 +161,22 @@ struct InlayHints {
     types: bool,
 }
 
+/// The labels the server puts above declarations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodeVision {
+    usages: bool,
+    implementations: bool,
+}
+
+impl Default for CodeVision {
+    fn default() -> Self {
+        Self {
+            usages: true,
+            implementations: true,
+        }
+    }
+}
+
 /// The Lombok agent of the project: the jar copied next to the server state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lombok {
@@ -193,6 +212,8 @@ pub struct JdtlsConfig {
     pub runtimes: Vec<Runtime>,
     /// Maven `settings.xml`, for a local repository outside the default place.
     pub maven_settings: Option<PathBuf>,
+    /// The Gradle installation, when the user names one instead of the wrapper.
+    pub gradle_home: Option<PathBuf>,
     pub gradle_user_home: Option<PathBuf>,
     /// The JDK of the project, so that the daemon matches the command line
     /// and the project level is not taken from the JDK that runs jdtls.
@@ -221,6 +242,8 @@ pub struct Jdtls {
     runtimes: Mutex<Vec<Runtime>>,
     /// The Inlay Hints settings of the window, read on every settings question.
     inlay: Mutex<InlayHints>,
+    /// The Code Vision settings of the window, read on every settings question.
+    code_vision: Mutex<CodeVision>,
     /// The Lombok agent of the running server, if the project uses Lombok.
     lombok: Mutex<Option<Lombok>>,
     /// When the last start began, so that a stale log is not read as its cause.
@@ -229,6 +252,8 @@ pub struct Jdtls {
     import_failure: watch::Sender<Option<ImportFailure>>,
     /// The legend of the semantic tokens, which the server gives at `initialize`.
     semantic_tokens: SemanticTokensSetup,
+    /// What the server gives about its code lenses at `initialize`.
+    code_lens: CodeLensSetup,
     _lock: fs::File,
 }
 
@@ -246,6 +271,7 @@ impl Jdtls {
         Ok(Self {
             runtimes: Mutex::new(config.runtimes.clone()),
             inlay: Mutex::new(InlayHints::default()),
+            code_vision: Mutex::new(CodeVision::default()),
             lombok: Mutex::new(None),
             config,
             root,
@@ -255,6 +281,7 @@ impl Jdtls {
             started: Mutex::new(None),
             import_failure,
             semantic_tokens: SemanticTokensSetup::new(),
+            code_lens: CodeLensSetup::new(),
             _lock: lock,
         })
     }
@@ -262,6 +289,11 @@ impl Jdtls {
     /// The legend the server declared, filled when it answers `initialize`.
     pub fn semantic_tokens(&self) -> SemanticTokensSetup {
         self.semantic_tokens.clone()
+    }
+
+    /// What the server declared about its code lenses, filled at `initialize`.
+    pub fn code_lens(&self) -> CodeLensSetup {
+        self.code_lens.clone()
     }
 
     /// The SDK the server itself runs on.
@@ -331,7 +363,17 @@ impl Jdtls {
             .inlay
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        settings(&self.config, &runtimes, self.autobuild.enabled(), inlay)
+        let code_vision = *self
+            .code_vision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        settings(
+            &self.config,
+            &runtimes,
+            self.autobuild.enabled(),
+            inlay,
+            code_vision,
+        )
     }
 
     /// What the server shows in the text. The caller sends the new settings to a
@@ -345,6 +387,22 @@ impl Jdtls {
         let wanted = InlayHints { parameters, types };
         let changed = *inlay != wanted;
         *inlay = wanted;
+        changed
+    }
+
+    /// The labels above declarations. The caller sends the new settings to a running
+    /// server, which applies them without a restart. `false` when nothing changed.
+    pub fn set_code_vision(&self, usages: bool, implementations: bool) -> bool {
+        let mut code_vision = self
+            .code_vision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let wanted = CodeVision {
+            usages,
+            implementations,
+        };
+        let changed = *code_vision != wanted;
+        *code_vision = wanted;
         changed
     }
 
@@ -423,11 +481,22 @@ fn copy_agent(state_dir: &Path, lombok: &Lombok) -> io::Result<PathBuf> {
     Ok(target)
 }
 
+/// The settings a start sends with the inlay hints of a fresh start. A check of the
+/// values needs no running server.
+pub fn settings_of(config: &JdtlsConfig) -> Value {
+    let inlay = InlayHints {
+        parameters: InlayParameterNames::default(),
+        types: false,
+    };
+    settings(config, &config.runtimes, true, inlay, CodeVision::default())
+}
+
 fn settings(
     config: &JdtlsConfig,
     runtimes: &[Runtime],
     autobuild: bool,
     inlay: InlayHints,
+    code_vision: CodeVision,
 ) -> Value {
     let runtimes: Vec<Value> = runtimes
         .iter()
@@ -451,8 +520,11 @@ fn settings(
         // dgs-framework and others ask for a build scan otherwise.
         "arguments": arguments.join(" "),
         "offline": {"enabled": config.offline},
-        "wrapper": {"enabled": true},
+        "wrapper": {"enabled": config.gradle_home.is_none()},
     });
+    if let Some(home) = &config.gradle_home {
+        gradle["home"] = json!(slashes(home));
+    }
     if let Some(home) = &config.gradle_user_home {
         gradle["user"] = json!({"home": slashes(home)});
     }
@@ -486,6 +558,14 @@ fn settings(
             "signatureHelp": {"enabled": true},
             "semanticHighlighting": {"enabled": true},
             "format": {"enabled": true},
+            "referencesCodeLens": {"enabled": code_vision.usages},
+            // jdtls 1.63 names the setting in the singular and takes a scope rather
+            // than a switch: `all`, `types`, `methods` or `none`.
+            "implementationCodeLens": if code_vision.implementations {
+                "all"
+            } else {
+                "none"
+            },
             "inlayHints": {
                 "parameterNames": {
                     "enabled": inlay.parameters.as_setting(),
@@ -595,6 +675,8 @@ fn capabilities() -> ClientCapabilities {
             "symbol": {"dynamicRegistration": true},
             "executeCommand": {"dynamicRegistration": true},
             "workspaceFolders": true,
+            // The server may ask for the labels again after a project-wide change.
+            "codeLens": {"refreshSupport": true},
         },
         "textDocument": {
             "synchronization": {"didSave": true},
@@ -643,6 +725,7 @@ fn capabilities() -> ClientCapabilities {
                 "augmentsSyntaxTokens": true,
             },
             "inlayHint": {"dynamicRegistration": false},
+            "codeLens": {"dynamicRegistration": false},
             "rename": {"prepareSupport": true},
             "publishDiagnostics": {"relatedInformation": true},
             "codeAction": {
@@ -811,6 +894,8 @@ impl ServerSpec for Jdtls {
     fn initialize_result(&self, result: &InitializeResult) {
         self.semantic_tokens
             .set(SemanticTokensCapability::from_server(&result.capabilities));
+        self.code_lens
+            .set(CodeLensCapability::from_server(&result.capabilities));
     }
 
     fn state_of(&self, method: &str, params: &Value) -> Option<State> {
@@ -872,6 +957,7 @@ mod tests {
                 default: true,
             }],
             maven_settings: None,
+            gradle_home: None,
             gradle_user_home: Some(PathBuf::from(r"E:\gradle")),
             gradle_java_home: None,
             offline: true,
@@ -898,6 +984,7 @@ mod tests {
             state_dir: root.join("state"),
             runtimes: Vec::new(),
             maven_settings: None,
+            gradle_home: None,
             gradle_user_home: None,
             gradle_java_home: None,
             offline: true,
@@ -998,6 +1085,38 @@ mod tests {
         assert_eq!(
             jdtls.settings()["java"]["inlayHints"]["parameterTypes"]["enabled"],
             Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn code_vision_labels_start_on_and_change_without_a_restart() {
+        let (jdtls, _) = jdtls();
+        assert_eq!(
+            jdtls.settings()["java"]["referencesCodeLens"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            jdtls.settings()["java"]["implementationCodeLens"],
+            json!("all")
+        );
+
+        assert!(jdtls.set_code_vision(false, true));
+        assert_eq!(
+            jdtls.settings()["java"]["referencesCodeLens"]["enabled"],
+            Value::Bool(false)
+        );
+        assert!(
+            !jdtls.set_code_vision(false, true),
+            "nothing changed, so no settings are resent"
+        );
+        assert_eq!(
+            jdtls.settings()["java"]["implementationCodeLens"],
+            json!("all")
+        );
+        jdtls.set_code_vision(false, false);
+        assert_eq!(
+            jdtls.settings()["java"]["implementationCodeLens"],
+            json!("none")
         );
     }
 

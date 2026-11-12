@@ -7,7 +7,8 @@ use tree_sitter::{Language, Query};
 /// A context that every place fits.
 pub const ANY: &str = "any";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// Typed as a word, expanded by Tab or picked from the list.
     Abbreviation,
@@ -24,7 +25,7 @@ pub enum Kind {
 /// start of a line is one indent unit of the language. `$END$` is where the caret ends,
 /// `$SELECTION$` and `$EXPR$` are filled in, every other name is a field. A field that
 /// occurs several times is typed once.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Template {
     pub key: &'static str,
     pub description: &'static str,
@@ -58,6 +59,9 @@ pub struct TemplateLanguage {
     /// creates an object.
     pub receiver_prefixes: &'static [&'static str],
     pub query: OnceLock<Option<Query>>,
+    /// Reads the names around the caret that `className()`, `methodName()` and
+    /// `packageName()` give; `None` leaves them empty.
+    pub declarations: Option<crate::DeclarationsProvider>,
 }
 
 impl TemplateLanguage {

@@ -59,6 +59,8 @@ impl GitRunner {
     }
 
     pub fn command(&self, cwd: &Path) -> Command {
+        // A `.cmd` path of the user also starts here: the standard library runs it
+        // through the command interpreter and refuses arguments it cannot quote safely.
         let mut command = Command::new(&self.program);
         command
             .current_dir(cwd)

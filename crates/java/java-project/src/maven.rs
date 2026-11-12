@@ -53,13 +53,35 @@ impl Maven {
     }
 
     pub(crate) fn command(&self, root: &Path) -> Result<ProcessSpec> {
-        let maven = find_maven(root)
-            .ok_or_else(|| format!("no mvnw.cmd in {} and no mvn in PATH", root.display()))?;
+        let settings = &self.env.build_tools.first;
+        let maven = match settings.home_path() {
+            Some(home) => {
+                let program = Path::new(home).join("bin").join("mvn.cmd");
+                if !program.is_file() {
+                    return Err(format!("no mvn.cmd in {}", program.display()).into());
+                }
+                program
+            }
+            None => find_maven(root)
+                .ok_or_else(|| format!("no mvnw.cmd in {} and no mvn in PATH", root.display()))?,
+        };
         let jdk = self.env.project_jdk(root)?;
-        let spec = ProcessSpec::new(maven)
+        let mut spec = ProcessSpec::new(maven)
             .cwd(root)
             .args(["-B", "-ntp"])
             .label("Build tool");
+        if settings.offline {
+            spec = spec.arg("-o");
+        }
+        if settings.update_snapshots {
+            spec = spec.arg("-U");
+        }
+        if let Some(file) = settings.settings_path() {
+            spec = spec.arg("-s").arg(file);
+        }
+        if let Some(options) = project_model::BuildToolSettings::path(&settings.vm_options) {
+            spec = spec.env("MAVEN_OPTS", options);
+        }
         Ok(self.env.apply(spec, &jdk).args(&self.env.maven_args))
     }
 

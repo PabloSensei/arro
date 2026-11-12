@@ -7,10 +7,11 @@ use editor_view::{EditorView, Semantic};
 use keymap::{editor as editor_keys, workspace as keys};
 use search::Tab;
 use ui_kit::*;
-use workspace::{DEBUG_TOOL, DockSide, Workspace};
+use workspace::{DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, Workspace};
 
 use crate::choice::{ChoiceDialog, DialogChoice};
 use crate::debug::ActiveDebug;
+use crate::documentation::ActiveDocumentation;
 use crate::finder::{ActiveFinder, Finder};
 use crate::git::ActiveGit;
 use crate::git_log::{self, ActiveGitLog};
@@ -240,6 +241,22 @@ pub fn register(
         "window.show_performance",
         "Show Performance Monitor",
         |workspace, window, cx| workspace.show_tool(workspace::PERFORMANCE_TOOL, window, cx),
+    );
+    workspace.register_command(
+        "window.show_documentation",
+        "Documentation",
+        |workspace, window, cx| {
+            workspace.show_tool(DOCUMENTATION_TOOL, window, cx);
+            let editor = workspace
+                .active_view()
+                .and_then(|view| view.downcast::<EditorView>().ok());
+            if let Some(editor) = editor
+                && let Some(panel) = cx.try_global::<ActiveDocumentation>()
+            {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.show_editor(editor, cx));
+            }
+        },
     );
     workspace.register_command("window.close_tab", "Close Tab", |workspace, window, cx| {
         workspace.close_active_tab(window, cx)
