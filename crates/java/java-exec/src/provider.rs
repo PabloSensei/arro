@@ -135,7 +135,9 @@ impl JavaProvider {
         let mut spec = ProcessSpec::new(jdk.java())
             .cwd(directory)
             .args(flags.output_encoding())
-            .label("Application");
+            .label("Application")
+            // A program may read its input, as `Scanner(System.in)` does.
+            .input();
         if debug {
             spec = spec.arg(flags.debug_agent("127.0.0.1", 0, true));
         }

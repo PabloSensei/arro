@@ -225,9 +225,9 @@ pub fn window_step(len: usize, current: usize, step: isize) -> Option<usize> {
 
 const SAVE_DELAY: Duration = Duration::from_millis(300);
 /// The automatic update check waits for the window to settle first.
-const UPDATE_DELAY: Duration = Duration::from_secs(30);
-/// The automatic check runs once a day.
-const UPDATE_INTERVAL_SECS: u64 = 86_400;
+const UPDATE_DELAY: Duration = Duration::from_secs(10);
+/// After the check at the start, a window that stays open asks again this often.
+const UPDATE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 const LAST_CHECK_KEY: &str = "updates.last_check";
 const SKIPPED_KEY: &str = "updates.skipped_version";
 /// A submenu opens only after the pointer rests on its row, as IDEA does.
@@ -490,6 +490,8 @@ pub struct Workspace {
     info: AppInfo,
     /// The newer release the notification offers, while it is open.
     update_release: Option<updater::Release>,
+    /// An update is downloading or being installed; a second one does not start.
+    installing_update: bool,
     theme_fade: Option<ThemeFade>,
     keymap: Keymap,
     /// The actions the keymap knows: the default ones and the plugin commands.
@@ -710,6 +712,7 @@ impl Workspace {
             debug: None,
             info,
             update_release: None,
+            installing_update: false,
             theme_fade: None,
             keymap,
             keymap_actions,
@@ -796,31 +799,32 @@ impl Workspace {
         if cfg!(debug_assertions) || cfg!(test) || cfg!(feature = "test-support") || off {
             return;
         }
+        // Every start asks, so a release is offered the first time the program opens after
+        // it; a window left open asks again twice a day.
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(UPDATE_DELAY).await;
-            let due = this
-                .update(cx, |this, cx| this.auto_update_due(cx))
-                .unwrap_or(false);
-            if due {
-                this.update(cx, |this, cx| this.start_update_check(true, cx))
-                    .ok();
+            let mut delay = UPDATE_DELAY;
+            loop {
+                cx.background_executor().timer(delay).await;
+                let Ok(due) = this.update(cx, |this, cx| this.auto_update_due(cx)) else {
+                    break;
+                };
+                if due {
+                    this.update(cx, |this, cx| this.start_update_check(true, cx))
+                        .ok();
+                }
+                delay = UPDATE_INTERVAL;
             }
         })
         .detach();
     }
 
+    /// Whether the automatic check may ask now: the setting is on and no update is being
+    /// installed.
     fn auto_update_due(&self, cx: &App) -> bool {
-        let enabled = cx
-            .try_global::<Settings>()
-            .is_none_or(|settings| settings.updates_check_automatically);
-        if !enabled {
-            return false;
-        }
-        let last = self
-            .state_value(LAST_CHECK_KEY)
-            .and_then(|text| text.parse::<u64>().ok())
-            .unwrap_or(0);
-        now_seconds().saturating_sub(last) >= UPDATE_INTERVAL_SECS
+        !self.installing_update
+            && cx
+                .try_global::<Settings>()
+                .is_none_or(|settings| settings.updates_check_automatically)
     }
 
     fn state_value(&self, key: &str) -> Option<String> {
@@ -944,6 +948,9 @@ impl Workspace {
     /// Downloads and installs the offered release away from the interface, then starts
     /// the new executable and closes this window.
     pub(crate) fn install_update(&mut self, cx: &mut Context<Self>) {
+        if self.installing_update {
+            return;
+        }
         let Some(release) = self.update_release.clone() else {
             return;
         };
@@ -959,6 +966,7 @@ impl Workspace {
             return;
         };
         let folder = self.state_dir.join("updates");
+        self.installing_update = true;
         self.notify_user(
             "Updating Arro",
             format!("Downloading Arro {}...", release.version_text()),
@@ -973,7 +981,10 @@ impl Workspace {
             let result = install_task.await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => this.restart_after_update(cx),
-                Err(error) => this.notify_user("The update did not install", error.to_string(), cx),
+                Err(error) => {
+                    this.installing_update = false;
+                    this.notify_user("The update did not install", error.to_string(), cx)
+                }
             })
             .ok();
         })

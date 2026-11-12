@@ -95,22 +95,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "Compare.SameVersion",
         "Comparing two versions of a file is not in MVP-1.",
     ),
-    (
-        "Console.Execute",
-        "The Run console takes no input in MVP-1.",
-    ),
-    (
-        "Console.Execute.Multiline",
-        "The Run console takes no input in MVP-1.",
-    ),
-    (
-        "Console.History.Browse",
-        "The Run console takes no input in MVP-1.",
-    ),
-    (
-        "Console.Open",
-        "The Run console opens with a run; MVP-1 has no separate console action.",
-    ),
     ("ContextHelp", "MVP-1 has no in-product help."),
     (
         "Diff.FocusOppositePane",
@@ -248,7 +232,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "SelectVirtualTemplateElement",
         "Virtual template elements are not in MVP-1.",
     ),
-    ("SendEOF", "The Run console takes no input in MVP-1."),
     (
         "ServiceView.GroupByContributor",
         "The Services window has one flat list.",

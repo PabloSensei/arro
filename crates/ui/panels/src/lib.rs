@@ -243,6 +243,9 @@ mod window_tests_template_engine;
 #[cfg(test)]
 mod window_tests_templates_settings;
 
+#[cfg(test)]
+mod window_tests_console_input;
+
 mod choice;
 mod invalidate;
 

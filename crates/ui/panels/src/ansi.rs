@@ -10,6 +10,8 @@ pub struct Style {
     pub bold: bool,
     /// Came from stderr.
     pub error: bool,
+    /// The user typed it into the console, not the program.
+    pub input: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -170,6 +172,7 @@ mod tests {
             color: Some(1),
             bold: true,
             error: false,
+            input: false,
         };
         assert_eq!(
             line.spans,

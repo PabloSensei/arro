@@ -794,6 +794,11 @@ pub mod workspace {
     pub const TODO_GROUP_PACKAGES: &str = "workspace.todo_group_packages";
     pub const TODO_GROUP_MODULES: &str = "workspace.todo_group_modules";
     pub const TODO_FLATTEN_PACKAGES: &str = "workspace.todo_flatten_packages";
+    pub const CONSOLE_EXECUTE: &str = "console.execute";
+    pub const CONSOLE_EXECUTE_MULTILINE: &str = "console.execute_multiline";
+    pub const CONSOLE_HISTORY_BROWSE: &str = "console.history_browse";
+    pub const CONSOLE_OPEN: &str = "console.open";
+    pub const SEND_EOF: &str = "console.send_eof";
 
     pub const IDEA_IDS: &[(&str, &str)] = &[
         ("GotoFile", GOTO_FILE),
@@ -860,6 +865,9 @@ pub mod workspace {
         ("TodoViewGroupByFlattenPackage", TODO_FLATTEN_PACKAGES),
         ("ShowSettingsAndFindUsages", SHOW_SETTINGS_AND_FIND_USAGES),
         ("ExportToTextFile", EXPORT_TO_TEXT_FILE),
+        ("Console.Execute", CONSOLE_EXECUTE),
+        ("Console.Execute.Multiline", CONSOLE_EXECUTE_MULTILINE),
+        ("SendEOF", SEND_EOF),
     ];
 
     /// IDEA actions the window has without a key of their own, because IDEA gives the
@@ -872,6 +880,10 @@ pub mod workspace {
         ("UsageGrouping.FileStructure", FIND_USAGE_FILTER_POPUP),
         ("TodoViewGroupByShowModules", USAGE_GROUP_MODULE),
         ("TodoViewGroupByShowPackages", USAGE_GROUP_DIRECTORY),
+        // IDEA gives these keys to another action of the same file outside the console:
+        // Ctrl+Alt+E is Toggle Find in Selection, Ctrl+Shift+F10 is Run Class.
+        ("Console.History.Browse", CONSOLE_HISTORY_BROWSE),
+        ("Console.Open", CONSOLE_OPEN),
     ];
 }
 

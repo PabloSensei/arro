@@ -158,6 +158,16 @@ pub struct RunPanel {
     build_parser: AnsiParser,
     /// The answer of a hot swap the last Build Project asked for.
     reload: Option<Receiver<ReloadOutcome>>,
+    /// The line the user types into the console, when its program reads input.
+    console_input: TextField,
+    /// The lines sent to this console, oldest first.
+    console_history: Vec<String>,
+    /// Where the walk through the history stands; `None` while the line is the live one.
+    history_at: Option<usize>,
+    /// The program was told that its input ended.
+    input_closed: bool,
+    /// The program step of the console started; a build step before it reads nothing.
+    program_started: bool,
 }
 
 /// A console whose main process ended, kept for the output that follows.
@@ -246,6 +256,11 @@ impl RunPanel {
                 build_running: false,
                 build_parser: AnsiParser::default(),
                 reload: None,
+                console_input: TextField::default(),
+                console_history: Vec::new(),
+                history_at: None,
+                input_closed: false,
+                program_started: false,
             }
         })
     }
@@ -715,6 +730,8 @@ impl RunPanel {
         });
         self.viewing = None;
         self.console_running = false;
+        self.program_started = false;
+        self.input_closed = false;
     }
 
     /// The workspace shows the tool window: this may run inside a workspace update.
@@ -970,6 +987,177 @@ impl RunPanel {
         }
     }
 
+    /// Whether the console in front reads what the user types. The program of a run does;
+    /// a build step, a test run and an old console tab do not.
+    pub(crate) fn takes_input(&self) -> bool {
+        self.viewing.is_none()
+            && self.program_started
+            && !self.input_closed
+            && self.console.as_ref().is_some_and(Console::takes_input)
+    }
+
+    /// The line typed into the console, for tests.
+    #[cfg(test)]
+    pub(crate) fn input_text(&self) -> &str {
+        &self.console_input.text
+    }
+
+    /// Enter in the console: the line goes to the program with the line break after it and
+    /// stays in the output, as IDEA shows what was typed.
+    pub fn execute_input(&mut self, cx: &mut Context<Self>) {
+        if !self.takes_input() {
+            return;
+        }
+        let line = self.console_input.text.clone();
+        self.send_console_line(&line, cx);
+    }
+
+    fn send_console_line(&mut self, line: &str, cx: &mut Context<Self>) {
+        if let Some(console) = &self.console {
+            console.send_line(line);
+        }
+        // A prompt the program left unfinished ends before the line the user typed.
+        let mut done = Vec::new();
+        self.parser.finish(&mut done);
+        self.lines.extend(done);
+        self.lines
+            .push_back(Line::plain(line.to_owned(), input_style()));
+        if !line.is_empty() && self.console_history.last().is_none_or(|last| last != line) {
+            self.console_history.push(line.to_owned());
+        }
+        self.console_input = TextField::default();
+        self.history_at = None;
+        self.changed(cx);
+    }
+
+    /// Send EOF: the program sees the end of its input, and nothing more is typed.
+    pub fn send_eof(&mut self, cx: &mut Context<Self>) {
+        if !self.takes_input() {
+            return;
+        }
+        if let Some(console) = &self.console {
+            console.send_eof();
+        }
+        self.input_closed = true;
+        self.console_input = TextField::default();
+        self.history_at = None;
+        self.changed(cx);
+    }
+
+    /// Up and Down in the input line: the lines sent to this console before, newest first.
+    pub fn browse_history(&mut self, older: bool, cx: &mut Context<Self>) {
+        if !self.takes_input() {
+            return;
+        }
+        let len = self.console_history.len();
+        if len == 0 {
+            return;
+        }
+        let next = match self.history_at {
+            None if !older => return,
+            None => Some(len - 1),
+            Some(index) if older => index.checked_sub(1),
+            Some(index) if index + 1 < len => Some(index + 1),
+            Some(_) => None,
+        };
+        self.history_at = next;
+        let text = next.map_or("", |index| self.console_history[index].as_str());
+        self.console_input = TextField::from_text(text);
+        cx.notify();
+    }
+
+    /// Ctrl+V: the complete lines of the clipboard go to the program one after another;
+    /// what follows the last line break stays in the input line.
+    fn paste_into_console(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let Some(at) = text.rfind('\n') else {
+            self.console_input.insert_text(&text);
+            cx.notify();
+            return;
+        };
+        for line in text[..at].split('\n') {
+            self.send_console_line(line, cx);
+        }
+        let rest = &text[at + 1..];
+        if !rest.is_empty() {
+            self.console_input.insert_text(rest);
+        }
+        cx.notify();
+    }
+
+    /// The keys of the console input line while the console waits for one. True when the
+    /// key was taken.
+    fn console_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !self.takes_input() {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        let primary = modifiers.control || modifiers.platform;
+        if primary && !modifiers.alt && !modifiers.shift {
+            match key {
+                "d" => {
+                    cx.stop_propagation();
+                    self.send_eof(cx);
+                    return true;
+                }
+                "v" => {
+                    cx.stop_propagation();
+                    self.paste_into_console(cx);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if !modifiers.alt && !modifiers.shift && matches!(key, "up" | "down") {
+            cx.stop_propagation();
+            self.browse_history(key == "up", cx);
+            return true;
+        }
+        if !modifiers.alt && !modifiers.shift && key == "enter" {
+            cx.stop_propagation();
+            self.execute_input(cx);
+            return true;
+        }
+        if self.console_input.key_with_clipboard(event, false, cx) {
+            if key == "backspace" || key == "delete" || event.keystroke.key_char.is_some() {
+                self.history_at = None;
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// A key of the tool window: the console takes it while it waits for a line, the tree
+    /// of tests otherwise.
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.console_key(event, cx) {
+            return;
+        }
+        self.test_key(event, window, cx);
+    }
+
+    /// The context menu of the console: Send EOF, as IDEA has it.
+    fn console_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.takes_input() {
+            return;
+        }
+        let panel = cx.weak_entity();
+        let entry = MenuEntry::new("Send EOF", move |_, cx| {
+            panel.update(cx, |panel, cx| panel.send_eof(cx)).ok();
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![entry], cx)
+            })
+            .ok();
+    }
+
     /// The work that runs behind the console: the import of the project and a build.
     pub fn background_tasks(&self) -> Vec<&'static str> {
         let mut tasks = Vec::new();
@@ -1087,6 +1275,11 @@ impl RunPanel {
         self.title = title.into();
         self.lines.clear();
         self.parser = AnsiParser::default();
+        self.console_input = TextField::default();
+        self.console_history.clear();
+        self.history_at = None;
+        self.input_closed = false;
+        self.program_started = false;
         self.tests.clear();
         cx.emit(TestsChanged);
         let plan = cx.background_executor().spawn(async move { make() });
@@ -1337,6 +1530,9 @@ impl RunPanel {
                         if step == Step::Before {
                             done.push(info("Building the project"));
                         }
+                        if step == Step::Program && main_console {
+                            self.program_started = true;
+                        }
                     }
                     ConsoleEvent::Failed { message } => {
                         done.push(Line::plain(message, error_style()));
@@ -1360,6 +1556,12 @@ impl RunPanel {
                     }
                 }
             }
+        }
+        if let Some(console) = &self.console
+            && let Some(message) = console.take_input_error()
+        {
+            changed = true;
+            done.push(Line::plain(message, error_style()));
         }
         let mut build_exited: Option<Option<i32>> = None;
         let mut build_closed = false;
@@ -1483,7 +1685,8 @@ impl RunPanel {
             }
         }
         if changed {
-            let last = self.lines.len();
+            // The console waits for a line below the last one, so that row is in view too.
+            let last = self.lines.len() + usize::from(self.takes_input());
             self.scroll.scroll_to_item(last, ScrollStrategy::Bottom);
             self.changed(cx);
         }
@@ -1753,8 +1956,12 @@ impl RunPanel {
             Some(drain) => drain.parser.current(),
             None => self.parser.current(),
         };
+        let typed = self.takes_input().then_some(self.lines.len() + 1);
         range
             .map(|index| {
+                if typed == Some(index) {
+                    return self.input_element(theme);
+                }
                 let line = match drain {
                     Some(drain) => drain.lines.get(index),
                     None => self.lines.get(index),
@@ -1763,6 +1970,28 @@ impl RunPanel {
                 line_element(line, theme)
             })
             .collect()
+    }
+
+    /// The line the user types, with the caret after it: the console waits for input at
+    /// the end of the output, and output that arrives meanwhile goes above it.
+    fn input_element(&self, theme: &Theme) -> AnyElement {
+        div()
+            .debug_selector(|| "run-console-input".to_owned())
+            .flex()
+            .items_center()
+            .h(px(CODE_LINE_HEIGHT))
+            .px(px(LINE_PAD))
+            .whitespace_nowrap()
+            .text_color(theme.console_input)
+            .child(self.console_input.text.clone())
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(1.))
+                    .h(px(CODE_SIZE))
+                    .bg(theme.console_input),
+            )
+            .into_any_element()
     }
 }
 
@@ -1829,6 +2058,14 @@ fn info_style() -> Style {
     }
 }
 
+/// A line the user typed into the console, not the program.
+fn input_style() -> Style {
+    Style {
+        input: true,
+        ..Style::default()
+    }
+}
+
 pub(crate) fn error_style() -> Style {
     Style {
         error: true,
@@ -1847,10 +2084,11 @@ pub(crate) fn line_element(line: &Line, theme: &Theme) -> AnyElement {
         (&ANSI_LIGHT, ERROR_LIGHT)
     };
     let highlights = line.spans.iter().map(|(range, style)| {
-        let color = match (style.color, style.error) {
-            (Some(index), _) => Some(color(palette[usize::from(index)])),
-            (None, true) => Some(color(error)),
-            (None, false) => None,
+        let color = match (style.input, style.color, style.error) {
+            (true, _, _) => Some(theme.console_input),
+            (false, Some(index), _) => Some(color(palette[usize::from(index)])),
+            (false, None, true) => Some(color(error)),
+            (false, None, false) => None,
         };
         let highlight = HighlightStyle {
             color,
@@ -1904,7 +2142,7 @@ impl Render for RunPanel {
         let view = self.viewing.filter(|index| *index < self.draining.len());
         let count = match view {
             Some(index) => self.draining[index].lines.len() + 1,
-            None => self.lines.len() + 1,
+            None => self.lines.len() + 1 + usize::from(self.takes_input()),
         };
         let workspace = self.workspace.clone();
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -1989,6 +2227,16 @@ impl Render for RunPanel {
             .font_family(MONO_FONT)
             .text_size(px(CODE_SIZE))
             .text_color(theme.code)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.console_menu(event.position, cx)
+                }),
+            )
             .children(tabs)
             .child(
                 scrollable(
@@ -2021,7 +2269,7 @@ impl Render for RunPanel {
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()
-            .on_key_down(cx.listener(|this, event, window, cx| this.test_key(event, window, cx)))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .child(
                 panel_header(self.title.clone(), GROUP, hide, &theme)
                     .debug_selector(|| "run-header".to_owned()),

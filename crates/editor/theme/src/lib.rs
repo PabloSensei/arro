@@ -151,6 +151,8 @@ tokens! {
     stripe_warning: 0xd9a441ff, 0xe0a530ff;
     stripe_find: 0x6aa9ffff, 0x2c6fbbff;
     stripe_caret: 0xe8e3daff, 0x1c1b1aff;
+    // What the user typed into a console, as IDEA colours its input line.
+    console_input: 0x62b543ff, 0x067d17ff;
 }
 
 /// Metrics in logical pixels.

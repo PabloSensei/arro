@@ -118,10 +118,14 @@ impl UpdateSource {
     }
 
     fn download_inner(&self, release: &Release, partial: &Path) -> Result<(), Error> {
-        let bytes = self.fetch(release.archive.url.as_str())?;
         {
+            // The archive goes to the disk as it comes: it is tens of megabytes, more
+            // than a body read into memory may hold.
+            let mut response = self.call(release.archive.url.as_str(), None)?;
             let mut file = File::create(partial)?;
-            file.write_all(&bytes)?;
+            let mut body = response.body_mut().as_reader();
+            io::copy(&mut body, &mut file).map_err(|error| Error::Http(error.to_string()))?;
+            file.flush()?;
         }
         let text = self.fetch_text(release.checksum.url.as_str())?;
         let expected = parse_checksum(&text)?;
@@ -138,8 +142,25 @@ impl UpdateSource {
     }
 
     fn fetch(&self, url: &str) -> Result<Vec<u8>, Error> {
+        let mut response = self.call(url, Some(TIMEOUT))?;
+        response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|error| Error::Http(error.to_string()))
+    }
+
+    /// Sends a GET to `url`. `total` bounds the whole call; without it only the connection
+    /// and the start of the answer are bounded, so a long download on a slow line is not
+    /// cut while bytes still arrive.
+    fn call(
+        &self,
+        url: &str,
+        total: Option<Duration>,
+    ) -> Result<ureq::http::Response<ureq::Body>, Error> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
+            .timeout_global(total)
+            .timeout_connect(Some(TIMEOUT))
+            .timeout_recv_response(Some(TIMEOUT))
             .tls_config(
                 ureq::tls::TlsConfig::builder()
                     .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -147,15 +168,11 @@ impl UpdateSource {
             )
             .build()
             .into();
-        let mut response = agent
+        agent
             .get(url)
             .header("User-Agent", USER_AGENT)
             .header("Accept", "application/vnd.github+json")
             .call()
-            .map_err(|error| Error::Http(error.to_string()))?;
-        response
-            .body_mut()
-            .read_to_vec()
             .map_err(|error| Error::Http(error.to_string()))
     }
 }
@@ -918,6 +935,33 @@ mod tests {
             .unwrap();
         assert_eq!(file, download.join(&release.archive.name));
         assert!(file.is_file());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_archive_larger_than_a_read_into_memory_downloads_whole() {
+        // A real release archive is tens of megabytes; 0.1.0 read it into memory, which
+        // stops at 10 MB, and every update failed.
+        let dir = temp("large");
+        fs::create_dir_all(&dir).unwrap();
+        let bytes: Vec<u8> = (0..24 * 1024 * 1024u32)
+            .map(|at| (at.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let source = dir.join("source.bin");
+        fs::write(&source, &bytes).unwrap();
+        let hash = sha256_file(&source).unwrap();
+        let server = Server::start(vec![
+            ("/archive.zip".into(), Reply::bytes(bytes.clone())),
+            (
+                "/archive.zip.sha256".into(),
+                Reply::text(format!("{hash}  arro.zip\n")),
+            ),
+        ]);
+        let release = release_from("v0.2.0", &server);
+        let file = server_source(&server)
+            .download(&release, &dir.join("download"))
+            .unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().len(), bytes.len() as u64);
         fs::remove_dir_all(dir).ok();
     }
 

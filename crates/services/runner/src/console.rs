@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::process::ChildStdin;
 use std::sync::mpsc::{
-    Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+    Receiver, RecvError, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
+    sync_channel,
 };
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
@@ -69,6 +71,18 @@ pub struct Console {
     stop: Cancel,
     keeper: Option<thread::JoinHandle<()>>,
     watch: Arc<OutputWatch>,
+    /// The program reads its input; `None` when nothing was open to write to.
+    input: Option<Sender<Input>>,
+    /// What the writer of the input could not do, for the window to show as a line.
+    input_error: Arc<Mutex<Option<String>>>,
+}
+
+/// One message for the standard input of the program.
+enum Input {
+    /// Text to write as it is; a line carries its own line break.
+    Line(String),
+    /// The program sees the end of its input, as Ctrl+D does in IDEA.
+    Eof,
 }
 
 /// The events of a console, with what [`Console::wait_for_output`] took aside while it
@@ -202,6 +216,17 @@ enum Work {
     },
 }
 
+impl Work {
+    /// Whether the program of the work reads its input. A single step is a build, which
+    /// never does.
+    fn reads_input(&self) -> bool {
+        match self {
+            Self::Plan(plan) => plan.program.reads_input(),
+            Self::Single { .. } => false,
+        }
+    }
+}
+
 impl Console {
     pub fn start(plan: RunPlan) -> Self {
         Self::spawn(Work::Plan(plan))
@@ -219,8 +244,24 @@ impl Console {
         let cancel = stop.clone();
         let watch = Arc::new(OutputWatch::default());
         let keeper_watch = watch.clone();
+        let input_error = Arc::new(Mutex::new(None));
+        let keeper_error = input_error.clone();
+        let (input, input_messages) = match work.reads_input() {
+            true => {
+                let (messages, receiver) = channel();
+                (Some(messages), Some(receiver))
+            }
+            false => (None, None),
+        };
         let keeper = thread::spawn(move || {
-            keep(work, &cancel, &sender, &keeper_watch);
+            keep(
+                work,
+                &cancel,
+                &sender,
+                &keeper_watch,
+                input_messages,
+                &keeper_error,
+            );
             keeper_watch.end();
         });
         Self {
@@ -229,7 +270,53 @@ impl Console {
             stop,
             keeper: Some(keeper),
             watch,
+            input,
+            input_error,
         }
+    }
+
+    /// Whether the program of the console reads its standard input from here. A build
+    /// step has its input closed, so nothing is typed into it.
+    pub fn takes_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Sends a line to the program with the line break that Enter adds. The write happens
+    /// on a thread of its own, so the window never waits for the pipe.
+    pub fn send_line(&self, line: &str) {
+        self.send_input(Input::Line(format!("{line}\n")));
+    }
+
+    /// The program sees the end of its input, as Send EOF of the console does.
+    pub fn send_eof(&self) {
+        self.send_input(Input::Eof);
+    }
+
+    fn send_input(&self, message: Input) {
+        let Some(input) = &self.input else {
+            return;
+        };
+        if input.send(message).is_err() {
+            // The program is gone and its input with it; a line says so, nothing panics.
+            self.report_input_error("the program has exited");
+        }
+    }
+
+    fn report_input_error(&self, reason: &str) {
+        let message = format!("Cannot send input to the program: {reason}");
+        let mut slot = self
+            .input_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(message);
+    }
+
+    /// What went wrong with the input since the last call, for a line in the console.
+    pub fn take_input_error(&self) -> Option<String> {
+        self.input_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     pub fn events(&self) -> ConsoleEvents<'_> {
@@ -295,11 +382,18 @@ impl Drop for Console {
     }
 }
 
-fn keep(work: Work, stop: &Cancel, events: &SyncSender<ConsoleEvent>, watch: &Arc<OutputWatch>) {
+fn keep(
+    work: Work,
+    stop: &Cancel,
+    events: &SyncSender<ConsoleEvent>,
+    watch: &Arc<OutputWatch>,
+    input: Option<Receiver<Input>>,
+    input_error: &Arc<Mutex<Option<String>>>,
+) {
     match work {
-        Work::Plan(plan) => keep_plan(plan, stop, events, watch),
+        Work::Plan(plan) => keep_plan(plan, stop, events, watch, input, input_error),
         Work::Single { spec, step, grace } => {
-            let end = run_step(&spec, step, grace, stop, events, watch);
+            let end = run_step(&spec, step, grace, stop, events, watch, None, input_error);
             let _ = events.send(ConsoleEvent::Exited {
                 code: end.code,
                 step,
@@ -317,9 +411,20 @@ fn keep_plan(
     stop: &Cancel,
     events: &SyncSender<ConsoleEvent>,
     watch: &Arc<OutputWatch>,
+    input: Option<Receiver<Input>>,
+    input_error: &Arc<Mutex<Option<String>>>,
 ) {
     if let Some(before) = &plan.before {
-        let end = run_step(before, Step::Before, plan.grace, stop, events, watch);
+        let end = run_step(
+            before,
+            Step::Before,
+            plan.grace,
+            stop,
+            events,
+            watch,
+            None,
+            input_error,
+        );
         if end.code != Some(0) || stop.is_cancelled() {
             let step = Step::Before;
             let _ = events.send(ConsoleEvent::Exited {
@@ -340,6 +445,8 @@ fn keep_plan(
         stop,
         events,
         watch,
+        input,
+        input_error,
     );
     let step = Step::Program;
     let _ = events.send(ConsoleEvent::Exited {
@@ -376,6 +483,7 @@ impl StepEnd {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_step(
     spec: &ProcessSpec,
     step: Step,
@@ -383,6 +491,8 @@ fn run_step(
     stop: &Cancel,
     events: &SyncSender<ConsoleEvent>,
     watch: &Arc<OutputWatch>,
+    input: Option<Receiver<Input>>,
+    input_error: &Arc<Mutex<Option<String>>>,
 ) -> StepEnd {
     let mut process = match spec.start() {
         Ok(process) => process,
@@ -398,7 +508,11 @@ fn run_step(
     };
     let pid = process.pid();
     let _ = events.send(ConsoleEvent::Started { pid, step });
-    drop(process.take_stdin());
+    match input.and_then(|input| process.take_stdin().map(|stdin| (stdin, input))) {
+        Some((stdin, input)) => write_input(stdin, input, input_error.clone()),
+        // A build, a test or a program that reads nothing: the pipe closes at once.
+        None => drop(process.take_stdin()),
+    }
     let readers = vec![
         read_pipe(
             process.take_stdout(),
@@ -493,6 +607,28 @@ fn deliver(events: &SyncSender<ConsoleEvent>, stream: Stream, text: String) -> b
         Err(TrySendError::Full(event)) => events.send(event).is_ok(),
         Err(TrySendError::Disconnected(_)) => false,
     }
+}
+
+/// Feeds the standard input of the program from its own thread: the window only hands a
+/// line over. Ends with Send EOF, when the program is gone, or with the console.
+fn write_input(mut stdin: ChildStdin, input: Receiver<Input>, error: Arc<Mutex<Option<String>>>) {
+    thread::spawn(move || {
+        while let Ok(message) = input.recv() {
+            let result = match message {
+                Input::Line(text) => stdin
+                    .write_all(text.as_bytes())
+                    .and_then(|()| stdin.flush()),
+                Input::Eof => return,
+            };
+            if let Err(failure) = result {
+                let mut slot = error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *slot = Some(format!("Cannot send input to the program: {failure}"));
+                return;
+            }
+        }
+    });
 }
 
 /// A read may end in the middle of a character, which must not turn into garbage.
@@ -697,6 +833,85 @@ mod tests {
         }
 
         assert!(start.elapsed() < PATIENCE);
+    }
+
+    /// A program that reads one line of its input and prints it back.
+    fn echo_line() -> ProcessSpec {
+        ProcessSpec::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$line=[Console]::In.ReadLine(); Write-Output ('got:' + $line)",
+            ])
+            .input()
+    }
+
+    /// A program that reads its input to the end and says so.
+    fn read_to_end() -> ProcessSpec {
+        ProcessSpec::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::In.ReadToEnd() | Out-Null; Write-Output 'input-ended'",
+            ])
+            .input()
+    }
+
+    #[test]
+    fn a_line_of_the_console_reaches_the_program() {
+        let console = Console::start(plan(None, echo_line()));
+        assert!(console.takes_input(), "the program reads its input");
+
+        console.send_line("hello");
+
+        let (text, code, _) = to_end(&console);
+        assert!(text.contains("got:hello"), "{text:?}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn the_end_of_input_closes_stdin_of_the_program() {
+        let console = Console::start(plan(None, read_to_end()));
+        assert!(console.takes_input(), "the program reads its input");
+
+        console.send_eof();
+
+        let (text, code, _) = to_end(&console);
+        assert!(text.contains("input-ended"), "{text:?}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn a_step_that_is_not_the_program_takes_no_input() {
+        let console = Console::start_step(shell("exit /b 0"), Step::Before, Duration::ZERO);
+
+        assert!(!console.takes_input(), "a build step reads nothing");
+        console.send_line("ignored");
+        console.send_eof();
+
+        let (_, code, step) = to_end(&console);
+        assert_eq!((code, step), (Some(0), Step::Before));
+    }
+
+    #[test]
+    fn a_line_sent_after_the_program_exited_is_a_line_not_a_panic() {
+        let console = Console::start(plan(None, shell("exit /b 0").input()));
+        let (_, code, _) = to_end(&console);
+        assert_eq!(code, Some(0));
+
+        console.send_line("too late");
+
+        let start = Instant::now();
+        let mut error = None;
+        while start.elapsed() < PATIENCE {
+            if let Some(message) = console.take_input_error() {
+                error = Some(message);
+                break;
+            }
+            sleep(POLL);
+        }
+        let error = error.expect("the write after the exit is reported");
+        assert!(error.contains("Cannot send input"), "{error}");
     }
 
     #[test]

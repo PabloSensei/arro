@@ -7,7 +7,7 @@ use editor_view::{EditorView, Semantic};
 use keymap::{editor as editor_keys, workspace as keys};
 use search::Tab;
 use ui_kit::*;
-use workspace::{DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, Workspace};
+use workspace::{DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, RUN_TOOL, Workspace};
 
 use crate::choice::{ChoiceDialog, DialogChoice};
 use crate::debug::ActiveDebug;
@@ -25,6 +25,7 @@ use crate::problems::ActiveProblems;
 use crate::project::ActiveProjectPanel;
 use crate::project_structure::ProjectStructureDialog;
 use crate::prompt::Prompt;
+use crate::run::RunPanel;
 use crate::run_configs::RunConfigDialog;
 use crate::script::ActiveRunPanel;
 use crate::todo::ActiveTodo;
@@ -41,6 +42,17 @@ fn title_of(id: &str) -> String {
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+/// The panel of the Run tool window, when its console waits for a line and has the
+/// focus: the console keys act on what the user types, nowhere else.
+fn console_panel(cx: &App, window: &Window) -> Option<Entity<RunPanel>> {
+    let panel = cx.try_global::<ActiveRunPanel>()?.0.clone();
+    let ready = {
+        let panel = panel.read(cx);
+        panel.takes_input() && panel.focus().contains_focused(window, cx)
+    };
+    ready.then_some(panel)
 }
 
 pub fn register(
@@ -94,6 +106,35 @@ pub fn register(
     }
 
     workspace.register_command(keys::RUN_CLASS, "Run Test at Caret", marks::run_at_caret);
+    for (id, title) in [
+        (keys::CONSOLE_EXECUTE, "Execute Console Command"),
+        (keys::CONSOLE_EXECUTE_MULTILINE, "Execute Console Command"),
+    ] {
+        workspace.register_command(id, title, |_, window, cx| {
+            if let Some(panel) = console_panel(cx, window) {
+                panel.update(cx, |panel, cx| panel.execute_input(cx));
+            }
+        });
+    }
+    workspace.register_command(keys::SEND_EOF, "Send EOF", |_, window, cx| {
+        if let Some(panel) = console_panel(cx, window) {
+            panel.update(cx, |panel, cx| panel.send_eof(cx));
+        }
+    });
+    workspace.register_command(
+        keys::CONSOLE_HISTORY_BROWSE,
+        "Console History",
+        |_, window, cx| {
+            if let Some(panel) = console_panel(cx, window) {
+                panel.update(cx, |panel, cx| panel.browse_history(true, cx));
+            }
+        },
+    );
+    workspace.register_command(
+        keys::CONSOLE_OPEN,
+        "Open Console",
+        |workspace, window, cx| workspace.show_tool(RUN_TOOL, window, cx),
+    );
     workspace.register_command(
         keys::BUILD_PROJECT,
         "Build Project",

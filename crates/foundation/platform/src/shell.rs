@@ -3,6 +3,9 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
+use windows_sys::Win32::System::Com::{
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -29,8 +32,12 @@ pub fn recorded_urls() -> Vec<String> {
     RECORDED.lock().map(|urls| urls.clone()).unwrap_or_default()
 }
 
-/// Opens `url` in the default browser. Returns whether the shell started; anything but
-/// an http or https address is refused.
+/// Opens `url` in the default browser. Returns whether the address was handed to the
+/// shell; anything but an http or https address is refused.
+///
+/// The shell runs on a thread of its own: `ShellExecuteW` pumps window messages while it
+/// works, and a message that reaches the window inside a click handler re-enters the
+/// interface and ends the program.
 pub fn open_url(url: &str) -> bool {
     if !is_web_url(url) {
         return false;
@@ -41,8 +48,28 @@ pub fn open_url(url: &str) -> bool {
         }
         return true;
     }
+    let url = url.to_owned();
+    std::thread::Builder::new()
+        .name("open-url".to_owned())
+        .spawn(move || {
+            if !shell_open(&url) {
+                eprintln!("the browser did not open {url}");
+            }
+        })
+        .is_ok()
+}
+
+fn shell_open(url: &str) -> bool {
     let operation = wide("open");
     let target = wide(url);
+    // SAFETY: the shell asks for a single-threaded apartment without DDE on the thread
+    // that calls it; this thread is ours and ends after the call.
+    let initialized = unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    } >= 0;
     // SAFETY: both strings are null terminated and live for the call.
     let started = unsafe {
         ShellExecuteW(
@@ -54,6 +81,10 @@ pub fn open_url(url: &str) -> bool {
             SW_SHOWNORMAL,
         )
     };
+    if initialized {
+        // SAFETY: pairs the successful initialization above on the same thread.
+        unsafe { CoUninitialize() };
+    }
     started as isize > 32
 }
 

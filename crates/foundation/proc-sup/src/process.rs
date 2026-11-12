@@ -40,6 +40,7 @@ pub struct ProcessSpec {
     class: ProcessClass,
     ctrl_helper: Option<PathBuf>,
     label: Option<&'static str>,
+    reads_input: bool,
 }
 
 impl ProcessSpec {
@@ -53,6 +54,7 @@ impl ProcessSpec {
             class: ProcessClass::default(),
             ctrl_helper: None,
             label: None,
+            reads_input: false,
         }
     }
 
@@ -104,6 +106,19 @@ impl ProcessSpec {
     pub fn label(mut self, label: &'static str) -> Self {
         self.label = Some(label);
         self
+    }
+
+    /// The program reads its standard input while it runs, so the owner keeps the pipe
+    /// open and may write to it. Without this the owner closes the pipe at once and the
+    /// program sees the end of its input.
+    pub fn input(mut self) -> Self {
+        self.reads_input = true;
+        self
+    }
+
+    /// Whether the owner writes to the standard input of the program.
+    pub fn reads_input(&self) -> bool {
+        self.reads_input
     }
 
     /// The arguments after the program, for a check of a plan before it starts.

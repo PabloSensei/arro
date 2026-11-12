@@ -315,15 +315,25 @@ impl BuildSystem for Gradle {
         task: &str,
         _options: TaskOptions,
     ) -> Result<ProcessSpec> {
-        Ok(self.command(root)?.arg(task_name(module, task)))
+        let spec = self.command(root)?.arg(task_name(module, task));
+        // The application these tasks start may read its input, as a console program does.
+        Ok(match task {
+            "run" | "bootRun" => spec.input(),
+            _ => spec,
+        })
     }
 
     fn goal(&self, root: &Path, line: &str, _options: TaskOptions) -> Result<ProcessSpec> {
         let mut spec = self.command(root)?;
+        let mut runs_program = false;
         for word in line.split_whitespace() {
+            runs_program |= matches!(word, "run" | "bootRun");
             spec = spec.arg(word);
         }
-        Ok(spec)
+        Ok(match runs_program {
+            true => spec.input(),
+            false => spec,
+        })
     }
 
     fn debug_task_in(

@@ -204,20 +204,30 @@ impl BuildSystem for Maven {
         task: &str,
         options: TaskOptions,
     ) -> Result<ProcessSpec> {
-        Ok(self
+        let spec = self
             .command(root)?
-            .args(run_args(root, module, task, options)))
+            .args(run_args(root, module, task, options));
+        // The application the plugin starts may read its input, as a console program does.
+        Ok(match task.ends_with("spring-boot:run") {
+            true => spec.input(),
+            false => spec,
+        })
     }
 
     fn goal(&self, root: &Path, line: &str, options: TaskOptions) -> Result<ProcessSpec> {
         let mut spec = self.command(root)?;
+        let mut runs_program = false;
         for word in line.split_whitespace() {
+            runs_program |= word.ends_with("spring-boot:run");
             spec = spec.arg(word);
         }
         if options.skip_tests {
             spec = spec.arg("-DskipTests");
         }
-        Ok(spec)
+        Ok(match runs_program {
+            true => spec.input(),
+            false => spec,
+        })
     }
 
     fn debug_task_in(
