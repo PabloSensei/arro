@@ -93,8 +93,13 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain && cargo --version
 
-      # The runner carries a Python it refuses to install into, so the tools live in a
-      # folder of the job and disappear with it.
+      # The Python of the runner moves on (3.14 by now), and the pinned debugpy does not
+      # start a program on it; the version is pinned with the packages.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tools live in a folder of the job and disappear with it.
       - name: Python tools
         run: |
           python3 -m venv "$RUNNER_TEMP/boundary-venv"
