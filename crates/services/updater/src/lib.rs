@@ -394,6 +394,7 @@ pub fn stage(archive: &Path, install_dir: &Path) -> Result<PathBuf, Error> {
 }
 
 /// [`stage`] with the name of the executable that is running. Tests name it themselves.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn stage_as(zip: &Path, install_dir: &Path, running: Option<&str>) -> Result<(), Error> {
     let parent = install_dir.parent().unwrap_or(install_dir);
     let temp = parent.join(format!(".arro-stage-{}-{}", std::process::id(), next_id()));
@@ -517,6 +518,7 @@ pub fn remove_old_bundle(bundle: &Path) -> io::Result<usize> {
 
 /// Writes the files of the installed release, relative to `install_dir`, into
 /// [`MANIFEST_FILE`].
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn write_manifest(install_dir: &Path, files: &[PathBuf]) -> io::Result<()> {
     let mut listed: Vec<String> = files
         .iter()
@@ -920,6 +922,7 @@ fn single_root(files: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// Whether two files hold the same bytes, read without loading them whole.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn same_content(left: &Path, right: &Path) -> io::Result<bool> {
     if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
         return Ok(false);
@@ -942,12 +945,14 @@ fn same_content(left: &Path, right: &Path) -> io::Result<bool> {
 
 /// Files that were put in place, so that a failure can take them away again.
 #[derive(Default)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 struct Transaction {
     created: Vec<PathBuf>,
     /// The backup and the place it came from.
     restored: Vec<(PathBuf, PathBuf)>,
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl Transaction {
     fn replace(
         &mut self,
@@ -1011,6 +1016,7 @@ fn next_id() -> u64 {
 }
 
 /// `ide.exe` becomes `ide.exe.old`; the running file can be renamed on Windows.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn old_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".old");

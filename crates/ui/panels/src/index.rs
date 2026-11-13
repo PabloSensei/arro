@@ -64,6 +64,8 @@ enum Command {
     Settings,
     /// Walk again: the window came back to the front.
     Rescan,
+    /// The window let the index go: the thread stops and its watchers go with it.
+    Stop,
 }
 
 /// Held by the window. Cloning shares the same index.
@@ -79,6 +81,17 @@ pub struct ProjectIndex {
     /// Bumped after the symbols of the files in the last list are in the index.
     #[allow(dead_code)]
     symbols_generation: Arc<AtomicU64>,
+    /// The last clone stops the thread. Without it the watchers of the closed window
+    /// would listen to the folder for the rest of the process.
+    _owner: Arc<IndexOwner>,
+}
+
+struct IndexOwner(Sender<Command>);
+
+impl Drop for IndexOwner {
+    fn drop(&mut self) {
+        let _ = self.0.send(Command::Stop);
+    }
 }
 
 impl ProjectIndex {
@@ -105,6 +118,7 @@ impl ProjectIndex {
             commands: commands.clone(),
             files: files.clone(),
             symbols_generation: symbols_generation.clone(),
+            _owner: Arc::new(IndexOwner(commands.clone())),
         };
         let spawned = thread::Builder::new()
             .name("project-index".to_owned())
@@ -250,7 +264,7 @@ fn run(
         // tells the repository metadata changed.
         let metadata = match &command {
             Command::Disk(batch) => batch.iter().any(is_repository_change),
-            Command::Settings | Command::Rescan => false,
+            Command::Settings | Command::Rescan | Command::Stop => false,
         };
         let (changes, watched) = match command {
             Command::Disk(batch) => {
@@ -262,6 +276,7 @@ fn run(
                 continue;
             }
             Command::Rescan => (table.rescan(), Some(vec![FsChange::Rescan])),
+            Command::Stop => break,
         };
         if let Some(watched) = watched
             && !watched.is_empty()

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# The number of running watchers, for the tests of the window that closes them.
+test-support = []
+
 [dependencies]
 ignore.workspace = true
 notify.workspace = true

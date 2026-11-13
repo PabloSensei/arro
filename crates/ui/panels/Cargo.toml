@@ -52,8 +52,12 @@ lang-fixture = { path = "../../../tools/lang-fixture" }
 test-support = { path = "../../../tools/test-support" }
 # The real language and debugger, for the ignored window tests of a real project.
 window-language = { path = "../../../tools/window-language" }
+# The archive name of the release for the system the update tests run on.
+updater.workspace = true
 # A runtime for the debug session of those tests, on the same client as the application.
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync"] }
 # The test platform of GPUI: real components in headless windows, through ui-kit.
 ui-kit = { path = "../ui-kit", features = ["test-support"] }
 workspace = { path = "../workspace", features = ["test-support"] }
+# The count of running file watchers: a closed window must give them back.
+fs-watch = { path = "../../foundation/fs-watch", features = ["test-support"] }

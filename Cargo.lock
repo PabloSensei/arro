@@ -5358,6 +5358,7 @@ dependencies = [
  "tokio",
  "tool-gateway",
  "ui-kit",
+ "updater",
  "vcs",
  "window-language",
  "workspace",

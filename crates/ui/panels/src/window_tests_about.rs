@@ -174,12 +174,20 @@ fn answer(mut stream: TcpStream, body: &str) {
     stream.flush().ok();
 }
 
+/// The archive of release 0.2.0 for the system the test runs on.
+pub(crate) fn release_archive() -> String {
+    let version = updater::parse_version("0.2.0").expect("a version");
+    updater::archive_name(&version).expect("a release platform of this build")
+}
+
 fn release_body() -> String {
-    r#"{"tag_name":"v0.2.0","name":"Arro 0.2.0","body":"Faster startup.","html_url":"https://example.test/release","prerelease":false,"draft":false,"assets":[
-        {"name":"arro-0.2.0-windows-x86_64.zip","browser_download_url":"https://example.test/arro.zip"},
-        {"name":"arro-0.2.0-windows-x86_64.zip.sha256","browser_download_url":"https://example.test/arro.zip.sha256"}
-    ]}"#
-    .to_owned()
+    let archive = release_archive();
+    format!(
+        r#"{{"tag_name":"v0.2.0","name":"Arro 0.2.0","body":"Faster startup.","html_url":"https://example.test/release","prerelease":false,"draft":false,"assets":[
+        {{"name":"{archive}","browser_download_url":"https://example.test/arro.zip"}},
+        {{"name":"{archive}.sha256","browser_download_url":"https://example.test/arro.zip.sha256"}}
+    ]}}"#
+    )
 }
 
 #[ui_kit::gpui::test]

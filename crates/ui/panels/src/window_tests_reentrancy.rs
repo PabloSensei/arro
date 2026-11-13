@@ -101,10 +101,11 @@ fn answer(mut stream: TcpStream, address: std::net::SocketAddr) {
 }
 
 fn release_body(address: std::net::SocketAddr) -> String {
+    let archive = crate::window_tests_about::release_archive();
     format!(
         r#"{{"tag_name":"v0.2.0","name":"Arro 0.2.0","body":"Faster startup.","html_url":"","prerelease":false,"draft":false,"assets":[
-        {{"name":"arro-0.2.0-windows-x86_64.zip","browser_download_url":"http://{address}/arro.zip"}},
-        {{"name":"arro-0.2.0-windows-x86_64.zip.sha256","browser_download_url":"http://{address}/arro.zip.sha256"}}
+        {{"name":"{archive}","browser_download_url":"http://{address}/arro.zip"}},
+        {{"name":"{archive}.sha256","browser_download_url":"http://{address}/arro.zip.sha256"}}
     ]}}"#
     )
 }

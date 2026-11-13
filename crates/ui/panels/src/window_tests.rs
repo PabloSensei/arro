@@ -117,7 +117,7 @@ pub(crate) fn open_window_with(
         support: None,
         status,
     };
-    cx.add_window(move |window, cx| {
+    let window = cx.add_window(move |window, cx| {
         let mut workspace =
             Workspace::new_for_test(launch, Layout::default(), store, Vec::new(), window, cx);
         install(
@@ -130,7 +130,24 @@ pub(crate) fn open_window_with(
         );
         connect(&mut workspace, server, cx);
         workspace
-    })
+    });
+    // The window of a test is closed before the test ends, as the close button of a real
+    // one does: the workspace, its panels and the watchers of its index go with it.
+    cx.update(|cx| {
+        cx.on_app_quit(|cx| {
+            for handle in cx.windows() {
+                let Some(handle) = handle.downcast::<Workspace>() else {
+                    continue;
+                };
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+            async {}
+        })
+        .detach();
+    });
+    window
 }
 
 /// The guard against a hang while a test waits for a signal of the window's own

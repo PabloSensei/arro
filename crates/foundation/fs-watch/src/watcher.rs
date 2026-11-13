@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,9 +26,16 @@ pub enum FsChange {
     Rescan,
 }
 
+/// The folders watched in this process that have not let go yet. A test of the window
+/// that closes it checks that its own watchers are gone.
+#[cfg(any(test, feature = "test-support"))]
+static LIVE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// Stops watching when dropped.
 pub struct FsWatcher {
     _watcher: RecommendedWatcher,
+    #[cfg(any(test, feature = "test-support"))]
+    root: PathBuf,
 }
 
 impl FsWatcher {
@@ -42,7 +51,43 @@ impl FsWatcher {
             .name("fs-watch".to_owned())
             .spawn(move || debounce(&receiver, on_batch))
             .map_err(notify::Error::io)?;
-        Ok(Self { _watcher: watcher })
+        #[cfg(any(test, feature = "test-support"))]
+        LIVE.lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(root.to_path_buf());
+        Ok(Self {
+            _watcher: watcher,
+            #[cfg(any(test, feature = "test-support"))]
+            root: root.to_path_buf(),
+        })
+    }
+
+    /// How many watchers the whole process runs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn live_count() -> usize {
+        LIVE.lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+
+    /// How many watchers the whole process runs on `root` or under it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn live_count_under(root: &Path) -> usize {
+        LIVE.lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|watched| watched.starts_with(root))
+            .count()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for FsWatcher {
+    fn drop(&mut self) {
+        let mut live = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(index) = live.iter().position(|watched| watched == &self.root) {
+            live.remove(index);
+        }
     }
 }
 

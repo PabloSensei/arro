@@ -76,25 +76,7 @@ jobs:
       # The Windows runner names its temporary folder in the short 8.3 form (RUNNER~1),
       # while the paths the program reads back are long; the tests compare both.
       - name: Tests
-        if: runner.os != 'macOS'
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: cargo test --workspace --no-fail-fast
-
-      # The windows of the panel tests are not released until their process ends, and
-      # after several hundred of them macOS no longer starts an FSEvents stream for a new
-      # file watcher. The panel tests run in six processes, each with a sixth of the list.
-      - name: Tests (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          status=0
-          cargo test --workspace --exclude panels --no-fail-fast || status=1
-          list="$RUNNER_TEMP/panels-tests.txt"
-          cargo test -p panels --lib -- --list --format terse | sed -n 's/: test$//p' > "$list"
-          echo "$(wc -l < "$list") panel tests"
-          awk -v dir="$RUNNER_TEMP" '{ print > (dir "/panels-shard-" (NR % 6)) }' "$list"
-          for shard in "$RUNNER_TEMP"/panels-shard-*; do
-            xargs cargo test -p panels --lib -- --exact < "$shard" || status=1
-          done
-          exit $status

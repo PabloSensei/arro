@@ -280,6 +280,9 @@ mod window_tests_keys_macos;
 #[cfg(test)]
 mod window_tests_mask_hint;
 
+#[cfg(test)]
+mod window_tests_release;
+
 mod choice;
 mod invalidate;
 
@@ -950,6 +953,59 @@ fn install(
     })
     .detach();
     watch_project(events, files, cx);
+    release_on_close(window, cx);
+}
+
+/// The window of a project is the only one of its process: nothing may keep its panels,
+/// its git state or the watchers of its index for the rest of the run after it closes.
+fn release_on_close(window: &Window, cx: &mut Context<Workspace>) {
+    let closed_window = window.window_handle().window_id();
+    cx.on_window_closed(move |cx, closed| {
+        if closed == closed_window {
+            release_globals(cx);
+        }
+    })
+    .detach();
+}
+
+/// Forgets the globals that hold the entities of a closed window.
+fn release_globals(cx: &mut App) {
+    macro_rules! forget {
+        ($($global:ty),* $(,)?) => {
+            $(
+                if cx.try_global::<$global>().is_some() {
+                    cx.remove_global::<$global>();
+                }
+            )*
+        };
+    }
+    forget![
+        agents::ActiveAgents,
+        call_hierarchy::ActiveCallHierarchy,
+        debug::ActiveDebug,
+        debug::ActiveDebugHub,
+        docker::ActiveDocker,
+        documentation::ActiveDocumentation,
+        finder::ActiveFinder,
+        git::ActiveGit,
+        git_log::ActiveGitLog,
+        index::ActiveIndex,
+        inspect::ActiveInspect,
+        method_hierarchy::ActiveMethodHierarchy,
+        performance::ActivePerformance,
+        plugins::ActivePlugins,
+        problems::ActiveProblems,
+        project::ActiveProjectPanel,
+        script::ActiveBuildPanel,
+        script::ActiveCommitPanel,
+        script::ActiveRunPanel,
+        structure::ActiveStructure,
+        terminal_panel::ActiveTerminal,
+        todo::ActiveTodo,
+        usages::ActiveFindUsagesSettings,
+        usages::ActiveShowUsages,
+        usages::ActiveUsages,
+    ];
 }
 
 /// Takes what the index thread reports: the file list for the search, and changes on
