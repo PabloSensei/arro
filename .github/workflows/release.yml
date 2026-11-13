@@ -51,8 +51,13 @@ jobs:
           name="arro-$version-linux-x86_64"
           echo "ARCHIVE=$name" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/dist"
+          # The helper jars compile against the libraries of Maven 3.9; the runner has
+          # one, Ubuntu 22.04 only an older Maven, so the runner's goes in read-only.
+          maven_home=$(dirname "$(dirname "$(readlink -f "$(command -v mvn)")")")
+          echo "Maven of the runner: $maven_home"
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP:/work" -w /src \
+            -v "$maven_home:/opt/maven:ro" -e MAVEN_HOME=/opt/maven \
             -e NAME="$name" -e DEBIAN_FRONTEND=noninteractive \
             ubuntu:22.04 bash -euo pipefail -c '
               apt-get update -qq

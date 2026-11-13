@@ -136,10 +136,12 @@ impl EditorView {
             return;
         }
         let store = state.store();
-        self.code_lens = entries
+        let mut fresh: Vec<CodeLensItem> = entries
             .into_iter()
             .map(|entry| CodeLensItem::from_entry(entry, store))
             .collect();
+        keep_shown_titles(&self.code_lens, &mut fresh);
+        self.code_lens = fresh;
         self.code_lens_resolved.clear();
         self.refresh_code_vision(cx);
         self.resolve_visible_code_lens(cx);
@@ -428,6 +430,34 @@ impl EditorView {
     }
 }
 
+/// A server may answer every edit with labels that have no title yet and resolve them
+/// one by one later; a row without a title has no text, so it would leave the screen
+/// and come back, and the code under it would jump on every key. Until its resolve
+/// answers, such a label keeps the title the label at the same place had: the row stays,
+/// and only its count changes when the new one arrives. The command is not taken over,
+/// so the label is still resolved.
+fn keep_shown_titles(shown: &[CodeLensItem], fresh: &mut [CodeLensItem]) {
+    let mut taken = vec![false; shown.len()];
+    for item in fresh.iter_mut().filter(|item| item.title.trim().is_empty()) {
+        let at_place = |index: &usize| {
+            !taken[*index]
+                && shown[*index].offset == item.offset
+                && !shown[*index].title.trim().is_empty()
+        };
+        let same_kind = (0..shown.len())
+            .filter(at_place)
+            .find(|index| item.kind != CodeLensKind::Other && shown[*index].kind == item.kind);
+        let Some(index) = same_kind.or_else(|| (0..shown.len()).find(at_place)) else {
+            continue;
+        };
+        taken[index] = true;
+        item.title = shown[index].title.clone();
+        if item.kind == CodeLensKind::Other {
+            item.kind = shown[index].kind;
+        }
+    }
+}
+
 /// The label of a row, with the wording IDEA uses. `None` for a label Settings hides
 /// or a label that says nothing about a count.
 fn code_vision_label(
@@ -488,4 +518,88 @@ fn indent_columns(text: &str, tab_size: usize) -> usize {
         }
     }
     columns
+}
+
+#[cfg(test)]
+mod tests {
+    use lang_api::{CodeLensCommand, CodeLensKind};
+
+    use super::{CodeLensItem, keep_shown_titles};
+
+    fn item(offset: usize, title: &str, kind: CodeLensKind, resolved: bool) -> CodeLensItem {
+        CodeLensItem {
+            offset,
+            title: title.to_owned(),
+            kind,
+            resolve: Some("data".to_owned()),
+            command: resolved.then(|| CodeLensCommand {
+                title: title.to_owned(),
+                command: "show".to_owned(),
+                arguments: None,
+            }),
+        }
+    }
+
+    /// The answer to an edit comes without titles; the rows keep their text until the
+    /// labels resolve, so the code under them does not jump.
+    #[test]
+    fn an_unresolved_label_keeps_the_title_shown_at_its_place() {
+        let shown = [
+            item(10, "2 usages", CodeLensKind::Usages, true),
+            item(10, "0 implementations", CodeLensKind::Implementations, true),
+            item(40, "1 usage", CodeLensKind::Usages, true),
+        ];
+        let mut fresh = vec![
+            item(10, "", CodeLensKind::Other, false),
+            item(10, "", CodeLensKind::Other, false),
+            item(40, "", CodeLensKind::Usages, false),
+            item(70, "", CodeLensKind::Other, false),
+        ];
+
+        keep_shown_titles(&shown, &mut fresh);
+
+        let titles: Vec<(&str, CodeLensKind)> = fresh
+            .iter()
+            .map(|item| (item.title.as_str(), item.kind))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                ("2 usages", CodeLensKind::Usages),
+                ("0 implementations", CodeLensKind::Implementations),
+                ("1 usage", CodeLensKind::Usages),
+                ("", CodeLensKind::Other),
+            ],
+            "a label at a new place has nothing to keep"
+        );
+        assert!(
+            fresh.iter().all(|item| item.command.is_none()),
+            "the labels are still resolved"
+        );
+    }
+
+    /// A label the server already resolved keeps its own title.
+    #[test]
+    fn a_resolved_label_keeps_its_own_title() {
+        let shown = [item(10, "2 usages", CodeLensKind::Usages, true)];
+        let mut fresh = vec![item(10, "3 usages", CodeLensKind::Usages, true)];
+
+        keep_shown_titles(&shown, &mut fresh);
+
+        assert_eq!(fresh[0].title, "3 usages");
+    }
+
+    /// The kind decides which shown title a label of a known kind takes.
+    #[test]
+    fn a_label_of_a_known_kind_takes_the_title_of_that_kind() {
+        let shown = [
+            item(10, "2 usages", CodeLensKind::Usages, true),
+            item(10, "1 implementation", CodeLensKind::Implementations, true),
+        ];
+        let mut fresh = vec![item(10, "", CodeLensKind::Implementations, false)];
+
+        keep_shown_titles(&shown, &mut fresh);
+
+        assert_eq!(fresh[0].title, "1 implementation");
+    }
 }
