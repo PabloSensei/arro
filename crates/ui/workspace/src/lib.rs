@@ -31,18 +31,18 @@ pub use settings::{
     TrimTrailingWhitespace, UI_SCALE_STEP,
 };
 pub use window::{
-    AI_TOOL, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP, COMMIT_TOOL, CloseTab, CommandFn,
-    DEBUG_TOOL, DOCUMENTATION_TOOL, Debug, Dismiss, DockSide, Evaluate, INSPECTION_TOOL, LOG_TOOL,
-    METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE, MIN_EDITOR_SIZE, MenuRow, MenuShortcut, NextProblem,
-    NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, PreviousProblem, ProjectOpener,
-    ProjectStructure, PushChanges, RUN_TOOL, RerunInspection, Resume, RevertChange, Run,
-    SERVICES_TOOL, STRUCTURE_TOOL, SelectInProject, ShowBranches, ShowCommit, ShowSearch,
-    ShowSettings, SplitRight, StepInto, StepOut, StepOver, Stop, TASKS_TOOL, TERMINAL_TOOL,
-    TODO_TOOL, TabListener, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleDebug, ToggleLog,
-    ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTerminal, ToggleTheme,
-    ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, WINDOW_KEYS,
-    WindowKey, Workspace, bind_keys, bind_keys_for, build_date, build_version, window_key,
-    window_step,
+    AI_TOOL, BOOKMARKS_POPUP, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP, COMMIT_TOOL, CloseTab,
+    CommandFn, DEBUG_TOOL, DOCUMENTATION_TOOL, Debug, Dismiss, DockSide, Evaluate, INSPECTION_TOOL,
+    LOG_TOOL, METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE, MIN_EDITOR_SIZE, MenuRow, MenuShortcut,
+    NextProblem, NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, PreviousProblem,
+    ProjectOpener, ProjectStructure, PushChanges, RECENT_PLACES_POPUP, RUN_TOOL, RerunInspection,
+    Resume, RevertChange, Run, SERVICES_TOOL, STRUCTURE_TOOL, SelectInProject, ShowBranches,
+    ShowCommit, ShowSearch, ShowSettings, SplitRight, StepInto, StepOut, StepOver, Stop,
+    TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, TabListener, ToggleAi, ToggleBreakpoint, ToggleCommit,
+    ToggleDebug, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
+    ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList,
+    ViewBreakpoints, WINDOW_KEYS, WindowKey, Workspace, bind_keys, bind_keys_for, build_date,
+    build_version, window_key, window_step,
 };
 
 #[cfg(any(test, feature = "test-support"))]

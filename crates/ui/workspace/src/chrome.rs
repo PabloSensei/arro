@@ -13,7 +13,7 @@ use ui_kit::*;
 use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
 use crate::window::{
-    AI_TOOL, BalloonAction, BuildProject, COMMIT_TOOL, ChooseDebugConfiguration,
+    AI_TOOL, BOOKMARKS_POPUP, BalloonAction, BuildProject, COMMIT_TOOL, ChooseDebugConfiguration,
     ChooseRunConfiguration, CloseTab, Compile, CopyElement, DEBUG_TOOL, Debug, Dismiss, DockSide,
     EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto,
     ForceStepOver, FullyExpandTreeNode, GotoRelated, HideToolWindow, LOG_TOOL, MenuRow,
@@ -494,13 +494,34 @@ impl Workspace {
                     "toolwindows/bookmarks",
                     "Bookmarks",
                     None,
-                    false,
+                    self.overlay_tag() == Some(BOOKMARKS_POPUP),
                     theme,
                 )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.run_command("window.show_bookmarks", window, cx);
-                })),
+                // The open popup hears this press too and closes itself on it, so the
+                // button reads the popup before the pointer does. A second press then
+                // closes the popup instead of opening it again.
+                .capture_any_mouse_down(cx.listener(
+                    |this, event: &MouseDownEvent, window, cx| {
+                        if event.button == MouseButton::Left {
+                            this.toggle_bookmarks(window, cx);
+                        }
+                    },
+                )),
             )
+    }
+
+    /// The Bookmarks button of the right stripe: the popup opens, and the same button
+    /// closes it while it is open.
+    fn toggle_bookmarks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_tag() == Some(BOOKMARKS_POPUP) {
+            self.close_overlay(window, cx);
+            return;
+        }
+        // A popup that is open now closes on this same press and would take the new one
+        // with it, so the bookmarks open after the press is through.
+        cx.defer_in(window, |this, window, cx| {
+            this.run_command("window.show_bookmarks", window, cx);
+        });
     }
 
     fn toolbar(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {

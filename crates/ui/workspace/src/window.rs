@@ -437,8 +437,16 @@ pub(crate) enum Overlay {
         /// The rows a popup that stands in for a menu shows, such as the branch popup.
         /// A popup of its own kind leaves them empty.
         rows: Option<Vec<MenuEntry>>,
+        /// The name a button of the window gave its popup, so that the button finds the
+        /// popup again and closes it on a second press. A popup of its own has none.
+        tag: Option<&'static str>,
     },
 }
+
+/// The popup of the Bookmarks button of the right stripe.
+pub const BOOKMARKS_POPUP: &str = "bookmarks";
+/// The popup of Recent Locations, which shares the class of the bookmarks popup.
+pub const RECENT_PLACES_POPUP: &str = "recent-places";
 
 /// What a key pressed inside a menu runs. The index of the highlighted row comes along
 /// when the menu knows it.
@@ -3148,9 +3156,34 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_view(view, focus, rows, None, window, cx);
+    }
+
+    /// Shows a popup under a name of its own, so that the button that opens it finds it
+    /// again and closes it on a second press.
+    pub fn show_overlay_tagged(
+        &mut self,
+        view: AnyView,
+        focus: FocusHandle,
+        tag: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_view(view, focus, None, Some(tag), window, cx);
+    }
+
+    fn show_view(
+        &mut self,
+        view: AnyView,
+        focus: FocusHandle,
+        rows: Option<Vec<MenuEntry>>,
+        tag: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.overlay_serial += 1;
         self.action_menu_anchor.borrow_mut().take();
-        self.overlay = Some(Overlay::View { view, rows });
+        self.overlay = Some(Overlay::View { view, rows, tag });
         window.focus(&focus, cx);
         cx.notify();
     }
@@ -3159,9 +3192,31 @@ impl Workspace {
     pub fn show_popup(&mut self, view: AnyView, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay_serial += 1;
         self.action_menu_anchor.borrow_mut().take();
-        self.overlay = Some(Overlay::View { view, rows: None });
+        self.overlay = Some(Overlay::View {
+            view,
+            rows: None,
+            tag: None,
+        });
         let _ = window;
         cx.notify();
+    }
+
+    /// The name the open popup was shown with, if a button of the window gave it one.
+    pub fn overlay_tag(&self) -> Option<&'static str> {
+        match self.overlay.as_ref()? {
+            Overlay::View { tag, .. } => *tag,
+            Overlay::Menu { .. } => None,
+        }
+    }
+
+    /// Closes the open popup and gives the focus back to the editor, as a second press on
+    /// the button that opened it does.
+    pub(crate) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay.take().is_some() {
+            self.menu_task = None;
+            self.focus_active(window, cx);
+            cx.notify();
+        }
     }
 
     pub fn show_menu(

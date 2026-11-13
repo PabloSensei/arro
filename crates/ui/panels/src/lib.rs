@@ -286,7 +286,12 @@ mod window_tests_release;
 #[cfg(test)]
 mod window_tests_cached_tails;
 #[cfg(test)]
+mod window_tests_close_terminal;
+#[cfg(test)]
 mod window_tests_diff_shared;
+
+#[cfg(test)]
+mod window_tests_stripe_notifications;
 
 #[cfg(test)]
 mod window_tests_diff_views;

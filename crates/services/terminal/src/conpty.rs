@@ -13,6 +13,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 
 use platform::{Job, allow_ctrl_c_in_children};
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
@@ -436,7 +437,27 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        self.close_console();
+        // The child tree goes first: a console whose program still runs keeps the close
+        // waiting, and whoever drops the last session may be the window's thread.
+        self.terminate();
+        let console = self
+            .console
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(console) = console else {
+            return;
+        };
+        let close = self.api.close;
+        // `ClosePseudoConsole` blocks until the console has drained, so the wait never
+        // happens on the dropping thread. `HPCON` is a plain number, so a failed spawn
+        // still has the handle to close here.
+        let spawned = thread::Builder::new()
+            .name("pty-close".to_string())
+            .spawn(move || unsafe { close(console) });
+        if spawned.is_err() {
+            unsafe { (self.api.close)(console) };
+        }
     }
 }
 
@@ -617,5 +638,35 @@ mod tests {
         let problem = verify_files(&temp.0, &Pins::default(), true).unwrap_err();
         assert!(problem.contains("OpenConsole.exe"), "{problem}");
         assert!(problem.contains("missing"), "{problem}");
+    }
+
+    #[test]
+    fn dropping_a_live_console_does_not_wait_for_its_output() {
+        let spec = SpawnSpec {
+            command_line: "ping.exe -t 127.0.0.1".to_string(),
+            cwd: None,
+            env: crate::env::allowlisted(),
+            cols: 80,
+            rows: 24,
+            shift_enter: Default::default(),
+        };
+        let (pty, input, output) = Pty::spawn(&spec).expect("spawn");
+        // Let the program fill the output pipe before the console goes away.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Nobody drains the pipe here, so a close that waits for the console comes back
+        // only when the test gives the pipe up: the dropping thread must not be the
+        // window's, and the window may not wait for it either.
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(pty);
+            let _ = done.send(());
+        });
+        let waited = finished.recv_timeout(std::time::Duration::from_secs(10));
+        drop(input);
+        drop(output);
+        assert!(
+            waited.is_ok(),
+            "closing the console waited for its output pipe"
+        );
     }
 }

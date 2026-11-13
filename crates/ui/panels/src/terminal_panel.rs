@@ -215,6 +215,16 @@ impl TerminalPanel {
     }
 }
 
+/// The window takes its terminal with it: the program of the shell stops even when a
+/// frame that still holds the session outlives the panel.
+impl Drop for TerminalPanel {
+    fn drop(&mut self) {
+        if let State::Running(session) = &self.state {
+            session.terminate();
+        }
+    }
+}
+
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();

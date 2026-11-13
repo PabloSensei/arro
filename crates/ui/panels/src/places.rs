@@ -136,12 +136,10 @@ fn show(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if rows.is_empty() {
-        let (title, message) = match kind {
-            Kind::Recent => ("Recent Locations", "No places yet"),
-            Kind::Bookmarks => ("Bookmarks", "No bookmarks yet"),
-        };
-        workspace.notify_user(title, message, cx);
+    // Recent Locations has no popup that could show an empty list, so it keeps its
+    // notification. Bookmarks have a popup of their own, and its empty state is part of it.
+    if rows.is_empty() && kind == Kind::Recent {
+        workspace.notify_user("Recent Locations", "No places yet", cx);
         return;
     }
     let weak = cx.weak_entity();
@@ -154,7 +152,11 @@ fn show(
         scroll: ScrollHandle::new(),
     });
     let focus = view.read(cx).focus.clone();
-    workspace.show_overlay(view.into(), focus, window, cx);
+    let tag = match kind {
+        Kind::Recent => workspace::RECENT_PLACES_POPUP,
+        Kind::Bookmarks => workspace::BOOKMARKS_POPUP,
+    };
+    workspace.show_overlay_tagged(view.into(), focus, tag, window, cx);
 }
 
 impl PlacesPopup {
@@ -291,7 +293,22 @@ impl Render for PlacesPopup {
                     .text_color(theme.text_secondary)
                     .child(title),
             )
-            .child(
+            .child(if rows.is_empty() {
+                // The bookmarks have a popup of their own even with nothing in it: the
+                // list says so in place of its rows, without a notification.
+                div()
+                    .id("places-empty")
+                    .debug_selector(|| "places-empty".to_owned())
+                    .flex_none()
+                    .px(px(ROW_PADDING_X))
+                    .py(px(SPACE_M))
+                    .text_color(theme.text_secondary)
+                    .child(match self.kind {
+                        Kind::Recent => "No places yet",
+                        Kind::Bookmarks => "No bookmarks yet",
+                    })
+                    .into_any_element()
+            } else {
                 scrollable(
                     "places-rows",
                     &self.scroll,
@@ -306,8 +323,9 @@ impl Render for PlacesPopup {
                     window,
                     cx,
                 )
-                .min_h_0(),
-            );
+                .min_h_0()
+                .into_any_element()
+            });
         div()
             .absolute()
             .left(left)
