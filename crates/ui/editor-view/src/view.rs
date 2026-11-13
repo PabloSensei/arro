@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ::base::perf;
@@ -587,6 +588,12 @@ pub struct EditorView {
     pub(crate) gutter_marks: Vec<GutterMark>,
     selecting: bool,
     was_dirty: bool,
+    /// The saves of this view whose text has not reached the disk yet. A count, because
+    /// a blocking save may write while a background one is on its way; the task that
+    /// writes lowers it, also when it panics, so the view never stays saving.
+    saving: Arc<AtomicUsize>,
+    /// The text and the format of the last save of this view that reached the disk.
+    last_saved: Option<(String, FileFormat)>,
     pending_caret: Option<(usize, usize)>,
     failed: Option<SharedString>,
     document: DocumentId,
@@ -625,6 +632,28 @@ pub struct EditorView {
 
 impl EventEmitter<EditorEvent> for EditorView {}
 
+/// Lowers the count of saves in flight when the task that writes ends, also when it
+/// panics or is dropped before its result lands.
+struct SavingGuard(Option<Arc<AtomicUsize>>);
+
+impl SavingGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        Self(Some(count))
+    }
+
+    fn finish(&mut self) {
+        if let Some(count) = self.0.take() {
+            count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for SavingGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 impl EditorView {
     /// Opens `path`. The file is read in the background; the view stays empty until then.
     pub fn open(
@@ -661,6 +690,10 @@ impl EditorView {
     /// Opens `text` over `path` at once, for a view of text that is not the file on disk:
     /// the other side of a comparison, or a version from the local history. The language
     /// comes from the path, so the text is coloured as the file would be.
+    ///
+    /// Such a view never writes the bookmarks of the file. A read-only one shows another
+    /// version, where the lines of the bookmarks mean nothing, so it shows none; an
+    /// editable one is the text the file has and shows them.
     pub fn open_text(
         path: PathBuf,
         text: String,
@@ -668,11 +701,62 @@ impl EditorView {
         style: EditorStyle,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::open_document(
+            path,
+            text,
+            FileFormat::default(),
+            read_only,
+            false,
+            !read_only,
+            style,
+            cx,
+        )
+    }
+
+    /// Opens `text` over `path` as a document of its own, written with `format` when it
+    /// saves. `writes_bookmarks` is false for a view of a text that is not the tab of
+    /// the file: it reads the bookmarks of the file and never replaces them in the
+    /// window list.
+    pub fn open_text_document(
+        path: PathBuf,
+        text: String,
+        format: FileFormat,
+        read_only: bool,
+        writes_bookmarks: bool,
+        style: EditorStyle,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::open_document(
+            path,
+            text,
+            format,
+            read_only,
+            writes_bookmarks,
+            true,
+            style,
+            cx,
+        )
+    }
+
+    /// The document of `open_text` and `open_text_document`; `shows_bookmarks` reads the
+    /// bookmarks the window keeps for the file.
+    #[allow(clippy::too_many_arguments)]
+    fn open_document(
+        path: PathBuf,
+        text: String,
+        format: FileFormat,
+        read_only: bool,
+        writes_bookmarks: bool,
+        shows_bookmarks: bool,
+        style: EditorStyle,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut view = Self::empty(path, style, cx);
         let language = cx
             .try_global::<Languages>()
             .and_then(|languages| (languages.resolve)(&view.path));
-        let mut state = EditorState::new(&text, FileFormat::default(), language, read_only);
+        let mut state = EditorState::new(&text, format, language, read_only);
+        state.set_writes_bookmarks(writes_bookmarks);
         state.set_save_options(view.options.save);
         state.apply_indent_defaults(
             view.options.use_tabs,
@@ -683,14 +767,21 @@ impl EditorView {
             view.start_syntax(language.clone(), &state, cx);
         }
         view.state = Some(state);
+        let saved = shows_bookmarks
+            .then(|| cx.try_global::<BookmarkStore>())
+            .flatten()
+            .and_then(|store| store.0.get(&view.path).cloned());
+        if let (Some(saved), Some(state)) = (saved, &mut view.state) {
+            state.set_bookmarks(&saved);
+        }
         view.attach(cx);
         view.remember_text(cx);
         cx.notify();
         view
     }
 
-    /// Opens another view of the buffer `source` shows. Edits and the undo history are
-    /// shared with `source`; the carets, selections, folds and scroll are this view's
+    /// Opens another view of the document `source` shows. The text and the undo history
+    /// are shared with `source`; the carets, selections, folds and scroll are this view's
     /// own, so one view moving never moves the other.
     pub fn open_shared(source: &Entity<EditorView>, cx: &mut App) -> Option<Entity<EditorView>> {
         let (state, path, style, options, zoom) = {
@@ -720,14 +811,97 @@ impl EditorView {
         Some(view)
     }
 
-    /// Takes the edits the other view of the buffer made, without adding an undo step:
-    /// the history they belong to is shared.
-    pub fn follow_edits(&mut self, edits: Vec<text_core::Edit>, cx: &mut Context<Self>) {
-        let Some(state) = &mut self.state else {
-            return;
-        };
-        let change = state.follow(edits);
-        self.changed(change, cx);
+    /// Whether the two views show one document, so an edit through either is the text of
+    /// both.
+    pub fn shares_document(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (Some(state), Some(other)) => state.shares_document(other),
+            _ => false,
+        }
+    }
+
+    /// Takes the changes another view of the same document made into the carets and the
+    /// folds of this view, before a key or an edit of this view counts its ranges from
+    /// the text. Nothing happens when the document has not moved since the last follow.
+    pub(crate) fn catch_up(&mut self, cx: &mut Context<Self>) {
+        if self
+            .state
+            .as_ref()
+            .is_some_and(EditorState::has_unseen_changes)
+        {
+            self.follow_changes(cx);
+        }
+    }
+
+    /// Takes the changes another view of the same document made into the carets and the
+    /// folds of this view, without adding an undo step: the history they belong to is
+    /// shared. The text itself is shared too, so it is already here.
+    pub fn follow_changes(&mut self, cx: &mut Context<Self>) {
+        let followed = self.state.as_mut().map(EditorState::follow);
+        match followed {
+            None | Some(text_core::Followed::Nothing) => self.changed(None, cx),
+            Some(text_core::Followed::Changes(change)) => self.changed(Some(change), cx),
+            Some(text_core::Followed::Missed) => {
+                // The edits that would move the ranges of this view are not known: drop
+                // every range that points into the old text, so nothing lands past the
+                // end of the new one or underlines the wrong line.
+                let language = self
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.language().cloned());
+                if let (Some(language), Some(state)) = (language, &self.state) {
+                    self.start_syntax(language, state, cx);
+                }
+                if let Some(lsp) = &mut self.lsp {
+                    lsp.marks.clear();
+                    lsp.received = false;
+                    lsp.completion = None;
+                    lsp.note = None;
+                    lsp.highlights.clear();
+                    lsp.signatures = None;
+                    lsp.parameter_walk = None;
+                    lsp.quick = None;
+                    lsp.actions = None;
+                    lsp.rename = None;
+                    lsp.move_to = None;
+                    lsp.overrides = None;
+                    lsp.definition = None;
+                    lsp.generation = None;
+                    lsp.safe_delete = None;
+                }
+                self.live.abandon();
+                self.hippie = None;
+                self.hover_word = None;
+                self.region_popup = None;
+                self.context_info = None;
+                self.usages = None;
+                self.code_lens.clear();
+                self.code_vision_labels.clear();
+                self.code_vision_hovered = None;
+                // The bookmarks of the file belong to the window, not to this view: read
+                // them again instead of syncing an empty list over the stored ones.
+                let saved = cx
+                    .try_global::<BookmarkStore>()
+                    .and_then(|store| store.0.get(&self.path).cloned());
+                if let (Some(saved), Some(state)) = (saved, &mut self.state) {
+                    state.set_bookmarks(&saved);
+                }
+                // The server gets the new text and answers with the marks of it.
+                self.sync_server(true);
+                self.refresh_matches(false, cx);
+                self.semantic_tokens_later(cx);
+                self.request_inlays(crate::semantic::INLAY_TYPING_DELAY, cx);
+                self.request_code_lens(crate::semantic::INLAY_TYPING_DELAY, cx);
+                self.request_doc_comments(cx);
+                self.highlight_later(cx);
+                self.autoscroll = true;
+                self.caret_on = true;
+                cx.emit(EditorEvent::Changed);
+                self.notify_dirty(cx);
+                self.remember_text(cx);
+                cx.notify();
+            }
+        }
     }
 
     /// The fields of a view before it has text. The file or the text comes next.
@@ -795,6 +969,8 @@ impl EditorView {
             gutter_marks: Vec::new(),
             selecting: false,
             was_dirty: false,
+            saving: Arc::new(AtomicUsize::new(0)),
+            last_saved: None,
             pending_caret: None,
             failed: None,
             document: DocumentId(NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed)),
@@ -1113,6 +1289,7 @@ impl EditorView {
 
     /// Edits from outside the keyboard. One undo step, the buffer becomes dirty.
     pub fn apply_edits(&mut self, edits: Vec<text_core::Edit>, cx: &mut Context<Self>) {
+        self.catch_up(cx);
         let Some(state) = &mut self.state else {
             return;
         };
@@ -1276,6 +1453,18 @@ impl EditorView {
         Some(text_core::encode(&text, &format))
     }
 
+    /// The encoding, BOM and line ends a save of this view writes.
+    pub fn format(&self) -> Option<FileFormat> {
+        self.state.as_ref().map(EditorState::format)
+    }
+
+    /// The text and the format of the last save of this view that reached the disk. A
+    /// view that takes over the text after a close shows what the file got, not the
+    /// buffer as it stood when the write started.
+    pub fn saved_document(&self) -> Option<(String, FileFormat)> {
+        self.last_saved.clone()
+    }
+
     /// The primary selection as a byte range of [`Self::text`] and the caret in it.
     /// `None` while loading.
     pub fn selection(&self) -> Option<(std::ops::Range<usize>, usize)> {
@@ -1290,6 +1479,7 @@ impl EditorView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(cx);
         let Some(state) = &mut self.state else {
             return;
         };
@@ -1499,6 +1689,7 @@ impl EditorView {
 
     /// Pastes text the way Ctrl+V does.
     pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.catch_up(cx);
         let change = self.state.as_mut().and_then(|state| state.paste(text));
         self.changed(change, cx);
     }
@@ -1513,12 +1704,21 @@ impl EditorView {
         }
         let snapshot = state.snapshot_for_save();
         let path = self.path.clone();
+        self.saving.fetch_add(1, Ordering::SeqCst);
+        let mut guard = SavingGuard::new(self.saving.clone());
         let task = cx.background_spawn(async move { EditorState::save_snapshot(&path, snapshot) });
         cx.spawn(async move |this, cx| {
             let saved = task.await;
+            guard.finish();
             this.update(cx, |this, cx| this.saved(&saved, cx)).ok();
         })
         .detach();
+    }
+
+    /// Whether a save of this view is writing the text now. Its text is the snapshot
+    /// taken when the write started, not necessarily the buffer as it is now.
+    pub fn is_saving(&self) -> bool {
+        self.saving.load(Ordering::SeqCst) > 0
     }
 
     /// The rules of `.editorconfig` for a save go into the buffer first, so the disk gets
@@ -1596,6 +1796,9 @@ impl EditorView {
     fn saved(&mut self, saved: &Saved, cx: &mut Context<Self>) {
         if let Some(state) = &mut self.state {
             state.finish_save(saved);
+        }
+        if saved.result.is_ok() {
+            self.last_saved = Some((saved.text.clone(), saved.format.clone()));
         }
         match &saved.result {
             Ok(()) => {
@@ -1778,7 +1981,7 @@ impl EditorView {
             self.changed(change, cx);
             return;
         }
-        let prefix_start = crate::semantic::word_start(store, caret);
+        let prefix_start = crate::semantic::word_start(&store, caret);
         let prefix = store.slice(prefix_start..caret);
         if prefix.is_empty() {
             return;
@@ -1909,6 +2112,7 @@ impl EditorView {
 
     /// F11 and Ctrl+F11 with a name.
     pub fn toggle_bookmark(&mut self, mnemonic: Option<char>, cx: &mut Context<Self>) {
+        self.catch_up(cx);
         if let Some(state) = &mut self.state {
             state.toggle_bookmark(mnemonic);
         }
@@ -1921,6 +2125,11 @@ impl EditorView {
         let Some(state) = &self.state else {
             return;
         };
+        // A second view of the document keeps the bookmarks of the file to itself: its
+        // list moves with its own folds, and an empty one must not erase the stored list.
+        if !state.writes_bookmarks() {
+            return;
+        }
         let lines = state.bookmarks();
         let store = cx.default_global::<BookmarkStore>();
         if lines.is_empty() {
@@ -2389,6 +2598,9 @@ impl EditorView {
 
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
+        // A command counts its edits from the carets and folds here, so the changes of
+        // the other view of the document come in first.
+        self.catch_up(cx);
         if self.quick_doc_open() {
             if action == actions::SELECT_ALL {
                 self.select_all_quick_doc(cx);
@@ -2915,6 +3127,7 @@ impl EditorView {
                 return;
             }
         }
+        self.catch_up(cx);
         let Some(state) = &mut self.state else {
             return;
         };

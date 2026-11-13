@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "crossbeam-channel",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "agent-pty"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agent-core",
  "agent-testkit",
@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "agent-testkit"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde_json",
  "terminal",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "agent-try"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agent-core",
  "agent-pty",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "base"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "arc-swap",
 ]
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "change-tracker"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agent-core",
  "base",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "container"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "proc-sup",
@@ -1532,7 +1532,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dap-client"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "lang-fixture",
  "proc-sup",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "display-map"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "proptest",
  "text-core",
@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "dockerfile-syntax"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "syntax",
  "tree-sitter",
@@ -1734,7 +1734,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "editor-view"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "display-map",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "fs-watch"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "ignore",
  "notify 9.0.0-rc.7",
@@ -3589,7 +3589,7 @@ checksum = "913a7d294ad056474749152107309fdee3ec17d2482d1ab70fdc61a81c64b9a3"
 
 [[package]]
 name = "ide"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "backtrace",
  "base",
@@ -3610,14 +3610,14 @@ dependencies = [
 
 [[package]]
 name = "ide-askpass"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "vcs",
 ]
 
 [[package]]
 name = "ide-ctrl"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "platform",
  "proc-sup",
@@ -3864,7 +3864,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "java-exec"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "java-project",
@@ -3882,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "java-lang"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "dap-client",
@@ -3918,7 +3918,7 @@ dependencies = [
 
 [[package]]
 name = "java-project"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "proc-sup",
@@ -3932,7 +3932,7 @@ dependencies = [
 
 [[package]]
 name = "java-syntax"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "lang-api",
  "syntax",
@@ -3943,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "jdtls-adapter"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "lsp-client",
@@ -4035,7 +4035,7 @@ dependencies = [
 
 [[package]]
 name = "keymap"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde_json",
  "test-support",
@@ -4103,7 +4103,7 @@ dependencies = [
 
 [[package]]
 name = "lang-api"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "futures-channel",
@@ -4115,7 +4115,7 @@ dependencies = [
 
 [[package]]
 name = "lang-fixture"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde_json",
 ]
@@ -4222,7 +4222,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local-history"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "flate2",
  "test-support",
@@ -4265,7 +4265,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lsp-client"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "lsp-types",
  "platform",
@@ -4435,7 +4435,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-server"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -5324,7 +5324,7 @@ dependencies = [
 
 [[package]]
 name = "panels"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agent-core",
  "agent-pty",
@@ -5641,7 +5641,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "libc",
  "test-support",
@@ -5679,7 +5679,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-host"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "keymap",
@@ -5840,7 +5840,7 @@ dependencies = [
 
 [[package]]
 name = "proc-sup"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "platform",
@@ -5868,7 +5868,7 @@ dependencies = [
 
 [[package]]
 name = "project-model"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "proc-sup",
@@ -6501,7 +6501,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "proc-sup",
@@ -6883,7 +6883,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "futures-executor",
@@ -6930,7 +6930,7 @@ checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "semantic-router"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "futures-util",
@@ -7121,7 +7121,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidecar"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "lsp-client",
  "platform",
@@ -7349,7 +7349,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "store"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "rusqlite",
  "test-support",
@@ -7509,7 +7509,7 @@ dependencies = [
 
 [[package]]
 name = "syntax"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "lang-api",
  "streaming-iterator",
@@ -7610,7 +7610,7 @@ dependencies = [
 
 [[package]]
 name = "templates"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -7641,7 +7641,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alacritty_terminal",
  "base",
@@ -7654,11 +7654,11 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.9"
+version = "0.1.10"
 
 [[package]]
 name = "text-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -7670,7 +7670,7 @@ dependencies = [
 
 [[package]]
 name = "theme"
-version = "0.1.9"
+version = "0.1.10"
 
 [[package]]
 name = "thiserror"
@@ -7975,7 +7975,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tool-gateway"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "dap-client",
@@ -8137,7 +8137,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "gpui-kit",
  "gpui-pre-windows",
@@ -8231,7 +8231,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "flate2",
  "platform",
@@ -8397,12 +8397,13 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vcs"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "imara-diff",
  "platform",
  "test-support",
+ "text-core",
 ]
 
 [[package]]
@@ -8933,7 +8934,7 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "window-language"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "dap-client",
@@ -9587,7 +9588,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "keymap",
  "platform",
@@ -9603,7 +9604,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base",
  "encoding_rs",
@@ -9731,7 +9732,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "keymap",
  "pdb-addr2line",

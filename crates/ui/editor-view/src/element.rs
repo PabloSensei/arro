@@ -618,8 +618,10 @@ impl Element for EditorElement {
                 view.horizontal_bar = false;
                 return;
             };
-            let blocks = decor.blocks(state.store());
-            let display = state.map().snapshot_with_blocks(state.store(), &blocks);
+            let blocks = decor.blocks(&state.store());
+            let display = state
+                .map()
+                .snapshot_with_blocks_owned(state.store(), &blocks);
             let widest = if wrap.is_none() {
                 longest_line_width(&display, f32::from(char_width))
             } else {
@@ -659,12 +661,12 @@ impl Element for EditorElement {
         let filler_blocks = view
             .state
             .as_ref()
-            .map(|state| self.decor.blocks(state.store()))
+            .map(|state| self.decor.blocks(&state.store()))
             .unwrap_or_default();
         let display = view.state.as_ref().map(|state| {
             state
                 .map()
-                .snapshot_with_blocks(state.store(), &filler_blocks)
+                .snapshot_with_blocks_owned(state.store(), &filler_blocks)
         });
         let mut rows = Vec::new();
         let mut highlights = Vec::new();
@@ -905,7 +907,7 @@ impl Element for EditorElement {
                     && state
                         .map()
                         .folds
-                        .candidate_on_line(store, buffer_line)
+                        .candidate_on_line(&store, buffer_line)
                         .is_some();
                 let fold = if continuation || block || doc_row.is_some() {
                     None
@@ -1329,7 +1331,7 @@ impl Element for EditorElement {
                     && find.kind != crate::bar::BarKind::Goto
                 {
                     for found in &find.matches {
-                        let line = store.offset_to_line(found.start);
+                        let line = store.offset_to_line(found.start.min(store.len()));
                         add_stripe(
                             &mut stripes,
                             &mut seen,
@@ -1367,7 +1369,7 @@ impl Element for EditorElement {
                             Severity::Warning => StripeKind::Warning,
                             Severity::Information | Severity::Hint => continue,
                         };
-                        let line = store.offset_to_line(mark.range.start);
+                        let line = store.offset_to_line(mark.range.start.min(store.len()));
                         add_stripe(
                             &mut stripes,
                             &mut seen,

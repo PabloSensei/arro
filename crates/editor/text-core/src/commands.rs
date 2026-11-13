@@ -32,7 +32,7 @@ pub fn backspace<S: TextStore>(buffer: &mut Buffer<S>, source: EditSource) -> Ch
     let store = buffer.store();
     let ranges = buffer.selections().iter().map(|selection| {
         if selection.is_empty() {
-            pair_to_delete(store, selection.head)
+            pair_to_delete(&store, selection.head)
                 .unwrap_or_else(|| store.prev_boundary(selection.head)..selection.head)
         } else {
             selection.range()

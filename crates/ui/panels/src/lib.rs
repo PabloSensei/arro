@@ -285,6 +285,11 @@ mod window_tests_release;
 
 #[cfg(test)]
 mod window_tests_cached_tails;
+#[cfg(test)]
+mod window_tests_diff_shared;
+
+#[cfg(test)]
+mod window_tests_diff_views;
 
 #[cfg(test)]
 mod window_tests_macos_menu;

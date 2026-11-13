@@ -34,9 +34,9 @@ pub enum EolStyle {
 /// The line end table of the lines that an edit replaced.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EolPatch {
-    line: usize,
-    removed: Vec<Eol>,
-    inserted: usize,
+    pub(crate) line: usize,
+    pub(crate) removed: Vec<Eol>,
+    pub(crate) inserted: usize,
 }
 
 impl EolStyle {

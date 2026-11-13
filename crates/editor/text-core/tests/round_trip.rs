@@ -107,18 +107,18 @@ fn an_edit_in_a_mixed_file_leaves_other_lines_alone() {
         EditKind::Command,
     );
     assert_eq!(
-        encode(&buffer.text(), buffer.format()),
+        encode(&buffer.text(), &buffer.format()),
         b"one\r\n2\r\ntwo\nthree\r\nfour\n"
     );
 
     buffer.undo();
     assert_eq!(
-        encode(&buffer.text(), buffer.format()),
+        encode(&buffer.text(), &buffer.format()),
         b"one\r\ntwo\nthree\r\nfour\n"
     );
     buffer.redo();
     assert_eq!(
-        encode(&buffer.text(), buffer.format()),
+        encode(&buffer.text(), &buffer.format()),
         b"one\r\n2\r\ntwo\nthree\r\nfour\n"
     );
 }
@@ -135,7 +135,7 @@ fn deleting_a_line_end_and_undo_restore_a_mixed_file() {
         EditKind::Command,
     );
     buffer.undo();
-    assert_eq!(encode(&buffer.text(), buffer.format()), bytes);
+    assert_eq!(encode(&buffer.text(), &buffer.format()), bytes);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn a_format_picked_by_the_user_is_written_and_marks_the_buffer_edited() {
 
     buffer.set_format(buffer.format().with_eol(Eol::CrLf));
     assert!(buffer.is_dirty());
-    assert_eq!(encode(&buffer.text(), buffer.format()), b"a\r\nb\r\n");
+    assert_eq!(encode(&buffer.text(), &buffer.format()), b"a\r\nb\r\n");
 
     let format = buffer.format().with_encoding_name("UTF-8 BOM").unwrap();
     assert_eq!(encode("é", &format), b"\xEF\xBB\xBF\xC3\xA9");

@@ -84,7 +84,13 @@ impl DisplayMap {
     }
 
     pub fn snapshot<'a, S: TextStore>(&'a self, store: &'a S) -> DisplaySnapshot<'a, S> {
-        self.snapshot_with_blocks(store, &[])
+        self.build(store.clone(), &[])
+    }
+
+    /// The map over a copy of the text that the caller owns, such as the snapshot of a
+    /// document that other views may edit. A store clones cheaply for that.
+    pub fn snapshot_owned<'a, S: TextStore>(&'a self, store: S) -> DisplaySnapshot<'a, S> {
+        self.build(store, &[])
     }
 
     /// The map at one text version with rows of one view added over the rows of the map.
@@ -95,9 +101,22 @@ impl DisplayMap {
         store: &'a S,
         extra: &'a [Block],
     ) -> DisplaySnapshot<'a, S> {
-        let mut visible = self.folds.visible_lines(store);
+        self.build(store.clone(), extra)
+    }
+
+    /// [`Self::snapshot_with_blocks`] over a copy of the text that the caller owns.
+    pub fn snapshot_with_blocks_owned<'a, S: TextStore>(
+        &'a self,
+        store: S,
+        extra: &'a [Block],
+    ) -> DisplaySnapshot<'a, S> {
+        self.build(store, extra)
+    }
+
+    fn build<'a, S: TextStore>(&'a self, store: S, extra: &'a [Block]) -> DisplaySnapshot<'a, S> {
+        let mut visible = self.folds.visible_lines(&store);
         if !self.docs.is_empty() {
-            visible.retain(|line| self.docs.covering_line(store, *line as usize).is_none());
+            visible.retain(|line| self.docs.covering_line(&store, *line as usize).is_none());
         }
         let mut snapshot = DisplaySnapshot {
             map: self,
@@ -133,7 +152,7 @@ struct Wrapped {
 /// A view of the map at one text version.
 pub struct DisplaySnapshot<'a, S: TextStore> {
     map: &'a DisplayMap,
-    store: &'a S,
+    store: S,
     /// Blocks of this view alone, standing over the blocks of the map.
     extra: &'a [Block],
     /// Buffer line of each row before the wrap and block layers.
@@ -294,7 +313,7 @@ impl<'a, S: TextStore> DisplaySnapshot<'a, S> {
         let comment = self
             .map
             .docs
-            .covering_line(self.store, line)
+            .covering_line(&self.store, line)
             .and_then(|comment| {
                 self.map
                     .docs
@@ -393,7 +412,7 @@ impl<'a, S: TextStore> DisplaySnapshot<'a, S> {
 
     fn fold_row_line(&self, row: usize) -> DisplayLine {
         layout::build_line(
-            self.store,
+            &self.store,
             self.fold_row_lines(row),
             self.map.folds.as_slice(),
             self.map.inlays.as_slice(),

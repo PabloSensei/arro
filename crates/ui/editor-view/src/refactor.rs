@@ -363,12 +363,13 @@ impl EditorView {
             return;
         };
         let path = self.path().to_path_buf();
+        let store = state.store();
         let mut ranges: Vec<Range<usize>> = spans
             .iter()
             .filter(|span| uri_path(&span.uri).as_deref() == Some(path.as_path()))
             .map(|span| {
-                let start = offset_at(state.store(), span.span.start);
-                start..offset_at(state.store(), span.span.end).max(start)
+                let start = offset_at(&store, span.span.start);
+                start..offset_at(&store, span.span.end).max(start)
             })
             .collect();
         ranges.sort_by_key(|range| range.start);

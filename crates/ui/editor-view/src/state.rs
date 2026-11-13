@@ -11,8 +11,8 @@ use syntax::{
     normalize_spans, shift_spans,
 };
 use text_core::{
-    Buffer, Change, Decoded, Edit, EditKind, EditSource, Eol, RopeStore, Selection, SelectionSet,
-    TextEncoding, TextStore, commands, difference, editing, normalize_newlines, read_file,
+    Buffer, Change, Decoded, Edit, EditKind, EditSource, Followed, RopeStore, Selection,
+    SelectionSet, TextStore, commands, difference, editing, normalize_newlines, read_file,
     transform_offset, write_file,
 };
 
@@ -34,6 +34,10 @@ pub struct Conflict;
 #[derive(Debug)]
 pub struct Saved {
     pub version: u64,
+    /// The text that went to the disk, as it was when the write started.
+    pub text: String,
+    /// The encoding, BOM and line ends the text went out in.
+    pub format: text_core::FileFormat,
     pub result: Result<(), String>,
 }
 
@@ -86,6 +90,9 @@ pub struct EditorState {
     place_cursor: Option<usize>,
     /// Bookmarks as the offset of a place on their line, which follows the text.
     bookmarks: Vec<(usize, Option<char>)>,
+    /// The window keeps the bookmarks of this file from this view; a second view of the
+    /// document only reads them, so the two never erase each other in the shared list.
+    writes_bookmarks: bool,
     /// Insert replaces the character under the caret.
     overwrite: bool,
     /// The closing characters the editor inserted together with an opening one.
@@ -156,6 +163,7 @@ impl EditorState {
             places: Vec::new(),
             place_cursor: None,
             bookmarks: Vec::new(),
+            writes_bookmarks: true,
             overwrite: false,
             auto_closers: Vec::new(),
             properties: text_core::Properties::default(),
@@ -166,7 +174,7 @@ impl EditorState {
         }
     }
 
-    /// Another view of the same buffer: the text and its undo history are shared, while
+    /// Another view of the same document: the text and its undo history are shared, while
     /// the carets, folds, scroll and selections belong to this view alone.
     pub fn fork(&self) -> Self {
         let mut map = DisplayMap::default();
@@ -187,6 +195,7 @@ impl EditorState {
             places: Vec::new(),
             place_cursor: None,
             bookmarks: self.bookmarks.clone(),
+            writes_bookmarks: false,
             overwrite: false,
             auto_closers: Vec::new(),
             properties: self.properties.clone(),
@@ -197,20 +206,78 @@ impl EditorState {
         }
     }
 
-    /// Takes edits the other view of the buffer already made: no undo step is added,
-    /// because the shared history has it, and the carets here follow the text.
-    pub fn follow(&mut self, edits: Vec<Edit>) -> Option<Change> {
-        if self.is_read_only() {
-            return None;
+    /// Whether the two states are views of one document.
+    pub fn shares_document(&self, other: &Self) -> bool {
+        self.buffer.shares_document(&other.buffer)
+    }
+
+    /// Takes the changes another view of the document already made: no undo step is
+    /// added, because the shared history has it, and the carets and folds here follow the
+    /// text. A view that was away for too long cannot move its own ranges and drops them
+    /// instead, so nothing points past the text.
+    pub fn follow(&mut self) -> Followed {
+        match self.buffer.follow() {
+            Followed::Nothing => Followed::Nothing,
+            Followed::Changes(change) => {
+                self.finish_with(change.clone(), false);
+                Followed::Changes(change)
+            }
+            Followed::Missed => {
+                self.forget_ranges();
+                Followed::Missed
+            }
         }
-        let change = self.buffer.follow(edits);
-        self.finish_with(change, false)
+    }
+
+    /// Whether the window takes the bookmarks of the file from this view. A second view
+    /// of the document reads them without writing, so a cleared list of one view never
+    /// erases the bookmarks of the file.
+    pub(crate) fn writes_bookmarks(&self) -> bool {
+        self.writes_bookmarks
+    }
+
+    /// Says whether this view writes the bookmarks of the file into the window list.
+    pub(crate) fn set_writes_bookmarks(&mut self, writes: bool) {
+        self.writes_bookmarks = writes;
+    }
+
+    /// Takes the changes of the other views of the document into the carets, folds and
+    /// ranges of this state, before a command counts its edits from them. A view above
+    /// follows through [`crate::EditorView::catch_up`], which also moves the ranges the
+    /// view keeps itself; a bare state used without a view gets back what it followed.
+    fn catch_up(&mut self) -> Followed {
+        self.follow()
+    }
+
+    /// Whether another view changed the document since this view last followed it.
+    pub(crate) fn has_unseen_changes(&self) -> bool {
+        self.buffer.has_unseen_changes()
+    }
+
+    /// Everything this view keeps as offsets into the text goes away, because the edits
+    /// that would have moved it are not known. The parser and the language fill it again.
+    fn forget_ranges(&mut self) {
+        self.map.folds.clear();
+        self.map.folds.set_candidates(Vec::new());
+        self.map.inlays.set(Vec::new());
+        self.map.set_blocks(Vec::new());
+        self.map.set_doc_comments(Vec::new());
+        self.spans.clear();
+        self.tokens.clear();
+        self.bookmarks.clear();
+        self.auto_closers.clear();
+        self.places.clear();
+        self.grown.clear();
+        self.marked = None;
+        self.goal = None;
+        self.parsed = None;
+        self.opened_folds = false;
     }
 
     /// The buffer lines the display shows, without the ones a fold hides.
     pub fn visible_lines(&self) -> Vec<u32> {
         self.map
-            .snapshot(self.buffer.store())
+            .snapshot_owned(self.buffer.store())
             .visible_lines()
             .to_vec()
     }
@@ -239,11 +306,16 @@ impl EditorState {
     pub fn save_snapshot(path: &Path, snapshot: (String, text_core::FileFormat, u64)) -> Saved {
         let (text, format, version) = snapshot;
         let result = write_file(path, &text, &format).map_err(|error| error.to_string());
-        Saved { version, result }
+        Saved {
+            version,
+            text,
+            format,
+            result,
+        }
     }
 
     pub fn snapshot_for_save(&self) -> (String, text_core::FileFormat, u64) {
-        let mut format = self.buffer.format().clone();
+        let mut format = self.buffer.format();
         // The text rules of `.editorconfig` went into the buffer in `prepare_save`; here
         // only the encoding and the line ends of the file are left, so the disk and the
         // buffer hold the same text.
@@ -261,6 +333,7 @@ impl EditorState {
     /// trailing whitespace of every line without a caret, as IDEA keeps the line being
     /// typed, and the final newline.
     pub fn prepare_save(&mut self) -> Option<Change> {
+        self.catch_up();
         if self.is_read_only() {
             return None;
         }
@@ -368,6 +441,7 @@ impl EditorState {
     }
 
     fn take_disk_text(&mut self, decoded: Decoded) -> Option<Change> {
+        self.catch_up();
         let edit = difference(&self.buffer.text(), &decoded.text)?;
         let change = self
             .buffer
@@ -382,7 +456,8 @@ impl EditorState {
         self.buffer.text()
     }
 
-    pub fn store(&self) -> &RopeStore {
+    /// The text for reading. A copy, which does not change when the document does.
+    pub fn store(&self) -> RopeStore {
         self.buffer.store()
     }
 
@@ -474,7 +549,7 @@ impl EditorState {
     }
 
     pub fn display(&self) -> DisplaySnapshot<'_, RopeStore> {
-        self.map.snapshot(self.buffer.store())
+        self.map.snapshot_owned(self.buffer.store())
     }
 
     pub fn marked(&self) -> Option<Range<usize>> {
@@ -518,24 +593,16 @@ impl EditorState {
         self.buffer.set_format(format);
     }
 
-    pub fn format(&self) -> &text_core::FileFormat {
+    pub fn format(&self) -> text_core::FileFormat {
         self.buffer.format()
     }
 
     pub fn encoding_name(&self) -> &'static str {
-        match self.buffer.format().encoding {
-            TextEncoding::Utf8 if self.buffer.format().bom => "UTF-8 BOM",
-            encoding => encoding.name(),
-        }
+        self.buffer.encoding_name()
     }
 
     pub fn eol_name(&self) -> &'static str {
-        match self.buffer.format().eol {
-            text_core::EolStyle::Uniform(Eol::Lf) => "LF",
-            text_core::EolStyle::Uniform(Eol::CrLf) => "CRLF",
-            text_core::EolStyle::Uniform(Eol::Cr) => "CR",
-            text_core::EolStyle::Mixed { .. } => "Mixed",
-        }
+        self.buffer.eol_name()
     }
 
     /// Takes a finished parse. A parse of an older version is dropped, the spans moved
@@ -675,6 +742,7 @@ impl EditorState {
 
     /// Runs an action by its keymap name. Returns the change to hand to the parser.
     pub fn perform(&mut self, action: &str, page_rows: usize) -> Option<Change> {
+        self.catch_up();
         let keeps_goal = matches!(
             action,
             actions::MOVE_UP
@@ -863,11 +931,13 @@ impl EditorState {
     }
 
     fn edit(&mut self, command: impl FnOnce(&mut Buffer) -> Change) -> Option<Change> {
+        self.catch_up();
         let change = command(&mut self.buffer);
         self.finish(change)
     }
 
     pub fn type_text(&mut self, text: &str) -> Option<Change> {
+        self.catch_up();
         if self.is_read_only() || text.is_empty() {
             return None;
         }
@@ -884,6 +954,7 @@ impl EditorState {
     /// Ctrl+V: like typing, but the lines after the first take the indent of the caret
     /// line, and the indentation of the pasted block keeps its own shape above that.
     pub fn paste(&mut self, text: &str) -> Option<Change> {
+        self.catch_up();
         if self.is_read_only() || text.is_empty() || !text.contains(['\n', '\r']) {
             return self.type_text(text);
         }
@@ -1179,7 +1250,7 @@ impl EditorState {
     pub fn bracket_pair(&self) -> Option<(usize, usize)> {
         let selections = self.buffer.selections();
         (selections.len() == 1 && selections.primary().is_empty())
-            .then(|| editing::bracket_pair(self.buffer.store(), selections.primary().head))
+            .then(|| editing::bracket_pair(&self.buffer.store(), selections.primary().head))
             .flatten()
     }
 
@@ -1189,7 +1260,7 @@ impl EditorState {
         if selections.len() != 1 || !selections.primary().is_empty() {
             return None;
         }
-        let word = commands::word_at(self.buffer.store(), selections.primary().head);
+        let word = commands::word_at(&self.buffer.store(), selections.primary().head);
         (!word.is_empty()).then_some(word)
     }
 
@@ -1390,7 +1461,7 @@ impl EditorState {
     }
 
     fn move_rows(&mut self, rows: isize, extend: bool) {
-        let display = self.map.snapshot(self.buffer.store());
+        let display = self.map.snapshot_owned(self.buffer.store());
         let primary = display.to_display(self.buffer.selections().primary().head);
         let goal = self
             .goal
@@ -1417,7 +1488,7 @@ impl EditorState {
 
     /// Home goes to the first non-blank character, then to the column zero.
     fn move_line_edge(&mut self, end: bool, extend: bool) {
-        let display = self.map.snapshot(self.buffer.store());
+        let display = self.map.snapshot_owned(self.buffer.store());
         let store = self.buffer.store();
         let moved = self.buffer.selections().map(|selection| {
             let line = display.line(display.to_display(selection.head).row);
@@ -1527,7 +1598,7 @@ impl EditorState {
     }
 
     fn unfold_at_caret(&mut self) {
-        let display = self.map.snapshot(self.buffer.store());
+        let display = self.map.snapshot_owned(self.buffer.store());
         let line = display.line(
             display
                 .to_display(self.buffer.selections().primary().head)
@@ -1543,7 +1614,7 @@ impl EditorState {
     /// The fold button in the gutter.
     pub fn toggle_fold_at_line(&mut self, line: usize) {
         let collapsed_before = self.map.folds.as_slice().len();
-        self.map.folds.toggle_at_line(self.buffer.store(), line);
+        self.map.folds.toggle_at_line(&self.buffer.store(), line);
         if self.map.folds.as_slice().len() > collapsed_before {
             let fold = self.map.folds.as_slice().iter().find(|fold| {
                 let store = self.buffer.store();
@@ -1814,7 +1885,7 @@ impl EditorState {
         self.grown.clear();
         let store = self.buffer.store();
         let range = match count {
-            2 => commands::word_at(store, offset),
+            2 => commands::word_at(&store, offset),
             3.. => {
                 let line = store.offset_to_line(offset);
                 let next = (line + 1 < store.line_count()).then(|| store.line_to_offset(line + 1));
@@ -1890,6 +1961,7 @@ impl EditorState {
         text: &str,
         mark: bool,
     ) -> Option<Change> {
+        self.catch_up();
         if self.is_read_only() {
             return None;
         }
@@ -1958,6 +2030,7 @@ impl EditorState {
         after: SelectionSet,
         kind: EditKind,
     ) -> Option<Change> {
+        self.catch_up();
         if self.is_read_only() || edits.is_empty() {
             return None;
         }
@@ -2016,6 +2089,7 @@ impl EditorState {
 
     /// Edits from outside the keyboard, such as Replace in Files. One undo step.
     pub fn apply_edits(&mut self, edits: Vec<Edit>) -> Option<Change> {
+        self.catch_up();
         if self.is_read_only() {
             return None;
         }
@@ -2028,6 +2102,7 @@ impl EditorState {
     /// Several changes that came in one answer. They are one undo step, even when the
     /// server sent more than one `TextDocumentEdit` for this file.
     pub fn apply_edits_batches(&mut self, batches: Vec<Vec<Edit>>) -> Option<Change> {
+        self.catch_up();
         if self.is_read_only() {
             return None;
         }

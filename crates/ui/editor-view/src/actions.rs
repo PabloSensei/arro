@@ -166,11 +166,12 @@ impl EditorView {
         batches: Vec<Vec<DocumentEdit>>,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(cx);
         let Some(state) = &mut self.state else {
             return;
         };
         let caret = state.selections().primary().head;
-        let Some(batches) = server_batches(state.store(), batches) else {
+        let Some(batches) = server_batches(&state.store(), batches) else {
             self.show_note(caret, OVERLAPPING, cx);
             return;
         };
@@ -190,6 +191,7 @@ impl EditorView {
         change: WorkspaceChange,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(cx);
         let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
             return;
         };
@@ -207,7 +209,7 @@ impl EditorView {
         }
         let caret = state.selections().primary().head;
         let sources = change.edits.into_iter().map(|source| source.edits);
-        let Some(batches) = server_batches(state.store(), sources) else {
+        let Some(batches) = server_batches(&state.store(), sources) else {
             self.show_note(caret, OVERLAPPING, cx);
             return;
         };
@@ -290,7 +292,7 @@ impl EditorView {
 
     /// Ctrl+Alt+O.
     pub(crate) fn optimize_imports(&mut self, cx: &mut Context<Self>) {
-        let Some(span) = self.state.as_ref().map(|state| whole(state.store())) else {
+        let Some(span) = self.state.as_ref().map(|state| whole(&state.store())) else {
             return;
         };
         let only = Some(ActionKind::OrganizeImports);
@@ -306,8 +308,8 @@ impl EditorView {
         let state = self.state.as_ref()?;
         let selection = state.selections().primary();
         Some(TextSpan {
-            start: point_at(state.store(), selection.start()),
-            end: point_at(state.store(), selection.end()),
+            start: point_at(&state.store(), selection.start()),
+            end: point_at(&state.store(), selection.end()),
         })
     }
 
@@ -401,7 +403,7 @@ impl EditorView {
         let selection = state.selections().primary();
         let word = state.caret_word().or_else(|| {
             (!selection.is_empty())
-                .then(|| text_core::commands::word_at(state.store(), selection.start()))
+                .then(|| text_core::commands::word_at(&state.store(), selection.start()))
                 .filter(|word| !word.is_empty())
         });
         let Some(word) = word else {
@@ -448,11 +450,12 @@ impl EditorView {
                 {
                     return;
                 }
+                let store = state.store();
                 let mut ranges: Vec<Range<usize>> = spans
                     .into_iter()
                     .map(|span| {
-                        let start = offset_at(state.store(), span.start);
-                        start..offset_at(state.store(), span.end).max(start)
+                        let start = offset_at(&store, span.start);
+                        start..offset_at(&store, span.end).max(start)
                     })
                     .collect();
                 ranges.sort_by_key(|range| range.start);
@@ -561,11 +564,12 @@ impl EditorView {
                     return;
                 }
                 let spans = answer.map(|(spans, _)| spans).unwrap_or_default();
+                let store = state.store();
                 lsp.highlights = spans
                     .into_iter()
                     .map(|span| {
-                        let start = offset_at(state.store(), span.start);
-                        start..offset_at(state.store(), span.end).max(start)
+                        let start = offset_at(&store, span.start);
+                        start..offset_at(&store, span.end).max(start)
                     })
                     .collect();
                 cx.notify();

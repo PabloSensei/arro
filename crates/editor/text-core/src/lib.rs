@@ -14,7 +14,7 @@ pub mod indent;
 mod selection;
 mod store;
 
-pub use buffer::{Buffer, Change, apply_edits};
+pub use buffer::{Buffer, Change, Followed, apply_edits};
 pub use edit::{Edit, EditKind, EditSource, difference};
 pub use editorconfig::{
     Charset, EndOfLine, IndentSize, IndentStyle, Properties, apply_save, for_file,

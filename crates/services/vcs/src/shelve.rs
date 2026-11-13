@@ -82,7 +82,7 @@ impl Repository {
     pub fn shelf_diff(&self, patch: &[u8], path: &str) -> io::Result<Option<ShelfDiff>> {
         let mut blobs = self.blobs()?;
         let base = blobs.read(&format!("HEAD:{path}"))?.unwrap_or_default();
-        let base = String::from_utf8_lossy(&base).replace("\r\n", "\n");
+        let base = text_core::decode(&base).text;
         let Some(current) = patched_text(&base, patch, path) else {
             return Ok(None);
         };
@@ -99,7 +99,7 @@ impl Repository {
     pub fn shelf_text(&self, patch: &[u8], path: &str) -> io::Result<Option<String>> {
         let mut blobs = self.blobs()?;
         let base = blobs.read(&format!("HEAD:{path}"))?.unwrap_or_default();
-        let base = String::from_utf8_lossy(&base).replace("\r\n", "\n");
+        let base = text_core::decode(&base).text;
         Ok(patched_text(&base, patch, path))
     }
 

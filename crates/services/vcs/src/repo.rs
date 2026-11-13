@@ -192,7 +192,7 @@ impl Repository {
         let base = blobs
             .read(&format!("{revision}:{path}"))?
             .unwrap_or_default();
-        let base = String::from_utf8_lossy(&base).replace("\r\n", "\n");
+        let base = text_core::decode(&base).text;
         let hunks = line_hunks(&base, current);
         Ok(FileDiff {
             base,
@@ -713,9 +713,9 @@ impl Repository {
         let base = blobs
             .read(&format!("{commit}^:{path}"))?
             .unwrap_or_default();
-        let base = String::from_utf8_lossy(&base).replace("\r\n", "\n");
+        let base = text_core::decode(&base).text;
         let current = blobs.read(&format!("{commit}:{path}"))?.unwrap_or_default();
-        let current = String::from_utf8_lossy(&current).replace("\r\n", "\n");
+        let current = text_core::decode(&current).text;
         let hunks = line_hunks(&base, &current);
         Ok(FileDiff {
             base,

@@ -6,7 +6,8 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use editor_view::{EditorEvent, EditorView, PaneDecor};
+use editor_view::{EditorEvent, EditorOptions, EditorStyle, EditorView, PaneDecor};
+use text_core::FileFormat;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -119,7 +120,7 @@ enum Pane {
 }
 
 /// Which editor an event came from: one of the panes, or the tab the right pane shares
-/// its buffer with.
+/// its document with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditorSide {
     Left,
@@ -141,11 +142,24 @@ pub struct DiffView {
     index: usize,
     /// The hunk the diff keys act on.
     selected: usize,
-    /// The open tab of the file. The right pane shows its buffer when it is there.
+    /// The open tab of the file. The right pane shows its document when it is there.
     tab: Option<Entity<EditorView>>,
+    /// The right pane is a view of the document of the tab, so a tab opened again for the
+    /// same file takes the place of the one that was closed.
+    attached: bool,
+    /// The text the right pane started from when it became a document of its own, while
+    /// no tab of the file is open. Edits of the pane go into a tab opened later only when
+    /// the file still holds this text.
+    detached_base: Option<String>,
+    /// The tab whose save was still on its way when it closed: the pane becomes a
+    /// document of its own when the write lands, over the text the file got.
+    pending_detach: Option<Entity<EditorView>>,
+    /// Why the pane last stayed a document of its own instead of taking the tab, with
+    /// the text of the tab then, so the same reason is told once.
+    refused: Option<(String, String)>,
     /// The version before, read only.
     left: Entity<EditorView>,
-    /// The working text: the buffer of the tab, or an editor of its own.
+    /// The working text: the document of the tab, or an editor of its own.
     right: Entity<EditorView>,
     /// Side by side when the setting says so, one list otherwise.
     side_by_side: bool,
@@ -156,6 +170,10 @@ pub struct DiffView {
     /// A scroll of one pane is being copied to the other, so it must not copy back.
     syncing: bool,
     scroll: ScrollHandle,
+    /// The events of the panes and of the tab, replaced when a pane is.
+    subscriptions: Vec<Subscription>,
+    /// The notify of the window, for a tab that opens or closes under the diff.
+    _workspace: Option<Subscription>,
 }
 
 /// What the diff is taken from: the working tree, one commit, or the clipboard.
@@ -213,13 +231,29 @@ pub(crate) struct DiffRow {
     kind: Option<Kind>,
 }
 
-/// The text of the file as the user sees it: the open editor, or the disk.
-fn current_text(path: &Path, editor: Option<&Entity<EditorView>>, cx: &App) -> String {
-    let text = editor
-        .and_then(|editor| editor.read(cx).text())
-        .or_else(|| std::fs::read_to_string(path).ok())
-        .unwrap_or_default();
-    text.replace("\r\n", "\n")
+/// The text with `\n` line ends, as the buffers keep it.
+fn normalized(text: &str) -> String {
+    text_core::normalize_newlines(text).into_owned()
+}
+
+/// The text of the file as the user sees it, with `\n` line ends, and the format a save
+/// writes: the open editor, or the disk. The disk is read with the loader of a tab, so a
+/// file in another encoding or with line ends of any kind keeps them.
+fn current_document(
+    path: &Path,
+    editor: Option<&Entity<EditorView>>,
+    cx: &App,
+) -> (String, FileFormat) {
+    if let Some(editor) = editor {
+        let editor = editor.read(cx);
+        if let Some(text) = editor.text() {
+            return (normalized(&text), editor.format().unwrap_or_default());
+        }
+    }
+    match text_core::read_file(path) {
+        Ok(decoded) => (decoded.text, decoded.format),
+        Err(_) => (String::new(), FileFormat::default()),
+    }
 }
 
 fn editor_of(
@@ -232,6 +266,27 @@ fn editor_of(
         .ok()?;
     let (_, view) = open.into_iter().find(|(open, _)| open == path)?;
     view.downcast::<EditorView>().ok()
+}
+
+/// An editor of a text that is not the document of a tab: the version before, or the
+/// working text when no tab of the file is open. It reads the bookmarks of the file and
+/// never replaces them in the window list.
+fn text_view(
+    path: PathBuf,
+    text: String,
+    format: FileFormat,
+    read_only: bool,
+    style: EditorStyle,
+    options: EditorOptions,
+    cx: &mut App,
+) -> Entity<EditorView> {
+    cx.new(move |cx| {
+        let mut view =
+            EditorView::open_text_document(path, text, format, read_only, false, style, cx);
+        view.set_options(options, cx);
+        view.lock_soft_wrap();
+        view
+    })
 }
 
 /// The lines of a text as the editor shows them: the empty line after a trailing newline
@@ -639,6 +694,7 @@ impl DiffView {
                         Vec::new(),
                         0,
                         diff.current,
+                        FileFormat::default(),
                         diff.base,
                         diff.hunks,
                         window,
@@ -667,9 +723,9 @@ impl DiffView {
             window,
             cx,
             move |path| {
-                let current = std::fs::read_to_string(path)
-                    .unwrap_or_default()
-                    .replace("\r\n", "\n");
+                let current = text_core::read_file(path)
+                    .map(|decoded| decoded.text)
+                    .unwrap_or_default();
                 (clipboard, current)
             },
         );
@@ -695,9 +751,9 @@ impl DiffView {
             cx,
             move |path| {
                 let read = |path: &Path| {
-                    std::fs::read_to_string(path)
+                    text_core::read_file(path)
+                        .map(|decoded| decoded.text)
                         .unwrap_or_default()
-                        .replace("\r\n", "\n")
                 };
                 (read(&other), read(path))
             },
@@ -718,12 +774,12 @@ impl DiffView {
         let Some(repo) = git.read(cx).repo() else {
             return;
         };
-        let current = match source {
+        let (current, format) = match source {
             Source::WorkingTree | Source::Branch(_) => {
-                current_text(&path, editor_of(&workspace, &path, cx).as_ref(), cx)
+                current_document(&path, editor_of(&workspace, &path, cx).as_ref(), cx)
             }
-            Source::Commit(_) | Source::Shelf(_) => String::new(),
-            Source::Clipboard | Source::File(_) => String::new(),
+            Source::Commit(_) | Source::Shelf(_) => (String::new(), FileFormat::default()),
+            Source::Clipboard | Source::File(_) => (String::new(), FileFormat::default()),
         };
         let (job_path, job_text) = (path.clone(), current.clone());
         let job_source = source.clone();
@@ -753,8 +809,8 @@ impl DiffView {
                         current
                     };
                     Self::show(
-                        git, workspace, path, source, files, index, current, diff.base, diff.hunks,
-                        window, cx,
+                        git, workspace, path, source, files, index, current, format, diff.base,
+                        diff.hunks, window, cx,
                     );
                 })
                 .ok();
@@ -789,6 +845,7 @@ impl DiffView {
                         Vec::new(),
                         0,
                         current,
+                        FileFormat::default(),
                         base,
                         hunks,
                         window,
@@ -809,6 +866,7 @@ impl DiffView {
         files: Vec<PathBuf>,
         index: usize,
         current: String,
+        format: FileFormat,
         base: String,
         hunks: Vec<Hunk>,
         window: &mut Window,
@@ -835,37 +893,39 @@ impl DiffView {
             let style = style.clone();
             let options = options.clone();
             cx.new(move |cx| {
-                let mut view = EditorView::open_text(path, base, true, style, cx);
+                let mut view = EditorView::open_text_document(
+                    path,
+                    base,
+                    FileFormat::default(),
+                    true,
+                    false,
+                    style,
+                    cx,
+                );
                 view.set_options(options, cx);
                 view
             })
         };
-        let right = match (&tab, source == Source::WorkingTree) {
-            (Some(tab), true) => EditorView::open_shared(tab, cx).unwrap_or_else(|| {
-                let text = current.clone();
-                let path = path.clone();
-                let style = style.clone();
-                let options = options.clone();
-                cx.new(move |cx| {
-                    let mut view = EditorView::open_text(path, text, false, style, cx);
-                    view.set_options(options, cx);
-                    view.lock_soft_wrap();
-                    view
-                })
-            }),
-            _ => {
-                let text = current.clone();
-                let read_only = source != Source::WorkingTree;
-                let path = path.clone();
-                let style = style.clone();
-                cx.new(move |cx| {
-                    let mut view = EditorView::open_text(path, text, read_only, style, cx);
-                    view.set_options(options, cx);
-                    view.lock_soft_wrap();
-                    view
-                })
-            }
+        let shared_right = match (&tab, source == Source::WorkingTree) {
+            (Some(tab), true) => EditorView::open_shared(tab, cx),
+            _ => None,
         };
+        // A right pane that is a view of the document of the tab keeps following the file
+        // when that tab is closed and opened again. A tab still reading the file becomes
+        // the document of the pane when it is ready.
+        let attached = shared_right.is_some();
+        let detached_base = (!attached).then(|| normalized(&current));
+        let right = shared_right.unwrap_or_else(|| {
+            text_view(
+                path.clone(),
+                current.clone(),
+                format.clone(),
+                source != Source::WorkingTree,
+                style.clone(),
+                options.clone(),
+                cx,
+            )
+        });
         left.update(cx, |left, _| left.lock_soft_wrap());
         let top = right.read(cx).scroll_top();
         left.update(cx, |left, cx| left.scroll_to_top(top, cx));
@@ -891,6 +951,10 @@ impl DiffView {
                 index,
                 selected: 0,
                 tab,
+                attached,
+                detached_base,
+                pending_detach: None,
+                refused: None,
                 left,
                 right,
                 side_by_side,
@@ -898,8 +962,10 @@ impl DiffView {
                 serial: 0,
                 syncing: false,
                 scroll: ScrollHandle::new(),
+                subscriptions: Vec::new(),
+                _workspace: None,
             });
-            view.update(cx, |view, cx| view.subscribe_editors(cx));
+            view.update(cx, |view, cx| view.attach(cx));
             let focus = view.read(cx).focus.clone();
             workspace.show_overlay(view.into(), focus, window, cx);
         });
@@ -916,45 +982,305 @@ impl DiffView {
         self.source == Source::WorkingTree
     }
 
+    /// Subscribes the panes and the tab, and the window, whose notifications bring a tab
+    /// that opens or closes under the diff.
+    fn attach(&mut self, cx: &mut Context<Self>) {
+        self.subscribe_editors(cx);
+        if let Some(workspace) = self.workspace.upgrade() {
+            self._workspace =
+                Some(cx.observe(&workspace, |this: &mut Self, _, cx| this.adopt_tab(cx)));
+        }
+    }
+
     /// Follows the text of the right pane and the scroll of both panes. The tab shares
-    /// its buffer with the right pane, so an edit in either one comes here.
+    /// its document with the right pane, so an edit in either one comes here.
     fn subscribe_editors(&mut self, cx: &mut Context<Self>) {
-        cx.subscribe(
+        let mut subscriptions = Vec::with_capacity(4);
+        subscriptions.push(cx.subscribe(
             &self.left,
             |this: &mut Self, source: Entity<EditorView>, event: &EditorEvent, cx| {
                 if this.left == source {
                     this.editor_event(EditorSide::Left, event, cx);
                 }
             },
-        )
-        .detach();
-        cx.subscribe(
+        ));
+        subscriptions.push(cx.subscribe(
             &self.right,
             |this: &mut Self, source: Entity<EditorView>, event: &EditorEvent, cx| {
                 if this.right == source {
                     this.editor_event(EditorSide::Right, event, cx);
                 }
             },
-        )
-        .detach();
+        ));
         if let Some(tab) = self.tab.clone()
             && tab != self.right
         {
-            cx.subscribe(
+            subscriptions.push(cx.subscribe(
                 &tab,
                 |this: &mut Self, source: Entity<EditorView>, event: &EditorEvent, cx| {
                     if this.tab.as_ref() == Some(&source) {
                         this.editor_event(EditorSide::Tab, event, cx);
                     }
                 },
-            )
-            .detach();
+            ));
         }
+        // The tab closed while its save was on its way: its result tells the text the
+        // pane takes over.
+        if let Some(closing) = self.pending_detach.clone()
+            && closing != self.right
+            && self.tab.as_ref() != Some(&closing)
+        {
+            subscriptions.push(cx.subscribe(
+                &closing,
+                |this: &mut Self, source: Entity<EditorView>, event: &EditorEvent, cx| {
+                    if this.pending_detach.as_ref() == Some(&source) {
+                        this.closing_event(source, event, cx);
+                    }
+                },
+            ));
+        }
+        self.subscriptions = subscriptions;
+    }
+
+    /// A tab of the file appeared, closed or opened again: the right pane follows it.
+    /// While no tab is open the pane is a document of its own; a tab opened later takes
+    /// its document over, and the edits the pane made meanwhile go into the tab when the
+    /// file still holds the text they were made over. A tab closed again leaves the pane
+    /// the text the file has now: a save kept it, "Don't save" dropped it.
+    fn adopt_tab(&mut self, cx: &mut Context<Self>) {
+        // A closed tab whose save has not landed yet keeps the pane bound to its document.
+        if let Some(closed) = self.pending_detach.clone() {
+            if closed.read(cx).is_saving() {
+                return;
+            }
+            // The result never came: the document the pane already shares holds the text.
+            self.leave_detached(cx);
+        }
+        let tab = editor_of(&self.workspace, &self.path, cx);
+        let wants = self.source == Source::WorkingTree;
+        let previous = self.tab.clone();
+        let changed = tab != previous;
+        if changed {
+            self.tab = tab.clone();
+            // Follows the new tab from its first event, also while it is still reading the
+            // file: its `Loaded` asks here again.
+            self.subscribe_editors(cx);
+        }
+        if !wants {
+            return;
+        }
+        let Some(tab) = tab else {
+            if previous.is_some() && self.attached {
+                self.detach(previous.as_ref(), cx);
+            }
+            return;
+        };
+        if self.attached {
+            // The pane already shows the document of the tab. A tab closed and opened
+            // again before a notification came is another view of the same document.
+            if changed {
+                self.bind(tab, cx);
+            }
+            return;
+        }
+        // The pane is a document of its own. Its edits go into the tab only when the file
+        // still holds the text they were counted on; otherwise the file changed on disk
+        // and merging the two silently would lose one of them.
+        let own = normalized(&self.right.read(cx).text().unwrap_or_default());
+        let Some(theirs) = tab.read(cx).text() else {
+            // The tab is still reading the file; its `Loaded` comes here again.
+            return;
+        };
+        let theirs = normalized(&theirs);
+        if self.right.read(cx).is_dirty() {
+            if self.detached_base.as_deref() != Some(theirs.as_str()) {
+                self.refuse(
+                    "changed on disk: the pane keeps the text of its own edits",
+                    &theirs,
+                    cx,
+                );
+                return;
+            }
+            if let Some(edit) = text_core::difference(&theirs, &own) {
+                self.syncing = true;
+                tab.update(cx, |tab, cx| tab.apply_edits(vec![edit], cx));
+                self.syncing = false;
+            }
+        }
+        // A tab that could not take the edits of the pane (a read-only file, for one)
+        // leaves the pane its own document, so nothing is lost.
+        let taken = normalized(&tab.read(cx).text().unwrap_or_default());
+        if self.right.read(cx).is_dirty() && taken != own {
+            self.refuse(
+                "cannot take the edits of the pane: it is read-only",
+                &theirs,
+                cx,
+            );
+            return;
+        }
+        self.bind(tab, cx);
+    }
+
+    /// Says why the pane stays a document of its own. The same reason over the same text
+    /// of the tab is told once: a later notification does not repeat it.
+    fn refuse(&mut self, reason: &str, theirs: &str, cx: &mut Context<Self>) {
+        let refusal = (reason.to_owned(), theirs.to_owned());
+        if self.refused.as_ref() != Some(&refusal) {
+            self.refused = Some(refusal);
+            let path = self.path.display().to_string();
+            self.git.update(cx, |git, cx| {
+                git.tell("Diff", format!("{path} {reason}"), cx)
+            });
+        }
+        cx.notify();
+    }
+
+    /// Makes the right pane a view of the document of `tab`.
+    fn bind(&mut self, tab: Entity<EditorView>, cx: &mut Context<Self>) {
+        let Some(right) = EditorView::open_shared(&tab, cx) else {
+            // The tab is still reading the file; its `Loaded` comes here again.
+            return;
+        };
+        let top = self.right.read(cx).scroll_top();
+        right.update(cx, |right, cx| right.scroll_to_top(top, cx));
+        self.right = right;
+        self.attached = true;
+        self.detached_base = None;
+        self.refused = None;
+        self.subscribe_editors(cx);
+        // The file may have changed on disk while the tab was closed.
+        if normalized(&self.right.read(cx).text().unwrap_or_default()) != self.changes.current {
+            self.reread(cx);
+        }
+        cx.notify();
+    }
+
+    /// The tab of the file is gone: the right pane becomes a document of its own over
+    /// the text the file has, so the unsaved edits of a closed tab do not stay in it. A
+    /// close writes the text first, so while that write is on its way this waits for its
+    /// result: a save that lands leaves its snapshot, a failed one leaves the edits. A
+    /// tab dropped without a save leaves the text of the disk.
+    fn detach(&mut self, closed: Option<&Entity<EditorView>>, cx: &mut Context<Self>) {
+        let Some(closed) = closed.cloned() else {
+            // No tab is left to read the text from: the pane keeps the document it has.
+            self.leave_detached(cx);
+            return;
+        };
+        if closed.read(cx).is_saving() {
+            if self.pending_detach.as_ref() != Some(&closed) {
+                self.pending_detach = Some(closed);
+                self.subscribe_editors(cx);
+            }
+            cx.notify();
+            return;
+        }
+        if closed.read(cx).is_dirty() {
+            // A tab dropped without a save: the file keeps the text of the disk.
+            match text_core::read_file(&self.path) {
+                Ok(decoded) => self.replace_detached(decoded.text, decoded.format, cx),
+                Err(_) => self.leave_detached(cx),
+            }
+            return;
+        }
+        // The buffer of a clean tab is what the file has. The snapshot of its last save
+        // is not: a reload from the disk after that save leaves the tab clean over newer
+        // text, and the snapshot would write the older one back.
+        let (text, format) = {
+            let tab = closed.read(cx);
+            (
+                tab.text().unwrap_or_default(),
+                tab.format().unwrap_or_default(),
+            )
+        };
+        self.replace_detached(text, format, cx);
+    }
+
+    /// The write of the closed tab ended: the pane takes the snapshot that reached the
+    /// disk, or keeps the text of the edits when the write failed.
+    fn closing_event(
+        &mut self,
+        closed: Entity<EditorView>,
+        event: &EditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if closed.read(cx).is_saving() {
+            return;
+        }
+        match event {
+            EditorEvent::Saved => {
+                let tab = closed.read(cx);
+                let current = tab.text().unwrap_or_default();
+                match tab.saved_document() {
+                    // Text typed into the pane while the write was on its way is not in
+                    // the snapshot: the pane keeps the document with it, unsaved.
+                    Some((saved, _)) if saved != current => self.leave_detached(cx),
+                    Some((saved, format)) => self.replace_detached(saved, format, cx),
+                    None => {
+                        let format = tab.format().unwrap_or_default();
+                        self.replace_detached(current, format, cx);
+                    }
+                }
+            }
+            EditorEvent::Failed(_) => {
+                // The write failed: the pane keeps the text of the edits.
+                self.leave_detached(cx);
+            }
+            _ => return,
+        }
+        if self.tab.is_some() {
+            self.adopt_tab(cx);
+        }
+    }
+
+    /// Makes the right pane a document of its own over `text`, written with `format`.
+    fn replace_detached(&mut self, text: String, format: FileFormat, cx: &mut Context<Self>) {
+        let top = self.right.read(cx).scroll_top();
+        let style = style_of(cx);
+        let options = options_of(cx);
+        let right = text_view(
+            self.path.clone(),
+            text.clone(),
+            format,
+            self.source != Source::WorkingTree,
+            style,
+            options,
+            cx,
+        );
+        right.update(cx, |right, cx| right.scroll_to_top(top, cx));
+        self.right = right;
+        self.attached = false;
+        self.detached_base = Some(normalized(&text));
+        self.pending_detach = None;
+        self.refused = None;
+        self.subscribe_editors(cx);
+        if normalized(&text) != self.changes.current {
+            self.reread(cx);
+        }
+        cx.notify();
+    }
+
+    /// The pane keeps the document it has and becomes a document of its own: a save
+    /// failed, or no tab is left to take the text from.
+    fn leave_detached(&mut self, cx: &mut Context<Self>) {
+        let text = normalized(&self.right.read(cx).text().unwrap_or_default());
+        self.attached = false;
+        self.detached_base = Some(text.clone());
+        self.pending_detach = None;
+        self.refused = None;
+        self.subscribe_editors(cx);
+        if text != self.changes.current {
+            self.reread(cx);
+        }
+        cx.notify();
     }
 
     fn editor_event(&mut self, from: EditorSide, event: &EditorEvent, cx: &mut Context<Self>) {
         match event {
             EditorEvent::Changed => self.text_changed(from, cx),
+            // The tab opened again is ready to be a view of the right pane.
+            EditorEvent::Loaded if from == EditorSide::Tab => self.adopt_tab(cx),
+            // A save of the pane of its own: the reason to stay apart may be gone.
+            EditorEvent::Saved if from == EditorSide::Right => self.adopt_tab(cx),
             EditorEvent::Scrolled(top) if from != EditorSide::Tab => {
                 let pane = if from == EditorSide::Left {
                     Pane::Left
@@ -970,10 +1296,10 @@ impl DiffView {
         }
     }
 
-    /// The text of one view of the buffer changed: the other view takes the same text,
-    /// and the hunks are read again.
+    /// The text of one view of the document changed: the other view moves its carets and
+    /// folds with the change, and the hunks are read again.
     fn text_changed(&mut self, from: EditorSide, cx: &mut Context<Self>) {
-        if self.syncing {
+        if self.syncing || from == EditorSide::Left {
             return;
         }
         if from == EditorSide::Right {
@@ -982,32 +1308,31 @@ impl DiffView {
                 .update(cx, |workspace, cx| workspace.remember_edited(&path, cx))
                 .ok();
         }
-        let Some((source, target)) = self.synced_pair(from) else {
-            if from != EditorSide::Left {
-                self.reread(cx);
-            }
-            return;
-        };
-        let source_text = source.read(cx).text().unwrap_or_default();
-        let target_text = target.read(cx).text().unwrap_or_default();
-        if target_text != source_text
-            && let Some(edit) = text_core::difference(&target_text, &source_text)
-        {
+        if let Some(target) = self.paired(from, cx) {
             self.syncing = true;
-            target.update(cx, |target, cx| target.follow_edits(vec![edit], cx));
+            target.update(cx, |target, cx| target.follow_changes(cx));
             self.syncing = false;
         }
         self.reread(cx);
     }
 
-    /// The two editors that share one buffer, when the tab of the file is open.
-    fn synced_pair(&self, from: EditorSide) -> Option<(Entity<EditorView>, Entity<EditorView>)> {
-        let tab = self.tab.clone().filter(|tab| tab != &self.right)?;
-        match from {
-            EditorSide::Tab => Some((tab, self.right.clone())),
-            EditorSide::Right => Some((self.right.clone(), tab)),
-            EditorSide::Left => None,
+    /// The view of the document of `from`, when the tab of the file is open: an edit in
+    /// one of them moves the carets of the other. Two views of different documents are
+    /// not paired, because following would move nothing.
+    fn paired(&self, from: EditorSide, cx: &App) -> Option<Entity<EditorView>> {
+        if self.source != Source::WorkingTree {
+            return None;
         }
+        let tab = self.tab.clone().filter(|tab| tab != &self.right)?;
+        let (source, target) = match from {
+            EditorSide::Tab => (&tab, &self.right),
+            EditorSide::Right => (&self.right, &tab),
+            EditorSide::Left => return None,
+        };
+        source
+            .read(cx)
+            .shares_document(target.read(cx))
+            .then(|| target.clone())
     }
 
     /// One pane scrolled: the other one follows, so the hunks stay face to face.
@@ -1103,9 +1428,9 @@ impl DiffView {
         };
         let source = self.source.clone();
         let tab = editor_of(&self.workspace, &path, cx);
-        let current = match source {
-            Source::WorkingTree | Source::Branch(_) => current_text(&path, tab.as_ref(), cx),
-            _ => String::new(),
+        let (current, format) = match source {
+            Source::WorkingTree | Source::Branch(_) => current_document(&path, tab.as_ref(), cx),
+            _ => (String::new(), FileFormat::default()),
         };
         let (job_path, job_text) = (path.clone(), current.clone());
         let job = cx.background_executor().spawn(async move {
@@ -1143,7 +1468,7 @@ impl DiffView {
                     current
                 };
                 this.tab = editor_of(&this.workspace, &path, cx);
-                this.set_text(&path, &diff.base, &current, cx);
+                this.set_text(&path, &diff.base, &current, format, cx);
                 this.path = path;
                 this.changes = Changes {
                     current,
@@ -1173,7 +1498,17 @@ impl DiffView {
         if !self.revertable() {
             return;
         }
-        let text_now = self.right.read(cx).text().unwrap_or_default();
+        // The range is counted in the text of the document the edit goes to: the document
+        // of the tab while the pane is a view of it, the pane's own document otherwise.
+        let target = if self.attached {
+            self.tab.clone().unwrap_or_else(|| self.right.clone())
+        } else {
+            self.right.clone()
+        };
+        let Some(text_now) = target.read(cx).text() else {
+            self.reread(cx);
+            return;
+        };
         let Some(TextEdit { range, text }) = self.changes.revert(index, &text_now) else {
             // The text moved while the popup was open: the old hunk may land in the wrong
             // place, so read the diff again and say why nothing was taken back.
@@ -1184,7 +1519,9 @@ impl DiffView {
             return;
         };
         let path = self.path.clone();
-        if let Some(tab) = self.tab.clone() {
+        if self.attached
+            && let Some(tab) = self.tab.clone()
+        {
             let bytes = tab.read(cx).file_bytes();
             let cause = local_history::Cause::BeforeGitRevert;
             crate::history::snapshot_bytes(&path, bytes, cause, cx);
@@ -1303,11 +1640,14 @@ impl DiffView {
         let Some(repo) = self.git.read(cx).repo() else {
             return;
         };
+        // The hunks describe the text the right pane shows. While the pane is a view of
+        // the document of the tab that is the text of the tab; a pane of its own (no tab,
+        // or a tab that could not take its edits) is read here.
         let current = self
             .right
             .read(cx)
             .text()
-            .map(|text| text.replace("\r\n", "\n"))
+            .map(|text| normalized(&text))
             .unwrap_or_default();
         let (path, text) = (self.path.clone(), current.clone());
         let job = cx.background_executor().spawn(async move {
@@ -1325,7 +1665,7 @@ impl DiffView {
                 if this.serial != serial {
                     return;
                 }
-                this.tab = editor_of(&this.workspace, &this.path, cx);
+                this.adopt_tab(cx);
                 this.changes = Changes {
                     current,
                     base: diff.base,
@@ -1343,46 +1683,44 @@ impl DiffView {
     }
 
     /// Replaces both panes with editors of `base` and `current`, and follows them.
-    fn set_text(&mut self, path: &Path, base: &str, current: &str, cx: &mut Context<Self>) {
+    fn set_text(
+        &mut self,
+        path: &Path,
+        base: &str,
+        current: &str,
+        format: FileFormat,
+        cx: &mut Context<Self>,
+    ) {
         let style = style_of(cx);
         let options = options_of(cx);
-        let left = {
-            let path = path.to_path_buf();
-            let base = base.to_owned();
-            let style = style.clone();
-            let options = options.clone();
-            cx.new(move |cx| {
-                let mut view = EditorView::open_text(path, base, true, style, cx);
-                view.set_options(options, cx);
-                view
-            })
+        let left = text_view(
+            path.to_path_buf(),
+            base.to_owned(),
+            FileFormat::default(),
+            true,
+            style.clone(),
+            options.clone(),
+            cx,
+        );
+        let shared_right = match (&self.tab, self.source == Source::WorkingTree) {
+            (Some(tab), true) => EditorView::open_shared(tab, cx),
+            _ => None,
         };
-        let right = match (&self.tab, self.source == Source::WorkingTree) {
-            (Some(tab), true) => EditorView::open_shared(tab, cx).unwrap_or_else(|| {
-                let path = path.to_path_buf();
-                let current = current.to_owned();
-                let style = style.clone();
-                let options = options.clone();
-                cx.new(move |cx| {
-                    let mut view = EditorView::open_text(path, current, false, style, cx);
-                    view.set_options(options, cx);
-                    view.lock_soft_wrap();
-                    view
-                })
-            }),
-            _ => {
-                let path = path.to_path_buf();
-                let current = current.to_owned();
-                let read_only = self.source != Source::WorkingTree;
-                let style = style.clone();
-                cx.new(move |cx| {
-                    let mut view = EditorView::open_text(path, current, read_only, style, cx);
-                    view.set_options(options, cx);
-                    view.lock_soft_wrap();
-                    view
-                })
-            }
-        };
+        self.attached = shared_right.is_some();
+        self.detached_base = (!self.attached).then(|| normalized(current));
+        self.pending_detach = None;
+        self.refused = None;
+        let right = shared_right.unwrap_or_else(|| {
+            text_view(
+                path.to_path_buf(),
+                current.to_owned(),
+                format,
+                self.source != Source::WorkingTree,
+                style.clone(),
+                options.clone(),
+                cx,
+            )
+        });
         left.update(cx, |left, _| left.lock_soft_wrap());
         self.left = left;
         self.right = right;
@@ -1417,6 +1755,12 @@ impl DiffView {
     #[cfg(test)]
     pub(crate) fn side_by_side(&self) -> bool {
         self.side_by_side
+    }
+
+    /// Whether the right pane is a view of the document of the tab, for tests.
+    #[cfg(test)]
+    pub(crate) fn attached(&self) -> bool {
+        self.attached
     }
 
     /// The pane the keys work in, for tests.

@@ -138,7 +138,7 @@ impl EditorView {
         let store = state.store();
         let mut fresh: Vec<CodeLensItem> = entries
             .into_iter()
-            .map(|entry| CodeLensItem::from_entry(entry, store))
+            .map(|entry| CodeLensItem::from_entry(entry, &store))
             .collect();
         keep_shown_titles(&self.code_lens, &mut fresh);
         self.code_lens = fresh;
@@ -280,8 +280,8 @@ impl EditorView {
                         version,
                         lens: CodeLensEntry {
                             span: lang_api::TextSpan {
-                                start: point_at(store, item.offset.min(store.len())),
-                                end: point_at(store, item.offset.min(store.len())),
+                                start: point_at(&store, item.offset.min(store.len())),
+                                end: point_at(&store, item.offset.min(store.len())),
                             },
                             title: item.title.clone(),
                             kind: item.kind,
@@ -318,7 +318,7 @@ impl EditorView {
                         return false;
                     };
                     let store = state.store();
-                    let resolved = CodeLensItem::from_entry(answer.value, store);
+                    let resolved = CodeLensItem::from_entry(answer.value, &store);
                     let Some(item) = this.code_lens.iter_mut().find(|item| item.offset == offset)
                     else {
                         return false;

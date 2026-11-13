@@ -17,7 +17,7 @@ fn a_hint_is_drawn_between_the_characters_and_the_buffer_stays_the_same() {
     }]);
 
     assert_eq!(state.text(), "foo(1)");
-    let snapshot = state.map().snapshot(state.store());
+    let snapshot = state.map().snapshot_owned(state.store());
     assert_eq!(snapshot.line(0).text, "foo(count: 1)");
 }
 
@@ -33,7 +33,11 @@ fn a_copy_and_a_selection_have_the_bytes_around_a_hint_only() {
     assert_eq!(state.selected_chars(), 6);
     assert_eq!(state.copy_text(), "foo(1)");
     assert_eq!(
-        state.map().snapshot(state.store()).to_display(4).column,
+        state
+            .map()
+            .snapshot_owned(state.store())
+            .to_display(4)
+            .column,
         11,
         "the caret after the bracket stands after the hint"
     );
@@ -57,10 +61,10 @@ fn an_edit_moves_a_hint_and_typing_near_it_keeps_the_text() {
 fn soft_wrap_counts_the_width_of_a_hint() {
     let mut state = state("aaaaaaaaaaaa");
     state.set_wrap(Some(8));
-    let rows = state.map().snapshot(state.store()).row_count();
+    let rows = state.map().snapshot_owned(state.store()).row_count();
     state.set_inlays(vec![Inlay {
         offset: 5,
         text: "xxxxx".to_owned(),
     }]);
-    assert!(state.map().snapshot(state.store()).row_count() > rows);
+    assert!(state.map().snapshot_owned(state.store()).row_count() > rows);
 }

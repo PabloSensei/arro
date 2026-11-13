@@ -982,8 +982,8 @@ impl EditorView {
                 uri: lsp.uri.clone(),
                 version,
                 range: lang_api::TextSpan {
-                    start: point_at(state.store(), start),
-                    end: point_at(state.store(), end),
+                    start: point_at(&state.store(), start),
+                    end: point_at(&state.store(), end),
                 },
             };
             (first, last, query, version, lsp.support.clone())
@@ -1042,6 +1042,7 @@ impl EditorView {
             return;
         }
         let mut inlays = Vec::with_capacity(entries.len());
+        let store = state.store();
         for entry in entries {
             let wanted = match entry.kind {
                 InlayHintKind::Parameter => parameter_names != InlayParameterNames::None,
@@ -1053,7 +1054,7 @@ impl EditorView {
             if !wanted {
                 continue;
             }
-            let offset = offset_at(state.store(), entry.position);
+            let offset = offset_at(&store, entry.position);
             let mut text = String::new();
             if entry.padding_left {
                 text.push(' ');
@@ -1301,8 +1302,8 @@ impl EditorView {
         );
         drop(display);
         Some(lang_api::TextSpan {
-            start: point_at(state.store(), start),
-            end: point_at(state.store(), end),
+            start: point_at(&state.store(), start),
+            end: point_at(&state.store(), end),
         })
     }
 
@@ -1317,8 +1318,8 @@ impl EditorView {
         let mut spans: Vec<TokenSpan> = tokens
             .into_iter()
             .filter_map(|token| {
-                let start = offset_at(store, token.span.start);
-                let end = offset_at(store, token.span.end).max(start);
+                let start = offset_at(&store, token.span.start);
+                let end = offset_at(&store, token.span.end).max(start);
                 (start < end).then_some(TokenSpan {
                     start: start as u32,
                     end: end as u32,
@@ -1355,8 +1356,8 @@ impl EditorView {
         lsp.marks = entries
             .iter()
             .map(|entry| {
-                let start = offset_at(store, entry.span.start);
-                let end = offset_at(store, entry.span.end).max(start);
+                let start = offset_at(&store, entry.span.start);
+                let end = offset_at(&store, entry.span.end).max(start);
                 Mark {
                     range: start..end,
                     severity: entry.severity,
@@ -1467,7 +1468,7 @@ impl EditorView {
         let spot = DocumentSpot {
             uri: lsp.uri.clone(),
             version: state.version() as i32,
-            point: point_at(state.store(), caret),
+            point: point_at(&state.store(), caret),
         };
         Some((spot, caret))
     }
@@ -1478,7 +1479,7 @@ impl EditorView {
         Some(DocumentSpot {
             uri: lsp.uri.clone(),
             version: state.version() as i32,
-            point: point_at(state.store(), offset),
+            point: point_at(&state.store(), offset),
         })
     }
 
@@ -1518,7 +1519,7 @@ impl EditorView {
         let (Some(lsp), Some(state)) = (&mut self.lsp, &self.state) else {
             return;
         };
-        let start = word_start(state.store(), caret);
+        let start = word_start(&state.store(), caret);
         let line_start = state
             .store()
             .line_to_offset(state.store().offset_to_line(caret));
@@ -1662,10 +1663,10 @@ impl EditorView {
         let caret = state.head();
         let start = entry
             .span
-            .map_or(start, |span| offset_at(state.store(), span.start))
+            .map_or(start, |span| offset_at(&state.store(), span.start))
             .min(caret);
         let end = if replace {
-            word_end(state.store(), caret).max(caret)
+            word_end(&state.store(), caret).max(caret)
         } else {
             caret
         };
@@ -1723,6 +1724,7 @@ impl EditorView {
         options: AcceptOptions,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(cx);
         let Some(state) = &self.state else {
             return;
         };
@@ -1749,11 +1751,12 @@ impl EditorView {
             return;
         };
         let end = end.max(start).min(state.store().len());
+        let store = state.store();
         let mut shift = 0isize;
         let mut edits: Vec<Edit> = Vec::new();
         for edit in additional {
-            let from = offset_at(state.store(), edit.span.start);
-            let to = offset_at(state.store(), edit.span.end).max(from);
+            let from = offset_at(&store, edit.span.start);
+            let to = offset_at(&store, edit.span.end).max(from);
             // A server sends its additional edits elsewhere; one over the insertion is
             // dropped rather than applied twice.
             if from < end && start < to {
@@ -1863,6 +1866,7 @@ impl EditorView {
         additional: &[DocumentEdit],
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(cx);
         let Some(state) = &mut self.state else {
             return;
         };
@@ -2319,7 +2323,7 @@ impl EditorView {
             return;
         };
         cx.default_global::<Reveals>().0.remove(&self.path);
-        let at = offset_at(state.store(), point);
+        let at = offset_at(&state.store(), point);
         state.select_range(at..at);
         self.reveal_center = true;
         self.changed(None, cx);

@@ -969,7 +969,7 @@ impl EditorView {
         }
         let offset = self.offset_at(position)?;
         let store = state.store();
-        let start = crate::semantic::word_start(store, offset);
+        let start = crate::semantic::word_start(&store, offset);
         let mut end = offset;
         while end < store.len() {
             let Some(character) = store.char_at(end) else {

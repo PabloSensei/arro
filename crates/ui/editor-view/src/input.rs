@@ -65,6 +65,7 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(cx);
         if self.override_typed(text, cx)
             || self.generation_typed(text, cx)
             || self.move_typed(text, cx)
@@ -97,6 +98,7 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(cx);
         let bytes = range.and_then(|range| self.to_utf8(&range));
         let change = self
             .state

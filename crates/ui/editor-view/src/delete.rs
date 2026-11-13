@@ -295,8 +295,8 @@ impl EditorView {
         let (start, end) = (edit.start.min(text_len), edit.end.min(text_len));
         let edit = DocumentEdit {
             span: TextSpan {
-                start: point_at(state.store(), start),
-                end: point_at(state.store(), end),
+                start: point_at(&state.store(), start),
+                end: point_at(&state.store(), end),
             },
             text: edit.replacement,
         };

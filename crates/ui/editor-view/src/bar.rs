@@ -184,7 +184,7 @@ impl EditorView {
         let selection = state.selections().primary();
         let word = state.caret_word().or_else(|| {
             (!selection.is_empty())
-                .then(|| text_core::commands::word_at(state.store(), selection.start()))
+                .then(|| text_core::commands::word_at(&state.store(), selection.start()))
                 .filter(|word| !word.is_empty())
         });
         let Some(word) = word else {
@@ -303,6 +303,7 @@ impl EditorView {
     }
 
     fn replace_current(&mut self, cx: &mut Context<Self>) {
+        self.catch_up(cx);
         let Some((edits, at)) = self.replace_edits(true) else {
             return;
         };
@@ -317,6 +318,7 @@ impl EditorView {
     }
 
     fn replace_all(&mut self, cx: &mut Context<Self>) {
+        self.catch_up(cx);
         let Some((edits, _)) = self.replace_edits(false) else {
             return;
         };

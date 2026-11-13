@@ -187,6 +187,13 @@ impl LiveTemplates {
         (indent, unit)
     }
 
+    /// Drops the open session: its ranges point into text this view no longer has.
+    pub fn abandon(&mut self) {
+        self.session = None;
+        self.list = None;
+        self.started = false;
+    }
+
     /// Starts walking the fields of `expansion`, inserted at `at`.
     pub fn start_session(&mut self, expansion: &Expansion, at: usize) {
         self.session = Session::start(expansion, at);
@@ -591,6 +598,7 @@ impl EditorView {
 
     /// `true` when the key went to the list or the fields.
     pub(crate) fn template_key(&mut self, stroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        self.catch_up(cx);
         self.sync_templates(cx);
         let Some(state) = &mut self.state else {
             return false;
@@ -617,6 +625,7 @@ impl EditorView {
     /// Enter or Space expands the template that chose it, when its abbreviation ends at
     /// the caret and no completion list is open. `false` leaves the key its usual text.
     pub(crate) fn template_expand_key(&mut self, key: ExpandWith, cx: &mut Context<Self>) -> bool {
+        self.catch_up(cx);
         if self
             .lsp
             .as_ref()
