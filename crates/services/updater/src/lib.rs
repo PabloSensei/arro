@@ -11,14 +11,79 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+/// A system the release is built for. The archive of a release is named after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Platform {
+    WindowsX86_64,
+    LinuxX86_64,
+    MacosAarch64,
+    MacosX86_64,
+}
+
+impl Platform {
+    /// Every system the project publishes an archive for.
+    pub const ALL: [Self; 4] = [
+        Self::WindowsX86_64,
+        Self::LinuxX86_64,
+        Self::MacosAarch64,
+        Self::MacosX86_64,
+    ];
+
+    /// The suffix of the archive name, as in `arro-0.1.0-windows-x86_64.zip`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::WindowsX86_64 => "windows-x86_64",
+            Self::LinuxX86_64 => "linux-x86_64",
+            Self::MacosAarch64 => "macos-aarch64",
+            Self::MacosX86_64 => "macos-x86_64",
+        }
+    }
+
+    /// The container of the archive: a zip on Windows and macOS, a compressed tar on Linux.
+    pub const fn archive_extension(self) -> &'static str {
+        match self {
+            Self::LinuxX86_64 => "tar.gz",
+            Self::WindowsX86_64 | Self::MacosAarch64 | Self::MacosX86_64 => "zip",
+        }
+    }
+
+    /// The system of this build.
+    pub const fn current() -> Self {
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            Self::WindowsX86_64
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            Self::LinuxX86_64
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self::MacosAarch64
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            Self::MacosX86_64
+        }
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64")
+)))]
+compile_error!("the updater has no release platform for this target");
+
 /// Where the latest release is described.
 pub const RELEASES_URL: &str = "https://api.github.com/repos/PabloSensei/arro/releases/latest";
 /// Replaces [`RELEASES_URL`], for tests and for a moved repository.
 pub const UPDATE_URL_ENV: &str = "ARRO_UPDATE_URL";
 /// Set to `1` to turn the automatic check off.
 pub const NO_UPDATE_CHECK_ENV: &str = "ARRO_NO_UPDATE_CHECK";
-/// The asset suffix of the only platform the distribution is made for.
-pub const PLATFORM: &str = "windows-x86_64";
+/// The suffix the assets of this build carry, `windows-x86_64` for example.
+pub const PLATFORM: &str = Platform::current().name();
 /// The list of files the installed release brought, one relative path per line. It
 /// tells the first start after an update which folders of the old release are gone.
 pub const MANIFEST_FILE: &str = "install.manifest";
@@ -215,9 +280,18 @@ pub fn parse_tag(tag: &str) -> Result<Version, Error> {
     Version::parse(text).map_err(|_| Error::InvalidVersion(tag.to_owned()))
 }
 
-/// What the archive of `version` is called.
+/// What the archive of `version` is called on `platform`.
+pub fn archive_name_for(version: &Version, platform: Platform) -> String {
+    format!(
+        "arro-{version}-{}.{}",
+        platform.name(),
+        platform.archive_extension()
+    )
+}
+
+/// What the archive of `version` is called on this build's platform.
 pub fn archive_name(version: &Version) -> String {
-    format!("arro-{version}-{PLATFORM}.zip")
+    archive_name_for(version, Platform::current())
 }
 
 /// A version string such as `0.1.0` as a version, for the running build.
@@ -225,14 +299,72 @@ pub fn parse_version(text: &str) -> Option<Version> {
     Version::parse(text.trim()).ok()
 }
 
-/// Replaces the files of `install_dir` with the contents of `zip`. The running executable
-/// is renamed to `*.old` first; any error puts every file back the way it was.
-pub fn stage(zip: &Path, install_dir: &Path) -> Result<(), Error> {
-    let running = std::env::current_exe().ok().and_then(|path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-    });
-    stage_as(zip, install_dir, running.as_deref())
+/// The folder an update replaces: the folder of the executable, or the `*.app` bundle
+/// that holds it on macOS.
+pub fn install_dir() -> io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    Ok(bundle_root(&executable))
+}
+
+/// [`install_dir`] for a program at `executable`. macOS keeps the program inside a
+/// bundle, so the folder to replace is the bundle, not `Contents/MacOS`.
+fn bundle_root(executable: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let mut folder = executable.parent();
+        while let Some(path) = folder {
+            if path.extension().is_some_and(|extension| extension == "app") {
+                return path.to_owned();
+            }
+            folder = path.parent();
+        }
+    }
+    executable.parent().unwrap_or(executable).to_owned()
+}
+
+/// The program of an installed release, next to [`install_dir`] or inside the macOS
+/// bundle. The running executable may have been renamed to `*.old` by the update, so
+/// the caller starts this one instead.
+fn executable_for(install_dir: &Path, name: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        bundle_executable(install_dir, name)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        install_dir.join(name)
+    }
+}
+
+/// The program inside a `*.app` bundle. The bundle is also replaced on other systems
+/// in the tests, so this does not depend on the system it is compiled for.
+#[cfg(any(target_os = "macos", test))]
+fn bundle_executable(bundle: &Path, name: &str) -> PathBuf {
+    bundle.join("Contents").join("MacOS").join(name)
+}
+
+/// Replaces the files of `install_dir` with the contents of `archive` and returns the
+/// program of the new release to start. The running executable is renamed to `*.old`
+/// first; any error puts every file back the way it was. On macOS the whole `*.app`
+/// bundle is replaced.
+pub fn stage(archive: &Path, install_dir: &Path) -> Result<PathBuf, Error> {
+    let name = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the name of the running program is unknown",
+            ))
+        })?;
+    #[cfg(target_os = "macos")]
+    stage_bundle(archive, install_dir, Some(&name))?;
+    #[cfg(not(target_os = "macos"))]
+    stage_as(archive, install_dir, Some(&name))?;
+    Ok(executable_for(install_dir, &name))
 }
 
 /// [`stage`] with the name of the executable that is running. Tests name it themselves.
@@ -267,6 +399,13 @@ fn stage_as(zip: &Path, install_dir: &Path, running: Option<&str>) -> Result<(),
         let _ = fs::remove_dir_all(&temp);
         return Err(error);
     }
+    if let Some(name) = running
+        && let Err(error) = platform::make_executable(&install_dir.join(name))
+    {
+        transaction.rollback();
+        let _ = fs::remove_dir_all(&temp);
+        return Err(error.into());
+    }
     // The start of the new version reads this list to remove the folders of the old
     // one, so a failure here takes the replacement back too.
     if let Err(error) = write_manifest(install_dir, &files) {
@@ -277,6 +416,77 @@ fn stage_as(zip: &Path, install_dir: &Path, running: Option<&str>) -> Result<(),
     }
     let _ = fs::remove_dir_all(&temp);
     Ok(())
+}
+
+/// [`stage`] for macOS: the archive holds the whole `*.app` bundle, and the bundle of
+/// the running program is renamed to `*.old` and replaced in one step. A running
+/// bundle can be renamed, so nothing inside it has to be touched file by file.
+#[cfg(any(target_os = "macos", test))]
+fn stage_bundle(archive: &Path, bundle: &Path, running: Option<&str>) -> Result<(), Error> {
+    let parent = bundle.parent().unwrap_or(bundle);
+    let temp = parent.join(format!(".arro-stage-{}-{}", std::process::id(), next_id()));
+    if temp.exists() {
+        fs::remove_dir_all(&temp)?;
+    }
+    let extracted = temp.join("files");
+    fs::create_dir_all(&extracted)?;
+
+    let files = extract(archive, &extracted).inspect_err(|_| {
+        let _ = fs::remove_dir_all(&temp);
+    })?;
+    // macOS archives hold `Arro.app/...`; a bundle is replaced as a folder, not file
+    // by file, so the folder inside the archive is the new bundle. A folder of the
+    // same name wins over the only folder of the archive.
+    let same_name = bundle
+        .file_name()
+        .map(|name| extracted.join(name))
+        .filter(|folder| folder.is_dir());
+    let staged = same_name
+        .or_else(|| single_root(&files).map(|root| extracted.join(root)))
+        .unwrap_or_else(|| extracted.clone());
+    if !staged.is_dir() {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(Error::Tar(format!(
+            "{} has no application folder",
+            archive.display()
+        )));
+    }
+
+    let old = old_bundle(bundle);
+    if old.exists() {
+        fs::remove_dir_all(&old)?;
+    }
+    fs::rename(bundle, &old)?;
+    if let Err(error) = fs::rename(&staged, bundle) {
+        let _ = fs::rename(&old, bundle);
+        let _ = fs::remove_dir_all(&temp);
+        return Err(error.into());
+    }
+    if let Some(name) = running {
+        platform::make_executable(&bundle_executable(bundle, name))?;
+    }
+    let _ = fs::remove_dir_all(&temp);
+    Ok(())
+}
+
+/// `Arro.app` and `Arro.app.old` next to each other.
+#[cfg(any(target_os = "macos", test))]
+fn old_bundle(bundle: &Path) -> PathBuf {
+    let mut name = bundle.file_name().unwrap_or_default().to_os_string();
+    name.push(".old");
+    bundle.with_file_name(name)
+}
+
+/// Deletes the bundle an earlier update replaced, `Arro.app.old`. The first start of
+/// the new version does this, while no process runs from the old bundle any more.
+#[cfg(any(target_os = "macos", test))]
+pub fn remove_old_bundle(bundle: &Path) -> io::Result<usize> {
+    let old = old_bundle(bundle);
+    if old.is_dir() {
+        fs::remove_dir_all(&old)?;
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 /// Writes the files of the installed release, relative to `install_dir`, into
@@ -369,6 +579,10 @@ pub fn remove_stale_tools(install_dir: &Path) -> io::Result<usize> {
 /// of an older release. Errors go to the journal and do not stop the others.
 pub fn cleanup(install_dir: &Path) -> io::Result<usize> {
     let mut removed = remove_old(install_dir)?;
+    #[cfg(target_os = "macos")]
+    {
+        removed += remove_old_bundle(install_dir)?;
+    }
     match remove_stale_tools(install_dir) {
         Ok(stale) => removed += stale,
         Err(error) => eprintln!("the tools of an older release are not removed: {error}"),
@@ -444,7 +658,22 @@ fn sha256_file(path: &Path) -> Result<String, Error> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn extract(zip: &Path, into: &Path) -> Result<Vec<PathBuf>, Error> {
+fn extract(archive: &Path, into: &Path) -> Result<Vec<PathBuf>, Error> {
+    if is_tar_gz(archive) {
+        extract_tar_gz(archive, into)
+    } else {
+        extract_zip(archive, into)
+    }
+}
+
+/// Whether the release is a compressed tar rather than a zip.
+fn is_tar_gz(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".tar.gz") || name.ends_with(".tgz"))
+}
+
+fn extract_zip(zip: &Path, into: &Path) -> Result<Vec<PathBuf>, Error> {
     let file = File::open(zip)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|error| Error::Zip(error.to_string()))?;
     let mut files = Vec::new();
@@ -462,6 +691,7 @@ fn extract(zip: &Path, into: &Path) -> Result<Vec<PathBuf>, Error> {
         let target = into.join(&relative);
         if entry.is_dir() {
             fs::create_dir_all(&target)?;
+            platform::set_mode(&target, entry.unix_mode().unwrap_or(0o755))?;
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -469,9 +699,183 @@ fn extract(zip: &Path, into: &Path) -> Result<Vec<PathBuf>, Error> {
         }
         let mut out = File::create(&target)?;
         io::copy(&mut entry, &mut out)?;
+        if let Some(mode) = entry.unix_mode() {
+            platform::set_mode(&target, mode)?;
+        }
         files.push(relative);
     }
     Ok(files)
+}
+
+const TAR_BLOCK: usize = 512;
+
+/// Unpacks a `.tar.gz` release. The tar reader is small on purpose: the archives the
+/// project publishes hold folders and regular files, and the paths are checked here so
+/// nothing may land outside `into`.
+fn extract_tar_gz(archive: &Path, into: &Path) -> Result<Vec<PathBuf>, Error> {
+    let file = File::open(archive)?;
+    let mut reader = io::BufReader::new(flate2::read::GzDecoder::new(file));
+    let mut files = Vec::new();
+    // A long name or a pax header comes in an entry of its own, before the file it
+    // describes.
+    let mut long_name: Option<String> = None;
+    loop {
+        let mut header = [0u8; TAR_BLOCK];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(Error::Tar(format!(
+                    "{} ends in the middle of a header",
+                    archive.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let size = octal(&header[124..136])?;
+        let mode = octal(&header[100..108])? as u32;
+        let kind = header[156];
+        let mut name = text_field(&header[0..100]);
+        let prefix = text_field(&header[345..500]);
+        if !prefix.is_empty() {
+            name = format!("{prefix}/{name}");
+        }
+
+        match kind {
+            b'L' => {
+                long_name = Some(text_of(&read_tar_data(&mut reader, size)?));
+                continue;
+            }
+            b'x' => {
+                let data = read_tar_data(&mut reader, size)?;
+                long_name = pax_path(&data);
+                continue;
+            }
+            b'g' => {
+                skip_tar_data(&mut reader, size)?;
+                continue;
+            }
+            _ => {}
+        }
+        let name = long_name.take().unwrap_or(name);
+        let relative = safe_relative(&name)?;
+        let target = into.join(&relative);
+
+        if kind == b'5' || name.ends_with('/') {
+            fs::create_dir_all(&target)?;
+            platform::set_mode(&target, mode)?;
+            skip_tar_data(&mut reader, size)?;
+            continue;
+        }
+        if kind != b'0' && kind != 0 && kind != b'7' {
+            skip_tar_data(&mut reader, size)?;
+            return Err(Error::Tar(format!(
+                "{name} is not a file or a folder of the release"
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut out = File::create(&target)?;
+        io::copy(&mut reader.by_ref().take(size), &mut out)?;
+        skip_padding(&mut reader, size)?;
+        platform::set_mode(&target, mode)?;
+        files.push(relative);
+    }
+    Ok(files)
+}
+
+/// The bytes of a header entry and the padding that aligns the next header.
+fn read_tar_data(reader: &mut impl Read, size: u64) -> Result<Vec<u8>, Error> {
+    let mut data = vec![0u8; usize::try_from(size).map_err(|_| Error::Tar("a huge name".into()))?];
+    reader.read_exact(&mut data)?;
+    skip_padding(reader, size)?;
+    Ok(data)
+}
+
+fn skip_tar_data(reader: &mut impl Read, size: u64) -> Result<(), Error> {
+    io::copy(&mut reader.by_ref().take(size), &mut io::sink())?;
+    skip_padding(reader, size)
+}
+
+fn skip_padding(reader: &mut impl Read, size: u64) -> Result<(), Error> {
+    let padding = (TAR_BLOCK as u64 - size % TAR_BLOCK as u64) % TAR_BLOCK as u64;
+    if padding > 0 {
+        io::copy(&mut reader.by_ref().take(padding), &mut io::sink())?;
+    }
+    Ok(())
+}
+
+/// A NUL-terminated text field of a tar header.
+fn text_field(field: &[u8]) -> String {
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).trim().to_owned()
+}
+
+fn text_of(data: &[u8]) -> String {
+    String::from_utf8_lossy(data)
+        .trim_end_matches('\0')
+        .to_owned()
+}
+
+/// The `path` of a pax extended header, `18 path=some/name\n`.
+fn pax_path(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    for record in text.split('\n') {
+        let Some((_, field)) = record.split_once(' ') else {
+            continue;
+        };
+        let Some(value) = field.strip_prefix("path=") else {
+            continue;
+        };
+        let value = value.trim_end_matches('\0');
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+/// An octal number of a tar header. GNU writes a huge size with the high bit of the
+/// first byte set; a release does not have such a file.
+fn octal(field: &[u8]) -> Result<u64, Error> {
+    let text = text_field(field);
+    if text.is_empty() {
+        return Ok(0);
+    }
+    u64::from_str_radix(text.trim(), 8)
+        .map_err(|_| Error::Tar(format!("{text} is not a number of a tar header")))
+}
+
+/// The path of a tar entry, relative to the folder of the unpacking. `..`, a root and
+/// a Windows prefix are refused.
+fn safe_relative(name: &str) -> Result<PathBuf, Error> {
+    let name = name.trim_start_matches("./");
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(Error::Tar(format!("{name} is outside the archive")));
+    }
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(Error::Tar(format!("{name} is outside the archive")));
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(Error::Tar("the archive has an entry without a name".into()));
+    }
+    Ok(relative)
 }
 
 /// The one folder every file of the archive sits in, if there is such a folder.
@@ -598,6 +1002,7 @@ pub enum Error {
     ChecksumFile(String),
     Checksum { expected: String, actual: String },
     Zip(String),
+    Tar(String),
     Io(io::Error),
 }
 
@@ -620,6 +1025,7 @@ impl std::fmt::Display for Error {
                 write!(formatter, "the archive is {actual}, not {expected}")
             }
             Self::Zip(message) => write!(formatter, "the archive is broken: {message}"),
+            Self::Tar(message) => write!(formatter, "the archive is broken: {message}"),
             Self::Io(error) => write!(formatter, "the update cannot touch the files: {error}"),
         }
     }
@@ -813,11 +1219,9 @@ mod tests {
         assert_eq!(release.version, version("0.2.0"));
         assert_eq!(release.tag, "v0.2.0");
         assert_eq!(release.notes, "Notes");
-        assert_eq!(release.archive.name, "arro-0.2.0-windows-x86_64.zip");
-        assert_eq!(
-            release.checksum.name,
-            "arro-0.2.0-windows-x86_64.zip.sha256"
-        );
+        let archive = archive_name(&version("0.2.0"));
+        assert_eq!(release.archive.name, archive);
+        assert_eq!(release.checksum.name, format!("{archive}.sha256"));
     }
 
     #[test]
@@ -856,13 +1260,11 @@ mod tests {
 
     #[test]
     fn a_release_without_the_archive_is_an_error() {
+        let checksum = format!("{}.sha256", archive_name(&version("0.2.0")));
         let json = release_json(
             "v0.2.0",
             false,
-            &[(
-                "arro-0.2.0-windows-x86_64.zip.sha256",
-                "https://example.test/archive.zip.sha256",
-            )],
+            &[(&checksum, "https://example.test/archive.zip.sha256")],
         );
         let error = parse_release(&json).unwrap_err();
         assert!(matches!(error, Error::MissingAsset(_)), "{error}");
@@ -1082,5 +1484,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod release_tests;
 #[cfg(test)]
 mod update_tests;

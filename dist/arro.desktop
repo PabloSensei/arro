@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Arro
+GenericName=Java IDE
+Comment=A native Java IDE
+Exec="@ARRO_DIR@/arro" %F
+Icon=arro
+Terminal=false
+Categories=Development;IDE;
+StartupNotify=true
+StartupWMClass=Arro

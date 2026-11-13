@@ -19,15 +19,49 @@ const CONTEXT: &str = "BranchPopup";
 
 actions!(branches, [Rename, NewBranch]);
 
-/// The keys of the popup while it has the focus. They are actions of their own, so that
-/// F2 renames a branch here and goes to the next problem everywhere else.
-pub(crate) fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("f2", Rename, Some(CONTEXT)),
-        KeyBinding::new("shift-f6", Rename, Some(CONTEXT)),
-        KeyBinding::new("ctrl-alt-n", NewBranch, Some(CONTEXT)),
-    ]);
+macro_rules! branch_keys {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
+        /// The keys of the popup while it has the focus. They are actions of their own,
+        /// so that F2 renames a branch here and goes to the next problem everywhere else.
+        pub(crate) fn bind_keys(cx: &mut App) {
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("branches::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
+        }
+
+        #[cfg(test)]
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
+                keys: $keys,
+                mac: $mac,
+                action: concat!("branches::", stringify!($action)),
+                context: Some(CONTEXT),
+                idea: $idea,
+            }),*
+        ];
+    };
 }
+
+branch_keys![
+    ("f2", Rename, Some("Git.Rename.Local.Branch"), None),
+    ("shift-f6", Rename, Some("Git.Rename.Local.Branch"), None),
+    ("ctrl-alt-n", NewBranch, Some("Git.CreateNewBranch"), None),
+];
 
 const WIDTH: f32 = 470.;
 const MAX_HEIGHT: f32 = 560.;

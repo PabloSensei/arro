@@ -4,6 +4,7 @@ mod budgets;
 mod ci;
 mod conpty;
 mod dist;
+mod dist_linux;
 mod dist_macos;
 mod helpers;
 mod icons;
@@ -39,12 +40,14 @@ commands:
   check-scrollbars           every scrolled area in the UI crates has scrollbars or is exempt
   build-helpers --out DIR [--maven-lib DIR]
                              the helper jars that run in project JVMs, needs a JDK
-  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--target windows|macos]
+  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--target windows|linux|macos]
                              release Arro, helpers, jdtls, java-debug, README, run-arro.cmd
                              and THIRD-PARTY.txt; the jdtls and java-debug archives come
                              from --tools DIR, $IDE_CORPUS/tools by default; arro.pdb and
-                             arro.exe go to DIR-symbols/<commit> by default. --target macos
-                             builds Arro.app with an ad-hoc signature instead, on a Mac
+                             arro.exe go to DIR-symbols/<commit> by default. --target linux
+                             writes arro, tools, arro.desktop, the icon and install.sh, and
+                             --target macos builds Arro.app with an ad-hoc signature; both
+                             are built on their own system
   symbolize LOG [--symbols DIR]
                              function and file:line for the arro.exe frames of a panic log;
                              DIR is target/symbols by default
@@ -107,7 +110,9 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
             "--zip" => zip = true,
             "--target" => {
                 index += 1;
-                target = args.get(index).ok_or("--target needs windows or macos")?;
+                target = args
+                    .get(index)
+                    .ok_or("--target needs windows, linux or macos")?;
             }
             "--out" => {
                 index += 1;
@@ -132,8 +137,9 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
     let out = out.ok_or("dist needs --out DIR")?;
     match target {
         "windows" => dist::run(root, out, symbols, tools, zip),
+        "linux" => dist_linux::run(root, out, tools, zip),
         "macos" => dist_macos::run(root, out, tools, zip),
-        other => Err(format!("unknown dist target: {other}; windows or macos").into()),
+        other => Err(format!("unknown dist target: {other}; windows, linux or macos").into()),
     }
 }
 

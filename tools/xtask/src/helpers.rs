@@ -68,9 +68,16 @@ pub fn run(root: &Path, out: &Path, maven_lib: Option<&Path>) -> Result {
 
 fn tool(name: &str) -> PathBuf {
     let from_home = env::var_os("JAVA_HOME").map(|home| {
-        let mut file = PathBuf::from(home).join("bin").join(name);
-        file.set_extension("exe");
-        file
+        #[cfg(windows)]
+        {
+            let mut file = PathBuf::from(home).join("bin").join(name);
+            file.set_extension("exe");
+            file
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(home).join("bin").join(name)
+        }
     });
     from_home
         .filter(|file| file.is_file())
@@ -108,20 +115,41 @@ fn find_maven_lib() -> Option<PathBuf> {
         .filter_map(|name| env::var_os(name).map(PathBuf::from))
         .chain(mvn_in_path());
     let lib = installed
-        .map(|home| home.join("lib"))
+        .flat_map(|home| {
+            [
+                home.join("lib"),
+                home.join("libexec").join("lib"),
+                home.join("libexec"),
+            ]
+        })
         .find(|lib| is_maven_3_9(lib));
     lib.or_else(wrapper_lib)
 }
 
-/// `bin/mvn.cmd` on PATH, the home is one level up.
+/// `bin/mvn` on PATH, the home is one level up. A distribution installed by a package
+/// manager is a symlink, so the home comes from the real file.
 fn mvn_in_path() -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
-    let mvn = env::split_paths(&path).map(|directory| directory.join("mvn.cmd"));
-    mvn.into_iter()
-        .find(|file| file.is_file())?
-        .parent()?
-        .parent()
-        .map(Path::to_owned)
+    let programs = ["mvn.cmd", "mvn.bat", "mvn"];
+    for directory in env::split_paths(&path) {
+        for name in programs {
+            let file = directory.join(name);
+            if !file.is_file() {
+                continue;
+            }
+            let file = fs::canonicalize(&file).unwrap_or(file);
+            let Some(home) = file.parent().and_then(Path::parent) else {
+                continue;
+            };
+            if home.join("lib").is_dir()
+                || home.join("libexec").join("lib").is_dir()
+                || home.join("libexec").is_dir()
+            {
+                return Some(home.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// `dists/<version>/<hash>/lib` from the script wrapper, or
@@ -129,7 +157,11 @@ fn mvn_in_path() -> Option<PathBuf> {
 fn wrapper_lib() -> Option<PathBuf> {
     let home = env::var_os("MAVEN_USER_HOME")
         .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(env::var_os("USERPROFILE")?).join(".m2")))?;
+        .or_else(|| {
+            env::var_os("USERPROFILE")
+                .or_else(|| env::var_os("HOME"))
+                .map(|home| PathBuf::from(home).join(".m2"))
+        })?;
     let mut candidates = Vec::new();
     for version in children(&home.join("wrapper/dists")) {
         for hash in children(&version) {

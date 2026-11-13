@@ -436,10 +436,7 @@ fn wait_for_old_process(process_id: Option<u32>) {
 /// program folder is dropped, so the search reads the new release; a folder the user
 /// chose elsewhere stays.
 fn forget_replaced_tools() {
-    let Some(install) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
+    let Ok(install) = updater::install_dir() else {
         return;
     };
     for name in [java_lang::JDTLS_HOME, java_lang::DEBUG_PLUGIN] {

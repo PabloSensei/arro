@@ -51,7 +51,16 @@ fn read_text(path: &Path) -> Option<String> {
 actions!(show_usages_popup, [Dismiss]);
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", Dismiss, Some(POPUP_CONTEXT))]);
+    let row = workspace::KeyRow {
+        keys: "escape",
+        mac: Some("escape"),
+        action: "show_usages_popup::Dismiss",
+        context: Some(POPUP_CONTEXT),
+        idea: None,
+    };
+    for key in row.keys_for(keymap::platform()) {
+        cx.bind_keys([KeyBinding::new(key, Dismiss, Some(POPUP_CONTEXT))]);
+    }
 }
 
 /// One tab of the Usages window: the places of one symbol search.
@@ -654,7 +663,7 @@ impl UsagesHub {
         let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
         let Some(tab) = self.tabs.get(self.active) else {
             self.sources.clear();
-            let buttons = header_buttons(&settings, cx);
+            let buttons = header_buttons(&settings, &self.workspace, cx);
             self.panel.update(cx, |panel, cx| {
                 panel.set_header_buttons(buttons, cx);
                 panel.set_view(Vec::new(), Vec::new(), cx);
@@ -706,7 +715,7 @@ impl UsagesHub {
             sources.push(index);
         }
         self.sources = sources;
-        let buttons = header_buttons(&settings, cx);
+        let buttons = header_buttons(&settings, &self.workspace, cx);
         self.panel.update(cx, |panel, cx| {
             panel.set_header_buttons(buttons, cx);
             panel.set_view(items, panel_rows, cx);
@@ -1190,13 +1199,34 @@ fn split_name(name: &str) -> Vec<String> {
         .collect()
 }
 
-fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<HeaderButton> {
+fn header_buttons(
+    settings: &Settings,
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut Context<UsagesHub>,
+) -> Vec<HeaderButton> {
     let weak = cx.weak_entity();
+    let platform = keymap::platform();
+    let hint = |id: &str, fallback: &str| -> String {
+        let text = workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).shortcut_of(id));
+        keymap::shortcut_label(text.as_deref().unwrap_or(fallback), platform)
+    };
+    // Group by File Structure shares its IDEA key with the filter popup, which the keymap
+    // does not bind, so the row keeps the key of the layout file.
+    let file_structure = if platform.uses_command() {
+        keymap::macos_keys("UsageGrouping.FileStructure")
+            .and_then(|keys| keys.first().copied())
+            .unwrap_or("alt-cmd-f")
+    } else {
+        "ctrl-alt-f"
+    };
     let button = |id,
                   label: &str,
                   icon: &'static str,
                   tooltip: &str,
-                  shortcut: &str,
+                  action: &str,
+                  fallback: &str,
                   active,
                   change: fn(&mut Settings)| {
         let weak = weak.clone();
@@ -1206,7 +1236,7 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             active,
             icon: Some(icon),
             tooltip: Some(tooltip.to_owned()),
-            shortcut: Some(shortcut.to_owned()),
+            shortcut: Some(hint(action, fallback)),
             run: std::rc::Rc::new(move |_, cx| {
                 let weak = weak.clone();
                 cx.spawn(async move |cx| {
@@ -1217,13 +1247,15 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             }),
         }
     };
+    use keymap::workspace as actions;
     vec![
         button(
             "usage-group-type",
             "Group by Type",
             "general/filter",
             "Group by Type",
-            "Ctrl+Alt+T",
+            actions::USAGE_GROUP_USAGE_TYPE,
+            "ctrl-alt-t",
             settings.usage_group_usage_type,
             |settings| settings.usage_group_usage_type = !settings.usage_group_usage_type,
         ),
@@ -1232,7 +1264,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Group by Module",
             "nodes/module",
             "Group by Module",
-            "Ctrl+Alt+M",
+            actions::USAGE_GROUP_MODULE,
+            "ctrl-alt-m",
             settings.usage_group_module,
             |settings| settings.usage_group_module = !settings.usage_group_module,
         ),
@@ -1241,7 +1274,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Group by Package",
             "nodes/package",
             "Group by Package",
-            "Ctrl+Alt+P",
+            actions::USAGE_GROUP_DIRECTORY,
+            "ctrl-alt-p",
             settings.usage_group_directory,
             |settings| settings.usage_group_directory = !settings.usage_group_directory,
         ),
@@ -1250,7 +1284,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Group by Directory",
             "nodes/folder",
             "Group by Directory Structure",
-            "Ctrl+Alt+D",
+            actions::USAGE_GROUP_DIRECTORY_STRUCTURE,
+            "ctrl-alt-d",
             settings.usage_group_directory_structure,
             |settings| {
                 settings.usage_group_directory_structure = !settings.usage_group_directory_structure
@@ -1261,7 +1296,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Group by File",
             "fileTypes/text",
             "Group by File Structure",
-            "Ctrl+Alt+F",
+            actions::USAGE_GROUP_FILE_STRUCTURE,
+            file_structure,
             settings.usage_group_file_structure,
             |settings| settings.usage_group_file_structure = !settings.usage_group_file_structure,
         ),
@@ -1270,7 +1306,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Flatten Modules",
             "general/collapseAll",
             "Flatten Modules",
-            "Ctrl+Alt+O",
+            actions::USAGE_GROUP_FLATTEN_MODULES,
+            "ctrl-alt-o",
             settings.usage_flatten_modules,
             |settings| settings.usage_flatten_modules = !settings.usage_flatten_modules,
         ),
@@ -1279,7 +1316,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Show Read Access",
             "general/show",
             "Show Read Access",
-            "Ctrl+R",
+            actions::USAGE_FILTER_READ,
+            "ctrl-r",
             !settings.usage_show_read,
             |settings| settings.usage_show_read = !settings.usage_show_read,
         ),
@@ -1288,7 +1326,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Show Write Access",
             "general/add",
             "Show Write Access",
-            "Ctrl+W",
+            actions::USAGE_FILTER_WRITE,
+            "ctrl-w",
             !settings.usage_show_write,
             |settings| settings.usage_show_write = !settings.usage_show_write,
         ),
@@ -1297,7 +1336,8 @@ fn header_buttons(settings: &Settings, cx: &mut Context<UsagesHub>) -> Vec<Heade
             "Show Imports",
             "general/openInToolWindow",
             "Show Imports",
-            "Ctrl+I",
+            actions::USAGE_FILTER_IMPORTS,
+            "ctrl-i",
             !settings.usage_show_imports,
             |settings| settings.usage_show_imports = !settings.usage_show_imports,
         ),

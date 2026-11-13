@@ -1,0 +1,115 @@
+# Builds the Linux and macOS archives and attaches them to a published release. The
+# Windows archive comes from the release script, built and tested on the maintainer's
+# machine, and is not replaced here.
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # The pinned language tools. `xtask dist` checks the SHA-256 of both files, so a
+  # different file stops the job instead of shipping another server.
+  JDTLS_ARCHIVE: jdt-language-server-1.63.0-202610191322.tar.gz
+  JDTLS_URL: https://download.eclipse.org/jdtls/snapshots/jdt-language-server-1.63.0-202610191322.tar.gz
+  DEBUG_ARCHIVE: vscjava.vscode-java-debug-0.60.0.vsix
+  DEBUG_URL: https://open-vsx.org/api/vscjava/vscode-java-debug/0.60.0/file/vscjava.vscode-java-debug-0.60.0.vsix
+
+jobs:
+  linux:
+    name: Linux archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GPUI draws through Wayland or X11 with fontconfig and xkbcommon, which the
+      # runner does not carry by default.
+      - name: Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Toolchain
+        run: rustup show active-toolchain && cargo --version
+
+      - name: Language tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/download-jdtls" "$RUNNER_TEMP/tools/download-java-debug"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-jdtls/$JDTLS_ARCHIVE" "$JDTLS_URL"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-java-debug/$DEBUG_ARCHIVE" "$DEBUG_URL"
+
+      - name: Archive and checksum
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="arro-$version-linux-x86_64"
+          mkdir -p "$RUNNER_TEMP/dist"
+          cargo run -q -p xtask -- dist --target linux \
+            --out "$RUNNER_TEMP/dist/$name" --tools "$RUNNER_TEMP/tools" --zip
+          cd "$RUNNER_TEMP/dist"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/dist/"arro-*.tar.gz \
+            "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256 \
+            --clobber
+
+  macos:
+    name: macOS archive
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup show active-toolchain && cargo --version
+
+      - name: Language tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/download-jdtls" "$RUNNER_TEMP/tools/download-java-debug"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-jdtls/$JDTLS_ARCHIVE" "$JDTLS_URL"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-java-debug/$DEBUG_ARCHIVE" "$DEBUG_URL"
+
+      # The runner is Apple silicon. `xtask dist --target macos` names the archive after
+      # the machine it built on, `macos-aarch64` here and `macos-x86_64` on an Intel Mac.
+      - name: Archive and checksum
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          case "$(uname -m)" in
+            arm64) platform=macos-aarch64 ;;
+            x86_64) platform=macos-x86_64 ;;
+            *) echo "no macOS release for $(uname -m)" >&2; exit 1 ;;
+          esac
+          out="$RUNNER_TEMP/dist"
+          mkdir -p "$out"
+          cargo run -q -p xtask -- dist --target macos --out "$out" \
+            --tools "$RUNNER_TEMP/tools" --zip
+          archive="$out/arro-$version-$platform.zip"
+          cd "$out"
+          shasum -a 256 "arro-$version-$platform.zip" > "arro-$version-$platform.zip.sha256"
+          cat "arro-$version-$platform.zip.sha256"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/dist/"arro-*.zip \
+            "$RUNNER_TEMP/dist/"arro-*.zip.sha256 \
+            --clobber

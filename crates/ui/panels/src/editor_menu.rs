@@ -8,11 +8,6 @@ use keymap::workspace as workspace_keys;
 use ui_kit::*;
 use workspace::Workspace;
 
-/// `ctrl-shift-n` as the menus write it: `Ctrl+Shift+N`, or `⇧⌘N` on macOS.
-fn shortcut_label(text: &str) -> String {
-    keymap::shortcut_label(text, keymap::platform())
-}
-
 /// What the menu reads from the window before it is built, so that building it never
 /// borrows the workspace that is already being updated.
 pub(crate) struct MenuModel {
@@ -56,7 +51,8 @@ impl MenuModel {
         let shortcuts = ids
             .into_iter()
             .map(|id| {
-                let text = workspace.shortcut_of(id).map(|text| shortcut_label(&text));
+                // The labels of the window actions come from their window rows.
+                let text = workspace.shortcut_of_key(id);
                 (id, text.map(Into::into))
             })
             .collect();

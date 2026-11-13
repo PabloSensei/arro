@@ -176,10 +176,16 @@ fn sign(app: &Path) -> Result {
     check(&mut command)
 }
 
-/// `ditto` keeps the bundle together, unlike the zip of a generic archiver.
+/// `ditto` keeps the bundle together, unlike the zip of a generic archiver. The name
+/// of the archive is the one the updater asks GitHub for.
 fn zip_bundle(app: &Path) -> Result<PathBuf> {
     let parent = app.parent().ok_or("the bundle has no parent folder")?;
-    let archive = parent.join(format!("{APP}.zip"));
+    let platform = match env::consts::ARCH {
+        "aarch64" => "macos-aarch64",
+        "x86_64" => "macos-x86_64",
+        other => return Err(format!("no macOS release for the {other} architecture").into()),
+    };
+    let archive = parent.join(format!("arro-{}-{platform}.zip", env!("CARGO_PKG_VERSION")));
     if archive.exists() {
         fs::remove_file(&archive)?;
     }
@@ -215,6 +221,13 @@ fn remove_old(out: &Path) -> Result {
         if path.is_dir() {
             fs::remove_dir_all(path)?;
         } else if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    for entry in fs::read_dir(out)?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_file() && name.starts_with("arro-") && name.ends_with(".zip") {
             fs::remove_file(path)?;
         }
     }

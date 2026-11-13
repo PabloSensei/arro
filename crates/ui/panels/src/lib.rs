@@ -276,6 +276,8 @@ mod window_tests_run_output;
 mod window_tests_cached_views;
 
 #[cfg(test)]
+mod window_tests_keys_macos;
+#[cfg(test)]
 mod window_tests_mask_hint;
 
 mod choice;

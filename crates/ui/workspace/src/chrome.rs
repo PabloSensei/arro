@@ -296,6 +296,8 @@ impl Workspace {
             .justify_between()
             .flex_none()
             .w(px(STRIPE_WIDTH))
+            // A cached view of its own: no flex parent stretches it any more.
+            .h_full()
             .py(px(SPACE_S))
             .child(
                 div()
@@ -447,6 +449,7 @@ impl Workspace {
             .gap(px(SPACE_XS))
             .flex_none()
             .w(px(RIGHT_STRIPE_WIDTH))
+            .h_full()
             .py(px(SPACE_S))
             .child(
                 self.stripe_button(
@@ -465,14 +468,11 @@ impl Workspace {
                     "own/aiSessions",
                     "AI Sessions",
                     Some("workspace::ToggleAi"),
-                    self.dock_open(DockSide::Right),
+                    self.tool_open(AI_TOOL),
                     theme,
                 )
-                .on_click(
-                    cx.listener(|this, _, window, cx| {
-                        this.toggle_panel(DockSide::Right, window, cx)
-                    }),
-                ),
+                // The AI sessions, not whichever tool window the right dock shows last.
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_tool(AI_TOOL, window, cx))),
             )
             .child(separator)
             .child(
@@ -808,7 +808,10 @@ impl Workspace {
                     .update(cx, |this, cx| this.build_project(window, cx))
                     .ok();
             })
-            .shortcut("Ctrl+F9"),
+            .shortcut(
+                self.shortcut_of_key("workspace::BuildProject")
+                    .unwrap_or_else(|| "Ctrl+F9".into()),
+            ),
         );
         entries.push(MenuEntry::separator());
         entries.push(self.command_row(&weak, "run.edit_configurations", "Edit Configurations..."));
@@ -863,11 +866,14 @@ impl Workspace {
         } else {
             "Pin Tab"
         };
+        let close_key = self
+            .shortcut_of_key("workspace::CloseTab")
+            .unwrap_or_else(|| "Ctrl+F4".into());
         let entries = vec![
             workspace_entry(&weak, "Close", move |this, window, cx| {
                 this.close_tab(pane, index, window, cx)
             })
-            .shortcut("Ctrl+F4"),
+            .shortcut(close_key),
             workspace_entry(&weak, "Close Other Tabs", move |this, window, cx| {
                 this.close_other_tabs(pane, index, window, cx)
             }),

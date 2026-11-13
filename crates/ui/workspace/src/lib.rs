@@ -4,6 +4,7 @@
 mod chrome;
 mod editor;
 mod invalidate;
+mod keys;
 mod launch;
 mod layout;
 mod native_menu;
@@ -17,6 +18,7 @@ mod about;
 pub use about::AboutView;
 pub use editor::{EditorFactory, EditorStatus, EditorTab, FileIcons, IndentChoice, IndentSetter};
 pub use invalidate::{apply_pending_invalidation, pending_invalidation, schedule_invalidation};
+pub use keys::KeyRow;
 pub use launch::{
     AppInfo, Launch, StartContext, choose_platform_keymap, run, spawn_project, start_context,
 };
@@ -39,7 +41,8 @@ pub use window::{
     TODO_TOOL, TabListener, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleDebug, ToggleLog,
     ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTerminal, ToggleTheme,
     ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, WINDOW_KEYS,
-    WindowKey, Workspace, bind_keys, build_date, build_version, window_step,
+    WindowKey, Workspace, bind_keys, bind_keys_for, build_date, build_version, window_key,
+    window_step,
 };
 
 #[cfg(any(test, feature = "test-support"))]

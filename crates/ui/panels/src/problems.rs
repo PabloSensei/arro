@@ -167,7 +167,7 @@ fn problem_menu(item: &Item, workspace: &WeakEntity<Workspace>, cx: &App) -> Vec
                 })
                 .ok();
         })
-        .shortcut("Enter")
+        .shortcut(keymap::shortcut_label("enter", keymap::platform()))
     };
     let quick = if can_show_fixes(cx) {
         let workspace = workspace.clone();
@@ -186,9 +186,10 @@ fn problem_menu(item: &Item, workspace: &WeakEntity<Workspace>, cx: &App) -> Vec
                 run_after_load(view, actions::SHOW_ACTIONS, cx);
             }
         })
-        .shortcut("Alt+Enter")
+        .shortcut(keymap::shortcut_label("alt-enter", keymap::platform()))
     } else {
-        MenuEntry::disabled("Show Quick Fixes").shortcut("Alt+Enter")
+        MenuEntry::disabled("Show Quick Fixes")
+            .shortcut(keymap::shortcut_label("alt-enter", keymap::platform()))
     };
     let message = item.label.clone();
     let copy = MenuEntry::new("Copy Problem Description", move |_, cx| {

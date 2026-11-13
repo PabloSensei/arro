@@ -31,26 +31,37 @@ const CONTEXT: &str = "DebugPanel";
 
 actions!(debug_panel, [NewWatch, DeleteWatch, SetValue, CancelInput]);
 
-/// One key of the Debug tool window and the IDEA action it implements, if any.
-#[cfg(test)]
-pub(crate) struct DebugKey {
-    pub(crate) keys: &'static str,
-    pub(crate) action: &'static str,
-    pub(crate) idea: Option<&'static str>,
-}
-
 macro_rules! debug_keys {
-    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
         /// The keys of the Debug tool window, while it has the focus.
         fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("debug_panel::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
         }
 
         #[cfg(test)]
-        pub(crate) const KEYS: &[DebugKey] = &[
-            $(DebugKey {
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("debug_panel::", stringify!($action)),
+                context: Some(CONTEXT),
                 idea: $idea,
             }),*
         ];
@@ -58,10 +69,10 @@ macro_rules! debug_keys {
 }
 
 debug_keys![
-    ("insert", NewWatch, Some("XDebugger.NewWatch")),
-    ("f2", SetValue, Some("XDebugger.SetValue")),
-    ("delete", DeleteWatch, None),
-    ("escape", CancelInput, None),
+    ("insert", NewWatch, Some("XDebugger.NewWatch"), None),
+    ("f2", SetValue, Some("XDebugger.SetValue"), None),
+    ("delete", DeleteWatch, None, Some("delete")),
+    ("escape", CancelInput, None, Some("escape")),
 ];
 
 const POLL: Duration = Duration::from_millis(50);

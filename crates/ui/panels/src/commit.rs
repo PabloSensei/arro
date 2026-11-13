@@ -44,26 +44,37 @@ actions!(
     ]
 );
 
-/// One key of the Commit window and the IDEA action it implements, if any.
-#[cfg(test)]
-pub(crate) struct CommitKey {
-    pub(crate) keys: &'static str,
-    pub(crate) action: &'static str,
-    pub(crate) idea: Option<&'static str>,
-}
-
 macro_rules! commit_keys {
-    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
         /// Ctrl+Alt+Z, Alt+M, Ctrl+M and the keys of the change lists and the shelves.
         fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("commit_panel::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
         }
 
         #[cfg(test)]
-        pub(crate) const KEYS: &[CommitKey] = &[
-            $(CommitKey {
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("commit_panel::", stringify!($action)),
+                context: Some(CONTEXT),
                 idea: $idea,
             }),*
         ];
@@ -71,47 +82,74 @@ macro_rules! commit_keys {
 }
 
 commit_keys![
-    ("ctrl-alt-z", RevertSelected, Some("ChangesView.Revert")),
-    ("alt-m", ToggleAmend, Some("Vcs.ToggleAmendCommitMode")),
-    ("ctrl-m", MessageHistory, Some("Vcs.ShowMessageHistory")),
-    ("alt-shift-m", MoveToChangelist, Some("ChangesView.Move")),
+    (
+        "ctrl-alt-z",
+        RevertSelected,
+        Some("ChangesView.Revert"),
+        None
+    ),
+    (
+        "alt-m",
+        ToggleAmend,
+        Some("Vcs.ToggleAmendCommitMode"),
+        None
+    ),
+    (
+        "ctrl-m",
+        MessageHistory,
+        Some("Vcs.ShowMessageHistory"),
+        None
+    ),
+    (
+        "alt-shift-m",
+        MoveToChangelist,
+        Some("ChangesView.Move"),
+        None
+    ),
     (
         "ctrl-space",
         SetActiveChangelist,
-        Some("ChangesView.SetDefault")
+        Some("ChangesView.SetDefault"),
+        None
     ),
-    ("f2", Rename, Some("ChangesView.Rename")),
-    ("shift-f6", Rename, Some("ChangesView.Rename")),
+    ("f2", Rename, Some("ChangesView.Rename"), None),
+    ("shift-f6", Rename, Some("ChangesView.Rename"), None),
     (
         "ctrl-alt-p",
         GroupByDirectory,
-        Some("ChangesView.GroupBy.Directory")
+        Some("ChangesView.GroupBy.Directory"),
+        None
     ),
     (
         "ctrl-alt-m",
         GroupByModule,
-        Some("ChangesView.GroupBy.Module")
+        Some("ChangesView.GroupBy.Module"),
+        None
     ),
     (
         "ctrl-o",
         ShowCommitOptions,
-        Some("ChangesView.ShowCommitOptions")
+        Some("ChangesView.ShowCommitOptions"),
+        None
     ),
     (
         "ctrl-shift-u",
         Unshelve,
-        Some("ShelveChanges.UnshelveWithDialog")
+        Some("ShelveChanges.UnshelveWithDialog"),
+        None
     ),
-    ("ctrl-d", ShowDiff, Some("Diff.ShowDiff")),
+    ("ctrl-d", ShowDiff, Some("Diff.ShowDiff"), None),
 ];
 
 /// F2 and Shift+F6 rename the selected shelf on the Shelf tab: the same keys and action.
 #[cfg(test)]
-pub(crate) const SHELF_RENAME: CommitKey = CommitKey {
+pub(crate) const SHELF_RENAME: &[workspace::KeyRow] = &[workspace::KeyRow {
     keys: "f2",
+    mac: None,
     action: "commit_panel::Rename",
+    context: Some(CONTEXT),
     idea: Some("ShelvedChanges.Rename"),
-};
+}];
 
 /// Which tab of the Commit tool window is shown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

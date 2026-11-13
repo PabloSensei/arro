@@ -83,26 +83,37 @@ impl Render for TreeDragPreview {
     }
 }
 
-/// One key of the tree and the IDEA action it implements, if any.
-#[cfg(test)]
-pub(crate) struct PanelKey {
-    pub(crate) keys: &'static str,
-    pub(crate) action: &'static str,
-    pub(crate) idea: Option<&'static str>,
-}
-
 /// The tree keys and, from the same rows, the table the keymap check reads.
 macro_rules! panel_keys {
-    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
         pub fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+            bind_keys_for(cx, keymap::platform());
         }
 
-        #[cfg(test)]
-        pub(crate) const PANEL_KEYS: &[PanelKey] = &[
-            $(PanelKey {
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("project_panel::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
+        }
+
+        /// The keys of the tree, for the menu hints and the keymap check.
+        pub(crate) const PANEL_KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("project_panel::", stringify!($action)),
+                context: Some(CONTEXT),
                 idea: $idea,
             }),*
         ];
@@ -110,26 +121,36 @@ macro_rules! panel_keys {
 }
 
 panel_keys![
-    ("up", SelectPrevious, None),
-    ("down", SelectNext, None),
-    ("right", ExpandRow, None),
-    ("left", CollapseRow, None),
-    ("enter", OpenRow, None),
-    ("f4", OpenRow, Some("EditSource")),
-    ("shift-f6", RenameRow, Some("RenameElement")),
-    ("delete", DeleteRow, Some("$Delete")),
-    ("alt-delete", SafeDeleteRow, Some("SafeDelete")),
-    ("alt-insert", NewItem, Some("NewElement")),
-    ("ctrl-x", CutRows, Some("$Cut")),
-    ("ctrl-c", CopyRows, Some("$Copy")),
-    ("ctrl-v", PasteRows, Some("$Paste")),
-    ("ctrl-shift-c", CopyPaths, Some("CopyPaths")),
-    ("ctrl-=", ExpandAllRows, Some("ExpandAll")),
-    ("ctrl--", CollapseAllRows, Some("CollapseAll")),
-    ("numpad_add", ExpandNode, Some("ExpandTreeNode")),
-    ("numpad_subtract", CollapseNode, Some("CollapseTreeNode")),
-    ("shift-enter", OpenInRightSplitRow, Some("OpenInRightSplit")),
-    ("ctrl-d", CompareTwoFiles, Some("CompareTwoFiles")),
+    ("up", SelectPrevious, None, Some("up")),
+    ("down", SelectNext, None, Some("down")),
+    ("right", ExpandRow, None, Some("right")),
+    ("left", CollapseRow, None, Some("left")),
+    ("enter", OpenRow, None, Some("enter")),
+    ("f4", OpenRow, Some("EditSource"), None),
+    ("shift-f6", RenameRow, Some("RenameElement"), None),
+    ("delete", DeleteRow, Some("$Delete"), None),
+    ("alt-delete", SafeDeleteRow, Some("SafeDelete"), None),
+    ("alt-insert", NewItem, Some("NewElement"), None),
+    ("ctrl-x", CutRows, Some("$Cut"), None),
+    ("ctrl-c", CopyRows, Some("$Copy"), None),
+    ("ctrl-v", PasteRows, Some("$Paste"), None),
+    ("ctrl-shift-c", CopyPaths, Some("CopyPaths"), None),
+    ("ctrl-=", ExpandAllRows, Some("ExpandAll"), None),
+    ("ctrl--", CollapseAllRows, Some("CollapseAll"), None),
+    ("numpad_add", ExpandNode, Some("ExpandTreeNode"), None),
+    (
+        "numpad_subtract",
+        CollapseNode,
+        Some("CollapseTreeNode"),
+        None
+    ),
+    (
+        "shift-enter",
+        OpenInRightSplitRow,
+        Some("OpenInRightSplit"),
+        None
+    ),
+    ("ctrl-d", CompareTwoFiles, Some("CompareTwoFiles"), None),
 ];
 
 /// What the tree can create, from the application and the basics.
@@ -1800,6 +1821,16 @@ impl ProjectPanel {
             .ok();
     }
 
+    /// The key of a row of the tree, as its menu writes it.
+    fn key_hint(action: &str) -> Option<String> {
+        let platform = keymap::platform();
+        PANEL_KEYS
+            .iter()
+            .find(|row| row.action == action)
+            .and_then(|row| row.keys_for(platform).first().copied())
+            .map(|keys| keymap::shortcut_label(keys, platform))
+    }
+
     fn menu_entries(
         &mut self,
         index: usize,
@@ -1827,44 +1858,56 @@ impl ProjectPanel {
         entries.push(MenuEntry::separator());
         if !is_folder {
             let (panel, path) = (panel.clone(), path.clone());
-            let open = MenuEntry::new("Open", move |window, cx| {
+            let mut open = MenuEntry::new("Open", move |window, cx| {
                 let path = path.clone();
                 let open = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                     this.open_file(path, window, cx)
                 };
                 Self::later(window, panel.clone(), cx, open);
             });
-            entries.push(open.shortcut("F4"));
+            if let Some(hint) = Self::key_hint("project_panel::OpenRow") {
+                open = open.shortcut(hint);
+            }
+            entries.push(open);
         }
         if is_folder {
             let (compare_panel, compare_left) = (panel.clone(), path.clone());
-            let compare = MenuEntry::new("Compare With...", move |window, cx| {
+            let mut compare = MenuEntry::new("Compare With...", move |window, cx| {
                 let left = compare_left.clone();
                 let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                     this.compare_with_folder(left, window, cx)
                 };
                 Self::later(window, compare_panel.clone(), cx, ask);
             });
-            entries.push(compare.shortcut("Ctrl+D"));
+            if let Some(hint) = Self::key_hint("project_panel::CompareTwoFiles") {
+                compare = compare.shortcut(hint);
+            }
+            entries.push(compare);
         }
         if !is_root {
             let (rename_panel, rename_path) = (panel.clone(), path.clone());
-            let rename = MenuEntry::new("Rename...", move |window, cx| {
+            let mut rename = MenuEntry::new("Rename...", move |window, cx| {
                 let path = rename_path.clone();
                 let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                     this.ask_rename(path, window, cx)
                 };
                 Self::later(window, rename_panel.clone(), cx, ask);
             });
-            entries.push(rename.shortcut("Shift+F6"));
+            if let Some(hint) = Self::key_hint("project_panel::RenameRow") {
+                rename = rename.shortcut(hint);
+            }
+            entries.push(rename);
             let delete_panel = panel;
-            let delete = MenuEntry::new("Delete...", move |window, cx| {
+            let mut delete = MenuEntry::new("Delete...", move |window, cx| {
                 let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                     this.ask_delete_selection(window, cx)
                 };
                 Self::later(window, delete_panel.clone(), cx, ask);
             });
-            entries.push(delete.shortcut("Delete"));
+            if let Some(hint) = Self::key_hint("project_panel::DeleteRow") {
+                delete = delete.shortcut(hint);
+            }
+            entries.push(delete);
             entries.push(MenuEntry::separator());
         }
         let (history_panel, history_path) = (cx.weak_entity(), path.clone());

@@ -131,18 +131,29 @@ type KeymapListener = Rc<dyn Fn(&mut App, Rc<Keymap>)>;
 pub type ProjectOpener = Rc<dyn Fn(&Path, &mut App)>;
 
 /// One key of the window and the IDEA action it implements, if any.
-pub struct WindowKey {
-    pub keys: &'static str,
-    pub action: &'static str,
-    pub context: Option<&'static str>,
-    pub idea: Option<&'static str>,
-}
+pub type WindowKey = crate::keys::KeyRow;
 
 /// The window keys and, from the same rows, the table the keymap check reads.
 macro_rules! window_keys {
-    ($(($keys:literal, $action:ident, $context:expr, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $context:expr, $idea:expr, $mac:expr)),* $(,)?) => {
         pub fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, $context)),*]);
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform. A test reads the macOS table on every runner.
+        pub fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = WindowKey {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("workspace::", stringify!($action)),
+                    context: $context,
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, $context)]);
+                }
+            )*
             // Every application of macOS quits with Command+Q, from its own menu.
             #[cfg(target_os = "macos")]
             cx.bind_keys([KeyBinding::new("cmd-q", QuitApp, None)]);
@@ -152,6 +163,7 @@ macro_rules! window_keys {
         pub const WINDOW_KEYS: &[WindowKey] = &[
             $(WindowKey {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("workspace::", stringify!($action)),
                 context: $context,
                 idea: $idea,
@@ -162,80 +174,89 @@ macro_rules! window_keys {
 
 #[rustfmt::skip]
 window_keys![
-    ("alt-1", ToggleProject, None, Some("ActivateProjectToolWindow")),
-    ("alt-2", ToggleAi, None, None),
-    ("alt-3", ToggleUsages, None, Some("ActivateFindToolWindow")),
-    ("alt-4", ToggleRun, None, Some("ActivateRunToolWindow")),
-    ("alt-5", ToggleDebug, None, Some("ActivateDebugToolWindow")),
-    ("alt-6", ToggleProblems, None, Some("ActivateProblemsViewToolWindow")),
-    ("alt-7", ToggleStructure, None, Some("ActivateStructureToolWindow")),
-    ("alt-8", ToggleServices, None, Some("ActivateServicesToolWindow")),
-    ("alt-9", ToggleLog, None, Some("ActivateVersionControlToolWindow")),
-    ("alt-0", ToggleCommit, None, Some("ActivateCommitToolWindow")),
-    ("alt-f12", ToggleTerminal, None, Some("ActivateTerminalToolWindow")),
-    ("ctrl-k", ShowCommit, None, None),
-    ("ctrl-shift-k", PushChanges, None, None),
-    ("ctrl-t", UpdateProject, None, None),
-    ("shift-f10", Run, None, Some("Run")),
-    ("shift-f9", Debug, None, Some("Debug")),
-    ("ctrl-f9", BuildProject, None, Some("CompileDirty")),
-    ("f8", StepOver, None, Some("StepOver")),
-    ("f7", StepInto, None, Some("StepInto")),
-    ("shift-f8", StepOut, None, Some("StepOut")),
-    ("f9", Resume, None, Some("Resume")),
-    ("alt-f8", Evaluate, None, Some("EvaluateExpression")),
-    ("ctrl-f8", ToggleBreakpoint, None, Some("ToggleLineBreakpoint")),
-    ("ctrl-shift-f8", EditBreakpoint, None, Some("EditBreakpoint")),
-    ("ctrl-f2", Stop, None, Some("Stop")),
-    ("escape", Dismiss, None, None),
-    ("shift-escape", HideToolWindow, None, Some("HideActiveWindow")),
-    ("ctrl-f4", CloseTab, None, Some("CloseContent")),
-    ("alt-left", TabLeft, None, Some("PreviousTab")),
-    ("alt-right", TabRight, None, Some("NextTab")),
-    ("ctrl-alt-shift-right", FocusNextGroup, None, None),
-    ("ctrl-alt-shift-left", FocusPreviousGroup, None, None),
-    ("ctrl-s", SaveAll, Some("Workspace"), Some("SaveAll")),
-    ("alt-f1", SelectInProject, None, Some("SelectIn")),
-    ("ctrl-alt-s", ShowSettings, None, Some("ShowSettings")),
-    ("f2", NextProblem, Some("Workspace"), Some("GotoNextError")),
-    ("shift-f2", PreviousProblem, Some("Workspace"), Some("GotoPreviousError")),
-    ("alt-shift-f10", ChooseRunConfiguration, None, Some("ChooseRunConfiguration")),
-    ("alt-shift-f9", ChooseDebugConfiguration, None, Some("ChooseDebugConfiguration")),
-    ("ctrl-f5", Rerun, None, Some("Rerun")),
-    ("alt-shift-f7", ForceStepInto, None, Some("ForceStepInto")),
-    ("shift-f7", SmartStepInto, None, Some("SmartStepInto")),
-    ("alt-f9", RunToCursor, None, Some("RunToCursor")),
-    ("ctrl-alt-f9", ForceRunToCursor, None, Some("ForceRunToCursor")),
-    ("alt-f10", ShowExecutionPoint, None, Some("ShowExecutionPoint")),
-    ("ctrl-alt-f8", QuickEvaluate, None, Some("QuickEvaluateExpression")),
-    ("ctrl-shift-f9", Compile, None, Some("Compile")),
-    ("alt-shift-r", RerunTests, None, Some("RerunTests")),
-    ("ctrl-shift-f2", StopBackgroundProcesses, None, Some("StopBackgroundProcesses")),
-    ("ctrl-alt-y", Synchronize, None, Some("Synchronize")),
-    ("alt-`", VcsQuickList, None, Some("Vcs.QuickListPopupAction")),
-    ("alt-shift-f8", ForceStepOver, None, Some("ForceStepOver")),
-    ("ctrl-alt-shift-f8", ToggleTemporaryLineBreakpoint, None, Some("ToggleTemporaryLineBreakpoint")),
-    ("ctrl-alt-insert", NewElementSamePlace, None, Some("NewElementSamePlace")),
-    ("f5", CopyElement, None, Some("CopyElement")),
-    ("ctrl-alt-home", GotoRelated, None, Some("GotoRelated")),
-    ("ctrl-alt-]", NextProjectWindow, None, Some("NextProjectWindow")),
-    ("ctrl-alt-[", PreviousProjectWindow, None, Some("PreviousProjectWindow")),
-    ("ctrl-f5", RerunInspection, Some("InspectionResults"), None),
-    ("ctrl-alt-shift-s", ProjectStructure, None, Some("ShowProjectStructureSettings")),
-    ("ctrl-shift-`", ShowBranches, None, None),
-    ("ctrl-alt-shift-left", ResizeToolWindowLeft, Some("ToolWindow"), Some("ResizeToolWindowLeft")),
-    ("ctrl-alt-shift-right", ResizeToolWindowRight, Some("ToolWindow"), Some("ResizeToolWindowRight")),
-    ("ctrl-alt-shift-up", ResizeToolWindowUp, Some("ToolWindow"), Some("ResizeToolWindowUp")),
-    ("ctrl-alt-shift-down", ResizeToolWindowDown, Some("ToolWindow"), Some("ResizeToolWindowDown")),
-    ("ctrl-shift-left", ResizeToolWindowLeft, Some("ToolWindow"), None),
-    ("ctrl-shift-right", ResizeToolWindowRight, Some("ToolWindow"), None),
-    ("ctrl-shift-up", ResizeToolWindowUp, Some("ToolWindow"), None),
-    ("ctrl-shift-down", ResizeToolWindowDown, Some("ToolWindow"), None),
-    ("numpad_multiply", FullyExpandTreeNode, Some("ToolWindow"), Some("FullyExpandTreeNode")),
-    ("shift-numpad_add", FullyExpandTreeNode, Some("ToolWindow"), None),
-    ("ctrl-f5", Synchronize, Some("ProjectPanel"), Some("Refresh")),
-    ("ctrl-shift-f5", Synchronize, Some("ProjectPanel"), Some("ForceRefresh")),
+    ("alt-1", ToggleProject, None, Some("ActivateProjectToolWindow"), None),
+    ("alt-2", ToggleAi, None, None, Some("cmd-2")),
+    ("alt-3", ToggleUsages, None, Some("ActivateFindToolWindow"), None),
+    ("alt-4", ToggleRun, None, Some("ActivateRunToolWindow"), None),
+    ("alt-5", ToggleDebug, None, Some("ActivateDebugToolWindow"), None),
+    ("alt-6", ToggleProblems, None, Some("ActivateProblemsViewToolWindow"), None),
+    ("alt-7", ToggleStructure, None, Some("ActivateStructureToolWindow"), None),
+    ("alt-8", ToggleServices, None, Some("ActivateServicesToolWindow"), None),
+    ("alt-9", ToggleLog, None, Some("ActivateVersionControlToolWindow"), None),
+    ("alt-0", ToggleCommit, None, Some("ActivateCommitToolWindow"), None),
+    ("alt-f12", ToggleTerminal, None, Some("ActivateTerminalToolWindow"), None),
+    ("ctrl-k", ShowCommit, None, None, Some("cmd-k")),
+    ("ctrl-shift-k", PushChanges, None, None, Some("cmd-shift-k")),
+    ("ctrl-t", UpdateProject, None, None, Some("cmd-t")),
+    ("shift-f10", Run, None, Some("Run"), None),
+    ("shift-f9", Debug, None, Some("Debug"), None),
+    ("ctrl-f9", BuildProject, None, Some("CompileDirty"), None),
+    ("f8", StepOver, None, Some("StepOver"), None),
+    ("f7", StepInto, None, Some("StepInto"), None),
+    ("shift-f8", StepOut, None, Some("StepOut"), None),
+    ("f9", Resume, None, Some("Resume"), None),
+    ("alt-f8", Evaluate, None, Some("EvaluateExpression"), None),
+    ("ctrl-f8", ToggleBreakpoint, None, Some("ToggleLineBreakpoint"), None),
+    ("ctrl-shift-f8", EditBreakpoint, None, Some("EditBreakpoint"), None),
+    ("ctrl-f2", Stop, None, Some("Stop"), None),
+    ("escape", Dismiss, None, None, Some("escape")),
+    ("shift-escape", HideToolWindow, None, Some("HideActiveWindow"), None),
+    ("ctrl-f4", CloseTab, None, Some("CloseContent"), None),
+    ("alt-left", TabLeft, None, Some("PreviousTab"), None),
+    ("alt-right", TabRight, None, Some("NextTab"), None),
+    ("ctrl-alt-shift-right", FocusNextGroup, None, None, Some("ctrl-alt-shift-right")),
+    ("ctrl-alt-shift-left", FocusPreviousGroup, None, None, Some("ctrl-alt-shift-left")),
+    ("ctrl-s", SaveAll, Some("Workspace"), Some("SaveAll"), None),
+    ("alt-f1", SelectInProject, None, Some("SelectIn"), None),
+    ("ctrl-alt-s", ShowSettings, None, Some("ShowSettings"), None),
+    ("f2", NextProblem, Some("Workspace"), Some("GotoNextError"), None),
+    ("shift-f2", PreviousProblem, Some("Workspace"), Some("GotoPreviousError"), None),
+    ("alt-shift-f10", ChooseRunConfiguration, None, Some("ChooseRunConfiguration"), None),
+    ("alt-shift-f9", ChooseDebugConfiguration, None, Some("ChooseDebugConfiguration"), None),
+    ("ctrl-f5", Rerun, None, Some("Rerun"), None),
+    ("alt-shift-f7", ForceStepInto, None, Some("ForceStepInto"), None),
+    ("shift-f7", SmartStepInto, None, Some("SmartStepInto"), None),
+    ("alt-f9", RunToCursor, None, Some("RunToCursor"), None),
+    ("ctrl-alt-f9", ForceRunToCursor, None, Some("ForceRunToCursor"), None),
+    ("alt-f10", ShowExecutionPoint, None, Some("ShowExecutionPoint"), None),
+    ("ctrl-alt-f8", QuickEvaluate, None, Some("QuickEvaluateExpression"), None),
+    ("ctrl-shift-f9", Compile, None, Some("Compile"), None),
+    ("alt-shift-r", RerunTests, None, Some("RerunTests"), None),
+    ("ctrl-shift-f2", StopBackgroundProcesses, None, Some("StopBackgroundProcesses"), None),
+    ("ctrl-alt-y", Synchronize, None, Some("Synchronize"), None),
+    ("alt-`", VcsQuickList, None, Some("Vcs.QuickListPopupAction"), None),
+    ("alt-shift-f8", ForceStepOver, None, Some("ForceStepOver"), None),
+    ("ctrl-alt-shift-f8", ToggleTemporaryLineBreakpoint, None, Some("ToggleTemporaryLineBreakpoint"), None),
+    ("ctrl-alt-insert", NewElementSamePlace, None, Some("NewElementSamePlace"), None),
+    ("f5", CopyElement, None, Some("CopyElement"), None),
+    ("ctrl-alt-home", GotoRelated, None, Some("GotoRelated"), None),
+    ("ctrl-alt-]", NextProjectWindow, None, Some("NextProjectWindow"), None),
+    ("ctrl-alt-[", PreviousProjectWindow, None, Some("PreviousProjectWindow"), None),
+    ("ctrl-f5", RerunInspection, Some("InspectionResults"), None, Some("cmd-f5")),
+    ("ctrl-alt-shift-s", ProjectStructure, None, Some("ShowProjectStructureSettings"), None),
+    ("ctrl-shift-`", ShowBranches, None, None, Some("cmd-shift-`")),
+    ("ctrl-alt-shift-left", ResizeToolWindowLeft, Some("ToolWindow"), Some("ResizeToolWindowLeft"), None),
+    ("ctrl-alt-shift-right", ResizeToolWindowRight, Some("ToolWindow"), Some("ResizeToolWindowRight"), None),
+    ("ctrl-alt-shift-up", ResizeToolWindowUp, Some("ToolWindow"), Some("ResizeToolWindowUp"), None),
+    ("ctrl-alt-shift-down", ResizeToolWindowDown, Some("ToolWindow"), Some("ResizeToolWindowDown"), None),
+    ("ctrl-shift-left", ResizeToolWindowLeft, Some("ToolWindow"), None, Some("ctrl-shift-left")),
+    ("ctrl-shift-right", ResizeToolWindowRight, Some("ToolWindow"), None, Some("ctrl-shift-right")),
+    ("ctrl-shift-up", ResizeToolWindowUp, Some("ToolWindow"), None, Some("ctrl-shift-up")),
+    ("ctrl-shift-down", ResizeToolWindowDown, Some("ToolWindow"), None, Some("ctrl-shift-down")),
+    ("numpad_multiply", FullyExpandTreeNode, Some("ToolWindow"), Some("FullyExpandTreeNode"), None),
+    ("shift-numpad_add", FullyExpandTreeNode, Some("ToolWindow"), None, Some("shift-numpad_add")),
+    ("ctrl-f5", Synchronize, Some("ProjectPanel"), Some("Refresh"), None),
+    ("ctrl-shift-f5", Synchronize, Some("ProjectPanel"), Some("ForceRefresh"), None),
 ];
+
+/// The first key of a window action on one platform, `ctrl-f9`, or `None` when the
+/// window has no row for it.
+pub fn window_key(action: &str, platform: keymap::Platform) -> Option<&'static str> {
+    WINDOW_KEYS
+        .iter()
+        .find(|binding| binding.action == action)
+        .and_then(|binding| binding.keys_for(platform).first().copied())
+}
 
 /// The index of the window a project switch goes to. `None` when there is no other one.
 pub fn window_step(len: usize, current: usize, step: isize) -> Option<usize> {
@@ -907,10 +928,7 @@ impl Workspace {
     /// version once the window has been open for a while. The request never runs on the
     /// interface thread.
     fn start_update_tasks(&mut self, cx: &mut Context<Self>) {
-        if let Some(folder) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        {
+        if let Ok(folder) = updater::install_dir() {
             let cleanup = cx
                 .background_executor()
                 .spawn(async move { updater::cleanup(&folder) });
@@ -1081,10 +1099,7 @@ impl Workspace {
         let Some(release) = self.update_release.clone() else {
             return;
         };
-        let Some(install) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        else {
+        let Ok(install) = updater::install_dir() else {
             self.notify_user(
                 "The update did not install",
                 "The program folder is unknown",
@@ -1101,13 +1116,13 @@ impl Workspace {
         );
         let source = updater::UpdateSource::new();
         let install_task = cx.background_executor().spawn(async move {
-            let zip = source.download(&release, &folder)?;
-            updater::stage(&zip, &install)
+            let archive = source.download(&release, &folder)?;
+            updater::stage(&archive, &install)
         });
         cx.spawn(async move |this, cx| {
             let result = install_task.await;
             this.update(cx, |this, cx| match result {
-                Ok(()) => this.restart_after_update(cx),
+                Ok(program) => this.restart_after_update(program, cx),
                 Err(error) => {
                     this.installing_update = false;
                     this.notify_user("The update did not install", error.to_string(), cx)
@@ -1140,7 +1155,9 @@ impl Workspace {
     }
 
     /// Writes the open files, then starts the new program on the same project and quits.
-    fn restart_after_update(&mut self, cx: &mut Context<Self>) {
+    /// `program` is the file the update just put in place: the running one was renamed,
+    /// or the whole bundle was replaced on macOS.
+    fn restart_after_update(&mut self, program: PathBuf, cx: &mut Context<Self>) {
         self.save_all_now(cx);
         if let (Some(store), Some(json)) = (self.store.clone(), self.fresh_json(cx))
             && let Err(error) = save_layout(&store, &self.root, &json)
@@ -1148,8 +1165,12 @@ impl Workspace {
             eprintln!("layout is not saved: {error}");
         }
         let root = self.root.clone();
-        let started =
-            crate::launch::spawn_project_after(&self.state_dir, &root, Some(std::process::id()));
+        let started = crate::launch::spawn_project_from(
+            program,
+            &self.state_dir,
+            &root,
+            Some(std::process::id()),
+        );
         match started {
             Ok(()) => cx.quit(),
             Err(error) => self.notify_user(
@@ -3753,17 +3774,12 @@ impl Workspace {
     /// menu does not spell keys itself: they come from the keymap or `WINDOW_KEYS`.
     pub fn shortcut_of_key(&self, key: &str) -> Option<String> {
         self.shortcut_of(key)
-            .or_else(|| {
-                WINDOW_KEYS
-                    .iter()
-                    .find(|binding| binding.action == key)
-                    .map(|binding| binding.keys.to_owned())
-            })
+            .or_else(|| window_key(key, keymap::platform()).map(str::to_owned))
             .or_else(|| {
                 // Ctrl+Alt+Y runs Synchronize, which is Reload All from Disk; Tab indents
                 // the selection, which is Indent Selection.
                 match key {
-                    "file.reload_all" => Some("ctrl-alt-y"),
+                    "file.reload_all" => window_key("workspace::Synchronize", keymap::platform()),
                     "editor.indent_selection" => Some("tab"),
                     _ => None,
                 }

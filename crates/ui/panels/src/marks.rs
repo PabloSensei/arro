@@ -137,10 +137,14 @@ pub(crate) fn launch_menu(
     workspace: WeakEntity<Workspace>,
 ) -> Vec<MenuEntry> {
     let name = config.name.clone();
+    let platform = keymap::platform();
+    let window_hint = |action: &str| {
+        ::workspace::window_key(action, platform).map(|keys| keymap::shortcut_label(keys, platform))
+    };
     let run_config = config.clone();
     let run_panel = panel.clone();
     let run_workspace = workspace.clone();
-    let run = MenuEntry::new(format!("Run '{name}'"), move |window, cx| {
+    let mut run = MenuEntry::new(format!("Run '{name}'"), move |window, cx| {
         run_panel.update(cx, |panel, cx| {
             panel.choose_configuration(run_config.clone(), cx);
             panel.run(cx);
@@ -151,12 +155,14 @@ pub(crate) fn launch_menu(
             })
             .ok();
     })
-    .icon("run/run")
-    .shortcut("Shift+F10");
+    .icon("run/run");
+    if let Some(hint) = window_hint("workspace::Run") {
+        run = run.shortcut(hint);
+    }
     let debug_config = config.clone();
     let debug_panel = panel.clone();
     let debug_workspace = workspace.clone();
-    let debug = MenuEntry::new(format!("Debug '{name}'"), move |window, cx| {
+    let mut debug = MenuEntry::new(format!("Debug '{name}'"), move |window, cx| {
         debug_panel.update(cx, |panel, cx| {
             panel.choose_configuration(debug_config.clone(), cx);
             panel.debug(window, cx);
@@ -167,8 +173,10 @@ pub(crate) fn launch_menu(
             })
             .ok();
     })
-    .icon("run/debug")
-    .shortcut("Shift+F9");
+    .icon("run/debug");
+    if let Some(hint) = window_hint("workspace::Debug") {
+        debug = debug.shortcut(hint);
+    }
     let modify_config = config;
     let modify_panel = panel.clone();
     let modify_workspace = workspace;

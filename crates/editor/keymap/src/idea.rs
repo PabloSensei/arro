@@ -1,6 +1,7 @@
 //! The IntelliJ IDEA keymap as data. See `keymaps/NOTICE.md` for where it comes from.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -201,6 +202,32 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "The debugger opens a type from the variables tree; no key.",
     ),
 ];
+
+/// The keys [`IDEA_DEFAULT_MACOS`] gives one IDEA action, in the syntax of this crate.
+/// `None` when the file does not name the action; an empty slice when macOS has no key
+/// for it. The strings stay for the whole process.
+pub fn macos_keys(id: &str) -> Option<&'static [&'static str]> {
+    static TABLE: OnceLock<HashMap<String, &'static [&'static str]>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        idea_shortcuts(IDEA_DEFAULT_MACOS)
+            .expect("the macOS keymap is part of the build")
+            .into_iter()
+            .map(|(id, shortcuts)| {
+                let keys: &'static [&'static str] = Box::leak(
+                    shortcuts
+                        .iter()
+                        .map(|shortcut| -> &'static str {
+                            Box::leak(shortcut.to_string().into_boxed_str())
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                );
+                (id, keys)
+            })
+            .collect()
+    });
+    table.get(id).copied()
+}
 
 /// IDEA action id to its shortcuts, from a file in the `idea-default.json` format.
 pub fn idea_shortcuts(json: &str) -> Result<HashMap<String, Vec<Shortcut>>, KeymapError> {

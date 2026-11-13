@@ -48,25 +48,36 @@ actions!(
     ]
 );
 
-/// One key of the Search Everywhere popup and the IDEA action it implements, if any.
-#[cfg(test)]
-pub(crate) struct PaletteKey {
-    pub(crate) keys: &'static str,
-    pub(crate) action: &'static str,
-    pub(crate) idea: Option<&'static str>,
-}
-
 macro_rules! palette_keys {
-    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
         pub fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("search_everywhere::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
         }
 
         #[cfg(test)]
-        pub(crate) const KEYS: &[PaletteKey] = &[
-            $(PaletteKey {
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("search_everywhere::", stringify!($action)),
+                context: Some(CONTEXT),
                 idea: $idea,
             }),*
         ];
@@ -74,39 +85,49 @@ macro_rules! palette_keys {
 }
 
 palette_keys![
-    ("up", Previous, None),
-    ("down", Next, None),
-    ("enter", Open, Some("SearchEverywhere.SelectItem")),
-    ("shift-enter", OpenDebug, None),
-    ("tab", NextTab, Some("SearchEverywhere.NextTab")),
-    ("shift-tab", PreviousTab, Some("SearchEverywhere.PrevTab")),
+    ("up", Previous, None, Some("up")),
+    ("down", Next, None, Some("down")),
+    ("enter", Open, Some("SearchEverywhere.SelectItem"), None),
+    ("shift-enter", OpenDebug, None, Some("shift-enter")),
+    ("tab", NextTab, Some("SearchEverywhere.NextTab"), None),
+    (
+        "shift-tab",
+        PreviousTab,
+        Some("SearchEverywhere.PrevTab"),
+        None
+    ),
     (
         "pagedown",
         NextGroup,
-        Some("SearchEverywhere.NavigateToNextGroup")
+        Some("SearchEverywhere.NavigateToNextGroup"),
+        None
     ),
     (
         "ctrl-down",
         NextGroup,
-        Some("SearchEverywhere.NavigateToNextGroup")
+        Some("SearchEverywhere.NavigateToNextGroup"),
+        None
     ),
     (
         "pageup",
         PreviousGroup,
-        Some("SearchEverywhere.NavigateToPrevGroup")
+        Some("SearchEverywhere.NavigateToPrevGroup"),
+        None
     ),
     (
         "ctrl-up",
         PreviousGroup,
-        Some("SearchEverywhere.NavigateToPrevGroup")
+        Some("SearchEverywhere.NavigateToPrevGroup"),
+        None
     ),
     // While Ctrl is held the Switcher keeps its list under the same keys.
-    ("ctrl-tab", NextTab, None),
-    ("ctrl-shift-tab", PreviousTab, None),
+    ("ctrl-tab", NextTab, None, Some("ctrl-tab")),
+    ("ctrl-shift-tab", PreviousTab, None, Some("ctrl-shift-tab")),
     (
         "ctrl-e",
         ToggleEdited,
-        Some("SwitcherRecentEditedChangedToggleCheckBox")
+        Some("SwitcherRecentEditedChangedToggleCheckBox"),
+        None
     ),
 ];
 

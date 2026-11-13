@@ -50,15 +50,6 @@ pub const RESTORE_BRANCH_COMMAND: &str = "git.restore_deleted_branch";
 /// A change on disk waits for this long, so a save of many files is one read of the status.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// The keys of the branches popup and the IDEA actions they implement.
-#[cfg(test)]
-pub(crate) const BRANCH_KEYS: &[(&str, &str)] = &[
-    ("ctrl-alt-n", "Git.CreateNewBranch"),
-    ("f2", "Git.Rename.Local.Branch"),
-    ("shift-f6", "Git.Rename.Local.Branch"),
-    ("ctrl-alt-n", "Git.New.Branch.In.Log"),
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Modified,

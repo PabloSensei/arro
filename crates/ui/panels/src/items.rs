@@ -20,14 +20,48 @@ const MAX_ITEMS: usize = 2_000;
 /// A pause this long starts a new speed search rather than adding to the old one.
 const SEARCH_TIMEOUT: Duration = Duration::from_millis(1000);
 
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", PreviousItem, Some(CONTEXT)),
-        KeyBinding::new("down", NextItem, Some(CONTEXT)),
-        KeyBinding::new("enter", OpenItem, Some(CONTEXT)),
-        KeyBinding::new("f4", OpenItem, Some(CONTEXT)),
-    ]);
+macro_rules! items_keys {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
+        pub fn bind_keys(cx: &mut App) {
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("items_panel::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
+        }
+
+        #[cfg(test)]
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
+                keys: $keys,
+                mac: $mac,
+                action: concat!("items_panel::", stringify!($action)),
+                context: Some(CONTEXT),
+                idea: $idea,
+            }),*
+        ];
+    };
 }
+
+items_keys![
+    ("up", PreviousItem, None, Some("up")),
+    ("down", NextItem, None, Some("down")),
+    ("enter", OpenItem, None, Some("enter")),
+    ("f4", OpenItem, None, Some("f4")),
+];
 
 /// One place in a file. Line and column count from zero.
 #[derive(Clone, Debug, PartialEq, Eq)]

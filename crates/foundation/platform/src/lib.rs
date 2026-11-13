@@ -15,6 +15,7 @@ mod memory;
 #[cfg(unix)]
 #[path = "memory_unix.rs"]
 mod memory;
+mod mode;
 #[cfg(windows)]
 mod os;
 #[cfg(unix)]
@@ -50,6 +51,7 @@ mod waiter;
 pub use crash::{install as install_crash_handler, module_of};
 pub use job::Job;
 pub use memory::{MemoryPressure, MemoryState, MemoryThresholds, physical_memory};
+pub use mode::{make_executable, mode, set_mode};
 pub use os::version as os_version;
 pub use path::CanonPath;
 pub use process::{

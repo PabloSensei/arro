@@ -39,32 +39,41 @@ actions!(
     ]
 );
 
-/// One key of the diff and the IDEA action it implements, if any.
-#[cfg(test)]
-pub(crate) struct DiffKey {
-    pub(crate) keys: &'static str,
-    pub(crate) action: &'static str,
-    pub(crate) idea: Option<&'static str>,
-}
-
 macro_rules! diff_keys {
-    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
         /// The diff keys, while the popup has the focus, and while one of its editors
         /// has it.
         pub(crate) fn bind_keys(cx: &mut App) {
-            cx.bind_keys([
-                $(
-                    KeyBinding::new($keys, $action, Some(CONTEXT)),
-                    KeyBinding::new($keys, $action, Some(EDITOR_CONTEXT)),
-                )*
-            ]);
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("diff_view::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([
+                        KeyBinding::new(key, $action, Some(CONTEXT)),
+                        KeyBinding::new(key, $action, Some(EDITOR_CONTEXT)),
+                    ]);
+                }
+            )*
         }
 
         #[cfg(test)]
-        pub(crate) const KEYS: &[DiffKey] = &[
-            $(DiffKey {
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("diff_view::", stringify!($action)),
+                context: Some(CONTEXT),
                 idea: $idea,
             }),*
         ];
@@ -72,17 +81,33 @@ macro_rules! diff_keys {
 }
 
 diff_keys![
-    ("f7", NextDiff, Some("NextDiff")),
-    ("shift-f7", PreviousDiff, Some("PreviousDiff")),
-    ("alt-shift-right", NextChange, Some("Diff.NextChange")),
-    ("alt-shift-left", PreviousChange, Some("Diff.PrevChange")),
-    ("ctrl-alt-r", ApplyLeftSide, Some("Diff.ApplyLeftSide")),
-    ("ctrl-alt-a", ApplyRightSide, Some("Diff.ApplyRightSide")),
+    ("f7", NextDiff, Some("NextDiff"), None),
+    ("shift-f7", PreviousDiff, Some("PreviousDiff"), None),
+    ("alt-shift-right", NextChange, Some("Diff.NextChange"), None),
+    (
+        "alt-shift-left",
+        PreviousChange,
+        Some("Diff.PrevChange"),
+        None
+    ),
+    (
+        "ctrl-alt-r",
+        ApplyLeftSide,
+        Some("Diff.ApplyLeftSide"),
+        None
+    ),
+    (
+        "ctrl-alt-a",
+        ApplyRightSide,
+        Some("Diff.ApplyRightSide"),
+        None
+    ),
     // Tab stays an indent in the editable pane, as in IDEA.
     (
         "ctrl-shift-tab",
         FocusOppositePane,
-        Some("Diff.FocusOppositePane")
+        Some("Diff.FocusOppositePane"),
+        None
     ),
 ];
 

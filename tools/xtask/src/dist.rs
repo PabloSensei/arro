@@ -214,6 +214,12 @@ pub(crate) fn install_java_tools_macos(out: &Path, tools: &Path) -> Result<JavaT
     install_java_tools_for(out, tools, JDTLS_SHA256, DEBUG_SHA256, "config_mac")
 }
 
+/// The Linux folder keeps `tools` next to the program, with the configuration folder
+/// `config_linux`.
+pub(crate) fn install_java_tools_linux(out: &Path, tools: &Path) -> Result<JavaTools> {
+    install_java_tools_for(out, tools, JDTLS_SHA256, DEBUG_SHA256, "config_linux")
+}
+
 /// The same servers with the configuration folder of another system, which is all that
 /// differs between the releases of jdtls.
 pub(crate) fn install_java_tools_for(
@@ -404,7 +410,7 @@ pub(crate) fn target_directory(root: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(target))
 }
 
-fn git(root: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(root)
@@ -420,6 +426,28 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 pub(crate) fn write_text(path: &Path, text: &str) -> Result {
     let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
     fs::write(path, text)?;
+    Ok(())
+}
+
+/// Writes a text with LF endings, as a Linux release carries it.
+pub(crate) fn write_unix_text(path: &Path, text: &str) -> Result {
+    fs::write(path, text.replace("\r\n", "\n"))?;
+    Ok(())
+}
+
+/// Sets the executable bits of a file of a Linux or macOS release. Windows has no
+/// such bits, and a package built there keeps the file as it is.
+pub(crate) fn make_executable(path: &Path) -> Result {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -457,7 +485,7 @@ pub(crate) fn tar() -> PathBuf {
     PathBuf::from("tar")
 }
 
-fn check(command: &mut Command) -> Result {
+pub(crate) fn check(command: &mut Command) -> Result {
     let status = command.status()?;
     if status.success() {
         return Ok(());

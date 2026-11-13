@@ -21,7 +21,7 @@ pub use dispatch::{Dispatch, KeyDispatcher};
 pub use gesture::{GestureRecognizer, Modifiers, STEP};
 pub use idea::{
     DEVIATIONS, Deviation, IDEA_DEFAULT, IDEA_DEFAULT_MACOS, NOT_IN_MVP, deviation_for,
-    idea_shortcuts,
+    idea_shortcuts, macos_keys,
 };
 pub use keymap_file::{
     KEYMAP_FILE, KEYMAP_VERSION, KeymapAction, KeymapChange, KeymapFile, LoadedKeymap,

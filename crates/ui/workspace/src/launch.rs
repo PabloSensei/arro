@@ -108,7 +108,18 @@ pub fn spawn_project_after(
     folder: &std::path::Path,
     replaced: Option<u32>,
 ) -> std::io::Result<()> {
-    let program = std::env::current_exe()?;
+    spawn_project_from(std::env::current_exe()?, state_dir, folder, replaced)
+}
+
+/// [`spawn_project_after`] with the program to start. An update renames the running
+/// executable or replaces the bundle around it, so the new process is started from the
+/// path the update itself wrote.
+pub fn spawn_project_from(
+    program: PathBuf,
+    state_dir: &std::path::Path,
+    folder: &std::path::Path,
+    replaced: Option<u32>,
+) -> std::io::Result<()> {
     let mut command = std::process::Command::new(program);
     command.arg("--state-dir").arg(state_dir);
     if let Some(process_id) = replaced {

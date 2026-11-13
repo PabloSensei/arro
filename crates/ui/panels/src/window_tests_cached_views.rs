@@ -12,11 +12,11 @@ use std::time::Duration;
 use ui_kit::Theme;
 use ui_kit::gpui;
 use ui_kit::gpui::{AppContext, TestAppContext, WindowHandle};
-use workspace::{PROJECT_TOOL, RUN_TOOL, Workspace, view_render_count};
+use workspace::{AI_TOOL, PROJECT_TOOL, RUN_TOOL, TASKS_TOOL, Workspace, view_render_count};
 
 use crate::project::ActiveProjectPanel;
 use crate::window_tests::{
-    click, draw, open_path, open_sample_window, press, wait_for_project_tree,
+    bounds_of, click, draw, open_path, open_sample_window, press, wait_for_project_tree,
 };
 #[cfg(windows)]
 use crate::window_tests::{open_window_with, sample_project};
@@ -234,4 +234,50 @@ fn a_wider_dock_rebuilds_the_project_tree(cx: &mut TestAppContext) {
         renders(cx, "project") > before,
         "a wider dock rebuilds the project tree"
     );
+}
+
+/// The stripes are cached views of their own: the bottom group of the left stripe still
+/// sits at the bottom of the window, below the middle of the window.
+#[ui_kit::gpui::test]
+fn the_bottom_group_of_the_left_stripe_stays_at_the_bottom(cx: &mut TestAppContext) {
+    let (_, window) = open_sample_window(cx, "cached-stripe");
+    settle(cx, window);
+    let project = bounds_of(cx, window, "stripe-s-project");
+    let terminal = bounds_of(cx, window, "stripe-s-terminal");
+    let height = window
+        .update(cx, |_, window, _| window.viewport_size().height)
+        .unwrap();
+    assert!(
+        terminal.origin.y > height / 2.,
+        "the terminal button is in the bottom half: {terminal:?} of {height:?}"
+    );
+    assert!(
+        terminal.origin.y > project.origin.y,
+        "the bottom group is below the top group"
+    );
+}
+
+/// The AI button shows the AI sessions even after another tool window of the right dock,
+/// and hides them on the second click.
+#[ui_kit::gpui::test]
+fn the_ai_button_shows_the_ai_sessions_after_another_tool_of_the_right_dock(
+    cx: &mut TestAppContext,
+) {
+    let (_, window) = open_sample_window(cx, "cached-ai-button");
+    show_tool(cx, window, TASKS_TOOL);
+    settle(cx, window);
+    let ai_open = |cx: &mut TestAppContext| {
+        window
+            .read_with(cx, |workspace, _| workspace.tool_open(AI_TOOL))
+            .unwrap()
+    };
+    assert!(!ai_open(cx), "Tasks is the tool of the right dock");
+
+    click(cx, window, "stripe-s-ai");
+    settle(cx, window);
+    assert!(ai_open(cx), "the AI button shows the AI sessions");
+
+    click(cx, window, "stripe-s-ai");
+    settle(cx, window);
+    assert!(!ai_open(cx), "the second click hides them");
 }

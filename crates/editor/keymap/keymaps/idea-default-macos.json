@@ -22,34 +22,34 @@
       "cmd-z"
     ],
     "ActivateBookmarksToolWindow": [
-      "alt-2"
+      "cmd-2"
     ],
     "ActivateCommitToolWindow": [
-      "alt-0"
+      "cmd-0"
     ],
     "ActivateDebugToolWindow": [
-      "alt-5"
+      "cmd-5"
     ],
     "ActivateFindToolWindow": [
-      "alt-3"
+      "cmd-3"
     ],
     "ActivateNuGetToolWindow": [
       "alt-shift-7"
     ],
     "ActivateProblemsViewToolWindow": [
-      "alt-6"
+      "cmd-6"
     ],
     "ActivateProjectToolWindow": [
-      "alt-1"
+      "cmd-1"
     ],
     "ActivateRunToolWindow": [
-      "alt-4"
+      "cmd-4"
     ],
     "ActivateServicesToolWindow": [
-      "alt-8"
+      "cmd-8"
     ],
     "ActivateStructureToolWindow": [
-      "alt-7"
+      "cmd-7"
     ],
     "ActivateTerminalToolWindow": [
       "alt-f12"
@@ -58,7 +58,7 @@
       "alt-shift-8"
     ],
     "ActivateVersionControlToolWindow": [
-      "alt-9"
+      "cmd-9"
     ],
     "AutoIndentLines": [
       "alt-cmd-i"
@@ -201,7 +201,7 @@
       "alt-shift-cmd-c"
     ],
     "Debug": [
-      "shift-f9"
+      "ctrl-d"
     ],
     "Diff.ApplyLeftSide": [
       "alt-cmd-r"
@@ -911,10 +911,10 @@
       "shift-f12"
     ],
     "Resume": [
-      "f9"
+      "alt-cmd-r"
     ],
     "Run": [
-      "shift-f10"
+      "ctrl-r"
     ],
     "RunAnything": [
       "double-ctrl"

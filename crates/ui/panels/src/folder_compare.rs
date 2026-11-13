@@ -36,26 +36,37 @@ actions!(
     ]
 );
 
-/// One key of the folder compare and the IDEA action it implements, if any.
-#[cfg(test)]
-pub(crate) struct CompareKey {
-    pub(crate) keys: &'static str,
-    pub(crate) action: &'static str,
-    pub(crate) idea: Option<&'static str>,
-}
-
 /// The keys of the window and, from the same rows, the table the keymap check reads.
 macro_rules! compare_keys {
-    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
         pub fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("folder_compare::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
         }
 
         #[cfg(test)]
-        pub(crate) const KEYS: &[CompareKey] = &[
-            $(CompareKey {
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("folder_compare::", stringify!($action)),
+                context: Some(CONTEXT),
                 idea: $idea,
             }),*
         ];
@@ -63,20 +74,22 @@ macro_rules! compare_keys {
 }
 
 compare_keys![
-    ("f7", NextDiff, Some("NextDiff")),
-    ("shift-f7", PreviousDiff, Some("PreviousDiff")),
+    ("f7", NextDiff, Some("NextDiff"), None),
+    ("shift-f7", PreviousDiff, Some("PreviousDiff"), None),
     (
         "enter",
         SynchronizeDiff,
-        Some("DirDiffMenu.SynchronizeDiff")
+        Some("DirDiffMenu.SynchronizeDiff"),
+        None
     ),
     (
         "ctrl-enter",
         SynchronizeDiffAll,
-        Some("DirDiffMenu.SynchronizeDiff.All")
+        Some("DirDiffMenu.SynchronizeDiff.All"),
+        None
     ),
-    ("ctrl-d", OpenDiff, Some("Compare.SameVersion")),
-    ("escape", CancelCompare, None),
+    ("ctrl-d", OpenDiff, Some("Compare.SameVersion"), None),
+    ("escape", CancelCompare, None, Some("escape")),
 ];
 
 /// The side a file is copied to.

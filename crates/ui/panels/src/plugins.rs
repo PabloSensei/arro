@@ -34,13 +34,47 @@ pub struct TogglePlugin {
     pub id: SharedString,
 }
 
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", Previous, Some(CONTEXT)),
-        KeyBinding::new("down", Next, Some(CONTEXT)),
-        KeyBinding::new("enter", Choose, Some(CONTEXT)),
-    ]);
+macro_rules! plugin_list_keys {
+    ($(($keys:literal, $action:ident, $mac:expr)),* $(,)?) => {
+        pub fn bind_keys(cx: &mut App) {
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: Some($mac),
+                    action: concat!("plugins::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: None,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
+        }
+
+        #[cfg(test)]
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
+                keys: $keys,
+                mac: Some($mac),
+                action: concat!("plugins::", stringify!($action)),
+                context: Some(CONTEXT),
+                idea: None,
+            }),*
+        ];
+    };
 }
+
+plugin_list_keys![
+    ("up", Previous, "up"),
+    ("down", Next, "down"),
+    ("enter", Choose, "enter"),
+];
 
 /// The plugins of the window, for scripts.
 pub struct ActivePlugins(pub Entity<Plugins>);

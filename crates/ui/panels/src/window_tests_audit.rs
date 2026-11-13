@@ -37,9 +37,14 @@ fn wait_for(
     }
 }
 
-fn idea_keys() -> HashMap<String, Vec<String>> {
-    keymap::idea_shortcuts(keymap::IDEA_DEFAULT)
-        .expect("idea-default.json parses")
+fn idea_keys_for(platform: keymap::Platform) -> HashMap<String, Vec<String>> {
+    let file = if platform.uses_command() {
+        keymap::IDEA_DEFAULT_MACOS
+    } else {
+        keymap::IDEA_DEFAULT
+    };
+    keymap::idea_shortcuts(file)
+        .expect("the IDEA keymap parses")
         .into_iter()
         .map(|(id, shortcuts)| {
             (
@@ -51,6 +56,24 @@ fn idea_keys() -> HashMap<String, Vec<String>> {
             )
         })
         .collect()
+}
+
+/// Every table of keys the window and the panels bind, for the checks below.
+fn tables() -> Vec<&'static [workspace::KeyRow]> {
+    vec![
+        workspace::WINDOW_KEYS,
+        crate::project::PANEL_KEYS,
+        crate::diff_view::KEYS,
+        crate::commit::KEYS,
+        crate::commit::SHELF_RENAME,
+        crate::git_log::KEYS,
+        crate::debug::KEYS,
+        crate::palette::KEYS,
+        crate::folder_compare::KEYS,
+        crate::branches::KEYS,
+        crate::items::KEYS,
+        crate::plugins::KEYS,
+    ]
 }
 
 /// The IDEA actions the keymaps of the window know, without the ones out of MVP-1.
@@ -65,74 +88,23 @@ fn implemented_ids() -> HashSet<&'static str> {
             .iter()
             .filter_map(|deviation| deviation.idea_action),
     );
-    ids.extend(workspace::WINDOW_KEYS.iter().filter_map(|row| row.idea));
-    ids.extend(crate::project::PANEL_KEYS.iter().filter_map(|row| row.idea));
-    ids.extend(crate::diff_view::KEYS.iter().filter_map(|row| row.idea));
-    ids.extend(crate::commit::KEYS.iter().filter_map(|row| row.idea));
-    ids.extend(crate::commit::SHELF_RENAME.idea);
-    ids.extend(crate::git_log::KEYS.iter().filter_map(|row| row.idea));
-    ids.extend(crate::debug::KEYS.iter().filter_map(|row| row.idea));
-    ids.extend(crate::palette::KEYS.iter().filter_map(|row| row.idea));
-    ids.extend(
-        crate::folder_compare::KEYS
-            .iter()
-            .filter_map(|row| row.idea),
-    );
-    ids.extend(crate::git::BRANCH_KEYS.iter().map(|(_, id)| *id));
+    for table in tables() {
+        ids.extend(table.iter().filter_map(|row| row.idea));
+    }
     ids
 }
 
-/// The rows of the key tables: our keys, the action, and the IDEA action it implements.
-fn keyed_rows() -> Vec<(&'static str, &'static str, &'static str)> {
-    let mut rows = Vec::new();
-    rows.extend(
-        workspace::WINDOW_KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    rows.extend(
-        crate::project::PANEL_KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    rows.extend(
-        crate::diff_view::KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    rows.extend(
-        crate::commit::KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    let shelf = &crate::commit::SHELF_RENAME;
-    rows.extend(shelf.idea.map(|idea| (shelf.keys, shelf.action, idea)));
-    rows.extend(
-        crate::git_log::KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    rows.extend(
-        crate::debug::KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    rows.extend(
-        crate::palette::KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    rows.extend(
-        crate::folder_compare::KEYS
-            .iter()
-            .filter_map(|row| Some((row.keys, row.action, row.idea?))),
-    );
-    rows
+fn platform_name(platform: keymap::Platform) -> &'static str {
+    match platform {
+        keymap::Platform::Windows => "Windows",
+        keymap::Platform::Linux => "Linux",
+        keymap::Platform::MacOs => "macOS",
+    }
 }
 
 #[test]
 fn every_idea_action_is_bound_a_deviation_or_out_of_mvp() {
-    let idea = idea_keys();
+    let idea = idea_keys_for(keymap::Platform::Windows);
     let implemented = implemented_ids();
     let out: HashSet<&str> = keymap::NOT_IN_MVP.iter().map(|(id, _)| *id).collect();
     let mut accounted: HashSet<&str> = implemented.clone();
@@ -162,25 +134,75 @@ fn every_idea_action_is_bound_a_deviation_or_out_of_mvp() {
 }
 
 #[test]
-fn every_key_of_a_panel_table_belongs_to_its_idea_action() {
-    let idea = idea_keys();
-    for (keys, action, id) in keyed_rows() {
-        let expected = idea
-            .get(id)
-            .unwrap_or_else(|| panic!("{id} is in the IDEA file"));
-        assert!(
-            expected.iter().any(|expected| expected == keys),
-            "{action}: {keys} is not a key of IDEA {id}"
-        );
+fn every_key_of_a_table_belongs_to_its_idea_action_on_both_platforms() {
+    for platform in [
+        keymap::Platform::Windows,
+        keymap::Platform::Linux,
+        keymap::Platform::MacOs,
+    ] {
+        let idea = idea_keys_for(platform);
+        for table in tables() {
+            for row in table {
+                let Some(id) = row.idea else { continue };
+                let expected = idea
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{id} of {} is in the IDEA file", row.action));
+                for keys in row.keys_for(platform) {
+                    assert!(
+                        expected.iter().any(|expected| expected == keys),
+                        "{}: {keys} is not a key of IDEA {id} on {}",
+                        row.action,
+                        platform_name(platform)
+                    );
+                }
+            }
+        }
     }
-    for (keys, id) in crate::git::BRANCH_KEYS {
-        let expected = idea
-            .get(*id)
-            .unwrap_or_else(|| panic!("{id} is in the IDEA file"));
-        assert!(
-            expected.iter().any(|expected| expected == keys),
-            "{keys} is not a key of IDEA {id}"
-        );
+}
+
+/// A row without an IDEA action spells its macOS key itself: the file cannot give it.
+#[test]
+fn a_row_without_an_idea_action_names_its_macos_key() {
+    for table in tables() {
+        for row in table {
+            if row.idea.is_none() {
+                assert!(
+                    row.mac.is_some(),
+                    "{} has no macOS key of its own",
+                    row.action
+                );
+            }
+        }
+    }
+}
+
+/// One key of one context runs one action on each platform: a stray row of the macOS
+/// table would otherwise take a key of the Windows one without a test noticing.
+#[test]
+fn one_key_in_a_context_runs_one_action_on_each_platform() {
+    for platform in [
+        keymap::Platform::Windows,
+        keymap::Platform::Linux,
+        keymap::Platform::MacOs,
+    ] {
+        let mut seen: HashMap<(Option<&'static str>, &'static str), &'static str> = HashMap::new();
+        for table in tables() {
+            for row in table {
+                for keys in row.keys_for(platform) {
+                    let key = (row.context, keys);
+                    if let Some(previous) = seen.insert(key, row.action) {
+                        assert_eq!(
+                            previous,
+                            row.action,
+                            "{keys} in {context:?} runs {previous} and {action} on {name}",
+                            context = row.context,
+                            action = row.action,
+                            name = platform_name(platform)
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

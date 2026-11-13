@@ -22,26 +22,37 @@ actions!(
     [RewordCommit, BranchAtCommit, ShowAllAffected]
 );
 
-/// One key of the log and the IDEA action it implements.
-#[cfg(test)]
-pub(crate) struct LogKey {
-    pub(crate) keys: &'static str,
-    pub(crate) action: &'static str,
-    pub(crate) idea: Option<&'static str>,
-}
-
 macro_rules! log_keys {
-    ($(($keys:literal, $action:ident, $idea:expr)),* $(,)?) => {
+    ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
         /// F2, Shift+F6, Ctrl+Alt+N and Alt+Shift+A of the log.
         fn bind_keys(cx: &mut App) {
-            cx.bind_keys([$(KeyBinding::new($keys, $action, Some(CONTEXT))),*]);
+            bind_keys_for(cx, keymap::platform());
+        }
+
+        /// Binds the keys of one platform, so that a test reads the macOS table on every
+        /// runner.
+        fn bind_keys_for(cx: &mut App, platform: keymap::Platform) {
+            $(
+                let row = workspace::KeyRow {
+                    keys: $keys,
+                    mac: $mac,
+                    action: concat!("git_log_panel::", stringify!($action)),
+                    context: Some(CONTEXT),
+                    idea: $idea,
+                };
+                for key in row.keys_for(platform) {
+                    cx.bind_keys([KeyBinding::new(key, $action, Some(CONTEXT))]);
+                }
+            )*
         }
 
         #[cfg(test)]
-        pub(crate) const KEYS: &[LogKey] = &[
-            $(LogKey {
+        pub(crate) const KEYS: &[workspace::KeyRow] = &[
+            $(workspace::KeyRow {
                 keys: $keys,
+                mac: $mac,
                 action: concat!("git_log_panel::", stringify!($action)),
+                context: Some(CONTEXT),
                 idea: $idea,
             }),*
         ];
@@ -49,13 +60,19 @@ macro_rules! log_keys {
 }
 
 log_keys![
-    ("f2", RewordCommit, Some("Git.Reword.Commit")),
-    ("shift-f6", RewordCommit, Some("Git.Reword.Commit")),
-    ("ctrl-alt-n", BranchAtCommit, Some("Git.New.Branch.In.Log")),
+    ("f2", RewordCommit, Some("Git.Reword.Commit"), None),
+    ("shift-f6", RewordCommit, Some("Git.Reword.Commit"), None),
+    (
+        "ctrl-alt-n",
+        BranchAtCommit,
+        Some("Git.New.Branch.In.Log"),
+        None
+    ),
     (
         "alt-shift-a",
         ShowAllAffected,
-        Some("VcsHistory.ShowAllAffected")
+        Some("VcsHistory.ShowAllAffected"),
+        None
     ),
 ];
 
