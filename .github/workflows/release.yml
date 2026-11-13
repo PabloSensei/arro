@@ -58,6 +58,7 @@ jobs:
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends \
                 build-essential binutils ca-certificates cmake curl git pkg-config unzip \
+                openjdk-17-jdk-headless \
                 libfontconfig1-dev libwayland-dev libx11-dev libxcb1-dev \
                 libxkbcommon-dev libxkbcommon-x11-dev > /dev/null
               git config --global --add safe.directory /src
