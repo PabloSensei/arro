@@ -472,6 +472,10 @@ impl MenuShortcut {
 #[action(no_json, no_register)]
 pub struct MenuRow {
     pub path: Vec<usize>,
+    /// The key of the row as the keymap writes it, `ctrl-shift-n`. GPUI shows a key beside
+    /// a row only for an action with a binding, so the key is part of the action: a binding
+    /// of the row is the action of that row alone.
+    pub key: Option<SharedString>,
 }
 
 pub(crate) struct Balloon {
@@ -3783,9 +3787,10 @@ impl Workspace {
         shortcuts.first().map(ToString::to_string)
     }
 
-    /// The key of a command id or of a window action name, as a menu writes it. The
-    /// menu does not spell keys itself: they come from the keymap or `WINDOW_KEYS`.
-    pub fn shortcut_of_key(&self, key: &str) -> Option<String> {
+    /// The key of a command id or of a window action name, as the keymap writes it,
+    /// `ctrl-shift-n`. The menu of the window spells the label from it; the menu of the
+    /// screen of macOS gives it to GPUI, which shows the key beside the row.
+    pub fn key_of_key(&self, key: &str) -> Option<String> {
         self.shortcut_of(key)
             .or_else(|| window_key(key, keymap::platform()).map(str::to_owned))
             .or_else(|| {
@@ -3798,7 +3803,12 @@ impl Workspace {
                 }
                 .map(str::to_owned)
             })
-            .map(|text| shortcut_label(&text))
+    }
+
+    /// The key of a command id or of a window action name, as a menu writes it. The
+    /// menu does not spell keys itself: they come from the keymap or `WINDOW_KEYS`.
+    pub fn shortcut_of_key(&self, key: &str) -> Option<String> {
+        self.key_of_key(key).map(|text| shortcut_label(&text))
     }
 
     /// Whether the keymap already takes Alt+`key`. A binding wins over the same letter

@@ -80,3 +80,34 @@ jobs:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: cargo test --workspace --no-fail-fast
+
+  # A real language server and a real debug adapter that are neither the ones the
+  # product ships nor for its language: the neutral clients must not hide a dependency
+  # on it. Both packages are test tools, not part of the build.
+  boundary:
+    name: Boundary (real servers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup show active-toolchain && cargo --version
+
+      # The runner carries a Python it refuses to install into, so the tools live in a
+      # folder of the job and disappear with it.
+      - name: Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/boundary-venv"
+          "$RUNNER_TEMP/boundary-venv/bin/pip" install --disable-pip-version-check \
+            "python-lsp-server[pyflakes]==1.12.0" \
+            "debugpy==1.8.14"
+
+      - name: Language server boundary
+        env:
+          ARRO_PYLSP: ${{ runner.temp }}/boundary-venv/bin/pylsp
+        run: cargo test -p lsp-client --test real_python -- --ignored
+
+      - name: Debug adapter boundary
+        env:
+          ARRO_DEBUGPY_PYTHON: ${{ runner.temp }}/boundary-venv/bin/python
+        run: cargo test -p dap-client --test real_debugpy -- --ignored

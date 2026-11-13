@@ -929,8 +929,8 @@ impl Workspace {
         } else {
             MenuEntry::disabled(label).id(id)
         };
-        if let Some(shortcut) = self.shortcut_of_key(id) {
-            entry = entry.shortcut(shortcut);
+        if let (Some(keys), Some(shortcut)) = (self.key_of_key(id), self.shortcut_of_key(id)) {
+            entry = entry.shortcut(shortcut).keys(keys);
         }
         entry
     }
@@ -938,9 +938,11 @@ impl Workspace {
     /// A window action row with its key from the window bindings.
     fn action_row<A: Action + Clone + 'static>(&self, label: &'static str, action: A) -> MenuEntry {
         let entry = action_entry(label, action);
-        match self.shortcut_of_key(A::name_for_type()) {
-            Some(shortcut) => entry.shortcut(shortcut),
-            None => entry,
+        let name = A::name_for_type();
+        if let (Some(keys), Some(shortcut)) = (self.key_of_key(name), self.shortcut_of_key(name)) {
+            entry.shortcut(shortcut).keys(keys)
+        } else {
+            entry
         }
     }
 
@@ -1026,7 +1028,11 @@ impl Workspace {
         #[cfg(target_os = "macos")]
         {
             let sections = self.main_menu(cx);
-            cx.set_menus(crate::native_menu::menus(self.info().name, &sections));
+            let screen = crate::native_menu::menus(self.info().name, &sections);
+            // The hints come before the menus: the platform reads the keymap when it
+            // builds them and makes the key it finds the key equivalent of the row.
+            crate::native_menu::add_hints(cx, &screen.hints);
+            cx.set_menus(screen.menus);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = cx;

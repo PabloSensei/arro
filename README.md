@@ -13,7 +13,7 @@
   <a href="https://github.com/PabloSensei/arro/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/PabloSensei/arro?include_prereleases&label=release&color=EA580C"></a>
   <a href="https://github.com/PabloSensei/arro/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/PabloSensei/arro/total?color=EA580C"></a>
   <a href="LICENSE.md"><img alt="License: FSL-1.1-ALv2" src="https://img.shields.io/badge/license-FSL--1.1--ALv2-1F1F23"></a>
-  <img alt="Platform: Windows 11" src="https://img.shields.io/badge/platform-Windows%2011-1F1F23">
+  <img alt="Platform: Windows 11, Linux x86-64, macOS" src="https://img.shields.io/badge/platform-Windows%2011%20%C2%B7%20Linux%20%C2%B7%20macOS-1F1F23">
   <a href="https://github.com/sponsors/PabloSensei"><img alt="Sponsor" src="https://img.shields.io/badge/sponsor-%E2%99%A5-EA580C"></a>
 </p>
 
@@ -90,19 +90,55 @@ And the rest you expect from an IDE: Search Everywhere, Find in Files, a project
 
 ## Install
 
-1. Download the latest zip from [Releases](https://github.com/PabloSensei/arro/releases/latest) and unpack it anywhere. There is no installer.
-2. Install a JDK 25 or newer for the language server, for example [Eclipse Temurin 25](https://adoptium.net/temurin/releases/?version=25&os=windows&arch=x64&package=jdk). Your projects can still build on their own JDK, from 8 to 25.
-3. Run `arro.exe` and open a folder with a Maven or Gradle project.
+Download the archive for your system from [Releases](https://github.com/PabloSensei/arro/releases/latest) and unpack it anywhere. There is no installer. Every archive has a `.sha256` file next to it.
 
-The Java language server and the debugger are already in the zip. `README.txt` inside it explains where Arro looks for a JDK and what it keeps on disk. Arro checks for updates once a day and can update itself; the check can be turned off in Settings.
+Whichever system you use, install a JDK 25 or newer for the language server, for example [Eclipse Temurin 25](https://adoptium.net/temurin/releases/?version=25&package=jdk). Your projects can still build on their own JDK, from 8 to 25. The Java language server and the debugger are already in the archive.
+
+### Windows 11 x86-64
+
+1. Unpack `arro-<version>-windows-x86_64.zip`.
+2. Run `arro.exe` and open a folder with a Maven or Gradle project.
+
+`run-arro.cmd` finds the JDK and the bundled tools for you; starting `arro.exe` directly works too.
+
+### Linux x86-64
+
+1. Unpack `arro-<version>-linux-x86_64.tar.gz`, for example into `~/opt`.
+2. Run `./arro` from that folder.
+3. If you want a shortcut in the application menu, run `./install.sh` and answer the question. It writes only to `~/.local/share` of your user; nothing is installed automatically.
+
+The window needs `libfontconfig`, `libwayland`, `libx11`, `libxcb` and `libxkbcommon` at run time. The archive includes `README.txt` with the JDK search paths and the servers it ships.
+
+### macOS (Apple silicon)
+
+1. Unpack `arro-<version>-macos-aarch64.zip` and drag `Arro.app` into Applications, or run it from where it is unpacked.
+2. The build is signed ad hoc, not notarized: the first start is stopped by Gatekeeper. Control-click `Arro.app`, choose Open and confirm, or run `xattr -dr com.apple.quarantine /Applications/Arro.app`.
+3. Open `Arro.app`, or run `open Arro.app --args /work/shop` for a project folder.
+
+An Intel build (`macos-x86_64`) is made when the release runner is an Intel Mac; the Apple silicon archive is the one published today. `README.txt` inside the bundle explains the JDK search and where Arro keeps its files.
+
+### Updates and limitations
+
+Arro checks for updates once a day and can update itself; the check can be turned off in Settings. The updater picks the archive of the running system: the zip on Windows, the tar.gz on Linux, the whole `Arro.app` bundle on macOS. Keep the folder you unpacked Arro into writable, otherwise the update stops with a message.
+
+Known limitations of this preview:
+
+- Linux and macOS are early previews: they build and pass the tests, but fewer people use them than the Windows build.
+- The macOS build is not notarized, so the first start needs the step above.
+- Linux is built for x86-64 only, and the macOS archive published by the release workflow is for Apple silicon. A build for another architecture has to be made on that architecture.
+- There is no `.deb`, `.rpm`, Flatpak or Homebrew package yet, and the macOS bundle is not a signed `.dmg`.
+- On Linux the terminal uses the system pseudo terminal; the Windows ConPTY is not part of that archive.
 
 ## Build from source
 
 ```shell
 cargo build --release -p ide
 cargo run -p xtask -- dist --out <folder>
+cargo run -p xtask -- dist --target linux --out <folder> --zip
 cargo run -p xtask -- dist --target macos --out <folder> --zip
 ```
+
+`--target linux` and `--target macos` are built on their own system; the archives they write are the ones the updater looks for.
 
 The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `cargo run -p xtask -- ci` runs formatting, lints, tests, license and architecture checks.
 
@@ -114,8 +150,8 @@ The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `c
 | Maven and Gradle, run, tests, debugger | ✅ Works |
 | Git | ✅ Works |
 | Windows 11 x86-64 | ✅ Supported |
-| Linux x86-64 | 🚧 Builds and tests pass; no release yet |
-| macOS (Apple silicon and Intel) | 🚧 In progress; no release yet |
+| Linux x86-64 | 🚧 Preview release |
+| macOS (Apple silicon; Intel where a runner builds it) | 🚧 Preview release |
 | AI agent panel (Claude Code, Codex, OpenCode) | 🚧 In progress |
 | More languages on the same core | 🗓️ Planned |
 

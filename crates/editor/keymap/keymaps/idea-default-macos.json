@@ -423,15 +423,11 @@
     "EditorTextEnd": [
       "cmd-down"
     ],
-    "EditorTextEndWithSelection": [
-      "shift-cmd-down"
-    ],
+    "EditorTextEndWithSelection": [],
     "EditorTextStart": [
       "cmd-up"
     ],
-    "EditorTextStartWithSelection": [
-      "shift-cmd-up"
-    ],
+    "EditorTextStartWithSelection": [],
     "EditorToggleCase": [
       "shift-cmd-u"
     ],

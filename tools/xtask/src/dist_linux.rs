@@ -38,6 +38,7 @@ pub fn run(root: &Path, out: &Path, tools: Option<&Path>, archive: bool) -> Resu
     let program = out.join(BINARY);
     fs::copy(&binary, &program)?;
     dist::make_executable(&program)?;
+    split_debug_info(&program, &dist::default_symbols_dir(&out))?;
     println!("{}", program.display());
 
     helpers::run(&root, &out.join("helpers"), None)?;
@@ -110,6 +111,36 @@ fn tar_gz_folder(out: &Path) -> Result<PathBuf> {
 }
 
 /// Only what this command writes is replaced, as in the Windows folder.
+/// Moves the line tables of the release build out of the program into
+/// `<symbols>/arro.debug`, the way the Windows release keeps its pdb out of the zip, and
+/// leaves a debug link behind. Without `objcopy` the program keeps them: the archive is
+/// larger, nothing else changes.
+fn split_debug_info(program: &Path, symbols: &Path) -> Result {
+    fs::create_dir_all(symbols)?;
+    let debug = symbols.join(format!("{BINARY}.debug"));
+    let keep = Command::new("objcopy")
+        .arg("--only-keep-debug")
+        .arg(program)
+        .arg(&debug)
+        .status();
+    match keep {
+        Ok(status) if status.success() => {}
+        Ok(status) => return Err(format!("objcopy --only-keep-debug failed: {status}").into()),
+        Err(error) => {
+            println!("objcopy is not available ({error}); the program keeps its debug info");
+            return Ok(());
+        }
+    }
+    let mut strip = Command::new("objcopy");
+    strip
+        .arg("--strip-debug")
+        .arg(format!("--add-gnu-debuglink={}", debug.display()))
+        .arg(program);
+    dist::check(&mut strip)?;
+    println!("{}", debug.display());
+    Ok(())
+}
+
 fn remove_old(out: &Path) -> Result {
     for name in [
         BINARY,

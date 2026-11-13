@@ -79,9 +79,11 @@ pub const OVERRIDES: &[(&str, &[&str])] = &[
     ("EditorSplitLine", &["cmd-enter"]),
     ("EditorStartNewLineBefore", &["cmd-alt-enter"]),
     ("EditorTextEnd", &["cmd-down"]),
-    ("EditorTextEndWithSelection", &["cmd-shift-down"]),
+    // IDEA's macOS keymap gives both selections ⇧⌘↑ and ⇧⌘↓, the keys of Move Line Up and
+    // Down. The editor keeps move, as IDEA does, and the selections have no key there.
+    ("EditorTextEndWithSelection", &[]),
     ("EditorTextStart", &["cmd-up"]),
-    ("EditorTextStartWithSelection", &["cmd-shift-up"]),
+    ("EditorTextStartWithSelection", &[]),
     ("EditorToggleCase", &["cmd-shift-u"]),
     ("EditorToggleColumnMode", &["cmd-shift-8"]),
     // An Apple keyboard has no Insert key and no Menu key.

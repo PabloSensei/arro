@@ -50,6 +50,10 @@ pub struct MenuCallbacks {
 pub struct MenuEntry {
     pub label: SharedString,
     pub shortcut: Option<SharedString>,
+    /// The key of the row as the keymap writes it, `ctrl-shift-n`. The menu of the screen
+    /// of macOS shows a key only for an action of the keymap, so it needs the key itself
+    /// and not only the label of `shortcut`.
+    pub keys: Option<SharedString>,
     pub icon: Option<&'static str>,
     pub on_click: Option<MenuAction>,
     pub submenu: Vec<MenuEntry>,
@@ -67,6 +71,7 @@ impl MenuEntry {
         Self {
             label: label.into(),
             shortcut: None,
+            keys: None,
             icon: None,
             on_click: Some(Rc::new(on_click)),
             submenu: Vec::new(),
@@ -86,6 +91,13 @@ impl MenuEntry {
 
     pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
         self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    /// The key of the row as the keymap writes it, `ctrl-shift-n`, beside the label of
+    /// [`MenuEntry::shortcut`].
+    pub fn keys(mut self, keys: impl Into<SharedString>) -> Self {
+        self.keys = Some(keys.into());
         self
     }
 
@@ -109,6 +121,7 @@ impl MenuEntry {
         Self {
             label: SharedString::default(),
             shortcut: None,
+            keys: None,
             icon: None,
             on_click: None,
             submenu: Vec::new(),

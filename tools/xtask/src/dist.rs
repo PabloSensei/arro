@@ -117,7 +117,7 @@ pub fn run(
 }
 
 /// The folder next to the distribution: `<out>-symbols`.
-fn default_symbols_dir(out: &Path) -> PathBuf {
+pub(crate) fn default_symbols_dir(out: &Path) -> PathBuf {
     match out.file_name() {
         Some(name) => {
             let mut name = name.to_os_string();
