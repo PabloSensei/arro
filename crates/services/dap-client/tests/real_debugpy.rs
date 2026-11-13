@@ -57,17 +57,23 @@ async fn wait_for(
     what: &str,
     mut matches: impl FnMut(&Event) -> bool,
 ) -> Event {
-    timeout(LIMIT, async {
+    // The events passed over on the way, so that a failure says what came instead.
+    let mut seen = Vec::new();
+    let found = timeout(LIMIT, async {
         loop {
             match events.recv().await {
-                Some(event) if matches(&event) => return event,
-                Some(Event::Closed) | None => panic!("the adapter closed before {what}"),
-                Some(_) => {}
+                Some(event) if matches(&event) => return Some(event),
+                Some(Event::Closed) | None => return None,
+                Some(event) => seen.push(format!("{event:?}")),
             }
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("the adapter sent no {what}"))
+    .await;
+    match found {
+        Ok(Some(event)) => event,
+        Ok(None) => panic!("the adapter closed before {what}; events: {seen:#?}"),
+        Err(_) => panic!("the adapter sent no {what}; events: {seen:#?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

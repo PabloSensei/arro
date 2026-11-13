@@ -9,12 +9,16 @@ use std::time::Duration;
 use ui_kit::gpui;
 use ui_kit::gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use ui_kit::{TOOLTIP_DELAY, clear_shown_tooltips, shown_tooltips};
-use workspace::{INSPECTION_TOOL, TERMINAL_TOOL, Workspace, view_render_count};
+#[cfg(windows)]
+use workspace::TERMINAL_TOOL;
+use workspace::{INSPECTION_TOOL, Workspace, view_render_count};
 
 use crate::inspect::ActiveInspect;
+#[cfg(windows)]
 use crate::terminal_panel::ActiveTerminal;
 use crate::window_tests::{bounds_of, open_sample_window};
 use crate::window_tests_cached_views::{frame, show_tool};
+#[cfg(windows)]
 use crate::window_tests_run::wait_for;
 
 /// Moves the pointer to the middle of an element and lets the frames and the tooltip
