@@ -1260,7 +1260,7 @@ fn the_start_screen_shows_recent_projects_and_opens_the_new_project_mode(cx: &mu
 }
 
 #[ui_kit::gpui::test]
-fn settings_open_change_at_once_and_reach_the_file(cx: &mut TestAppContext) {
+fn settings_keep_a_draft_and_apply_reaches_the_window_and_the_file(cx: &mut TestAppContext) {
     let (_, window) = open_sample_window(cx, "settings");
     let settings_file = window
         .read_with(cx, |workspace, _| {
@@ -1273,22 +1273,40 @@ fn settings_open_change_at_once_and_reach_the_file(cx: &mut TestAppContext) {
     let before = cx.update(|cx| cx.global::<Settings>().font_size);
     click(cx, window, "settings-font-up");
     let after = cx.update(|cx| cx.global::<Settings>().font_size);
-    assert_eq!(after, before + 1., "the font size changes at once");
+    assert_eq!(
+        after, before,
+        "a click changes the draft and not the window at once"
+    );
 
+    click(cx, window, "settings-apply");
     draw(cx, window);
+    assert_eq!(
+        cx.update(|cx| cx.global::<Settings>().font_size),
+        before + 1.,
+        "Apply reaches the window"
+    );
+
     click(cx, window, "settings-page-editor");
     draw(cx, window);
     click(cx, window, "settings-soft-wrap");
     assert!(
+        !cx.update(|cx| cx.global::<Settings>().soft_wrap),
+        "the switch changes the draft only"
+    );
+    click(cx, window, "settings-ok");
+    draw(cx, window);
+    assert!(
         cx.update(|cx| cx.global::<Settings>().soft_wrap),
-        "the switch changes the setting"
+        "OK reaches the window"
     );
 
     cx.run_until_parked();
-    let saved: Settings = serde_json::from_str(&fs::read_to_string(&settings_file).unwrap())
-        .expect("the settings file is written");
-    assert_eq!(saved.font_size, after);
-    assert!(saved.soft_wrap);
+    wait_for_signal(cx, "the settings file", |_| {
+        fs::read_to_string(&settings_file)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+            .is_some_and(|saved| saved.font_size == before + 1. && saved.soft_wrap)
+    });
 }
 
 #[ui_kit::gpui::test]

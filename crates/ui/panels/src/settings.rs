@@ -1,6 +1,7 @@
-//! The Settings window, Ctrl+Alt+S: what changes the editor and the window, the plugins
-//! with a switch each, and the keys to look at. Every change applies at once and is written
-//! to the settings file in the background.
+//! The Settings window, Ctrl+Alt+S: a titled window with a close button, a search over the
+//! pages, and OK, Cancel and Apply. The pages of the settings file keep a draft until
+//! Apply or OK; Theme, Keymap, the templates and the Project SDK row apply at once, as
+//! their own windows and files do.
 
 use std::path::{Path, PathBuf};
 
@@ -11,13 +12,48 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{Settings, Workspace};
 
-use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog};
+use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog, dialog_button};
 use crate::prompt::TextField;
 use crate::settings_catalog::{self, Setting, SettingField, SettingKind, SettingsPage};
 use crate::settings_keymap::KeymapPage;
 use crate::settings_templates::TemplateSection;
 
 const WIDTH: f32 = 800.;
+const MIN_WIDTH: f32 = 640.;
+const MIN_HEIGHT: f32 = 420.;
+/// The grab area of the edge and the corner that change the size.
+const RESIZE_GRIP: f32 = 8.;
+
+/// Where the Settings window sits and how large it is, for this session only.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettingsWindowPlacement {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Global for SettingsWindowPlacement {}
+
+#[derive(Clone, Copy)]
+struct PlacementDrag {
+    from: Point<Pixels>,
+    placement: SettingsWindowPlacement,
+}
+
+#[derive(Clone, Copy)]
+enum ResizeEdge {
+    Right,
+    Bottom,
+    Corner,
+}
+
+#[derive(Clone, Copy)]
+struct PlacementResize {
+    from: Point<Pixels>,
+    placement: SettingsWindowPlacement,
+    edge: ResizeEdge,
+}
 
 /// A plugin as the list shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,13 +182,23 @@ pub struct SettingsView {
     focus: FocusHandle,
     editing: Option<&'static str>,
     text_field: TextField,
+    /// The settings the window shows and edits; nothing of it reaches the window until
+    /// Apply or OK.
+    draft: Settings,
+    /// The settings in force when the draft was last applied, to tell the changed leaves.
+    saved: Settings,
     plugins: Vec<PluginRow>,
+    /// The switches as they were last applied, to write the file only for a change.
+    saved_plugins: Vec<PluginRow>,
     plugin_file: PathBuf,
     pub(crate) keymap_page: KeymapPage,
     pub(crate) templates_page: crate::settings_templates::TemplatesPage,
     page: SettingsPage,
     /// The row the window came for, drawn as chosen while the window is open.
     highlight: Option<&'static str>,
+    /// The search over the pages, drawn above the tree.
+    search: TextField,
+    search_editing: bool,
     /// The name of the SDK of the project, empty until the environment is read.
     sdk: String,
     /// The SDKs the pages offer where a choice among them is needed.
@@ -162,6 +208,8 @@ pub struct SettingsView {
     /// What the Test button of the Git page found.
     git_version: Option<String>,
     testing_git: bool,
+    dragging: Option<PlacementDrag>,
+    resizing: Option<PlacementResize>,
     scroll_pages: ScrollHandle,
     scroll_content: ScrollHandle,
 }
@@ -206,17 +254,24 @@ impl SettingsView {
             focus: cx.focus_handle(),
             editing: None,
             text_field: TextField::from_text(font_family),
+            draft: settings.clone(),
+            saved: settings,
             plugins: Vec::new(),
+            saved_plugins: Vec::new(),
             plugin_file: plugin_file.clone(),
             keymap_page,
             templates_page,
             page,
             highlight: target,
+            search: TextField::default(),
+            search_editing: false,
             sdk: "not set".to_owned(),
             runtimes: Vec::new(),
             repository: String::new(),
             git_version: None,
             testing_git: false,
+            dragging: None,
+            resizing: None,
             scroll_pages: ScrollHandle::new(),
             scroll_content: ScrollHandle::new(),
         });
@@ -261,6 +316,7 @@ impl SettingsView {
         cx.spawn(async move |_, cx| {
             let plugins = read.await;
             list.update(cx, |view, cx| {
+                view.saved_plugins = plugins.clone();
                 view.plugins = plugins;
                 cx.notify();
             })
@@ -271,11 +327,10 @@ impl SettingsView {
         workspace.show_overlay(view.into(), focus, window, cx);
     }
 
+    /// Edits the draft only: nothing reaches the window or the settings file until Apply
+    /// or OK.
     fn change(&mut self, change: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
-        let apply = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
-            workspace.update_settings(change, cx)
-        };
-        self.workspace.update(cx, apply).ok();
+        change(&mut self.draft);
         cx.notify();
     }
 
@@ -284,9 +339,55 @@ impl SettingsView {
             return;
         };
         row.enabled = !row.enabled;
-        let mut switches = PluginSettings::default();
-        let off = self.plugins.iter().filter(|row| !row.enabled);
-        switches.disabled = off.map(|row| row.id.clone()).collect();
+        cx.notify();
+    }
+
+    /// Whether the window holds something Apply would write.
+    fn changed(&self) -> bool {
+        self.draft != self.saved || self.plugins != self.saved_plugins
+    }
+
+    /// Apply or OK: the changed leaves of the draft reach the window, the plugin switches
+    /// are written, and the draft starts again from what is in force. OK closes the
+    /// window afterwards; Apply leaves it open.
+    fn apply_draft(&mut self, close: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changed() {
+            if close {
+                self.close(window, cx);
+            }
+            return;
+        }
+        let saved = self.saved.clone();
+        let draft = self.draft.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.apply_settings(&saved, &draft, cx);
+            })
+            .ok();
+        let current = cx.global::<Settings>().clone();
+        self.saved = current.clone();
+        self.draft = current;
+        self.save_plugins(cx);
+        if close {
+            self.close(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Writes the plugin switches only when one moved since the last Apply or OK.
+    fn save_plugins(&mut self, cx: &mut Context<Self>) {
+        if self.plugins == self.saved_plugins {
+            return;
+        }
+        let switches = PluginSettings {
+            disabled: self
+                .plugins
+                .iter()
+                .filter(|row| !row.enabled)
+                .map(|row| row.id.clone())
+                .collect(),
+        };
+        self.saved_plugins = self.plugins.clone();
         let file = self.plugin_file.clone();
         let write = cx
             .background_executor()
@@ -297,10 +398,147 @@ impl SettingsView {
             }
         })
         .detach();
+    }
+
+    /// Cancel and the close button: the draft is dropped, nothing is written.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.close_menu(window, cx))
+            .ok();
+    }
+
+    /// Moves the window with a drag of its title bar.
+    fn drag_window(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(drag) = self.dragging else {
+            return;
+        };
+        let next = SettingsWindowPlacement {
+            left: drag.placement.left + f32::from(event.position.x) - f32::from(drag.from.x),
+            top: drag.placement.top + f32::from(event.position.y) - f32::from(drag.from.y),
+            ..drag.placement
+        };
+        cx.set_global(next);
         cx.notify();
     }
 
-    fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    /// Changes the size from the edge or the corner the drag started on.
+    fn resize_window(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(resize) = self.resizing else {
+            return;
+        };
+        let dx = f32::from(event.position.x) - f32::from(resize.from.x);
+        let dy = f32::from(event.position.y) - f32::from(resize.from.y);
+        let mut next = resize.placement;
+        let viewport = window.viewport_size();
+        if matches!(resize.edge, ResizeEdge::Right | ResizeEdge::Corner) {
+            let room = f32::from(viewport.width) - resize.placement.left;
+            next.width = (resize.placement.width + dx)
+                .max(MIN_WIDTH)
+                .min(room.max(MIN_WIDTH));
+        }
+        if matches!(resize.edge, ResizeEdge::Bottom | ResizeEdge::Corner) {
+            let room = f32::from(viewport.height) - resize.placement.top;
+            next.height = (resize.placement.height + dy)
+                .max(MIN_HEIGHT)
+                .min(room.max(MIN_HEIGHT));
+        }
+        cx.set_global(next);
+        cx.notify();
+    }
+
+    /// The button came up after a drag of the title or of an edge.
+    fn finish_drag(&mut self, cx: &mut Context<Self>) {
+        if self.dragging.take().is_some() || self.resizing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The search field over the tree of pages.
+    fn search_field(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let empty = self.search.text.is_empty();
+        let color = if empty {
+            theme.text_secondary
+        } else {
+            theme.text
+        };
+        div()
+            .id("settings-search")
+            .debug_selector(|| "settings-search".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_2()
+            .border_color(if self.search_editing {
+                theme.accent
+            } else {
+                theme.border
+            })
+            .text_color(color)
+            .children(text_field_children_named(
+                "settings-search-field",
+                &self.search,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                16.,
+                self.search_editing,
+            ))
+            .when(empty, |this| this.child("Search settings"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.search_editing = true;
+                this.editing = None;
+                cx.notify();
+            }))
+    }
+
+    /// The search keys. Escape in a filled field clears it; in an empty one it cancels the
+    /// window, as the close button does.
+    fn search_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" {
+            if self.search.text.is_empty() {
+                self.close(window, cx);
+            } else {
+                self.search = TextField::default();
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.search.key_with_clipboard(event, false, cx) {
+            let pages = settings_catalog::pages_matching(&self.search.text);
+            if !pages.contains(&self.page) {
+                self.page = pages
+                    .first()
+                    .copied()
+                    .unwrap_or(SettingsPage::Appearance)
+                    .target();
+                self.highlight = None;
+            }
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_editing {
+            self.search_key(event, window, cx);
+            return;
+        }
         if let Some(id) = self.editing {
             if self.text_field.key_with_clipboard(event, false, cx) {
                 let text = self.text_field.text.clone();
@@ -322,20 +560,22 @@ impl SettingsView {
             TemplateSection::section(self.page).is_some() && self.templates_page.key(event, cx);
         if keymap || templates {
             cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key == "escape" {
+            self.close(window, cx);
+            cx.stop_propagation();
         }
     }
 
     /// Reads the local repository of the settings file again, off the UI thread.
     fn refresh_repository(&self, cx: &mut Context<Self>) {
-        let file = cx
-            .try_global::<Settings>()
-            .and_then(|settings| {
-                settings
-                    .build_tools
-                    .first
-                    .settings_path()
-                    .map(PathBuf::from)
-            })
+        let file = self
+            .draft
+            .build_tools
+            .first
+            .settings_path()
+            .map(PathBuf::from)
             .unwrap_or_else(default_settings_file);
         let read = cx
             .background_executor()
@@ -358,10 +598,7 @@ impl SettingsView {
         if self.testing_git {
             return;
         }
-        let configured = cx
-            .try_global::<Settings>()
-            .map(|settings| settings.git_path.trim().to_owned())
-            .unwrap_or_default();
+        let configured = self.draft.git_path.trim().to_owned();
         self.testing_git = true;
         self.git_version = None;
         cx.notify();
@@ -412,9 +649,15 @@ fn pill(id: impl Into<ElementId>, text: &str, on: bool, theme: &Theme) -> Statef
         .child(text.to_string())
 }
 
-fn field(id: &'static str, text: &str, hint: &str, active: bool, theme: &Theme) -> Stateful<Div> {
-    let shown = if text.is_empty() { hint } else { text };
-    let color = if text.is_empty() {
+fn field(
+    id: &'static str,
+    value: &TextField,
+    hint: &'static str,
+    active: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let empty = value.text.is_empty();
+    let color = if empty {
         theme.text_secondary
     } else {
         theme.text
@@ -430,7 +673,17 @@ fn field(id: &'static str, text: &str, hint: &str, active: bool, theme: &Theme) 
         .border_2()
         .border_color(if active { theme.accent } else { theme.border })
         .text_color(color)
-        .child(shown.to_string())
+        .children(text_field_children_named(
+            "settings-field",
+            value,
+            theme.text,
+            theme.text,
+            theme.selection,
+            theme.caret,
+            16.,
+            active,
+        ))
+        .when(empty, |this| this.child(hint))
 }
 
 fn row(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div {
@@ -483,8 +736,7 @@ fn runtime_pill(
     pill(id, &label, true, theme)
         .debug_selector(move || format!("settings-{}", id.replace('_', "-")))
         .on_click(cx.listener(move |this, _, _, cx| {
-            let settings = cx.global::<Settings>().clone();
-            let current = settings.build_tools.second.runtime_home.clone();
+            let current = this.draft.build_tools.second.runtime_home.clone();
             let mut homes = vec![String::new()];
             homes.extend(
                 this.runtimes
@@ -673,17 +925,92 @@ fn project_sdk_row(sdk: &str, theme: &Theme, cx: &mut Context<SettingsView>) -> 
         }))
 }
 
+/// One edge or the corner that changes the size of the window.
+fn resize_grip(
+    id: &'static str,
+    edge: ResizeEdge,
+    placement: SettingsWindowPlacement,
+    cx: &mut Context<SettingsView>,
+) -> Stateful<Div> {
+    let grip = div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .absolute()
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.resizing = Some(PlacementResize {
+                    from: event.position,
+                    placement,
+                    edge,
+                });
+                cx.notify();
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+            this.resize_window(event, window, cx);
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.finish_drag(cx)),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.finish_drag(cx)),
+        );
+    match edge {
+        ResizeEdge::Right => grip
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(RESIZE_GRIP))
+            .cursor_col_resize(),
+        ResizeEdge::Bottom => grip
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .h(px(RESIZE_GRIP))
+            .cursor_row_resize(),
+        ResizeEdge::Corner => grip
+            .right_0()
+            .bottom_0()
+            .w(px(RESIZE_GRIP))
+            .h(px(RESIZE_GRIP))
+            .cursor_row_resize(),
+    }
+}
+
+/// A line that says a control of the page does not wait for Apply.
+fn note(text: &'static str, theme: &Theme) -> Div {
+    div()
+        .text_size(px(TEXT_SMALL))
+        .text_color(theme.text_secondary)
+        .child(text)
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        let settings = cx.global::<Settings>().clone();
-        let width = px(WIDTH).min(window.viewport_size().width - px(2. * DIALOG_PADDING));
-        let left = (window.viewport_size().width - width) / 2.;
-        let top = window.viewport_size().height * 0.08;
-        let height = window.viewport_size().height * 0.8;
+        let settings = self.draft.clone();
+        let query = self.search.text.trim().to_owned();
+        let viewport = window.viewport_size();
+        let default = SettingsWindowPlacement {
+            left: (f32::from(viewport.width)
+                - f32::from(px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING))))
+                / 2.,
+            top: f32::from(viewport.height) * 0.08,
+            width: f32::from(px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING))),
+            height: f32::from(viewport.height) * 0.8,
+        };
+        let placement = cx
+            .try_global::<SettingsWindowPlacement>()
+            .copied()
+            .unwrap_or(default);
 
         let on_off = |on: bool| if on { "On" } else { "Off" };
-        let pages: Vec<_> = SettingsPage::ALL
+        let navigation = settings_catalog::pages_matching(&query);
+        let pages: Vec<_> = navigation
             .iter()
             .enumerate()
             .map(|(index, page)| {
@@ -714,6 +1041,7 @@ impl Render for SettingsView {
                         this.page = page.target();
                         this.highlight = None;
                         this.editing = None;
+                        this.search_editing = false;
                         cx.notify();
                     }))
                     .child(page.title())
@@ -749,21 +1077,25 @@ impl Render for SettingsView {
                 }
             }
             SettingsPage::Keymap => {
+                content.push(note("Changes on this page apply at once.", &theme));
                 content.push(self.keymap_page.render(window, cx));
             }
             SettingsPage::EditorLiveTemplates => {
+                content.push(note("Changes on this page apply at once.", &theme));
                 content.push(
                     self.templates_page
                         .render(TemplateSection::Live, window, cx),
                 );
             }
             SettingsPage::EditorPostfix => {
+                content.push(note("Changes on this page apply at once.", &theme));
                 content.push(
                     self.templates_page
                         .render(TemplateSection::Postfix, window, cx),
                 );
             }
             SettingsPage::EditorFileTemplates => {
+                content.push(note("Changes on this page apply at once.", &theme));
                 content.push(
                     self.templates_page
                         .render(TemplateSection::Files, window, cx),
@@ -772,6 +1104,10 @@ impl Render for SettingsView {
             _ => {
                 if self.page == SettingsPage::Project {
                     content.push(div().child(project_sdk_row(&self.sdk, &theme, cx)));
+                    content.push(note("The project SDK applies at once.", &theme));
+                }
+                if self.page == SettingsPage::Appearance {
+                    content.push(note("The theme applies at once.", &theme));
                 }
                 let mut last_section: Option<&'static str> = None;
                 for entry in settings_catalog::all()
@@ -842,7 +1178,7 @@ impl Render for SettingsView {
                             } else if entry.field == SettingField::BuildToolFirstRepository {
                                 field(
                                     entry.id,
-                                    &self.repository,
+                                    &TextField::from_text(self.repository.clone()),
                                     "Read from the settings file",
                                     false,
                                     &theme,
@@ -850,11 +1186,18 @@ impl Render for SettingsView {
                                 .into_any_element()
                             } else {
                                 let id = entry.id;
-                                let value =
+                                let current =
                                     settings_catalog::text(&settings, id).unwrap_or_default();
                                 let hint = text_hint(entry.field);
                                 let active = self.editing == Some(id);
-                                let start = value.clone();
+                                let start = current.clone();
+                                let typed;
+                                let value = if active {
+                                    &self.text_field
+                                } else {
+                                    typed = TextField::from_text(current);
+                                    &typed
+                                };
                                 let test = if entry.field == SettingField::GitPath {
                                     Some(git_test_row(
                                         &self.git_version,
@@ -865,12 +1208,13 @@ impl Render for SettingsView {
                                 } else {
                                     None
                                 };
-                                let input = field(id, &value, hint, active, &theme)
+                                let input = field(id, value, hint, active, &theme)
                                     .debug_selector(move || {
                                         format!("settings-{}", id.replace('_', "-"))
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.editing = Some(id);
+                                        this.search_editing = false;
                                         this.text_field = TextField::from_text(start.clone());
                                         cx.notify();
                                     }));
@@ -892,7 +1236,8 @@ impl Render for SettingsView {
                             toggle_button(entry.id, on, &theme, cx).into_any_element()
                         }
                     };
-                    let highlighted = self.highlight == Some(entry.id);
+                    let highlighted = self.highlight == Some(entry.id)
+                        || (!query.is_empty() && entry.matches(&query));
                     content.push(setting_row(entry, control, highlighted, &theme));
                 }
             }
@@ -913,9 +1258,17 @@ impl Render for SettingsView {
             window,
             cx,
         )
-        .w(px(160.))
-        .flex_none()
-        .h_full();
+        .flex_1()
+        .min_h_0();
+        let pages = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .w(px(160.))
+            .flex_none()
+            .h_full()
+            .child(self.search_field(&theme, cx))
+            .child(pages);
         let content = scrollable(
             "settings-content",
             &self.scroll_content,
@@ -944,33 +1297,163 @@ impl Render for SettingsView {
             .child(pages)
             .child(content);
 
-        let body = surface(&theme)
-            .id("settings")
-            .debug_selector(|| "settings".to_owned())
-            .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .p(px(DIALOG_PADDING))
-            .gap(px(SPACE_XS))
-            .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
+        let changed = self.changed();
+        let ok = dialog_button(
+            "settings-ok",
+            "settings-ok".to_owned(),
+            "OK",
+            true,
+            true,
+            &theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.apply_draft(true, window, cx)));
+        let apply = dialog_button(
+            "settings-apply",
+            "settings-apply".to_owned(),
+            "Apply",
+            false,
+            changed,
+            &theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.apply_draft(false, window, cx)));
+        let cancel = dialog_button(
+            "settings-cancel",
+            "settings-cancel".to_owned(),
+            "Cancel",
+            false,
+            true,
+            &theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
+        let buttons = div()
+            .flex()
+            .justify_end()
+            .flex_none()
+            .gap(px(SPACE_M))
+            .child(ok)
+            .child(cancel)
+            .child(apply);
+
+        let close = icon_button("settings-close", "general/close", "Close", None, &theme)
+            .debug_selector(|| "settings-close".to_owned())
+            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
+        let title = div()
+            .id("settings-title")
+            .debug_selector(|| "settings-title".to_owned())
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .h(px(24.))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.dragging = Some(PlacementDrag {
+                        from: event.position,
+                        placement,
+                    });
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag_window(event, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_drag(cx)),
             )
             .child(
                 div()
-                    .debug_selector(|| "settings-title".to_owned())
                     .text_size(px(TEXT_TITLE))
                     .font_weight(FontWeight::MEDIUM)
                     .child("Settings"),
             )
-            .child(section);
+            .child(close);
+
+        let catcher = (self.dragging.is_some() || self.resizing.is_some()).then(|| {
+            div()
+                .id("settings-drag-catcher")
+                .debug_selector(|| "settings-drag-catcher".to_owned())
+                .absolute()
+                .left(px(-placement.left))
+                .top(px(-placement.top))
+                .w(viewport.width)
+                .h(viewport.height)
+                .occlude()
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    this.drag_window(event, cx);
+                    this.resize_window(event, window, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.finish_drag(cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.finish_drag(cx)),
+                )
+        });
+
+        let body = surface(&theme)
+            .id("settings")
+            .debug_selector(|| "settings".to_owned())
+            .key_context("Settings")
+            .track_focus(&self.focus)
+            .occlude()
+            .w(px(placement.width))
+            .h(px(placement.height))
+            .p(px(DIALOG_PADDING))
+            .gap(px(SPACE_XS))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &workspace::Dismiss, window, cx| {
+                if this.page == SettingsPage::Keymap && this.keymap_page.escape(cx) {
+                    return;
+                }
+                if TemplateSection::section(this.page).is_some() && this.templates_page.escape(cx) {
+                    return;
+                }
+                if this.search.text.is_empty() {
+                    this.close(window, cx);
+                } else {
+                    this.search = TextField::default();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
+            )
+            .child(title)
+            .child(section)
+            .child(buttons)
+            .child(resize_grip(
+                "settings-resize-right",
+                ResizeEdge::Right,
+                placement,
+                cx,
+            ))
+            .child(resize_grip(
+                "settings-resize-bottom",
+                ResizeEdge::Bottom,
+                placement,
+                cx,
+            ))
+            .child(resize_grip(
+                "settings-resize-corner",
+                ResizeEdge::Corner,
+                placement,
+                cx,
+            ));
         div()
             .absolute()
-            .left(left)
-            .top(top)
+            .left(px(placement.left))
+            .top(px(placement.top))
             .child(enter("settings-enter", body))
+            .children(catcher)
     }
 }
 

@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -106,8 +107,25 @@ impl PluginSettings {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, text)
+        let temp = temp_path(path);
+        std::fs::write(&temp, text)?;
+        if let Err(error) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        Ok(())
     }
+}
+
+/// A name beside `path` that a save of this process has not taken yet.
+fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map_or_else(|| "plugins".into(), |name| name.to_os_string());
+    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// What the plugin list shows.
@@ -574,5 +592,29 @@ impl PluginHost {
 impl Drop for PluginHost {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PluginSettings;
+
+    #[test]
+    fn the_save_leaves_no_temporary_file_behind() {
+        let dir = test_support::scratch("plugin-settings-atomic");
+        let file = dir.join("plugins.toml");
+        let mut switches = PluginSettings::default();
+        switches.disabled.insert("first".into());
+        switches.save(&file).unwrap();
+        switches.disabled.insert("second".into());
+        switches.save(&file).unwrap();
+
+        assert_eq!(PluginSettings::load(&file).unwrap(), switches);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["plugins.toml"], "only the switch file stays");
     }
 }

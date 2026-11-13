@@ -2044,6 +2044,12 @@ impl EditorView {
         self.syntax_generation
     }
 
+    /// The spans the last parse coloured. A test reads them to check that a file format
+    /// reaches the editor with its language.
+    pub fn highlight_spans(&self) -> &[HighlightSpan] {
+        self.state.as_ref().map_or(&[], |state| state.spans())
+    }
+
     /// Numbers the next request for the outline, so that an older answer can be dropped.
     pub fn next_outline_serial(&mut self) -> u64 {
         self.outline_serial += 1;

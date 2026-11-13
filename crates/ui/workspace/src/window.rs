@@ -2320,6 +2320,23 @@ impl Workspace {
         if settings == before {
             return;
         }
+        self.store_settings(settings, cx);
+    }
+
+    /// Applies a dialog's draft over the settings in force. Only the leaves that differ
+    /// from `saved` come from the draft, so a field another part of the window changed
+    /// meanwhile keeps its newer value.
+    pub fn apply_settings(&mut self, saved: &Settings, draft: &Settings, cx: &mut Context<Self>) {
+        let mut settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        settings.merge_draft(saved, draft);
+        if cx.try_global::<Settings>() == Some(&settings) {
+            return;
+        }
+        self.store_settings(settings, cx);
+    }
+
+    /// Puts the settings in force and writes the file in the background.
+    fn store_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         cx.set_global(settings.clone());
         let path = self.settings_dir.join(SETTINGS_FILE);
         let write = cx

@@ -46,6 +46,8 @@ workspace-core.workspace = true
 [dev-dependencies]
 # A language for the editor keys in window tests: comments and syntax without a server.
 dockerfile-syntax = { path = "../../editor/dockerfile-syntax" }
+# The formats around a project, for the window test of their highlighting.
+file-syntax = { path = "../../editor/file-syntax" }
 # The mock debug adapter of the fixture language, for the debug window tests.
 lang-fixture = { path = "../../../tools/lang-fixture" }
 # Temporary folders of the tests: one root and removal without help from a test.

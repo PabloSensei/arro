@@ -108,7 +108,7 @@ fn setup() -> ProjectSetup {
 
 /// A window whose strings are `.txt` files of a grammar without a server, with the
 /// templates and the file templates of the test.
-fn open_templates_window(
+pub(crate) fn open_templates_window(
     cx: &mut TestAppContext,
     root: PathBuf,
 ) -> ui_kit::gpui::WindowHandle<Workspace> {
@@ -131,7 +131,7 @@ fn open_templates_window(
     window
 }
 
-fn open_page(
+pub(crate) fn open_page(
     cx: &mut TestAppContext,
     window: ui_kit::gpui::WindowHandle<Workspace>,
     page: &'static str,

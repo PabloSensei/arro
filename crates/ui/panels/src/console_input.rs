@@ -152,14 +152,16 @@ impl ConsoleInput {
             .px(px(SPACE_L))
             .whitespace_nowrap()
             .text_color(theme.console_input)
-            .child(self.field.text.clone())
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(1.))
-                    .h(px(CODE_SIZE))
-                    .bg(theme.console_input),
-            )
+            .children(text_field_children_named(
+                "console-input-field",
+                &self.field,
+                theme.console_input,
+                theme.console_input,
+                theme.selection,
+                theme.console_input,
+                CODE_SIZE,
+                true,
+            ))
             .into_any_element()
     }
 

@@ -382,6 +382,26 @@ impl Render for DocumentationPanel {
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()
+            // The side buttons of the mouse page the answers of the window while it has
+            // somewhere to go; otherwise the window lets the keys of Back and Forward run.
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| {
+                    if this.index > 0 {
+                        this.back(cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| {
+                    if this.index + 1 < this.history.len() {
+                        this.forward(cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .child(header)
             .child(body)
     }

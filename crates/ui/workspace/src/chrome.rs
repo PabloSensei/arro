@@ -2408,6 +2408,7 @@ impl Render for Workspace {
         } else {
             "Workspace"
         };
+        let navigation = cx.weak_entity();
         div()
             .id("workspace")
             .key_context(key_context)
@@ -2420,6 +2421,40 @@ impl Render for Workspace {
             .text_color(theme.text)
             .font_family(UI_FONT)
             .text_size(px(UI_SIZE * scale))
+            .child(
+                // The side buttons of the mouse are the keys of Back and Forward:
+                // pressing one runs the same command wherever the pointer is, even over
+                // a field of a dialog or of a tool window that holds the focus. The
+                // listener is registered by the first child, so a view with a history of
+                // its own, such as the Documentation window, sees the press first and may
+                // take it for itself.
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Bubble {
+                                return;
+                            }
+                            let id = match event.button {
+                                MouseButton::Navigate(NavigationDirection::Back) => {
+                                    workspace_keys::BACK
+                                }
+                                MouseButton::Navigate(NavigationDirection::Forward) => {
+                                    workspace_keys::FORWARD
+                                }
+                                _ => return,
+                            };
+                            if let Some(workspace) = navigation.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.run_command(id, window, cx);
+                                });
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
             .on_action(cx.listener(|this, _: &ToggleProject, window, cx| {
                 this.toggle_tool(PROJECT_TOOL, window, cx)

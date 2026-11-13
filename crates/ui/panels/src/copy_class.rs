@@ -320,7 +320,7 @@ impl Render for CopyClassDialog {
         let name = field_box(
             "copy-class-name-field",
             "copy-class-name".to_owned(),
-            &self.name.text,
+            &self.name,
             active == Field::Name,
             &theme,
         )
@@ -332,7 +332,7 @@ impl Render for CopyClassDialog {
         let destination = field_box(
             "copy-class-destination-field",
             "copy-class-destination".to_owned(),
-            &self.destination.text,
+            &self.destination,
             active == Field::Destination,
             &theme,
         )
@@ -399,7 +399,7 @@ fn labelled(label: &str, field: Stateful<Div>, theme: &Theme) -> Div {
 fn field_box(
     id: impl Into<ElementId>,
     selector: String,
-    text: &str,
+    field: &TextField,
     active: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
@@ -419,5 +419,14 @@ fn field_box(
             theme.control_border
         })
         .text_color(color)
-        .child(text.to_owned())
+        .children(text_field_children_named(
+            "copy-class-field",
+            field,
+            theme.text,
+            theme.text,
+            theme.selection,
+            theme.caret,
+            18.,
+            active,
+        ))
 }

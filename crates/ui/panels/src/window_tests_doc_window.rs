@@ -43,20 +43,20 @@ impl SyntaxProvider for NoSyntax {
 }
 
 /// A language whose documentation answer is set by the test.
-struct DocsLanguage {
+pub(crate) struct DocsLanguage {
     syntax: NoSyntax,
     hover: Mutex<String>,
 }
 
 impl DocsLanguage {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             syntax: NoSyntax(Queries::default()),
             hover: Mutex::new(String::new()),
         })
     }
 
-    fn set_hover(&self, text: &str) {
+    pub(crate) fn set_hover(&self, text: &str) {
         *self.hover.lock().unwrap() = text.to_owned();
     }
 }
@@ -87,7 +87,7 @@ impl LanguageSupport for DocsLanguage {
     }
 }
 
-fn open_window_with(
+pub(crate) fn open_window_with(
     cx: &mut TestAppContext,
     root: PathBuf,
     language: Arc<DocsLanguage>,
@@ -153,7 +153,7 @@ fn shown(cx: &mut TestAppContext, window: WindowHandle<Workspace>, selector: &'s
 }
 
 /// Clicks a character of a line, as the editor tests do.
-fn click_editor(
+pub(crate) fn click_editor(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     line: usize,

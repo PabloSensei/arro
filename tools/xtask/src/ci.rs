@@ -3,7 +3,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use crate::{Result, budgets, cargo, layers, scrollbars, spacing, tooltips};
+use crate::{Result, budgets, cargo, fields, layers, scrollbars, spacing, tooltips};
 
 const FMT: &[&str] = &["fmt", "--all", "--check"];
 const CLIPPY: &[&str] = &[
@@ -51,7 +51,9 @@ pub fn run(root: &Path) -> Result {
     println!("==> check-tooltips");
     tooltips::run(root)?;
     println!("==> check-scrollbars");
-    scrollbars::run(root)
+    scrollbars::run(root)?;
+    println!("==> check-fields");
+    fields::run(root)
 }
 
 /// The checks that make sense on a Unix machine: no Windows formatting of line endings,

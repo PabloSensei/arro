@@ -24,6 +24,8 @@ use crate::shelf::{Shelf, ShelfStore, UnshelveDialog};
 const GROUP: &str = "left-panel";
 const ROW_MARGIN: f32 = SPACE_L;
 const MESSAGE_HEIGHT: f32 = 84.;
+/// The height of one line of the message, which is the height of its caret too.
+const MESSAGE_LINE_HEIGHT: f32 = 18.;
 const CONTEXT: &str = "CommitPanel";
 
 actions!(
@@ -2321,11 +2323,7 @@ impl Render for CommitPanel {
         };
         let rows = self.grouped_rows(&theme, cx);
         let message_empty = self.message.text.is_empty();
-        let shown: SharedString = if message_empty {
-            "Commit message".into()
-        } else {
-            self.message.text.clone().into()
-        };
+        let message_shown = !self.files_focused;
         let summary = match (busy, branch) {
             (Some(what), _) => format!("{what}..."),
             (None, Some(branch)) => format!("{count} changed on {branch}"),
@@ -2389,12 +2387,26 @@ impl Render for CommitPanel {
                                 .border_1()
                                 .border_color(theme.popup_border)
                                 .overflow_hidden()
+                                .flex()
+                                .flex_col()
                                 .text_color(if message_empty {
                                     theme.text_secondary
                                 } else {
                                     theme.text
                                 })
-                                .child(shown),
+                                .children(text_field_lines_named(
+                                    "commit-message",
+                                    &self.message,
+                                    theme.text,
+                                    theme.text,
+                                    theme.selection,
+                                    theme.caret,
+                                    MESSAGE_LINE_HEIGHT,
+                                    message_shown,
+                                ))
+                                .when(message_empty && !message_shown, |this| {
+                                    this.child("Commit message")
+                                }),
                         )
                         .child(
                             div()

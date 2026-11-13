@@ -331,6 +331,7 @@ impl TextField {
 
 /// The parts of a field for drawing: its text split at the selection, with the caret bar
 /// between them. `text_color` is the colour of the unselected text.
+#[allow(clippy::too_many_arguments)]
 pub fn text_field_children(
     field: &TextField,
     text_color: Hsla,
@@ -340,28 +341,177 @@ pub fn text_field_children(
     caret_height: f32,
     show_caret: bool,
 ) -> Vec<AnyElement> {
-    let (start, end) = {
-        let selection = field.selection();
-        (selection.start, selection.end)
-    };
+    range_children(
+        None,
+        field,
+        0..field.text.len(),
+        text_color,
+        selected_color,
+        selection_color,
+        caret_color,
+        caret_height,
+        show_caret,
+    )
+}
+
+/// [`text_field_children`] with the caret and the selected text named in the render tree
+/// as `<name>-caret` and `<name>-selection`, so a test of a window sees the caret of the
+/// field it focused.
+#[allow(clippy::too_many_arguments)]
+pub fn text_field_children_named(
+    name: &'static str,
+    field: &TextField,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+) -> Vec<AnyElement> {
+    range_children(
+        Some(name),
+        field,
+        0..field.text.len(),
+        text_color,
+        selected_color,
+        selection_color,
+        caret_color,
+        caret_height,
+        show_caret,
+    )
+}
+
+/// The lines of a multiline field: one row per line, with the caret on its own line. A
+/// line is `caret_height` tall, so a caret and the text next to it share the row.
+#[allow(clippy::too_many_arguments)]
+pub fn text_field_lines(
+    field: &TextField,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+) -> Vec<AnyElement> {
+    lines_children(
+        None,
+        field,
+        text_color,
+        selected_color,
+        selection_color,
+        caret_color,
+        caret_height,
+        show_caret,
+    )
+}
+
+/// [`text_field_lines`] with the named parts of [`text_field_children_named`].
+#[allow(clippy::too_many_arguments)]
+pub fn text_field_lines_named(
+    name: &'static str,
+    field: &TextField,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+) -> Vec<AnyElement> {
+    lines_children(
+        Some(name),
+        field,
+        text_color,
+        selected_color,
+        selection_color,
+        caret_color,
+        caret_height,
+        show_caret,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lines_children(
+    name: Option<&'static str>,
+    field: &TextField,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+) -> Vec<AnyElement> {
+    let mut children = Vec::new();
+    let mut start = 0;
+    loop {
+        let end = field.text[start..]
+            .find('\n')
+            .map_or(field.text.len(), |index| start + index);
+        children.push(
+            div()
+                .flex()
+                .items_center()
+                .flex_none()
+                .h(px(caret_height))
+                .whitespace_nowrap()
+                .children(range_children(
+                    name,
+                    field,
+                    start..end,
+                    text_color,
+                    selected_color,
+                    selection_color,
+                    caret_color,
+                    caret_height,
+                    show_caret,
+                ))
+                .into_any_element(),
+        );
+        if end == field.text.len() {
+            return children;
+        }
+        start = end + 1;
+    }
+}
+
+/// The parts of the field that lie on one line. The caret is placed only when it belongs
+/// to this line, and the fallback at the end keeps it on an empty line.
+#[allow(clippy::too_many_arguments)]
+fn range_children(
+    name: Option<&'static str>,
+    field: &TextField,
+    line: Range<usize>,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+) -> Vec<AnyElement> {
+    let selection = field.selection();
+    let selected_start = selection.start.clamp(line.start, line.end);
+    let selected_end = selection.end.clamp(line.start, line.end);
     let mut parts: Vec<(Range<usize>, bool)> = Vec::new();
-    if start > 0 {
-        parts.push((0..start, false));
+    if selected_start > line.start {
+        parts.push((line.start..selected_start, false));
     }
-    if start < end {
-        parts.push((start..end, true));
+    if selected_start < selected_end {
+        parts.push((selected_start..selected_end, true));
     }
-    if end < field.text.len() {
-        parts.push((end..field.text.len(), false));
+    if selected_end < line.end {
+        parts.push((selected_end..line.end, false));
     }
+    let caret_in_line = show_caret && field.caret >= line.start && field.caret <= line.end;
     let mut children = Vec::new();
     let mut caret_placed = false;
     for (range, selected) in parts {
-        let caret_here =
-            show_caret && !caret_placed && field.caret >= range.start && field.caret <= range.end;
+        let caret_here = caret_in_line
+            && !caret_placed
+            && field.caret >= range.start
+            && field.caret <= range.end;
         let split = if caret_here { field.caret } else { range.end };
         if split > range.start {
             children.push(segment(
+                name,
                 &field.text[range.start..split],
                 selected,
                 text_color,
@@ -370,10 +520,11 @@ pub fn text_field_children(
             ));
         }
         if caret_here {
-            children.push(caret(caret_color, caret_height));
+            children.push(caret(caret_color, caret_height, name));
             caret_placed = true;
             if range.end > split {
                 children.push(segment(
+                    name,
                     &field.text[split..range.end],
                     selected,
                     text_color,
@@ -383,13 +534,14 @@ pub fn text_field_children(
             }
         }
     }
-    if show_caret && !caret_placed {
-        children.push(caret(caret_color, caret_height));
+    if caret_in_line && !caret_placed {
+        children.push(caret(caret_color, caret_height, name));
     }
     children
 }
 
 fn segment(
+    name: Option<&'static str>,
     text: &str,
     selected: bool,
     text_color: Hsla,
@@ -400,16 +552,22 @@ fn segment(
         .whitespace_nowrap()
         .text_color(if selected { selected_color } else { text_color })
         .when(selected, |this| this.bg(selection_color))
+        .when_some(name.filter(|_| selected), |this, name| {
+            this.debug_selector(move || format!("{name}-selection"))
+        })
         .child(text.to_owned())
         .into_any_element()
 }
 
-fn caret(color: Hsla, height: f32) -> AnyElement {
+fn caret(color: Hsla, height: f32, name: Option<&'static str>) -> AnyElement {
     div()
         .flex_none()
         .w(px(1.5))
         .h(px(height))
         .bg(color)
+        .when_some(name, |this, name| {
+            this.debug_selector(move || format!("{name}-caret"))
+        })
         .into_any_element()
 }
 

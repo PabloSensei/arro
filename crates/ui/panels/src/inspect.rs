@@ -1359,14 +1359,11 @@ impl Render for RunInspectionPopup {
                     .on_click(cx.listener(move |this, _, window, cx| this.pick(index, window, cx)))
             })
             .collect();
-        let shown: SharedString = if self.field.text.is_empty() {
-            if self.kinds.is_empty() {
-                "No inspections known yet. Run Inspect Code first.".into()
-            } else {
-                "Inspection name".into()
-            }
+        let empty = self.field.text.is_empty();
+        let placeholder = if self.kinds.is_empty() {
+            "No inspections known yet. Run Inspect Code first."
         } else {
-            self.field.text.clone().into()
+            "Inspection name"
         };
         let body = surface(&theme)
             .id("run-inspection")
@@ -1388,12 +1385,22 @@ impl Render for RunInspectionPopup {
                     .rounded(px(CONTROL_RADIUS))
                     .border_2()
                     .border_color(theme.accent)
-                    .text_color(if self.field.text.is_empty() {
+                    .text_color(if empty {
                         theme.text_secondary
                     } else {
                         theme.text
                     })
-                    .child(shown),
+                    .children(text_field_children_named(
+                        "run-inspection-field",
+                        &self.field,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        16.,
+                        true,
+                    ))
+                    .when(empty, |this| this.child(placeholder)),
             )
             .child(
                 div()

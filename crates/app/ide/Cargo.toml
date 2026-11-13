@@ -19,6 +19,7 @@ backtrace = "0.3.77"
 base.workspace = true
 dockerfile-syntax = { path = "../../editor/dockerfile-syntax" }
 editor-view = { path = "../../ui/editor-view" }
+file-syntax = { path = "../../editor/file-syntax" }
 futures-channel = "0.3"
 java-lang = { path = "../../java/java-lang" }
 lang-api.workspace = true

@@ -360,7 +360,16 @@ fn text_field(label: &'static str, field: &TextField, active: bool, theme: &Them
                 .rounded(px(CONTROL_RADIUS))
                 .border_2()
                 .border_color(if active { theme.accent } else { theme.border })
-                .child(field.text.clone()),
+                .children(text_field_children_named(
+                    "start-field",
+                    field,
+                    theme.text,
+                    theme.text,
+                    theme.selection,
+                    theme.caret,
+                    18.,
+                    active,
+                )),
         )
 }
 

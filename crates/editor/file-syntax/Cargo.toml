@@ -1,0 +1,17 @@
+[package]
+name = "file-syntax"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+syntax = { path = "../syntax" }
+tree-sitter-bash.workspace = true
+tree-sitter-batch.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-properties.workspace = true
+tree-sitter-xml.workspace = true
+tree-sitter-yaml.workspace = true
+
+[dev-dependencies]
+tree-sitter.workspace = true

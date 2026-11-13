@@ -79,6 +79,8 @@ mod window_tests_edit;
 #[cfg(test)]
 mod window_tests_editing;
 #[cfg(test)]
+mod window_tests_file_syntax;
+#[cfg(test)]
 mod window_tests_git;
 #[cfg(test)]
 mod window_tests_hierarchy;
@@ -224,6 +226,8 @@ mod window_tests_inlay_hints;
 #[cfg(test)]
 mod window_tests_menu_gaps;
 #[cfg(test)]
+mod window_tests_mouse_navigation;
+#[cfg(test)]
 mod window_tests_scrollbars;
 #[cfg(test)]
 mod window_tests_semantic_tokens;
@@ -299,10 +303,16 @@ mod window_tests_stripe_notifications;
 mod window_tests_script_smoke;
 
 #[cfg(test)]
+mod window_tests_settings_window;
+
+#[cfg(test)]
 mod window_tests_diff_views;
 
 #[cfg(test)]
 mod window_tests_macos_menu;
+
+#[cfg(test)]
+mod window_tests_field_caret;
 
 mod choice;
 mod invalidate;

@@ -491,6 +491,15 @@ impl TemplatesPage {
         self.select_live(id, cx);
     }
 
+    /// Escape leaves the field of a template without closing the window.
+    pub(crate) fn escape(&mut self, cx: &mut Context<SettingsView>) -> bool {
+        if self.field.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<SettingsView>) -> bool {
         let Some(field) = self.field else {
             return false;
@@ -912,15 +921,30 @@ impl TemplatesPage {
             boxed = boxed.items_center();
         }
         if active {
-            boxed = boxed.children(text_field_children(
-                text,
-                theme.text,
-                theme.text,
-                theme.selection,
-                theme.caret,
-                18.,
-                true,
-            ));
+            let parts = if multiline {
+                text_field_lines_named(
+                    "template-field",
+                    text,
+                    theme.text,
+                    theme.text,
+                    theme.selection,
+                    theme.caret,
+                    18.,
+                    true,
+                )
+            } else {
+                text_field_children_named(
+                    "template-field",
+                    text,
+                    theme.text,
+                    theme.text,
+                    theme.selection,
+                    theme.caret,
+                    18.,
+                    true,
+                )
+            };
+            boxed = boxed.children(parts);
         } else if shown.is_empty() {
             boxed = boxed.child(div().text_color(theme.text_secondary).child("Empty"));
         } else {
@@ -1092,7 +1116,6 @@ impl TemplatesPage {
         cx: &mut Context<SettingsView>,
     ) -> Stateful<Div> {
         let active = self.field == Some(field);
-        let shown = text.text.clone();
         let selector = id.to_owned();
         div()
             .id(SharedString::from(format!("template-field-{id}")))
@@ -1110,7 +1133,16 @@ impl TemplatesPage {
                 this.templates_page.field = Some(field);
                 cx.notify();
             }))
-            .child(div().child(shown))
+            .children(text_field_children_named(
+                "template-field",
+                text,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                16.,
+                active,
+            ))
     }
 
     fn contexts_row(
@@ -1334,7 +1366,8 @@ impl TemplatesPage {
                 cx.notify();
             }));
         boxed = if active {
-            boxed.children(text_field_children(
+            boxed.children(text_field_lines_named(
+                "template-field",
                 &self.file_text,
                 theme.text,
                 theme.text,

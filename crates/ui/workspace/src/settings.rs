@@ -1,7 +1,8 @@
 //! What the user can change in Settings. One JSON file in the settings folder; a missing
 //! or damaged file gives the defaults, a new key an old file does not know gets its default.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use project_model::BuildTools;
 use serde::{Deserialize, Serialize};
@@ -349,13 +350,38 @@ impl Settings {
         parsed.map_or_else(Self::default, Self::clamped)
     }
 
-    /// Writes the file, creating its folder. Blocks: not for the UI thread.
+    /// Writes the file, creating its folder. The new text goes to a file beside the old
+    /// one and takes its place, so a stop in the middle leaves the old file whole.
+    /// Blocks: not for the UI thread.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, text)
+        let temp = temp_path(path);
+        std::fs::write(&temp, text)?;
+        if let Err(error) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Takes over the leaves of `draft` that differ from `saved`. A field that another
+    /// part of the window changed while the dialog was open keeps its newer value, even
+    /// inside a nested object.
+    pub fn merge_draft(&mut self, saved: &Settings, draft: &Settings) {
+        let (Ok(saved), Ok(draft), Ok(mut current)) = (
+            serde_json::to_value(saved),
+            serde_json::to_value(draft),
+            serde_json::to_value(&*self),
+        ) else {
+            return;
+        };
+        merge_changed(&mut current, &saved, &draft);
+        if let Ok(merged) = serde_json::from_value(current) {
+            *self = merged;
+        }
     }
 
     fn clamped(mut self) -> Self {
@@ -421,6 +447,46 @@ impl Settings {
             ..self.clone()
         }
         .clamped()
+    }
+}
+
+/// A name beside `path` that a save of this process has not taken yet.
+fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map_or_else(|| "settings".into(), |name| name.to_os_string());
+    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Copies the changed leaves of `draft` over `target`, one key of an object at a time.
+fn merge_changed(
+    target: &mut serde_json::Value,
+    saved: &serde_json::Value,
+    draft: &serde_json::Value,
+) {
+    match (saved, draft) {
+        (serde_json::Value::Object(saved), serde_json::Value::Object(draft)) => {
+            let serde_json::Value::Object(target) = target else {
+                return;
+            };
+            for (key, draft_value) in draft {
+                let saved_value = saved.get(key).unwrap_or(&serde_json::Value::Null);
+                if saved_value == draft_value {
+                    continue;
+                }
+                match target.get_mut(key) {
+                    Some(target_value) => merge_changed(target_value, saved_value, draft_value),
+                    None => {
+                        target.insert(key.clone(), draft_value.clone());
+                    }
+                }
+            }
+        }
+        _ if saved != draft => *target = draft.clone(),
+        _ => {}
     }
 }
 
@@ -536,5 +602,56 @@ mod tests {
         assert_eq!(clamped.indent_size, MAX_INDENT_SIZE as u32);
         assert_eq!(clamped.completion_delay_ms, MAX_COMPLETION_DELAY_MS);
         assert_eq!(clamped.editor_font_family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn a_nested_draft_field_keeps_the_neighbour_changed_outside() {
+        let saved = {
+            let mut settings = Settings::default();
+            settings.build_tools.first.home = "old home".into();
+            settings.build_tools.second.user_home = "old user home".into();
+            settings.git_path = "old git".into();
+            settings
+        };
+        let mut draft = saved.clone();
+        draft.build_tools.first.home = "new home".into();
+
+        let mut current = saved.clone();
+        current.build_tools.second.user_home = "changed outside".into();
+        current.git_path = "new git".into();
+        current.merge_draft(&saved, &draft);
+
+        assert_eq!(
+            current.build_tools.first.home, "new home",
+            "the field of the draft wins"
+        );
+        assert_eq!(
+            current.build_tools.second.user_home, "changed outside",
+            "a neighbour inside the same object keeps its newer value"
+        );
+        assert_eq!(
+            current.git_path, "new git",
+            "a field the draft did not touch keeps its newer value"
+        );
+    }
+
+    #[test]
+    fn the_save_leaves_no_temporary_file_behind() {
+        let dir = test_support::scratch("settings-atomic");
+        let file = dir.join("settings.json");
+        let settings = Settings {
+            font_size: 17.,
+            ..Settings::default()
+        };
+        settings.save(&file).unwrap();
+        settings.save(&file).unwrap();
+        assert_eq!(Settings::load(&file), settings);
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["settings.json"], "only the settings file stays");
     }
 }

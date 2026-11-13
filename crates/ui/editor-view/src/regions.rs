@@ -153,8 +153,20 @@ impl EditorView {
             .child(
                 div()
                     .px_2()
+                    .flex()
+                    .items_center()
                     .text_color(theme.text_muted)
-                    .child(format!("Region {}|", popup.query.text)),
+                    .child("Region ")
+                    .children(text_field_children_named(
+                        "region-query-field",
+                        &popup.query,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        self.style.line_height,
+                        true,
+                    )),
             )
             .children(rows)
             .when(found.is_empty(), |body| {

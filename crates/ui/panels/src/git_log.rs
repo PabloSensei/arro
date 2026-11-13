@@ -651,12 +651,9 @@ impl Render for GitLogPanel {
                 None => "Git Log".into(),
             },
         };
-        let shown: SharedString = if self.filter.text.is_empty() {
-            "Filter commits".into()
-        } else {
-            self.filter.text.clone().into()
-        };
-        let filter_color = if self.filter.text.is_empty() {
+        let filter_empty = self.filter.text.is_empty();
+        let filter_focused = self.focus.is_focused(window);
+        let filter_color = if filter_empty {
             theme.text_secondary
         } else {
             theme.text
@@ -734,7 +731,17 @@ impl Render for GitLogPanel {
                     .border_1()
                     .border_color(theme.popup_border)
                     .text_color(filter_color)
-                    .child(shown),
+                    .children(text_field_children_named(
+                        "git-log-filter",
+                        &self.filter,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        16.,
+                        filter_focused,
+                    ))
+                    .when(filter_empty, |this| this.child("Filter commits")),
             )
             .child(
                 div()

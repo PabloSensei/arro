@@ -102,6 +102,33 @@ impl KeymapPage {
         }
     }
 
+    /// Escape inside the page: a capture, a conflict, a menu or a shortcut search closes
+    /// first, and the window only after them.
+    pub(crate) fn escape(&mut self, cx: &mut Context<SettingsView>) -> bool {
+        if self.capture.is_some() {
+            self.capture = None;
+            cx.notify();
+            return true;
+        }
+        if self.conflict.is_some() || self.reset_all {
+            self.conflict = None;
+            self.reset_all = false;
+            cx.notify();
+            return true;
+        }
+        if self.menu.is_some() {
+            self.menu = None;
+            cx.notify();
+            return true;
+        }
+        if self.shortcut_search.is_some() {
+            self.shortcut_search = None;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     /// Takes a key while the page or its popup is on screen. Returns whether the key
     /// belonged to it.
     pub fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<SettingsView>) -> bool {
@@ -429,11 +456,7 @@ impl KeymapPage {
 
     fn search_field(&self, theme: &Theme) -> impl IntoElement + use<> {
         let empty = self.search.text.is_empty();
-        let text = if empty {
-            "Search by action name".to_owned()
-        } else {
-            self.search.text.clone()
-        };
+        let active = self.capture.is_none() && self.conflict.is_none() && !self.reset_all;
         div()
             .id("keymap-search")
             .debug_selector(|| "keymap-search".to_owned())
@@ -450,7 +473,17 @@ impl KeymapPage {
             } else {
                 theme.text
             })
-            .child(text)
+            .children(text_field_children_named(
+                "keymap-search-field",
+                &self.search,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                16.,
+                active,
+            ))
+            .when(empty, |this| this.child("Search by action name"))
     }
 
     fn row(

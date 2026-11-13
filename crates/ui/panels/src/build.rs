@@ -566,11 +566,6 @@ impl BuildPanel {
 
     fn execute_popup(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let empty = self.execute.text.is_empty();
-        let shown: SharedString = if empty {
-            "clean install".into()
-        } else {
-            self.execute.text.clone().into()
-        };
         let color = if empty {
             theme.text_secondary
         } else {
@@ -585,8 +580,17 @@ impl BuildPanel {
             .border_1()
             .border_color(theme.accent)
             .text_color(color)
-            .child(shown)
-            .child(div().w(px(1.)).h(px(16.)).bg(theme.text));
+            .children(text_field_children_named(
+                "build-execute-field",
+                &self.execute,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                16.,
+                true,
+            ))
+            .when(empty, |this| this.child("clean install"));
         let history = self.history.iter().rev().enumerate().map(|(index, line)| {
             let line = line.clone();
             let shown = line.clone();

@@ -44,7 +44,9 @@ fn file_icons() -> FileIcons {
 
 /// What a file is: Java first, then the languages around a project.
 fn language_for(path: &Path) -> Option<LanguageConfig> {
-    java_lang::language_for(path).or_else(|| dockerfile_syntax::language_for(path))
+    java_lang::language_for(path)
+        .or_else(|| dockerfile_syntax::language_for(path))
+        .or_else(|| file_syntax::language_for(path))
 }
 
 fn class_text(folder: &Path, root: &Path, name: &str) -> String {

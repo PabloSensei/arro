@@ -53,7 +53,7 @@ impl RunConfigProvider for ReadingRun {
     }
 }
 
-fn open(cx: &mut TestAppContext, root: &Path) -> WindowHandle<Workspace> {
+pub(crate) fn open(cx: &mut TestAppContext, root: &Path) -> WindowHandle<Workspace> {
     let mut setup = setup(root);
     setup.providers = vec![Arc::new(ReadingRun)];
     open_with(cx, root, setup)
@@ -68,7 +68,7 @@ fn input_text(cx: &TestAppContext, panel: &gpui::Entity<RunPanel>) -> String {
 }
 
 /// Starts the run and waits until its console waits for a line.
-fn started(
+pub(crate) fn started(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     panel: &gpui::Entity<RunPanel>,

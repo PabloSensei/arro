@@ -480,7 +480,7 @@ fn summary(change: &WorkspaceChange) -> String {
 fn field_box(
     id: impl Into<ElementId>,
     selector: String,
-    text: &str,
+    field: &TextField,
     active: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
@@ -501,13 +501,16 @@ fn field_box(
             theme.control_border
         })
         .text_color(theme.text)
-        .child(if active {
-            format!("{text}|")
-        } else if text.is_empty() {
-            "\u{200b}".to_owned()
-        } else {
-            text.to_owned()
-        })
+        .children(text_field_children_named(
+            "change-signature-field",
+            field,
+            theme.text,
+            theme.text,
+            theme.selection,
+            theme.caret,
+            18.,
+            active,
+        ))
 }
 
 fn labelled(label: &str, field: Stateful<Div>, theme: &Theme) -> impl IntoElement {
@@ -590,7 +593,7 @@ impl Render for ChangeSignatureDialog {
         let name = field_box(
             "change-signature-name-field",
             "change-signature-name".to_owned(),
-            &self.name.text,
+            &self.name,
             active == Field::Name,
             &theme,
         )
@@ -602,7 +605,7 @@ impl Render for ChangeSignatureDialog {
         let visibility = field_box(
             "change-signature-visibility-field",
             "change-signature-visibility".to_owned(),
-            &self.visibility.text,
+            &self.visibility,
             active == Field::Visibility,
             &theme,
         )
@@ -614,7 +617,7 @@ impl Render for ChangeSignatureDialog {
         let return_type = field_box(
             "change-signature-return-field",
             "change-signature-return".to_owned(),
-            &self.return_type.text,
+            &self.return_type,
             active == Field::ReturnType,
             &theme,
         )
@@ -626,13 +629,10 @@ impl Render for ChangeSignatureDialog {
 
         let mut rows = Vec::with_capacity(self.parameters.len());
         for index in 0..self.parameters.len() {
-            let type_text = self.parameters[index].type_name.text.clone();
-            let name_text = self.parameters[index].name.text.clone();
-            let default_text = self.parameters[index].default_value.text.clone();
             let type_field = field_box(
                 ("change-signature-type", index),
                 format!("change-signature-type-{index}"),
-                &type_text,
+                &self.parameters[index].type_name,
                 active == Field::ParameterType(index),
                 &theme,
             )
@@ -644,7 +644,7 @@ impl Render for ChangeSignatureDialog {
             let name_field = field_box(
                 ("change-signature-param-name", index),
                 format!("change-signature-name-{index}"),
-                &name_text,
+                &self.parameters[index].name,
                 active == Field::ParameterName(index),
                 &theme,
             )
@@ -656,7 +656,7 @@ impl Render for ChangeSignatureDialog {
             let default_field = field_box(
                 ("change-signature-default", index),
                 format!("change-signature-default-{index}"),
-                &default_text,
+                &self.parameters[index].default_value,
                 active == Field::ParameterDefault(index),
                 &theme,
             )

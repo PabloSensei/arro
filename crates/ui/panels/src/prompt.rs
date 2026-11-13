@@ -112,12 +112,8 @@ impl Render for Prompt {
         let width = px(420.);
         let left = (window.viewport_size().width - width) / 2.;
         let top = window.viewport_size().height * 0.25;
-        let shown: SharedString = if self.field.text.is_empty() {
-            self.hint.clone()
-        } else {
-            self.field.text.clone().into()
-        };
-        let color = if self.field.text.is_empty() {
+        let empty = self.field.text.is_empty();
+        let color = if empty {
             theme.text_secondary
         } else {
             theme.text
@@ -153,7 +149,17 @@ impl Render for Prompt {
                     .border_2()
                     .border_color(theme.accent)
                     .text_color(color)
-                    .child(shown)
+                    .children(text_field_children_named(
+                        "prompt-field",
+                        &self.field,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        18.,
+                        true,
+                    ))
+                    .when(empty, |this| this.child(self.hint.clone()))
                     .into_any_element()
             });
         div()

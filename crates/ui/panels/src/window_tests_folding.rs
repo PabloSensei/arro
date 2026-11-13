@@ -57,7 +57,7 @@ fn sample_language(path: &Path) -> Option<LanguageConfig> {
     Some(config)
 }
 
-fn open_text(
+pub(crate) fn open_text(
     cx: &mut TestAppContext,
     name: &str,
     text: &str,

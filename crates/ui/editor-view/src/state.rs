@@ -1417,8 +1417,17 @@ impl EditorState {
     }
 
     fn toggle_comment(&mut self) -> Option<Change> {
-        let prefix = self.language.as_ref()?.line_comment?;
-        self.edit(|buffer| commands::toggle_line_comment(buffer, prefix, EditSource::User))
+        if let Some(prefix) = self
+            .language
+            .as_ref()
+            .and_then(|language| language.line_comment)
+        {
+            return self
+                .edit(|buffer| commands::toggle_line_comment(buffer, prefix, EditSource::User));
+        }
+        // A format without a line comment, such as XML, takes the block comment.
+        let marks = self.language.as_ref()?.block_comment?;
+        self.edit(|buffer| editing::toggle_block_comment(buffer, marks, EditSource::User))
     }
 
     fn move_heads(&mut self, extend: bool, mut target: impl FnMut(&RopeStore, usize) -> usize) {

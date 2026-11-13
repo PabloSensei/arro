@@ -207,11 +207,6 @@ impl Render for ConflictView {
         } else {
             theme.text
         };
-        let shown: SharedString = if message_empty {
-            "Merge message".into()
-        } else {
-            self.message.text.clone().into()
-        };
         let footer = match operation {
             Operation::Merge if none => div()
                 .flex()
@@ -227,8 +222,20 @@ impl Render for ConflictView {
                         .border_1()
                         .border_color(theme.popup_border)
                         .overflow_hidden()
+                        .flex()
+                        .flex_col()
                         .text_color(message_color)
-                        .child(shown),
+                        .children(text_field_lines_named(
+                            "conflict-message-field",
+                            &self.message,
+                            theme.text,
+                            theme.text,
+                            theme.selection,
+                            theme.caret,
+                            18.,
+                            true,
+                        ))
+                        .when(message_empty, |this| this.child("Merge message")),
                 )
                 .child(
                     Self::button(("conflict-commit", 0), "Commit Merge", true, &theme)

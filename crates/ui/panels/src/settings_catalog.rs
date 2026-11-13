@@ -124,6 +124,24 @@ impl SettingsPage {
             page => page,
         }
     }
+
+    /// The group row above this page in the tree, when it has one.
+    pub fn parent(self) -> Option<SettingsPage> {
+        match self {
+            SettingsPage::EditorCodeStyle
+            | SettingsPage::EditorCompletion
+            | SettingsPage::EditorInlayHints
+            | SettingsPage::EditorLiveTemplates
+            | SettingsPage::EditorPostfix
+            | SettingsPage::EditorFileTemplates => Some(SettingsPage::Editor),
+            SettingsPage::BuildToolsFirst | SettingsPage::BuildToolsSecond => {
+                Some(SettingsPage::BuildTools)
+            }
+            SettingsPage::Git => Some(SettingsPage::VersionControl),
+            SettingsPage::Terminal => Some(SettingsPage::Tools),
+            _ => None,
+        }
+    }
 }
 
 /// What the control of a setting does.
@@ -672,6 +690,30 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static Setting> {
         .collect()
 }
 
+/// The pages the search keeps, in the order of the tree: the pages of the settings that
+/// match and the groups above them. The Keymap and template pages have a search of their
+/// own and stay when the query is empty only.
+pub fn pages_matching(query: &str) -> Vec<SettingsPage> {
+    if query.trim().is_empty() {
+        return SettingsPage::ALL.to_vec();
+    }
+    let mut kept = Vec::new();
+    for setting in SETTINGS.iter().filter(|setting| setting.matches(query)) {
+        let mut page = Some(setting.page);
+        while let Some(current) = page {
+            if !kept.contains(&current) {
+                kept.push(current);
+            }
+            page = current.parent();
+        }
+    }
+    SettingsPage::ALL
+        .iter()
+        .copied()
+        .filter(|page| kept.contains(page))
+        .collect()
+}
+
 /// The switch of a boolean setting; `None` for a setting that is not a switch.
 pub fn value(settings: &Settings, id: &str) -> Option<bool> {
     match find(id)?.field {
@@ -1012,6 +1054,26 @@ mod tests {
         );
         assert!(search("zzz", 10).is_empty());
         assert_eq!(search("", 100).len(), super::all().len());
+    }
+
+    #[test]
+    fn the_search_keeps_the_pages_of_the_matching_settings_and_their_groups() {
+        let pages = super::pages_matching("font");
+        assert!(pages.contains(&super::SettingsPage::Appearance));
+        assert!(
+            !pages.contains(&super::SettingsPage::Project),
+            "a page without a matching setting leaves the tree"
+        );
+        let pages = super::pages_matching("tab size");
+        assert!(pages.contains(&super::SettingsPage::EditorCodeStyle));
+        assert!(
+            pages.contains(&super::SettingsPage::Editor),
+            "the group above the page stays, so the tree keeps its shape"
+        );
+        assert_eq!(
+            super::pages_matching("").len(),
+            super::SettingsPage::ALL.len()
+        );
     }
 
     #[test]
