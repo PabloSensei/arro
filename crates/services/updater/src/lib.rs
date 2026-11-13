@@ -47,34 +47,36 @@ impl Platform {
         }
     }
 
-    /// The system of this build.
-    pub const fn current() -> Self {
+    /// The system of this build, or `None` when the project publishes no release for
+    /// it. The program still builds and runs there; only the updates are off.
+    pub const fn current() -> Option<Self> {
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         {
-            Self::WindowsX86_64
+            Some(Self::WindowsX86_64)
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            Self::LinuxX86_64
+            Some(Self::LinuxX86_64)
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            Self::MacosAarch64
+            Some(Self::MacosAarch64)
         }
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         {
-            Self::MacosX86_64
+            Some(Self::MacosX86_64)
+        }
+        #[cfg(not(any(
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        )))]
+        {
+            None
         }
     }
 }
-
-#[cfg(not(any(
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64")
-)))]
-compile_error!("the updater has no release platform for this target");
 
 /// Where the latest release is described.
 pub const RELEASES_URL: &str = "https://api.github.com/repos/PabloSensei/arro/releases/latest";
@@ -82,8 +84,16 @@ pub const RELEASES_URL: &str = "https://api.github.com/repos/PabloSensei/arro/re
 pub const UPDATE_URL_ENV: &str = "ARRO_UPDATE_URL";
 /// Set to `1` to turn the automatic check off.
 pub const NO_UPDATE_CHECK_ENV: &str = "ARRO_NO_UPDATE_CHECK";
-/// The suffix the assets of this build carry, `windows-x86_64` for example.
-pub const PLATFORM: &str = Platform::current().name();
+/// The suffix the assets of this build carry, `windows-x86_64` for example, and empty
+/// on a system without a release.
+pub const PLATFORM: &str = match Platform::current() {
+    Some(platform) => platform.name(),
+    None => "",
+};
+/// What a manual "Check for Updates" says on a system without a release. No request
+/// leaves the machine there.
+pub const NO_RELEASE_NOTICE: &str =
+    "Updates are not available for this system; build Arro from source to update.";
 /// The list of files the installed release brought, one relative path per line. It
 /// tells the first start after an update which folders of the old release are gone.
 pub const MANIFEST_FILE: &str = "install.manifest";
@@ -151,8 +161,12 @@ impl UpdateSource {
     }
 
     /// The newer release, or `None` when the running version is the latest. Prereleases
-    /// and drafts are skipped.
+    /// and drafts are skipped. A system without a release has nothing to update to, so
+    /// no request is made there.
     pub fn check(&self, current: &Version) -> Result<Option<Release>, Error> {
+        if Platform::current().is_none() {
+            return Ok(None);
+        }
         let text = self.fetch_text(self.url.as_str())?;
         let Some(release) = parse_release(&text)? else {
             return Ok(None);
@@ -242,7 +256,8 @@ impl UpdateSource {
     }
 }
 
-/// The release in a GitHub Releases response. `None` for a draft or a prerelease.
+/// The release in a GitHub Releases response. `None` for a draft, a prerelease and a
+/// system without a release of its own.
 pub fn parse_release(text: &str) -> Result<Option<Release>, Error> {
     let response: GithubRelease =
         serde_json::from_str(text).map_err(|error| Error::InvalidJson(error.to_string()))?;
@@ -254,7 +269,9 @@ pub fn parse_release(text: &str) -> Result<Option<Release>, Error> {
     if !version.pre.is_empty() {
         return Ok(None);
     }
-    let expected = archive_name(&version);
+    let Some(expected) = archive_name(&version) else {
+        return Ok(None);
+    };
     let checksum_name = format!("{expected}.sha256");
     let archive = asset_of(&response.assets, &expected)
         .ok_or_else(|| Error::MissingAsset(expected.clone()))?;
@@ -280,18 +297,27 @@ pub fn parse_tag(tag: &str) -> Result<Version, Error> {
     Version::parse(text).map_err(|_| Error::InvalidVersion(tag.to_owned()))
 }
 
-/// What the archive of `version` is called on `platform`.
-pub fn archive_name_for(version: &Version, platform: Platform) -> String {
-    format!(
-        "arro-{version}-{}.{}",
-        platform.name(),
-        platform.archive_extension()
-    )
+/// What the archive of `version` is called on `platform`. `None` when the project
+/// publishes no release for that system: there is nothing to update to.
+pub fn archive_name_for(version: &Version, platform: Option<Platform>) -> Option<String> {
+    platform.map(|platform| {
+        format!(
+            "arro-{version}-{}.{}",
+            platform.name(),
+            platform.archive_extension()
+        )
+    })
 }
 
 /// What the archive of `version` is called on this build's platform.
-pub fn archive_name(version: &Version) -> String {
+pub fn archive_name(version: &Version) -> Option<String> {
     archive_name_for(version, Platform::current())
+}
+
+/// The message a manual "Check for Updates" shows on `platform`, or `None` when the
+/// project publishes a release for it and the check may ask the server.
+pub fn manual_check_notice(platform: Option<Platform>) -> Option<&'static str> {
+    platform.is_none().then_some(NO_RELEASE_NOTICE)
 }
 
 /// A version string such as `0.1.0` as a version, for the running build.
@@ -1184,7 +1210,7 @@ mod tests {
 
     fn assets_for(tag: &str) -> (String, String) {
         let version = version(tag.trim_start_matches('v'));
-        let archive = archive_name(&version);
+        let archive = archive_name(&version).expect("a release platform of this build");
         let checksum = format!("{archive}.sha256");
         (archive, checksum)
     }
@@ -1219,7 +1245,7 @@ mod tests {
         assert_eq!(release.version, version("0.2.0"));
         assert_eq!(release.tag, "v0.2.0");
         assert_eq!(release.notes, "Notes");
-        let archive = archive_name(&version("0.2.0"));
+        let archive = archive_name(&version("0.2.0")).expect("a release platform of this build");
         assert_eq!(release.archive.name, archive);
         assert_eq!(release.checksum.name, format!("{archive}.sha256"));
     }
@@ -1260,7 +1286,10 @@ mod tests {
 
     #[test]
     fn a_release_without_the_archive_is_an_error() {
-        let checksum = format!("{}.sha256", archive_name(&version("0.2.0")));
+        let checksum = format!(
+            "{}.sha256",
+            archive_name(&version("0.2.0")).expect("a release platform of this build")
+        );
         let json = release_json(
             "v0.2.0",
             false,
@@ -1484,6 +1513,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod platform_tests;
 #[cfg(test)]
 mod release_tests;
 #[cfg(test)]

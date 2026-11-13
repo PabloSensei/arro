@@ -75,7 +75,10 @@ fn every_platform_has_its_own_archive_name() {
         (Platform::MacosAarch64, "arro-0.2.0-macos-aarch64.zip"),
         (Platform::MacosX86_64, "arro-0.2.0-macos-x86_64.zip"),
     ] {
-        assert_eq!(archive_name_for(&version, platform), expected);
+        assert_eq!(
+            archive_name_for(&version, Some(platform)),
+            Some(expected.to_owned())
+        );
     }
 }
 
@@ -85,7 +88,7 @@ fn the_release_of_the_build_is_the_archive_of_its_platform() {
         archive_name(&version("0.2.0")),
         archive_name_for(&version("0.2.0"), Platform::current())
     );
-    assert_eq!(PLATFORM, Platform::current().name());
+    assert_eq!(PLATFORM, Platform::current().map_or("", Platform::name));
 }
 
 #[test]

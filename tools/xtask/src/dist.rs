@@ -345,17 +345,40 @@ fn unpack_debug(out: &Path, archive: &Path, target: &Path) -> Result {
     result
 }
 
-/// Unpacks `archive` with the Windows `tar.exe`, which reads both `.tar.gz` and the zip
-/// inside a `.vsix`.
+/// Unpacks `archive`. The Windows `tar.exe` reads both `.tar.gz` and the zip inside a
+/// `.vsix`; GNU tar on Linux reads no zip, so a zip goes to `unzip` outside Windows.
 pub(crate) fn unpack(archive: &Path, directory: &Path) -> Result {
     fs::create_dir_all(directory)?;
-    let mut command = Command::new(tar());
-    command
-        .args(["-x", "-f"])
-        .arg(archive)
-        .arg("-C")
-        .arg(directory);
+    let mut command = if is_zip(archive) && !cfg!(windows) {
+        let mut command = Command::new("unzip");
+        command
+            .args(["-q", "-o"])
+            .arg(archive)
+            .arg("-d")
+            .arg(directory);
+        command
+    } else {
+        let mut command = Command::new(tar());
+        command
+            .args(["-x", "-f"])
+            .arg(archive)
+            .arg("-C")
+            .arg(directory);
+        command
+    };
     check(&mut command)
+}
+
+/// A `.zip`, `.vsix` or `.jar`: an archive in the zip format.
+fn is_zip(archive: &Path) -> bool {
+    archive
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["zip", "vsix", "jar"]
+                .iter()
+                .any(|zip| extension.eq_ignore_ascii_case(zip))
+        })
 }
 
 /// Reads `epl-2.0.html` out of the Equinox launcher feature into the root of the
@@ -375,13 +398,25 @@ fn extract_epl(unpacked: &Path) {
     }) else {
         return;
     };
-    let mut command = Command::new(tar());
-    command
-        .args(["-x", "-f"])
-        .arg(feature)
-        .arg("-C")
-        .arg(unpacked)
-        .arg("epl-2.0.html");
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new(tar());
+        command
+            .args(["-x", "-f"])
+            .arg(feature)
+            .arg("-C")
+            .arg(unpacked)
+            .arg("epl-2.0.html");
+        command
+    } else {
+        let mut command = Command::new("unzip");
+        command
+            .args(["-q", "-o"])
+            .arg(feature)
+            .arg("epl-2.0.html")
+            .arg("-d")
+            .arg(unpacked);
+        command
+    };
     let _ = command.output();
 }
 

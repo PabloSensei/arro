@@ -941,7 +941,12 @@ impl Workspace {
         }
 
         let off = std::env::var(updater::NO_UPDATE_CHECK_ENV).as_deref() == Ok("1");
-        if cfg!(debug_assertions) || cfg!(test) || cfg!(feature = "test-support") || off {
+        if cfg!(debug_assertions)
+            || cfg!(test)
+            || cfg!(feature = "test-support")
+            || off
+            || updater::Platform::current().is_none()
+        {
             return;
         }
         // Every start asks, so a release is offered the first time the program opens after
@@ -995,6 +1000,14 @@ impl Workspace {
     }
 
     fn start_update_check(&mut self, automatic: bool, cx: &mut Context<Self>) {
+        // A system without a release has nothing to fetch: a manual check only says so,
+        // and no request leaves the machine.
+        if let Some(notice) = updater::manual_check_notice(updater::Platform::current()) {
+            if !automatic {
+                self.notify_user("No updates", notice, cx);
+            }
+            return;
+        }
         let Some(current) = updater::parse_version(self.info.version) else {
             if !automatic {
                 self.notify_user(

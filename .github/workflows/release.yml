@@ -40,7 +40,8 @@ jobs:
             libx11-dev \
             libxcb1-dev \
             libxkbcommon-dev \
-            libxkbcommon-x11-dev
+            libxkbcommon-x11-dev \
+            unzip
 
       - name: Toolchain
         run: rustup show active-toolchain && cargo --version

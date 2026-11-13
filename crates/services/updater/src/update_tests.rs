@@ -289,7 +289,7 @@ fn an_update_from_the_release_server_replaces_files_and_cleans_up_the_old_releas
             (format!("{NEW}/tools/shared/same.jar"), "same jar".into()),
         ],
     );
-    let archive = archive_name(&version("0.2.0"));
+    let archive = archive_name(&version("0.2.0")).expect("a release platform of this build");
     let checksum = format!("{archive}.sha256");
     let bytes = fs::read(&new_zip).unwrap();
     let hash = sha256_file(&new_zip).unwrap();
