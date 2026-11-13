@@ -1,19 +1,22 @@
-# Builds the Linux and macOS archives and attaches them to a published release. The
-# Windows archive comes from the release script, built and tested on the maintainer's
-# machine, and is not replaced here.
+# Builds the Linux and macOS archives, attaches them to the draft release that
+# team/release.sh made with the Windows archive, checks the whole set and only then
+# publishes the release: nobody can download a release without its archives.
+# Without a tag the run is a trial: the Linux archive becomes an artifact of the run.
 name: release
 
 on:
-  release:
-    types: [published]
-  # A trial build without a release: the archives become artifacts of the run.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag of the draft release, v0.1.12 for one; empty for a trial"
+        required: false
+        default: ""
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -23,6 +26,7 @@ env:
   JDTLS_URL: https://download.eclipse.org/jdtls/snapshots/jdt-language-server-1.63.0-202610191322.tar.gz
   DEBUG_ARCHIVE: vscjava.vscode-java-debug-0.60.0.vsix
   DEBUG_URL: https://open-vsx.org/api/vscjava/vscode-java-debug/0.60.0/file/vscjava.vscode-java-debug-0.60.0.vsix
+  TAG: ${{ inputs.tag }}
 
 jobs:
   linux:
@@ -43,8 +47,8 @@ jobs:
       # system the runner itself has.
       - name: Archive and checksum
         run: |
-          if [ "$GITHUB_EVENT_NAME" = release ]; then
-            version="${GITHUB_REF_NAME#v}"
+          if [ -n "$TAG" ]; then
+            version="${TAG#v}"
           else
             version="trial-${GITHUB_SHA::7}"
           fi
@@ -83,14 +87,17 @@ jobs:
           cat "$name.tar.gz.sha256"
 
       - name: Attach to the release
-        if: github.event_name == 'release'
+        if: inputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$GITHUB_REF_NAME"             "$RUNNER_TEMP/dist/"arro-*.tar.gz             "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256             --clobber
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/dist/"arro-*.tar.gz \
+            "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256 \
+            --clobber
 
       - name: Keep the trial archive
-        if: github.event_name != 'release'
+        if: inputs.tag == ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARCHIVE }}
@@ -102,7 +109,7 @@ jobs:
   macos:
     name: macOS archive
     # Only for a release: a trial run checks the Linux build alone.
-    if: github.event_name == 'release'
+    if: inputs.tag != ''
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +127,7 @@ jobs:
       # the machine it built on, `macos-aarch64` here and `macos-x86_64` on an Intel Mac.
       - name: Archive and checksum
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           case "$(uname -m)" in
             arm64) platform=macos-aarch64 ;;
             x86_64) platform=macos-x86_64 ;;
@@ -130,7 +137,6 @@ jobs:
           mkdir -p "$out"
           cargo run -q -p xtask -- dist --target macos --out "$out" \
             --tools "$RUNNER_TEMP/tools" --zip
-          archive="$out/arro-$version-$platform.zip"
           cd "$out"
           shasum -a 256 "arro-$version-$platform.zip" > "arro-$version-$platform.zip.sha256"
           cat "arro-$version-$platform.zip.sha256"
@@ -139,7 +145,49 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" \
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/dist/"arro-*.zip \
             "$RUNNER_TEMP/dist/"arro-*.zip.sha256 \
             --clobber
+
+  # The draft becomes public only when every archive is there and matches its checksum,
+  # the Linux program asks for no glibc past 2.35 and each archive holds its program.
+  publish:
+    name: Check and publish
+    needs: [linux, macos]
+    if: inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p "$RUNNER_TEMP/check" && cd "$RUNNER_TEMP/check"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          for archive in \
+            "arro-$version-windows-x86_64.zip" \
+            "arro-$version-linux-x86_64.tar.gz" \
+            "arro-$version-macos-aarch64.zip"; do
+            [ -f "$archive" ] || { echo "missing $archive"; exit 1; }
+            [ -f "$archive.sha256" ] || { echo "missing $archive.sha256"; exit 1; }
+            expected=$(cut -d' ' -f1 "$archive.sha256")
+            actual=$(sha256sum "$archive" | cut -d' ' -f1)
+            [ "$expected" = "$actual" ] || { echo "the checksum of $archive differs"; exit 1; }
+            echo "ok $archive"
+          done
+          tar -xzf "arro-$version-linux-x86_64.tar.gz"
+          program="arro-$version-linux-x86_64/arro"
+          [ -x "$program" ] || { echo "the Linux archive has no arro"; exit 1; }
+          newest=$(objdump -T "$program" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1)
+          echo "newest glibc symbol: $newest"
+          [ "$( { echo "$newest"; echo GLIBC_2.35; } | sort -V | tail -1)" = GLIBC_2.35 ]
+          unzip -l "arro-$version-macos-aarch64.zip" | grep -q "Arro.app/Contents/MacOS/" \
+            || { echo "the macOS archive has no Arro.app"; exit 1; }
+          unzip -l "arro-$version-windows-x86_64.zip" | grep -q "arro.exe" \
+            || { echo "the Windows archive has no arro.exe"; exit 1; }
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

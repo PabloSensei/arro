@@ -59,6 +59,13 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain && cargo --version
 
+      # The dependencies and GPUI come from the cache of the last run of this system;
+      # only the crates of the workspace compile again. Saved from main only.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -92,6 +99,11 @@ jobs:
 
       - name: Toolchain
         run: rustup show active-toolchain && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: boundary
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The Python of the runner moves on (3.14 by now), and the pinned debugpy does not
       # start a program on it; the version is pinned with the packages.
