@@ -222,6 +222,22 @@ impl InspectHub {
         self.run.is_some()
     }
 
+    /// The state behind Rerun changed. The panel draws the button from the hub, so it has
+    /// to hear about this here rather than rely on a title or a progress bar that
+    /// happens to travel with the same change.
+    fn state_changed(&mut self, cx: &mut Context<Self>) {
+        self.panel.update(cx, |_, cx| cx.notify());
+    }
+
+    /// Changes the state of Rerun without a title update, for the test that checks the
+    /// panel hears the hub itself.
+    #[cfg(test)]
+    pub(crate) fn rerun_changed_for_test(&mut self, ready: bool, cx: &mut Context<Self>) {
+        self.last = ready.then_some((Mode::Cleanup, Scope::Project));
+        self.run = None;
+        self.state_changed(cx);
+    }
+
     /// Runs Inspect Code over exactly these files, for the commit analysis. `false` when
     /// there is nothing to inspect.
     pub(crate) fn start_files(&mut self, files: Vec<PathBuf>, cx: &mut Context<Self>) -> bool {
@@ -331,9 +347,11 @@ impl InspectHub {
             .try_global::<Semantic>()
             .map(|semantic| semantic.0.clone())
         else {
+            self.state_changed(cx);
             return;
         };
         self.last = Some((mode.clone(), scope.clone()));
+        self.state_changed(cx);
         let files: Vec<PathBuf> = self
             .files_of(&scope, cx)
             .into_iter()
@@ -370,6 +388,7 @@ impl InspectHub {
                 panel.set_progress(None, cx);
                 panel.set_title("Inspection Results (0 problems)".to_owned(), cx);
             });
+            self.state_changed(cx);
             return;
         }
         self.run = Some(RunState {
@@ -377,6 +396,7 @@ impl InspectHub {
             label: label.clone(),
             filter,
         });
+        self.state_changed(cx);
         let total = files.len();
         let prepare = matches!(
             &scope,
@@ -809,6 +829,7 @@ impl InspectHub {
         self.kinds = kinds;
         self.findings = findings;
         self.run = None;
+        self.state_changed(cx);
         let count = self.findings.len();
         let shown = self.findings.clone();
         self.panel.update(cx, |panel, cx| {
@@ -821,6 +842,7 @@ impl InspectHub {
 
     fn finish_cleanup(&mut self, changed: usize, cx: &mut Context<Self>) {
         self.run = None;
+        self.state_changed(cx);
         self.panel.update(cx, |panel, cx| {
             panel.set_progress(None, cx);
             panel.set_title(format!("Code Cleanup ({changed} files changed)"), cx);
@@ -956,6 +978,7 @@ impl InspectHub {
         if let Some(run) = self.run.take() {
             run.cancel.cancel();
         }
+        self.state_changed(cx);
         self.panel.update(cx, |panel, cx| {
             panel.set_progress(None, cx);
             panel.set_title("Inspection Results".to_owned(), cx);
@@ -1950,6 +1973,8 @@ fn push_source(change: &mut WorkspaceChange, source: &SourceEdit) {
 
 impl Render for InspectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        workspace::note_view_render(cx, "inspection");
         let theme = *cx.global::<Theme>();
         let (workspace, tool) = (self.workspace.clone(), INSPECTION_TOOL);
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {

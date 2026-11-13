@@ -232,9 +232,7 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_file_gets_an_entry_of_the_freedesktop_trash() {
-        let dir = std::env::temp_dir().join(format!("trash-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("trash-test");
         let file = dir.join("taken-back.txt");
         std::fs::write(&file, "text").unwrap();
         let trash = dir.join("Trash");
@@ -249,7 +247,6 @@ mod tests {
         let info = std::fs::read_to_string(trash.join("info/taken-back.txt.trashinfo")).unwrap();
         assert!(info.starts_with("[Trash Info]\nPath="), "{info}");
         assert!(info.contains("DeletionDate="), "{info}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The Trash of the Finder keeps the file under its name and renames a second one.

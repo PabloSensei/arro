@@ -69,15 +69,13 @@ mod tests {
 
     #[test]
     fn an_existing_file_has_one_spelling_however_it_is_named() {
-        let directory = std::env::temp_dir().join(format!("canon-path-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = test_support::TempDir::new("canon-path");
         let file = directory.join("Name.txt");
         std::fs::write(&file, "x").unwrap();
 
         let exact = CanonPath::new(&file).unwrap();
         let other = CanonPath::new(directory.join(".").join("Name.txt")).unwrap();
 
-        std::fs::remove_dir_all(&directory).unwrap();
         assert_eq!(exact, other);
     }
 

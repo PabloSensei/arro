@@ -161,7 +161,10 @@ mod tests {
 
     #[test]
     fn back_and_forward_walk_the_places_jumped_from() {
-        let (first, second) = (std::env::temp_dir(), std::env::current_dir().unwrap());
+        let (first, second) = (
+            test_support::scratch("nav-back-forward"),
+            std::env::current_dir().unwrap(),
+        );
         let mut navigator = Navigator::default();
         navigator.activated(&first);
         navigator.jumped_from(&first, 10);
@@ -180,7 +183,10 @@ mod tests {
 
     #[test]
     fn recent_files_put_the_last_active_first() {
-        let (first, second) = (std::env::temp_dir(), std::env::current_dir().unwrap());
+        let (first, second) = (
+            test_support::scratch("nav-recent"),
+            std::env::current_dir().unwrap(),
+        );
         let mut navigator = Navigator::default();
         navigator.activated(&first);
         navigator.activated(&second);

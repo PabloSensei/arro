@@ -87,7 +87,7 @@ pub fn button_frame(
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .tooltip(move |_, cx| tooltip(label.clone(), shortcut.clone(), cx))
-        .tooltip_show_delay(tooltip_show_delay())
+        .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
 }
 
 /// Text button with an optional leading icon and a trailing chevron.
@@ -152,7 +152,7 @@ pub fn window_button(
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .tooltip(move |_, cx| tooltip(label.clone(), None, cx))
-        .tooltip_show_delay(tooltip_show_delay())
+        .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
         .child(
             svg()
                 .path(path)
@@ -186,7 +186,7 @@ pub fn stripe_button(
         .when(!selected, |this| this.hover(move |style| style.bg(hover)))
         .active(move |style| style.bg(pressed))
         .tooltip(move |_, cx| tooltip(label.clone(), shortcut.clone(), cx))
-        .tooltip_show_delay(tooltip_show_delay())
+        .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
         .child(icon_sized(icon_name, ICON, theme))
 }
 
@@ -325,8 +325,20 @@ impl TooltipTiming {
 
 static TOOLTIP_TIMING: Mutex<TooltipTiming> = Mutex::new(TooltipTiming::new());
 
-/// The delay of the next tooltip, from the tooltips this window showed before.
-pub fn tooltip_show_delay() -> Duration {
+/// The delay GPUI waits before it asks for a tooltip. It is zero: the entity of the
+/// tooltip is created when the pointer enters the element, and that is where the real
+/// wait is decided. A view drawn once keeps its frame, so a delay read at draw time would
+/// be the delay of the previous hover.
+pub const TOOLTIP_CREATE_DELAY: Duration = Duration::ZERO;
+
+/// The delay of the next tooltip, as GPUI needs it: none. Kept for call sites that still
+/// pass a delay explicitly; the wait itself is in [`Tooltip`].
+pub const fn tooltip_show_delay() -> Duration {
+    TOOLTIP_CREATE_DELAY
+}
+
+/// The delay of a tooltip whose element is entered now.
+fn tooltip_wait() -> Duration {
     let now = Instant::now();
     TOOLTIP_TIMING
         .lock()
@@ -353,14 +365,22 @@ pub fn tooltip_position(
     point(x, y)
 }
 
-/// A tooltip with an optional shortcut, shown by GPUI after its hover delay.
+/// A tooltip with an optional shortcut. It is created when the pointer enters its
+/// element and shows itself after the delay of that moment, so a cached frame cannot
+/// keep the delay of a past render.
 pub struct Tooltip {
     text: SharedString,
     shortcut: Option<SharedString>,
+    ready: bool,
+    shown_at: Option<Instant>,
 }
 
 impl Drop for Tooltip {
     fn drop(&mut self) {
+        // A tooltip that never became visible does not open the warm window.
+        if self.shown_at.is_none() {
+            return;
+        }
         if let Ok(mut timing) = TOOLTIP_TIMING.lock() {
             timing.hidden(Instant::now());
         }
@@ -373,7 +393,27 @@ pub fn tooltip(
     cx: &mut App,
 ) -> AnyView {
     let text = text.into();
-    cx.new(|_| Tooltip { text, shortcut }).into()
+    let wait = tooltip_wait();
+    cx.new(move |cx| {
+        if !wait.is_zero() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |tooltip: &mut Tooltip, cx| {
+                    tooltip.ready = true;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        Tooltip {
+            text,
+            shortcut,
+            ready: wait.is_zero(),
+            shown_at: None,
+        }
+    })
+    .into()
 }
 
 // The tooltips a test build rendered, oldest first.
@@ -402,26 +442,35 @@ pub fn clear_shown_tooltips() {
 
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Ok(mut timing) = TOOLTIP_TIMING.lock() {
-            timing.shown(Instant::now());
+        if self.ready && self.shown_at.is_none() {
+            let now = Instant::now();
+            self.shown_at = Some(now);
+            if let Ok(mut timing) = TOOLTIP_TIMING.lock() {
+                timing.shown(now);
+            }
         }
         #[cfg(any(test, feature = "test-support"))]
-        SHOWN_TOOLTIPS.with(|list| {
-            let mut list = list.borrow_mut();
-            let shown = (self.text.clone(), self.shortcut.clone());
-            if list.last() != Some(&shown) {
-                list.push(shown);
-            }
-        });
+        if self.ready {
+            SHOWN_TOOLTIPS.with(|list| {
+                let mut list = list.borrow_mut();
+                let shown = (self.text.clone(), self.shortcut.clone());
+                if list.last() != Some(&shown) {
+                    list.push(shown);
+                }
+            });
+        }
         let theme = *cx.global::<Theme>();
         // The gap is on both sides, so the content keeps it whether GPUI puts the
-        // tooltip under the pointer or above it near the bottom edge.
+        // tooltip under the pointer or above it near the bottom edge. While the wait
+        // runs the frame stays empty, which keeps the tooltip where the pointer is.
         div()
-            .pt(px(TOOLTIP_GAP))
-            .pb(px(TOOLTIP_GAP))
-            .pl(px(SPACE_S))
-            .font_family(UI_FONT)
-            .child(
+            .when(self.ready, |this| {
+                this.pt(px(TOOLTIP_GAP))
+                    .pb(px(TOOLTIP_GAP))
+                    .pl(px(SPACE_S))
+                    .font_family(UI_FONT)
+            })
+            .children(self.ready.then(|| {
                 popup_frame(&theme)
                     .flex()
                     .items_center()
@@ -435,7 +484,7 @@ impl Render for Tooltip {
                         self.shortcut
                             .clone()
                             .map(|shortcut| div().text_color(theme.text_muted).child(shortcut)),
-                    ),
-            )
+                    )
+            }))
     }
 }

@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -82,7 +82,6 @@ pub(crate) struct Shared {
     pub(crate) screen: Snapshot<Screen>,
     pub(crate) modes: AtomicU32,
     pub(crate) bytes: AtomicU64,
-    pub(crate) closed: AtomicBool,
     pub(crate) exit: OnceLock<u32>,
     size: AtomicU32,
     pub(crate) pty: Arc<Pty>,
@@ -126,7 +125,6 @@ impl TerminalSession {
             screen: Snapshot::new(Screen::default()),
             modes: AtomicU32::new(0),
             bytes: AtomicU64::new(0),
-            closed: AtomicBool::new(false),
             exit: OnceLock::new(),
             size: AtomicU32::new(pack_size(spec.cols, spec.rows)),
             pty: pty.clone(),
@@ -198,9 +196,10 @@ impl TerminalSession {
         self.shared.exit_code()
     }
 
-    /// True once the stream ended and the last picture is out.
+    /// True once the stream ended and the last picture is out. The flag lives in the
+    /// snapshot itself, so a reader of the final version cannot miss the end.
     pub fn is_closed(&self) -> bool {
-        self.shared.closed.load(Ordering::SeqCst)
+        self.shared.screen.get().closed
     }
 
     fn enqueue(&self, segments: Vec<Vec<u8>>) -> Result<(), InputError> {

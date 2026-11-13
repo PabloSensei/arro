@@ -153,6 +153,7 @@ pub(crate) struct Engine {
     dirty: bool,
     last_publish: Instant,
     version: u64,
+    closed: bool,
 }
 
 impl Engine {
@@ -188,6 +189,7 @@ impl Engine {
             dirty: true,
             last_publish: Instant::now(),
             version: 0,
+            closed: false,
         }
     }
 
@@ -212,8 +214,10 @@ impl Engine {
             }
         }
         self.flush_sync();
+        // Close before the last publish: a panel that reads the new version must also
+        // see the end, or a frame drawn between the two would never get another one.
+        self.closed = true;
         self.publish();
-        self.shared.closed.store(true, Ordering::SeqCst);
         let code = self.shared.exit_code();
         drop(self.events.try_send(TerminalEvent::Exited(code)));
     }
@@ -351,6 +355,7 @@ impl Engine {
             bells: notes.bells,
             version: self.version,
             exit_code: self.shared.exit.get().copied(),
+            closed: self.closed,
         }
     }
 }

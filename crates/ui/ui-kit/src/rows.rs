@@ -4,7 +4,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::metrics::*;
-use crate::{Theme, icon, icon_sized, tooltip, tooltip_show_delay};
+use crate::{TOOLTIP_CREATE_DELAY, Theme, icon, icon_sized, tooltip};
 
 /// One editor tab. `index` makes element ids unique inside a pane.
 pub struct TabStyle {
@@ -92,7 +92,7 @@ pub fn tab(
                         cx,
                     )
                 })
-                .tooltip_show_delay(tooltip_show_delay())
+                .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
                 .on_click(on_close)
                 .child(if pinned {
                     div()

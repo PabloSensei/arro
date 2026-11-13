@@ -82,7 +82,7 @@ fn stdin_reaches_the_child() {
 
 #[test]
 fn working_directory_and_environment_are_passed() {
-    let directory = std::env::temp_dir();
+    let directory = test_support::scratch("proc-sup-cwd");
     let mut process = shell("echo %CD%^|%PROC_SUP_TEST%")
         .cwd(&directory)
         .env("PROC_SUP_TEST", "value")

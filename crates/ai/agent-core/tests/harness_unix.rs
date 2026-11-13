@@ -3,29 +3,25 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_core::{Harness, detect};
 
-struct Directory(PathBuf);
+struct Directory(test_support::TempDir);
 
 impl Directory {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("harness-unix-{name}-{}", std::process::id()));
-        fs::create_dir_all(&path).expect("directory");
-        Self(path)
+        Self(test_support::TempDir::new(&format!("harness-unix-{name}")))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.path()
     }
 
     fn touch(&self, name: &str) -> PathBuf {
-        let file = self.0.join(name);
+        let file = self.path().join(name);
         fs::write(&file, "#!/bin/sh\n").expect("file");
         file
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -34,7 +30,7 @@ fn an_entry_point_of_the_package_manager_is_found_as_it_is() {
     let directory = Directory::new("plain");
     let program = directory.touch("claude");
 
-    let found = detect(directory.0.as_os_str());
+    let found = detect(directory.path().as_os_str());
 
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].harness, Harness::Claude);
@@ -47,5 +43,5 @@ fn a_batch_file_of_another_system_is_not_a_harness() {
     let directory = Directory::new("batch");
     directory.touch("opencode.cmd");
 
-    assert!(detect(directory.0.as_os_str()).is_empty());
+    assert!(detect(directory.path().as_os_str()).is_empty());
 }

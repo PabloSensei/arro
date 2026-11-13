@@ -376,6 +376,7 @@ fn label(labels: &str, name: &str) -> Option<String> {
 }
 
 /// Quotes the way the C runtime of Windows reads a command line back into arguments.
+#[cfg(not(unix))]
 fn join_command_line(words: &[String]) -> String {
     let quote = |word: &String| {
         if !word.is_empty() && !word.contains([' ', '\t', '"']) {
@@ -405,6 +406,44 @@ fn join_command_line(words: &[String]) -> String {
     words.iter().map(quote).collect::<Vec<_>>().join(" ")
 }
 
+/// Quotes one argument the way `/bin/sh` reads it back.
+///
+/// Single quotes leave `$`, a double quote and a backslash as they are. An inner single
+/// quote closes the quoted part, adds an escaped one and opens it again.
+#[cfg(unix)]
+fn push_argument(line: &mut String, argument: &str) {
+    if !argument.is_empty()
+        && argument
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&byte))
+    {
+        line.push_str(argument);
+        return;
+    }
+    line.push('\'');
+    for ch in argument.chars() {
+        if ch == '\'' {
+            line.push_str("'\\''");
+        } else {
+            line.push(ch);
+        }
+    }
+    line.push('\'');
+}
+
+/// One line for `/bin/sh -c` from the words of a command.
+#[cfg(unix)]
+fn join_command_line(words: &[String]) -> String {
+    let mut line = String::new();
+    for word in words {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        push_argument(&mut line, word);
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +465,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn command_lines_quote_what_needs_it() {
         let cli = DockerCli::new("C:/Program Files/Docker/docker.exe")
@@ -439,5 +479,58 @@ mod tests {
         );
         let words = vec![r#"a "b" c\"#.to_owned()];
         assert_eq!(join_command_line(&words), r#""a \"b\" c\\""#);
+    }
+
+    /// Every argument survives the shell that reads the line back, with the same order
+    /// and the same bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_command_line_keeps_every_argument() {
+        use std::process::Command;
+
+        let words: Vec<String> = [
+            "plain",
+            "two words",
+            "say 'hi'",
+            "say \"hi\"",
+            "$HOME",
+            "a\\b",
+            "",
+            "colon: and, commas",
+        ]
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect();
+
+        let line = format!("printf '%s\\n' {}", join_command_line(&words));
+        let output = Command::new("/bin/sh")
+            .args(["-c", &line])
+            .output()
+            .expect("a shell");
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).expect("text");
+        let lines: Vec<&str> = text.split('\n').collect();
+        let expected: Vec<&str> = words.iter().map(String::as_str).collect();
+        assert_eq!(&lines[..words.len()], expected.as_slice());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_compose_command_line_is_quoted_for_the_shell() {
+        let cli =
+            DockerCli::new("/usr/local/bin/docker").with_context(Some("desktop-linux".into()));
+
+        let line =
+            cli.compose_command_line(Path::new("/home/me/my app/compose.yaml"), ComposeAction::Up);
+
+        assert_eq!(
+            line,
+            "/usr/local/bin/docker --context desktop-linux compose --file '/home/me/my app/compose.yaml' up"
+        );
     }
 }

@@ -561,7 +561,7 @@ mod tests {
             assemble_first: false,
             settings: Table::try_from(JavaTarget::default()).unwrap(),
         };
-        let provider = provider(std::env::temp_dir().as_path());
+        let provider = provider(&temp_dir("plain-program"));
 
         let fields = provider.fields(&config);
 

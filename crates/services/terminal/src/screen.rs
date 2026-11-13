@@ -118,6 +118,9 @@ pub struct Screen {
     /// Grows with every published change.
     pub version: u64,
     pub exit_code: Option<u32>,
+    /// The final snapshot of a session whose program has ended. A reader that saw this
+    /// frame at `version` has seen the end, so no update of the closed state can follow.
+    pub closed: bool,
 }
 
 impl Screen {

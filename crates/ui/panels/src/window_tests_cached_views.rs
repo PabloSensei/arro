@@ -30,7 +30,7 @@ fn renders(cx: &TestAppContext, view: &str) -> usize {
 
 /// One frame that honors the cache of the views, unlike the `draw` helper of the window
 /// tests, which refreshes every view on purpose.
-fn frame(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
+pub(crate) fn frame(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     cx.update_window(window.into(), |_, window, cx| {
         window.draw(cx).clear(cx);
     })
@@ -46,7 +46,11 @@ fn settle(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     }
 }
 
-fn show_tool(cx: &mut TestAppContext, window: WindowHandle<Workspace>, tool: &'static str) {
+pub(crate) fn show_tool(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    tool: &'static str,
+) {
     window
         .update(cx, |workspace, window, cx| {
             workspace.show_tool(tool, window, cx)

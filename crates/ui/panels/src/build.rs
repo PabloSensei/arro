@@ -547,7 +547,7 @@ impl BuildPanel {
                 skip_button(self.skip_tests, theme)
                     .debug_selector(|| "build-skip-tests".to_owned())
                     .tooltip(move |_, cx| tooltip(TOOLTIPS[2].1, None, cx))
-                    .tooltip_show_delay(tooltip_show_delay())
+                    .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.skip_tests = !this.skip_tests;
                         cx.notify();

@@ -609,7 +609,7 @@ impl Render for ItemsPanel {
                     .tooltip(move |_, cx| {
                         tooltip(tooltip_text.clone(), shortcut.clone().map(Into::into), cx)
                     })
-                    .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                    .tooltip_show_delay(ui_kit::TOOLTIP_CREATE_DELAY)
             })
             .collect();
         let header = div()

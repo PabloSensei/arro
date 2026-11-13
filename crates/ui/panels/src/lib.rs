@@ -283,6 +283,9 @@ mod window_tests_mask_hint;
 #[cfg(test)]
 mod window_tests_release;
 
+#[cfg(test)]
+mod window_tests_cached_tails;
+
 mod choice;
 mod invalidate;
 

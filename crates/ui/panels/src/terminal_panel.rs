@@ -31,6 +31,7 @@ pub struct TerminalPanel {
     state: State,
     focus: FocusHandle,
     version: u64,
+    exit_code: Option<u32>,
 }
 
 /// The shell sees what the user sees in any console, plus the terminal variables and the
@@ -116,6 +117,7 @@ impl TerminalPanel {
                 state: State::Starting,
                 focus: cx.focus_handle(),
                 version: 0,
+                exit_code: None,
             };
             panel.start(cx);
             every_frame(cx, Self::refresh);
@@ -184,8 +186,12 @@ impl TerminalPanel {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if let Some(session) = self.session() {
             let version = session.screen().version;
-            if version != self.version {
+            let exit_code = session.exit_code();
+            // The exit code belongs to the waiter thread and may arrive just after the
+            // last frame, so it is watched on its own as well.
+            if version != self.version || exit_code != self.exit_code {
                 self.version = version;
+                self.exit_code = exit_code;
                 cx.notify();
             }
         }
@@ -238,6 +244,7 @@ impl Render for TerminalPanel {
                 if let Some(code) = session.exit_code().filter(|_| session.is_closed()) {
                     body = body.child(
                         div()
+                            .debug_selector(|| "terminal-exit".to_owned())
                             .flex_none()
                             .px(px(SPACE_M))
                             .pb(px(SPACE_M))
