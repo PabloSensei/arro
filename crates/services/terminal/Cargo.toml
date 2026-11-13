@@ -26,6 +26,12 @@ name = "term-probe"
 path = "src/bin/term_probe.rs"
 test = false
 
+[[bin]]
+# A window program of the tests, not shipped: the close of a terminal must not reach it.
+name = "gui-sleeper"
+path = "src/bin/gui_sleeper.rs"
+test = false
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

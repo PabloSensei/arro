@@ -1,7 +1,7 @@
 //! `--script` drives the window with the same calls as the mouse and keyboard, so a
 //! scenario runs without taking the real pointer or the focus of the user.
 //!
-//! Steps are separated by `;`, paths are relative to the project root:
+//! Steps are separated by `;` or by a line end, paths are relative to the project root:
 //! `reveal:src/main`, `open:pom.xml`, `key:ctrl-s`, `type:text`, `theme`, `split`,
 //! `close-tab`, `next-tab`, `dock:left|right|bottom`, `search`, `dismiss`, `wait:MS`,
 //! `report:FILE`, `quit`. `config:NAME` waits for a run configuration and selects it,
@@ -28,7 +28,22 @@
 //! `agent:claude|codex`, `agent-input:MS`. `agent-input` waits until the
 //! active session shows its input box and closes the window when it does not, so a script never
 //! types into a login or permission screen. `type` and `key` go to whatever has the focus,
-//! the terminal of a dock included.
+//! the terminal of a dock included; `type` reads `\n`, `\t` and `\\` as the keys Enter,
+//! Tab and a backslash.
+//!
+//! `click:SELECTOR` presses the left button in the middle of the element a spot names,
+//! as the mouse does and without the real cursor. The stripe buttons (`stripe-s-project`,
+//! `stripe-s-bookmarks`, ...), the places popup (`places-popup`, `places-empty`) and the
+//! notification balloon (`notification`) have spots, which a release build records as
+//! well as a debug one. `expect:SELECTOR` and `expect-not:SELECTOR` check that the spot
+//! was drawn on the next frame, `expect-tool:TOOL` and `expect-no-tool:TOOL` check that a
+//! tool window is open or closed. `close-notification` hides the balloon as its close
+//! button does, so a scenario that checks the balloon does not depend on a notification
+//! the window showed on its own. `hide-tools` closes every tool window and the balloon,
+//! so a scenario starts from the same window whatever state the window saved.
+//! `close-window` closes the window as its close button does. A check prints `ok ...` or `FAIL ...` and the run ends with
+//! `summary: N ok, M failed`; the lines go to the file of `report:FILE` too. A run whose
+//! last step is `quit` exits with code 1 when a check failed.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -139,15 +154,21 @@ pub enum Step {
     TestsIdle,
     Docker(String, String),
     DockerUntil(String),
+    Click(String),
+    Expect(String, bool),
+    ExpectTool(String, bool),
+    HideTools,
+    CloseNotification,
+    CloseWindow,
     Report(PathBuf),
     Quit,
 }
 
 pub fn parse_script(script: &str) -> Result<Vec<Step>, String> {
     let steps = script
-        .split(';')
+        .split([';', '\n', '\r'])
         .map(str::trim)
-        .filter(|step| !step.is_empty());
+        .filter(|step| !step.is_empty() && !step.starts_with('#'));
     steps.map(parse_step).collect()
 }
 
@@ -157,7 +178,7 @@ fn parse_step(step: &str) -> Result<Step, String> {
         "reveal" => Step::Reveal(value.into()),
         "open" => Step::Open(value.into()),
         "key" => Step::Key(value.into()),
-        "type" => Step::Type(value.into()),
+        "type" => Step::Type(unescape(value)),
         "theme" => Step::Theme,
         "split" => Step::Split,
         "split-down" => Step::SplitDown,
@@ -262,6 +283,14 @@ fn parse_step(step: &str) -> Result<Step, String> {
             Step::Docker(action.into(), name.into())
         }
         "docker-until" => Step::DockerUntil(value.into()),
+        "click" => Step::Click(named(value, "click")?),
+        "expect" => Step::Expect(named(value, "expect")?, true),
+        "expect-not" => Step::Expect(named(value, "expect-not")?, false),
+        "expect-tool" => Step::ExpectTool(named(value, "expect-tool")?, true),
+        "expect-no-tool" => Step::ExpectTool(named(value, "expect-no-tool")?, false),
+        "hide-tools" => Step::HideTools,
+        "close-notification" => Step::CloseNotification,
+        "close-window" => Step::CloseWindow,
         "agent-input" => Step::AgentInput(value.parse().map_err(|_| format!("bad wait {value}"))?),
         "goto" => Step::Goto(value.parse().map_err(|_| format!("bad line {value}"))?),
         "mark" => Step::Mark(value.parse().map_err(|_| format!("bad line {value}"))?),
@@ -275,6 +304,38 @@ fn parse_step(step: &str) -> Result<Step, String> {
         "quit" => Step::Quit,
         other => return Err(format!("unknown step {other}")),
     })
+}
+
+/// The name a check or a click works on: a selector or a tool window, never empty.
+fn named(value: &str, step: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err(format!("{step} needs a name"))
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+/// The text of a `type` step with the escapes a scenario file can write on one line.
+fn unescape(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            result.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('n') => result.push('\n'),
+            Some('t') => result.push('\t'),
+            Some('\\') => result.push('\\'),
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+    result
 }
 
 /// A text snapshot of the window state, for checks from outside.
@@ -494,11 +555,19 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
         Step::Search => workspace.show_search(window, cx),
         Step::Dismiss => workspace.dismiss(window, cx),
         Step::Show(tool) => workspace.show_tool(tool, window, cx),
-        Step::Report(file) => {
-            if let Err(error) = std::fs::write(file, report(workspace, cx)) {
-                eprintln!("report is not written: {error}");
+        // A saved window may keep a tool window or a balloon open, so a scenario that
+        // starts with this step always begins from the same window.
+        Step::HideTools => {
+            for side in [DockSide::Left, DockSide::Right, DockSide::Bottom] {
+                if workspace.dock_open(side) {
+                    workspace.toggle_panel(side, window, cx);
+                }
             }
+            workspace.close_notification(cx);
         }
+        // The loop writes the report with the lines of the checks it has run so far.
+        Step::Report(_) => {}
+        Step::CloseWindow | Step::Quit => workspace.close_window(window, cx),
         Step::Goto(line) => {
             let view = workspace.active_view();
             if let Some(view) =
@@ -550,7 +619,6 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
             let panel = cx.global::<ActiveRunPanel>().0.clone();
             panel.update(cx, |panel, cx| panel.stop(cx));
         }
-        Step::Quit => workspace.close_window(window, cx),
         Step::TestsIdle => {}
         Step::Reveal(_)
         | Step::Key(_)
@@ -570,7 +638,11 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
         | Step::Idle
         | Step::Until(_)
         | Step::Docker(..)
-        | Step::DockerUntil(_) => {}
+        | Step::DockerUntil(_)
+        | Step::Click(_)
+        | Step::Expect(..)
+        | Step::ExpectTool(..)
+        | Step::CloseNotification => {}
         Step::Problem { path, problem } => {
             let path = root.join(path);
             let hub = cx.global::<ActiveProblems>().0.clone();
@@ -731,6 +803,138 @@ fn check(step: &Step, cx: &mut App) -> bool {
     }
 }
 
+/// How long a check waits for the window to draw the frame it looks at.
+const FRAME_PATIENCE: Duration = Duration::from_secs(5);
+/// One turn of the wait for a frame.
+const FRAME_POLL: Duration = Duration::from_millis(50);
+
+/// What the checks of a run found: the lines of the report and their count.
+#[derive(Default)]
+struct Outcome {
+    lines: Vec<String>,
+    ok: usize,
+    failed: usize,
+}
+
+impl Outcome {
+    /// Keeps one line of the report and prints it, so a run in a terminal shows it too.
+    fn record(&mut self, passed: bool, line: String) {
+        println!("{line}");
+        if passed {
+            self.ok += 1;
+        } else {
+            self.failed += 1;
+        }
+        self.lines.push(line);
+    }
+
+    fn summary(&self) -> String {
+        format!("summary: {} ok, {} failed", self.ok, self.failed)
+    }
+
+    fn text(&self) -> String {
+        let mut text = self.lines.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&self.summary());
+        text.push('\n');
+        text
+    }
+}
+
+/// The line of one step of the report, `ok expect places-empty` or `FAIL click places-popup`.
+fn check_line(passed: bool, kind: &str, name: &str) -> String {
+    let verdict = if passed { "ok" } else { "FAIL" };
+    if name.is_empty() {
+        format!("{verdict} {kind}")
+    } else {
+        format!("{verdict} {kind} {name}")
+    }
+}
+
+/// Writes the state of the window and then the lines of the checks, the summary last.
+fn write_report(file: &Path, snapshot: &str, outcome: &Outcome) {
+    // A run started in another folder asks for `target/smoke-report.txt` before the
+    // folder exists, so the report makes the folders it needs.
+    if let Some(folder) = file.parent()
+        && !folder.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(folder)
+    {
+        eprintln!("the folder of the report is not made: {error}");
+    }
+    if let Err(error) = std::fs::write(file, format!("{snapshot}{}", outcome.text())) {
+        eprintln!("report is not written: {error}");
+    }
+}
+
+/// Asks the window for a frame and returns the number of the frame drawn last.
+fn frame_now(cx: &mut AsyncWindowContext) -> u64 {
+    cx.update(|window, cx| {
+        window.refresh();
+        cx.try_global::<ScriptSpots>()
+            .map_or(0, |spots| spots.frame())
+    })
+    .unwrap_or(0)
+}
+
+/// Waits until the window draws a frame after this call: a check sees what a press has
+/// changed only once the next frame is on screen.
+async fn next_frame(cx: &mut AsyncWindowContext) -> bool {
+    let before = frame_now(cx);
+    let started = Instant::now();
+    loop {
+        if frame_now(cx) > before {
+            return true;
+        }
+        if started.elapsed() > FRAME_PATIENCE {
+            return false;
+        }
+        cx.background_executor().timer(FRAME_POLL).await;
+    }
+}
+
+/// Presses the middle of the spot `selector` names, as the left button of the mouse does
+/// and without the real cursor. An element no spot names is an error of the step.
+async fn click_spot(cx: &mut AsyncWindowContext, selector: &str) -> Result<(), String> {
+    let started = Instant::now();
+    let bounds = loop {
+        let found = cx
+            .update(|window, cx| {
+                window.refresh();
+                cx.try_global::<ScriptSpots>()
+                    .and_then(|spots| spots.find(selector))
+            })
+            .unwrap_or(None);
+        if let Some(bounds) = found {
+            break bounds;
+        }
+        if started.elapsed() > FRAME_PATIENCE {
+            return Err(format!("no element named {selector}"));
+        }
+        cx.background_executor().timer(FRAME_POLL).await;
+    };
+    let position = bounds.center();
+    let pressed = cx.update(|window, cx| {
+        let down = PlatformInput::MouseDown(MouseDownEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        let up = PlatformInput::MouseUp(MouseUpEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+        });
+        window.dispatch_event(down, cx);
+        window.dispatch_event(up, cx);
+    });
+    pressed.map_err(|_| "the window is gone".to_owned())
+}
+
 pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
     let steps = match parse_script(script) {
         Ok(steps) => steps,
@@ -739,8 +943,15 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
             return;
         }
     };
+    // The table of spots lives only while a script runs: every other window draws and
+    // records nothing.
+    *cx.default_global::<ScriptSpots>() = ScriptSpots::default();
+    let count = steps.len();
     cx.spawn_in(window, async move |this, cx| {
-        for step in steps {
+        let mut outcome = Outcome::default();
+        let mut report_file: Option<PathBuf> = None;
+        for (index, step) in steps.into_iter().enumerate() {
+            let last = index + 1 == count;
             // A tab shows its text a moment after it opens: a key or a jump sent before
             // that would go nowhere, and the caret would stay where the file starts.
             if waits_for_the_text(&step) {
@@ -756,6 +967,86 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                 }
             }
             match &step {
+                // The report is written again with the lines of every check run so far,
+                // and once more when the script ends.
+                Step::Report(file) => {
+                    report_file = Some(file.clone());
+                    this.update_in(cx, |workspace, _, cx| {
+                        let snapshot = report(workspace, cx);
+                        write_report(file, &snapshot, &outcome);
+                    })
+                    .ok();
+                    continue;
+                }
+                Step::Click(selector) => {
+                    let pressed = click_spot(cx, selector).await;
+                    let passed = pressed.is_ok();
+                    let name = match &pressed {
+                        Ok(()) => selector.clone(),
+                        Err(reason) => format!("{selector}: {reason}"),
+                    };
+                    outcome.record(passed, check_line(passed, "click", &name));
+                    continue;
+                }
+                // The balloon is hidden at once; the next step waits for a frame as a
+                // check does, so a press after this one starts from a closed balloon.
+                Step::CloseNotification => {
+                    this.update_in(cx, |workspace, _, cx| workspace.close_notification(cx))
+                        .ok();
+                    outcome.record(true, check_line(true, "close-notification", ""));
+                    continue;
+                }
+                Step::Expect(selector, wanted) => {
+                    if !next_frame(cx).await {
+                        eprintln!("the window draws no frame, the check reads the last one");
+                    }
+                    let shown = cx
+                        .update(|_, cx| {
+                            cx.try_global::<ScriptSpots>()
+                                .is_some_and(|spots| spots.holds(selector))
+                        })
+                        .unwrap_or(false);
+                    let kind = if *wanted { "expect" } else { "expect-not" };
+                    outcome.record(
+                        shown == *wanted,
+                        check_line(shown == *wanted, kind, selector),
+                    );
+                    continue;
+                }
+                Step::ExpectTool(tool, wanted) => {
+                    let open = this
+                        .update_in(cx, |workspace, _, _| workspace.tool_open(tool))
+                        .unwrap_or(false);
+                    let kind = if *wanted {
+                        "expect-tool"
+                    } else {
+                        "expect-no-tool"
+                    };
+                    outcome.record(open == *wanted, check_line(open == *wanted, kind, tool));
+                    continue;
+                }
+                // The close button of the window saves what is unsaved and then takes the
+                // window away; `quit` is the same close with a code for a failed run.
+                Step::CloseWindow | Step::Quit => {
+                    if matches!(&step, Step::CloseWindow) {
+                        outcome.record(true, check_line(true, "close-window", ""));
+                    }
+                    let snapshot = this
+                        .update_in(cx, |workspace, _, cx| report(workspace, cx))
+                        .unwrap_or_default();
+                    if let Some(file) = &report_file {
+                        write_report(file, &snapshot, &outcome);
+                    }
+                    this.update_in(cx, |workspace, window, cx| {
+                        workspace.close_window(window, cx)
+                    })
+                    .ok();
+                    println!("{}", outcome.summary());
+                    if matches!(&step, Step::Quit) && last && outcome.failed > 0 {
+                        exit_failed();
+                    }
+                    return;
+                }
                 Step::Wait(ms) => {
                     let delay = Duration::from_millis(*ms);
                     cx.background_executor().timer(delay).await;
@@ -868,7 +1159,17 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                 }
                 Step::Type(text) => {
                     for character in text.chars() {
-                        let stroke = typed(character);
+                        let stroke = match character {
+                            '\n' | '\r' => Keystroke {
+                                key: "enter".into(),
+                                ..Keystroke::default()
+                            },
+                            '\t' => Keystroke {
+                                key: "tab".into(),
+                                ..Keystroke::default()
+                            },
+                            character => typed(character),
+                        };
                         cx.update(|window, cx| window.dispatch_keystroke(stroke, cx))
                             .ok();
                     }
@@ -883,8 +1184,23 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                 break;
             }
         }
+        if let Some(file) = &report_file {
+            this.update_in(cx, |workspace, _, cx| {
+                let snapshot = report(workspace, cx);
+                write_report(file, &snapshot, &outcome);
+            })
+            .ok();
+        }
+        println!("{}", outcome.summary());
     })
     .detach();
+}
+
+/// A run whose checks failed exits with a code the caller can read. A test never ends
+/// the whole process, so the lines of its report are all it checks.
+fn exit_failed() {
+    #[cfg(not(test))]
+    std::process::exit(1);
 }
 
 #[cfg(test)]
@@ -894,7 +1210,7 @@ mod tests {
     #[test]
     fn parses_every_kind_of_step() {
         let steps = parse_script(
-            "reveal:src; open:a b.txt;theme;dock:bottom;wait:50;key:ctrl-s;type:x;config:App;task:package;until:Started;docker:stop:web;docker-until:tick;agent:codex;settings;setting:font_size:15;problem:a.txt:3:7:error:bad thing;problem-clear:a.txt;todo-scan;caret:3:7;group:prev;new:Class:src/a:Foo;rename:a.txt:b.txt;delete:b.txt;format:CRLF;quit;",
+            "reveal:src; open:a b.txt;theme;dock:bottom;wait:50;key:ctrl-s;type:x;config:App;task:package;until:Started;docker:stop:web;docker-until:tick;agent:codex;settings;setting:font_size:15;problem:a.txt:3:7:error:bad thing;problem-clear:a.txt;todo-scan;caret:3:7;group:prev;new:Class:src/a:Foo;rename:a.txt:b.txt;delete:b.txt;format:CRLF;hide-tools;quit;",
         )
         .unwrap();
         assert_eq!(
@@ -936,6 +1252,7 @@ mod tests {
                 Step::Rename("a.txt".into(), "b.txt".into()),
                 Step::Delete("b.txt".into()),
                 Step::Format("CRLF".into()),
+                Step::HideTools,
                 Step::Quit,
             ]
         );

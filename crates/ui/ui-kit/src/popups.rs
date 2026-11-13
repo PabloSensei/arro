@@ -9,7 +9,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::metrics::*;
-use crate::{Theme, icon, icon_button, icon_sized, motion, popup_frame};
+use crate::{Theme, icon, icon_button, icon_sized, motion, popup_frame, script_spot};
 
 /// The one entry motion of a popup or a dialog: a short fade, no movement.
 pub fn enter(
@@ -735,6 +735,7 @@ pub fn notification(
     text: SharedString,
     actions: Vec<NotificationAction>,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    scripted: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
     let hover = theme.hover;
@@ -766,6 +767,8 @@ pub fn notification(
     popup_frame(theme)
         .id("notification")
         .debug_selector(|| "notification".to_owned())
+        .relative()
+        .child(script_spot(scripted, "notification"))
         .occlude()
         .flex()
         .flex_col()

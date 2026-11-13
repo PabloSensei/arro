@@ -3703,6 +3703,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Hides the balloon as its close button does, for a script that has to know whether
+    /// a notification is on screen.
+    pub fn close_notification(&mut self, cx: &mut Context<Self>) {
+        if self.balloon_visible {
+            self.balloon_visible = false;
+            self.balloon_serial += 1;
+            cx.notify();
+        }
+    }
+
     /// Double Shift and Double Ctrl: the keymap says what they run. Alt alone, pressed
     /// and released without another key, picks the first section of the menu bar.
     pub(crate) fn modifiers_changed(

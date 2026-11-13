@@ -276,6 +276,19 @@ impl Workspace {
     }
 
     fn left_stripe(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = "left-stripe";
+        let scripted = cx.has_global::<ScriptSpots>();
+        // The stripe is a cached view, so its spots are kept until it draws again.
+        let button = |id: &'static str,
+                      icon_name: &'static str,
+                      label: &'static str,
+                      key: Option<&'static str>,
+                      selected: bool,
+                      theme: &Theme| {
+            self.stripe_button(id, icon_name, label, key, selected, theme)
+                .relative()
+                .child(kept_spot(scripted, view, format!("stripe-{id}")))
+        };
         let toggle = |id: &'static str| {
             cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
                 this.toggle_tool(id, window, cx)
@@ -306,7 +319,7 @@ impl Workspace {
                     .items_center()
                     .gap(px(SPACE_XS))
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-project",
                             "toolwindows/project",
                             "Project",
@@ -317,7 +330,7 @@ impl Workspace {
                         .on_click(toggle(PROJECT_TOOL)),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-commit",
                             "toolwindows/commit",
                             "Commit",
@@ -328,7 +341,7 @@ impl Workspace {
                         .on_click(toggle(COMMIT_TOOL)),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-log",
                             "general/vcs",
                             "Git Log",
@@ -340,7 +353,7 @@ impl Workspace {
                     )
                     .child(separator())
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-structure",
                             "toolwindows/structure",
                             "Structure",
@@ -359,7 +372,7 @@ impl Workspace {
                     .gap(px(SPACE_XS))
                     .child(separator())
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-run",
                             "toolwindows/run",
                             "Run",
@@ -370,7 +383,7 @@ impl Workspace {
                         .on_click(toggle(RUN_TOOL)),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-debug",
                             "toolwindows/debug",
                             "Debug",
@@ -383,7 +396,7 @@ impl Workspace {
                         })),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-terminal",
                             "toolwindows/terminal",
                             "Terminal",
@@ -394,7 +407,7 @@ impl Workspace {
                         .on_click(toggle(TERMINAL_TOOL)),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-services",
                             "toolwindows/services",
                             "Services",
@@ -405,7 +418,7 @@ impl Workspace {
                         .on_click(toggle(SERVICES_TOOL)),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-todo",
                             "status/info",
                             "TODO",
@@ -416,7 +429,7 @@ impl Workspace {
                         .on_click(toggle(TODO_TOOL)),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-problems",
                             "toolwindows/problems",
                             "Problems",
@@ -427,7 +440,7 @@ impl Workspace {
                         .on_click(toggle(PROBLEMS_TOOL)),
                     )
                     .child(
-                        self.stripe_button(
+                        button(
                             "s-usages",
                             "codeInsight/search",
                             "Usages",
@@ -441,6 +454,19 @@ impl Workspace {
     }
 
     fn right_stripe(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = "right-stripe";
+        let scripted = cx.has_global::<ScriptSpots>();
+        // The stripe is a cached view, so its spots are kept until it draws again.
+        let button = |id: &'static str,
+                      icon_name: &'static str,
+                      label: &'static str,
+                      key: Option<&'static str>,
+                      selected: bool,
+                      theme: &Theme| {
+            self.stripe_button(id, icon_name, label, key, selected, theme)
+                .relative()
+                .child(kept_spot(scripted, view, format!("stripe-{id}")))
+        };
         let separator = div().w(px(ICON)).h(px(DIVIDER_WIDTH)).bg(theme.border);
         div()
             .flex()
@@ -452,7 +478,7 @@ impl Workspace {
             .h_full()
             .py(px(SPACE_S))
             .child(
-                self.stripe_button(
+                button(
                     "s-notifications",
                     "toolwindows/notifications",
                     "Notifications",
@@ -463,7 +489,7 @@ impl Workspace {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_balloon(cx))),
             )
             .child(
-                self.stripe_button(
+                button(
                     "s-ai",
                     "own/aiSessions",
                     "AI Sessions",
@@ -476,7 +502,7 @@ impl Workspace {
             )
             .child(separator)
             .child(
-                self.stripe_button(
+                button(
                     "s-tasks",
                     "toolwindows/tasks",
                     "Tasks",
@@ -489,7 +515,7 @@ impl Workspace {
                 ),
             )
             .child(
-                self.stripe_button(
+                button(
                     "s-bookmarks",
                     "toolwindows/bookmarks",
                     "Bookmarks",
@@ -2264,7 +2290,14 @@ impl Workspace {
                 });
             }
         }
-        let body = notification(title, text, actions, close, theme);
+        let body = notification(
+            title,
+            text,
+            actions,
+            close,
+            cx.has_global::<ScriptSpots>(),
+            theme,
+        );
         Some(
             deferred(
                 div()
@@ -2280,6 +2313,12 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The spots a script names are recorded for this frame only; a view the window
+        // caches keeps its own until it draws again. A window no script drives has no
+        // table at all.
+        if cx.has_global::<ScriptSpots>() {
+            cx.global_mut::<ScriptSpots>().begin_frame();
+        }
         #[cfg(any(test, feature = "test-support"))]
         if self.state_revision != self.counted_revision {
             self.counted_revision = self.state_revision;
@@ -2695,8 +2734,24 @@ impl ChromeView {
     }
 }
 
+/// The name a cached piece of the window is known by in the table of `--script` spots.
+fn chrome_view_name(part: &ChromePart) -> &'static str {
+    match part {
+        ChromePart::TitleBar => "title",
+        ChromePart::LeftStripe => "left-stripe",
+        ChromePart::RightStripe => "right-stripe",
+        ChromePart::Tool(_) => "tool",
+    }
+}
+
 impl Render for ChromeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A cached piece drops the spots of the frame it drew last: what it no longer
+        // shows leaves the table, and what it shows is recorded again below.
+        if cx.has_global::<ScriptSpots>() {
+            cx.global_mut::<ScriptSpots>()
+                .begin_view(chrome_view_name(&self.part));
+        }
         let theme = *cx.global::<Theme>();
         let content = match &self.part {
             ChromePart::Tool(view) => view.clone().into_any_element(),
@@ -2902,6 +2957,7 @@ impl Render for TabBarView {
             .flex()
             .items_center()
             .gap(px(2.))
+            // scrollbar-exempt: the strip is the content of ui_kit::scrollable just below
             .overflow_x_scroll()
             .track_scroll(&scroll)
             .children(items)

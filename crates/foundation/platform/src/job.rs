@@ -10,6 +10,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
 /// A process tree that dies together. Children stay in the job, so closing it, even by a
 /// crash of this process, ends the whole tree.
@@ -54,6 +55,21 @@ impl Job {
         let process = process.as_handle().as_raw_handle();
         // SAFETY: both handles are valid for the call.
         check(unsafe { AssignProcessToJobObject(self.handle.as_raw_handle(), process) })
+    }
+
+    /// Pulls a running process into the job, for a program whose children left it.
+    pub fn assign_id(&self, pid: u32) -> io::Result<()> {
+        // SAFETY: the handle is checked and closed below.
+        let handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a non-null result is ours to own.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+        // SAFETY: both handles are valid for the call.
+        check(unsafe {
+            AssignProcessToJobObject(self.handle.as_raw_handle(), handle.as_raw_handle())
+        })
     }
 
     /// Ends every process in the job. Returns before they are gone.

@@ -183,6 +183,14 @@ impl Pty {
             libc::kill(self.pid as i32, libc::SIGKILL);
         }
     }
+
+    /// The session of the child is the unit here, so there is nothing to pull in.
+    pub(crate) fn adopt(&self) -> usize {
+        0
+    }
+
+    /// `terminate` already signals the whole session of the child.
+    pub(crate) fn kill_tree(&self) {}
 }
 
 impl Drop for Pty {

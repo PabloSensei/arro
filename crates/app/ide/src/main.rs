@@ -1,8 +1,11 @@
-//! The Arro binary: `arro [--state-dir DIR] [--script STEPS] [--mock-agents]
+//! The Arro binary: `arro [--state-dir DIR] [--script STEPS] [--script-file PATH]
+//! [--mock-agents]
 //! [--after-update PID] [PATH]`. `PATH` is a project folder, or a file, which opens in
 //! the folder that holds it. `--mock-agents` runs harnesses in an empty home against a
 //! local model API, in builds with the `mock-agents` feature only. `--after-update` is
 //! set by a restart and waits for the old process before the project opens.
+//! `--script-file` reads the steps of `--script` from a file, one step per line or
+//! separated by `;`.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -103,6 +106,7 @@ struct Args {
     path: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     script: Option<String>,
+    script_file: Option<PathBuf>,
     mock_agents: bool,
     /// The process this one replaces, set by a restart after an update.
     after_update: Option<u32>,
@@ -116,6 +120,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--state-dir" => parsed.state_dir = Some(value("--state-dir")?.into()),
             "--script" => parsed.script = Some(value("--script")?),
+            "--script-file" => parsed.script_file = Some(value("--script-file")?.into()),
             "--after-update" => {
                 let text = value("--after-update")?;
                 parsed.after_update = Some(
@@ -190,7 +195,17 @@ fn log_migration(logs: &Path, failed: &[String]) {
     }
 }
 
-fn launch(args: Args) -> Result<(Launch, ProjectSetup, Args), String> {
+fn launch(mut args: Args) -> Result<(Launch, ProjectSetup, Args), String> {
+    // The steps of a scenario file run after the steps of `--script`, so a caller can
+    // give a file and add a step of its own to it.
+    if let Some(path) = args.script_file.take() {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("{} is not read: {error}", path.display()))?;
+        args.script = Some(match args.script.take() {
+            Some(script) => format!("{script};{text}"),
+            None => text,
+        });
+    }
     let path = match args.path.clone() {
         Some(path) => path,
         None => std::env::current_dir().map_err(|error| error.to_string())?,
@@ -491,6 +506,7 @@ fn main() -> ExitCode {
     if let Ok(args) = &parsed
         && args.path.is_none()
         && args.script.is_none()
+        && args.script_file.is_none()
     {
         start_screen(args);
         return ExitCode::SUCCESS;
@@ -585,6 +601,17 @@ mod tests {
     fn refuses_unknown_flags_and_missing_values() {
         assert!(parse(&["--nope"]).is_err());
         assert!(parse(&["--script"]).is_err());
+    }
+
+    #[test]
+    fn reads_a_script_file_flag() {
+        let args = parse(&["--script-file", "tools/smoke/release.script", "project"]).unwrap();
+        assert_eq!(
+            args.script_file,
+            Some(PathBuf::from("tools/smoke/release.script"))
+        );
+        assert_eq!(args.script, None);
+        assert!(parse(&["--script-file"]).is_err());
     }
 
     #[test]

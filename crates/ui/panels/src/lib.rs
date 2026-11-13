@@ -289,9 +289,14 @@ mod window_tests_cached_tails;
 mod window_tests_close_terminal;
 #[cfg(test)]
 mod window_tests_diff_shared;
+#[cfg(test)]
+mod window_tests_terminal_leak;
 
 #[cfg(test)]
 mod window_tests_stripe_notifications;
+
+#[cfg(test)]
+mod window_tests_script_smoke;
 
 #[cfg(test)]
 mod window_tests_diff_views;

@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base::Snapshot;
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, select};
 
 use crate::conpty::{Backend, Pty};
 use crate::engine::Engine;
@@ -27,6 +27,8 @@ const EVENTS: usize = 1024;
 const CONTROLS: usize = 64;
 /// One write to the pipe. The boundaries fall on chars, and replies pass between chunks.
 const WRITE_CHUNK: usize = 16 * 1024;
+/// The shortest gap between two snapshots of the process table while output flows.
+const ADOPT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// What to start. `env` is the whole environment of the child, see `allowlisted`.
 #[derive(Clone, Debug)]
@@ -135,11 +137,16 @@ impl TerminalSession {
         let (output, output_queue) = bounded(OUTPUT_CHUNKS);
         let (control, control_queue) = bounded(CONTROLS);
         let (event_sink, events) = bounded(EVENTS);
+        let (output_seen, adopt_queue) = bounded(1);
 
         spawn_thread("pty-writer", move || {
             write_loop(input_pipe, reply_queue, input_queue);
         })?;
-        spawn_thread("pty-reader", move || read_loop(output_pipe, output))?;
+        spawn_thread("pty-reader", move || {
+            read_loop(output_pipe, output, output_seen);
+        })?;
+        let adopt_pty = pty.clone();
+        spawn_thread("pty-adopt", move || adopt_loop(adopt_queue, adopt_pty))?;
         let (cols, rows) = (spec.cols, spec.rows);
         let engine_shared = shared.clone();
         // `Term` is built on its own thread: its listener is not `Send`.
@@ -151,9 +158,14 @@ impl TerminalSession {
         spawn_thread("pty-waiter", move || {
             let code = pty.wait();
             let _ = waiter_shared.exit.set(code);
+            // Programs outside the job do not go with it; the rounds end them by their
+            // parent id, which the snapshot keeps after the shell is gone.
+            pty.kill_tree();
+            // The console goes last: a program still attached would keep the close waiting.
             pty.close_console();
-            // Whatever the child left running goes with it.
+            // Whatever the cleanup rounds missed still dies with the job.
             pty.terminate();
+            pty.kill_tree();
         })?;
 
         Ok(Self {
@@ -332,7 +344,7 @@ fn sanitize(text: &str) -> String {
         .replace('\x1b', "")
 }
 
-fn read_loop(mut pipe: File, output: Sender<Vec<u8>>) {
+fn read_loop(mut pipe: File, output: Sender<Vec<u8>>, seen: Sender<()>) {
     let mut buffer = vec![0; READ_BUFFER];
     loop {
         match pipe.read(&mut buffer) {
@@ -341,6 +353,43 @@ fn read_loop(mut pipe: File, output: Sender<Vec<u8>>) {
                 if output.send(buffer[..count].to_vec()).is_err() {
                     return;
                 }
+                // One queued signal is enough: a snapshot covers every chunk that came
+                // before the adopt thread wakes up.
+                let _ = seen.try_send(());
+            }
+        }
+    }
+}
+
+/// Takes a snapshot of the process table shortly after the shell prints something. A
+/// quiet terminal leaves this thread blocked on the channel: no timer and no snapshot.
+/// Output that keeps coming costs at most one snapshot per interval, and the one delayed
+/// call after a burst covers a program that printed nothing but its prompt.
+fn adopt_loop(signals: Receiver<()>, pty: Arc<Pty>) {
+    let mut last: Option<Instant> = None;
+    loop {
+        if signals.recv().is_err() {
+            return;
+        }
+        if let Some(previous) = last {
+            let rest = ADOPT_INTERVAL.saturating_sub(previous.elapsed());
+            if !rest.is_zero() {
+                thread::sleep(rest);
+                while signals.try_recv().is_ok() {}
+            }
+        }
+        pty.adopt();
+        last = Some(Instant::now());
+        match signals.recv_timeout(ADOPT_INTERVAL) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                // The output stopped: one last look at the tree it may have started.
+                pty.adopt();
+                last = Some(Instant::now());
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                pty.adopt();
+                return;
             }
         }
     }
@@ -409,5 +458,72 @@ mod tests {
     #[test]
     fn a_paste_cannot_close_its_own_bracket() {
         assert_eq!(sanitize("a\x1b[201~b\r\nc\rd"), "a[201~b\nc\nd");
+    }
+
+    /// A program that prints one line, starts a long child and then stays quiet.
+    #[cfg(windows)]
+    fn quiet_session() -> TerminalSession {
+        let line = crate::command_line(
+            std::path::Path::new("cmd.exe"),
+            &[
+                "/c".to_string(),
+                "echo ready & ping -n 30 127.0.0.1 >NUL".to_string(),
+            ],
+        );
+        let session = TerminalSession::spawn(&SpawnSpec {
+            command_line: line,
+            cwd: None,
+            env: crate::allowlisted(),
+            cols: 80,
+            rows: 12,
+            shift_enter: ShiftEnter::default(),
+        })
+        .expect("spawn");
+        assert!(session.wait_for(Duration::from_secs(15), |screen| screen.contains("ready")));
+        session
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_quiet_terminal_takes_no_process_snapshots() {
+        let session = quiet_session();
+        // The burst that printed the line and its delayed snapshot pass first.
+        thread::sleep(Duration::from_millis(600));
+        let before = session.shared.pty.adopt_calls();
+        thread::sleep(Duration::from_millis(1200));
+        let after = session.shared.pty.adopt_calls();
+        assert_eq!(before, after, "a quiet terminal took process snapshots");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_job_of_a_session_holds_the_program_of_its_shell() {
+        let session = quiet_session();
+        let shell = session.pid();
+        let started = Instant::now();
+        let program = loop {
+            let program = platform::process_table()
+                .into_iter()
+                .find(|process| {
+                    process.parent == Some(shell) && process.name.eq_ignore_ascii_case("PING.EXE")
+                })
+                .map(|process| process.pid);
+            if let Some(program) = program {
+                break program;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "the shell started no program"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let started = Instant::now();
+        while !session.shared.pty.job_ids().contains(&program) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the job does not hold the program {program}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }

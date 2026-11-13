@@ -224,6 +224,7 @@ fn snippet(text: &str) -> String {
 impl Render for PlacesPopup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let scripted = cx.has_global::<ScriptSpots>();
         let viewport = window.viewport_size();
         let left = (viewport.width - px(WIDTH)) / 2.;
         let top = viewport.height * 0.205;
@@ -275,6 +276,8 @@ impl Render for PlacesPopup {
         let body = surface(&theme)
             .id("places-popup")
             .debug_selector(|| "places-popup".to_owned())
+            .relative()
+            .child(script_spot(scripted, "places-popup"))
             .track_focus(&self.focus)
             .occlude()
             .w(px(WIDTH))
@@ -299,6 +302,8 @@ impl Render for PlacesPopup {
                 div()
                     .id("places-empty")
                     .debug_selector(|| "places-empty".to_owned())
+                    .relative()
+                    .child(script_spot(scripted, "places-empty"))
                     .flex_none()
                     .px(px(ROW_PADDING_X))
                     .py(px(SPACE_M))

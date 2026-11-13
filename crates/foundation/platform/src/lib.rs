@@ -58,6 +58,10 @@ pub use process::{
     ConsoleSignal, NO_WINDOW, SUSPENDED_NO_WINDOW, allow_ctrl_c_in_children, resume_process,
     signal_console_of,
 };
+#[cfg(windows)]
+pub use process_stats::{
+    ProcessEntry, is_console_process, process_created, process_table, terminate_process,
+};
 pub use process_stats::{ProcessMemory, label_process, process_tree};
 pub use shell::{NO_BROWSER_ENV, open_url, recorded_urls};
 pub use trash::move_to_trash;

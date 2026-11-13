@@ -1,3 +1,4 @@
+mod affected;
 #[cfg(all(test, windows))]
 mod app_resources_tests;
 mod budgets;
@@ -38,6 +39,9 @@ commands:
   check-spacing              padding, margins and gaps in the UI crates are on the spacing scale
   check-tooltips             every icon-only button in the UI crates names itself in a tooltip
   check-scrollbars           every scrolled area in the UI crates has scrollbars or is exempt
+  affected [--base REF] [--run test|clippy|both] [--list]
+                             the workspace crates a change touches and their dependents,
+                             REF is main by default; prints `-p` names or runs the checks
   build-helpers --out DIR [--maven-lib DIR]
                              the helper jars that run in project JVMs, needs a JDK
   dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--target windows|linux|macos]
@@ -70,6 +74,7 @@ fn main() -> ExitCode {
         ["check-spacing"] => spacing::run(&root),
         ["check-tooltips"] => tooltips::run(&root),
         ["check-scrollbars"] => scrollbars::run(&root),
+        ["affected", args @ ..] => affected_command(&root, args),
         ["fetch-conpty"] => conpty::fetch(&root),
         ["idea-keymap", xml, json] => idea_keymap::run(Path::new(xml), Path::new(json)),
         ["macos-keymap", windows, macos] => macos_keymap::run(Path::new(windows), Path::new(macos)),
@@ -90,6 +95,31 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `--base REF`, `--run test|clippy|both` and `--list` in any order.
+fn affected_command(root: &Path, args: &[&str]) -> Result {
+    let mut base = "main";
+    let mut run = None;
+    let mut list = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--list" => list = true,
+            "--base" => {
+                index += 1;
+                base = args.get(index).ok_or("--base needs a git ref")?;
+            }
+            "--run" => {
+                index += 1;
+                let mode = args.get(index).ok_or("--run needs test, clippy or both")?;
+                run = Some(affected::Mode::parse(mode)?);
+            }
+            other => return Err(format!("unknown affected option: {other}").into()),
+        }
+        index += 1;
+    }
+    affected::run(root, base, run, list)
 }
 
 /// `--out DIR`, an optional `--tools DIR` and `--zip`, in any order.
