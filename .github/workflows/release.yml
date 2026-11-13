@@ -6,6 +6,8 @@ name: release
 on:
   release:
     types: [published]
+  # A trial build without a release: the archives become artifacts of the run.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -29,51 +31,72 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # GPUI draws through Wayland or X11 with fontconfig and xkbcommon, which the
-      # runner does not carry by default.
-      - name: Linux packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libfontconfig1-dev \
-            libwayland-dev \
-            libx11-dev \
-            libxcb1-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            unzip
-
-      - name: Toolchain
-        run: rustup show active-toolchain && cargo --version
-
       - name: Language tools
         run: |
           mkdir -p "$RUNNER_TEMP/tools/download-jdtls" "$RUNNER_TEMP/tools/download-java-debug"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-jdtls/$JDTLS_ARCHIVE" "$JDTLS_URL"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-java-debug/$DEBUG_ARCHIVE" "$DEBUG_URL"
 
+      # The binary links against the glibc of the system it is built on, and a newer
+      # glibc does not start on an older one. The archive is built in Ubuntu 22.04
+      # (glibc 2.35), so it runs on Ubuntu 22.04, Debian 12 and anything newer, whatever
+      # system the runner itself has.
       - name: Archive and checksum
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="trial-${GITHUB_SHA::7}"
+          fi
           name="arro-$version-linux-x86_64"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/dist"
-          cargo run -q -p xtask -- dist --target linux \
-            --out "$RUNNER_TEMP/dist/$name" --tools "$RUNNER_TEMP/tools" --zip
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP:/work" -w /src \
+            -e NAME="$name" -e DEBIAN_FRONTEND=noninteractive \
+            ubuntu:22.04 bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                build-essential binutils ca-certificates cmake curl git pkg-config unzip \
+                libfontconfig1-dev libwayland-dev libx11-dev libxcb1-dev \
+                libxkbcommon-dev libxkbcommon-x11-dev > /dev/null
+              git config --global --add safe.directory /src
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+              . "$HOME/.cargo/env"
+              cargo run -q -p xtask -- dist --target linux \
+                --out "/work/dist/$NAME" --tools /work/tools --zip
+              # The newest glibc the program asks for; anything past 2.35 would shut
+              # out the systems this build is for.
+              newest=$(objdump -T "/work/dist/$NAME/arro" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1)
+              echo "newest glibc symbol: $newest"
+              [ "$( { echo "$newest"; echo GLIBC_2.35; } | sort -V | tail -1)" = GLIBC_2.35 ]
+              chown -R "$(stat -c %u:%g /src)" /work/dist /src/target
+            '
           cd "$RUNNER_TEMP/dist"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           cat "$name.tar.gz.sha256"
 
       - name: Attach to the release
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" \
-            "$RUNNER_TEMP/dist/"arro-*.tar.gz \
-            "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256 \
-            --clobber
+          gh release upload "$GITHUB_REF_NAME"             "$RUNNER_TEMP/dist/"arro-*.tar.gz             "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256             --clobber
+
+      - name: Keep the trial archive
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            ${{ runner.temp }}/dist/arro-*.tar.gz
+            ${{ runner.temp }}/dist/arro-*.tar.gz.sha256
+          retention-days: 7
 
   macos:
     name: macOS archive
+    # Only for a release: a trial run checks the Linux build alone.
+    if: github.event_name == 'release'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

@@ -103,6 +103,8 @@ Whichever system you use, install a JDK 25 or newer for the language server, for
 
 ### Linux x86-64
 
+The build needs glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36 or a later release.
+
 1. Unpack `arro-<version>-linux-x86_64.tar.gz`, for example into `~/opt`.
 2. Run `./arro` from that folder.
 3. If you want a shortcut in the application menu, run `./install.sh` and answer the question. It writes only to `~/.local/share` of your user; nothing is installed automatically.
