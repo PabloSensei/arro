@@ -25,6 +25,9 @@ pub struct SymbolMatch {
 #[derive(Clone, Debug, Default)]
 pub struct SymbolIndex {
     files: HashMap<PathBuf, Arc<[Symbol]>>,
+    /// The symbols of every file, kept as files change so that a reader learns the size
+    /// without walking the map.
+    symbols: usize,
 }
 
 impl SymbolIndex {
@@ -33,11 +36,20 @@ impl SymbolIndex {
     }
 
     pub fn update(&mut self, path: PathBuf, symbols: Vec<Symbol>) {
-        self.files.insert(path, symbols.into());
+        let count = symbols.len();
+        match self.files.insert(path, symbols.into()) {
+            Some(previous) => {
+                self.symbols -= previous.len();
+                self.symbols += count;
+            }
+            None => self.symbols += count,
+        }
     }
 
     pub fn remove(&mut self, path: &Path) {
-        self.files.remove(path);
+        if let Some(previous) = self.files.remove(path) {
+            self.symbols -= previous.len();
+        }
     }
 
     /// Declarations of one file in source order, for the file structure.
@@ -47,6 +59,11 @@ impl SymbolIndex {
 
     pub fn file_count(&self) -> usize {
         self.files.len()
+    }
+
+    /// How many declarations the index keeps in all its files.
+    pub fn symbol_count(&self) -> usize {
+        self.symbols
     }
 
     /// An estimate of the bytes the symbols keep alive, for the memory panel.
@@ -146,4 +163,40 @@ pub fn file_symbols(path: &Path, provider_for: &ProviderFor) -> Option<Vec<Symbo
     let provider = provider_for(path)?;
     let file = text_core::read_file(path).ok()?;
     Some(provider.file_symbols(path, &file.text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(name: &str) -> Symbol {
+        Symbol {
+            name: name.to_owned(),
+            kind: lang_api::SymbolKind::Class,
+            container: None,
+            depth: 0,
+            range: 0..name.len(),
+            name_range: 0..name.len(),
+        }
+    }
+
+    #[test]
+    fn the_count_follows_updated_and_removed_files() {
+        let mut index = SymbolIndex::new();
+        assert_eq!(index.symbol_count(), 0);
+        index.update(
+            PathBuf::from("/p/A.src"),
+            vec![symbol("Owner"), symbol("Pet")],
+        );
+        index.update(PathBuf::from("/p/B.src"), vec![symbol("Vet")]);
+        assert_eq!(index.symbol_count(), 3);
+
+        index.update(PathBuf::from("/p/A.src"), vec![symbol("Owner")]);
+        assert_eq!(index.symbol_count(), 2);
+
+        index.remove(Path::new("/p/A.src"));
+        assert_eq!(index.symbol_count(), 1);
+        index.remove(Path::new("/p/missing.src"));
+        assert_eq!(index.symbol_count(), 1);
+    }
 }

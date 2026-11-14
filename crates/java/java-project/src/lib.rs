@@ -2,6 +2,8 @@
 //! and the full model the tool reports through the helpers in `helpers/`.
 
 mod coverage;
+mod database;
+mod dependencies;
 mod env;
 mod environment;
 mod fingerprint;
@@ -10,9 +12,12 @@ mod jdk;
 mod lombok;
 mod maven;
 mod pom;
+pub mod profile;
+mod sources;
 mod test_runs;
 
 pub use coverage::CoverageTools;
+pub use database::{drivers, kind_of_jar};
 pub use env::{BuildEnv, detect_build_system};
 pub use environment::{
     ProjectSettings, ResolvedEnvironment, language_level, load_settings, project_jdk,
@@ -26,4 +31,8 @@ pub use lombok::{
 };
 pub use maven::{Maven, find_maven};
 pub use pom::{Pom, read_pom, scan_poms};
+pub use sources::{
+    FetchError, Fetched, MAVEN_CENTRAL, SourceLocation, SourceStore, fetch, repositories_of,
+    source_location,
+};
 pub use test_runs::{TEST_LISTENER, TestHook, TestSelection};

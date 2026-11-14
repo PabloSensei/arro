@@ -5,18 +5,26 @@
 mod config;
 mod console;
 mod coverage;
+mod live;
+mod profile;
 mod tasks;
 mod testing;
 
 pub use config::{
-    ConfigField, ConfigFieldKind, ConfigTemplate, LaunchPoint, RunConfig, RunConfigProvider,
-    RunPlan, configs_file, format_environment, join_arguments, load_configs, merge_configs,
-    parse_environment, save_configs, split_arguments,
+    AttachPlan, ConfigField, ConfigFieldKind, ConfigTemplate, LaunchPoint, RunConfig,
+    RunConfigProvider, RunPlan, configs_file, format_environment, join_arguments, load_configs,
+    merge_configs, parse_environment, save_configs, split_arguments,
 };
 pub use console::{Console, ConsoleEvent, ConsoleEvents, Step, Stream};
 pub use coverage::{CoverageOwner, CoveragePlan, TestCoverageRun};
+pub use live::{
+    LiveApplication, LiveEndpoint, LiveNote, LiveRequest, LiveRow, LiveSection, LiveTable,
+    LiveTarget, LiveTone,
+};
+pub use profile::{ProfileOwner, ProfilePlan};
 pub use tasks::{BuildTaskProvider, PROVIDER_ID as BUILD_TASK_PROVIDER};
 pub use testing::{
     FindTests, STOPPED_BY_USER, TestCounts, TestDebug, TestEvent, TestKind, TestListen, TestNode,
-    TestOutcome, TestProvider, TestRequest, TestRun, TestSite, TestState, TestTree, TreeNode,
+    TestOutcome, TestProfileRun, TestProvider, TestRequest, TestRun, TestSite, TestState, TestTree,
+    TreeNode,
 };

@@ -11,27 +11,38 @@ use std::time::Duration;
 
 use ::base::Cancel;
 use dap_client::ReloadOutcome;
+use editor_view::Semantic;
+use futures_util::StreamExt;
+use lang_api::{DumpQuery, ask};
 use project_model::{
     BuildModule, BuildSystem, EnvironmentProvider, ProjectModel, ProjectSession, SyncEvent,
     TaskOptions, open_project,
 };
 use runner::{
-    Console, ConsoleEvent, CoverageOwner, FindTests, RunConfig, RunConfigProvider, RunPlan,
-    STOPPED_BY_USER, Step, Stream, TestProvider, TestRequest, TestRun,
+    Console, ConsoleEvent, CoverageOwner, FindTests, LiveApplication, ProfileOwner, RunConfig,
+    RunConfigProvider, RunPlan, STOPPED_BY_USER, Step, Stream, TestProvider, TestRequest, TestRun,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{DEBUG_TOOL, RUN_TOOL, RunControls, RunState, Workspace};
+use workspace::{DEBUG_TOOL, RUN_TOOL, RunControls, RunState, STACK_TRACE_TOOL, Workspace};
 use workspace_core::Delivery;
 
 use crate::ansi::{Line, OutputBuffers, Style};
 use crate::console_input::{ConsoleInput, ConsoleKey};
+use crate::stack_traces::ActiveStackTrace;
 
 mod tests;
 
 pub(crate) use tests::TestsChanged;
 use tests::{TestView, title_of};
+
+/// The lines the debugger's console printed for the live tab of a run under the
+/// debugger. The debugger writes them without touching the Run panel; its poll reads them.
+#[derive(Default)]
+pub(crate) struct DebugOutput(pub(crate) std::sync::Mutex<Vec<String>>);
+
+impl Global for DebugOutput {}
 
 /// The list of run configurations changed, for the gutter marks of the open editors.
 pub(crate) struct ConfigsChanged;
@@ -43,6 +54,16 @@ impl EventEmitter<ConfigsChanged> for RunPanel {}
 pub struct CoverageChanged;
 
 impl EventEmitter<CoverageChanged> for RunPanel {}
+
+/// The profile snapshot of the last run changed, or the recordings on disk did.
+pub struct ProfileChanged;
+
+impl EventEmitter<ProfileChanged> for RunPanel {}
+
+/// The list of recordings on disk changed, without a new snapshot.
+pub struct ProfileRecordingsChanged;
+
+impl EventEmitter<ProfileRecordingsChanged> for RunPanel {}
 
 /// How a project is built and run, and what it can create. The application fills it,
 /// panels only pass it on.
@@ -148,6 +169,9 @@ pub struct RunPanel {
     output: OutputBuffers,
     /// The process whose output goes into the main console now.
     console_process: Option<u32>,
+    /// The JVM of the program of the current run, when its step started. Dump Threads
+    /// asks this process for the stacks of its threads.
+    program_pid: Option<u32>,
     /// The last test run, see `run/tests.rs`.
     tests: TestView,
     test_provider: Option<Arc<dyn TestProvider>>,
@@ -194,6 +218,53 @@ pub struct RunPanel {
     coverage_pending: Option<PendingCoverage>,
     /// A report of an older run that arrives after a newer one started is dropped.
     coverage_generation: u64,
+    /// The profile snapshot of the last run, when one has been read.
+    profile: Option<Arc<lang_api::ProfileSnapshot>>,
+    /// Everything the recordings of the last profile run hold, the first one as the
+    /// window shows it first.
+    profile_report: Option<Arc<lang_api::ProfileReport>>,
+    /// One entry per recording of the last run: a runtime may write several.
+    profile_entries: Vec<ProfileEntry>,
+    /// A profile run whose snapshot comes when it ends.
+    profile_pending: Option<PendingProfile>,
+    /// A snapshot of an older run that arrives after a newer one started is dropped.
+    profile_generation: u64,
+    /// Why the snapshot of the last profile run could not be read.
+    profile_error: Option<String>,
+    /// The recording of the last profile run, or the file the user opened.
+    profile_recording: Option<PathBuf>,
+    /// The recordings on disk the Profiler window lists.
+    profile_recordings: Vec<lang_api::ProfileRecording>,
+    /// The list of the recordings is being read in the background.
+    recordings_loading: bool,
+    /// Bumped when the snapshot, its file or its error changes, so a window that only
+    /// hears about the list of recordings does not drop a snapshot it shows.
+    profile_revision: u64,
+    /// The live sections of the program of the current run, when its language has them.
+    live: Option<Entity<crate::live_panel::LivePanel>>,
+    /// The live tab is in front instead of the console.
+    live_open: bool,
+}
+
+/// The name of a recording file, for the list of several.
+fn path_label(path: &StdPath) -> String {
+    path.file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+}
+
+/// One recording of a profile run as the Profiler window lists it.
+#[derive(Clone)]
+pub struct ProfileEntry {
+    /// The name of the file, for the list of several recordings.
+    pub label: String,
+    pub report: Arc<lang_api::ProfileReport>,
+}
+
+/// The recording of a profile run and the provider that reads it once the run ends.
+struct PendingProfile {
+    recording: PathBuf,
+    owner: ProfileOwner,
+    generation: u64,
 }
 
 /// The data file of a coverage run and the provider that reads it once the run ends.
@@ -279,6 +350,7 @@ impl RunPanel {
                 lines: VecDeque::new(),
                 output: OutputBuffers::default(),
                 console_process: None,
+                program_pid: None,
                 tests: TestView::new(),
                 test_provider: setup.tests,
                 debug_service: setup.debug,
@@ -302,12 +374,30 @@ impl RunPanel {
                 coverage_visible: false,
                 coverage_pending: None,
                 coverage_generation: 0,
+                profile: None,
+                profile_report: None,
+                profile_entries: Vec::new(),
+                profile_pending: None,
+                profile_generation: 0,
+                profile_error: None,
+                profile_recording: None,
+                profile_recordings: Vec::new(),
+                recordings_loading: false,
+                profile_revision: 0,
+                live: None,
+                live_open: false,
             }
         })
     }
 
     pub fn focus(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// The program the Dump Threads button would ask, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn set_program_pid(&mut self, pid: Option<u32>) {
+        self.program_pid = pid;
     }
 
     /// The root of the build model cache of the project, for Invalidate Caches.
@@ -333,7 +423,11 @@ impl RunPanel {
             run_tests_coverage,
             hide_coverage,
             toggle_coverage,
+            profile,
+            profile_tests,
         ) = (
+            panel.clone(),
+            panel.clone(),
             panel.clone(),
             panel.clone(),
             panel.clone(),
@@ -380,6 +474,10 @@ impl RunPanel {
             }),
             toggle_coverage: Rc::new(move |_, cx| {
                 toggle_coverage.update(cx, |this, cx| this.toggle_coverage(cx))
+            }),
+            profile: Rc::new(move |_, cx| profile.update(cx, |this, cx| this.run_profile(cx))),
+            profile_tests: Rc::new(move |_, cx| {
+                profile_tests.update(cx, |this, cx| this.rerun_tests_profile(cx))
             }),
         }
     }
@@ -529,6 +627,98 @@ impl RunPanel {
         cx.notify();
     }
 
+    /// The live tab of the current run, when its language has one.
+    pub fn live_panel(&self) -> Option<Entity<crate::live_panel::LivePanel>> {
+        self.live.clone()
+    }
+
+    /// Shows the live tab, as a click on its tab does.
+    pub fn show_live(&mut self, cx: &mut Context<Self>) {
+        if self.live.is_none() {
+            return;
+        }
+        self.live_open = true;
+        cx.notify();
+    }
+
+    /// Shows the console again.
+    pub fn show_console(&mut self, cx: &mut Context<Self>) {
+        self.live_open = false;
+        cx.notify();
+    }
+
+    /// The live tab is in front.
+    pub fn live_open(&self) -> bool {
+        self.live_open
+    }
+
+    /// The application of the live tab reported that it is ready.
+    pub fn live_started(&self, cx: &App) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.read(cx).started())
+    }
+
+    /// The lines the program printed reach the live tab, and its report of the end
+    /// reaches the tab too.
+    fn feed_live(&mut self, done: &[Line], ended: bool, cx: &mut Context<Self>) {
+        let Some(live) = self.live.clone() else {
+            return;
+        };
+        let lines: Vec<String> = done
+            .iter()
+            .filter(|line| !line.text.is_empty())
+            .map(|line| line.text.clone())
+            .collect();
+        if lines.is_empty() && !ended {
+            return;
+        }
+        live.update(cx, |live, cx| {
+            for line in &lines {
+                live.observe(line, cx);
+            }
+            if ended {
+                live.stop(cx);
+            }
+        });
+    }
+
+    /// A line of the console of the debugger reaches the live tab of the same run, which
+    /// may have started under the debugger.
+    pub fn observe_live_line(&mut self, line: &str, cx: &mut Context<Self>) {
+        if let Some(live) = self.live.clone() {
+            live.update(cx, |live, cx| live.observe(line, cx));
+        }
+    }
+
+    /// Takes what the debugger's console wrote since the last poll.
+    fn drain_debug_live(&mut self, cx: &mut Context<Self>) {
+        let lines: Vec<String> = {
+            let queue = cx.default_global::<DebugOutput>();
+            let mut queue = queue.0.lock().unwrap_or_else(|poison| poison.into_inner());
+            std::mem::take(&mut *queue)
+        };
+        if lines.is_empty() || self.live.is_none() {
+            return;
+        }
+        for line in &lines {
+            self.observe_live_line(line, cx);
+        }
+    }
+
+    /// Starts the live tab of a configuration, or replaces the one of the last run.
+    fn set_live(&mut self, app: Option<Arc<dyn LiveApplication>>, cx: &mut Context<Self>) {
+        self.live_open = false;
+        self.live =
+            app.map(|app| crate::live_panel::LivePanel::create(app, self.workspace.clone(), cx));
+    }
+
+    fn stop_live(&mut self, cx: &mut Context<Self>) {
+        if let Some(live) = self.live.clone() {
+            live.update(cx, |live, cx| live.stop(cx));
+        }
+    }
+
     /// What went wrong so far, for scripts.
     pub fn problems(&self) -> &[String] {
         &self.problems
@@ -602,6 +792,12 @@ impl RunPanel {
     /// The model the Add button needs to pick a module.
     pub(crate) fn model(&self) -> Option<Arc<ProjectModel>> {
         self.session.as_ref().and_then(ProjectSession::model)
+    }
+
+    /// The tool that reads and builds the project, for the windows that ask it a
+    /// question of its own, such as the change of a build file.
+    pub(crate) fn build_system(&self) -> Option<Arc<dyn BuildSystem>> {
+        self.tool.clone()
     }
 
     /// Why `.arro/run.toml` cannot be read, if it is broken.
@@ -836,6 +1032,7 @@ impl RunPanel {
         let title = std::mem::take(&mut self.title);
         let output = std::mem::take(&mut self.output);
         let process = self.console_process.take();
+        self.program_pid = None;
         let lines = self.lines.drain(..).collect();
         // Old runs whose output has ended are kept as tabs, the latest few of them.
         while self.draining.len() >= MAX_OLD_RUNS {
@@ -899,7 +1096,14 @@ impl RunPanel {
             return;
         };
         let title = config.name.clone();
-        self.launch(title, cx, move || plan(&*provider, &config, &model));
+        let live_provider = provider.clone();
+        let live_config = config.clone();
+        let live_model = model.clone();
+        self.launch(title, cx, move || {
+            let live = live_provider.live_application(&live_config, &live_model);
+            let plan = plan(&*live_provider, &live_config, &live_model)?;
+            Ok((plan, live))
+        });
     }
 
     /// Runs the selected configuration with the coverage agent. The old data goes at
@@ -945,6 +1149,7 @@ impl RunPanel {
         self.lines.clear();
         self.output = OutputBuffers::default();
         self.console_process = None;
+        self.program_pid = None;
         self.console_input.restart();
         self.program_started = false;
         self.tests.clear();
@@ -1022,6 +1227,7 @@ impl RunPanel {
         self.lines.clear();
         self.output = OutputBuffers::default();
         self.console_process = None;
+        self.program_pid = None;
         self.console_input.restart();
         self.program_started = false;
         self.tests.begin(request.clone());
@@ -1061,6 +1267,96 @@ impl RunPanel {
         .detach();
         cx.emit(TestsChanged);
         self.changed(cx);
+    }
+
+    /// Runs the tests of the last run with their JVMs recorded. The recordings are read
+    /// when the run ends.
+    pub fn run_tests_profile(&mut self, request: TestRequest, cx: &mut Context<Self>) {
+        if self.starting {
+            return;
+        }
+        if self.busy() {
+            self.tell("Busy", "Stop what is running first", cx);
+            return;
+        }
+        let Some(provider) = self.test_provider.clone() else {
+            self.tell("Cannot run tests", "The project has no build tool", cx);
+            return;
+        };
+        if !provider.supports_profiler() {
+            self.tell(
+                "Cannot profile the tests",
+                "The build tool cannot record the test JVMs",
+                cx,
+            );
+            return;
+        }
+        let model = self.session.as_ref().and_then(ProjectSession::model);
+        let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
+            self.tell("Cannot run tests", "The project is still loading", cx);
+            return;
+        };
+        self.begin_profile(cx);
+        self.waiting_tests = None;
+        self.queued_tests = None;
+        self.rerun = false;
+        self.archive_console();
+        self.title = title_of(&request).into();
+        self.lines.clear();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
+        self.console_input.restart();
+        self.program_started = false;
+        self.tests.begin(request.clone());
+        self.starting = true;
+        let owner = provider.clone();
+        let generation = self.profile_generation;
+        let plan = cx.background_executor().spawn(async move {
+            TestRun::profile_start(&*provider, &model, &request).map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let started = plan.await;
+            this.update(cx, |this, cx| {
+                this.starting = false;
+                match started {
+                    Ok(started) => {
+                        if let Some(note) = &started.note {
+                            this.note(note, false);
+                        }
+                        this.profile_recording = Some(started.recording.clone());
+                        this.profile_pending = Some(PendingProfile {
+                            recording: started.recording,
+                            owner: ProfileOwner::Tests(owner),
+                            generation,
+                        });
+                        this.tests.run = Some(started.run);
+                    }
+                    Err(message) => {
+                        this.note(&message, true);
+                        this.tell("Cannot run tests with profiler", message, cx);
+                        this.tests.finished = true;
+                    }
+                }
+                cx.emit(TestsChanged);
+                this.changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.emit(TestsChanged);
+        self.changed(cx);
+    }
+
+    /// The action of the menu: the tests of the last run, recorded.
+    pub fn rerun_tests_profile(&mut self, cx: &mut Context<Self>) {
+        match self.tests.request.clone() {
+            Some(request) => self.run_tests_profile(request, cx),
+            None => self.tell(
+                "Nothing to profile",
+                "Run a test before profiling the tests",
+                cx,
+            ),
+        }
     }
 
     /// Starts over the coverage of the window: the old data is dropped before the run, as
@@ -1155,6 +1451,339 @@ impl RunPanel {
         self.changed(cx);
     }
 
+    /// Runs the selected configuration with its samples recorded. The old snapshot goes
+    /// at once; the new one replaces it when the run ends.
+    pub fn run_profile(&mut self, cx: &mut Context<Self>) {
+        if self.starting {
+            return;
+        }
+        if self.busy() {
+            self.tell("Busy", "Stop what is running first", cx);
+            return;
+        }
+        let Some(config) = self
+            .selected
+            .and_then(|index| self.configs.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let model = self.session.as_ref().and_then(ProjectSession::model);
+        let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
+            self.tell("Cannot profile", "The project is still loading", cx);
+            return;
+        };
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id() == config.provider)
+            .cloned()
+        else {
+            let text = format!("Nothing runs configurations of kind {}", config.provider);
+            self.tell("Cannot profile", text, cx);
+            return;
+        };
+        self.begin_profile(cx);
+        self.waiting = false;
+        self.waiting_tests = None;
+        self.queued_tests = None;
+        self.rerun = false;
+        self.archive_console();
+        self.title = config.name.clone().into();
+        self.lines.clear();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
+        self.program_pid = None;
+        self.console_input.restart();
+        self.program_started = false;
+        self.tests.clear();
+        cx.emit(TestsChanged);
+        let owner = provider.clone();
+        let generation = self.profile_generation;
+        let plan = cx
+            .background_executor()
+            .spawn(async move { provider.profile_plan(&config, &model) });
+        cx.spawn(async move |this, cx| {
+            let plan = plan.await;
+            this.update(cx, |this, cx| {
+                this.starting = false;
+                match plan {
+                    Ok(profile) => {
+                        if let Some(note) = &profile.note {
+                            this.note(note, false);
+                        }
+                        this.profile_recording = Some(profile.recording.clone());
+                        this.profile_pending = Some(PendingProfile {
+                            recording: profile.recording,
+                            owner: ProfileOwner::Configuration(owner),
+                            generation,
+                        });
+                        this.console = Some(Console::start(profile.plan));
+                        this.console_running = true;
+                        this.profile_changed(cx);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        this.note(&message, true);
+                        this.profile_error = Some(message.clone());
+                        this.tell("Cannot run with profiler", message, cx);
+                        this.profile_changed(cx);
+                    }
+                }
+                this.changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.starting = true;
+        self.changed(cx);
+    }
+
+    /// Starts over the profile of the window: the old snapshot is dropped before the run,
+    /// as a new run replaces it.
+    fn begin_profile(&mut self, cx: &mut Context<Self>) {
+        self.profile_generation = self.profile_generation.wrapping_add(1);
+        self.profile = None;
+        self.profile_report = None;
+        self.profile_entries.clear();
+        self.profile_pending = None;
+        self.profile_error = None;
+        self.profile_recording = None;
+        self.profile_changed(cx);
+    }
+
+    /// The recordings of the run that just ended, read in the background.
+    fn finish_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.profile_pending.take() else {
+            return;
+        };
+        let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
+            return;
+        };
+        let PendingProfile {
+            recording,
+            owner,
+            generation,
+        } = pending;
+        let recordings = owner.run_recordings(&recording);
+        let reports = cx.background_executor().spawn(async move {
+            let mut entries = Vec::new();
+            let mut error = None;
+            for path in recordings {
+                let label = path
+                    .file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                match owner.report(&path, &model) {
+                    Ok(report) => entries.push(ProfileEntry {
+                        label,
+                        report: Arc::new(report),
+                    }),
+                    Err(failed) => {
+                        if error.is_none() {
+                            error = Some(failed.to_string());
+                        }
+                    }
+                }
+            }
+            (entries, error)
+        });
+        cx.spawn(async move |this, cx| {
+            let (entries, error) = reports.await;
+            this.update(cx, |this, cx| {
+                if this.profile_generation != generation {
+                    return;
+                }
+                if entries.is_empty() {
+                    let message = error.unwrap_or_else(|| "no recording was written".to_owned());
+                    this.note(&format!("No profile: {message}"), true);
+                    this.profile_error = Some(message);
+                } else {
+                    let first = entries[0].report.clone();
+                    this.profile = Some(Arc::new(first.cpu_tree.clone()));
+                    this.profile_report = Some(first);
+                    this.profile_entries = entries;
+                    this.profile_error = None;
+                }
+                this.refresh_profile_recordings(cx);
+                this.profile_changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reads a recording from disk into the window, with the provider of the selected
+    /// configuration, or the first provider that can read one.
+    pub fn open_profile_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
+            self.tell("Cannot read a profile", "The project is still loading", cx);
+            return;
+        };
+        let Some(provider) = self.profiler_provider() else {
+            self.tell(
+                "Cannot read a profile",
+                "The project has no profiler provider",
+                cx,
+            );
+            return;
+        };
+        self.profile_generation = self.profile_generation.wrapping_add(1);
+        let generation = self.profile_generation;
+        self.profile_pending = None;
+        self.profile = None;
+        self.profile_report = None;
+        self.profile_entries.clear();
+        self.profile_error = None;
+        self.profile_recording = Some(path.clone());
+        self.profile_changed(cx);
+        let owner = ProfileOwner::Configuration(provider);
+        let label_path = path.clone();
+        let report = cx
+            .background_executor()
+            .spawn(async move { owner.report(&path, &model) });
+        cx.spawn(async move |this, cx| {
+            let report = report.await;
+            this.update(cx, |this, cx| {
+                if this.profile_generation != generation {
+                    return;
+                }
+                match report {
+                    Ok(report) => {
+                        let report = Arc::new(report);
+                        this.profile = Some(Arc::new(report.cpu_tree.clone()));
+                        this.profile_report = Some(report.clone());
+                        this.profile_entries = vec![ProfileEntry {
+                            label: path_label(&label_path),
+                            report,
+                        }];
+                        this.profile_error = None;
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        this.note(&format!("No profile: {message}"), true);
+                        this.profile_error = Some(message);
+                    }
+                }
+                this.refresh_profile_recordings(cx);
+                this.profile_changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The provider that opens a recording: the one of the selected configuration, or the
+    /// first provider of the project that can.
+    fn profiler_provider(&self) -> Option<Arc<dyn RunConfigProvider>> {
+        let selected = self
+            .selected
+            .and_then(|index| self.configs.get(index))
+            .and_then(|config| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.id() == config.provider)
+            })
+            .filter(|provider| provider.supports_profiler())
+            .cloned();
+        selected.or_else(|| {
+            self.providers
+                .iter()
+                .find(|provider| provider.supports_profiler())
+                .cloned()
+        })
+    }
+
+    /// Asks the provider for the recordings on disk, in the background. The window lists
+    /// the newest; the folder keeps them itself.
+    pub fn refresh_profile_recordings(&mut self, cx: &mut Context<Self>) {
+        if self.recordings_loading {
+            return;
+        }
+        let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
+            return;
+        };
+        let Some(provider) = self.profiler_provider() else {
+            return;
+        };
+        self.recordings_loading = true;
+        let recordings = cx
+            .background_executor()
+            .spawn(async move { provider.profile_recordings(&model) });
+        cx.spawn(async move |this, cx| {
+            let recordings = recordings.await;
+            this.update(cx, |this, cx| {
+                this.recordings_loading = false;
+                if let Ok(recordings) = recordings {
+                    this.profile_recordings = recordings;
+                }
+                cx.emit(ProfileRecordingsChanged);
+                cx.notify();
+                this.changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The snapshot of the last run, when one was read.
+    pub fn profile(&self) -> Option<Arc<lang_api::ProfileSnapshot>> {
+        self.profile.clone()
+    }
+
+    /// Everything the first recording of the last run holds.
+    pub fn profile_report(&self) -> Option<Arc<lang_api::ProfileReport>> {
+        self.profile_report.clone()
+    }
+
+    /// The recordings of the last run, one entry each, when there are several.
+    pub fn profile_entries(&self) -> &[ProfileEntry] {
+        &self.profile_entries
+    }
+
+    /// Why the last recording could not be read.
+    pub fn profile_error(&self) -> Option<String> {
+        self.profile_error.clone()
+    }
+
+    /// The recording of the last run, or the file the user opened.
+    pub fn profile_recording(&self) -> Option<&StdPath> {
+        self.profile_recording.as_deref()
+    }
+
+    /// The recordings the Profiler window lists, the newest first.
+    pub fn profile_recordings(&self) -> &[lang_api::ProfileRecording] {
+        &self.profile_recordings
+    }
+
+    /// Whether a profile run records now: the window offers Stop and Show Snapshot.
+    pub fn profile_running(&self) -> bool {
+        self.profile_pending.is_some()
+    }
+
+    /// The button of the Run window: stops the profiled program gently, so the runtime
+    /// writes the recording, and shows the Profiler window. The snapshot arrives when the
+    /// process ends.
+    pub fn stop_and_show_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop(cx);
+        let workspace = self.workspace.clone();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(workspace::PROFILER_TOOL, window, cx)
+            })
+            .ok();
+    }
+
+    fn profile_changed(&mut self, cx: &mut Context<Self>) {
+        self.profile_revision = self.profile_revision.wrapping_add(1);
+        cx.emit(ProfileChanged);
+        self.changed(cx);
+    }
+
+    /// The number of changes of the snapshot, its file and its error.
+    pub fn profile_revision(&self) -> u64 {
+        self.profile_revision
+    }
+
     /// Runs a task of the root project of the build tool, `package` for one. The console
     /// takes it over.
     pub fn run_task(&mut self, task: &str, cx: &mut Context<Self>) {
@@ -1184,11 +1813,14 @@ impl RunPanel {
             let program = tool
                 .task_in(&root, module.as_ref(), &name, options)
                 .map_err(|error| error.to_string())?;
-            Ok(RunPlan {
-                before: None,
-                program,
-                grace: TASK_GRACE,
-            })
+            Ok((
+                RunPlan {
+                    before: None,
+                    program,
+                    grace: TASK_GRACE,
+                },
+                None,
+            ))
         });
     }
 
@@ -1207,11 +1839,14 @@ impl RunPanel {
             let program = tool
                 .goal(&root, &line, TaskOptions::default())
                 .map_err(|error| error.to_string())?;
-            Ok(RunPlan {
-                before: None,
-                program,
-                grace: TASK_GRACE,
-            })
+            Ok((
+                RunPlan {
+                    before: None,
+                    program,
+                    grace: TASK_GRACE,
+                },
+                None,
+            ))
         });
     }
 
@@ -1321,7 +1956,7 @@ impl RunPanel {
             self.launch_build(title, cx, make);
         } else {
             self.building_project = true;
-            self.launch(title, cx, make);
+            self.launch(title, cx, move || make().map(|plan| (plan, None)));
         }
     }
 
@@ -1349,11 +1984,14 @@ impl RunPanel {
             let program = tool
                 .compile(&root, module.as_ref())
                 .map_err(|error| error.to_string())?;
-            Ok(RunPlan {
-                before: None,
-                program,
-                grace: TASK_GRACE,
-            })
+            Ok((
+                RunPlan {
+                    before: None,
+                    program,
+                    grace: TASK_GRACE,
+                },
+                None,
+            ))
         };
         self.building_project = true;
         self.launch(title, cx, make);
@@ -1599,15 +2237,20 @@ impl RunPanel {
         &mut self,
         title: String,
         cx: &mut Context<Self>,
-        make: impl FnOnce() -> Result<RunPlan, String> + Send + 'static,
+        make: impl FnOnce() -> Result<(RunPlan, Option<Arc<dyn LiveApplication>>), String>
+        + Send
+        + 'static,
     ) {
         self.starting = true;
         self.archive_console();
+        self.live = None;
+        self.live_open = false;
         crate::history::put_label(&self.root, format!("Before running {title}"), cx);
         self.title = title.into();
         self.lines.clear();
         self.output = OutputBuffers::default();
         self.console_process = None;
+        self.program_pid = None;
         self.console_input.restart();
         self.program_started = false;
         self.tests.clear();
@@ -1618,7 +2261,8 @@ impl RunPanel {
             this.update(cx, |this, cx| {
                 this.starting = false;
                 match plan {
-                    Ok(plan) => {
+                    Ok((plan, live)) => {
+                        this.set_live(live, cx);
                         this.console = Some(Console::start(plan));
                         this.console_running = true;
                     }
@@ -1646,12 +2290,78 @@ impl RunPanel {
         self.build_console = None;
         self.build_running = false;
         self.console_running = false;
+        self.program_pid = None;
         self.reload = None;
         if let Some(starting) = &self.starting_tests {
             starting.cancel();
         }
         self.stop_running();
+        self.stop_live(cx);
         self.changed(cx);
+    }
+
+    /// The Dump Threads button: asks the JDK of the project for the threads of the
+    /// program that runs now. The answer fills the Stack Trace tool window.
+    fn dump_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pid) = self.program_pid else {
+            self.note(
+                "Nothing is running: start a program to dump its threads",
+                true,
+            );
+            self.changed(cx);
+            return;
+        };
+        let support = cx
+            .try_global::<Semantic>()
+            .map(|semantic| semantic.0.clone());
+        let Some(provider) = support.as_ref().and_then(|support| support.thread_dump()) else {
+            self.note("The language cannot dump the threads of a program", true);
+            self.changed(cx);
+            return;
+        };
+        let mut replies = ask(provider, DumpQuery(pid));
+        let workspace = self.workspace.clone();
+        let handle = window.window_handle();
+        self.note("Dumping the threads of the program", false);
+        self.changed(cx);
+        cx.spawn(async move |this, cx| {
+            let Some(answer) = replies.next().await else {
+                return;
+            };
+            let dump = answer.value;
+            if let Some(error) = dump.error {
+                this.update(cx, |this, cx| {
+                    this.note(&error, true);
+                    this.changed(cx);
+                })
+                .ok();
+                return;
+            }
+            let Some(report) = dump.report else {
+                return;
+            };
+            this.update(cx, |_, cx| {
+                cx.defer(move |cx| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.show_tool(STACK_TRACE_TOOL, window, cx)
+                                })
+                                .ok();
+                        })
+                        .ok();
+                    if let Some(panel) = cx.try_global::<ActiveStackTrace>() {
+                        panel
+                            .0
+                            .clone()
+                            .update(cx, |panel, cx| panel.show(report, cx));
+                    }
+                });
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Shift+F9: starts the selected configuration under the debugger.
@@ -1683,9 +2393,15 @@ impl RunPanel {
         // made in the background.
         let provider = provider.clone();
         let name = config.name.clone();
-        let plan = cx
-            .background_executor()
-            .spawn(async move { provider.debug_plan(&config, &model) });
+        let plan = cx.background_executor().spawn(async move {
+            if let Some(attach) = provider.attach_plan(&config, &model)? {
+                return Ok((Some(attach), None, None));
+            }
+            let live = provider.live_application(&config, &model);
+            provider
+                .debug_plan(&config, &model)
+                .map(|plan| (None, Some(plan), live))
+        });
         let panel = cx.global::<crate::debug::ActiveDebug>().0.clone();
         let workspace = self.workspace.clone();
         let handle = window.window_handle();
@@ -1700,14 +2416,37 @@ impl RunPanel {
                     return;
                 }
             };
+            let live = plan.2.clone();
+            this.update(cx, |this, cx| this.set_live(live, cx)).ok();
             cx.update(|cx| {
-                let entry = workspace
-                    .read_with(cx, |workspace, _| workspace.active_path())
-                    .ok()
-                    .flatten();
-                panel.update(cx, |panel, cx| {
-                    panel.start_plan(service, plan, name, entry, cx)
-                });
+                if let (Some(attach), _, _) = &plan {
+                    let started = panel.update(cx, |panel, cx| {
+                        panel.start_attach(
+                            service,
+                            attach.host.clone(),
+                            attach.port,
+                            attach.name.clone(),
+                            attach.project.clone(),
+                            cx,
+                        )
+                    });
+                    if let Err(error) = started {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.notify_user("Cannot attach", error, cx)
+                            })
+                            .ok();
+                        return;
+                    }
+                } else if let (_, Some(plan), _) = plan {
+                    let entry = workspace
+                        .read_with(cx, |workspace, _| workspace.active_path())
+                        .ok()
+                        .flatten();
+                    panel.update(cx, |panel, cx| {
+                        panel.start_plan(service, plan, name, entry, cx)
+                    });
+                }
                 handle
                     .update(cx, |_, window, cx| {
                         workspace
@@ -1753,6 +2492,7 @@ impl RunPanel {
         self.lines.clear();
         self.output = OutputBuffers::default();
         self.console_process = None;
+        self.program_pid = None;
         self.tests.begin(request.clone());
         self.starting = true;
         self.debugging_tests = true;
@@ -1835,12 +2575,14 @@ impl RunPanel {
 
     fn poll(&mut self, cx: &mut Context<Self>) {
         self.show_notice(cx);
+        self.drain_debug_live(cx);
         let mut changed = self.poll_sync(cx);
         let mut done = Vec::new();
         // The test console of a debug run shows the lines the parser has completed, so a
         // piece of a line held back here is not cut in two there.
         let debug_from = self.debugging_tests.then_some(done.len());
         let mut exited: Option<Option<i32>> = None;
+        let mut program_ended = false;
         let mut closed = false;
         let mut built = false;
         let main_console = self.console.is_some();
@@ -1862,6 +2604,9 @@ impl RunPanel {
                     }
                     ConsoleEvent::Started { pid, step } => {
                         self.console_process = Some(pid);
+                        if step == Step::Program {
+                            self.program_pid = Some(pid);
+                        }
                         if step == Step::Before {
                             done.push(info("Building the project"));
                         }
@@ -1873,6 +2618,9 @@ impl RunPanel {
                         done.push(Line::plain(message, error_style()));
                     }
                     ConsoleEvent::Exited { code, step } => {
+                        if step == Step::Program {
+                            self.program_pid = None;
+                        }
                         match self.console_process.take() {
                             Some(process) => self.output.finish(process, &mut done),
                             None => self.output.finish_all(&mut done),
@@ -1883,12 +2631,16 @@ impl RunPanel {
                         if step == Step::Before && code == Some(0) {
                             built = true;
                         }
+                        if step == Step::Program {
+                            program_ended = true;
+                        }
                         exited = Some(code);
                     }
                     // The pipes are closed: the last output, late as it was, is in.
                     ConsoleEvent::Closed => {
                         self.output.finish_all(&mut done);
                         self.console_process = None;
+                        self.program_pid = None;
                         closed = true;
                         self.console_running = false;
                         break;
@@ -2014,6 +2766,11 @@ impl RunPanel {
                 drain.console = None;
             }
         }
+        self.feed_live(
+            &done,
+            program_ended || (closed && main_console) || exited.is_some(),
+            cx,
+        );
         self.lines.extend(done);
         let extra = self.lines.len().saturating_sub(MAX_LINES);
         self.lines.drain(..extra);
@@ -2055,6 +2812,14 @@ impl RunPanel {
             && self.tests.run.is_none()
         {
             self.finish_coverage(cx);
+        }
+        let profile_started = program_ended || (self.console.is_none() && !self.console_running);
+        if self.profile_pending.is_some()
+            && profile_started
+            && !self.starting
+            && self.tests.run.is_none()
+        {
+            self.finish_profile(cx);
         }
         // A test that waits for a process waits for this, not for a clock: the console is
         // closed, so every line of the program is in, and a test run is over only when
@@ -2521,6 +3286,37 @@ fn tab_button(
         .child(label)
 }
 
+/// A tab of the main views of the window, the console and the live sections.
+fn view_tab(
+    id: &'static str,
+    selected: bool,
+    theme: &Theme,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    content: impl IntoElement,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex()
+        .items_center()
+        .flex_none()
+        .h(px(22.))
+        .px(px(8.))
+        .rounded(px(CONTROL_RADIUS))
+        .text_size(px(UI_SIZE))
+        .text_color(if selected {
+            theme.text
+        } else {
+            theme.text_secondary
+        })
+        .when(selected, |this| this.bg(theme.selection))
+        .when(!selected, |this| {
+            this.hover(move |style| style.bg(theme.selection_hover))
+        })
+        .on_click(on_click)
+        .child(content)
+}
+
 impl Render for RunPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
@@ -2540,6 +3336,7 @@ impl Render for RunPanel {
                 .ok();
         };
         let running = self.busy() || self.starting || self.waiting || self.waiting_tests.is_some();
+        let profiling = self.profile_running();
         let can_run = self.selected.is_some() || self.tests.active();
         let rerun_icon = icon("run/restart", &theme);
         let rerun_icon = if can_run {
@@ -2552,6 +3349,12 @@ impl Render for RunPanel {
             stop_icon
         } else {
             stop_icon.grayscale(true).opacity(0.4)
+        };
+        let dump_icon = icon("general/logs", &theme);
+        let dump_icon = if self.program_pid.is_some() {
+            dump_icon
+        } else {
+            dump_icon.grayscale(true).opacity(0.4)
         };
         let side = div()
             .flex()
@@ -2571,7 +3374,21 @@ impl Render for RunPanel {
                     .debug_selector(|| "run-stop".to_owned())
                     .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                     .child(stop_icon),
-            );
+            )
+            .child(
+                button_frame("run-dump-threads", "Dump Threads", None, &theme)
+                    .debug_selector(|| "run-dump-threads".to_owned())
+                    .on_click(cx.listener(|this, _, window, cx| this.dump_threads(window, cx)))
+                    .child(dump_icon),
+            )
+            .children(profiling.then(|| {
+                button_frame("run-stop-snapshot", "Stop and Show Snapshot", None, &theme)
+                    .debug_selector(|| "run-stop-snapshot".to_owned())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.stop_and_show_profile(window, cx)),
+                    )
+                    .child(icon("run/profiler", &theme))
+            }));
         let tabs = (!self.draining.is_empty()).then(|| {
             let current = tab_button(
                 "run-tab-current",
@@ -2648,9 +3465,77 @@ impl Render for RunPanel {
             .into_any_element();
         let body = if self.tests.active() {
             self.tests_body(console, &theme, window, cx)
+        } else if let Some(live) = self.live.clone() {
+            let started = live.read(cx).started();
+            let stopped = live.read(cx).stopped();
+            let title = live.read(cx).title();
+            let labels = div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .px(px(SPACE_M))
+                .pt(px(SPACE_S))
+                .overflow_hidden()
+                .child(view_tab(
+                    "run-console-tab",
+                    !self.live_open,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.show_console(cx)),
+                    div().child("Console"),
+                ))
+                .child(view_tab(
+                    "run-live-tab",
+                    self.live_open,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.show_live(cx)),
+                    crate::live_panel::live_tab_label(&title, started, stopped, &theme),
+                ));
+            let content = if self.live_open {
+                live.into_any_element()
+            } else {
+                console
+            };
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(labels)
+                .child(div().flex_1().min_h_0().child(content))
+                .into_any_element()
         } else {
             console
         };
+        let ready = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.read(cx).started());
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .pl(px(SPACE_M))
+            .pr(px(SPACE_S))
+            .text_size(px(UI_SIZE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .font_weight(FontWeight::MEDIUM)
+                    .children(ready.then(|| {
+                        div()
+                            .debug_selector(|| "run-ready-dot".to_owned())
+                            .flex_none()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(theme.semantic_type)
+                    }))
+                    .child(self.title.clone()),
+            )
+            .child(panel_tools(GROUP, hide, &theme))
+            .debug_selector(|| "run-header".to_owned());
         island(&theme)
             .id("run-panel")
             .key_context("RunPanel ToolWindow")
@@ -2658,10 +3543,7 @@ impl Render for RunPanel {
             .group(GROUP)
             .h_full()
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(
-                panel_header(self.title.clone(), GROUP, hide, &theme)
-                    .debug_selector(|| "run-header".to_owned()),
-            )
+            .child(header)
             .child(
                 div()
                     .flex()

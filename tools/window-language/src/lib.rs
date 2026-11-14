@@ -30,6 +30,127 @@ pub fn build_tool_names() -> (String, String) {
     ("Maven".to_owned(), "Gradle".to_owned())
 }
 
+/// The support of the configuration files of a project whose class path is known: the
+/// jars and the output folders, for a window test that builds them itself.
+pub fn spring_config(root: &Path, classpath: Vec<PathBuf>) -> Arc<dyn LanguageSupport> {
+    let support = java_lang::spring_config(root.to_path_buf());
+    support.set_classpath(classpath);
+    support
+}
+
+/// The support of the configuration files of a project with the class path of its model.
+pub fn spring_config_with_model(root: &Path, model: &ProjectModel) -> Arc<dyn LanguageSupport> {
+    let support = java_lang::spring_config(root.to_path_buf());
+    support.set_model(model);
+    support
+}
+
+/// The support of the entities and the queries of the data repositories of a project,
+/// read from its sources.
+pub fn spring_data(root: &Path) -> Arc<dyn LanguageSupport> {
+    java_lang::spring_data_support(root.to_path_buf())
+}
+
+/// The support of the configuration files of a project whose class path and source roots
+/// the caller gives, for a window test that builds the jar itself.
+pub fn spring_config_with_sources(
+    root: &Path,
+    classpath: Vec<PathBuf>,
+    sources: Vec<PathBuf>,
+) -> Arc<dyn LanguageSupport> {
+    let support = java_lang::spring_config(root.to_path_buf());
+    support.set_classpath(classpath);
+    support.set_sources(sources);
+    support
+}
+
+/// The message bundles of a project: the `*.properties` files of a base name with their
+/// locales and the places of the sources that use a key.
+pub fn message_bundles(root: &Path) -> Arc<dyn LanguageSupport> {
+    java_lang::message_bundles(root.to_path_buf())
+}
+
+/// The message bundles of a project whose resource folders the caller names.
+pub fn message_bundles_with_roots(root: &Path, roots: Vec<PathBuf>) -> Arc<dyn LanguageSupport> {
+    let support = java_lang::message_bundles(root.to_path_buf());
+    support.set_roots(roots);
+    support
+}
+
+/// The path of a source file of a test project, under the source root of its only module.
+pub fn source_path(root: &Path, name: &str) -> PathBuf {
+    root.join("src")
+        .join("main")
+        .join("java")
+        .join("com")
+        .join("example")
+        .join(format!("{name}.java"))
+}
+
+/// Writes a source file of a test project and returns its path.
+pub fn write_test_source(root: &Path, name: &str, text: &str) -> PathBuf {
+    let path = source_path(root, name);
+    fs::create_dir_all(path.parent().expect("the source folder")).expect("the source folder");
+    fs::write(&path, text).expect("the source of the test");
+    path
+}
+
+/// A source file named by the `sourceType` of the metadata jar, for Ctrl+B from a key.
+pub fn write_spring_source(root: &Path) -> PathBuf {
+    let file = spring_source_root(root).join("com/example/JpaProperties.java");
+    fs::create_dir_all(file.parent().expect("the source folder")).expect("the source folder");
+    fs::write(&file, "package com.example;\n\nclass JpaProperties {\n}\n")
+        .expect("the source of the test");
+    file
+}
+
+/// The root of the sources of a project the window tests build themselves.
+pub fn spring_source_root(root: &Path) -> PathBuf {
+    root.join("src").join("main").join("java")
+}
+
+/// A settings file for the build tool of a project, with the repository of
+/// `MAVEN_USER_HOME` and no network.
+pub fn offline_build_settings(state_dir: &Path) -> PathBuf {
+    write_maven_settings(state_dir).expect("MAVEN_USER_HOME with the filled repository")
+}
+
+/// The full model of a real project, read by its build tool. The helpers of the test
+/// build and the repository of `MAVEN_USER_HOME` are the only outside world.
+pub fn project_model(root: &Path, cache: &Path, settings: &Path) -> Result<ProjectModel, String> {
+    let mut build_tools = project_model::BuildTools::default();
+    build_tools.first.settings_file = settings.display().to_string();
+    build_tools.first.offline = true;
+    let environment = Jdk::at(&corpus().join("jdk").join("17"));
+    let env = BuildEnv {
+        jdk: environment,
+        // The formatting and style plugins of the sample project are not part of reading
+        // its model, and they would slow the sync down or fail offline.
+        maven_args: vec![
+            "-Dspring-javaformat.skip=true".to_owned(),
+            "-Dcheckstyle.skip=true".to_owned(),
+        ],
+        cache_root: Some(cache.to_path_buf()),
+        helpers: helpers_dir(),
+        build_tools,
+        ..BuildEnv::default()
+    };
+    let tool = java_project::detect_build_system(root, &env)
+        .ok_or_else(|| "the project has no build tool".to_owned())?;
+    tool.sync(root, &Cancel::new())
+        .map_err(|error| error.to_string())
+}
+
+fn helpers_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("IDE_HELPERS_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let exe = std::env::current_exe().ok()?;
+    // The test binary is under `<target>/<profile>/deps`, the helpers under the profile.
+    let beside = exe.parent()?.parent()?.join("helpers");
+    beside.is_dir().then_some(beside)
+}
+
 /// The command the first build tool runs for `task` of the project, with the settings of
 /// its page.
 pub fn first_build_tool_command(
@@ -329,6 +450,13 @@ impl RealLanguage {
         self.session.watch_status(on_change);
     }
 
+    /// Hands the model of the project to the language, as the window does after a sync.
+    pub fn set_model(&self, model: &ProjectModel) {
+        self.session
+            .project()
+            .set_project_model(&Arc::new(model.clone()));
+    }
+
     /// Starts debugging through the real plugin inside jdtls.
     pub fn debugger(&self) -> Arc<dyn DebugService> {
         Arc::new(JavaDebugger::new(
@@ -462,6 +590,24 @@ impl RealLanguage {
     /// A JDK of the corpus, by version folder name.
     pub fn jdk_home(version: &str) -> PathBuf {
         jdk(&corpus(), version)
+    }
+
+    /// Starts the probe of [`Probe::classes`] under a JVM that waits for a debugger on
+    /// `port`. The caller owns the process and ends it.
+    pub fn start_remote_probe(classes: &Path, port: u16) -> std::process::Child {
+        let name = if cfg!(windows) { "java.exe" } else { "java" };
+        Command::new(Self::jdk_home("25").join("bin").join(name))
+            .arg(format!(
+                "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:{port}"
+            ))
+            .arg("-cp")
+            .arg(classes)
+            .arg("probe.DebugProbe")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the remote probe starts")
     }
 
     /// A build tool that answers at once: the debug test needs configurations, not a
@@ -923,6 +1069,108 @@ pub fn prepare_project(from: &Path, to: &Path) {
     let _ = fs::remove_dir_all(to.join("gradle"));
 }
 
+/// A jar with the configuration metadata of a Spring Boot library, for the window tests
+/// of the neutral crates: the file name and its folder are the caller's.
+pub fn write_spring_metadata_jar(folder: &Path) -> PathBuf {
+    const METADATA: &str = r#"{
+        "groups": [
+            {"name": "spring.jpa", "type": "com.example.JpaProperties", "sourceType": "com.example.JpaProperties"},
+            {"name": "spring.jpa.hibernate", "type": "com.example.HibernateSettings", "sourceType": "com.example.HibernateSettings"},
+            {"name": "logging.level", "type": "java.util.Map<java.lang.String,java.lang.String>"}
+        ],
+        "properties": [
+            {
+                "name": "spring.jpa.open-in-view",
+                "type": "java.lang.Boolean",
+                "defaultValue": true,
+                "description": "Whether to enable the open entity manager in view interceptor.",
+                "sourceType": "com.example.JpaProperties"
+            },
+            {
+                "name": "spring.jpa.hibernate.ddl-auto",
+                "type": "com.example.DdlAuto",
+                "description": "What to do with the schema at start up.",
+                "sourceType": "com.example.HibernateSettings"
+            },
+            {
+                "name": "spring.jpa.database-platform",
+                "type": "java.lang.String",
+                "description": "The name of the target database.",
+                "sourceType": "com.example.JpaProperties"
+            },
+            {
+                "name": "spring.jpa.properties",
+                "type": "java.util.Map<java.lang.String,java.lang.String>",
+                "description": "Extra properties of the persistence unit."
+            },
+            {
+                "name": "spring.jpa.show-sql",
+                "type": "boolean",
+                "defaultValue": false,
+                "description": "Whether to log the statements."
+            },
+            {
+                "name": "spring.jpa.old-key",
+                "type": "java.lang.String",
+                "deprecation": {
+                    "replacement": "spring.jpa.open-in-view",
+                    "reason": "The key was renamed."
+                }
+            },
+            {
+                "name": "spring.jpa.encoding",
+                "type": "java.nio.charset.Charset",
+                "description": "The encoding of the stored text."
+            }
+        ],
+        "hints": [
+            {
+                "name": "spring.jpa.hibernate.ddl-auto",
+                "values": [
+                    {"value": "none", "description": "Do nothing."},
+                    {"value": "update", "description": "Update the schema."},
+                    {"value": "validate", "description": "Only check the schema."},
+                    {"value": "create", "description": "Create the schema."},
+                    {"value": "create-drop", "description": "Create it and drop it at the end."}
+                ]
+            }
+        ]
+    }"#;
+    const ADDITIONAL: &str = r#"{
+        "properties": [
+            {
+                "name": "spring.jpa.timeout",
+                "type": "java.time.Duration",
+                "defaultValue": "30s",
+                "description": "How long a statement may take."
+            }
+        ]
+    }"#;
+    let file = folder.join("spring-metadata.jar");
+    let mut writer = zip::ZipWriter::new(fs::File::create(&file).expect("the jar of the test"));
+    for (name, text) in [
+        ("META-INF/spring-configuration-metadata.json", METADATA),
+        (
+            "META-INF/additional-spring-configuration-metadata.json",
+            ADDITIONAL,
+        ),
+    ] {
+        use std::io::Write as _;
+        writer
+            .start_file(
+                name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("an entry of the jar");
+        writer
+            .write_all(text.as_bytes())
+            .expect("the text of the jar");
+    }
+    writer.finish().expect("the finished jar");
+    file
+}
+
 /// The corpus folder, or the `corpus/` of the checkout.
 fn corpus() -> PathBuf {
     if let Some(folder) = std::env::var_os("IDE_CORPUS") {
@@ -1223,6 +1471,203 @@ public class DebugProbe {
     }
 }
 "#;
+
+/// A project with one dependency whose sources are not in the repository, a copy of the
+/// local repository that holds the jar, and a loopback server that has its sources. The
+/// cache of the fixture is temporary: `MAVEN_USER_HOME` points at it until the fixture
+/// is dropped.
+pub struct SourceFixture {
+    pub root: PathBuf,
+    pub main: PathBuf,
+    /// The address of the loopback repository, for the project that names it.
+    pub repository: String,
+    home: PathBuf,
+    previous: Option<std::ffi::OsString>,
+}
+
+const LIBRARY_SOURCES: &str = r#"package com.example;
+
+/** SOURCE-MARKER */
+public class Lib {
+    public int answer() { return 42; }
+}
+"#;
+
+impl SourceFixture {
+    pub fn new(name: &str) -> Self {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let base = test_support::scratch(&format!("window-language-{name}"));
+        let root = base.join("app");
+        let home = base.join("home");
+        let library = base.join("library");
+        let classes = library.join("classes");
+        let source_dir = library.join("src");
+        fs::create_dir_all(source_dir.join("com/example")).unwrap();
+        fs::create_dir_all(&classes).unwrap();
+        let real_home = PathBuf::from(
+            std::env::var("MAVEN_USER_HOME").expect("MAVEN_USER_HOME names the cache"),
+        );
+        let repository = home.join("repository");
+        mirror_repository(&real_home.join("repository"), &repository);
+        fs::create_dir_all(repository.join("com/example/lib/1.0")).unwrap();
+
+        let jdk = jdk(&corpus(), "17");
+        fs::write(source_dir.join("com/example/Lib.java"), LIBRARY_SOURCES).unwrap();
+        let status = Command::new(jdk.join("bin/javac.exe"))
+            .arg("-d")
+            .arg(&classes)
+            .arg(source_dir.join("com/example/Lib.java"))
+            .status()
+            .expect("javac runs");
+        assert!(status.success(), "the fixture library compiles");
+        let status = Command::new(jdk.join("bin/jar.exe"))
+            .args(["--create", "--file"])
+            .arg(repository.join("com/example/lib/1.0/lib-1.0.jar"))
+            .arg("-C")
+            .arg(&classes)
+            .arg(".")
+            .status()
+            .expect("jar runs");
+        assert!(status.success(), "the fixture library jar is built");
+        let status = Command::new(jdk.join("bin/jar.exe"))
+            .args(["--create", "--file"])
+            .arg(library.join("lib-1.0-sources.jar"))
+            .arg("-C")
+            .arg(&source_dir)
+            .arg(".")
+            .status()
+            .expect("jar runs");
+        assert!(status.success(), "the fixture sources jar is built");
+        fs::write(
+            repository.join("com/example/lib/1.0/lib-1.0.pom"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+             <artifactId>lib</artifactId><version>1.0</version></project>",
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        let served = fs::read(library.join("lib-1.0-sources.jar")).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let found = request.contains("lib-1.0-sources.jar");
+                let body: &[u8] = if found { &served } else { b"not here" };
+                let status = if found { "200 OK" } else { "404 Not Found" };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        fs::create_dir_all(root.join("src/main/java/com/example")).unwrap();
+        fs::write(
+            root.join("pom.xml"),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion>\
+                 <groupId>com.example</groupId><artifactId>app</artifactId>\
+                 <version>1.0</version>\
+                 <properties><maven.compiler.release>17</maven.compiler.release>\
+                 <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>\
+                 <repositories><repository><id>loopback</id>\
+                 <url>http://127.0.0.1:{port}</url></repository></repositories>\
+                 <dependencies><dependency><groupId>com.example</groupId>\
+                 <artifactId>lib</artifactId><version>1.0</version></dependency></dependencies>\
+                 </project>"
+            ),
+        )
+        .unwrap();
+        let main = root.join("src/main/java/com/example/Main.java");
+        fs::write(
+            &main,
+            "package com.example;\n\npublic class Main {\n    public int use() {\n        \
+             return new Lib().answer();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let previous = std::env::var_os("MAVEN_USER_HOME");
+        // SAFETY: the ignored test runs one at a time, and the value comes back on drop.
+        unsafe { std::env::set_var("MAVEN_USER_HOME", &home) };
+        Self {
+            root,
+            main,
+            repository: format!("http://127.0.0.1:{port}"),
+            home,
+            previous,
+        }
+    }
+
+    /// The repository the sources were written to.
+    pub fn repository_dir(&self) -> PathBuf {
+        self.home.join("repository")
+    }
+}
+
+impl Drop for SourceFixture {
+    fn drop(&mut self) {
+        // SAFETY: as in `new`.
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("MAVEN_USER_HOME", value),
+                None => std::env::remove_var("MAVEN_USER_HOME"),
+            }
+        }
+    }
+}
+
+/// A repository built from links to another one, so that a project import finds its
+/// plugins while the fixture artifact stays in a copy of its own. Without links the
+/// artifact would be written to the cache of the machine.
+#[cfg(windows)]
+fn mirror_repository(from: &Path, to: &Path) {
+    let windows = |path: &Path| path.to_string_lossy().replace('/', "\\");
+    let link = |target: &Path, at: &Path| {
+        let status = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(windows(at))
+            .arg(windows(target))
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("mklink runs");
+        assert!(
+            status.success(),
+            "{} links to {}",
+            at.display(),
+            target.display()
+        );
+    };
+    fs::create_dir_all(to).unwrap();
+    let Ok(entries) = fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == "com" {
+            let ours = to.join("com");
+            fs::create_dir_all(&ours).unwrap();
+            for child in fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+                if child.file_name() != "example" {
+                    link(&child.path(), &ours.join(child.file_name()));
+                }
+            }
+        } else {
+            link(&entry.path(), &to.join(name));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn mirror_repository(_: &Path, _: &Path) {}
 
 const PROBE: &str = r#"package probe;
 

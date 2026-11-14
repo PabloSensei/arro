@@ -75,6 +75,22 @@ impl Maven {
             .map(|(spec, _)| spec)
     }
 
+    /// The same run with the recording flag in every test JVM. The flag goes after the
+    /// `argLine` the project set, so JaCoCo and the like keep working; when the project
+    /// has none, the flag is the whole `argLine`.
+    pub fn profile_test_command(
+        &self,
+        root: &Path,
+        selection: &TestSelection,
+        hook: &TestHook,
+        recording: &Path,
+    ) -> Result<ProcessSpec> {
+        let flag = crate::profile::recording_flag(recording);
+        let extra = [profile_argline(&flag, has_argline(root))];
+        self.test_spec(root, selection, hook, None, &extra)
+            .map(|(spec, _)| spec)
+    }
+
     /// The same run with the coverage agent in every test JVM. The JaCoCo plugin appends
     /// the agent to the `argLine` of the project, so the flags there stay; a project
     /// that cannot load the plugin gets the agent as `argLine` itself, and its own flags
@@ -156,6 +172,45 @@ impl Maven {
     }
 }
 
+/// The user property of Surefire that carries the recording flag. A project that set its
+/// own `argLine` keeps it through `@{argLine}`, which Surefire replaces with that value.
+pub(crate) fn profile_argline(flag: &str, keep_project_argline: bool) -> String {
+    match keep_project_argline {
+        true => format!("-DargLine=@{{argLine}} {flag}"),
+        false => format!("-DargLine={flag}"),
+    }
+}
+
+/// Whether a `pom.xml` of the project sets the `argLine` of Surefire or the property of
+/// the same name, which the recording flag then follows.
+pub(crate) fn has_argline(root: &Path) -> bool {
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !matches!(
+                    name.as_ref(),
+                    "target" | "build" | ".gradle" | "node_modules"
+                ) {
+                    pending.push(path);
+                }
+            } else if name == "pom.xml" {
+                let text = fs::read_to_string(&path).unwrap_or_default();
+                if text.contains("argLine") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// The arguments that put the coverage agent into the test JVMs of Maven. With the
 /// plugin the agent follows the `argLine` of the project; without it the agent is the
 /// `argLine`, and the note tells the user what that replaced.
@@ -214,7 +269,7 @@ impl Gradle {
         selection: &TestSelection,
         hook: &TestHook,
     ) -> Result<ProcessSpec> {
-        self.test_spec(root, selection, hook, None, None)
+        self.test_spec(root, selection, hook, None, None, None)
             .map(|(spec, _)| spec)
     }
 
@@ -227,7 +282,7 @@ impl Gradle {
         hook: &TestHook,
         agent: &str,
     ) -> Result<ProcessSpec> {
-        self.test_spec(root, selection, hook, Some(agent), None)
+        self.test_spec(root, selection, hook, Some(agent), None, None)
             .map(|(spec, _)| spec)
     }
 
@@ -240,7 +295,21 @@ impl Gradle {
         hook: &TestHook,
         agent: &str,
     ) -> Result<(ProcessSpec, Option<String>)> {
-        self.test_spec(root, selection, hook, None, Some(agent))
+        self.test_spec(root, selection, hook, None, Some(agent), None)
+    }
+
+    /// The same run with the recording flag in every test JVM, which the init script adds
+    /// to the `jvmArgs` of the `Test` tasks too.
+    pub fn profile_test_command(
+        &self,
+        root: &Path,
+        selection: &TestSelection,
+        hook: &TestHook,
+        recording: &Path,
+    ) -> Result<ProcessSpec> {
+        let flag = crate::profile::recording_flag(recording);
+        self.test_spec(root, selection, hook, None, None, Some(&flag))
+            .map(|(spec, _)| spec)
     }
 
     fn test_spec(
@@ -250,6 +319,7 @@ impl Gradle {
         hook: &TestHook,
         debug_agent: Option<&str>,
         coverage_agent: Option<&str>,
+        profile_flag: Option<&str>,
     ) -> Result<(ProcessSpec, Option<String>)> {
         let listener = self.env.test_listener()?;
         let directory = cache_file(&self.env.cache_root(), root).with_file_name("tests");
@@ -273,6 +343,9 @@ impl Gradle {
         }
         if let Some(agent) = coverage_agent {
             spec = spec.arg(format!("-Pide.coverage.agent={agent}"));
+        }
+        if let Some(flag) = profile_flag {
+            spec = spec.arg(format!("-Pide.profile.flag={flag}"));
         }
         let mut spec = spec.arg(task);
         for (class, method) in &selection.cases {
@@ -333,6 +406,44 @@ mod tests {
     fn the_gradle_init_script_takes_the_coverage_agent_of_the_run() {
         assert!(INIT_SCRIPT.contains("ide.coverage.agent"));
         assert!(INIT_SCRIPT.contains("test.jvmArgs coverageAgent"));
+    }
+
+    #[test]
+    fn the_gradle_init_script_takes_the_recording_flag_of_the_run() {
+        assert!(INIT_SCRIPT.contains("ide.profile.flag"));
+        assert!(INIT_SCRIPT.contains("test.jvmArgs profileFlag"));
+    }
+
+    #[test]
+    fn the_recording_flag_follows_the_argline_the_project_set() {
+        let flag = "-XX:StartFlightRecording=filename=\"C:/cache/profiler/Tests-1.jfr\"";
+
+        assert_eq!(profile_argline(flag, false), format!("-DargLine={flag}"));
+        assert_eq!(
+            profile_argline(flag, true),
+            format!("-DargLine=@{{argLine}} {flag}"),
+            "the flags of the project stay in front of the recording"
+        );
+    }
+
+    #[test]
+    fn an_argline_is_found_in_a_pom_of_the_project() {
+        let root = test_support::scratch("profile-argline");
+        let plain = root.join("plain/src");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("pom.xml"), "<project/>").unwrap();
+
+        assert!(!has_argline(&root));
+
+        let covered = root.join("covered");
+        fs::create_dir_all(&covered).unwrap();
+        fs::write(
+            covered.join("pom.xml"),
+            "<argLine>-javaagent:jacoco.jar</argLine>",
+        )
+        .unwrap();
+
+        assert!(has_argline(&root));
     }
 
     #[test]

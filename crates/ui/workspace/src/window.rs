@@ -19,7 +19,7 @@ use workspace_core::CommandRegistry;
 
 use crate::about::AboutView;
 use crate::chrome::{ChromeView, EditorChromeSignal, StatusBarView, TabBarView};
-use crate::editor::{EditorFactory, EditorStatus, FileIcons};
+use crate::editor::{EditorFactory, EditorStatus, FileIcons, PreviewLayout};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{
     DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_dark_theme, save_layout,
@@ -45,6 +45,7 @@ actions!(
         ToggleCommit,
         ToggleStructure,
         ToggleServices,
+        ToggleDatabase,
         ToggleLog,
         Run,
         Stop,
@@ -125,10 +126,14 @@ actions!(
         ProjectStructure,
         RunWithCoverage,
         RunTestsWithCoverage,
+        RunTestsWithProfiler,
         HideCoverage,
         ToggleCoverage,
+        RunWithProfiler,
         // The HTTP Response window, opened automatically when a request runs.
         ToggleHttp,
+        // The Endpoints window: the HTTP handlers of the project.
+        ToggleEndpoints,
     ]
 );
 
@@ -191,6 +196,7 @@ window_keys![
     ("alt-7", ToggleStructure, None, Some("ActivateStructureToolWindow"), None),
     ("alt-8", ToggleServices, None, Some("ActivateServicesToolWindow"), None),
     ("alt-9", ToggleLog, None, Some("ActivateVersionControlToolWindow"), None),
+    ("ctrl-shift-d", ToggleDatabase, None, None, Some("cmd-shift-d")),
     ("alt-0", ToggleCommit, None, Some("ActivateCommitToolWindow"), None),
     ("alt-f12", ToggleTerminal, None, Some("ActivateTerminalToolWindow"), None),
     ("ctrl-k", ShowCommit, None, None, Some("cmd-k")),
@@ -381,10 +387,16 @@ pub const PERFORMANCE_TOOL: &str = "performance";
 pub const DOCUMENTATION_TOOL: &str = "documentation";
 pub const LOG_TOOL: &str = "log";
 pub const CALL_HIERARCHY_TOOL: &str = "call-hierarchy";
+pub const STACK_TRACE_TOOL: &str = "stack-trace";
 pub const METHOD_HIERARCHY_TOOL: &str = "method-hierarchy";
 pub const INSPECTION_TOOL: &str = "inspection-results";
 pub const COVERAGE_TOOL: &str = "coverage";
+pub const PROFILER_TOOL: &str = "profiler";
 pub const HTTP_TOOL: &str = "http-response";
+pub const DATABASE_TOOL: &str = "database";
+pub const JSHELL_TOOL: &str = "jshell";
+pub const ENDPOINTS_TOOL: &str = "endpoints";
+pub const BEANS_TOOL: &str = "beans";
 
 pub(crate) struct DockTool {
     pub id: &'static str,
@@ -657,6 +669,8 @@ pub struct Workspace {
     saved_json: String,
     /// Opens a project elsewhere; `None` starts the program of the application.
     project_opener: Option<ProjectOpener>,
+    /// Callbacks that stop what the window owns: helpers and sessions.
+    close_hooks: Vec<Box<dyn FnOnce()>>,
     /// The window closes without writing its unsaved text.
     skip_save_on_close: bool,
     _subscriptions: Vec<Subscription>,
@@ -666,6 +680,17 @@ pub struct Workspace {
 fn autosave_on(cx: &App) -> bool {
     cx.try_global::<Settings>()
         .is_none_or(|settings| settings.autosave)
+}
+
+/// Whether a save also asks the language for its actions. Such a save waits for an
+/// answer, so a tab switch or a window that loses the focus starts it in the background
+/// rather than writing before it returns.
+fn save_actions_on(cx: &App) -> bool {
+    cx.try_global::<Settings>().is_some_and(|settings| {
+        settings.actions_on_save_reformat
+            || settings.actions_on_save_optimize_imports
+            || settings.actions_on_save_cleanup
+    })
 }
 
 fn placement_of(window: &Window) -> Option<WindowPlacement> {
@@ -805,6 +830,8 @@ impl Workspace {
                 // The menu of the screen follows what the window holds: recent projects,
                 // run configurations, the tabs of the window.
                 this.refresh_platform_menus(cx);
+            } else if autosave_on(cx) && save_actions_on(cx) {
+                this.save_all(cx);
             } else if autosave_on(cx) {
                 this.save_all_now(cx);
             }
@@ -949,6 +976,7 @@ impl Workspace {
             save_serial: 0,
             saved_json,
             project_opener: None,
+            close_hooks: Vec::new(),
             skip_save_on_close: false,
             root,
             _subscriptions: vec![bounds, activation, keystrokes],
@@ -1282,6 +1310,12 @@ impl Workspace {
             .as_ref()
             .is_none_or(|store| !has_saved_layout(store, &self.root));
         let states = std::mem::take(&mut self.layout.panes);
+        let modes: HashMap<PathBuf, PreviewLayout> = self
+            .layout
+            .preview_modes
+            .iter()
+            .map(|(path, mode)| (::platform::path_key(path), *mode))
+            .collect();
         let mut panes = Vec::with_capacity(states.len());
         let mut seen = HashSet::new();
         for state in &states {
@@ -1295,6 +1329,11 @@ impl Workspace {
                 tab.pinned = state.pinned.contains(path);
                 if let Some(caret) = state.carets.get(index) {
                     (tab.editor.restore_caret)(*caret, cx);
+                }
+                if let Some(mode) = modes.get(&::platform::path_key(path))
+                    && let Some(preview) = &tab.editor.preview
+                {
+                    (preview.set_layout)(*mode, cx);
                 }
                 if index == state.active {
                     active = tabs.len();
@@ -1330,9 +1369,13 @@ impl Workspace {
         };
         self.open_file(path.clone(), window, cx);
         if let Some(index) = self.panes[self.active_pane].position(&path) {
-            let tab = &self.panes[self.active_pane].tabs[index];
-            if let Some(show) = &tab.editor.show_preview_only {
-                show(cx);
+            let preview = self.panes[self.active_pane].tabs[index]
+                .editor
+                .preview
+                .clone();
+            if let Some(preview) = preview {
+                (preview.set_layout)(PreviewLayout::PreviewOnly, cx);
+                self.layout_changed(cx);
             }
         }
     }
@@ -1434,6 +1477,12 @@ impl Workspace {
                 cx,
             )),
         }
+    }
+
+    /// Adds a callback that runs when this window goes away, before its views are
+    /// dropped: helpers and connections end with the window.
+    pub fn on_close(&mut self, hook: impl FnOnce() + 'static) {
+        self.close_hooks.push(Box::new(hook));
     }
 
     /// Puts a tool window into a dock, in place of one with the same id. The window keeps
@@ -1597,11 +1646,29 @@ impl Workspace {
         }
     }
 
+    /// Runs the selected configuration with its samples recorded and shows the Profiler
+    /// window; its snapshot arrives when the run ends.
+    pub fn run_with_profiler(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.profile)(window, cx);
+            self.show_tool(PROFILER_TOOL, window, cx);
+        }
+    }
+
     /// Runs the tests of the last run with the coverage agent.
     pub fn run_tests_with_coverage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(run) = self.run.clone() {
             (run.run_tests_coverage)(window, cx);
             self.show_tool(COVERAGE_TOOL, window, cx);
+        }
+    }
+
+    /// Runs the tests of the last run with their JVMs recorded and shows the Profiler
+    /// window; the recordings are read when the run ends.
+    pub fn run_tests_with_profiler(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.profile_tests)(window, cx);
+            self.show_tool(PROFILER_TOOL, window, cx);
         }
     }
 
@@ -2383,8 +2450,15 @@ impl Workspace {
         if !autosave_on(cx) {
             return;
         }
-        // Written before it returns: the switch is not over until the text is on disk.
-        if let Some(tab) = self.active_tab() {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if save_actions_on(cx) {
+            // The actions of the save wait for the language, so the switch starts the
+            // save and does not wait for its answer.
+            (tab.editor.save)(cx);
+        } else {
+            // Written before it returns: the switch is not over until the text is on disk.
             (tab.editor.save_now)(cx);
         }
     }
@@ -4100,6 +4174,15 @@ impl Workspace {
             .filter(|pane| !pane.tabs.is_empty())
             .count();
         let panes = self.panes.iter().filter(|pane| !pane.tabs.is_empty());
+        let preview_modes = self
+            .panes
+            .iter()
+            .flat_map(|pane| &pane.tabs)
+            .filter_map(|tab| {
+                let preview = tab.editor.preview.as_ref()?;
+                Some((tab.path.clone(), (preview.layout)(cx)))
+            })
+            .collect();
         Layout {
             window: self.placement,
             left: self.left.state(),
@@ -4112,7 +4195,13 @@ impl Workspace {
             tree_selected: self.layout.tree_selected.clone(),
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
             recent_edited: self.recent_edited.clone(),
+            preview_modes,
         }
+    }
+
+    /// A tab changed something the saved layout keeps, such as what its preview shows.
+    pub fn tab_layout_changed(&mut self, cx: &mut Context<Self>) {
+        self.layout_changed(cx);
     }
 
     /// Saves a moment after the last change, off the UI thread.
@@ -4209,4 +4298,12 @@ impl Focusable for Workspace {
 /// A key that only modifies others: it never breaks a Double Shift or a Double Ctrl.
 fn is_modifier_key(key: &str) -> bool {
     matches!(key, "shift" | "control" | "alt" | "platform" | "cmd" | "fn")
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        for hook in self.close_hooks.drain(..) {
+            hook();
+        }
+    }
 }

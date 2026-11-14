@@ -18,7 +18,7 @@ use lang_api::CoverageReport;
 use project_model::ProjectModel;
 use serde::Deserialize;
 
-use crate::coverage::{CoveragePlan, CoverageStart, StartKind};
+use crate::coverage::{CoveragePlan, CoverageStart, ProfileStart, StartKind, StartedExtra};
 use crate::{Console, RunPlan};
 
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
@@ -110,6 +110,42 @@ pub trait TestProvider: Send + Sync {
         Err("this test provider cannot read coverage".into())
     }
 
+    /// Whether [`TestProvider::profile_plan`] makes a plan. The actions offer Profile for
+    /// the tests only when it does.
+    fn supports_profiler(&self) -> bool {
+        false
+    }
+
+    /// The same tests with the samples of their JVMs recorded, and the file the runtime
+    /// writes. A provider without a profiler keeps the error of this default.
+    fn profile_plan(
+        &self,
+        _model: &ProjectModel,
+        _request: &TestRequest,
+        _listen: &TestListen,
+    ) -> Result<crate::ProfilePlan> {
+        Err(format!("{} cannot record a profile", std::any::type_name::<Self>()).into())
+    }
+
+    /// Reads a recording of [`TestProvider::profile_plan`].
+    fn profile_report(
+        &self,
+        _recording: &std::path::Path,
+        _model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        Err("this test provider cannot read a profile".into())
+    }
+
+    /// The recordings of this provider still on disk, the newest first.
+    fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        Ok(Vec::new())
+    }
+
+    /// Every file one profile run left: a runtime may write one recording per JVM.
+    fn profile_run_recordings(&self, recording: &std::path::Path) -> Vec<std::path::PathBuf> {
+        vec![recording.to_owned()]
+    }
+
     /// A line of the test output that says the test JVM listens for the debugger. A
     /// provider whose debug JVM names its port provides it, and the run waits for it
     /// before the window attaches.
@@ -186,7 +222,32 @@ pub struct TestRun {
     console: Console,
 }
 
+/// A started test run that records its JVMs, with the file the runtime writes.
+pub struct TestProfileRun {
+    pub run: TestRun,
+    pub recording: std::path::PathBuf,
+    pub note: Option<String>,
+}
+
 impl TestRun {
+    /// Starts the tests as [`TestRun::start`] does, with the samples of their JVMs
+    /// recorded.
+    pub fn profile_start(
+        provider: &dyn TestProvider,
+        model: &ProjectModel,
+        request: &TestRequest,
+    ) -> Result<TestProfileRun> {
+        let (run, started) = Self::start_with(provider, model, request, StartKind::Profile)?;
+        let StartedExtra::Profile(profile) = started else {
+            unreachable!("a profile start returns its recording")
+        };
+        Ok(TestProfileRun {
+            run,
+            recording: profile.recording,
+            note: profile.note,
+        })
+    }
+
     pub fn start(
         provider: &dyn TestProvider,
         model: &ProjectModel,
@@ -247,7 +308,7 @@ impl TestRun {
         model: &ProjectModel,
         request: &TestRequest,
         kind: StartKind<'_>,
-    ) -> Result<(Self, Option<CoverageStart>)> {
+    ) -> Result<(Self, StartedExtra)> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let listen = TestListen {
@@ -266,20 +327,33 @@ impl TestRun {
         let plan = match kind {
             StartKind::Debug(debug) => provider
                 .debug_plan(model, request, &listen, debug)
-                .map(|plan| (plan, None)),
+                .map(|plan| (plan, StartedExtra::None)),
             StartKind::Plain => provider
                 .plan(model, request, &listen)
-                .map(|plan| (plan, None)),
+                .map(|plan| (plan, StartedExtra::None)),
             StartKind::Coverage => {
                 provider
                     .coverage_plan(model, request, &listen)
                     .map(|coverage| {
                         let CoveragePlan { plan, exec, note } = coverage;
-                        (plan, Some(CoverageStart { exec, note }))
+                        (plan, StartedExtra::Coverage(CoverageStart { exec, note }))
                     })
             }
+            StartKind::Profile => provider
+                .profile_plan(model, request, &listen)
+                .map(|profile| {
+                    let crate::ProfilePlan {
+                        plan,
+                        recording,
+                        note,
+                    } = profile;
+                    (
+                        plan,
+                        StartedExtra::Profile(ProfileStart { recording, note }),
+                    )
+                }),
         };
-        let (plan, coverage) = match plan {
+        let (plan, extra) = match plan {
             Ok(plan) => plan,
             Err(error) => {
                 stop.store(true, Ordering::Relaxed);
@@ -292,7 +366,7 @@ impl TestRun {
                 stop,
                 console: Console::start(plan),
             },
-            coverage,
+            extra,
         ))
     }
 

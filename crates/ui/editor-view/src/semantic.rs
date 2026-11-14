@@ -74,9 +74,23 @@ pub struct Semantic(pub Arc<dyn LanguageSupport>);
 
 impl Global for Semantic {}
 
+/// Languages for files that no project server owns, such as the console of a tool. The
+/// application sets them; the editor asks them when the project language does not match.
+pub struct FileLanguages(pub Vec<Arc<dyn LanguageSupport>>);
+
+impl Global for FileLanguages {}
+
+/// The text of a document that is not a file, and the origin it came from.
+#[derive(Clone)]
+pub(crate) struct SourceDoc {
+    pub text: Arc<str>,
+    /// The origin the language gave for the text; a class of a library has one.
+    pub origin: Option<Arc<str>>,
+}
+
 /// Texts that are not files, opened read only under a made-up path.
 #[derive(Default)]
-pub(crate) struct Sources(pub HashMap<PathBuf, Arc<str>>);
+pub(crate) struct Sources(pub HashMap<PathBuf, SourceDoc>);
 
 impl Global for Sources {}
 
@@ -193,14 +207,19 @@ pub fn show_location(
     };
     let uri = target.uri.clone();
     let path = source_path(&uri, extension);
-    let replies = ask(provider, SourceTextQuery(uri));
+    let replies = ask(provider, SourceTextQuery(uri.clone()));
     cx.spawn(async move |cx| {
         let answer = first(replies).await;
         cx.update(|cx| match answer {
             Some((text, _)) if !text.is_empty() => {
-                cx.default_global::<Sources>()
-                    .0
-                    .insert(path.clone(), text.into());
+                let origin = uri.clone();
+                cx.default_global::<Sources>().0.insert(
+                    path.clone(),
+                    SourceDoc {
+                        text: text.into(),
+                        origin: Some(origin.into()),
+                    },
+                );
                 cx.default_global::<Reveals>().0.insert(path.clone(), point);
                 open(path, cx);
             }
@@ -210,6 +229,7 @@ pub fn show_location(
     .detach();
 }
 
+#[derive(Clone)]
 pub(crate) struct Mark {
     pub range: Range<usize>,
     pub severity: Severity,
@@ -286,6 +306,8 @@ pub(crate) struct CompletionRow {
     pub left: String,
     pub right: Option<String>,
     pub owner: Option<String>,
+    /// The entry is out of use: the row strikes its name through.
+    pub deprecated: bool,
 }
 
 impl Completion {
@@ -306,7 +328,12 @@ impl Completion {
             entry.detail.as_deref(),
             entry.label_details.as_ref(),
         );
-        CompletionRow { left, right, owner }
+        CompletionRow {
+            left,
+            right,
+            owner,
+            deprecated: entry.deprecated,
+        }
     }
 
     /// The text to insert and the span it replaces, when the entry has its own.
@@ -882,6 +909,18 @@ pub(crate) struct Lsp {
     pub support: Arc<dyn LanguageSupport>,
     pub uri: String,
     pub marks: Vec<Mark>,
+    /// The marks the server sent, before the native ones join them.
+    pub(crate) server_marks: Vec<Mark>,
+    /// The marks of a native model, such as the checks of a framework, by the source of
+    /// the model.
+    pub(crate) native_marks: HashMap<&'static str, Vec<Mark>>,
+    /// The diagnostics both sets came from, for the Problems window.
+    pub(crate) server_entries: Vec<DiagnosticEntry>,
+    pub(crate) native_entries: HashMap<&'static str, Vec<DiagnosticEntry>>,
+    /// The tokens the server sent, before the native ones join them.
+    pub(crate) server_tokens: Vec<TokenSpan>,
+    /// The tokens of a native model, by the source of the model.
+    pub(crate) native_tokens: HashMap<&'static str, Vec<TokenSpan>>,
     /// The server answered about the diagnostics of this text at least once.
     pub received: bool,
     pub completion: Option<Completion>,
@@ -915,6 +954,54 @@ pub(crate) struct Lsp {
 }
 
 impl Lsp {
+    /// Moves both sets of marks over the edits of a text change and joins them again.
+    pub fn retain_transformed_marks(&mut self, steps: &[Vec<text_core::Edit>], len: usize) {
+        for mark in self
+            .server_marks
+            .iter_mut()
+            .chain(self.native_marks.values_mut().flatten())
+        {
+            for step in steps {
+                mark.range.start = text_core::transform_offset(mark.range.start, step);
+                mark.range.end = text_core::transform_offset(mark.range.end, step);
+            }
+            mark.range.end = mark.range.end.min(len);
+            mark.range.start = mark.range.start.min(mark.range.end);
+        }
+        self.marks = self
+            .server_marks
+            .iter()
+            .chain(self.native_marks.values().flatten())
+            .cloned()
+            .collect();
+    }
+
+    /// Moves both sets of tokens over the edits of a text change.
+    pub fn retain_transformed_tokens(&mut self, steps: &[Vec<text_core::Edit>], len: usize) {
+        let mut tokens: Vec<&mut TokenSpan> = self
+            .server_tokens
+            .iter_mut()
+            .chain(self.native_tokens.values_mut().flatten())
+            .collect();
+        for token in &mut tokens {
+            for step in steps {
+                token.start = text_core::transform_offset(token.start as usize, step) as u32;
+                token.end = text_core::transform_offset(token.end as usize, step) as u32;
+            }
+            token.end = token.end.min(len as u32);
+            token.start = token.start.min(token.end);
+        }
+    }
+
+    /// The tokens of the server and of the native models, in one list.
+    pub fn joined_tokens(&self) -> Vec<TokenSpan> {
+        self.server_tokens
+            .iter()
+            .chain(self.native_tokens.values().flatten())
+            .copied()
+            .collect()
+    }
+
     pub fn close(&self) {
         if let Some(server) = self.support.server() {
             server.close(&self.uri);
@@ -1113,19 +1200,70 @@ fn maybe_clamp_parameter(popup: &mut SignaturePopup) {
 impl EditorView {
     /// Text for a made-up path that a navigation opened.
     pub(crate) fn source_text(path: &Path, cx: &App) -> Option<Arc<str>> {
-        cx.try_global::<Sources>()?.0.get(path).cloned()
+        cx.try_global::<Sources>()?
+            .0
+            .get(path)
+            .map(|doc| doc.text.clone())
+    }
+
+    /// The origin of the text of a made-up path: a class of a library has one.
+    pub fn source_origin(path: &Path, cx: &App) -> Option<String> {
+        let origin = cx.try_global::<Sources>()?.0.get(path)?.origin.clone()?;
+        Some(origin.to_string())
+    }
+
+    /// Takes new text for a made-up path, for a document that was read again.
+    pub(crate) fn set_source_text(path: &Path, text: &str, cx: &mut App) {
+        let origin = cx
+            .try_global::<Sources>()
+            .and_then(|sources| sources.0.get(path))
+            .and_then(|doc| doc.origin.clone());
+        let Some(origin) = origin else {
+            return;
+        };
+        cx.default_global::<Sources>().0.insert(
+            path.to_path_buf(),
+            SourceDoc {
+                text: text.into(),
+                origin: Some(origin),
+            },
+        );
     }
 
     /// Opens the document at the server once it is loaded, and follows its diagnostics.
     pub(crate) fn attach(&mut self, cx: &mut Context<Self>) {
-        let Some(semantic) = cx.try_global::<Semantic>() else {
+        // A project language also serves other files of its project, such as
+        // configuration files, through the languages it brings for them. A file that no
+        // project language owns may still belong to a tool, such as a console.
+        let mut support = None;
+        if let Some(semantic) = cx.try_global::<Semantic>() {
+            let main = semantic.0.clone();
+            if main.matches(&self.path) {
+                support = Some(main);
+            } else if let Some(language) = main
+                .embedded_languages()
+                .into_iter()
+                .find(|language| language.matches(&self.path))
+            {
+                support = Some(language);
+            }
+        }
+        if support.is_none() {
+            support = cx.try_global::<FileLanguages>().and_then(|files| {
+                files
+                    .0
+                    .iter()
+                    .find(|file| file.matches(&self.path))
+                    .cloned()
+            });
+        }
+        let Some(support) = support else {
             return;
         };
-        let support = semantic.0.clone();
         let Some(state) = &self.state else {
             return;
         };
-        if state.is_read_only() || !support.matches(&self.path) {
+        if state.is_read_only() {
             return;
         }
         let Ok(canonical) = CanonPath::new(&self.path) else {
@@ -1152,6 +1290,12 @@ impl EditorView {
             support,
             uri,
             marks: Vec::new(),
+            server_marks: Vec::new(),
+            native_marks: HashMap::new(),
+            server_entries: Vec::new(),
+            native_entries: HashMap::new(),
+            server_tokens: Vec::new(),
+            native_tokens: HashMap::new(),
             received: !follows_diagnostics,
             completion: None,
             note: None,
@@ -1311,11 +1455,11 @@ impl EditorView {
         if !self.options.semantic_highlighting {
             return;
         }
-        let Some(state) = &mut self.state else {
+        let Some(state) = &self.state else {
             return;
         };
         let store = state.store();
-        let mut spans: Vec<TokenSpan> = tokens
+        let spans: Vec<TokenSpan> = tokens
             .into_iter()
             .filter_map(|token| {
                 let start = offset_at(&store, token.span.start);
@@ -1328,9 +1472,10 @@ impl EditorView {
                 })
             })
             .collect();
-        normalize_tokens(&mut spans, store.len());
-        state.set_semantic_tokens(spans);
-        cx.notify();
+        if let Some(lsp) = &mut self.lsp {
+            lsp.server_tokens = spans;
+        }
+        self.apply_tokens(cx);
     }
 
     /// The colour and the marks of the semantic token over `offset`. `None` when
@@ -1353,7 +1498,7 @@ impl EditorView {
             return;
         };
         let store = state.store();
-        lsp.marks = entries
+        lsp.server_marks = entries
             .iter()
             .map(|entry| {
                 let start = offset_at(&store, entry.span.start);
@@ -1366,7 +1511,128 @@ impl EditorView {
                 }
             })
             .collect();
+        lsp.server_entries = entries;
+        self.apply_marks(cx);
+    }
+
+    /// Replaces the marks of a native model of the language, such as the checks of a
+    /// framework. The marks of the server stay, so an edit of the model does not hide
+    /// them.
+    pub fn set_native_marks(&mut self, entries: Vec<DiagnosticEntry>, cx: &mut Context<Self>) {
+        self.set_native_marks_from("language", entries, cx);
+    }
+
+    /// Replaces the marks of one native model of the language, keyed by the source that
+    /// gave them, so that two models do not hide each other's checks. The marks of the
+    /// server stay.
+    pub fn set_native_marks_from(
+        &mut self,
+        key: &'static str,
+        entries: Vec<DiagnosticEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(lsp), Some(state)) = (&mut self.lsp, &self.state) else {
+            return;
+        };
+        let store = state.store();
+        let marks: Vec<Mark> = entries
+            .iter()
+            .map(|entry| {
+                let start = offset_at(&store, entry.span.start);
+                let end = offset_at(&store, entry.span.end).max(start);
+                Mark {
+                    range: start..end,
+                    severity: entry.severity,
+                    message: entry.message.clone(),
+                    unnecessary: entry.unnecessary,
+                }
+            })
+            .collect();
+        if entries.is_empty() {
+            lsp.native_marks.remove(key);
+            lsp.native_entries.remove(key);
+        } else {
+            lsp.native_marks.insert(key, marks);
+            lsp.native_entries.insert(key, entries);
+        }
+        self.apply_marks(cx);
+    }
+
+    /// Replaces the tokens of one native model of the language, such as the keywords of
+    /// a query inside a string. The tokens of the server stay.
+    pub fn set_native_tokens(
+        &mut self,
+        key: &'static str,
+        tokens: Vec<SemanticToken>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.options.semantic_highlighting {
+            return;
+        }
+        let Some(state) = &self.state else {
+            return;
+        };
+        let store = state.store();
+        let spans: Vec<TokenSpan> = tokens
+            .into_iter()
+            .filter_map(|token| {
+                let start = offset_at(&store, token.span.start);
+                let end = offset_at(&store, token.span.end).max(start);
+                (start < end).then_some(TokenSpan {
+                    start: start as u32,
+                    end: end as u32,
+                    kind: token.kind,
+                    modifiers: token.modifiers,
+                })
+            })
+            .collect();
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if spans.is_empty() {
+            lsp.native_tokens.remove(key);
+        } else {
+            lsp.native_tokens.insert(key, spans);
+        }
+        self.apply_tokens(cx);
+    }
+
+    /// Joins the tokens of the server with the tokens of the native models.
+    pub(crate) fn apply_tokens(&mut self, cx: &mut Context<Self>) {
+        if !self.options.semantic_highlighting {
+            return;
+        }
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let len = state.store().len();
+        let mut tokens = match &self.lsp {
+            Some(lsp) => lsp.joined_tokens(),
+            None => return,
+        };
+        normalize_tokens(&mut tokens, len);
+        state.set_semantic_tokens(tokens);
+        cx.notify();
+    }
+
+    /// Joins the marks of the server with the marks of a native model.
+    fn apply_marks(&mut self, cx: &mut Context<Self>) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        lsp.marks = lsp
+            .server_marks
+            .iter()
+            .chain(lsp.native_marks.values().flatten())
+            .cloned()
+            .collect();
         lsp.received = true;
+        let entries: Vec<DiagnosticEntry> = lsp
+            .server_entries
+            .iter()
+            .chain(lsp.native_entries.values().flatten())
+            .cloned()
+            .collect();
         cx.emit(EditorEvent::Diagnostics(entries));
         cx.notify();
     }
@@ -1963,6 +2229,17 @@ impl EditorView {
             let answer = first(replies).await;
             this.update(cx, |this, cx| match answer {
                 Some((spans, _)) if !spans.is_empty() => this.go_to_location(&spans[0], cx),
+                Some((_, confidence))
+                    if confidence != Confidence::Unknown
+                        && this
+                            .lsp
+                            .as_ref()
+                            .is_some_and(|lsp| lsp.support.definition_falls_back_to_hover()) =>
+                {
+                    // A language whose places map onto configuration files shows what
+                    // it knows about the place rather than nothing.
+                    this.quick_doc(cx)
+                }
                 Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
                 Some(_) => this.show_note(caret, "Cannot find declaration to go to", cx),
                 None => {}

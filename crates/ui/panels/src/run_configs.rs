@@ -443,7 +443,10 @@ impl RunConfigDialog {
             }
             _ => {
                 if let Some(row) = self.rows.get_mut(self.active - 1) {
-                    if row.field.kind == ConfigFieldKind::Bool {
+                    if matches!(
+                        row.field.kind,
+                        ConfigFieldKind::Bool | ConfigFieldKind::ReadOnly
+                    ) {
                         return;
                     }
                     if row.text.key_with_clipboard(event, false, cx) {
@@ -609,6 +612,37 @@ impl Render for RunConfigDialog {
                                     cx.notify();
                                 }
                             }))
+                            .into_any_element()
+                    }
+                    ConfigFieldKind::ReadOnly => {
+                        let key = row.field.key;
+                        let text = row.text.text.clone();
+                        let field = field_box(
+                            ("run-config-read-only", index),
+                            format!("run-config-field-{key}"),
+                            &row.text,
+                            false,
+                            &theme,
+                        );
+                        let copy = icon_button(
+                            ("run-config-copy", index),
+                            "general/copy",
+                            "Copy",
+                            None,
+                            &theme,
+                        )
+                        .debug_selector(move || format!("run-config-copy-{key}"))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        }));
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(field)
+                            .child(copy)
                             .into_any_element()
                     }
                     _ => {

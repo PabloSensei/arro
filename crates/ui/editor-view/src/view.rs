@@ -12,8 +12,12 @@ use ::base::perf;
 use display_map::{Bias, DisplayChunk, DisplayPoint};
 use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt;
+use futures_util::future::{Either, select};
 use keymap::{Keymap, Keystroke, Lookup, default_keymap, editor as actions};
-use lang_api::{DiagnosticEntry, NavigationKind, Severity, SourceSpan};
+use lang_api::{
+    ActionKind, ActionQuery, DiagnosticEntry, DocumentEdit, FormatQuery, NavigationKind,
+    RangeFormatQuery, Replies, Severity, SourceSpan, TextSpan, ask,
+};
 use syntax::{DocumentId, HighlightSpan, LanguageConfig, SyntaxService};
 use templates::{ExpandWith, FileTemplateDefinition, TemplateLanguage, TemplateOverrides};
 use text_core::{Change, FileFormat, RopeStore, Selection, TextStore, read_file};
@@ -34,6 +38,45 @@ use crate::state::{Conflict, EditorState, LoadError, Saved};
 use crate::style::EditorStyle;
 
 const BLINK: Duration = Duration::from_millis(530);
+/// The keys whose frame has not measured them yet are kept at most, so a view that is
+/// painted as a pane of another one and never renders itself cannot grow with typing.
+const PENDING_FRAMES: usize = 64;
+
+/// The columns of the widest row of a text and the rows they were counted on. A frame
+/// that shows the same rows reuses the count instead of walking the lines of a big file
+/// again; an edit, a fold or a tab width starts a new count.
+#[derive(Clone, Copy)]
+pub(crate) struct WidestRow {
+    version: u64,
+    tab_size: usize,
+    folds: usize,
+    inlays: usize,
+    columns: usize,
+}
+
+impl WidestRow {
+    pub(crate) fn of(state: &EditorState, columns: usize) -> Self {
+        Self {
+            version: state.version(),
+            tab_size: state.map().tab_size,
+            folds: state.map().folds.as_slice().len(),
+            inlays: state.map().inlays.as_slice().len(),
+            columns,
+        }
+    }
+
+    /// Whether the count still belongs to the rows `state` shows.
+    pub(crate) fn matches(&self, state: &EditorState) -> bool {
+        self.version == state.version()
+            && self.tab_size == state.map().tab_size
+            && self.folds == state.map().folds.as_slice().len()
+            && self.inlays == state.map().inlays.as_slice().len()
+    }
+
+    pub(crate) fn columns(&self) -> usize {
+        self.columns
+    }
+}
 
 /// Names the syntax documents of the views that paint text outside an editor.
 static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
@@ -57,6 +100,12 @@ pub struct PlainSyntax {
 }
 
 impl Global for PlainSyntax {}
+
+/// Files where Ctrl+Enter asks a tool window to run what is there. A format that already
+/// owns Ctrl+Enter keeps it: the predicates are independent and either may take the key.
+pub struct RunFiles(pub std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>);
+
+impl Global for RunFiles {}
 
 /// The builder of the row the application puts above the text of a kind of file.
 pub type FileBarBuilder =
@@ -262,6 +311,38 @@ impl OutlineItem {
     }
 }
 
+/// A variable of the stopped frame as the editor draws it after the lines that name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugValue {
+    pub name: String,
+    pub value: String,
+    /// The value differs from the one of the previous stop.
+    pub changed: bool,
+}
+
+/// The values of one buffer line, shown after its text while the program is stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineValue {
+    /// The buffer line, from zero.
+    pub line: usize,
+    pub text: String,
+    /// One of the values changed since the previous stop.
+    pub changed: bool,
+}
+
+/// The most characters of one value the line shows; the rest is cut with an ellipsis.
+const INLINE_VALUE_LIMIT: usize = 60;
+
+/// `value` cut to `limit` characters, with an ellipsis when something was left out.
+fn cut_value(value: &str, limit: usize) -> String {
+    let mut characters = value.chars();
+    let mut cut: String = characters.by_ref().take(limit).collect();
+    if characters.next().is_some() {
+        cut.push('…');
+    }
+    cut
+}
+
 /// A declaration whose name starts on a line, as the gutter chooses the kind of a
 /// breakpoint there. `owner` is the type that declares it, when the language names one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,6 +403,40 @@ pub struct RunMark {
     pub line: u32,
     pub state: RunMarkState,
     pub color: Hsla,
+}
+
+/// A button in the gutter beside the run button: the line starts something that is not
+/// a program, such as an HTTP handler. The colour is the caller's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EndpointMark {
+    /// Buffer line from zero.
+    pub line: u32,
+    pub color: Hsla,
+}
+
+/// A place a badge of the gutter goes to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaceTarget {
+    /// The text of the place in the list of a badge.
+    pub label: String,
+    pub file: PathBuf,
+    pub offset: usize,
+}
+
+/// A badge in the gutter beside the line number: a click with one place goes to it, a
+/// click with several opens their list. The colour and the icon are the caller's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaceMark {
+    /// Buffer line from zero.
+    pub line: u32,
+    /// The icon of the badge, from the icon set of the editor.
+    pub icon: SharedString,
+    pub color: Hsla,
+    /// The hint of the badge under the pointer.
+    pub hint: SharedString,
+    /// The badge opens its list even when it holds one place, as the usages of a bean do.
+    pub list: bool,
+    pub places: Vec<PlaceTarget>,
 }
 
 /// How a line looks after a run with coverage.
@@ -414,6 +529,9 @@ pub enum EditorEvent {
     Dirty(bool),
     Saved,
     Failed(SharedString),
+    /// A save met a language server that could not run its actions; the text went to
+    /// the disk without them.
+    SaveNote(SharedString),
     /// The file changed on disk while the buffer has unsaved edits.
     Conflict,
     /// A clean buffer took text from disk that differs from what it showed. The bytes
@@ -451,6 +569,10 @@ pub enum EditorEvent {
     Moved,
     /// A run mark was clicked: the line it stands on, from zero.
     RunMark(u32),
+    /// The mark beside the run button was clicked: the line it stands on, from zero.
+    EndpointMark(u32),
+    /// A badge of the gutter was clicked: the line it stands on, from zero.
+    PlaceMark(u32),
     /// Ctrl+Enter in a file whose format runs something, such as a request file: the
     /// line of the caret, from zero.
     RunRequest(u32),
@@ -547,6 +669,8 @@ pub struct EditorOptions {
     pub wheel_zoom: bool,
     /// What a save does with the spaces and tabs at the end of a line.
     pub save: crate::state::SaveOptions,
+    /// The work of the language a save does before the text reaches the disk.
+    pub actions_on_save: crate::state::ActionsOnSave,
     /// How the completion list compares the typed prefix with its entries.
     pub completion_case: crate::semantic::CompletionCase,
     /// The completion list opens while the user types.
@@ -573,6 +697,8 @@ pub struct EditorOptions {
     pub code_vision_implementations: bool,
     /// Documentation comments of the language show as rendered text.
     pub render_doc_comments: bool,
+    /// The preview of a markdown file takes the pictures of an address of the internet.
+    pub markdown_images_from_internet: bool,
 }
 
 impl Default for EditorOptions {
@@ -584,6 +710,7 @@ impl Default for EditorOptions {
             caret_blink: true,
             wheel_zoom: true,
             save: crate::state::SaveOptions::default(),
+            actions_on_save: crate::state::ActionsOnSave::default(),
             completion_case: crate::semantic::CompletionCase::None,
             completion_auto_popup: true,
             completion_delay_ms: 0,
@@ -597,12 +724,15 @@ impl Default for EditorOptions {
             code_vision_usages: true,
             code_vision_implementations: true,
             render_doc_comments: false,
+            markdown_images_from_internet: true,
         }
     }
 }
 
 pub struct EditorView {
     pub(crate) path: PathBuf,
+    /// The root of the project the file belongs to; `None` for a file opened alone.
+    project_root: Option<PathBuf>,
     pub(crate) state: Option<EditorState>,
     pub(crate) style: EditorStyle,
     base_style: EditorStyle,
@@ -653,6 +783,9 @@ pub struct EditorView {
     pub(crate) scroll_left: f32,
     /// The horizontal bar was painted in the last frame.
     pub(crate) horizontal_bar: bool,
+    /// The widest row of the text and the rows it was counted on, so that a repaint
+    /// without a text change, a blink of the caret for one, does not walk every line.
+    pub(crate) widest: Option<WidestRow>,
     /// The pointer is over the bar: it takes the wide look.
     pub(crate) scrollbar_hovered: bool,
     /// The thumb the pointer holds.
@@ -663,6 +796,8 @@ pub struct EditorView {
     annotate_hint: Option<(String, Point<Pixels>)>,
     /// The hint of the coverage stripe under the pointer, and where it stands.
     coverage_hint: Option<(String, Point<Pixels>)>,
+    /// The hint of a badge of the gutter under the pointer, and where it stands.
+    place_hint: Option<(String, Point<Pixels>)>,
     pub(crate) autoscroll: bool,
     /// The next autoscroll puts the caret near the middle, as a jump to a place does.
     pub(crate) reveal_center: bool,
@@ -671,6 +806,8 @@ pub struct EditorView {
     pub(crate) layout: Option<Rc<Layout>>,
     pub(crate) gutter_hovered: bool,
     pub(crate) run_marks: Vec<RunMark>,
+    pub(crate) endpoint_marks: Vec<EndpointMark>,
+    pub(crate) place_marks: Vec<PlaceMark>,
     pub(crate) coverage: Vec<CoverageMark>,
     /// Buffer lines of the breakpoints, from zero.
     pub(crate) breakpoints: Vec<u32>,
@@ -725,8 +862,12 @@ pub struct EditorView {
     pub(crate) docs: crate::rendered_doc::RenderedDocs,
     /// The preview of a markdown file beside its text, `None` for other files.
     pub(crate) preview: Option<crate::markdown_preview::MarkdownPreview>,
+    /// The folder the preview keeps the pictures it takes from the internet.
+    pub(crate) picture_cache: Option<PathBuf>,
     /// Keys waiting for the next frame, so the latency of a key includes the paint.
     pending_frames: Vec<Instant>,
+    /// The values of the stopped frame, by buffer line, drawn after the line.
+    pub(crate) debug_values: Vec<InlineValue>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -750,6 +891,124 @@ impl SavingGuard {
 impl Drop for SavingGuard {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+/// How long a save waits for the language before it writes without the actions.
+const SAVE_ACTIONS_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn whole_span(store: &RopeStore) -> TextSpan {
+    TextSpan {
+        start: lang_api::TextPoint::default(),
+        end: crate::semantic::point_at(store, store.len()),
+    }
+}
+
+/// The span of whole lines, the shape a diff hunk names.
+fn lines_span(store: &RopeStore, lines: std::ops::Range<u32>) -> TextSpan {
+    let at = |line: u32| {
+        if line as usize >= store.line_count() {
+            store.len()
+        } else {
+            store.line_to_offset(line as usize)
+        }
+    };
+    TextSpan {
+        start: crate::semantic::point_at(store, at(lines.start)),
+        end: crate::semantic::point_at(store, at(lines.end)),
+    }
+}
+
+/// Whether the text carries the markers of a merge conflict, which a formatter must not
+/// touch.
+fn has_conflict_markers(text: &str) -> bool {
+    let (mut start, mut middle) = (false, false);
+    for line in text.lines() {
+        if line.starts_with("<<<<<<< ") {
+            start = true;
+            middle = false;
+        } else if start && line == "=======" {
+            middle = true;
+        } else if middle && line.starts_with(">>>>>>> ") {
+            return true;
+        }
+    }
+    false
+}
+
+const SAVE_SERVER_SLOW: &str =
+    "The language server did not answer in time; the file was saved without the actions on save";
+const SAVE_SERVER_MISSING: &str =
+    "The language server is not ready; the file was saved without the actions on save";
+
+/// The questions a save puts to the language before it writes.
+struct SaveActionRequests {
+    /// The text version the answers belong to.
+    version: u64,
+    /// Whole-file or per-range formatting answers.
+    format: Vec<Replies<Vec<DocumentEdit>>>,
+    /// Organize Imports and Code Cleanup answers.
+    actions: Vec<Replies<Vec<lang_api::ActionEntry>>>,
+    /// The lines the format may touch; empty for the whole file.
+    ranges: Vec<TextSpan>,
+    /// A provider the settings wanted but the language does not offer.
+    missing: bool,
+}
+
+/// What the language answered for a save.
+struct SaveActionOutcome {
+    version: u64,
+    /// `None` when the answer did not come in time.
+    edits: Option<Vec<DocumentEdit>>,
+    ranges: Vec<TextSpan>,
+    note: Option<&'static str>,
+}
+
+/// Awaits every answer of a save under one deadline, so a slow provider costs the wait
+/// of the whole group rather than its own.
+async fn collect_save_actions(
+    requests: SaveActionRequests,
+    deadline: impl std::future::Future<Output = ()>,
+) -> SaveActionOutcome {
+    let SaveActionRequests {
+        version,
+        format,
+        actions,
+        ranges,
+        missing,
+    } = requests;
+    let answers = async move {
+        let mut edits = Vec::new();
+        for mut replies in format {
+            if let Some(answer) = replies.next().await {
+                edits.extend(answer.value);
+            }
+        }
+        for mut replies in actions {
+            if let Some(answer) = replies.next().await
+                && let Some(entry) = answer.value.into_iter().next()
+            {
+                for source in entry.edits {
+                    edits.extend(source.edits);
+                }
+            }
+        }
+        edits
+    };
+    let answer = select(Box::pin(answers), Box::pin(deadline)).await;
+    match answer {
+        Either::Left((edits, _)) => SaveActionOutcome {
+            version,
+            edits: Some(edits),
+            ranges,
+            note: missing.then_some(SAVE_SERVER_MISSING),
+        },
+        Either::Right(_) => SaveActionOutcome {
+            version,
+            edits: None,
+            ranges,
+            note: Some(SAVE_SERVER_SLOW),
+        },
     }
 }
 
@@ -955,6 +1214,12 @@ impl EditorView {
                 }
                 if let Some(lsp) = &mut self.lsp {
                     lsp.marks.clear();
+                    lsp.server_marks.clear();
+                    lsp.native_marks.clear();
+                    lsp.server_entries.clear();
+                    lsp.native_entries.clear();
+                    lsp.server_tokens.clear();
+                    lsp.native_tokens.clear();
                     lsp.received = false;
                     lsp.completion = None;
                     lsp.note = None;
@@ -979,6 +1244,7 @@ impl EditorView {
                 self.code_lens.clear();
                 self.code_vision_labels.clear();
                 self.code_vision_hovered = None;
+                self.debug_values.clear();
                 // The bookmarks of the file belong to the window, not to this view: read
                 // them again instead of syncing an empty list over the stored ones.
                 let saved = cx
@@ -1024,6 +1290,7 @@ impl EditorView {
         }
         Self {
             path,
+            project_root: None,
             state: None,
             style: style.clone(),
             base_style: style,
@@ -1056,11 +1323,13 @@ impl EditorView {
             scroll_top: 0.,
             scroll_left: 0.,
             horizontal_bar: false,
+            widest: None,
             scrollbar_hovered: false,
             scrollbar_drag: None,
             stripe_hint: None,
             annotate_hint: None,
             coverage_hint: None,
+            place_hint: None,
             autoscroll: false,
             reveal_center: false,
             caret_on: true,
@@ -1068,6 +1337,8 @@ impl EditorView {
             layout: None,
             gutter_hovered: false,
             run_marks: Vec::new(),
+            endpoint_marks: Vec::new(),
+            place_marks: Vec::new(),
             coverage: Vec::new(),
             breakpoints: Vec::new(),
             muted_breakpoints: Vec::new(),
@@ -1099,7 +1370,9 @@ impl EditorView {
             code_lens_task: None,
             docs: crate::rendered_doc::RenderedDocs::default(),
             preview: None,
+            picture_cache: None,
             pending_frames: Vec::with_capacity(8),
+            debug_values: Vec::new(),
         }
     }
 
@@ -1226,6 +1499,30 @@ impl EditorView {
 
     pub fn run_marks(&self) -> &[RunMark] {
         &self.run_marks
+    }
+
+    /// Replaces the marks beside the run button in the gutter.
+    pub fn set_endpoint_marks(&mut self, marks: Vec<EndpointMark>, cx: &mut Context<Self>) {
+        if self.endpoint_marks != marks {
+            self.endpoint_marks = marks;
+            cx.notify();
+        }
+    }
+
+    pub fn endpoint_marks(&self) -> &[EndpointMark] {
+        &self.endpoint_marks
+    }
+
+    /// Replaces the badges of the gutter that open a list of places.
+    pub fn set_place_marks(&mut self, marks: Vec<PlaceMark>, cx: &mut Context<Self>) {
+        if self.place_marks != marks {
+            self.place_marks = marks;
+            cx.notify();
+        }
+    }
+
+    pub fn place_marks(&self) -> &[PlaceMark] {
+        &self.place_marks
     }
 
     /// Replaces the coverage stripes of the gutter.
@@ -1418,6 +1715,71 @@ impl EditorView {
         self.layout
             .as_ref()
             .map_or(&[], |layout| layout.inlays.as_slice())
+    }
+
+    /// The values of the stopped frame, by buffer line. A test reads them; the paint
+    /// takes one line at a time.
+    pub fn debug_values(&self) -> &[InlineValue] {
+        &self.debug_values
+    }
+
+    /// The values of one buffer line, when the debugger stopped there.
+    pub(crate) fn debug_value_at(&self, line: usize) -> Option<&InlineValue> {
+        self.debug_values.iter().find(|value| value.line == line)
+    }
+
+    /// Shows the values of the stopped frame after the lines of its method that name
+    /// them. `line` is the buffer line of the stop, from zero; `None` takes the values
+    /// away when the program runs.
+    pub fn set_debug_values(
+        &mut self,
+        line: Option<usize>,
+        values: &[DebugValue],
+        cx: &mut Context<Self>,
+    ) {
+        let shown = line
+            .filter(|_| !values.is_empty())
+            .and_then(|line| self.values_on_lines(line, values))
+            .unwrap_or_default();
+        if self.debug_values != shown {
+            self.debug_values = shown;
+            cx.notify();
+        }
+    }
+
+    /// The values of `values` grouped by the lines that name them, from the start of the
+    /// declaration around `line` through `line`.
+    fn values_on_lines(&self, line: usize, values: &[DebugValue]) -> Option<Vec<InlineValue>> {
+        let state = self.state.as_ref()?;
+        let text = state.text();
+        let identifiers = match &self.lsp {
+            Some(lsp) => lsp.support.syntax().identifiers_around(&text, line),
+            None => lang_api::identifiers_around(&text, line),
+        };
+        let mut shown = Vec::new();
+        for (index, names) in identifiers.lines.iter().enumerate() {
+            let mut parts = Vec::new();
+            let mut changed = false;
+            for name in names {
+                let Some(value) = values.iter().find(|value| &value.name == name) else {
+                    continue;
+                };
+                parts.push(format!(
+                    "{} = {}",
+                    value.name,
+                    cut_value(&value.value, INLINE_VALUE_LIMIT)
+                ));
+                changed |= value.changed;
+            }
+            if !parts.is_empty() {
+                shown.push(InlineValue {
+                    line: identifiers.first_line + index,
+                    text: parts.join(", "),
+                    changed,
+                });
+            }
+        }
+        Some(shown)
     }
 
     /// The caret in bytes, `None` before the file is read.
@@ -1632,6 +1994,13 @@ impl EditorView {
         self.state.as_ref().map(EditorState::text)
     }
 
+    /// The selected text of the primary selection, `None` when the caret covers nothing.
+    pub fn selected_text(&self) -> Option<String> {
+        let state = self.state.as_ref()?;
+        let range = state.selections().primary().range();
+        (!range.is_empty()).then(|| state.store().slice(range))
+    }
+
     /// Whether the file is read, or the read failed. A script step that touches the text
     /// of the open file waits for this.
     pub fn is_ready(&self) -> bool {
@@ -1810,6 +2179,8 @@ impl EditorView {
         let code_vision_changed = self.options.code_vision_usages != options.code_vision_usages
             || self.options.code_vision_implementations != options.code_vision_implementations;
         let docs_changed = self.options.render_doc_comments != options.render_doc_comments;
+        let pictures_changed =
+            self.options.markdown_images_from_internet != options.markdown_images_from_internet;
         self.options = options;
         if let Some(state) = &mut self.state {
             state.set_save_options(self.options.save);
@@ -1869,12 +2240,21 @@ impl EditorView {
         if docs_changed {
             self.apply_doc_comments(cx);
         }
+        if pictures_changed {
+            self.pictures_from_internet(cx);
+        }
         cx.notify();
     }
 
     /// What Settings turned on and off in this editor.
     pub fn options(&self) -> &EditorOptions {
         &self.options
+    }
+
+    /// The root of the project the file belongs to. Actions on save touch a file only
+    /// inside it; a file opened alone has no root and no such check.
+    pub fn set_project_root(&mut self, root: Option<PathBuf>) {
+        self.project_root = root;
     }
 
     fn apply_zoom(&mut self) {
@@ -1902,6 +2282,180 @@ impl EditorView {
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        let Some(requests) = self.save_action_requests() else {
+            self.write_save(cx);
+            return;
+        };
+        // The count covers the wait for the language: an external change of the file
+        // during it is a change against a save that has not written yet.
+        self.saving.fetch_add(1, Ordering::SeqCst);
+        let mut guard = SavingGuard::new(self.saving.clone());
+        let deadline = cx.background_executor().timer(SAVE_ACTIONS_TIMEOUT);
+        cx.spawn(async move |this, cx| {
+            let outcome = collect_save_actions(requests, deadline).await;
+            guard.finish();
+            this.update(cx, |this, cx| this.finish_save_actions(outcome, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// The questions the settings of actions on save put to the language, `None` when a
+    /// save has nothing to ask or may not touch the file.
+    fn save_action_requests(&self) -> Option<SaveActionRequests> {
+        let actions = &self.options.actions_on_save;
+        if !actions.any() || !actions.matches(&self.path) {
+            return None;
+        }
+        let state = self.state.as_ref()?;
+        if state.is_read_only() || !state.is_dirty() {
+            return None;
+        }
+        if has_conflict_markers(&state.text()) {
+            return None;
+        }
+        if let Some(root) = &self.project_root
+            && !self.path.starts_with(root)
+        {
+            return None;
+        }
+        let lsp = self.lsp.as_ref()?;
+        let uri = lsp.uri.clone();
+        let (tab_size, insert_spaces) = self.formatting_options();
+        let version = state.version();
+        let mut ranges = Vec::new();
+        if actions.reformat && actions.reformat_changed {
+            let store = state.store();
+            ranges = self
+                .gutter_marks
+                .iter()
+                .map(|mark| lines_span(&store, mark.lines.clone()))
+                .collect();
+        }
+        let support = &lsp.support;
+        let mut format = Vec::new();
+        let mut missing = false;
+        if actions.reformat {
+            if !ranges.is_empty()
+                && let Some(provider) = support.range_format()
+            {
+                for range in &ranges {
+                    format.push(ask(
+                        provider,
+                        RangeFormatQuery {
+                            uri: uri.clone(),
+                            version: version as i32,
+                            range: *range,
+                            tab_size,
+                            insert_spaces,
+                        },
+                    ));
+                }
+            } else if let Some(provider) = support.format() {
+                format.push(ask(
+                    provider,
+                    FormatQuery {
+                        uri: uri.clone(),
+                        version: version as i32,
+                        tab_size,
+                        insert_spaces,
+                    },
+                ));
+            } else {
+                missing = true;
+            }
+        }
+        let mut replies = Vec::new();
+        if actions.optimize_imports || actions.cleanup {
+            match support.actions() {
+                Some(provider) => {
+                    let store = state.store();
+                    let span = whole_span(&store);
+                    if actions.optimize_imports {
+                        replies.push(ask(
+                            provider,
+                            ActionQuery {
+                                uri: uri.clone(),
+                                version: version as i32,
+                                span,
+                                only: Some(ActionKind::OrganizeImports),
+                            },
+                        ));
+                    }
+                    if actions.cleanup {
+                        replies.push(ask(
+                            provider,
+                            ActionQuery {
+                                uri: uri.clone(),
+                                version: version as i32,
+                                span,
+                                only: Some(ActionKind::FixAll),
+                            },
+                        ));
+                    }
+                }
+                None => missing = true,
+            }
+        }
+        // With no request to wait for, the note of the missing provider is the answer.
+        Some(SaveActionRequests {
+            version,
+            format,
+            actions: replies,
+            ranges,
+            missing,
+        })
+    }
+
+    /// The language answered or the wait is over: the edits of the save go into the
+    /// buffer as one undo step, then the text is written.
+    fn finish_save_actions(&mut self, outcome: SaveActionOutcome, cx: &mut Context<Self>) {
+        let current = self.state.as_ref().map(EditorState::version);
+        if current == Some(outcome.version)
+            && let Some(edits) = outcome.edits
+            && let Some(state) = &self.state
+        {
+            let store = state.store();
+            let edits: Vec<DocumentEdit> = if outcome.ranges.is_empty() {
+                edits
+            } else {
+                edits
+                    .into_iter()
+                    .filter(|edit| {
+                        let start = crate::semantic::offset_at(&store, edit.span.start);
+                        let end = crate::semantic::offset_at(&store, edit.span.end).max(start);
+                        outcome.ranges.iter().any(|range| {
+                            let range_start = crate::semantic::offset_at(&store, range.start);
+                            let range_end =
+                                crate::semantic::offset_at(&store, range.end).max(range_start);
+                            start <= range_end && end >= range_start
+                        })
+                    })
+                    .collect()
+            };
+            if let Some(edits) = crate::actions::server_edits(&store, edits) {
+                let scroll = (self.scroll_top, self.scroll_left);
+                let change = self
+                    .state
+                    .as_mut()
+                    .and_then(|state| state.apply_save_action_edits(edits));
+                if change.is_some() {
+                    self.changed(change, cx);
+                    self.scroll_top = scroll.0;
+                    self.scroll_left = scroll.1;
+                    self.autoscroll = false;
+                }
+            }
+        }
+        if let Some(note) = outcome.note {
+            cx.emit(EditorEvent::SaveNote(note.into()));
+        }
+        self.write_save(cx);
+    }
+
+    /// The save without the language: the rules of `.editorconfig` and the settings go
+    /// into the buffer, then its text is written.
+    fn write_save(&mut self, cx: &mut Context<Self>) {
         self.prepare_save(cx);
         let Some(state) = &self.state else {
             return;
@@ -1947,6 +2501,32 @@ impl EditorView {
     /// so undo brings the edits back.
     pub fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
         self.read_disk(true, cx);
+    }
+
+    /// Reads a class of a library again, after its sources were attached. The caret stays
+    /// on the word it was on where the new text still has that word.
+    pub fn replace_source_text(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let anchor = word_at_caret(&state.text(), self.caret());
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let change = state.take_source_text(&text);
+        Self::set_source_text(&self.path, &text, cx);
+        self.changed(change, cx);
+        if let Some((word, offset)) = anchor
+            && let Some(found) = nearest_word(&text, &word, offset)
+        {
+            let line = text[..found].bytes().filter(|byte| *byte == b'\n').count();
+            let line_start = text[..found].rfind('\n').map_or(0, |at| at + 1);
+            let column = text[line_start..found].chars().count();
+            if let Some(state) = &mut self.state {
+                state.set_caret(line, column);
+            }
+        }
+        cx.notify();
     }
 
     fn read_disk(&mut self, forced: bool, cx: &mut Context<Self>) {
@@ -2094,19 +2674,15 @@ impl EditorView {
                 lsp.highlights.retain(|range| range.start < range.end);
                 lsp.highlights.sort_by_key(|range| (range.start, range.end));
                 lsp.highlights.dedup();
-                for mark in &mut lsp.marks {
-                    for step in &change.steps {
-                        mark.range.start = text_core::transform_offset(mark.range.start, step);
-                        mark.range.end = text_core::transform_offset(mark.range.end, step);
-                    }
-                    mark.range.end = mark.range.end.min(len);
-                    mark.range.start = mark.range.start.min(mark.range.end);
-                }
+                lsp.retain_transformed_marks(&change.steps, len);
+                lsp.retain_transformed_tokens(&change.steps, len);
             }
+            self.apply_tokens(cx);
             self.usages = None;
             self.sync_bookmarks(cx);
         }
         if change.is_some() {
+            self.debug_values.clear();
             cx.emit(EditorEvent::Changed);
             if self.bar.is_some() {
                 self.refresh_matches(false, cx);
@@ -2299,8 +2875,13 @@ impl EditorView {
 
     /// Whether Ctrl+Enter belongs to the application in this file.
     fn runs_on_enter(&self, cx: &App) -> bool {
-        cx.try_global::<PlainSyntax>()
-            .is_some_and(|plain| (plain.runs_on_enter)(&self.path))
+        let plain = cx
+            .try_global::<PlainSyntax>()
+            .is_some_and(|plain| (plain.runs_on_enter)(&self.path));
+        plain
+            || cx
+                .try_global::<RunFiles>()
+                .is_some_and(|files| (files.0)(&self.path))
     }
 
     /// The row the application adds above the text of this file.
@@ -2705,7 +3286,11 @@ impl EditorView {
             return;
         }
         // The frame after this key finishes the measurement; a run of keys records each.
-        self.pending_frames.push(Instant::now());
+        // A view painted as a pane of another one has no render of its own to drain the
+        // list, so it keeps only the latest keys.
+        if self.pending_frames.len() < PENDING_FRAMES {
+            self.pending_frames.push(Instant::now());
+        }
         let stroke = Keystroke {
             ctrl: modifiers.control,
             alt: modifiers.alt,
@@ -3293,6 +3878,30 @@ impl EditorView {
         Some((note.details.clone(), at))
     }
 
+    /// The hint of a badge of the gutter under the pointer: its text and where it stands.
+    fn place_hint_at(&self, position: Point<Pixels>) -> Option<(String, Point<Pixels>)> {
+        let layout = self.layout.as_ref()?;
+        let left = layout.bounds.left();
+        if !self.in_gutter(position)
+            || position.x < left + px(crate::element::ENDPOINT_X)
+            || position.x >= left + px(crate::element::ENDPOINT_X + 16.)
+        {
+            return None;
+        }
+        let line_height = px(self.style.line_height);
+        let shown = layout.rows.iter().find(|laid_out| {
+            !laid_out.is_block
+                && !laid_out.line.continuation
+                && position.y >= laid_out.y
+                && position.y < laid_out.y + line_height
+        })?;
+        let mark = self
+            .place_marks
+            .iter()
+            .find(|mark| mark.line as usize == shown.buffer_line)?;
+        Some((mark.hint.to_string(), point(position.x, shown.y)))
+    }
+
     /// The hint of the coverage stripe under the pointer, when the pointer is in the
     /// gutter: its text and where it stands.
     fn coverage_hint_at(&self, position: Point<Pixels>) -> Option<(String, Point<Pixels>)> {
@@ -3474,6 +4083,31 @@ impl EditorView {
             .state
             .as_ref()
             .map(|state| state.store().offset_to_line(line.start_offset));
+        if let Some(buffer_line) = run_line
+            && !line.continuation
+        {
+            let x = event.position.x - layout.bounds.left();
+            if x >= px(crate::element::ENDPOINT_X)
+                && x < px(crate::element::ENDPOINT_X + 16.)
+                && self
+                    .place_marks
+                    .iter()
+                    .any(|mark| mark.line as usize == buffer_line)
+            {
+                cx.emit(EditorEvent::PlaceMark(buffer_line as u32));
+                return;
+            }
+            if x >= px(crate::element::ENDPOINT_X)
+                && x < px(crate::element::ENDPOINT_X + 16.)
+                && self
+                    .endpoint_marks
+                    .iter()
+                    .any(|mark| mark.line as usize == buffer_line)
+            {
+                cx.emit(EditorEvent::EndpointMark(buffer_line as u32));
+                return;
+            }
+        }
         if let Some(buffer_line) = run_line
             && !line.continuation
             && event.position.x - layout.bounds.left() < px(crate::element::FOLD_X)
@@ -3661,6 +4295,12 @@ impl EditorView {
             cx.notify();
         }
 
+        let place_hint = self.place_hint_at(event.position);
+        if place_hint != self.place_hint {
+            self.place_hint = place_hint;
+            cx.notify();
+        }
+
         let hovered = self.in_gutter(event.position);
         if hovered != self.gutter_hovered {
             self.gutter_hovered = hovered;
@@ -3701,6 +4341,56 @@ impl EditorView {
         self.block_drag = None;
         self.scrollbar_drag = None;
     }
+}
+
+/// The word under a caret, with the byte offset of its start, for a text that is read
+/// again under the same caret.
+fn word_at_caret(text: &str, caret: (usize, usize)) -> Option<(String, usize)> {
+    let (line, column) = caret;
+    let start = text
+        .split_inclusive('\n')
+        .take(line)
+        .map(str::len)
+        .sum::<usize>();
+    let line_text = text[start..].split('\n').next().unwrap_or_default();
+    let mut offset = start
+        + line_text
+            .char_indices()
+            .nth(column)
+            .map_or(line_text.len(), |(at, _)| at);
+    let is_word =
+        |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+    while offset > start && text[..offset].chars().next_back().is_some_and(is_word) {
+        offset -= text[..offset].chars().next_back()?.len_utf8();
+    }
+    let end = text[offset..]
+        .char_indices()
+        .find(|(_, character)| !is_word(*character))
+        .map_or(text.len(), |(at, _)| offset + at);
+    (offset < end).then(|| (text[offset..end].to_owned(), offset))
+}
+
+/// The occurrence of `word` in `text` nearest to `offset`, for a caret that should stay
+/// on the same symbol after the text changed.
+fn nearest_word(text: &str, word: &str, offset: usize) -> Option<usize> {
+    let is_word =
+        |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+    let mut best = None;
+    let mut from = 0;
+    while let Some(found) = text[from..].find(word) {
+        let start = from + found;
+        let end = start + word.len();
+        let whole = !text[..start].chars().next_back().is_some_and(is_word)
+            && !text[end..].chars().next().is_some_and(is_word);
+        if whole {
+            let distance = start.abs_diff(offset);
+            if best.is_none_or(|(_, best): (usize, usize)| distance < best) {
+                best = Some((start, distance));
+            }
+        }
+        from = end;
+    }
+    best.map(|(start, _)| start)
 }
 
 fn position_in_fold_column(position: Point<Pixels>, bounds: Bounds<Pixels>) -> bool {
@@ -3940,6 +4630,25 @@ impl EditorView {
                 .into_any_element(),
             );
         }
+        if let Some((text, position)) = &self.place_hint {
+            let body = surface(&theme)
+                .debug_selector(|| "editor-place-hint".to_owned())
+                .max_w(px(420.))
+                .p_2()
+                .text_size(px(UI_SIZE))
+                .text_color(theme.text)
+                .child(text.clone());
+            popups.push(
+                deferred(
+                    anchored()
+                        .position(point(position.x + px(12.), position.y + px(16.)))
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
         if let Some((text, position)) = &self.coverage_hint {
             let rows: Vec<AnyElement> = text
                 .lines()
@@ -3985,6 +4694,23 @@ impl EditorView {
                 completion.window().map(|row| {
                     let parts = completion.label(row);
                     let selected = row == completion.selected;
+                    let left = if parts.deprecated {
+                        let len = parts.left.len();
+                        StyledText::new(parts.left)
+                            .with_highlights([(
+                                0..len,
+                                HighlightStyle {
+                                    strikethrough: Some(StrikethroughStyle {
+                                        thickness: px(1.),
+                                        color: None,
+                                    }),
+                                    ..HighlightStyle::default()
+                                },
+                            )])
+                            .into_any_element()
+                    } else {
+                        parts.left.into_any_element()
+                    };
                     div()
                         .flex()
                         .items_center()
@@ -3997,7 +4723,7 @@ impl EditorView {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(theme.text)
-                                .child(parts.left),
+                                .child(left),
                         )
                         .children(parts.right.map(|right| {
                             div().flex_none().text_color(theme.text_muted).child(right)

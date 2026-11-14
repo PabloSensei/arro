@@ -178,13 +178,24 @@ fn build(
         entry("Copy", actions::COPY, true),
         entry("Paste", actions::PASTE, paste),
         entry("Paste from History...", actions::PASTE_HISTORY, history),
-        MenuEntry::separator(),
     ];
 
     let text = path.display().to_string();
     entries.push(MenuEntry::new("Copy Path", move |_, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
     }));
+    let compare_workspace = workspace.clone();
+    entries.push(if paste {
+        MenuEntry::new("Compare with Clipboard", move |window, cx| {
+            compare_workspace
+                .update(cx, |workspace, cx| {
+                    workspace.run_command("workspace.compare_with_clipboard", window, cx)
+                })
+                .ok();
+        })
+    } else {
+        MenuEntry::disabled("Compare with Clipboard")
+    });
     entries.push(MenuEntry::separator());
 
     entries.push(entry(

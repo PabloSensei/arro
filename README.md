@@ -72,7 +72,17 @@
     </td>
     <td width="50%" valign="top">
       <h3>Run, test, debug</h3>
-      Maven and Gradle projects, run configurations, gutter run marks for <code>main</code> and tests, a test tree with rerun of failures, a debugger with breakpoints, stepping, evaluation, hot swap and thousands of virtual threads.
+      Maven and Gradle projects, run configurations, gutter run marks for <code>main</code> and tests, a test tree with rerun of failures, a debugger with breakpoints, stepping, evaluation, hot swap, variable values inline in the editor, remote JVM attach and thousands of virtual threads. Analyze Stack Trace turns a pasted trace or thread dump into clickable frames, and Dump Threads reads a running JVM.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Spring</h3>
+      Completion, hover and checks for <code>application.properties</code> and <code>.yml</code> from the configuration metadata of your class path. A Beans window with injection gutter marks and navigation, an Endpoints window with every HTTP handler, Spring Data JPA query methods and JPQL in <code>@Query</code> completed and checked against your entities, message bundles linked to <code>getMessage</code>, validation messages and Thymeleaf <code>#{…}</code>. A running Spring Boot app gets an Actuator tab with live Health, Beans, Mappings and Environment.
+    </td>
+    <td width="50%" valign="top">
+      <h3>Tools in the window</h3>
+      A database console for JDBC sources with a schema tree, an HTTP client for <code>.http</code> files, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, library sources on demand, and a Markdown preview with images.
     </td>
   </tr>
   <tr>
@@ -86,7 +96,7 @@
   </tr>
 </table>
 
-And the rest you expect from an IDE: Search Everywhere, Find in Files, a project tree, a terminal, file structure, bookmarks, split editors, dark and light themes, a configurable keymap, Docker services, Lombok support, and automatic updates.
+And the rest you expect from an IDE: Search Everywhere, Find in Files, a project tree, a terminal, file structure, bookmarks, split editors, Compare with Clipboard, actions on save (reformat, optimize imports), dark and light themes, a configurable keymap, Docker services, Lombok support, and automatic updates.
 
 ## Install
 
@@ -151,6 +161,8 @@ The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `c
 | Editor, navigation, refactoring | ✅ Works every day |
 | Maven and Gradle, run, tests, debugger | ✅ Works |
 | Git | ✅ Works |
+| Spring: configuration, beans, endpoints, message bundles, Actuator | 🚧 New, works on Spring PetClinic |
+| Database console, HTTP client, profiler, JShell | 🚧 New |
 | Windows 11 x86-64 | ✅ Supported |
 | Linux x86-64 | 🚧 Preview release |
 | macOS (Apple silicon; Intel where a runner builds it) | 🚧 Preview release |

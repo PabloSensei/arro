@@ -7,10 +7,11 @@ use editor_view::{EditorView, Semantic};
 use keymap::{editor as editor_keys, workspace as keys};
 use search::Tab;
 use ui_kit::*;
-use workspace::{DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, RUN_TOOL, Workspace};
+use workspace::{DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, RUN_TOOL, Workspace};
 
 use crate::choice::{ChoiceDialog, DialogChoice};
 use crate::debug::ActiveDebug;
+use crate::diff_view::DiffView;
 use crate::documentation::ActiveDocumentation;
 use crate::finder::{ActiveFinder, Finder};
 use crate::git::ActiveGit;
@@ -28,6 +29,7 @@ use crate::prompt::Prompt;
 use crate::run::RunPanel;
 use crate::run_configs::RunConfigDialog;
 use crate::script::{ActiveCommitPanel, ActiveRunPanel};
+use crate::stack_trace_dialog::StackTraceDialog;
 use crate::todo::ActiveTodo;
 use crate::usages::{self, ActiveUsages};
 
@@ -145,6 +147,21 @@ pub fn register(
         "Build Project",
         |workspace, window, cx| workspace.build_project(window, cx),
     );
+    workspace.register_command(
+        "workspace.profile",
+        "Profile with Profiler",
+        |workspace, window, cx| workspace.run_with_profiler(window, cx),
+    );
+    workspace.register_command(
+        "workspace.analyze_stack_trace",
+        "Analyze Stack Trace",
+        StackTraceDialog::show,
+    );
+    workspace.register_command(
+        "workspace.compare_with_clipboard",
+        "Compare with Clipboard",
+        compare_with_clipboard,
+    );
     workspace.register_command("workspace.compile", "Compile", |workspace, window, cx| {
         // Ctrl+Shift+F9 in a class with `main` debugs that program, as IDEA does; any
         // other file compiles the module as before.
@@ -173,6 +190,9 @@ pub fn register(
         workspace.compile_path(path, window, cx);
     });
     workspace.register_command("debug.attach_jvm", "Attach to JVM…", attach_to_jvm);
+    workspace.register_command("window.database", "Database", |workspace, window, cx| {
+        workspace.toggle_tool(DATABASE_TOOL, window, cx)
+    });
     workspace.register_command(
         "run.edit_configurations",
         "Edit Configurations…",
@@ -1084,6 +1104,38 @@ fn copy_paths(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
             .join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
+}
+
+/// Ctrl+D in the editor: the selected text, or the whole file, against the clipboard.
+fn compare_with_clipboard(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(view) = workspace
+        .active_view()
+        .and_then(|view| view.downcast::<EditorView>().ok())
+    else {
+        workspace.notify_user("Compare with Clipboard", "No file is open", cx);
+        return;
+    };
+    let Some(clipboard) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        workspace.notify_user("Compare with Clipboard", "The clipboard is empty", cx);
+        return;
+    };
+    let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+        return;
+    };
+    let (path, text) = {
+        let view = view.read(cx);
+        let text = view
+            .selected_text()
+            .or_else(|| view.text())
+            .unwrap_or_default();
+        (view.path().to_path_buf(), text)
+    };
+    let weak = cx.weak_entity();
+    DiffView::compare_text_clipboard(git, weak, path, text, clipboard, window, cx);
 }
 
 /// File > Open: a file opens in a tab of this window, a folder as a project.

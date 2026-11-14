@@ -436,6 +436,59 @@ impl<'a, S: TextStore> DisplaySnapshot<'a, S> {
         Wrapped { rows, first }
     }
 
+    /// The columns of the widest row of the text, with tabs counted as the spaces they
+    /// show. Rows the view itself adds, a block or a rendered comment, have no text and
+    /// are skipped. The common row is one line without a fold or an inlay, so its width
+    /// comes from the store without building the text of the line.
+    pub fn widest_row_columns(&self) -> usize {
+        // The common file: every row is one line of the text and nothing is folded, hinted
+        // or labelled, so one pass over the bytes gives the width of the widest line.
+        if self.wrapped.is_none()
+            && self.extra.is_empty()
+            && self.map.block.as_slice().is_empty()
+            && self.map.docs.as_slice().is_empty()
+            && self.map.folds.as_slice().is_empty()
+            && self.map.inlays.as_slice().is_empty()
+        {
+            return layout::widest_line_columns(&self.store, self.map.tab_size);
+        }
+        let mut widest = 0;
+        for row in 0..self.row_count() {
+            if self.is_block_row(row) {
+                continue;
+            }
+            widest = widest.max(self.row_columns(row));
+        }
+        widest
+    }
+
+    /// The columns of one row on screen, without building its text when the text is the
+    /// text of a single line.
+    fn row_columns(&self, row: usize) -> usize {
+        if self.wrapped.is_none() && !self.is_doc_row(row) {
+            let lines = self.fold_row_lines(row);
+            if lines.len() == 1 && self.plain_row(&lines) {
+                return layout::line_columns(&self.store, lines.start, self.map.tab_size);
+            }
+        }
+        self.line(row).text.chars().count()
+    }
+
+    /// Whether the one-line range has neither a fold nor an inlay, so the row shows the
+    /// text of the line as the store has it.
+    fn plain_row(&self, lines: &Range<usize>) -> bool {
+        let start = self.store.line_to_offset(lines.start);
+        let end = self.store.line_end(lines.end - 1);
+        let folds = self.map.folds.as_slice();
+        let fold = folds.partition_point(|fold| fold.range.end <= start);
+        if folds.get(fold).is_some_and(|fold| fold.range.start <= end) {
+            return false;
+        }
+        let inlays = self.map.inlays.as_slice();
+        let inlay = inlays.partition_point(|inlay| inlay.offset < start);
+        !inlays.get(inlay).is_some_and(|inlay| inlay.offset <= end)
+    }
+
     pub fn line(&self, row: usize) -> DisplayLine {
         let group = self.group_of(row);
         if let Some(doc) = self.doc_row(row) {

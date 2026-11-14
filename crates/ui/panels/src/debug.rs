@@ -4,7 +4,7 @@
 //! The panel is the window's end of a `dap_client::Debugger`: it sends commands and
 //! draws the newest snapshot, so an adapter never holds a frame.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -139,6 +139,10 @@ impl Global for ActiveDebugHub {}
 /// The breakpoints or the watch list changed, so an editor refreshes its gutter.
 #[derive(Clone, Copy, Debug)]
 pub struct BreakpointsChanged;
+
+/// The values of the stopped frame changed, so an editor refreshes its inline values.
+#[derive(Clone, Copy, Debug)]
+pub struct ValuesChanged;
 
 /// One breakpoint with the properties the user gave it. Kept with the project.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,9 +519,16 @@ pub struct DebugPanel {
     scroll_side: ScrollHandle,
     scroll_variables: ScrollHandle,
     scroll_watch: ScrollHandle,
+    /// The values of the frame at the last stop, by name, for the colour of changed ones.
+    stop_values: BTreeMap<String, String>,
+    /// The names whose value differs from the previous stop.
+    changed_values: BTreeSet<String>,
+    /// The stop whose values are in `stop_values`; zero before the first stop.
+    values_stop: u64,
 }
 
 impl EventEmitter<BreakpointsChanged> for DebugPanel {}
+impl EventEmitter<ValuesChanged> for DebugPanel {}
 
 impl DebugPanel {
     /// `root` and `store` come from the caller: the panel is made while the workspace is
@@ -576,6 +587,9 @@ impl DebugPanel {
             scroll_side: ScrollHandle::new(),
             scroll_variables: ScrollHandle::new(),
             scroll_watch: ScrollHandle::new(),
+            stop_values: BTreeMap::new(),
+            changed_values: BTreeSet::new(),
+            values_stop: 0,
         });
         let polling = panel.downgrade();
         cx.spawn(async move |cx| {
@@ -601,6 +615,59 @@ impl DebugPanel {
     /// The newest snapshot of the session, for scripts and tests.
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// The values of the frame at the stop, with the ones that changed since the
+    /// previous stop, for the editor to show after the lines that name them.
+    pub fn stopped_values(&self) -> Vec<editor_view::DebugValue> {
+        let changed = &self.changed_values;
+        self.frame_values()
+            .into_iter()
+            .map(|(name, value)| editor_view::DebugValue {
+                changed: changed.contains(&name),
+                name,
+                value,
+            })
+            .collect()
+    }
+
+    /// The file and the buffer line of the frame the window shows while stopped.
+    pub fn stop_location(&self) -> Option<(PathBuf, usize)> {
+        if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            return None;
+        }
+        let frame = self
+            .snapshot
+            .frames
+            .iter()
+            .find(|frame| Some(frame.id) == self.snapshot.selected_frame && frame.source.is_some())
+            .or_else(|| {
+                self.snapshot
+                    .frames
+                    .iter()
+                    .find(|frame| frame.source.is_some())
+            })?;
+        Some((frame.source.clone()?, frame.line.saturating_sub(1) as usize))
+    }
+
+    /// The values of the scopes of the selected frame, by name. A name of the locals
+    /// wins over a field of the same name, as the debugger names the one in force.
+    fn frame_values(&self) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        for scope in &self.snapshot.scopes {
+            let Some(variables) = self.snapshot.variables.get(&scope.reference) else {
+                continue;
+            };
+            for variable in variables {
+                if variable.name.is_empty() || variable.name == "this" {
+                    continue;
+                }
+                values
+                    .entry(variable.name.clone())
+                    .or_insert_with(|| variable.value.clone());
+            }
+        }
+        values
     }
 
     /// Whether a scope or a variable of the tree is open, for tests.
@@ -818,6 +885,9 @@ impl DebugPanel {
         self.pending = None;
         self.session = None;
         self.front = Front::Debugger;
+        self.stop_values.clear();
+        self.changed_values.clear();
+        self.values_stop = 0;
     }
 
     fn launch_pending(&mut self, cx: &mut Context<Self>) {
@@ -1595,6 +1665,35 @@ impl DebugPanel {
                 self.send(Command::StepIn, cx);
             }
         }
+        // The inline values follow the stop that the stack and its scopes belong to.
+        let stopped = matches!(self.snapshot.state, DebugState::Stopped { .. });
+        let values_changed = if stopped
+            && !self.snapshot.frames.is_empty()
+            && self.values_stop != self.snapshot.stops
+        {
+            self.values_stop = self.snapshot.stops;
+            let current = self.frame_values();
+            self.changed_values = current
+                .iter()
+                .filter(|(name, value)| {
+                    self.stop_values
+                        .get(*name)
+                        .is_some_and(|previous| previous != *value)
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            self.stop_values = current;
+            true
+        } else if !stopped && self.values_stop != 0 {
+            self.values_stop = 0;
+            self.changed_values.clear();
+            true
+        } else {
+            false
+        };
+        if values_changed {
+            cx.emit(ValuesChanged);
+        }
         if breakpoints_changed {
             cx.emit(BreakpointsChanged);
         }
@@ -1696,11 +1795,21 @@ impl DebugPanel {
 
     /// Output that comes from the process of a test run, forwarded by the Run panel.
     pub fn push_output(&mut self, text: impl Into<String>, error: bool, cx: &mut Context<Self>) {
-        for line in text.into().lines() {
+        let text = text.into();
+        for line in text.lines() {
             if !line.is_empty() {
                 self.local_console
                     .push(ConsoleLine::new(line.to_owned(), error));
             }
+        }
+        {
+            let queue = cx.default_global::<crate::run::DebugOutput>();
+            let mut queue = queue.0.lock().unwrap_or_else(|poison| poison.into_inner());
+            queue.extend(
+                text.lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned),
+            );
         }
         self.trim_console();
         cx.notify();
@@ -1842,6 +1951,7 @@ impl DebugPanel {
     }
 
     pub fn resume(&mut self, _cx: &mut Context<Self>) {
+        self.run_away(_cx);
         self.send(Command::Continue, _cx);
     }
 
@@ -1863,15 +1973,31 @@ impl DebugPanel {
     }
 
     pub fn step_over(&mut self, _cx: &mut Context<Self>) {
+        self.run_away(_cx);
         self.send(Command::Next, _cx);
     }
 
     pub fn step_into(&mut self, _cx: &mut Context<Self>) {
+        self.run_away(_cx);
         self.send(Command::StepIn, _cx);
     }
 
     pub fn step_out(&mut self, _cx: &mut Context<Self>) {
+        self.run_away(_cx);
         self.send(Command::StepOut, _cx);
+    }
+
+    /// The program runs on: the values of the stop go away at once, without waiting for
+    /// the snapshot of the command, so a step does not flash them again.
+    fn run_away(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            return;
+        }
+        self.snapshot.state = DebugState::Running;
+        self.values_stop = 0;
+        self.changed_values.clear();
+        cx.emit(ValuesChanged);
+        cx.notify();
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
@@ -5045,6 +5171,48 @@ pub(crate) fn refresh_breakpoints(
     view.set_field_watchpoints(fields, cx);
 }
 
+/// Shows the values of the stopped frame after the lines of the method the editor
+/// shows, or takes them away when the program runs or Settings hides them.
+pub(crate) fn refresh_inline_values(
+    view: &mut editor_view::EditorView,
+    cx: &mut Context<editor_view::EditorView>,
+) {
+    let enabled = cx
+        .try_global::<workspace::Settings>()
+        .is_none_or(|settings| settings.debug_show_values_inline);
+    let Some(panel) = cx.try_global::<ActiveDebug>() else {
+        view.set_debug_values(None, &[], cx);
+        return;
+    };
+    let panel = panel.0.clone();
+    let path = view.path().to_path_buf();
+    let shown = if enabled {
+        panel.read_with(cx, |panel, _| {
+            let (file, line) = panel.stop_location()?;
+            same_file(&file, &path).then(|| (line, panel.stopped_values()))
+        })
+    } else {
+        None
+    };
+    match shown {
+        Some((line, values)) => view.set_debug_values(Some(line), &values, cx),
+        None => view.set_debug_values(None, &[], cx),
+    }
+}
+
+/// Whether two paths name the same file, without a case difference on Windows.
+fn same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 /// The toolbar and the debug keys of the window.
 pub fn controls(
     panel: &Entity<DebugPanel>,
@@ -5125,7 +5293,7 @@ pub fn controls(
 // The only test here runs ping.exe and cmd.exe.
 #[cfg(all(test, windows))]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5218,6 +5386,9 @@ mod tests {
                 scroll_side: ScrollHandle::new(),
                 scroll_variables: ScrollHandle::new(),
                 scroll_watch: ScrollHandle::new(),
+                stop_values: BTreeMap::new(),
+                changed_values: BTreeSet::new(),
+                values_stop: 0,
             })
         })
     }

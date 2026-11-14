@@ -32,6 +32,18 @@ impl OpenEditors {
     pub fn get(cx: &App, path: &Path) -> Option<Entity<EditorView>> {
         cx.try_global::<Self>()?.0.get(path)?.upgrade()
     }
+
+    /// The open editors, for a model that has to reach every one of them.
+    pub fn all(cx: &App) -> Vec<Entity<EditorView>> {
+        let Some(editors) = cx.try_global::<Self>() else {
+            return Vec::new();
+        };
+        editors
+            .0
+            .values()
+            .filter_map(|view| view.upgrade())
+            .collect()
+    }
 }
 
 fn kind_of(kind: SymbolKind) -> OutlineKind {

@@ -118,6 +118,8 @@ pub struct CompletionEntry {
     pub resolve: Option<String>,
     /// What the entry names, when the provider tells.
     pub kind: CompletionKind,
+    /// The entry is out of use: the list strikes its name through and puts it last.
+    pub deprecated: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

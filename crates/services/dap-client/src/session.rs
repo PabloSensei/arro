@@ -84,6 +84,7 @@ pub async fn run_with_output(
         project: launch.project.clone(),
         attach_host: launch.attach_host.clone(),
         attach_port: launch.attach_port,
+        owns_process: launch.process_id.is_some(),
         name: launch.name.clone(),
         adapter_id: launch.adapter_id.clone(),
         output,
@@ -156,6 +157,9 @@ struct Session {
     project: Option<String>,
     attach_host: Option<String>,
     attach_port: Option<u16>,
+    /// The program of this session was started by this process, so the session may end
+    /// it. An attached program belongs to somebody else and stays.
+    owns_process: bool,
     name: String,
     adapter_id: String,
     /// Lines of the debuggee that the adapter does not report.
@@ -780,10 +784,8 @@ impl Session {
     }
 
     async fn disconnect(&mut self) {
-        let _ = self
-            .client
-            .request("disconnect", json!({"terminateDebuggee": true}))
-            .await;
+        let arguments = json!({"terminateDebuggee": self.owns_process});
+        let _ = self.client.request("disconnect", arguments).await;
         self.finish();
     }
 

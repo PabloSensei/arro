@@ -5,13 +5,13 @@ use std::ops::Range;
 
 use tree_sitter::{Node, Parser, Tree};
 
-fn parse(text: &str) -> Option<Tree> {
+pub(super) fn parse(text: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&super::config().grammar).ok()?;
     parser.parse(text, None)
 }
 
-fn node_at(tree: &Tree, offset: usize) -> Node<'_> {
+pub(super) fn node_at(tree: &Tree, offset: usize) -> Node<'_> {
     let offset = offset.min(tree.root_node().end_byte());
     tree.root_node()
         .descendant_for_byte_range(offset, offset)

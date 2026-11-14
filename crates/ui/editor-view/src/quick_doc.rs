@@ -6,6 +6,7 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -84,7 +85,37 @@ pub enum DocInline {
     Strong(Vec<DocInline>),
     Emphasis(Vec<DocInline>),
     Code(String),
-    Link { text: Vec<DocInline>, url: String },
+    Link {
+        text: Vec<DocInline>,
+        url: String,
+    },
+    /// A picture among the words, drawn where the place that shows the answer can
+    /// reach it and named by its text elsewhere.
+    Image(DocImage),
+}
+
+/// A picture of a document: the text for the places that do not draw it, the address it
+/// comes from and the size the document asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocImage {
+    pub alt: String,
+    pub url: String,
+    /// The width the document asks for, in pixels.
+    pub width: Option<f32>,
+    /// The height the document asks for, in pixels.
+    pub height: Option<f32>,
+}
+
+/// A picture the place that shows the answer has already found: a file of the project,
+/// bytes from the internet, or the reason there is nothing to draw.
+#[derive(Clone)]
+pub enum DocPicture {
+    File(PathBuf),
+    Bytes(Arc<Image>),
+    /// The bytes are on their way.
+    Loading,
+    /// The file is not there, the address is not a picture, or the bytes did not come.
+    Unavailable,
 }
 
 /// The quick documentation popup and what it belongs to.
@@ -239,10 +270,10 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>, lines: &mut Ve
                 }
             }
             mdast::Node::Html(html) => {
-                let text = strip_tags(&html.value);
-                let text = text.trim();
-                if !text.is_empty() {
-                    blocks.push(DocBlock::Paragraph(vec![DocInline::Text(text.to_owned())]));
+                let inlines = html_inlines(&html.value);
+                let inlines = trim_inlines(inlines);
+                if !inlines.is_empty() {
+                    blocks.push(DocBlock::Paragraph(inlines));
                 }
             }
             _ => {}
@@ -362,15 +393,18 @@ fn push_inline(node: &mdast::Node, out: &mut Vec<DocInline>) {
             }],
         ),
         mdast::Node::Image(image) => {
-            merge(out, vec![DocInline::Text(image.alt.clone())]);
+            merge(
+                out,
+                vec![DocInline::Image(DocImage {
+                    alt: image.alt.clone(),
+                    url: image.url.clone(),
+                    width: None,
+                    height: None,
+                })],
+            );
         }
         mdast::Node::Break(_) => merge(out, vec![DocInline::Text("\n".to_owned())]),
-        mdast::Node::Html(html) => {
-            let text = strip_tags(&html.value);
-            if !text.is_empty() {
-                merge(out, vec![DocInline::Text(text)]);
-            }
-        }
+        mdast::Node::Html(html) => merge(out, html_inlines(&html.value)),
         other => {
             let text = plain_node(other);
             if !text.is_empty() {
@@ -569,9 +603,92 @@ pub(crate) fn plain_inlines(inlines: &[DocInline]) -> String {
                 out.push_str(&plain_inlines(children));
             }
             DocInline::Link { text, .. } => out.push_str(&plain_inlines(text)),
+            DocInline::Image(image) => {
+                out.push_str(if image.alt.is_empty() {
+                    &image.url
+                } else {
+                    &image.alt
+                });
+            }
         }
     }
     out
+}
+
+/// A piece of HTML as the runs of an answer: the pictures it holds in place and the text
+/// around them. A piece without pictures is the text with its tags dropped, as before.
+fn html_inlines(html: &str) -> Vec<DocInline> {
+    let mut out: Vec<DocInline> = Vec::new();
+    let mut text = String::new();
+    let mut at = 0;
+    while let Some(open) = html[at..].find('<') {
+        text.push_str(&html[at..at + open]);
+        let Some(close) = html[at + open..].find('>') else {
+            at = html.len();
+            break;
+        };
+        let end = at + open + close + 1;
+        let tag = &html[at + open + 1..end - 1];
+        if tag_name(tag) == "img"
+            && let Some(image) = html_image(tag)
+        {
+            if !text.is_empty() {
+                merge(&mut out, vec![DocInline::Text(std::mem::take(&mut text))]);
+            }
+            merge(&mut out, vec![DocInline::Image(image)]);
+        }
+        at = end;
+    }
+    text.push_str(&html[at..]);
+    if !text.is_empty() {
+        merge(&mut out, vec![DocInline::Text(text)]);
+    }
+    out
+}
+
+/// Drops the spaces at the two ends of a run of HTML the markdown parser kept whole.
+fn trim_inlines(mut inlines: Vec<DocInline>) -> Vec<DocInline> {
+    if let Some(DocInline::Text(first)) = inlines.first_mut() {
+        *first = first.trim_start().to_owned();
+    }
+    if let Some(DocInline::Text(last)) = inlines.last_mut() {
+        *last = last.trim_end().to_owned();
+    }
+    inlines.retain(|inline| !matches!(inline, DocInline::Text(text) if text.is_empty()));
+    inlines
+}
+
+/// The name of a tag, lowercased, without the slash of a closing one.
+fn tag_name(tag: &str) -> String {
+    tag.trim_start_matches('/')
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// The picture of an `<img>` tag: its address, its text for the places that do not draw
+/// it and the size it asks for.
+fn html_image(tag: &str) -> Option<DocImage> {
+    let url = attribute(tag, "src")?;
+    if url.trim().is_empty() {
+        return None;
+    }
+    Some(DocImage {
+        alt: attribute(tag, "alt").unwrap_or_default(),
+        url,
+        width: size_attribute(tag, "width"),
+        height: size_attribute(tag, "height"),
+    })
+}
+
+/// The size of one attribute in pixels: `width="1042"`, `width="1042px"` and
+/// `width="1042.5"` all count.
+fn size_attribute(body: &str, wanted: &str) -> Option<f32> {
+    let value = attribute(body, wanted)?;
+    let value = value.trim().trim_end_matches("px").trim();
+    value.parse::<f32>().ok().filter(|size| *size > 0.)
 }
 
 /// The simple tags a documentation comment uses, as markdown. Tags are only read
@@ -788,23 +905,8 @@ fn attribute(body: &str, wanted: &str) -> Option<String> {
     None
 }
 
-/// The text without tags, for an HTML block the markdown parser kept whole.
-fn strip_tags(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    while let Some(open) = text[at..].find('<') {
-        out.push_str(&text[at..at + open]);
-        let Some(close) = text[at + open..].find('>') else {
-            out.push_str(&text[at + open..]);
-            return out;
-        };
-        at += open + close + 1;
-    }
-    out.push_str(&text[at..]);
-    out
-}
-
-/// One piece of a rendered line, already split by the emphasis around it.
+/// One piece of a rendered line, already split by the emphasis around it: a run of
+/// words or a picture.
 struct Piece {
     text: String,
     bold: bool,
@@ -812,6 +914,22 @@ struct Piece {
     code: bool,
     url: Option<String>,
     link: Option<usize>,
+    /// The picture this piece draws instead of its words.
+    image: Option<DocImage>,
+}
+
+impl Piece {
+    fn words(text: String, style: InlineStyle<'_>, code: bool) -> Self {
+        Self {
+            text,
+            bold: style.bold,
+            italic: style.italic,
+            code,
+            url: style.url.map(str::to_owned),
+            link: style.link,
+            image: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -830,22 +948,8 @@ fn flatten_inline(
     out: &mut Vec<Piece>,
 ) {
     match inline {
-        DocInline::Text(text) => out.push(Piece {
-            text: text.clone(),
-            bold: style.bold,
-            italic: style.italic,
-            code: style.code,
-            url: style.url.map(str::to_owned),
-            link: style.link,
-        }),
-        DocInline::Code(text) => out.push(Piece {
-            text: text.clone(),
-            bold: style.bold,
-            italic: style.italic,
-            code: true,
-            url: style.url.map(str::to_owned),
-            link: style.link,
-        }),
+        DocInline::Text(text) => out.push(Piece::words(text.clone(), style, style.code)),
+        DocInline::Code(text) => out.push(Piece::words(text.clone(), style, true)),
         DocInline::Strong(children) => {
             let style = InlineStyle {
                 bold: true,
@@ -876,6 +980,19 @@ fn flatten_inline(
                 flatten_inline(child, style, next_link, out);
             }
         }
+        DocInline::Image(image) => out.push(Piece {
+            text: if image.alt.is_empty() {
+                image.url.clone()
+            } else {
+                image.alt.clone()
+            },
+            bold: style.bold,
+            italic: style.italic,
+            code: false,
+            url: style.url.map(str::to_owned),
+            link: style.link,
+            image: Some(image.clone()),
+        }),
     }
 }
 
@@ -1521,12 +1638,10 @@ pub enum DocSelectEvent {
 
 /// The width of a column of a table, so that a wide one scrolls sideways.
 const TABLE_COLUMN_WIDTH: f32 = 180.;
-/// The widest a picture of a file gets in its preview.
-const PICTURE_WIDTH: f32 = 480.;
 
 /// The file a picture of the answer comes from, when the address points at one of the
 /// formats the window draws.
-fn image_path(base: &Path, url: &str) -> Option<PathBuf> {
+pub(crate) fn image_path(base: &Path, url: &str) -> Option<PathBuf> {
     let url = url.split(['#', '?']).next().unwrap_or_default();
     if url.is_empty() || url.contains("://") {
         return None;
@@ -1594,7 +1709,22 @@ impl<'a> DocRenderer<'a> {
             link_tokens: Vec::new(),
             table: 0,
             word: 0,
+            pictures: None,
+            picture_count: 0,
         })
+    }
+
+    /// The same renderer for a place that found the pictures of the answer itself: a
+    /// picture missing from `pictures` is shown by its text.
+    pub(crate) fn with_pictures(
+        style: &'a EditorStyle,
+        theme: &'a Theme,
+        host: &'a DocHost,
+        pictures: &'a std::collections::HashMap<String, DocPicture>,
+    ) -> Self {
+        let mut renderer = Self::new(style, theme, host);
+        renderer.0.pictures = Some(pictures);
+        renderer
     }
 
     /// One block, in the order of the answer: the cursor keeps the offsets of a selection
@@ -1629,6 +1759,11 @@ struct DocRender<'a> {
     link_tokens: Vec<usize>,
     table: usize,
     word: usize,
+    /// The pictures the caller has already found by their address, `None` when it has
+    /// none and every picture shows its text.
+    pictures: Option<&'a std::collections::HashMap<String, DocPicture>>,
+    /// How many pictures have been placed, for a selector.
+    picture_count: usize,
 }
 
 impl DocRender<'_> {
@@ -1734,7 +1869,13 @@ impl DocRender<'_> {
             } => self.table(alignments, header, rows, window, cx),
             DocBlock::Image { alt, url } => {
                 self.cursor += 1;
-                self.image(alt, url)
+                let image = DocImage {
+                    alt: alt.clone(),
+                    url: url.clone(),
+                    width: None,
+                    height: None,
+                };
+                self.image(&image)
             }
             DocBlock::Quote(inner) => {
                 let mut column = div()
@@ -1858,18 +1999,40 @@ impl DocRender<'_> {
         .into_any_element()
     }
 
-    /// A picture of the text: drawn from the folder of the file when the viewer knows
-    /// that folder and the address is a picture, the text of it otherwise.
-    fn image(&mut self, alt: &str, url: &str) -> AnyElement {
+    /// A picture of the text: drawn where the caller found it, the text of it in a frame
+    /// when there is nothing to draw, or taken from the folder of the file when the
+    /// viewer knows that folder and nothing more.
+    fn image(&mut self, image: &DocImage) -> AnyElement {
         let theme = self.theme;
-        let text = if alt.is_empty() { url } else { alt };
+        let index = self.next_picture();
+        if let Some(drawn) = self.picture(image, index, None) {
+            return div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(drawn)
+                .into_any_element();
+        }
+        if self.pictures.is_some() {
+            return div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(self.picture_text(image, index, None))
+                .into_any_element();
+        }
+        let text = if image.alt.is_empty() {
+            &image.url
+        } else {
+            &image.alt
+        };
         let Some(base) = &self.host.base else {
             let inlines = [DocInline::Text(text.to_owned())];
             return self
                 .inlines(&inlines, UI_SIZE, theme.code, false, true)
                 .into_any_element();
         };
-        let Some(path) = image_path(base, url) else {
+        let Some(path) = image_path(base, &image.url) else {
             let inlines = [DocInline::Text(text.to_owned())];
             return self
                 .inlines(&inlines, UI_SIZE, theme.code, false, true)
@@ -1884,9 +2047,79 @@ impl DocRender<'_> {
             .flex_col()
             .gap(px(SPACE_XS))
             .w_full()
-            .child(img(path.as_path()).max_w(px(PICTURE_WIDTH)))
+            .child(img(path.as_path()).max_w_full())
             .child(caption)
             .into_any_element()
+    }
+
+    /// The number of the next picture, for the selector of its element.
+    fn next_picture(&mut self) -> usize {
+        let index = self.picture_count;
+        self.picture_count += 1;
+        index
+    }
+
+    /// The picture itself, when the caller found it: no wider than the column that holds
+    /// it, and as wide and as high as the document asks. `link` makes it open.
+    fn picture(&self, image: &DocImage, index: usize, link: Option<&str>) -> Option<AnyElement> {
+        let picture = self.pictures?.get(&image.url)?;
+        let mut element = match picture {
+            DocPicture::File(path) => img(path.as_path()),
+            DocPicture::Bytes(bytes) => img(bytes.clone()),
+            DocPicture::Loading | DocPicture::Unavailable => return None,
+        };
+        element = element.flex_none().max_w_full();
+        if let Some(width) = image.width {
+            element = element.w(px(width.max(1.)));
+        }
+        if let Some(height) = image.height {
+            element = element.h(px(height.max(1.)));
+        }
+        let selector = format!("{}-image-{index}", self.host.name);
+        let mut element = element
+            .id(ElementId::Name(selector.clone().into()))
+            .debug_selector(move || selector);
+        if let Some(url) = link {
+            let on_link = self.host.on_link.clone();
+            let url = url.to_owned();
+            element = element
+                .cursor_pointer()
+                .on_click(move |_, window, cx| on_link(url.clone(), window, cx));
+        }
+        Some(element.into_any_element())
+    }
+
+    /// The text of a picture there is nothing to draw for, in a frame of its own. It
+    /// opens the link around the picture, as the words of a link do.
+    fn picture_text(&mut self, image: &DocImage, index: usize, link: Option<&str>) -> AnyElement {
+        let theme = self.theme;
+        let text = if image.alt.is_empty() {
+            image.url.clone()
+        } else {
+            image.alt.clone()
+        };
+        self.cursor += text.len();
+        let name = self.host.name.clone();
+        let mut frame = div()
+            .id(ElementId::Name(format!("{name}-picture-{index}").into()))
+            .flex_none()
+            .mx(px(SPACE_XS))
+            .px(px(SPACE_S))
+            .py(px(SPACE_XS))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text_secondary)
+            .debug_selector(move || format!("{name}-picture-{index}"));
+        if let Some(url) = link {
+            let on_link = self.host.on_link.clone();
+            let url = url.to_owned();
+            frame = frame
+                .cursor_pointer()
+                .on_click(move |_, window, cx| on_link(url.clone(), window, cx));
+        }
+        frame.child(text).into_any_element()
     }
 
     fn inlines(
@@ -1911,6 +2144,21 @@ impl DocRender<'_> {
         }
         let mut lines: Vec<Vec<AnyElement>> = vec![Vec::new()];
         for piece in pieces {
+            if let Some(image) = &piece.image {
+                let link = piece.url.as_deref();
+                let index = self.next_picture();
+                let cell = match self.picture(image, index, link) {
+                    Some(drawn) => drawn,
+                    None if self.pictures.is_some() => self.picture_text(image, index, link),
+                    None => {
+                        let inlines = [DocInline::Text(piece.text.clone())];
+                        self.inlines(&inlines, size, color, bold, wrap)
+                            .into_any_element()
+                    }
+                };
+                lines.last_mut().expect("a line").push(cell);
+                continue;
+            }
             for (line, text) in piece.text.split('\n').enumerate() {
                 if line > 0 {
                     self.cursor += 1;
@@ -2349,6 +2597,38 @@ mod tests {
             plain_inlines(inlines).contains("an icon"),
             "a picture inside a line keeps its text: {inlines:?}"
         );
+    }
+
+    #[test]
+    fn a_picture_among_words_keeps_the_words_around_it() {
+        let (blocks, _) = parse_with_lines("See ![an icon](a.png) here.\n");
+        let DocBlock::Paragraph(inlines) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        assert!(
+            inlines
+                .iter()
+                .any(|inline| matches!(inline, DocInline::Image(_))),
+            "the picture stays a picture of its own: {inlines:?}"
+        );
+        assert_eq!(plain_inlines(inlines), "See an icon here.");
+    }
+
+    #[test]
+    fn an_html_picture_keeps_its_address_size_and_text() {
+        let (blocks, _) = parse_with_lines(
+            "<img width=\"1042\" height=\"20px\" alt=\"shot\" src=\"docs/a.png\">\n",
+        );
+        let DocBlock::Paragraph(inlines) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        let DocInline::Image(image) = &inlines[0] else {
+            panic!("the picture is a run of the line: {inlines:?}");
+        };
+        assert_eq!(image.alt, "shot");
+        assert_eq!(image.url, "docs/a.png");
+        assert_eq!(image.width, Some(1042.));
+        assert_eq!(image.height, Some(20.));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use base::{Cancel, Result, Snapshot};
 use proc_sup::ProcessSpec;
 use workspace_core::{EventBus, Subscription};
 
-use crate::{BuildModule, Module, ProjectModel, cache};
+use crate::{BuildModule, Exclusion, FileEdit, Module, ProjectModel, cache};
 
 const EVENT_QUEUE: usize = 16;
 
@@ -91,10 +91,70 @@ pub trait BuildSystem: Send + Sync {
         self.task_in(root, module, task, options)
     }
 
+    /// Whether a task run can have its samples recorded.
+    fn supports_profiler(&self) -> bool {
+        false
+    }
+
+    /// The command of `task` with the JVMs it starts recording, and the file the runtime
+    /// writes. A task whose JVMs the tool cannot reach records nothing, and the window
+    /// says so.
+    fn profile_task_in(
+        &self,
+        _root: &Path,
+        _module: Option<&Module>,
+        _task: &str,
+        _options: TaskOptions,
+    ) -> Result<Option<RecordedTask>> {
+        Ok(None)
+    }
+
+    /// Reads a recording of [`BuildSystem::profile_task_in`] into the model of the window.
+    fn profile_report(
+        &self,
+        _recording: &Path,
+        _model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        Err("this build tool cannot read a recording".into())
+    }
+
+    /// The recordings of this tool still on disk, the newest first.
+    fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        Ok(Vec::new())
+    }
+
+    /// Every file one profile run left: a recording is per JVM, so a run may have several.
+    fn profile_run_recordings(&self, recording: &Path) -> Vec<PathBuf> {
+        vec![recording.to_owned()]
+    }
+
     /// Whether [`TaskOptions::skip_tests`] changes what the tool runs.
     fn supports_skip_tests(&self) -> bool {
         false
     }
+
+    /// The change to the build file that leaves the dependency `request.exclude` out of
+    /// the first-level dependency `request.declared` of `module`, as offsets in `text`.
+    /// `None` when the file does not declare that dependency in a form an edit can
+    /// change. The window makes the edit in its editor and saves it as a user edit.
+    fn exclude(
+        &self,
+        _root: &Path,
+        _module: &Module,
+        _build_file: &Path,
+        _request: &Exclusion,
+        _text: &str,
+    ) -> Result<Option<FileEdit>> {
+        Ok(None)
+    }
+}
+
+/// A task run whose JVMs record their samples: the command and the file the runtime
+/// writes.
+#[derive(Clone, Debug)]
+pub struct RecordedTask {
+    pub program: ProcessSpec,
+    pub recording: PathBuf,
 }
 
 /// What a task run may change besides the task itself.

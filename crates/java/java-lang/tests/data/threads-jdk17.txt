@@ -1,0 +1,23 @@
+2026-11-14 10:00:00
+Full thread dump OpenJDK 64-Bit Server VM (17.0.2+8 mixed mode):
+
+"main" #1 prio=5 os_prio=0 cpu=123.45ms elapsed=1.23s tid=0x000001d8a2 nid=0x2a1c waiting on condition  [0x000000d4a1]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+	at java.base/java.lang.Thread.sleep0(Native Method)
+	at java.base/java.lang.Thread.sleep(Thread.java:509)
+	at com.example.App.main(App.java:8)
+
+"pool-1-thread-1" #14 prio=5 os_prio=0 cpu=12.00ms elapsed=1.20s tid=0x000001d8b3 nid=0x3b20 waiting for monitor entry  [0x000000d4b2]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait0(Native Method)
+	- waiting on <0x00000000deadbeef> (a java.lang.Object)
+	at java.lang.Object.wait(Object.java:366)
+	at com.example.App.lambda$main$0(App.java:20)
+	- locked <0x00000000cafebabe> (a java.lang.Object)
+	- waiting to lock <0x00000000deadbeef> (a java.lang.Object)
+
+"Reference Handler" #2 daemon prio=10 os_prio=0 cpu=0.31ms elapsed=1.23s tid=0x000001d8c4 nid=0x2b30 waiting on condition  [0x000000d4c3]
+   java.lang.Thread.State: RUNNABLE
+	at java.lang.ref.Reference.waitForReferencePendingList(Native Method)
+	at java.lang.ref.Reference.processPendingReferences(Reference.java:253)
+	at java.lang.ref.Reference$ReferenceHandler.run(Reference.java:215)

@@ -6,16 +6,21 @@ use base::program::bat_script;
 use base::{Cancel, Result};
 use proc_sup::{ProcessClass, ProcessSpec};
 use project_model::{
-    BuildGroup, BuildModule, BuildSystem, BuildTask, Module, PathEntry, PathKind, ProjectModel,
-    TaskOptions, Unit, cache_file,
+    BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, Module,
+    ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TaskOptions, Unit,
+    cache_file,
 };
 use serde::Deserialize;
 
+use crate::dependencies::{ReportTrees, exclude_in_script};
 use crate::env::{fresh_directory, run_tool};
 use crate::fingerprint::{BuildStamp, has_classes};
 use crate::{BuildEnv, Jdk, find_jdks};
 
 const INIT_SCRIPT: &str = include_str!("../../../../helpers/gradle-init/ide-model.init.gradle");
+/// The init script of a profile run: it adds the recording flag to the JVMs of the task.
+const PROFILE_SCRIPT: &str =
+    include_str!("../../../../helpers/gradle-init/ide-profile.init.gradle");
 const WRAPPER_JAR: &str = "gradle/wrapper/gradle-wrapper.jar";
 const WRAPPER_PROPERTIES: &str = "gradle/wrapper/gradle-wrapper.properties";
 const BUILD_FILES: &[&str] = &[
@@ -352,6 +357,71 @@ impl BuildSystem for Gradle {
             _ => spec,
         })
     }
+
+    fn exclude(
+        &self,
+        _root: &Path,
+        _module: &Module,
+        build_file: &Path,
+        request: &Exclusion,
+        text: &str,
+    ) -> Result<Option<FileEdit>> {
+        Ok(exclude_in_script(text, request, build_file))
+    }
+
+    fn supports_profiler(&self) -> bool {
+        true
+    }
+
+    /// The init script adds the flag to the JVMs of the task: the `JavaExec` of `run` and
+    /// `bootRun`, the forks of `test`.
+    fn profile_task_in(
+        &self,
+        root: &Path,
+        module: Option<&Module>,
+        task: &str,
+        _options: TaskOptions,
+    ) -> Result<Option<RecordedTask>> {
+        if !matches!(task, "run" | "bootRun" | "test") {
+            return Ok(None);
+        }
+        let recording = crate::profile::recording_file(&self.env.cache_root(), task)?;
+        let flag = crate::profile::recording_flag(&recording);
+        let directory = cache_file(&self.env.cache_root(), root).with_file_name("profile");
+        let directory = fresh_directory(&directory)?;
+        let script = directory.join("ide-profile.init.gradle");
+        fs::write(&script, PROFILE_SCRIPT)?;
+        let spec = self
+            .command(root)?
+            .arg("--init-script")
+            .arg(&script)
+            .arg(format!("-Pide.profile.flag={flag}"))
+            .arg(task_name(module, task));
+        let spec = match task {
+            "run" | "bootRun" => spec.input(),
+            _ => spec,
+        };
+        Ok(Some(RecordedTask {
+            program: spec,
+            recording,
+        }))
+    }
+
+    fn profile_report(
+        &self,
+        recording: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        crate::profile::report_of(&self.env, recording, model)
+    }
+
+    fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        Ok(crate::profile::recordings(&self.env.cache_root()))
+    }
+
+    fn profile_run_recordings(&self, recording: &Path) -> Vec<PathBuf> {
+        crate::profile::run_recordings(recording)
+    }
 }
 
 /// The idle timeout of the daemon this command may start, unless the project chose one
@@ -408,7 +478,11 @@ struct ReportProject {
     path: String,
     name: String,
     project_dir: PathBuf,
+    #[serde(default)]
+    build_file: Option<PathBuf>,
     source_sets: Vec<ReportSet>,
+    #[serde(default)]
+    dependencies: ReportTrees,
     problems: Vec<String>,
 }
 
@@ -494,6 +568,11 @@ fn parse_reports(files: &[Vec<u8>], root: &Path) -> Result<ProjectModel> {
         let report: Report = serde_json::from_slice(file)?;
         model.tool_version = report.tool_version;
         model.problems.extend(report.project.problems);
+        model.dependencies.push(ModuleDependencies {
+            module: report.project.path.clone(),
+            build_file: report.project.build_file,
+            scopes: report.project.dependencies.into_scopes(),
+        });
         model.modules.push(Module {
             id: report.project.path,
             name: report.project.name,
@@ -520,7 +599,8 @@ mod tests {
     const APP: &str = r#"{
       "schema": 1, "tool": "gradle", "toolVersion": "9.5.1", "javaVersion": "17",
       "project": {
-        "path": ":app", "name": "app", "projectDir": "C:/p/app", "buildDir": "C:/p/app/build",
+        "path": ":app", "name": "app", "projectDir": "C:/p/app", "buildFile": "C:/p/app/build.gradle",
+        "buildDir": "C:/p/app/build",
         "plugins": {"java": true, "kotlin": false},
         "sourceSets": [{
           "name": "main",
@@ -541,13 +621,27 @@ mod tests {
             {"path": "C:/r/extra", "kind": "file"}
           ]
         }],
+        "dependencies": {
+          "compile": [{
+            "coordinates": "g:starter:1", "scope": "compileClasspath",
+            "children": [
+              {"coordinates": "g:core:2", "scope": "compileClasspath",
+               "requested": "g:core:1"},
+              {"coordinates": "g:old:1", "scope": "compileClasspath", "module": ":lib"}
+            ]
+          }],
+          "runtime": [{
+            "coordinates": "g:starter:1", "scope": "runtimeClasspath"
+          }]
+        },
         "problems": []
       }
     }"#;
     const LIB: &str = r#"{
       "schema": 1, "tool": "gradle", "toolVersion": "9.5.1", "javaVersion": "17",
       "project": {
-        "path": ":lib", "name": "lib", "projectDir": "C:/p/lib", "buildDir": "C:/p/lib/build",
+        "path": ":lib", "name": "lib", "projectDir": "C:/p/lib", "buildFile": "C:/p/lib/build.gradle.kts",
+        "buildDir": "C:/p/lib/build",
         "plugins": {"java": true, "kotlin": true},
         "sourceSets": [
           {"name": "jmh", "sourceRoots": [], "allSourceRoots": [], "resourceRoots": [],
@@ -557,6 +651,7 @@ mod tests {
            "classesDirs": ["C:/p/lib/build/classes/kotlin/main"], "resourcesDir": null,
            "compileClasspath": [], "runtimeClasspath": []}
         ],
+        "dependencies": {},
         "problems": ["runtimeClasspath: broken"]
       }
     }"#;
@@ -564,6 +659,14 @@ mod tests {
     fn model() -> ProjectModel {
         let files = [LIB.as_bytes().to_vec(), APP.as_bytes().to_vec()];
         parse_reports(&files, Path::new("C:/p")).unwrap()
+    }
+
+    #[test]
+    fn the_profile_init_script_adds_the_flag_to_the_task_jvms() {
+        assert!(PROFILE_SCRIPT.contains("ide.profile.flag"));
+        assert!(PROFILE_SCRIPT.contains("JavaExec"));
+        assert!(PROFILE_SCRIPT.contains("tasks.withType(Test)"));
+        assert!(PROFILE_SCRIPT.contains("jvmArgs flag"));
     }
 
     #[test]
@@ -593,6 +696,37 @@ mod tests {
             "C:/p/app/build/resources/main",
         ];
         assert_eq!(main.output_dirs, outputs.map(PathBuf::from));
+    }
+
+    #[test]
+    fn a_report_keeps_the_dependency_trees_and_the_build_file() {
+        let model = model();
+
+        let app = model.dependencies_of(":app").unwrap();
+        assert_eq!(
+            app.build_file.as_deref(),
+            Some(Path::new("C:/p/app/build.gradle"))
+        );
+        let scopes: Vec<_> = app.scopes.iter().map(|scope| scope.name.as_str()).collect();
+        assert_eq!(scopes, ["compile", "runtime"], "an empty scope is left out");
+        let compile = app.scope("compile").unwrap();
+        assert_eq!(compile.roots[0].children.len(), 2);
+        assert_eq!(
+            compile.roots[0].children[0].requested_version().as_deref(),
+            Some("1"),
+            "the version asked for stays next to the chosen one"
+        );
+        assert_eq!(
+            compile.roots[0].children[1].module.as_deref(),
+            Some(":lib"),
+            "a neighbour is a module, not a library"
+        );
+        assert!(
+            model
+                .dependencies_of(":lib")
+                .is_none_or(|found| found.scopes.is_empty()),
+            "a report without dependencies adds no scope"
+        );
     }
 
     /// A neighbour arrives as a jar nobody built yet, and a Kotlin neighbour keeps its

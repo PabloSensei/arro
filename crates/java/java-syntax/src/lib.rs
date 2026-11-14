@@ -1,12 +1,26 @@
 //! Grammar and queries of the language.
 
 mod edit;
+mod endpoints;
+mod inline;
+mod spring_beans;
+mod spring_data;
 
 use std::sync::OnceLock;
 
 pub use edit::{
     Deletion, DeletionKind, UnwrapEdit, deletion, enclosing_type_at, first_type_name,
     first_type_offset, method_at, testable_methods, type_declares_method, unwrap_edits,
+};
+pub use endpoints::endpoints;
+pub use inline::identifiers_around;
+pub use spring_beans::{
+    Annotation, Constructor, Field, File as SpringFile, Method, Parameter, Type, spring_file,
+};
+pub use spring_data::{
+    Alias, AliasSource, Boundary, Condition, Connector, MethodCursor, MethodName, OPERATOR_WORDS,
+    Operator, Order, Prefix, PropertyPath, Query, Reference, Segment, Token as QueryToken,
+    TokenKind, method_cursor, parse_method_name, parse_query, token_at, tokens as query_tokens,
 };
 
 use syntax::{FoldStyle, LanguageConfig, StatementRules, TagSymbols};

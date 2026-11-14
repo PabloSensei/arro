@@ -6,12 +6,14 @@ use base::program::cmd_script;
 use base::{Cancel, Result};
 use proc_sup::ProcessSpec;
 use project_model::{
-    BuildGroup, BuildModule, BuildSystem, BuildTask, MAIN_UNIT, Module, PathEntry, PathKind,
-    ProjectModel, TEST_UNIT, TaskOptions, Unit, cache_file,
+    BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, MAIN_UNIT, Module,
+    ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TEST_UNIT, TaskOptions,
+    Unit, cache_file,
 };
 use serde::Deserialize;
 
 use crate::BuildEnv;
+use crate::dependencies::{ReportTrees, exclude_in_pom};
 use crate::env::{fresh_directory, run_tool};
 use crate::fingerprint::{BuildStamp, has_classes};
 use crate::pom::scan_poms;
@@ -266,6 +268,66 @@ impl BuildSystem for Maven {
     fn supports_skip_tests(&self) -> bool {
         true
     }
+
+    fn supports_profiler(&self) -> bool {
+        true
+    }
+
+    /// The run goal gets the flag through `spring-boot.run.jvmArguments`, the tests
+    /// through the `argLine` of Surefire.
+    fn profile_task_in(
+        &self,
+        root: &Path,
+        module: Option<&Module>,
+        task: &str,
+        options: TaskOptions,
+    ) -> Result<Option<RecordedTask>> {
+        let recording = crate::profile::recording_file(&self.env.cache_root(), &task_slug(task))?;
+        let flag = crate::profile::recording_flag(&recording);
+        let spec = self
+            .command(root)?
+            .args(run_args(root, module, task, options));
+        let Some(argument) = profile_argument(task, &flag, crate::test_runs::has_argline(root))
+        else {
+            return Ok(None);
+        };
+        let spec = match task.ends_with("spring-boot:run") {
+            true => spec.input(),
+            false => spec,
+        }
+        .arg(argument);
+        Ok(Some(RecordedTask {
+            program: spec,
+            recording,
+        }))
+    }
+
+    fn profile_report(
+        &self,
+        recording: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        crate::profile::report_of(&self.env, recording, model)
+    }
+
+    fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        Ok(crate::profile::recordings(&self.env.cache_root()))
+    }
+
+    fn profile_run_recordings(&self, recording: &Path) -> Vec<PathBuf> {
+        crate::profile::run_recordings(recording)
+    }
+
+    fn exclude(
+        &self,
+        _root: &Path,
+        _module: &Module,
+        build_file: &Path,
+        request: &Exclusion,
+        text: &str,
+    ) -> Result<Option<FileEdit>> {
+        Ok(exclude_in_pom(text, request, build_file))
+    }
 }
 
 /// The reactor arguments for one module: `-pl` from the root, which works with a wrapper
@@ -297,6 +359,32 @@ fn run_args(root: &Path, module: Option<&Module>, task: &str, options: TaskOptio
     args
 }
 
+/// The argument that puts the recording flag into the JVM of a task. The run goal starts
+/// its JVMs through `spring-boot.run.jvmArguments`, the tests through Surefire's
+/// `argLine`, which keeps the flags of the project through `@{argLine}`.
+fn profile_argument(task: &str, flag: &str, keep_argline: bool) -> Option<String> {
+    if task.ends_with("spring-boot:run") {
+        return Some(format!("-Dspring-boot.run.jvmArguments={flag}"));
+    }
+    if task == "test" {
+        return Some(crate::test_runs::profile_argline(flag, keep_argline));
+    }
+    None
+}
+
+/// The name of a recording: the task without the punctuation a file name cannot keep.
+fn task_slug(task: &str) -> String {
+    task.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// Whether the module applies the Spring Boot plugin, so that its run goal exists.
 fn has_spring_boot(module: &Module) -> bool {
     let Ok(text) = fs::read_to_string(module.dir.join("pom.xml")) else {
@@ -312,11 +400,17 @@ struct Report {
     projects: Vec<ReportProject>,
 }
 
+/// The dependency trees of one module, one per scope.
+///
+/// The parser lives in [`crate::dependencies`], shared with the other tool.
+/// The report of a `pom.xml` names the file it came from.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReportProject {
     id: String,
     base_dir: PathBuf,
+    #[serde(default)]
+    build_file: Option<PathBuf>,
     source_roots: Vec<PathBuf>,
     test_source_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -328,6 +422,8 @@ struct ReportProject {
     compile_classpath: Vec<ReportEntry>,
     runtime_classpath: Vec<ReportEntry>,
     test_classpath: Vec<ReportEntry>,
+    #[serde(default)]
+    dependencies: ReportTrees,
     problems: Vec<String>,
 }
 
@@ -405,19 +501,29 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
             compile_paths: test_paths.clone(),
             runtime_paths: test_paths,
         };
-        Module {
-            id: project.id,
-            name,
-            dir: project.base_dir,
-            units: vec![main, test],
-        }
+        let dependencies = ModuleDependencies {
+            module: project.id.clone(),
+            build_file: project.build_file,
+            scopes: project.dependencies.into_scopes(),
+        };
+        (
+            Module {
+                id: project.id,
+                name,
+                dir: project.base_dir,
+                units: vec![main, test],
+            },
+            dependencies,
+        )
     });
-    let modules = modules.collect();
+    let pairs: Vec<(Module, ModuleDependencies)> = modules.collect();
+    let (modules, dependencies): (Vec<Module>, Vec<ModuleDependencies>) = pairs.into_iter().unzip();
     Ok(ProjectModel {
         root: root.to_owned(),
         tool: "maven".into(),
         tool_version: report.tool_version,
         modules,
+        dependencies,
         resolved: true,
         problems,
     })
@@ -432,6 +538,7 @@ mod tests {
       "schema": 1, "tool": "maven", "toolVersion": "3.9.16", "javaVersion": "17",
       "projects": [{
         "id": "demo:app:1.0", "packaging": "jar", "baseDir": "C:/p/app",
+        "buildFile": "C:/p/app/pom.xml",
         "sourceRoots": ["C:/p/app/src/main/java"],
         "testSourceRoots": ["C:/p/app/src/test/java"],
         "resourceRoots": ["C:/p/app/src/main/resources"],
@@ -448,6 +555,30 @@ mod tests {
         "testClasspath": [
           {"kind": "library", "coordinates": "g:t:jar:1", "path": "C:/r/t.jar"}
         ],
+        "dependencies": {
+          "compile": [{
+            "coordinates": "org.springframework.boot:spring-boot-starter-web:3.5.0",
+            "scope": "compile", "path": "C:/r/starter.jar",
+            "children": [
+              {"coordinates": "org.springframework:spring-web:6.2.0", "scope": "compile",
+               "requested": "org.springframework:spring-web:6.1.0", "path": "C:/r/web.jar"},
+              {"coordinates": "com.fasterxml.jackson.core:jackson-databind:2.15.0",
+               "scope": "compile", "winner": "com.fasterxml.jackson.core:jackson-databind:2.17.0",
+               "path": "C:/r/old-databind.jar"}
+            ]
+          }],
+          "runtime": [{
+            "coordinates": "org.springframework.boot:spring-boot-starter-web:3.5.0",
+            "scope": "compile",
+            "children": [
+              {"coordinates": "org.springframework:spring-web:6.2.0", "scope": "compile"}
+            ]
+          }],
+          "test": [{
+            "coordinates": "org.junit.jupiter:junit-jupiter:5.11.0", "scope": "test",
+            "path": "C:/r/junit.jar"
+          }]
+        },
         "problems": ["not resolved: g:gone:jar:1"]
       }]
     }"#;
@@ -519,6 +650,48 @@ mod tests {
     #[test]
     fn a_broken_report_is_an_error() {
         assert!(parse_report(b"{}", Path::new("C:/p")).is_err());
+    }
+
+    #[test]
+    fn the_report_keeps_the_dependency_tree_of_every_scope() {
+        let model = parse_report(REPORT.as_bytes(), Path::new("C:/p")).unwrap();
+
+        let module = model.module("demo:app:1.0").unwrap();
+        assert_eq!(module.name, "app");
+        let found = model.dependencies_of("demo:app:1.0").unwrap();
+        assert_eq!(
+            found.build_file.as_deref(),
+            Some(Path::new("C:/p/app/pom.xml"))
+        );
+        let scopes: Vec<_> = found
+            .scopes
+            .iter()
+            .map(|scope| scope.name.as_str())
+            .collect();
+        assert_eq!(scopes, ["compile", "runtime", "test"]);
+        let compile = found.scope("compile").unwrap();
+        let root = &compile.roots[0];
+        assert_eq!(
+            root.coordinates,
+            "org.springframework.boot:spring-boot-starter-web:3.5.0"
+        );
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(
+            root.children[0].requested.as_deref(),
+            Some("org.springframework:spring-web:6.1.0"),
+            "the version the build asks for stays next to the chosen one"
+        );
+        assert_eq!(
+            root.children[1].winner.as_deref(),
+            Some("com.fasterxml.jackson.core:jackson-databind:2.17.0"),
+            "the edge that lost a conflict names the winner"
+        );
+        assert_eq!(
+            root.children[1].requested_version(),
+            None,
+            "an edge without a requested version asks for nothing else"
+        );
+        assert_eq!(found.scope("test").unwrap().roots[0].scope, "test");
     }
 
     fn multi_module(name: &str, core_plugin: &str) -> PathBuf {
@@ -649,5 +822,24 @@ mod tests {
             run_args(root, None, "compile", TaskOptions::default()),
             ["compile".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_recorded_task_takes_the_flag_of_its_kind() {
+        let flag = "-XX:StartFlightRecording=filename=\"C:/cache/profiler/test-1.jfr\"";
+
+        assert_eq!(
+            profile_argument("spring-boot:run", flag, false).as_deref(),
+            Some(format!("-Dspring-boot.run.jvmArguments={flag}").as_str())
+        );
+        assert_eq!(
+            profile_argument("test", flag, false).as_deref(),
+            Some(format!("-DargLine={flag}").as_str())
+        );
+        assert_eq!(
+            profile_argument("test", flag, true).as_deref(),
+            Some(format!("-DargLine=@{{argLine}} {flag}").as_str())
+        );
+        assert_eq!(profile_argument("compile", flag, false), None);
     }
 }

@@ -1,23 +1,35 @@
 //! The facade the application uses to reach everything about the language: syntax for the
 //! editor, and `lang-api` traits over one open project backed by jdtls.
 
+mod beans;
+mod database;
 mod debug;
 mod doc;
+mod endpoints;
 mod environment;
 mod file_templates;
+mod jshell;
 mod language;
 mod live_templates;
 mod lombok;
+mod messages;
 mod problems;
 mod project;
 mod refactor;
 mod session;
 mod setup;
+mod sources;
+mod spring;
+mod spring_data;
+mod stack;
 
+pub use beans::{BeanIndex, bean_index};
+pub use database::DatabaseSupport;
 pub use debug::{DebugExtension, DebugSession, JavaDebugger, ResolvedMain};
 pub use doc::documentation_comments;
 pub use environment::{JavaEnvironment, project_environment};
 pub use file_templates::file_templates;
+pub use jshell::JShellSupport;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +44,7 @@ use syntax::LanguageConfig;
 pub use jdtls_adapter::{ImportFailure, JdtlsConfig, Runtime};
 pub use language::{JavaSyntax, LANGUAGE_ID};
 pub use live_templates::templates_for;
+pub use messages::{MessageBundles, message_bundles};
 pub use project::{JavaProject, OpenError};
 pub use project_model::BuildTools;
 pub use session::{
@@ -40,14 +53,24 @@ pub use session::{
 };
 pub use setup::{Missing, Search, Toolchain, discover};
 pub use sidecar::{State, Status, Trust};
+pub use spring::{SpringConfigSupport, spring_config};
+pub use spring_data::{SpringDataIndex, SpringDataSupport, spring_data_index, spring_data_support};
+pub use stack::{jcmd_thread_dump, parse as parse_stack};
 
 fn is_source(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
 }
 
+/// The scratch file of the console: its fragments are Java, so the editor colours it as
+/// Java even though it is not a source of the project.
+fn is_console(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsh"))
+}
+
 pub fn language_for(path: &Path) -> Option<LanguageConfig> {
-    is_source(path).then(java_syntax::config)
+    (is_source(path) || is_console(path)).then(java_syntax::config)
 }
 
 pub fn symbols_for(path: &Path) -> Option<&'static dyn SymbolProvider> {

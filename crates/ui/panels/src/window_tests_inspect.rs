@@ -703,6 +703,7 @@ fn module_setup(root: &Path) -> ProjectSetup {
             dir: root.to_path_buf(),
             units: Vec::new(),
         }],
+        dependencies: Vec::new(),
         resolved: true,
         problems: Vec::new(),
     };

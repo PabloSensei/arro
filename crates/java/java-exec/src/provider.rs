@@ -8,8 +8,9 @@ use java_project::{BuildEnv, CoverageTools, Jdk};
 use proc_sup::ProcessSpec;
 use project_model::{BuildSystem, MAIN_UNIT, Module, ProjectModel};
 use runner::{
-    ConfigField, ConfigTemplate, CoveragePlan, LaunchPoint, RunConfig, RunConfigProvider, RunPlan,
-    format_environment, join_arguments, parse_environment, split_arguments,
+    ConfigField, ConfigTemplate, CoveragePlan, LaunchPoint, ProfilePlan, RunConfig,
+    RunConfigProvider, RunPlan, format_environment, join_arguments, parse_environment,
+    split_arguments,
 };
 use serde::{Deserialize, Serialize};
 use toml::Table;
@@ -25,10 +26,18 @@ const FIELD_VM_OPTIONS: &str = "jvm_args";
 const FIELD_ENV: &str = "env";
 const FIELD_WORKING_DIR: &str = "working_dir";
 const FIELD_SPRING_PROFILES: &str = "spring_profiles";
+const FIELD_HOST: &str = "host";
+const FIELD_PORT: &str = "port";
+const FIELD_AGENT: &str = "agent";
 /// The only kind of configuration the Add button offers.
 const TEMPLATE_APPLICATION: &str = "application";
+/// The template that attaches to a JVM another process started.
+const TEMPLATE_REMOTE: &str = "remote";
 /// What the new configuration is called before the user renames it.
 const NEW_CONFIG_NAME: &str = "Unnamed";
+/// The host and the port of a remote JVM before the user changes them.
+pub const REMOTE_HOST: &str = "localhost";
+pub const REMOTE_PORT: u16 = 5005;
 /// How long a program gets for its shutdown hooks after Ctrl+C.
 const GRACE: Duration = Duration::from_secs(5);
 /// Makes Spring Boot color its log, the console renders ANSI.
@@ -51,6 +60,10 @@ pub struct JavaTarget {
     pub env: BTreeMap<String, String>,
     /// The module directory if not set.
     pub working_dir: Option<PathBuf>,
+    /// The configuration attaches to a JVM somebody else started rather than runs one.
+    pub remote: bool,
+    pub host: String,
+    pub port: u16,
 }
 
 /// Starts `java` directly with an explicit classpath. Only a direct start gets Ctrl+C
@@ -77,6 +90,26 @@ impl JavaProvider {
 
     fn store(target: &JavaTarget) -> Result<Table> {
         Ok(Table::try_from(target.clone())?)
+    }
+
+    /// The port of the remote JVM, the usual one when the configuration names none.
+    fn remote_port(target: &JavaTarget) -> u16 {
+        if target.port == 0 {
+            REMOTE_PORT
+        } else {
+            target.port
+        }
+    }
+
+    /// The host of the remote JVM, the local machine when the configuration has none.
+    fn remote_host(target: &JavaTarget) -> &str {
+        let host = target.host.trim();
+        if host.is_empty() { REMOTE_HOST } else { host }
+    }
+
+    /// The option the remote JVM starts with, which opens the port for the debugger.
+    fn agent_option(port: u16) -> String {
+        format!("-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:{port}")
     }
 
     /// The configuration `discover` makes for a class with `main`. The launch points of a
@@ -107,9 +140,10 @@ impl JavaProvider {
     }
 
     fn program(&self, target: &JavaTarget, model: &ProjectModel, jdk: &Jdk) -> Result<ProcessSpec> {
-        self.program_with(target, model, jdk, false, None)
+        self.program_with(target, model, jdk, false, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn program_with(
         &self,
         target: &JavaTarget,
@@ -117,6 +151,7 @@ impl JavaProvider {
         jdk: &Jdk,
         debug: bool,
         coverage: Option<(&CoverageTools, &Path)>,
+        recording: Option<&Path>,
     ) -> Result<ProcessSpec> {
         let unit = target.unit.as_deref().unwrap_or(MAIN_UNIT);
         let module = model
@@ -144,6 +179,9 @@ impl JavaProvider {
         }
         if let Some((tools, exec)) = coverage {
             spec = spec.arg(tools.java_agent(exec));
+        }
+        if let Some(recording) = recording {
+            spec = spec.arg(crate::profile::recording_flag(recording));
         }
         if target.spring_boot {
             spec = spec.arg(SPRING_ANSI);
@@ -194,6 +232,11 @@ impl RunConfigProvider for JavaProvider {
             return Err("the project model has no dependencies yet, sync first".into());
         }
         let target: JavaTarget = config.settings.clone().try_into()?;
+        if target.remote {
+            return Err(
+                "the remote configuration attaches to a running JVM, it starts nothing".into(),
+            );
+        }
         let jdk = self.jdk(model)?;
         let before = config
             .assemble_first
@@ -212,6 +255,11 @@ impl RunConfigProvider for JavaProvider {
             return Err("the project model has no dependencies yet, sync first".into());
         }
         let target: JavaTarget = config.settings.clone().try_into()?;
+        if target.remote {
+            return Err(
+                "the remote configuration attaches to a running JVM, it starts nothing".into(),
+            );
+        }
         let jdk = self.jdk(model)?;
         let before = config
             .assemble_first
@@ -220,13 +268,31 @@ impl RunConfigProvider for JavaProvider {
             .flatten();
         Ok(RunPlan {
             before,
-            program: self.program_with(&target, model, &jdk, true, None)?,
+            program: self.program_with(&target, model, &jdk, true, None, None)?,
             grace: GRACE,
         })
     }
 
     fn supports_coverage(&self) -> bool {
         true
+    }
+
+    /// The remote configuration attaches to a JVM that another process started.
+    fn attach_plan(
+        &self,
+        config: &RunConfig,
+        _model: &ProjectModel,
+    ) -> Result<Option<runner::AttachPlan>> {
+        let target: JavaTarget = config.settings.clone().try_into()?;
+        if !target.remote {
+            return Ok(None);
+        }
+        Ok(Some(runner::AttachPlan {
+            host: Self::remote_host(&target).to_owned(),
+            port: Self::remote_port(&target),
+            name: config.name.clone(),
+            project: None,
+        }))
     }
 
     /// The same program with the coverage agent, whose data goes to a file of the cache
@@ -247,7 +313,8 @@ impl RunConfigProvider for JavaProvider {
             .then(|| self.tool.assemble_if_needed(&model.root))
             .transpose()?
             .flatten();
-        let program = self.program_with(&target, model, &jdk, false, Some((&tools, &exec)))?;
+        let program =
+            self.program_with(&target, model, &jdk, false, Some((&tools, &exec)), None)?;
         Ok(CoveragePlan {
             plan: RunPlan {
                 before,
@@ -265,6 +332,67 @@ impl RunConfigProvider for JavaProvider {
         model: &ProjectModel,
     ) -> Result<lang_api::CoverageReport> {
         crate::coverage::report(&self.env, exec, model)
+    }
+
+    fn supports_profiler(&self) -> bool {
+        true
+    }
+
+    /// The same program with its samples recorded to a file of the cache of the project.
+    fn profile_plan(&self, config: &RunConfig, model: &ProjectModel) -> Result<ProfilePlan> {
+        if !model.resolved {
+            return Err("the project model has no dependencies yet, sync first".into());
+        }
+        let target: JavaTarget = config.settings.clone().try_into()?;
+        let jdk = self.jdk(model)?;
+        if !crate::profile::supported(&jdk) {
+            return Err(format!(
+                "the profiler needs Flight Recorder, which JDK {} does not have; use 8u262 or newer",
+                jdk.version
+            )
+            .into());
+        }
+        let recording = crate::profile::recording_file(&self.env.cache_root(), &config.name)?;
+        let before = config
+            .assemble_first
+            .then(|| self.tool.assemble_if_needed(&model.root))
+            .transpose()?
+            .flatten();
+        let program = self.program_with(&target, model, &jdk, false, None, Some(&recording))?;
+        Ok(ProfilePlan {
+            plan: RunPlan {
+                before,
+                program,
+                grace: GRACE,
+            },
+            recording,
+            note: None,
+        })
+    }
+
+    fn profile_snapshot(
+        &self,
+        recording: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::ProfileSnapshot> {
+        let jdk = self.jdk(model)?;
+        crate::profile::snapshot(&self.env, &jdk, recording, model)
+    }
+
+    fn profile_report(
+        &self,
+        recording: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        crate::profile::report_of(&self.env, recording, model)
+    }
+
+    fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        Ok(crate::profile::recordings(&self.env.cache_root()))
+    }
+
+    fn profile_run_recordings(&self, recording: &Path) -> Vec<std::path::PathBuf> {
+        crate::profile::run_recordings(recording)
     }
 
     fn launch_points(&self, text: &str, file: &Path, model: &ProjectModel) -> Vec<LaunchPoint> {
@@ -298,6 +426,16 @@ impl RunConfigProvider for JavaProvider {
 
     fn fields(&self, config: &RunConfig) -> Vec<ConfigField> {
         let target = Self::target(config);
+        if target.remote {
+            return vec![
+                ConfigField::text(FIELD_HOST, "Host")
+                    .hint("The machine of the JVM that runs the debug agent"),
+                ConfigField::text(FIELD_PORT, "Port")
+                    .hint("The port of the debug agent, 5005 by default"),
+                ConfigField::read_only(FIELD_AGENT, "Debugger command")
+                    .hint("Start the remote JVM with this option"),
+            ];
+        }
         let mut fields = vec![
             ConfigField::text(FIELD_MAIN_CLASS, "Main class")
                 .hint("The fully qualified name of the class with the main method"),
@@ -319,6 +457,17 @@ impl RunConfigProvider for JavaProvider {
         fields
     }
 
+    /// The live sections of a Spring Boot application this configuration starts.
+    fn live_application(
+        &self,
+        config: &RunConfig,
+        model: &ProjectModel,
+    ) -> Option<Arc<dyn runner::LiveApplication>> {
+        let target = Self::target(config);
+        crate::live::SpringLive::of(&target, model)
+            .map(|live| Arc::new(live) as Arc<dyn runner::LiveApplication>)
+    }
+
     fn read_field(&self, config: &RunConfig, key: &str) -> String {
         let target = Self::target(config);
         match key {
@@ -332,6 +481,9 @@ impl RunConfigProvider for JavaProvider {
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default(),
             FIELD_SPRING_PROFILES => target.spring_profiles.join(","),
+            FIELD_HOST => Self::remote_host(&target).to_owned(),
+            FIELD_PORT => Self::remote_port(&target).to_string(),
+            FIELD_AGENT => Self::agent_option(Self::remote_port(&target)),
             _ => String::new(),
         }
     }
@@ -356,6 +508,12 @@ impl RunConfigProvider for JavaProvider {
                     .map(str::to_owned)
                     .collect();
             }
+            FIELD_HOST => target.host = value.trim().to_owned(),
+            FIELD_PORT => {
+                if let Ok(port) = value.trim().parse() {
+                    target.port = port;
+                }
+            }
             _ => return,
         }
         if let Ok(settings) = Self::store(&target) {
@@ -364,13 +522,33 @@ impl RunConfigProvider for JavaProvider {
     }
 
     fn templates(&self) -> Vec<ConfigTemplate> {
-        vec![ConfigTemplate {
-            id: TEMPLATE_APPLICATION,
-            name: "Application",
-        }]
+        vec![
+            ConfigTemplate {
+                id: TEMPLATE_APPLICATION,
+                name: "Application",
+            },
+            ConfigTemplate {
+                id: TEMPLATE_REMOTE,
+                name: "Remote JVM Debug",
+            },
+        ]
     }
 
     fn create_config(&self, template: &str, model: &ProjectModel) -> Result<RunConfig> {
+        if template == TEMPLATE_REMOTE {
+            let target = JavaTarget {
+                remote: true,
+                host: REMOTE_HOST.to_owned(),
+                port: REMOTE_PORT,
+                ..JavaTarget::default()
+            };
+            return Ok(RunConfig {
+                name: "Remote JVM Debug".into(),
+                provider: PROVIDER_ID.into(),
+                assemble_first: false,
+                settings: Self::store(&target)?,
+            });
+        }
         if template != TEMPLATE_APPLICATION {
             return Err(format!("{PROVIDER_ID} cannot create {template}").into());
         }
@@ -518,6 +696,57 @@ mod tests {
         model.resolved = false;
 
         assert!(provider.plan(&config, &model).is_err());
+    }
+
+    #[test]
+    fn a_profile_plan_records_to_the_cache_of_the_project() {
+        let root = temp_dir("profile-plan");
+        let provider = provider(&root.join("cache"));
+        let model = model(&root);
+        let mut config = provider.discover(&model).unwrap().remove(0);
+        config.assemble_first = false;
+
+        let profile = provider.profile_plan(&config, &model).unwrap();
+        let args = arguments(&profile.plan.program);
+
+        assert!(
+            args.iter()
+                .any(|argument| argument.starts_with("-XX:StartFlightRecording=filename=\"")),
+            "{args:?}"
+        );
+        assert!(
+            args.iter().any(|argument| {
+                argument.contains("settings=profile") && argument.contains("dumponexit=true")
+            }),
+            "{args:?}"
+        );
+        assert!(profile.recording.starts_with(root.join("cache")));
+        assert_eq!(profile.recording.extension().unwrap(), "jfr");
+        assert!(profile.plan.before.is_none());
+    }
+
+    #[test]
+    fn a_jdk_8_before_262_has_no_profiler_and_says_so() {
+        let root = temp_dir("profile-jdk8");
+        let env = BuildEnv {
+            jdk: Some(Jdk {
+                home: "C:/jdk8".into(),
+                version: "1.8.0_252".into(),
+                feature: 8,
+            }),
+            cache_root: Some(root.join("cache")),
+            ..BuildEnv::default()
+        };
+        let provider = JavaProvider::new(env, Arc::new(NoTool));
+        let model = model(&root);
+        let config = provider.discover(&model).unwrap().remove(0);
+
+        let error = provider.profile_plan(&config, &model).err().unwrap();
+
+        assert!(
+            error.to_string().contains("Flight Recorder"),
+            "the message names what the JDK lacks: {error}"
+        );
     }
 
     #[test]
@@ -675,8 +904,9 @@ mod tests {
         let model = model(&root);
 
         let templates = provider.templates();
-        assert_eq!(templates.len(), 1);
+        assert_eq!(templates.len(), 2);
         assert_eq!(templates[0].name, "Application");
+        assert_eq!(templates[1].name, "Remote JVM Debug");
         let config = provider.create_config(templates[0].id, &model).unwrap();
 
         assert_eq!(config.name, NEW_CONFIG_NAME);

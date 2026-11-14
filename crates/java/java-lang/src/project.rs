@@ -9,12 +9,13 @@ use base::Cancel;
 use futures_util::StreamExt;
 use jdtls_adapter::{ImportFailure, Jdtls, JdtlsConfig};
 use lang_api::{
-    Answer, Confidence, DefinitionPreview, DefinitionPreviewQuery, DocumentSpot, ExternalDoc,
-    FileSymbol, FileSymbolsQuery, GenerateApplyRequest, GenerateChoice, GenerateKind,
+    Answer, CompletionList, Confidence, DefinitionPreview, DefinitionPreviewQuery, DocumentSpot,
+    ExternalDoc, FileSymbol, FileSymbolsQuery, GenerateApplyRequest, GenerateChoice, GenerateKind,
     GenerateQuery, GeneratedFile, Generation, HierarchyDirection, HierarchyQuery, HoverProvider,
-    MethodHierarchyEntry, MethodHierarchyQuery, MethodRelation, PrepareDiagnosticsQuery,
-    ProjectProblem, ProjectProblemsQuery, Provider, ReferenceQuery, Reply, Severity, SourceId,
-    SourceSpan, SourceTextQuery, SymbolEntry, SymbolKind, TextSpan, ask, offset_in,
+    MethodHierarchyEntry, MethodHierarchyQuery, MethodRelation, NavigationQuery,
+    PrepareDiagnosticsQuery, ProjectProblem, ProjectProblemsQuery, Provider, ReferenceQuery, Reply,
+    Severity, SourceId, SourceSpan, SourceTextQuery, SymbolEntry, SymbolKind, TextSpan, ask,
+    offset_in,
 };
 use lsp_client::ServerEvents;
 use lsp_client::lsp_types::{
@@ -31,7 +32,10 @@ use tokio::time::sleep;
 use crate::debug::DebugExtension;
 use crate::language::{JavaSyntax, LANGUAGE_ID, is_import_line};
 use crate::lombok::LombokSupport;
+use crate::messages::{JavaMessages, MessageBundles};
 use crate::refactor::RefactorForms;
+use crate::spring::SpringConfigSupport;
+use crate::spring_data::{NativeCompletion, NativeNavigation, SpringDataIndex};
 
 const SOURCE: SourceId = SourceId::new("jdtls");
 
@@ -103,12 +107,32 @@ pub struct JavaProject {
     pub(crate) server: JavaServer,
     pub(crate) syntax: JavaSyntax,
     pub(crate) class_files: ClassFiles,
+    /// The sources of library classes: the jar, the repository and the attachment.
+    pub(crate) library_sources: crate::sources::LibrarySources,
+    /// The model of the project, for the request that fetches every source at once.
+    model: Arc<std::sync::Mutex<Option<Arc<project_model::ProjectModel>>>>,
     pub(crate) problems: ProjectProblems,
     pub(crate) debug: DebugExtension,
     /// The refactorings whose values the window asks for before the server edits.
     pub(crate) forms: RefactorForms,
     /// The Lombok agent: found in the project dependencies and applied with a restart.
     lombok: Arc<LombokSupport>,
+    /// Stack traces and thread dumps: the frames of a trace, and `jcmd` for a running
+    /// program of the project.
+    pub(crate) stack: crate::stack::StackService,
+    /// The metadata of the configuration files of the project, which is read in the
+    /// background from the class path of the model.
+    pub(crate) spring: Arc<SpringConfigSupport>,
+    /// The message bundles of the project and the places of the sources that use a key.
+    pub(crate) messages: Arc<MessageBundles>,
+    /// The answers of the message bundles in front of the answers of the server.
+    pub(crate) java_messages: JavaMessages,
+    /// The beans and the points of an injection of the project, read in the background
+    /// from its sources.
+    pub(crate) beans: Arc<crate::BeanIndex>,
+    /// The entities of the project and the queries of its data repositories, read in the
+    /// background from its sources.
+    pub(crate) data: Arc<SpringDataIndex>,
 }
 
 /// The language server as the window sees it. A build file that appears or disappears can
@@ -122,6 +146,13 @@ pub(crate) struct JavaServer {
     /// Bumped on every added or removed build file: a branch switch brings many at
     /// once, and only the import after the last of them runs.
     imports: Arc<std::sync::atomic::AtomicU64>,
+    /// The message bundles, which check the keys a Java source uses.
+    messages: Arc<MessageBundles>,
+    /// The text of an open source, so that the model of the beans follows an unsaved
+    /// editor.
+    beans: Arc<crate::BeanIndex>,
+    /// The same text for the model of the entities and the queries.
+    data: Arc<SpringDataIndex>,
 }
 
 /// How long the build files have to stay quiet before the full import starts.
@@ -129,18 +160,28 @@ const IMPORT_QUIET: Duration = Duration::from_millis(500);
 
 impl lang_api::SemanticServer for JavaServer {
     fn open(&self, uri: &str, version: i32, text: Arc<str>) {
+        self.data.document_uri_changed(uri, Some(text.clone()));
+        self.messages.open(uri, version, text.clone());
         self.providers.open(uri, version, text);
     }
 
     fn change(&self, uri: &str, version: i32, text: Arc<str>, edits: Vec<lang_api::DocumentEdit>) {
+        self.messages
+            .change(uri, version, text.clone(), edits.clone());
+        self.beans.document_uri_changed(uri, Some(text.clone()));
+        self.data.document_uri_changed(uri, Some(text.clone()));
         self.providers.change(uri, version, text, edits);
     }
 
     fn save(&self, uri: &str) {
+        self.messages.save(uri);
         self.providers.save(uri);
     }
 
     fn close(&self, uri: &str) {
+        self.messages.close(uri);
+        self.beans.document_uri_changed(uri, None);
+        self.data.document_uri_changed(uri, None);
         self.providers.close(uri);
     }
 
@@ -363,6 +404,7 @@ impl JavaProject {
             return Err(OpenError::NotTrusted);
         }
         let root = config.project_root.clone();
+        let cache = config.state_dir.clone();
         let repositories = crate::lombok::repositories(
             config.maven_settings.as_deref(),
             config.gradle_user_home.as_deref(),
@@ -374,6 +416,7 @@ impl JavaProject {
             trust,
             root,
             repositories,
+            cache,
         )
     }
 
@@ -417,6 +460,7 @@ impl JavaProject {
         trust: Trust,
         root: PathBuf,
         repositories: java_project::LocalRepositories,
+        cache: PathBuf,
     ) -> Result<Self, OpenError> {
         let problems = ProjectProblems {
             failures: spec.watch_import_failure(),
@@ -442,9 +486,18 @@ impl JavaProject {
             root.clone(),
             spec.clone(),
             sidecar.reload_handle(),
-            repositories,
+            repositories.clone(),
         ));
+        let model: Arc<std::sync::Mutex<Option<Arc<project_model::ProjectModel>>>> = Arc::default();
         let router = Router::new(sidecar.status());
+        let library_sources = crate::sources::LibrarySources::new(
+            router.clone(),
+            Handle::current(),
+            root.clone(),
+            repositories,
+            cache,
+            model.clone(),
+        );
         let providers = Arc::new(
             LspProviders::new(
                 router.clone(),
@@ -503,12 +556,33 @@ impl JavaProject {
                 delegate_generate: "java/generateDelegateMethods",
             }),
         );
+        let spring = crate::spring_config(root.clone());
+        let messages = crate::message_bundles(root.clone());
+        let beans = crate::bean_index(root.clone());
+        let data = crate::spring_data_index(root.clone());
+        let completion_fallback: Arc<dyn Provider<DocumentSpot, CompletionList>> =
+            providers.clone();
+        let navigation_fallback: Arc<dyn Provider<NavigationQuery, Vec<SourceSpan>>> =
+            providers.clone();
+        let completion = NativeCompletion {
+            data: data.clone(),
+            fallback: Some(completion_fallback),
+        };
+        let navigation = NativeNavigation {
+            data: data.clone(),
+            fallback: Some(navigation_fallback),
+        };
+        let native_completion = Arc::new(completion);
+        let native_navigation = Arc::new(navigation);
         let server = JavaServer {
             router: router.clone(),
             providers: providers.clone(),
             runtime: Handle::current(),
             lombok: lombok.clone(),
             imports: Arc::default(),
+            messages: messages.clone(),
+            beans: beans.clone(),
+            data: data.clone(),
         };
         let class_files = ClassFiles {
             router: router.clone(),
@@ -516,6 +590,19 @@ impl JavaProject {
         };
         let debug = DebugExtension::with_router(router.clone(), autobuild);
         let forms = RefactorForms::new(router.clone(), Handle::current());
+        let stack = crate::stack::StackService::new(
+            root.clone(),
+            router.clone(),
+            Handle::current(),
+            model.clone(),
+        );
+        let java_messages = JavaMessages::new(
+            providers.clone(),
+            router.clone(),
+            messages.clone(),
+            Handle::current(),
+        )
+        .with_data(native_completion, native_navigation);
         Ok(Self {
             sidecar,
             spec,
@@ -526,10 +613,18 @@ impl JavaProject {
             server,
             syntax: JavaSyntax::new(),
             class_files,
+            library_sources,
+            model,
             problems,
             debug,
             forms,
             lombok,
+            stack,
+            spring,
+            messages,
+            java_messages,
+            beans,
+            data,
         })
     }
 
@@ -558,9 +653,17 @@ impl JavaProject {
     }
 
     /// The model of the project arrived. A Lombok jar in its dependencies is copied and
-    /// a running server starts again with it.
-    pub(crate) fn set_project_model(&self, model: &Arc<project_model::ProjectModel>) {
+    /// a running server starts again with it, and the configuration metadata of its
+    /// class path is read again. The test support sets the model the same way.
+    pub fn set_project_model(&self, model: &Arc<project_model::ProjectModel>) {
+        if let Ok(mut stored) = self.model.lock() {
+            *stored = Some(model.clone());
+        }
         self.lombok.project_model(model.clone());
+        self.spring.set_model(model);
+        self.messages.set_model(model);
+        self.beans.set_model(model);
+        self.data.set_model(model);
     }
 
     /// The version of Lombok the server runs with.

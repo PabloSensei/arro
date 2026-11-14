@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -165,15 +165,25 @@ fn text(body: &Value, key: &str) -> String {
 type Reply = Result<Value, Error>;
 
 struct Shared {
-    outgoing: mpsc::UnboundedSender<Vec<u8>>,
+    /// The frames that go to the adapter. The last client drops the sender, which closes
+    /// the standard input of an adapter process and lets it leave.
+    outgoing: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
     pending: Mutex<Option<HashMap<i64, oneshot::Sender<Reply>>>>,
     next_seq: AtomicI64,
+    /// How many clients the connection has; the sender closes when the last one goes.
+    clients: AtomicUsize,
+    /// The adapter process this connection owns, if any.
+    adapter: Mutex<Option<AdapterProcess>>,
 }
 
 impl Shared {
     fn send(&self, message: &Value) -> Result<(), Error> {
         let frame = encode_frame(&serde_json::to_vec(message)?);
-        self.outgoing.send(frame).map_err(|_| Error::Closed)
+        let outgoing = lock(&self.outgoing);
+        let Some(outgoing) = outgoing.as_ref() else {
+            return Err(Error::Closed);
+        };
+        outgoing.send(frame).map_err(|_| Error::Closed)
     }
 
     fn answer(&self, request_seq: &Value, message: &str) {
@@ -207,6 +217,57 @@ impl Shared {
         for sender in pending.into_values() {
             let _ = sender.send(Err(Error::Closed));
         }
+    }
+
+    /// Ends the connection of the last client: the sender goes first, so that the
+    /// adapter sees the end of its input, then the answers nobody waits for.
+    fn close_clients(&self) {
+        lock(&self.outgoing).take();
+        self.close();
+        if let Some(adapter) = lock(&self.adapter).take() {
+            adapter.shut_down();
+        }
+    }
+}
+
+/// How long an adapter process gets to leave after its standard input closes.
+pub const ADAPTER_GRACE: Duration = Duration::from_secs(2);
+
+/// The adapter process of a connection. The last client closes the sender of the
+/// connection, which closes the input of the process; a process that has not left after
+/// the grace is killed.
+pub struct AdapterProcess {
+    finish: Box<dyn FnOnce(Duration) + Send>,
+}
+
+impl AdapterProcess {
+    /// The process of an adapter that is reached over a socket, or whose pipes the
+    /// caller reads and writes on its own.
+    pub fn new(mut process: proc_sup::Process) -> Self {
+        Self::from_shutdown(move |grace| {
+            let started = std::time::Instant::now();
+            while started.elapsed() < grace {
+                match process.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(_) => break,
+                }
+            }
+            let _ = process.stop();
+        })
+    }
+
+    /// A process of any kind: `shutdown` waits for it for no longer than the grace it
+    /// gets and then ends it.
+    pub fn from_shutdown(shutdown: impl FnOnce(Duration) + Send + 'static) -> Self {
+        Self {
+            finish: Box::new(shutdown),
+        }
+    }
+
+    fn shut_down(self) {
+        let finish = self.finish;
+        std::thread::spawn(move || finish(ADAPTER_GRACE));
     }
 }
 
@@ -244,9 +305,25 @@ impl Drop for InFlight {
 }
 
 /// A connection to a debug adapter. Cheap to clone.
-#[derive(Clone)]
 pub struct Client {
     shared: Arc<Shared>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        self.shared.clients.fetch_add(1, Ordering::SeqCst);
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if self.shared.clients.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.shared.close_clients();
+        }
+    }
 }
 
 impl Client {
@@ -265,12 +342,52 @@ impl Client {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        Self::start_with_adapter_parts(output, input, None)
+    }
+
+    /// The same as [`Client::start`], with the adapter process the connection owns: the
+    /// last client closes the sender, the process sees the end of its input, and a
+    /// process that stays after the grace is killed.
+    pub fn start_with_adapter<R, W>(
+        output: R,
+        input: W,
+        adapter: AdapterProcess,
+    ) -> (Self, mpsc::UnboundedReceiver<Event>)
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         let (outgoing, receiver) = mpsc::unbounded_channel();
         let (events, incoming) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
-            outgoing,
+            outgoing: Mutex::new(Some(outgoing)),
             pending: Mutex::new(Some(HashMap::new())),
             next_seq: AtomicI64::new(1),
+            clients: AtomicUsize::new(1),
+            adapter: Mutex::new(Some(adapter)),
+        });
+        tokio::spawn(write_loop(input, receiver));
+        tokio::spawn(read_loop(output, shared.clone(), events));
+        (Self { shared }, incoming)
+    }
+
+    fn start_with_adapter_parts<R, W>(
+        output: R,
+        input: W,
+        adapter: Option<AdapterProcess>,
+    ) -> (Self, mpsc::UnboundedReceiver<Event>)
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let (outgoing, receiver) = mpsc::unbounded_channel();
+        let (events, incoming) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            outgoing: Mutex::new(Some(outgoing)),
+            pending: Mutex::new(Some(HashMap::new())),
+            next_seq: AtomicI64::new(1),
+            clients: AtomicUsize::new(1),
+            adapter: Mutex::new(adapter),
         });
         tokio::spawn(write_loop(input, receiver));
         tokio::spawn(read_loop(output, shared.clone(), events));

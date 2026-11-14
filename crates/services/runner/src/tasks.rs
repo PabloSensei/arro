@@ -1,6 +1,7 @@
 //! Run configurations of build tool tasks. The configuration keeps the module and the
 //! task; the build tool makes the command when the configuration is planned.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use base::Result;
@@ -96,6 +97,53 @@ impl RunConfigProvider for BuildTaskProvider {
             program,
             grace: std::time::Duration::from_secs(5),
         })
+    }
+
+    fn supports_profiler(&self) -> bool {
+        self.tool.supports_profiler()
+    }
+
+    /// The task with the flag in the JVMs it starts, as the build tool of the project
+    /// knows how to add it.
+    fn profile_plan(&self, config: &RunConfig, model: &ProjectModel) -> Result<crate::ProfilePlan> {
+        let target = Self::target(config);
+        let module = match target.module.is_empty() {
+            true => None,
+            false => Some(
+                model
+                    .module(&target.module)
+                    .ok_or_else(|| format!("no module {}", target.module))?,
+            ),
+        };
+        let recorded = self
+            .tool
+            .profile_task_in(&model.root, module, &target.task, Self::options(&target))?
+            .ok_or_else(|| format!("the task \"{}\" cannot be recorded", target.task))?;
+        Ok(crate::ProfilePlan {
+            plan: RunPlan {
+                before: None,
+                program: recorded.program,
+                grace: std::time::Duration::from_secs(5),
+            },
+            recording: recorded.recording,
+            note: None,
+        })
+    }
+
+    fn profile_report(
+        &self,
+        recording: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        self.tool.profile_report(recording, model)
+    }
+
+    fn profile_recordings(&self, model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        self.tool.profile_recordings(model)
+    }
+
+    fn profile_run_recordings(&self, recording: &Path) -> Vec<std::path::PathBuf> {
+        self.tool.profile_run_recordings(recording)
     }
 
     fn fields(&self, _config: &RunConfig) -> Vec<ConfigField> {

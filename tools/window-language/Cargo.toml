@@ -21,3 +21,5 @@ project-model.workspace = true
 runner.workspace = true
 syntax = { path = "../../crates/editor/syntax" }
 templates = { path = "../../crates/editor/templates" }
+test-support = { path = "../test-support" }
+zip = { version = "9", default-features = false }

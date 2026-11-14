@@ -14,6 +14,7 @@ mod hierarchy;
 mod hippie;
 mod input;
 mod live;
+mod markdown_images;
 mod markdown_preview;
 mod quick_doc;
 mod refactor;
@@ -28,29 +29,35 @@ mod view;
 pub use annotate::BlameNote;
 pub use decor::PaneDecor;
 pub use element::StripeKind;
+#[cfg(any(test, feature = "test-support"))]
+pub use element::{reset_widest_row_counts, widest_row_counts};
 pub use live::{KeyUse, LiveTemplates, TemplateList};
 pub use markdown_preview::PreviewMode;
+pub use markdown_preview::PreviewModes;
 pub use quick_doc::{
-    DocAlign, DocBlock, DocHost, DocInline, DocLinkHandler, DocSelectEvent, DocSelectHandler,
-    display_text as display_documentation, parse as parse_documentation, render_document,
-    split_line_fragment,
+    DocAlign, DocBlock, DocHost, DocImage, DocInline, DocLinkHandler, DocPicture, DocSelectEvent,
+    DocSelectHandler, display_text as display_documentation, parse as parse_documentation,
+    render_document, split_line_fragment,
 };
 pub use refactor::FolderMove;
 pub use semantic::{
-    CompletionCase, CompletionSources, ExternalLinks, ExternalOpener, LocalCompletions, Semantic,
-    completion_order, completion_order_with, completion_parts, expand_snippet, show_location,
-    uri_path,
+    CompletionCase, CompletionSources, ExternalLinks, ExternalOpener, FileLanguages,
+    LocalCompletions, Semantic, completion_order, completion_order_with, completion_parts,
+    expand_snippet, show_location, uri_path,
 };
-pub use state::{Conflict, EditorState, LoadError, SaveOptions, Saved, TrimTrailing};
+pub use state::{
+    ActionsOnSave, Conflict, EditorState, LoadError, SaveOptions, Saved, TrimTrailing,
+};
 pub use style::{EditorStyle, SemanticLook};
 // The language data a caller needs to describe its files to the editor, and to build
 // one in a test.
 pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
-    BookmarkEntry, CoverageMark, CoverageState, DetailedUsage, DocumentationQuery, EditorEvent,
-    EditorOptions, EditorView, FileBar, GutterKind, GutterMark, InlayPaint, Languages,
-    LineDeclaration, OutlineItem, OutlineKind, PlainSyntax, ProblemSummary, RowPaint, RunMark,
-    RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history,
-    highlight_text, install_keymap,
+    BookmarkEntry, CoverageMark, CoverageState, DebugValue, DetailedUsage, DocumentationQuery,
+    EditorEvent, EditorOptions, EditorView, EndpointMark, FileBar, GutterKind, GutterMark,
+    InlayPaint, InlineValue, Languages, LineDeclaration, OutlineItem, OutlineKind, PlaceMark,
+    PlaceTarget, PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot,
+    TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
+    install_keymap,
 };

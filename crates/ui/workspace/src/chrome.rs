@@ -14,23 +14,27 @@ use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
 use crate::window::{
     AI_TOOL, BOOKMARKS_POPUP, BalloonAction, BuildProject, COMMIT_TOOL, ChooseDebugConfiguration,
-    ChooseRunConfiguration, CloseTab, Compile, CopyElement, DEBUG_TOOL, Debug, Dismiss, DockSide,
-    EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto,
-    ForceStepOver, FullyExpandTreeNode, GotoRelated, HTTP_TOOL, HideCoverage, HideToolWindow,
-    LOG_TOOL, MenuRow, MoveToOtherGroup, NewElementSamePlace, NextProblem, NextProjectWindow,
-    NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem,
-    PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate, QuitApp, RUN_TOOL,
-    ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown, ResizeToolWindowLeft,
-    ResizeToolWindowRight, ResizeToolWindowUp, Resume, Run, RunTestsWithCoverage, RunToCursor,
-    RunWithCoverage, SERVICES_TOOL, STRUCTURE_TOOL, SaveAll, ShowBranches, ShowCommit,
-    ShowExecutionPoint, ShowSearch, ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto,
-    StepOut, StepOver, Stop, StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL,
-    TabLeft, TabRight, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDebug,
-    ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
-    ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
-    UpdateProject, VcsQuickList, ViewBreakpoints, Workspace,
+    ChooseRunConfiguration, CloseTab, Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug,
+    Dismiss, DockSide, EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup,
+    ForceRunToCursor, ForceStepInto, ForceStepOver, FullyExpandTreeNode, GotoRelated, HTTP_TOOL,
+    HideCoverage, HideToolWindow, LOG_TOOL, MenuRow, MoveToOtherGroup, NewElementSamePlace,
+    NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL,
+    PinTab, PreviousProblem, PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate,
+    QuitApp, RUN_TOOL, ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown,
+    ResizeToolWindowLeft, ResizeToolWindowRight, ResizeToolWindowUp, Resume, Run,
+    RunTestsWithCoverage, RunTestsWithProfiler, RunToCursor, RunWithCoverage, SERVICES_TOOL,
+    STRUCTURE_TOOL, SaveAll, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
+    ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop,
+    StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi,
+    ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug, ToggleLog,
+    ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTemporaryLineBreakpoint,
+    ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList,
+    ViewBreakpoints, Workspace,
 };
-use crate::window::{TODO_TOOL, ToggleHttp, ToggleProblems, ToggleTodo};
+use crate::window::{
+    ENDPOINTS_TOOL, RunWithProfiler, TODO_TOOL, ToggleEndpoints, ToggleHttp, ToggleProblems,
+    ToggleTodo,
+};
 
 /// Wider than the gap itself so that the edge is easy to catch.
 const EDGE_GRIP: f32 = 6.;
@@ -420,6 +424,17 @@ impl Workspace {
                     )
                     .child(
                         button(
+                            "s-database",
+                            "toolwindows/database",
+                            "Database",
+                            Some("workspace::ToggleDatabase"),
+                            self.tool_open(DATABASE_TOOL),
+                            theme,
+                        )
+                        .on_click(toggle(DATABASE_TOOL)),
+                    )
+                    .child(
+                        button(
                             "s-todo",
                             "status/info",
                             "TODO",
@@ -797,6 +812,10 @@ impl Workspace {
         .debug_selector(|| "t-coverage".to_owned())
         .on_click(cx.listener(|this, _, window, cx| this.run_with_coverage(window, cx)))
         .child(icon_sized("run/coverage", ICON, theme));
+        let profile = button_frame("t-profile", "Profile", None, theme)
+            .debug_selector(|| "t-profile".to_owned())
+            .on_click(cx.listener(|this, _, window, cx| this.run_with_profiler(window, cx)))
+            .child(icon_sized("run/profiler", ICON, theme));
         let active = state.running || self.debug_state(cx).active;
         let stop = active.then(|| {
             button_frame(
@@ -818,6 +837,7 @@ impl Workspace {
             .items_center()
             .gap(px(SPACE_XS))
             .child(coverage)
+            .child(profile)
             .child(configs)
             .child(run)
             .child(debug)
@@ -1000,6 +1020,24 @@ impl Workspace {
     fn action_row<A: Action + Clone + 'static>(&self, label: &'static str, action: A) -> MenuEntry {
         let entry = action_entry(label, action);
         let name = A::name_for_type();
+        if let (Some(keys), Some(shortcut)) = (self.key_of_key(name), self.shortcut_of_key(name)) {
+            entry.shortcut(shortcut).keys(keys)
+        } else {
+            entry
+        }
+    }
+
+    /// The same row with a label that names the selected configuration.
+    fn action_row_named<A: Action + Clone + 'static>(
+        &self,
+        label: impl Into<SharedString>,
+        action: A,
+    ) -> MenuEntry {
+        let name = A::name_for_type();
+        let entry = MenuEntry::new(label, move |window, cx| {
+            window.dispatch_action(Box::new(action.clone()), cx);
+        })
+        .id(name);
         if let (Some(keys), Some(shortcut)) = (self.key_of_key(name), self.shortcut_of_key(name)) {
             entry.shortcut(shortcut).keys(keys)
         } else {
@@ -1210,6 +1248,9 @@ impl Workspace {
                 self.action_row("Structure", ToggleStructure),
                 self.action_row("Problems", ToggleProblems),
                 self.action_row("Services", ToggleServices),
+                self.action_row("Database", ToggleDatabase),
+                command("jshell.open", "JShell Console"),
+                self.action_row("Endpoints", ToggleEndpoints),
                 self.action_row("Usages", ToggleUsages),
                 self.action_row("TODO", ToggleTodo),
                 self.action_row("Git", ToggleLog),
@@ -1324,6 +1365,8 @@ impl Workspace {
                 command(workspace_keys::RUN_INSPECTION, "Run Inspection by Name..."),
                 command(workspace_keys::CODE_CLEANUP, "Code Cleanup..."),
                 MenuEntry::separator(),
+                command("workspace.analyze_stack_trace", "Analyze Stack Trace..."),
+                MenuEntry::separator(),
                 MenuEntry::submenu(
                     "Folding",
                     vec![
@@ -1369,13 +1412,20 @@ impl Workspace {
             ],
         );
 
+        let run_state = self.run_state(cx);
+        let profile_label = match run_state.selected {
+            Some(_) => format!("Profile '{}'", run_state.label()),
+            None => "Profile".to_owned(),
+        };
         let run = MenuEntry::submenu(
             "Run",
             vec![
                 self.action_row("Run", Run),
                 self.action_row("Debug", Debug),
                 self.action_row("Run with Coverage", RunWithCoverage),
+                self.action_row_named(profile_label, RunWithProfiler),
                 self.action_row("Run Tests with Coverage", RunTestsWithCoverage),
+                self.action_row("Run Tests with Profiler", RunTestsWithProfiler),
                 self.action_row("Hide Coverage", HideCoverage),
                 command(workspace_keys::RUN_ANYTHING, "Run Anything"),
                 command(workspace_keys::RUN_CLASS, "Run Test at Caret"),
@@ -2483,6 +2533,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleServices, window, cx| {
                 this.toggle_tool(SERVICES_TOOL, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleDatabase, window, cx| {
+                this.toggle_tool(DATABASE_TOOL, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleEndpoints, window, cx| {
+                this.toggle_tool(ENDPOINTS_TOOL, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleCommit, window, cx| {
                 this.toggle_tool(COMMIT_TOOL, window, cx)
             }))
@@ -2567,8 +2623,14 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RunWithCoverage, window, cx| {
                 this.run_with_coverage(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &RunWithProfiler, window, cx| {
+                this.run_with_profiler(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &RunTestsWithCoverage, window, cx| {
                 this.run_tests_with_coverage(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RunTestsWithProfiler, window, cx| {
+                this.run_tests_with_profiler(window, cx)
             }))
             .on_action(
                 cx.listener(|this, _: &HideCoverage, window, cx| this.hide_coverage(window, cx)),

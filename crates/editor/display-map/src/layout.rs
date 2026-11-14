@@ -210,6 +210,64 @@ pub(crate) fn build_line<S: TextStore>(
     line
 }
 
+/// The columns of the widest line of the whole text, with every tab counted as the
+/// spaces it shows. One pass over the bytes and no allocation, so the horizontal bar of a
+/// big file costs the same as reading the text once.
+pub(crate) fn widest_line_columns<S: TextStore>(store: &S, tab_size: usize) -> usize {
+    let mut widest = 0;
+    let mut columns = 0;
+    let mut at = 0;
+    while at < store.len() {
+        let (chunk, chunk_start) = store.chunk_at(at);
+        let from = at.saturating_sub(chunk_start).min(chunk.len());
+        if from >= chunk.len() {
+            break;
+        }
+        for character in chunk[from..].chars() {
+            match character {
+                '\n' => {
+                    widest = widest.max(columns);
+                    columns = 0;
+                }
+                '\t' => columns += tab_size - columns % tab_size,
+                _ => columns += 1,
+            }
+        }
+        at += chunk.len() - from;
+    }
+    widest.max(columns)
+}
+
+/// The columns a line takes on screen: its characters, with a tab counted as the
+/// spaces it shows up to the next stop. No text is built, so walking the lines of a big
+/// file for its widest one costs one pass over the bytes and no allocation.
+pub(crate) fn line_columns<S: TextStore>(store: &S, line: usize, tab_size: usize) -> usize {
+    let start = store.line_to_offset(line);
+    let end = store.line_end(line);
+    let mut columns = 0;
+    let mut at = start;
+    while at < end {
+        let (chunk, chunk_start) = store.chunk_at(at);
+        if chunk.is_empty() {
+            break;
+        }
+        let from = at.saturating_sub(chunk_start).min(chunk.len());
+        let take = (end - at).min(chunk.len() - from);
+        if take == 0 {
+            break;
+        }
+        for character in chunk[from..from + take].chars() {
+            columns += if character == '\t' {
+                tab_size - columns % tab_size
+            } else {
+                1
+            };
+        }
+        at += take;
+    }
+    columns
+}
+
 fn push_inlay(line: &mut DisplayLine, inlay: &Inlay) {
     let column = line.text.len();
     line.text.push_str(&inlay.text);

@@ -11,6 +11,11 @@ use crate::Result;
 const RELEASE: &str = "8";
 const EXTENSION: &str = "maven-ext.jar";
 const TEST_LISTENER: &str = "ide-test-listener.jar";
+const DATABASE_HELPER: &str = "ide-db-helper.jar";
+const CONSOLE_HELPER: &str = "ide-jshell-helper.jar";
+/// The console helper links to the console API of the runtime, which is documented from
+/// release 9 on: a project may run it on any runtime from that one up.
+const CONSOLE_RELEASE: &str = "9";
 
 /// Builds the test listener, then compiles `helpers/maven-ext` against the libraries of a
 /// Maven distribution.
@@ -29,6 +34,8 @@ pub fn run_with(
 ) -> Result {
     fs::create_dir_all(out)?;
     test_listener(root, out)?;
+    database_helper(root, out)?;
+    console_helper(root, out)?;
     let maven_lib = match maven_lib {
         Some(lib) => lib.to_owned(),
         None => find_maven_lib().ok_or(
@@ -242,6 +249,72 @@ fn test_listener(root: &Path, out: &Path) -> Result {
         .arg(".");
     check(&mut jar)?;
     fs::remove_dir_all(&stubs)?;
+    fs::remove_dir_all(&classes)?;
+    println!("{}", jar_file.display());
+    Ok(())
+}
+
+/// The helper that talks to a database driver. It has no libraries of its own: the jar
+/// of the project driver is next to it on the classpath of the project JVM.
+fn database_helper(root: &Path, out: &Path) -> Result {
+    let helper = root.join("helpers/db-helper/src");
+    let classes = out.join("db-helper-classes");
+    if classes.exists() {
+        fs::remove_dir_all(&classes)?;
+    }
+    fs::create_dir_all(&classes)?;
+    let mut sources = Vec::new();
+    collect_sources(&helper, &mut sources)?;
+    check(javac(&classes).args(&sources))?;
+    let jar_file = out.join(DATABASE_HELPER);
+    let mut jar = Command::new(tool("jar"));
+    jar.arg("--create")
+        .arg("--file")
+        .arg(&jar_file)
+        .arg("-C")
+        .arg(&classes)
+        .arg(".");
+    check(&mut jar)?;
+    fs::remove_dir_all(&classes)?;
+    println!("{}", jar_file.display());
+    Ok(())
+}
+
+/// The helper that runs the fragments of a console in a process of its own. It links to
+/// the console API of the runtime, so it is compiled for release 9 and not for the
+/// release of the other helpers.
+fn console_helper(root: &Path, out: &Path) -> Result {
+    let helper = root.join("helpers/jshell-helper/src");
+    let classes = out.join("console-helper-classes");
+    if classes.exists() {
+        fs::remove_dir_all(&classes)?;
+    }
+    fs::create_dir_all(&classes)?;
+    let mut sources = Vec::new();
+    collect_sources(&helper, &mut sources)?;
+    let mut javac = Command::new(tool("javac"));
+    javac
+        .args([
+            "--release",
+            CONSOLE_RELEASE,
+            "-Xlint:-options",
+            "-nowarn",
+            "-encoding",
+            "UTF-8",
+        ])
+        .arg("-d")
+        .arg(&classes)
+        .args(&sources);
+    check(&mut javac)?;
+    let jar_file = out.join(CONSOLE_HELPER);
+    let mut jar = Command::new(tool("jar"));
+    jar.arg("--create")
+        .arg("--file")
+        .arg(&jar_file)
+        .arg("-C")
+        .arg(&classes)
+        .arg(".");
+    check(&mut jar)?;
     fs::remove_dir_all(&classes)?;
     println!("{}", jar_file.display());
     Ok(())

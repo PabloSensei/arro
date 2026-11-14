@@ -2,10 +2,11 @@
 //! program can be started, how the last run went for them, and which one is under the
 //! caret.
 
-use editor_view::{EditorView, RunMark, RunMarkState};
+use editor_view::{EditorView, EndpointMark, RunMark, RunMarkState};
+use lang_api::Endpoint;
 use runner::{LaunchPoint, RunConfig, TestRequest, TestSite, TestState};
 use ui_kit::*;
-use workspace::{COVERAGE_TOOL, DEBUG_TOOL, RUN_TOOL, Workspace};
+use workspace::{COVERAGE_TOOL, DEBUG_TOOL, ENDPOINTS_TOOL, RUN_TOOL, Workspace};
 
 use crate::run::RunPanel;
 use crate::run_configs::RunConfigDialog;
@@ -83,7 +84,96 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
     );
     marks.sort_by_key(|mark| mark.line);
     marks.dedup_by_key(|mark| mark.line);
+    let endpoints = endpoint_marks(view, &text, cx);
     view.set_run_marks(marks, cx);
+    view.set_endpoint_marks(endpoints, cx);
+    crate::beans::refresh(view, cx);
+    crate::spring_data::refresh(view, cx);
+}
+
+/// The lines of the file that start an HTTP handler, from the language that reads them.
+fn endpoint_marks(view: &EditorView, text: &str, cx: &App) -> Vec<EndpointMark> {
+    let Some(support) = cx
+        .try_global::<editor_view::Semantic>()
+        .map(|semantic| semantic.0.clone())
+    else {
+        return Vec::new();
+    };
+    let Some(provider) = support.endpoints() else {
+        return Vec::new();
+    };
+    let color = cx.global::<Theme>().accent;
+    provider
+        .file_endpoints(view.path(), text)
+        .endpoints
+        .iter()
+        .map(|endpoint| EndpointMark {
+            line: endpoint.line,
+            color,
+        })
+        .collect()
+}
+
+/// The handler whose name starts on a line, with the port of its module.
+pub(crate) fn endpoint_at_line(
+    view: &EditorView,
+    line: usize,
+    cx: &App,
+) -> Option<(Endpoint, Option<u16>)> {
+    let support = cx
+        .try_global::<editor_view::Semantic>()
+        .map(|semantic| semantic.0.clone())?;
+    let provider = support.endpoints()?;
+    let text = view.text()?;
+    let scan = provider.file_endpoints(view.path(), &text);
+    let lang_api::EndpointScan { port, endpoints } = scan;
+    let endpoint = endpoints
+        .into_iter()
+        .find(|endpoint| endpoint.line as usize == line)?;
+    Some((endpoint, port))
+}
+
+/// The menu of the mark beside the run button: the request it becomes and the window
+/// that lists it.
+pub(crate) fn show_endpoint_menu(
+    view: &Entity<EditorView>,
+    line: usize,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some((endpoint, port)) = ({
+        let view = view.read(cx);
+        endpoint_at_line(view, line, cx)
+    }) else {
+        return;
+    };
+    let weak = cx.weak_entity();
+    let generate_endpoint = endpoint.clone();
+    let generate = MenuEntry::new("Generate Request in HTTP Client", move |window, cx| {
+        weak.update(cx, |workspace, cx| {
+            crate::endpoints::generate_request(&generate_endpoint, port, workspace, window, cx)
+        })
+        .ok();
+    })
+    .icon("toolwindows/services");
+    let show_endpoint = endpoint;
+    let show_weak = cx.weak_entity();
+    let show = MenuEntry::new("Show in Endpoints", move |window, cx| {
+        let path = show_endpoint.file.clone();
+        let line = show_endpoint.line;
+        if let Some(panel) = cx.try_global::<crate::endpoints::ActiveEndpoints>() {
+            let panel = panel.0.clone();
+            panel.update(cx, |panel, cx| panel.show_at(&path, line, cx));
+        }
+        show_weak
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(ENDPOINTS_TOOL, window, cx)
+            })
+            .ok();
+    })
+    .icon("general/locate");
+    workspace.show_menu(window.mouse_position(), vec![generate, show], cx);
 }
 
 /// The test or class whose mark is on this line, from zero.

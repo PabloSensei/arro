@@ -209,6 +209,7 @@ fn completion_entry(item: lsp::CompletionItem) -> CompletionEntry {
         command,
         resolve,
         kind: completion_kind(item.kind),
+        deprecated: item.deprecated.unwrap_or(false),
     }
 }
 

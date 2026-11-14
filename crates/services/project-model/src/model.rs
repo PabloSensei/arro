@@ -12,6 +12,9 @@ pub struct ProjectModel {
     pub tool: String,
     pub tool_version: Option<String>,
     pub modules: Vec<Module>,
+    /// What each module depends on, when the tool resolved it.
+    #[serde(default)]
+    pub dependencies: Vec<ModuleDependencies>,
     /// False for a model read from project files alone, without the tool: it knows the
     /// modules and their roots, not their dependencies.
     pub resolved: bool,
@@ -21,6 +24,13 @@ pub struct ProjectModel {
 impl ProjectModel {
     pub fn module(&self, id: &str) -> Option<&Module> {
         self.modules.iter().find(|module| module.id == id)
+    }
+
+    /// The dependencies of one module, when the tool reported them.
+    pub fn dependencies_of(&self, module: &str) -> Option<&ModuleDependencies> {
+        self.dependencies
+            .iter()
+            .find(|found| found.module == module)
     }
 
     /// Everything a program of this unit needs at run time, outputs first. A neighbour
@@ -81,10 +91,120 @@ pub struct Module {
     pub units: Vec<Unit>,
 }
 
+/// What one module depends on: the file it is declared in and a tree per scope.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleDependencies {
+    pub module: String,
+    /// The file that declares the dependencies of the module, when the tool named one.
+    #[serde(default)]
+    pub build_file: Option<PathBuf>,
+    /// The dependencies of the module, one tree per scope.
+    #[serde(default)]
+    pub scopes: Vec<DependencyScope>,
+}
+
+/// The dependencies of a module under one scope, as the tool resolved them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyScope {
+    /// `compile`, `runtime`, `test`, or the name the tool gives its own scope.
+    pub name: String,
+    pub roots: Vec<Dependency>,
+}
+
+/// One edge of the dependency tree: a dependency and everything it pulls in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dependency {
+    /// `group:artifact:version` of the version resolution chose; the id of a module
+    /// for a neighbour of the project.
+    pub coordinates: String,
+    /// The scope the tool gave this edge.
+    #[serde(default)]
+    pub scope: String,
+    /// `group:artifact:version` the build asks for at this edge, when it differs from
+    /// [`Dependency::coordinates`].
+    #[serde(default)]
+    pub requested: Option<String>,
+    /// `group:artifact:version` resolution chose instead of this one, when this edge
+    /// lost a version conflict.
+    #[serde(default)]
+    pub winner: Option<String>,
+    /// The file the dependency comes as, when the tool resolved one.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// The project module this dependency is, rather than a library.
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
+    pub children: Vec<Dependency>,
+}
+
+/// `group:artifact:version` of a dependency, split for the window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Coordinates {
+    pub group: String,
+    pub artifact: String,
+    pub version: String,
+}
+
+impl Coordinates {
+    /// Reads `group:artifact:version`. `None` for a name that does not have all three,
+    /// such as the id of a project module.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (group, rest) = text.split_once(':')?;
+        let (artifact, version) = rest.split_once(':')?;
+        if group.is_empty() || artifact.is_empty() || version.is_empty() {
+            return None;
+        }
+        Some(Self {
+            group: group.to_owned(),
+            artifact: artifact.to_owned(),
+            version: version.to_owned(),
+        })
+    }
+
+    /// `group:artifact`, the name an artifact keeps across its versions.
+    pub fn artifact_name(&self) -> String {
+        format!("{}:{}", self.group, self.artifact)
+    }
+}
+
+impl ModuleDependencies {
+    /// The tree of one scope, when the tool reported it.
+    pub fn scope(&self, name: &str) -> Option<&DependencyScope> {
+        self.scopes.iter().find(|scope| scope.name == name)
+    }
+}
+
+impl Dependency {
+    /// The version this edge asks for in the build file, when the tool reported one.
+    pub fn requested_version(&self) -> Option<String> {
+        Coordinates::parse(self.requested.as_deref()?).map(|found| found.version)
+    }
+}
+
 impl Module {
     pub fn unit(&self, name: &str) -> Option<&Unit> {
         self.units.iter().find(|unit| unit.name == name)
     }
+}
+
+/// A dependency left out of another one: the group and the artifact.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Exclusion {
+    pub group: String,
+    pub artifact: String,
+    /// `group:artifact:version` of the dependency declared by the module whose
+    /// declaration gets the exclusion.
+    pub declared: String,
+}
+
+/// A change to the text of one file, in offsets of the text the caller holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileEdit {
+    pub path: PathBuf,
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
 }
 
 /// Sources that compile together, like `main` or `test`.
@@ -195,5 +315,50 @@ mod tests {
                 .runtime_paths("app", "main")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn coordinates_split_into_group_artifact_and_version() {
+        let found = Coordinates::parse("com.fasterxml.jackson.core:jackson-databind:2.17.0");
+        let found = found.unwrap();
+
+        assert_eq!(found.group, "com.fasterxml.jackson.core");
+        assert_eq!(found.artifact, "jackson-databind");
+        assert_eq!(found.version, "2.17.0");
+        assert_eq!(
+            found.artifact_name(),
+            "com.fasterxml.jackson.core:jackson-databind"
+        );
+        assert_eq!(
+            Coordinates::parse(":app"),
+            None,
+            "a module id is no artifact"
+        );
+        assert_eq!(Coordinates::parse("group:artifact"), None);
+    }
+
+    #[test]
+    fn a_node_keeps_the_version_it_asks_for_and_the_one_it_lost_to() {
+        let node = Dependency {
+            coordinates: "g:a:1".into(),
+            requested: Some("g:a:2".into()),
+            winner: Some("g:a:3".into()),
+            ..Dependency::default()
+        };
+
+        assert_eq!(node.requested_version(), Some("2".to_owned()));
+        assert_eq!(node.children.len(), 0);
+    }
+
+    /// The cache of an older model has no dependency fields, and must still load.
+    #[test]
+    fn a_model_without_dependencies_still_loads() {
+        let text = r#"{"root":"p","tool":"m","modules":[{"id":"a","name":"a","dir":"p",
+            "units":[]}],"resolved":true,"problems":[]}"#;
+
+        let model: ProjectModel = serde_json::from_str(text).unwrap();
+
+        assert!(model.dependencies.is_empty());
+        assert_eq!(model.modules[0].name, "a");
     }
 }

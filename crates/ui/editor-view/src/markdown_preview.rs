@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ui_kit::metrics::*;
@@ -13,8 +14,8 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 
 use crate::quick_doc::{
-    DocBlock, DocHost, DocLinkHandler, DocRenderer, display_text, parse_with_lines, plain_inlines,
-    split_line_fragment,
+    DocBlock, DocHost, DocImage, DocInline, DocLinkHandler, DocPicture, DocRenderer, display_text,
+    image_path, parse_with_lines, plain_inlines, split_line_fragment,
 };
 use crate::view::EditorView;
 
@@ -43,9 +44,9 @@ impl PreviewMode {
 }
 
 /// The mode picked for each file of the session: a tab opened again shows what it showed
-/// when it closed.
+/// when it closed. The saved layout keeps the same choice for a project opened again.
 #[derive(Default)]
-struct PreviewModes(HashMap<PathBuf, PreviewMode>);
+pub struct PreviewModes(HashMap<PathBuf, PreviewMode>);
 
 impl Global for PreviewModes {}
 
@@ -67,6 +68,8 @@ pub(crate) struct MarkdownPreview {
     target: Option<usize>,
     pub(crate) scroll: ScrollHandle,
     pub(crate) mode: PreviewMode,
+    /// The pictures of the document by their address, once the tab has found them.
+    pub(crate) pictures: HashMap<String, DocPicture>,
     /// The version of the text the blocks are made of.
     parsed: Option<u64>,
     /// The version of the parse on its way, so the text is asked for once.
@@ -81,6 +84,7 @@ impl MarkdownPreview {
             target: None,
             scroll: ScrollHandle::new(),
             mode,
+            pictures: HashMap::new(),
             parsed: None,
             pending: None,
         }
@@ -128,6 +132,53 @@ fn slug(text: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
+/// The pictures of the blocks, in the order the document names them.
+fn pictures_of(blocks: &[DocBlock], out: &mut Vec<DocImage>) {
+    for block in blocks {
+        match block {
+            DocBlock::Paragraph(inlines) => pictures_in(inlines, out),
+            DocBlock::Heading { text, .. } => pictures_in(text, out),
+            DocBlock::List { items, .. } => {
+                for item in items {
+                    pictures_in(item, out);
+                }
+            }
+            DocBlock::Table { header, rows, .. } => {
+                for cell in header {
+                    pictures_in(cell, out);
+                }
+                for row in rows {
+                    for cell in row {
+                        pictures_in(cell, out);
+                    }
+                }
+            }
+            DocBlock::Image { alt, url } => out.push(DocImage {
+                alt: alt.clone(),
+                url: url.clone(),
+                width: None,
+                height: None,
+            }),
+            DocBlock::Quote(inner) => pictures_of(inner, out),
+            DocBlock::Code { .. } | DocBlock::Divider => {}
+        }
+    }
+}
+
+/// The pictures of a run of a line, in the order the document names them.
+fn pictures_in(inlines: &[DocInline], out: &mut Vec<DocImage>) {
+    for inline in inlines {
+        match inline {
+            DocInline::Image(image) => out.push(image.clone()),
+            DocInline::Strong(children) | DocInline::Emphasis(children) => {
+                pictures_in(children, out);
+            }
+            DocInline::Link { text, .. } => pictures_in(text, out),
+            DocInline::Text(_) | DocInline::Code(_) => {}
+        }
+    }
+}
+
 impl EditorView {
     /// The mode of the preview of this tab, `None` for a file without one.
     pub fn preview_mode(&self) -> Option<PreviewMode> {
@@ -143,6 +194,12 @@ impl EditorView {
     /// The block the panel was last scrolled to, for the tests.
     pub fn preview_block(&self) -> Option<usize> {
         self.preview.as_ref()?.target
+    }
+
+    /// The folder the preview keeps the pictures it takes from the internet, so that a
+    /// second open of the project draws them without asking again.
+    pub fn set_picture_cache(&mut self, folder: PathBuf) {
+        self.picture_cache = Some(folder);
     }
 
     /// How far the panel of the preview is scrolled, for the tests.
@@ -249,6 +306,93 @@ impl EditorView {
         preview.blocks = blocks;
         preview.lines = lines;
         preview.parsed = Some(version);
+        self.prepare_pictures(cx);
+        cx.notify();
+    }
+
+    /// Finds the pictures the document draws: a file next to it, or the bytes of an
+    /// address of the internet from the cache of the state folder or the server. A
+    /// picture already found stays as it is.
+    fn prepare_pictures(&mut self, cx: &mut Context<Self>) {
+        let base = self
+            .path
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        let internet = self.options.markdown_images_from_internet;
+        let cache = self.picture_cache.clone();
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        if preview.blocks.is_empty() {
+            return;
+        }
+        let mut wanted = Vec::new();
+        pictures_of(&preview.blocks, &mut wanted);
+        for image in wanted {
+            if preview.pictures.contains_key(&image.url) {
+                continue;
+            }
+            if crate::markdown_images::is_remote(&image.url) {
+                if !internet {
+                    preview.pictures.insert(image.url, DocPicture::Unavailable);
+                    continue;
+                }
+                let url = image.url.clone();
+                preview.pictures.insert(image.url, DocPicture::Loading);
+                let asked = url.clone();
+                let folder = cache.clone();
+                let job = cx.background_executor().spawn(async move {
+                    let bytes = crate::markdown_images::fetch(&asked, folder.as_deref())?;
+                    let format = crate::markdown_images::format_of(&bytes, &asked)
+                        .ok_or_else(|| "the address is not a picture".to_owned())?;
+                    Ok::<_, String>(Arc::new(Image::from_bytes(format, bytes)))
+                });
+                cx.spawn(async move |this, cx| {
+                    let answer = job.await;
+                    this.update(cx, |this, cx| this.picture_arrived(url, answer, cx))
+                        .ok();
+                })
+                .detach();
+                continue;
+            }
+            let picture = match image_path(&base, &image.url) {
+                Some(path) if path.is_file() => DocPicture::File(path),
+                _ => DocPicture::Unavailable,
+            };
+            preview.pictures.insert(image.url, picture);
+        }
+    }
+
+    /// The bytes of a picture of the internet have come, or the reason they did not.
+    fn picture_arrived(
+        &mut self,
+        url: String,
+        answer: Result<Arc<Image>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let internet = self.options.markdown_images_from_internet;
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        let remote = crate::markdown_images::is_remote(&url);
+        let picture = match answer {
+            Ok(bytes) if !remote || internet => DocPicture::Bytes(bytes),
+            Ok(_) | Err(_) => DocPicture::Unavailable,
+        };
+        preview.pictures.insert(url, picture);
+        cx.notify();
+    }
+
+    /// Settings turned the pictures of the internet on or off: the addresses of a
+    /// server are asked for again, or dropped back to their text.
+    pub(crate) fn pictures_from_internet(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        preview
+            .pictures
+            .retain(|url, _| !crate::markdown_images::is_remote(url));
+        self.prepare_pictures(cx);
         cx.notify();
     }
 
@@ -364,10 +508,11 @@ impl EditorView {
                     .map_or_else(PathBuf::new, Path::to_path_buf),
             ),
         };
-        let mut renderer = DocRenderer::new(&self.style, &theme, &host);
         let Some(preview) = &self.preview else {
             return editor;
         };
+        let mut renderer =
+            DocRenderer::with_pictures(&self.style, &theme, &host, &preview.pictures);
         let mut content = div()
             .id("markdown-preview-scroll")
             .flex()

@@ -52,8 +52,10 @@ impl TestRun {
         model: &ProjectModel,
         request: &TestRequest,
     ) -> Result<TestCoverageRun> {
-        let (run, coverage) = Self::start_with(provider, model, request, StartKind::Coverage)?;
-        let coverage = coverage.expect("a coverage start returns its plan");
+        let (run, started) = Self::start_with(provider, model, request, StartKind::Coverage)?;
+        let StartedExtra::Coverage(coverage) = started else {
+            unreachable!("a coverage start returns its plan")
+        };
         Ok(TestCoverageRun {
             run,
             exec: coverage.exec,
@@ -68,11 +70,26 @@ pub(crate) struct CoverageStart {
     pub note: Option<String>,
 }
 
+/// The recording a started profile test run writes, and what the user has to know.
+pub(crate) struct ProfileStart {
+    pub recording: std::path::PathBuf,
+    pub note: Option<String>,
+}
+
+/// What a start beyond the plain one adds: the data file of a coverage run or the
+/// recording of a profile run.
+pub(crate) enum StartedExtra {
+    None,
+    Coverage(CoverageStart),
+    Profile(ProfileStart),
+}
+
 /// The kind of start of a test run, which decides the plan the provider makes.
 pub(crate) enum StartKind<'a> {
     Plain,
     Debug(&'a crate::TestDebug),
     Coverage,
+    Profile,
 }
 
 #[cfg(test)]

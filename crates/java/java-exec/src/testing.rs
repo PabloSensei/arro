@@ -168,6 +168,70 @@ impl TestProvider for JavaTestProvider {
         crate::coverage::report(&self.env, exec, model)
     }
 
+    fn supports_profiler(&self) -> bool {
+        true
+    }
+
+    /// The same tests with the recording flag in every JVM of the build: the `argLine` of
+    /// Surefire for Maven, the `jvmArgs` of the test tasks for Gradle.
+    fn profile_plan(
+        &self,
+        model: &ProjectModel,
+        request: &TestRequest,
+        listen: &TestListen,
+    ) -> Result<runner::ProfilePlan> {
+        let jdk = self.env.project_jdk(&model.root)?;
+        if !crate::profile::supported(&jdk) {
+            return Err(format!(
+                "the profiler needs Flight Recorder, which JDK {} does not have; use 8u262 or newer",
+                jdk.version
+            )
+            .into());
+        }
+        let selection = Self::selection(request)?;
+        let hook = TestHook {
+            port: listen.port,
+            token: listen.token.clone(),
+        };
+        let recording = crate::profile::recording_file(&self.env.cache_root(), "Tests")?;
+        let program = match model.tool.as_str() {
+            "maven" => {
+                let maven = Maven::new(self.env.clone());
+                maven.profile_test_command(&model.root, &selection, &hook, &recording)?
+            }
+            "gradle" => {
+                let gradle = Gradle::new(self.env.clone());
+                gradle.profile_test_command(&model.root, &selection, &hook, &recording)?
+            }
+            tool => return Err(format!("no test runs for the tool \"{tool}\"").into()),
+        };
+        Ok(runner::ProfilePlan {
+            plan: RunPlan {
+                before: None,
+                program,
+                grace: GRACE,
+            },
+            recording,
+            note: None,
+        })
+    }
+
+    fn profile_report(
+        &self,
+        recording: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        crate::profile::report_of(&self.env, recording, model)
+    }
+
+    fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        Ok(crate::profile::recordings(&self.env.cache_root()))
+    }
+
+    fn profile_run_recordings(&self, recording: &Path) -> Vec<std::path::PathBuf> {
+        crate::profile::run_recordings(recording)
+    }
+
     fn debug_ready(&self) -> Option<&'static str> {
         Some(DEBUG_READY_LINE)
     }

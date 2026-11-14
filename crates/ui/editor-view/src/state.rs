@@ -62,6 +62,75 @@ pub struct SaveOptions {
     pub ensure_final_newline: bool,
 }
 
+/// The work of the language a save does before the text reaches the disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActionsOnSave {
+    /// Reformat Code through the language.
+    pub reformat: bool,
+    /// Format the lines the last commit does not have rather than the whole file.
+    pub reformat_changed: bool,
+    /// The files the actions touch, as comma-separated masks; `*` is every file.
+    pub reformat_files: String,
+    /// Optimize Imports through the language.
+    pub optimize_imports: bool,
+    /// Code Cleanup through the language.
+    pub cleanup: bool,
+}
+
+impl ActionsOnSave {
+    /// Whether a save asks the language for anything.
+    pub fn any(&self) -> bool {
+        self.reformat || self.optimize_imports || self.cleanup
+    }
+
+    /// Whether the mask of the settings names `path`. An empty mask or `*` takes every
+    /// file, as does a mask with no pattern that matches.
+    pub fn matches(&self, path: &Path) -> bool {
+        let masks = self.reformat_files.trim();
+        if masks.is_empty() || masks == "*" {
+            return true;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let full = path.to_string_lossy().replace('\\', "/");
+        masks
+            .split([',', ';'])
+            .map(str::trim)
+            .filter(|mask| !mask.is_empty())
+            .any(|mask| wildcard(mask, &name) || wildcard(mask, &full))
+    }
+}
+
+/// A mask with `*` for any run of characters and `?` for one character.
+fn wildcard(mask: &str, text: &str) -> bool {
+    let (mask, text) = (mask.as_bytes(), text.as_bytes());
+    let (mut m, mut t) = (0, 0);
+    let mut star = None;
+    let mut resume = 0;
+    while t < text.len() {
+        if m < mask.len() && (mask[m] == b'?' || mask[m] == text[t]) {
+            m += 1;
+            t += 1;
+        } else if m < mask.len() && mask[m] == b'*' {
+            star = Some(m);
+            m += 1;
+            resume = t;
+        } else if let Some(at) = star {
+            m = at + 1;
+            resume += 1;
+            t = resume;
+        } else {
+            return false;
+        }
+    }
+    while m < mask.len() && mask[m] == b'*' {
+        m += 1;
+    }
+    m == mask.len()
+}
+
 struct Parsed {
     version: u64,
     tree: Tree,
@@ -363,23 +432,40 @@ impl EditorState {
             return None;
         }
         let text = self.buffer.text();
+        let carets: Vec<usize> = self
+            .buffer
+            .selections()
+            .iter()
+            .map(|selection| selection.head)
+            .collect();
+        let edits = self.save_edits(&text, &carets);
+        if edits.is_empty() {
+            return None;
+        }
+        let appended = edits
+            .last()
+            .is_some_and(|edit| edit.range == (text.len()..text.len()));
+        let change = self.apply_edits(edits);
+        if appended {
+            self.keep_caret_before_final_newline();
+        }
+        change
+    }
+
+    /// The edits of `.editorconfig` and of the save settings for `text`, with the carets
+    /// at the same offsets of `text`.
+    fn save_edits(&self, text: &str, carets: &[usize]) -> Vec<Edit> {
         let mut edits = Vec::new();
         let trim = match self.properties.trim_trailing_whitespace {
             Some(trim) => trim,
             None => self.save.trim_trailing != TrimTrailing::None,
         };
         if trim {
-            let carets: Vec<usize> = self
-                .buffer
-                .selections()
-                .iter()
-                .map(|selection| selection.head)
-                .collect();
             let modified: Vec<bool> = match (
                 self.properties.trim_trailing_whitespace,
                 self.save.trim_trailing,
             ) {
-                (None, TrimTrailing::Modified) => modified_lines(&text, &self.saved_text),
+                (None, TrimTrailing::Modified) => modified_lines(text, &self.saved_text),
                 _ => Vec::new(),
             };
             let mut start = 0;
@@ -411,30 +497,54 @@ impl EditorState {
             }
             _ => {}
         }
-        if edits.is_empty() {
+        edits
+    }
+
+    /// The edits of the language a save made, with the save rules of `.editorconfig` and
+    /// the settings after them, as one undo step. `edits` are in the coordinates of the
+    /// text as it is now.
+    pub fn apply_save_action_edits(&mut self, edits: Vec<Edit>) -> Option<Change> {
+        self.catch_up();
+        if self.is_read_only() || edits.is_empty() {
             return None;
         }
-        let appended = edits
+        let text = self.buffer.text();
+        let mut probe = RopeStore::from_text(&text);
+        let mut format = self.buffer.format();
+        text_core::apply_edits(&mut probe, &mut format, &edits);
+        let after = probe.text();
+        let carets: Vec<usize> = self
+            .buffer
+            .selections()
+            .iter()
+            .map(|selection| transform_offset(selection.head, &edits))
+            .collect();
+        let local = self.save_edits(&after, &carets);
+        let appended = local
             .last()
-            .is_some_and(|edit| edit.range == (text.len()..text.len()));
-        let change = self.apply_edits(edits);
+            .is_some_and(|edit| edit.range == (after.len()..after.len()));
+        let change = self.buffer.apply_batches(vec![edits, local]);
         if appended {
-            // The final newline goes after a caret at the end of the text: the caret stays
-            // on its line instead of moving to the new empty one.
-            let end = self.buffer.text().len().saturating_sub(1);
-            let selections: Vec<Selection> = self
-                .buffer
-                .selections()
-                .iter()
-                .map(|selection| Selection {
-                    anchor: selection.anchor.min(end),
-                    head: selection.head.min(end),
-                })
-                .collect();
-            self.buffer
-                .set_selections(SelectionSet::from_vec(selections));
+            self.keep_caret_before_final_newline();
         }
-        change
+        self.finish(change)
+    }
+
+    /// A final newline goes after a caret at the end of the text: the caret stays on its
+    /// line instead of moving to the new empty one.
+    fn keep_caret_before_final_newline(&mut self) {
+        let end = self.buffer.text().len().saturating_sub(1);
+        let selections: Vec<Selection> = self
+            .buffer
+            .selections()
+            .iter()
+            .map(|selection| Selection {
+                anchor: selection.anchor.min(end),
+                head: selection.head.min(end),
+            })
+            .collect();
+        self.buffer
+            .set_selections(SelectionSet::from_vec(selections));
     }
 
     pub fn finish_save(&mut self, saved: &Saved) {
@@ -474,6 +584,17 @@ impl EditorState {
         self.buffer.mark_saved();
         self.saved_text = self.buffer.text();
         self.read_only = !decoded.lossless;
+        self.finish_with(change, false)
+    }
+
+    /// Takes a new text for a read-only document, as one external edit: undo brings the
+    /// old text back, and the carets move with the edit where it allows.
+    pub fn take_source_text(&mut self, text: &str) -> Option<Change> {
+        self.catch_up();
+        let edit = difference(&self.buffer.text(), text)?;
+        let change = self
+            .buffer
+            .apply(vec![edit], None, EditSource::External, EditKind::Command);
         self.finish_with(change, false)
     }
 

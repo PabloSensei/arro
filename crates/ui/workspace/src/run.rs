@@ -70,6 +70,10 @@ pub struct RunControls {
     pub hide_coverage: Action,
     /// Shows or hides the coverage stripes.
     pub toggle_coverage: Action,
+    /// Runs the selected configuration with its samples recorded.
+    pub profile: Action,
+    /// Runs the tests of the last run with their JVMs recorded.
+    pub profile_tests: Action,
 }
 
 /// Where a debug session is, for the toolbar and the keys.

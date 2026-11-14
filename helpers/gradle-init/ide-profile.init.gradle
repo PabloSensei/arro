@@ -1,0 +1,13 @@
+// Adds the recording flag to the JVMs of the run and test tasks of a build.
+//   gradlew --init-script ide-profile.init.gradle -Pide.profile.flag=FLAG bootRun
+//
+// Only the task the IDE asked for runs, so every JavaExec and Test task may carry it.
+
+def flag = gradle.startParameter.projectProperties['ide.profile.flag']
+
+if (flag != null) {
+    allprojects {
+        tasks.withType(org.gradle.api.tasks.JavaExec).configureEach { task -> task.jvmArgs flag }
+        tasks.withType(Test).configureEach { task -> task.jvmArgs flag }
+    }
+}

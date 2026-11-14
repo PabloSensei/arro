@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use store::Store;
 use ui_kit::metrics::*;
 
+use crate::editor::PreviewLayout;
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DockState {
     pub open: bool,
@@ -50,6 +52,8 @@ pub struct Layout {
     /// Files that were edited in the project, the latest first. Opening a file alone
     /// does not put it here; saving does not take it away.
     pub recent_edited: Vec<PathBuf>,
+    /// What each file with a rendered document showed: the text, the document, or both.
+    pub preview_modes: Vec<(PathBuf, PreviewLayout)>,
 }
 
 impl Default for Layout {
@@ -75,6 +79,7 @@ impl Default for Layout {
             tree_selected: None,
             bottom_tool: None,
             recent_edited: Vec::new(),
+            preview_modes: Vec::new(),
         }
     }
 }

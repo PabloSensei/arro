@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
 use ui_kit::*;
 
 /// Line and column of a caret, from zero.
@@ -32,8 +33,29 @@ pub type IndentSetter = Rc<dyn Fn(IndentChoice, &mut App)>;
 /// Writes unsaved changes before it returns. `Some` says why the text is still not on disk.
 pub type SaveNow = Rc<dyn Fn(&mut App) -> Option<String>>;
 
-/// Shows the rendered document of a tab alone, as a README opens.
-pub type PreviewOnly = Rc<dyn Fn(&mut App)>;
+/// What a tab with a rendered document shows: the text, the document, or both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewLayout {
+    EditorOnly,
+    #[default]
+    Both,
+    PreviewOnly,
+}
+
+/// Reads what a tab with a rendered document shows.
+pub type PreviewReader = Rc<dyn Fn(&App) -> PreviewLayout>;
+
+/// Changes what a tab with a rendered document shows.
+pub type PreviewSetter = Rc<dyn Fn(PreviewLayout, &mut App)>;
+
+/// Reads and changes what a tab with a rendered document shows: the tab itself and the
+/// mode the layout of the project keeps for the file.
+#[derive(Clone)]
+pub struct PreviewTab {
+    pub layout: PreviewReader,
+    pub set_layout: PreviewSetter,
+}
 
 /// What the status bar shows about the active tab.
 #[derive(Clone, Default)]
@@ -76,9 +98,8 @@ pub struct EditorTab {
     pub set_indent: IndentSetter,
     /// Takes the text on disk in place of the edits of the buffer; undo brings them back.
     pub reload_from_disk: Rc<dyn Fn(&mut App)>,
-    /// Shows the rendered document of the tab alone, the way a README opens; `None` for
-    /// a file without a preview.
-    pub show_preview_only: Option<PreviewOnly>,
+    /// What the tab with a rendered document shows; `None` for a file without a preview.
+    pub preview: Option<PreviewTab>,
 }
 
 /// Line ends and encodings the status bar offers, by the names `EditorTab::set_format` takes.

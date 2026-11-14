@@ -23,11 +23,13 @@ pub enum SettingsPage {
     VersionControl,
     Git,
     Tools,
+    ActionsOnSave,
     Terminal,
     HttpClient,
     EditorLiveTemplates,
     EditorPostfix,
     EditorFileTemplates,
+    Debugger,
 }
 
 /// The names the language gives its two build tools. They are no part of this crate:
@@ -55,7 +57,7 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 19] = [
+    pub const ALL: [SettingsPage; 21] = [
         SettingsPage::Appearance,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
@@ -64,6 +66,7 @@ impl SettingsPage {
         SettingsPage::EditorLiveTemplates,
         SettingsPage::EditorPostfix,
         SettingsPage::EditorFileTemplates,
+        SettingsPage::Debugger,
         SettingsPage::Project,
         SettingsPage::BuildTools,
         SettingsPage::BuildToolsFirst,
@@ -71,6 +74,7 @@ impl SettingsPage {
         SettingsPage::VersionControl,
         SettingsPage::Git,
         SettingsPage::Tools,
+        SettingsPage::ActionsOnSave,
         SettingsPage::Terminal,
         SettingsPage::HttpClient,
         SettingsPage::Plugins,
@@ -93,11 +97,13 @@ impl SettingsPage {
             SettingsPage::VersionControl => "Version Control",
             SettingsPage::Git => "Git",
             SettingsPage::Tools => "Tools",
+            SettingsPage::ActionsOnSave => "Actions on Save",
             SettingsPage::Terminal => "Terminal",
             SettingsPage::HttpClient => "HTTP Client",
             SettingsPage::EditorLiveTemplates => "Live Templates",
             SettingsPage::EditorPostfix => "Postfix Completion",
             SettingsPage::EditorFileTemplates => "File and Code Templates",
+            SettingsPage::Debugger => "Debugger",
         }
     }
 
@@ -110,6 +116,7 @@ impl SettingsPage {
             | SettingsPage::BuildToolsFirst
             | SettingsPage::BuildToolsSecond
             | SettingsPage::Git
+            | SettingsPage::ActionsOnSave
             | SettingsPage::Terminal
             | SettingsPage::EditorLiveTemplates
             | SettingsPage::EditorFileTemplates => 1,
@@ -141,7 +148,7 @@ impl SettingsPage {
                 Some(SettingsPage::BuildTools)
             }
             SettingsPage::Git => Some(SettingsPage::VersionControl),
-            SettingsPage::Terminal => Some(SettingsPage::Tools),
+            SettingsPage::ActionsOnSave | SettingsPage::Terminal => Some(SettingsPage::Tools),
             _ => None,
         }
     }
@@ -176,6 +183,11 @@ pub enum SettingField {
     CaretBlink,
     TrimTrailingWhitespace,
     EnsureFinalNewline,
+    ActionsOnSaveReformat,
+    ActionsOnSaveScope,
+    ActionsOnSaveFiles,
+    ActionsOnSaveOptimizeImports,
+    ActionsOnSaveCleanup,
     ZoomWithWheel,
     TabSize,
     IndentSize,
@@ -198,6 +210,7 @@ pub enum SettingField {
     BuildToolFirstOffline,
     BuildToolFirstVmOptions,
     BuildToolFirstUpdateSnapshots,
+    DownloadSourcesAutomatically,
     BuildToolSecondHome,
     BuildToolSecondOffline,
     BuildToolSecondUserHome,
@@ -211,9 +224,11 @@ pub enum SettingField {
     TerminalStartDirectory,
     TerminalEnvironment,
     RenderDocComments,
+    MarkdownImagesFromInternet,
     DiffSideBySide,
     GitGroupByDirectory,
     HttpTimeout,
+    DebugShowValuesInline,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -376,19 +391,59 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         id: "trim_trailing_whitespace",
-        title: "Trim trailing whitespace on save",
-        page: SettingsPage::Editor,
+        title: "Remove trailing whitespace",
+        page: SettingsPage::ActionsOnSave,
         kind: SettingKind::Choice,
         field: SettingField::TrimTrailingWhitespace,
-        keywords: "spaces tabs trailing save modified lines editor general",
+        keywords: "spaces tabs trailing save modified lines actions on save editor general",
     },
     Setting {
         id: "ensure_final_newline",
-        title: "Ensure line feed at file end on save",
-        page: SettingsPage::Editor,
+        title: "Ensure an empty line at the end of file",
+        page: SettingsPage::ActionsOnSave,
         kind: SettingKind::Toggle,
         field: SettingField::EnsureFinalNewline,
-        keywords: "newline final save line feed editor general",
+        keywords: "newline final empty line save line feed actions on save",
+    },
+    Setting {
+        id: "actions_on_save_reformat",
+        title: "Reformat code",
+        page: SettingsPage::ActionsOnSave,
+        kind: SettingKind::Toggle,
+        field: SettingField::ActionsOnSaveReformat,
+        keywords: "format reformat code save actions",
+    },
+    Setting {
+        id: "actions_on_save_reformat_scope",
+        title: "Reformat code: scope",
+        page: SettingsPage::ActionsOnSave,
+        kind: SettingKind::Choice,
+        field: SettingField::ActionsOnSaveScope,
+        keywords: "format reformat whole file changed lines vcs save actions",
+    },
+    Setting {
+        id: "actions_on_save_reformat_files",
+        title: "Reformat code: files",
+        page: SettingsPage::ActionsOnSave,
+        kind: SettingKind::Text,
+        field: SettingField::ActionsOnSaveFiles,
+        keywords: "format mask files patterns save actions",
+    },
+    Setting {
+        id: "actions_on_save_optimize_imports",
+        title: "Optimize imports",
+        page: SettingsPage::ActionsOnSave,
+        kind: SettingKind::Toggle,
+        field: SettingField::ActionsOnSaveOptimizeImports,
+        keywords: "imports organize save actions",
+    },
+    Setting {
+        id: "actions_on_save_cleanup",
+        title: "Run code cleanup",
+        page: SettingsPage::ActionsOnSave,
+        kind: SettingKind::Toggle,
+        field: SettingField::ActionsOnSaveCleanup,
+        keywords: "cleanup safe fixes inspections save actions",
     },
     Setting {
         id: "zoom_with_wheel",
@@ -543,6 +598,14 @@ pub const SETTINGS: &[Setting] = &[
         keywords: "update snapshots refresh dependencies build tools",
     },
     Setting {
+        id: "download_sources_automatically",
+        title: "Download sources automatically",
+        page: SettingsPage::BuildToolsFirst,
+        kind: SettingKind::Toggle,
+        field: SettingField::DownloadSourcesAutomatically,
+        keywords: "sources download library decompiled class build tools",
+    },
+    Setting {
         id: "build_tool_second_home",
         title: "Distribution",
         page: SettingsPage::BuildToolsSecond,
@@ -647,6 +710,14 @@ pub const SETTINGS: &[Setting] = &[
         keywords: "documentation comments doc rendered javadoc editor appearance",
     },
     Setting {
+        id: "markdown_images_from_internet",
+        title: "Load images from the internet",
+        page: SettingsPage::Editor,
+        kind: SettingKind::Toggle,
+        field: SettingField::MarkdownImagesFromInternet,
+        keywords: "markdown preview images internet network picture editor",
+    },
+    Setting {
         id: "diff_side_by_side",
         title: "Show diffs side by side",
         page: SettingsPage::Editor,
@@ -670,6 +741,14 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::HttpTimeout,
         keywords: "http rest request timeout seconds network client",
     },
+    Setting {
+        id: "debug_show_values_inline",
+        title: "Show values inline",
+        page: SettingsPage::Debugger,
+        kind: SettingKind::Toggle,
+        field: SettingField::DebugShowValuesInline,
+        keywords: "debugger values variables inline editor",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -687,6 +766,7 @@ pub fn find(id: &str) -> Option<&'static Setting> {
 pub fn section_of(id: &str) -> Option<&'static str> {
     match id {
         "render_doc_comments" => Some("Appearance"),
+        "markdown_images_from_internet" => Some("Markdown"),
         "code_vision_usages" | "code_vision_implementations" => Some("Code Vision"),
         _ => None,
     }
@@ -745,12 +825,18 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::ShowIndentGuides => Some(settings.show_indent_guides),
         SettingField::CaretBlink => Some(settings.caret_blink),
         SettingField::EnsureFinalNewline => Some(settings.ensure_final_newline),
+        SettingField::ActionsOnSaveReformat => Some(settings.actions_on_save_reformat),
+        SettingField::ActionsOnSaveOptimizeImports => {
+            Some(settings.actions_on_save_optimize_imports)
+        }
+        SettingField::ActionsOnSaveCleanup => Some(settings.actions_on_save_cleanup),
         SettingField::ZoomWithWheel => Some(settings.zoom_with_wheel),
         SettingField::CompletionAutoPopup => Some(settings.completion_auto_popup),
         SettingField::InlayTypeHints => Some(settings.inlay_type_hints),
         SettingField::CodeVisionUsages => Some(settings.code_vision_usages),
         SettingField::CodeVisionImplementations => Some(settings.code_vision_implementations),
         SettingField::RenderDocComments => Some(settings.render_doc_comments),
+        SettingField::MarkdownImagesFromInternet => Some(settings.markdown_images_from_internet),
         SettingField::Autosave => Some(settings.autosave),
         SettingField::OpenReadmeOnFirstOpen => Some(settings.open_readme_on_first_open),
         SettingField::UpdatesCheckAutomatically => Some(settings.updates_check_automatically),
@@ -763,15 +849,19 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
             Some(settings.build_tools.first.update_snapshots)
         }
         SettingField::BuildToolSecondOffline => Some(settings.build_tools.second.offline),
+        SettingField::DownloadSourcesAutomatically => Some(settings.download_sources_automatically),
         SettingField::GitAutoUpdateOnReject => Some(settings.git_auto_update_on_reject),
         SettingField::GitWarnCrlf => Some(settings.git_warn_crlf),
         SettingField::GitAnalyzeBeforeCommit => Some(settings.git_analyze_before_commit),
+        SettingField::DebugShowValuesInline => Some(settings.debug_show_values_inline),
         SettingField::Theme
         | SettingField::FontSize
         | SettingField::UiScale
         | SettingField::EditorFontFamily
         | SettingField::LineSpacing
         | SettingField::TrimTrailingWhitespace
+        | SettingField::ActionsOnSaveScope
+        | SettingField::ActionsOnSaveFiles
         | SettingField::TabSize
         | SettingField::IndentSize
         | SettingField::UseTabs
@@ -814,6 +904,15 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         Some(SettingField::EnsureFinalNewline) => {
             settings.ensure_final_newline = !settings.ensure_final_newline;
         }
+        Some(SettingField::ActionsOnSaveReformat) => {
+            settings.actions_on_save_reformat = !settings.actions_on_save_reformat;
+        }
+        Some(SettingField::ActionsOnSaveOptimizeImports) => {
+            settings.actions_on_save_optimize_imports = !settings.actions_on_save_optimize_imports;
+        }
+        Some(SettingField::ActionsOnSaveCleanup) => {
+            settings.actions_on_save_cleanup = !settings.actions_on_save_cleanup;
+        }
         Some(SettingField::ZoomWithWheel) => settings.zoom_with_wheel = !settings.zoom_with_wheel,
         Some(SettingField::CompletionAutoPopup) => {
             settings.completion_auto_popup = !settings.completion_auto_popup;
@@ -829,6 +928,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::RenderDocComments) => {
             settings.render_doc_comments = !settings.render_doc_comments;
+        }
+        Some(SettingField::MarkdownImagesFromInternet) => {
+            settings.markdown_images_from_internet = !settings.markdown_images_from_internet;
         }
         Some(SettingField::Autosave) => settings.autosave = !settings.autosave,
         Some(SettingField::OpenReadmeOnFirstOpen) => {
@@ -859,12 +961,18 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         Some(SettingField::BuildToolSecondOffline) => {
             settings.build_tools.second.offline = !settings.build_tools.second.offline;
         }
+        Some(SettingField::DownloadSourcesAutomatically) => {
+            settings.download_sources_automatically = !settings.download_sources_automatically;
+        }
         Some(SettingField::GitAutoUpdateOnReject) => {
             settings.git_auto_update_on_reject = !settings.git_auto_update_on_reject;
         }
         Some(SettingField::GitWarnCrlf) => settings.git_warn_crlf = !settings.git_warn_crlf,
         Some(SettingField::GitAnalyzeBeforeCommit) => {
             settings.git_analyze_before_commit = !settings.git_analyze_before_commit;
+        }
+        Some(SettingField::DebugShowValuesInline) => {
+            settings.debug_show_values_inline = !settings.debug_show_values_inline;
         }
         Some(
             SettingField::Theme
@@ -873,6 +981,8 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::EditorFontFamily
             | SettingField::LineSpacing
             | SettingField::TrimTrailingWhitespace
+            | SettingField::ActionsOnSaveScope
+            | SettingField::ActionsOnSaveFiles
             | SettingField::TabSize
             | SettingField::IndentSize
             | SettingField::UseTabs
@@ -1000,6 +1110,9 @@ pub fn set_text(settings: &mut Settings, id: &str, text: &str) -> bool {
     }
     match setting.field {
         SettingField::EditorFontFamily => settings.editor_font_family = text.to_owned(),
+        SettingField::ActionsOnSaveFiles => {
+            settings.actions_on_save_reformat_files = text.to_owned()
+        }
         SettingField::GitPath => settings.git_path = text.to_owned(),
         SettingField::TerminalShell => settings.terminal_shell = text.to_owned(),
         SettingField::TerminalStartDirectory => settings.terminal_start_directory = text.to_owned(),
@@ -1027,6 +1140,7 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
     }
     Some(match setting.field {
         SettingField::EditorFontFamily => settings.editor_font_family.clone(),
+        SettingField::ActionsOnSaveFiles => settings.actions_on_save_reformat_files.clone(),
         SettingField::GitPath => settings.git_path.clone(),
         SettingField::TerminalShell => settings.terminal_shell.clone(),
         SettingField::TerminalStartDirectory => settings.terminal_start_directory.clone(),
@@ -1039,6 +1153,7 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
 pub fn choice_label(settings: &Settings, id: &str) -> Option<&'static str> {
     match find(id)?.field {
         SettingField::TrimTrailingWhitespace => Some(settings.trim_trailing_whitespace.label()),
+        SettingField::ActionsOnSaveScope => Some(settings.actions_on_save_reformat_scope.label()),
         SettingField::UseTabs => Some(if settings.use_tabs { "Tabs" } else { "Spaces" }),
         SettingField::CompletionCase => Some(settings.completion_case.label()),
         SettingField::InlayParameterNames => Some(settings.inlay_parameter_names.label()),
@@ -1052,6 +1167,10 @@ pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
     match find(id).map(|setting| setting.field) {
         Some(SettingField::TrimTrailingWhitespace) => {
             settings.trim_trailing_whitespace = settings.trim_trailing_whitespace.next();
+        }
+        Some(SettingField::ActionsOnSaveScope) => {
+            settings.actions_on_save_reformat_scope =
+                settings.actions_on_save_reformat_scope.next();
         }
         Some(SettingField::UseTabs) => settings.use_tabs = !settings.use_tabs,
         Some(SettingField::CompletionCase) => {

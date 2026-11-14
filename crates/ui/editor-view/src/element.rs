@@ -15,12 +15,14 @@ use crate::scrollbar::{self, Bar};
 use crate::semantic::TokenSpan;
 use crate::style::EditorStyle;
 use crate::view::{
-    EditorView, GutterKind, GutterMark, InlayPaint, OutlineItem, RunMarkState, inside,
+    EditorView, GutterKind, GutterMark, InlayPaint, OutlineItem, RunMarkState, WidestRow, inside,
 };
 
 pub(crate) const GUTTER_WIDTH: f32 = 64.;
 pub(crate) const TEXT_INSET: f32 = 3.;
 pub(crate) const FOLD_X: f32 = 43.;
+/// Where the mark of a handler is, between the line number and the fold button.
+pub(crate) const ENDPOINT_X: f32 = 25.;
 /// The room of the blame column left of the text, when the column is on.
 pub(crate) const ANNOTATE_WIDTH: f32 = 180.;
 /// The room between the left edge of the blame column and its label.
@@ -51,6 +53,10 @@ pub(crate) struct LaidOutRow {
     fold: Option<bool>,
     /// A run mark takes the place of the line number.
     run: Option<(RunMarkState, Hsla)>,
+    /// The mark beside the run button, when the line starts a handler.
+    endpoint: Option<Hsla>,
+    /// The badge of a place, with its icon and colour, when the line has one.
+    place: Option<(SharedString, Hsla)>,
     /// A bookmark without a name takes the place of the line number.
     bookmark: bool,
     /// The label of the blame column on this row, on the first line of a run of a commit.
@@ -69,6 +75,8 @@ pub(crate) struct LaidOutRow {
     pub(crate) block_labels: Vec<BlockLabel>,
     /// The links of a rendered documentation row.
     pub(crate) doc_links: Vec<DocLinkLabel>,
+    /// The values of the stopped debugger after the line.
+    tail: Option<ShapedLine>,
 }
 
 /// One clickable link of a rendered documentation row.
@@ -521,21 +529,30 @@ fn runs_of(
     runs
 }
 
-/// The width of the widest display row, in pixels. Soft wrap makes every row fit, so
-/// the horizontal bar hides and the walk is skipped.
-fn longest_line_width<S: TextStore>(
-    display: &display_map::DisplaySnapshot<'_, S>,
-    char_width: f32,
-) -> f32 {
-    let mut widest = 0f32;
-    for row in 0..display.row_count() {
-        if display.is_block_row(row) {
-            continue;
-        }
-        let columns = display.line(row).text.chars().count() as f32;
-        widest = widest.max(columns * char_width);
-    }
-    widest
+// The number of counts of the widest row of a text, for tests of big files: a count
+// walks the rows of the whole text once, so the number must follow the text changes, not
+// the frames. The count belongs to the thread of a test, so windows of tests that run
+// side by side do not add to each other's numbers.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static WIDEST_COUNTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times a frame counted the widest row of a text since the window opened.
+#[cfg(any(test, feature = "test-support"))]
+pub fn widest_row_counts() -> usize {
+    WIDEST_COUNTS.with(std::cell::Cell::get)
+}
+
+/// Starts the count of [`widest_row_counts`] over.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_widest_row_counts() {
+    WIDEST_COUNTS.with(|count| count.set(0));
+}
+
+fn note_widest_count() {
+    #[cfg(any(test, feature = "test-support"))]
+    WIDEST_COUNTS.with(|count| count.set(count.get() + 1));
 }
 
 /// Adds one mark to the vertical bar unless one of the same kind already stands on
@@ -670,10 +687,14 @@ impl Element for EditorElement {
         let text_hitbox = window.insert_hitbox(text_bounds, HitboxBehavior::Normal);
 
         let decor = self.decor.clone();
+        let columns = (f32::from(text_width) / f32::from(char_width).max(1.)).floor() as usize;
+        let wrap = self
+            .view
+            .read(cx)
+            .soft_wrap()
+            .then(|| columns.saturating_sub(1).max(8));
         self.view.update(cx, |view, _| {
             view.viewport = bounds.size;
-            let columns = (f32::from(text_width) / f32::from(char_width).max(1.)).floor() as usize;
-            let wrap = (view.soft_wrap()).then(|| columns.saturating_sub(1).max(8));
             if let Some(state) = &mut view.state
                 && state.wrap() != wrap
             {
@@ -682,22 +703,47 @@ impl Element for EditorElement {
             if wrap.is_some() {
                 view.scroll_left = 0.;
             }
-            let Some(state) = &view.state else {
+            if view.state.is_none() {
                 view.horizontal_bar = false;
-                return;
-            };
-            let blocks = decor.blocks(&state.store());
-            let display = state
+            }
+        });
+
+        // One snapshot of the display serves the widest row, the scroll and the rows of
+        // this frame: building it again for each of them would cost the file twice.
+        let view = self.view.read(cx);
+        let blocks = view
+            .state
+            .as_ref()
+            .map(|state| decor.blocks(&state.store()))
+            .unwrap_or_default();
+        let display = view.state.as_ref().map(|state| {
+            state
                 .map()
-                .snapshot_with_blocks_owned(state.store(), &blocks);
-            let widest = if wrap.is_none() {
-                longest_line_width(&display, f32::from(char_width))
-            } else {
-                0.
-            };
-            view.horizontal_bar = widest > f32::from(text_width) + 0.5;
+                .snapshot_with_blocks_owned(state.store(), &blocks)
+        });
+        let mut widest_width = 0f32;
+        let mut horizontal_bar = false;
+        let mut scroll_top = view.scroll_top;
+        let mut reveal_center = view.reveal_center;
+        let mut widest_row = None;
+        if let Some(state) = &view.state
+            && let Some(display) = &display
+        {
+            if wrap.is_none() {
+                let counted = match view.widest {
+                    Some(widest) if widest.matches(state) => Some(widest.columns()),
+                    _ => None,
+                };
+                let columns = counted.unwrap_or_else(|| display.widest_row_columns());
+                if counted.is_none() {
+                    note_widest_count();
+                    widest_row = Some(WidestRow::of(state, columns));
+                }
+                widest_width = columns as f32 * f32::from(char_width);
+                horizontal_bar = widest_width > f32::from(text_width) + 0.5;
+            }
             let height = f32::from(bounds.size.height)
-                - if view.horizontal_bar {
+                - if horizontal_bar {
                     scrollbar::HORIZONTAL_HEIGHT
                 } else {
                     0.
@@ -705,37 +751,27 @@ impl Element for EditorElement {
             if view.autoscroll {
                 let row = display.to_display(state.selections().primary().head).row;
                 let top = row as f32 * line_height;
-                let near_bottom = top + line_height > view.scroll_top + height;
-                let near_top = top < view.scroll_top;
-                if std::mem::take(&mut view.reveal_center) {
+                let near_bottom = top + line_height > scroll_top + height;
+                let near_top = top < scroll_top;
+                if reveal_center {
                     // A jump to a place centers the line when it is out of sight or at
                     // the edge, as IDEA does.
                     let edge = line_height * 2.;
-                    let at_edge = top < view.scroll_top + edge
-                        || top + line_height > view.scroll_top + height - edge;
+                    let at_edge =
+                        top < scroll_top + edge || top + line_height > scroll_top + height - edge;
                     if near_top || near_bottom || at_edge {
                         let margin = (height - line_height) / 2.;
-                        view.scroll_top = (top - margin).max(0.);
+                        scroll_top = (top - margin).max(0.);
                     }
+                    reveal_center = false;
                 } else if near_top {
-                    view.scroll_top = top;
+                    scroll_top = top;
                 } else if near_bottom {
-                    view.scroll_top = top + line_height - height;
+                    scroll_top = top + line_height - height;
                 }
             }
-        });
+        }
 
-        let view = self.view.read(cx);
-        let filler_blocks = view
-            .state
-            .as_ref()
-            .map(|state| self.decor.blocks(&state.store()))
-            .unwrap_or_default();
-        let display = view.state.as_ref().map(|state| {
-            state
-                .map()
-                .snapshot_with_blocks_owned(state.store(), &filler_blocks)
-        });
         let mut rows = Vec::new();
         let mut highlights = Vec::new();
         let mut line_tints = Vec::new();
@@ -755,7 +791,7 @@ impl Element for EditorElement {
         let mut horizontal_area = None;
         let mut scroll_left = view.scroll_left;
         let text_height = f32::from(bounds.size.height)
-            - if view.horizontal_bar {
+            - if horizontal_bar {
                 scrollbar::HORIZONTAL_HEIGHT
             } else {
                 0.
@@ -766,7 +802,7 @@ impl Element for EditorElement {
         {
             let store = state.store();
             let primary_row = display.to_display(state.selections().primary().head).row;
-            let first = (view.scroll_top / line_height) as usize;
+            let first = (scroll_top / line_height) as usize;
             let line_of = |at: usize| store.offset_to_line(at.min(store.len()));
             let top_line = if first < display.row_count() {
                 display.row_to_line(first)
@@ -777,7 +813,7 @@ impl Element for EditorElement {
             // The panel of pinned declarations takes whole rows and the gap under them:
             // the text starts on a row boundary below it, so no letter is cut in half.
             let offset = if pinned.is_empty() {
-                -(view.scroll_top % line_height)
+                -(scroll_top % line_height)
             } else {
                 STICKY_GAP
             };
@@ -994,6 +1030,26 @@ impl Element for EditorElement {
                             && mark.line as usize == buffer_line
                     })
                     .map(|mark| (mark.state, mark.color));
+                let endpoint = view
+                    .endpoint_marks
+                    .iter()
+                    .find(|mark| {
+                        !block
+                            && doc_row.is_none()
+                            && !continuation
+                            && mark.line as usize == buffer_line
+                    })
+                    .map(|mark| mark.color);
+                let place = view
+                    .place_marks
+                    .iter()
+                    .find(|mark| {
+                        !block
+                            && doc_row.is_none()
+                            && !continuation
+                            && mark.line as usize == buffer_line
+                    })
+                    .map(|mark| (mark.icon.clone(), mark.color));
                 let doc_icon = (!continuation)
                     .then(|| view.rendered_doc_at_line(buffer_line))
                     .flatten();
@@ -1017,6 +1073,26 @@ impl Element for EditorElement {
                 } else {
                     None
                 };
+                // The values of the stopped frame stand after the line in grey italics,
+                // and in the accent colour when they changed since the previous stop.
+                let tail = if block || continuation || doc_row.is_some() {
+                    None
+                } else {
+                    view.debug_value_at(buffer_line).map(|value| {
+                        let color = if value.changed {
+                            style.accent
+                        } else {
+                            style.inlay
+                        };
+                        let runs = [crate::element::run(
+                            value.text.len(),
+                            &code_font,
+                            color,
+                            true,
+                        )];
+                        text_system.shape_line(value.text.clone().into(), font_size, &runs, None)
+                    })
+                };
                 rows.push(LaidOutRow {
                     row,
                     buffer_line,
@@ -1028,6 +1104,8 @@ impl Element for EditorElement {
                     inlays,
                     fold,
                     run,
+                    endpoint,
+                    place,
                     bookmark: !block && matches!(bookmark, Some(None)),
                     annotation,
                     current,
@@ -1038,6 +1116,7 @@ impl Element for EditorElement {
                     doc_range,
                     block_labels,
                     doc_links,
+                    tail,
                 });
             }
 
@@ -1339,18 +1418,14 @@ impl Element for EditorElement {
             let store = state.store();
             let row_count = display.row_count().max(1);
             let horizontal_viewport = f32::from(text_width);
-            let widest = if view.soft_wrap() {
-                0.
-            } else {
-                longest_line_width(display, f32::from(char_width))
-            };
             let horizontal_track_start = f32::from(text_x);
             let horizontal_track_len = f32::from(text_width);
-            let horizontal_bar = (widest > horizontal_viewport + 0.5 && horizontal_track_len > 0.)
+            let horizontal_bar = (widest_width > horizontal_viewport + 0.5
+                && horizontal_track_len > 0.)
                 .then_some(Bar {
                     track_start: horizontal_track_start,
                     track_len: horizontal_track_len,
-                    content: widest,
+                    content: widest_width,
                     viewport: horizontal_viewport,
                 });
 
@@ -1495,7 +1570,13 @@ impl Element for EditorElement {
             view.sticky = sticky_lines;
             view.layout = Some(shared);
             view.autoscroll = false;
+            view.reveal_center = reveal_center;
+            view.scroll_top = scroll_top;
             view.scroll_left = scroll_left;
+            view.horizontal_bar = horizontal.is_some();
+            if let Some(widest) = widest_row {
+                view.widest = Some(widest);
+            }
         });
 
         let text_mask = Bounds::from_corners(
@@ -1510,10 +1591,7 @@ impl Element for EditorElement {
                     },
             ),
         );
-        let (scroll_top, scrollbar_hovered) = {
-            let view = self.view.read(cx);
-            (view.scroll_top, view.scrollbar_hovered)
-        };
+        let scrollbar_hovered = self.view.read(cx).scrollbar_hovered;
 
         EditorPrepaint {
             layout,
@@ -1819,6 +1897,33 @@ impl Element for EditorElement {
                         )
                         .ok();
                 }
+                if let Some((icon, color)) = &shown.place {
+                    let mark = Bounds::new(
+                        point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
+                        size(px(16.), px(16.)),
+                    );
+                    window
+                        .paint_svg(
+                            mark,
+                            icon.clone(),
+                            None,
+                            TransformationMatrix::unit(),
+                            *color,
+                            cx,
+                        )
+                        .ok();
+                } else if let Some(color) = shown.endpoint {
+                    let suffix = if style.dark { "_dark" } else { "" };
+                    let mark = Bounds::new(
+                        point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
+                        size(px(16.), px(16.)),
+                    );
+                    let path: SharedString =
+                        format!("icons/toolwindows/services{suffix}.svg").into();
+                    window
+                        .paint_svg(mark, path, None, TransformationMatrix::unit(), color, cx)
+                        .ok();
+                }
                 if let Some(rendered) = shown.doc_icon {
                     let name = if rendered { "hide" } else { "show" };
                     let suffix = if style.dark { "_dark" } else { "" };
@@ -2001,6 +2106,17 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
+                    if let Some(tail) = &shown.tail {
+                        tail.paint(
+                            point(text_x + shown.text.width() + px(8.), shown.y),
+                            height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .ok();
+                    }
                     for inlay in &shown.inlays {
                         let Some(paint) = &inlay.paint else {
                             continue;

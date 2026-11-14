@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lang_api::{
     ActionProvider, AddOverridableMethodsProvider, CallHierarchyProvider,
@@ -58,6 +59,10 @@ impl SyntaxProvider for JavaSyntax {
         &self.queries
     }
 
+    fn identifiers_around(&self, text: &str, line: usize) -> lang_api::IdentifierLines {
+        java_syntax::identifiers_around(text, line).unwrap_or_default()
+    }
+
     fn unwrap_edits(&self, text: &str, offset: usize) -> Vec<UnwrapEdit> {
         java_syntax::unwrap_edits(text, offset)
             .into_iter()
@@ -95,6 +100,12 @@ impl lang_api::DocumentationCommentProvider for JavaProject {
     }
 }
 
+impl lang_api::EndpointProvider for JavaProject {
+    fn file_endpoints(&self, path: &Path, text: &str) -> lang_api::EndpointScan {
+        crate::endpoints::scan(path, text)
+    }
+}
+
 impl LanguageSupport for JavaProject {
     fn id(&self) -> LanguageId {
         LANGUAGE_ID
@@ -106,6 +117,10 @@ impl LanguageSupport for JavaProject {
 
     fn watches_file(&self, path: &Path) -> bool {
         jdtls_adapter::is_build_file(path)
+    }
+
+    fn embedded_languages(&self) -> Vec<Arc<dyn LanguageSupport>> {
+        vec![self.spring.clone(), self.messages.clone()]
     }
 
     fn related_files(&self, path: &Path) -> Vec<PathBuf> {
@@ -164,6 +179,18 @@ impl LanguageSupport for JavaProject {
         &self.syntax
     }
 
+    fn embedded_text(&self) -> Option<&dyn lang_api::EmbeddedTextProvider> {
+        Some(self.data.as_ref())
+    }
+
+    fn stack_traces(&self) -> Option<&lang_api::TraceProvider> {
+        Some(&self.stack)
+    }
+
+    fn thread_dump(&self) -> Option<&lang_api::DumpProvider> {
+        Some(&self.stack)
+    }
+
     fn symbols(&self) -> Option<&dyn SymbolProvider> {
         Some(java_syntax::java_symbols())
     }
@@ -173,7 +200,7 @@ impl LanguageSupport for JavaProject {
     }
 
     fn completion(&self) -> Option<&CompletionProvider> {
-        Some(self.providers.as_ref())
+        Some(&self.java_messages)
     }
 
     fn completion_resolve(&self) -> Option<&CompletionResolveProvider> {
@@ -185,11 +212,11 @@ impl LanguageSupport for JavaProject {
     }
 
     fn navigation(&self) -> Option<&NavigationProvider> {
-        Some(self.providers.as_ref())
+        Some(&self.java_messages)
     }
 
     fn hover(&self) -> Option<&HoverProvider> {
-        Some(self.providers.as_ref())
+        Some(&self.java_messages)
     }
 
     fn workspace_symbols(&self) -> Option<&WorkspaceSymbolProvider> {
@@ -197,7 +224,7 @@ impl LanguageSupport for JavaProject {
     }
 
     fn diagnostics(&self) -> Option<&DiagnosticsProvider> {
-        Some(self.providers.as_ref())
+        Some(&self.java_messages)
     }
 
     fn semantic_tokens(&self) -> Option<&SemanticTokensProvider> {
@@ -218,6 +245,14 @@ impl LanguageSupport for JavaProject {
 
     fn documentation_comments(&self) -> Option<&dyn lang_api::DocumentationCommentProvider> {
         Some(self)
+    }
+
+    fn endpoints(&self) -> Option<&dyn lang_api::EndpointProvider> {
+        Some(self)
+    }
+
+    fn beans(&self) -> Option<&dyn lang_api::BeanProvider> {
+        Some(self.beans.as_ref())
     }
 
     fn set_code_vision_settings(&self, settings: lang_api::CodeVisionSettings) {
@@ -256,12 +291,20 @@ impl LanguageSupport for JavaProject {
         Some(&self.class_files)
     }
 
+    fn library_class(&self) -> Option<&lang_api::LibraryClassProvider> {
+        Some(&self.library_sources)
+    }
+
+    fn library_sources(&self) -> Option<&lang_api::SourcesProvider> {
+        Some(&self.library_sources)
+    }
+
     fn format(&self) -> Option<&FormatProvider> {
         Some(self.providers.as_ref())
     }
 
     fn actions(&self) -> Option<&ActionProvider> {
-        Some(self.providers.as_ref())
+        Some(&self.java_messages)
     }
 
     fn action_parameters(&self) -> Option<&lang_api::ActionParametersProvider> {

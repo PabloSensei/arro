@@ -3,13 +3,12 @@
 
 use keymap::workspace as keys;
 use ui_kit::*;
-use workspace::{UI_SCALE_STEP, Workspace};
+use workspace::{TASKS_TOOL, UI_SCALE_STEP, Workspace};
 
 use crate::call_hierarchy::ActiveCallHierarchy;
 use crate::method_hierarchy::ActiveMethodHierarchy;
 use crate::project::ActiveProjectPanel;
 use crate::window_popups;
-
 /// Registers the commands of the window. They run from the keymap, Find Action and the
 /// menus once the panels are in place.
 pub fn register(workspace: &mut Workspace, _window: &mut Window, cx: &mut Context<Workspace>) {
@@ -112,6 +111,22 @@ pub fn register(workspace: &mut Workspace, _window: &mut Window, cx: &mut Contex
         keys::NEW_SCRATCH_FILE,
         "New Scratch File",
         window_popups::show_scratch_languages,
+    );
+    // Find Action: the analyzer of the dependencies of the project, in the window of the
+    // build tool.
+    workspace.register_command(
+        crate::build::ANALYZE_COMMAND,
+        "Analyze Dependencies",
+        |workspace, window, cx| {
+            let Some(panel) = cx
+                .try_global::<crate::script::ActiveBuildPanel>()
+                .map(|panel| panel.0.clone())
+            else {
+                return;
+            };
+            panel.update(cx, |panel, cx| panel.open_analyzer(cx));
+            workspace.show_tool(TASKS_TOOL, window, cx);
+        },
     );
     for (id, title, node) in [
         (keys::EXPAND_ALL, "Expand All", false),

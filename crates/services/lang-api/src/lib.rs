@@ -6,11 +6,17 @@
 mod answer;
 mod code_lens;
 mod coverage;
+mod di;
 mod documentation;
+mod embedded;
+mod endpoint;
 mod hierarchy;
 mod inlay;
 mod language;
+mod profile;
 mod semantic;
+mod sources;
+mod stack;
 mod stream;
 mod symbol;
 mod syntax;
@@ -23,8 +29,15 @@ pub use code_lens::{
 pub use coverage::{
     BranchCoverage, Counters, CoverageReport, FileCoverage, LineCoverage, LineState, TypeCoverage,
 };
+pub use di::{
+    Bean, BeanModel, BeanProvider, BeanQuery, BeanWarning, InjectionPlace, InjectionPoint,
+};
 pub use documentation::{
     DocumentationBlock, DocumentationComment, DocumentationCommentProvider, DocumentationInline,
+};
+pub use embedded::EmbeddedTextProvider;
+pub use endpoint::{
+    Endpoint, EndpointParameter, EndpointParameterKind, EndpointProvider, EndpointScan, HttpMethod,
 };
 pub use hierarchy::{
     AddOverridableMethodsProvider, AddOverridableMethodsRequest, CallDirection, CallHierarchyItem,
@@ -39,6 +52,10 @@ pub use inlay::{
     InlayParameterNames,
 };
 pub use language::{LanguageId, LanguageSupport};
+pub use profile::{
+    ProfileFrame, ProfileMethod, ProfileNode, ProfileRecording, ProfileReport, ProfileSample,
+    ProfileSamples, ProfileSnapshot, ProfileType, ProfileTypeTree, ProfileUnit, bytes_text,
+};
 pub use semantic::{
     ActionApplyProvider, ActionApplyRequest, ActionChoice, ActionEntry, ActionField, ActionKind,
     ActionMember, ActionOutcome, ActionParameters, ActionParametersProvider, ActionParametersQuery,
@@ -69,7 +86,18 @@ pub use semantic::{
     WorkspaceDiagnosticsQuery,
 };
 pub use semantic::{UsageEntry, UsageKind, UsageProvider};
+pub use sources::{
+    LibraryClass, LibraryClassProvider, LibraryClassQuery, SourcesEvent, SourcesKind,
+    SourcesProvider, SourcesRequest,
+};
+pub use stack::{
+    DumpAnswer, DumpProvider, DumpQuery, Frame, FrameOrigin, Line as StackLine, LineKind, Report,
+    Thread as ThreadStack, TraceProvider, TraceQuery,
+};
 pub use stream::{Provider, Replies, Reply, ReplyClosed, ask, channel};
 pub use symbol::{Symbol, SymbolKind, SymbolProvider};
-pub use syntax::{Deletion, DeletionKind, Queries, SyntaxProvider, UnwrapEdit};
+pub use syntax::{
+    Deletion, DeletionKind, IdentifierLines, Queries, SyntaxProvider, UnwrapEdit,
+    identifiers_around,
+};
 pub use tree_sitter_language::LanguageFn;

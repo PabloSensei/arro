@@ -731,6 +731,28 @@ impl DiffView {
         );
     }
 
+    /// The selected text of an editor, or its whole text, against the clipboard. Both
+    /// sides are read only, and the clipboard is the left one.
+    pub fn compare_text_clipboard(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        text: String,
+        clipboard: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_text(
+            git,
+            workspace,
+            path,
+            Source::Clipboard,
+            window,
+            cx,
+            move |_| (clipboard, text),
+        );
+    }
+
     /// Ctrl+D on two files of the project tree: `left` against `right`, both read in
     /// the background.
     pub fn compare_files(

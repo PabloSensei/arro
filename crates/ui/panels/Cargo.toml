@@ -10,6 +10,7 @@ mock-agents = ["dep:agent-testkit"]
 
 [dependencies]
 dap-client.workspace = true
+database.workspace = true
 agent-core = { path = "../../ai/agent-core" }
 agent-pty = { path = "../../ai/agent-pty" }
 agent-testkit = { path = "../../ai/agent-testkit", optional = true }
@@ -29,6 +30,7 @@ mcp-server = { path = "../../ai/mcp-server" }
 platform.workspace = true
 proc-sup.workspace = true
 project-model.workspace = true
+repl.workspace = true
 runner.workspace = true
 plugin-host.workspace = true
 search = { path = "../../services/search" }
@@ -47,6 +49,8 @@ workspace-core.workspace = true
 [dev-dependencies]
 # A language for the editor keys in window tests: comments and syntax without a server.
 dockerfile-syntax = { path = "../../editor/dockerfile-syntax" }
+# The counters of the editor layout, for the tests of big files.
+editor-view = { path = "../editor-view", features = ["test-support"] }
 # The formats around a project, for the window test of their highlighting.
 file-syntax = { path = "../../editor/file-syntax" }
 # The mock debug adapter of the fixture language, for the debug window tests.

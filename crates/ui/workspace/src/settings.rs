@@ -67,6 +67,33 @@ impl TrimTrailingWhitespace {
     }
 }
 
+/// The part of a file Reformat Code changes on save.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReformatScope {
+    /// Every line of the file.
+    #[default]
+    WholeFile,
+    /// Only the lines that differ from the last commit, as the gutter marks them.
+    ChangedLines,
+}
+
+impl ReformatScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReformatScope::WholeFile => "Whole file",
+            ReformatScope::ChangedLines => "Changed lines",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            ReformatScope::WholeFile => ReformatScope::ChangedLines,
+            ReformatScope::ChangedLines => ReformatScope::WholeFile,
+        }
+    }
+}
+
 /// How the completion list compares the typed prefix with its entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +209,8 @@ pub struct Settings {
     pub show_line_numbers: bool,
     /// The background of the line with the caret.
     pub highlight_current_line: bool,
+    /// The values of the variables of the stopped frame after the lines that name them.
+    pub debug_show_values_inline: bool,
     /// The thin vertical lines at the steps of the indentation.
     pub show_indent_guides: bool,
     /// The caret blinks while the editor has the focus.
@@ -190,6 +219,16 @@ pub struct Settings {
     pub trim_trailing_whitespace: TrimTrailingWhitespace,
     /// A save puts a line break after the last line when the file lacks one.
     pub ensure_final_newline: bool,
+    /// A save formats the file through the language.
+    pub actions_on_save_reformat: bool,
+    /// What that formatting changes: the whole file or the lines of the last commit.
+    pub actions_on_save_reformat_scope: ReformatScope,
+    /// The files actions on save touch, as masks; `*` is every file.
+    pub actions_on_save_reformat_files: String,
+    /// A save organizes the imports through the language.
+    pub actions_on_save_optimize_imports: bool,
+    /// A save runs the safe fixes of the language over the file.
+    pub actions_on_save_cleanup: bool,
     /// Ctrl+wheel changes the font size of the editor.
     pub zoom_with_wheel: bool,
     /// Columns a tab takes on screen; also the default step of the indentation.
@@ -214,6 +253,8 @@ pub struct Settings {
     pub code_vision_implementations: bool,
     /// Documentation comments show as rendered text in the editor.
     pub render_doc_comments: bool,
+    /// The preview of a markdown file takes the pictures of an address of the internet.
+    pub markdown_images_from_internet: bool,
     /// Unsaved files are written when the window loses the focus or the tab changes.
     pub autosave: bool,
     /// The first open of a project shows its README, rendered when it is markdown.
@@ -259,6 +300,8 @@ pub struct Settings {
     pub quick_doc_on_hover: bool,
     /// How the build tools of the project start, in the order of their pages.
     pub build_tools: BuildTools,
+    /// The sources of a class of a library are fetched as soon as the class opens.
+    pub download_sources_automatically: bool,
     /// The program that runs Git; empty means the one on `PATH`.
     pub git_path: String,
     /// How Update Project brings the upstream in.
@@ -294,10 +337,16 @@ impl Default for Settings {
             show_whitespace: false,
             show_line_numbers: true,
             highlight_current_line: true,
+            debug_show_values_inline: true,
             show_indent_guides: true,
             caret_blink: true,
             trim_trailing_whitespace: TrimTrailingWhitespace::None,
             ensure_final_newline: false,
+            actions_on_save_reformat: false,
+            actions_on_save_reformat_scope: ReformatScope::WholeFile,
+            actions_on_save_reformat_files: "*".to_owned(),
+            actions_on_save_optimize_imports: false,
+            actions_on_save_cleanup: false,
             zoom_with_wheel: true,
             tab_size: 4,
             indent_size: 4,
@@ -310,6 +359,7 @@ impl Default for Settings {
             code_vision_usages: true,
             code_vision_implementations: true,
             render_doc_comments: false,
+            markdown_images_from_internet: true,
             autosave: true,
             open_readme_on_first_open: true,
             runtime_home: String::new(),
@@ -335,6 +385,7 @@ impl Default for Settings {
             semantic_highlighting: true,
             quick_doc_on_hover: true,
             build_tools: BuildTools::default(),
+            download_sources_automatically: false,
             git_path: String::new(),
             git_update_method: GitUpdateMethod::Merge,
             git_auto_update_on_reject: false,

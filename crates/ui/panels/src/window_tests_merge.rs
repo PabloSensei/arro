@@ -179,7 +179,7 @@ fn a_double_click_on_the_conflict_row_opens_the_merge_window(cx: &mut TestAppCon
 
 /// A repository whose one file both sides changed differently, so git leaves it in
 /// conflict. `base`, `ours` and `theirs` are the bytes of the three versions.
-fn conflict_repository(
+pub(crate) fn conflict_repository(
     name: &str,
     file: &str,
     base: &[u8],
@@ -277,7 +277,10 @@ fn delete_modify_repository(name: &str) -> (PathBuf, PathBuf, vcs::GitRunner) {
 }
 
 /// The Merge window of the test's window.
-fn merge_view(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> gpui::Entity<MergeView> {
+pub(crate) fn merge_view(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+) -> gpui::Entity<MergeView> {
     window
         .read_with(cx, |workspace, _| workspace.overlay_view())
         .unwrap()

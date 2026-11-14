@@ -9,7 +9,9 @@ mod model;
 mod session;
 mod threads;
 
-pub use client::{Client, Error, Event, REQUEST_TIMEOUT, ResponseError};
+pub use client::{
+    ADAPTER_GRACE, AdapterProcess, Client, Error, Event, REQUEST_TIMEOUT, ResponseError,
+};
 pub use model::{
     Breakpoint, BreakpointKind, BreakpointSpec, Capabilities, Command, ConsoleLine, DataAccessType,
     DataBreakpointSpec, DebugState, Debugger, Evaluation, ExceptionFilter, Frame,

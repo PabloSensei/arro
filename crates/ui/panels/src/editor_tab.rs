@@ -4,14 +4,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use editor_view::{
-    CompletionCase, EditorEvent, EditorOptions, EditorStyle, EditorView, PreviewMode, SaveOptions,
-    Spot, TrimTrailing,
+    ActionsOnSave, CompletionCase, EditorEvent, EditorOptions, EditorStyle, EditorView,
+    PreviewMode, SaveOptions, Spot, TrimTrailing,
 };
 use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{
-    DOCUMENTATION_TOOL, EditorFactory, EditorStatus, EditorTab, IndentChoice, Settings,
-    USAGES_TOOL, Workspace,
+    DOCUMENTATION_TOOL, EditorFactory, EditorStatus, EditorTab, IndentChoice, PreviewLayout,
+    PreviewTab, Settings, USAGES_TOOL, Workspace,
 };
 
 use crate::documentation::ActiveDocumentation;
@@ -65,6 +65,14 @@ pub(crate) fn options_of(cx: &App) -> EditorOptions {
             },
             ensure_final_newline: settings.ensure_final_newline,
         },
+        actions_on_save: ActionsOnSave {
+            reformat: settings.actions_on_save_reformat,
+            reformat_changed: settings.actions_on_save_reformat_scope
+                == workspace::ReformatScope::ChangedLines,
+            reformat_files: settings.actions_on_save_reformat_files.clone(),
+            optimize_imports: settings.actions_on_save_optimize_imports,
+            cleanup: settings.actions_on_save_cleanup,
+        },
         completion_case: match settings.completion_case {
             workspace::CompletionCase::None => CompletionCase::None,
             workspace::CompletionCase::FirstLetter => CompletionCase::FirstLetter,
@@ -86,6 +94,7 @@ pub(crate) fn options_of(cx: &App) -> EditorOptions {
         code_vision_usages: settings.code_vision_usages,
         code_vision_implementations: settings.code_vision_implementations,
         render_doc_comments: settings.render_doc_comments,
+        markdown_images_from_internet: settings.markdown_images_from_internet,
     }
 }
 
@@ -125,6 +134,7 @@ fn status_of(view: &EditorView) -> EditorStatus {
 
 fn open(
     workspace: &WeakEntity<Workspace>,
+    state_dir: &std::path::Path,
     path: PathBuf,
     window: &mut Window,
     cx: &mut App,
@@ -143,6 +153,7 @@ fn open(
             view.set_options(options_of(cx), cx);
             marks::refresh(view, cx);
             crate::coverage::refresh(view, cx);
+            debug::refresh_inline_values(view, cx);
         })
         .detach();
         if let Some(panel) = cx
@@ -170,11 +181,31 @@ fn open(
                 debug::refresh_breakpoints(view, cx)
             })
             .detach();
+            cx.subscribe(&panel, |view, _, _: &debug::ValuesChanged, cx| {
+                debug::refresh_inline_values(view, cx)
+            })
+            .detach();
         }
         EditorView::open(path, style, window, cx)
     });
     view.update(cx, debug::refresh_breakpoints);
+    view.update(cx, debug::refresh_inline_values);
     view.update(cx, |view, cx| view.set_options(options_of(cx), cx));
+    let opened = view.read(cx).path().to_path_buf();
+    crate::library_sources::tab_opened(&opened, cx);
+    crate::jshell_panel::tab_opened(&opened, cx);
+    // The tab is built while the window updates its tabs, so the root of the project is
+    // read once that update is over.
+    let root_workspace = workspace.clone();
+    let root_view = view.clone();
+    cx.defer(move |cx| {
+        let root = root_workspace
+            .read_with(cx, |workspace, _| workspace.root().to_path_buf())
+            .ok();
+        root_view.update(cx, |view, _| view.set_project_root(root));
+    });
+    let pictures = state_dir.join("markdown-images");
+    view.update(cx, |view, _| view.set_picture_cache(pictures));
 
     OpenEditors::add(cx, view.read(cx).path().to_path_buf(), view.downgrade());
     outline::refresh(&view, false, cx);
@@ -200,6 +231,7 @@ fn open(
                     }
                     view.update(cx, marks::refresh);
                     view.update(cx, crate::coverage::refresh);
+                    crate::endpoints::editor_changed(&view, cx);
                     outline::refresh(&view, matches!(event, EditorEvent::Changed), cx);
                     if matches!(event, EditorEvent::Changed) {
                         places::remember(&view, cx);
@@ -528,6 +560,28 @@ fn open(
                         })
                         .ok();
                 }
+                EditorEvent::EndpointMark(line) => {
+                    let view = view.clone();
+                    runner
+                        .update(cx, |workspace, cx| {
+                            marks::show_endpoint_menu(&view, *line as usize, workspace, window, cx)
+                        })
+                        .ok();
+                }
+                EditorEvent::PlaceMark(line) => {
+                    let view = view.clone();
+                    runner
+                        .update(cx, |workspace, cx| {
+                            crate::beans::show_place_menu(
+                                &view,
+                                *line as usize,
+                                workspace,
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                }
                 EditorEvent::DebugRunMark(line) => {
                     let view = view.clone();
                     runner
@@ -539,7 +593,21 @@ fn open(
                 EditorEvent::RunRequest(line) => {
                     runner
                         .update(cx, |workspace, cx| {
-                            crate::http::run_line(&view, *line as usize, workspace, window, cx)
+                            if !crate::database_panel::run_line(
+                                &view,
+                                *line as usize,
+                                workspace,
+                                window,
+                                cx,
+                            ) && !crate::jshell_panel::run_line(
+                                &view,
+                                *line as usize,
+                                workspace,
+                                window,
+                                cx,
+                            ) {
+                                crate::http::run_line(&view, *line as usize, workspace, window, cx);
+                            }
                         })
                         .ok();
                 }
@@ -592,6 +660,14 @@ fn open(
                 })
                 .ok();
         }
+        EditorEvent::SaveNote(message) => {
+            let message = message.clone();
+            reports
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user("Actions on Save", message, cx)
+                })
+                .ok();
+        }
         EditorEvent::Conflict => {
             let title = view.read(cx).title();
             let text = format!(
@@ -607,6 +683,7 @@ fn open(
         EditorEvent::Saved => {
             let path = view.read(cx).path().to_path_buf();
             crate::history::snapshot_file(&path, local_history::Cause::Saved, cx);
+            crate::endpoints::editor_changed(&view, cx);
         }
         EditorEvent::ExternalChange(bytes) => {
             let path = view.read(cx).path().to_path_buf();
@@ -716,13 +793,33 @@ fn open(
     let (caret, restore, format) = (view.clone(), view.clone(), view.clone());
     let indent = view.clone();
     let reload = view.clone();
-    let show_preview_only = view.read(cx).preview_mode().is_some().then(|| {
-        let preview = view.clone();
-        Rc::new(move |cx: &mut App| {
-            preview.update(cx, |view, cx| {
-                view.set_preview_mode(PreviewMode::PreviewOnly, cx)
-            });
-        }) as Rc<dyn Fn(&mut App)>
+    let preview = view.read(cx).preview_mode().is_some().then(|| {
+        let read_view = view.clone();
+        let write_view = view.clone();
+        let saver = workspace.clone();
+        PreviewTab {
+            layout: Rc::new(move |cx: &App| match read_view.read(cx).preview_mode() {
+                Some(PreviewMode::EditorOnly) => PreviewLayout::EditorOnly,
+                Some(PreviewMode::PreviewOnly) => PreviewLayout::PreviewOnly,
+                _ => PreviewLayout::Both,
+            }),
+            set_layout: Rc::new(move |layout, cx: &mut App| {
+                let mode = match layout {
+                    PreviewLayout::EditorOnly => PreviewMode::EditorOnly,
+                    PreviewLayout::Both => PreviewMode::EditorAndPreview,
+                    PreviewLayout::PreviewOnly => PreviewMode::PreviewOnly,
+                };
+                write_view.update(cx, |view, cx| view.set_preview_mode(mode, cx));
+                // The window may be the one that is being updated, so the saved layout
+                // hears of the change once that update is over.
+                let saver = saver.clone();
+                cx.defer(move |cx| {
+                    saver
+                        .update(cx, |workspace, cx| workspace.tab_layout_changed(cx))
+                        .ok();
+                });
+            }),
+        }
     });
     EditorTab {
         view: view.into(),
@@ -758,13 +855,12 @@ fn open(
             };
             indent.update(cx, |view, cx| view.set_indent(tabs, size, cx));
         }),
-        show_preview_only,
+        preview,
     }
 }
-
 /// The factory the workspace opens files with.
-pub fn factory(workspace: WeakEntity<Workspace>) -> EditorFactory {
-    Rc::new(move |path, window, cx| open(&workspace, path, window, cx))
+pub fn factory(workspace: WeakEntity<Workspace>, state_dir: PathBuf) -> EditorFactory {
+    Rc::new(move |path, window, cx| open(&workspace, &state_dir, path, window, cx))
 }
 
 #[cfg(test)]

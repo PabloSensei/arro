@@ -35,7 +35,7 @@ impl BuildEnv {
         self.cache_root.clone().unwrap_or_else(default_cache_root)
     }
 
-    pub(crate) fn helpers_dir(&self) -> Result<PathBuf> {
+    pub fn helpers_dir(&self) -> Result<PathBuf> {
         if let Some(helpers) = &self.helpers {
             return Ok(helpers.clone());
         }

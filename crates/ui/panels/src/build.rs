@@ -1,11 +1,23 @@
 //! The tool window of the build tool: the modules of the project, their groups of tasks
 //! and the buttons that read the model again, run a line of the user or leave the tests
 //! out. A double click or Enter runs a task in the console of the Run window.
+//!
+//! Under every module the window shows the tree of its dependencies, one scope at a time,
+//! and the Dependency Analyzer lists every artifact of the project with the paths that
+//! bring it in. A double click on a dependency goes to its declaration in the build file;
+//! the analyzer can copy the coordinates of an artifact or add an exclusion to the
+//! first-level dependency it comes through.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
-use editor_view::Semantic;
-use project_model::{BuildGroup, BuildModule, BuildTask};
+use editor_view::{EditorView, Semantic, Spot};
+use project_model::{
+    BuildGroup, BuildModule, BuildSystem, BuildTask, Coordinates, Dependency, Exclusion, Module,
+    ProjectModel,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -14,11 +26,21 @@ use workspace::{RUN_TOOL, TASKS_TOOL, Workspace};
 use crate::prompt::TextField;
 use crate::run::RunPanel;
 
+#[path = "dependencies.rs"]
+mod dependencies;
+pub(crate) use dependencies::ANALYZE_COMMAND;
+
+use dependencies::Artifact;
+
 const GROUP: &str = "right-panel";
 const ROW_MARGIN: f32 = SPACE_L;
 /// Lines of the Execute field that stay offered.
 const HISTORY: usize = 10;
 const POPUP_WIDTH: f32 = 250.;
+/// The part of the analyzer the list of artifacts takes.
+const LIST_WIDTH: f32 = 260.;
+/// How deep the tree of one scope may go before the window stops drawing it.
+const MAX_TREE_DEPTH: usize = 32;
 
 /// The buttons of the window and the hint each of them shows. The tests read the same
 /// table the render does.
@@ -28,6 +50,8 @@ pub(crate) const TOOLTIPS: &[(&str, &str)] = &[
     ("build-skip-tests", "Skip Tests"),
     ("build-expand-all", "Expand All"),
     ("build-collapse-all", "Collapse All"),
+    ("build-analyze", "Analyze Dependencies"),
+    ("build-download-sources", "Download Sources for All"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +59,27 @@ enum RowKind {
     Module,
     Group,
     Task,
+    /// The node of a module that holds its dependencies.
+    Dependencies,
+    /// One scope of the dependencies: compile, runtime or test.
+    Scope,
+    /// One edge of a scope tree.
+    Dependency,
+}
+
+/// A dependency row names the artifact its declaration is searched by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DependencyRow {
+    coordinates: String,
+}
+
+/// What an exclusion needs once the editor of the build file holds its text.
+struct ExcludeJob {
+    tool: Arc<dyn BuildSystem>,
+    module: Module,
+    root: PathBuf,
+    path: PathBuf,
+    request: Exclusion,
 }
 
 /// One line of the visible tree.
@@ -48,21 +93,19 @@ struct Row {
     module: String,
     /// The name of the module as the tree shows it, for the labels of the menu.
     module_name: String,
-    group: Option<String>,
     task: Option<String>,
     program: bool,
-}
-
-impl Row {
-    fn group_key(&self) -> Option<String> {
-        let group = self.group.as_deref()?;
-        Some(format!("{}\u{0}{group}", self.module))
-    }
+    /// The tree node that can be closed: a group, the Dependencies node or a scope.
+    key: Option<String>,
+    /// The grey text after the label, such as the version a conflict dropped.
+    hint: Option<String>,
+    dependency: Option<DependencyRow>,
 }
 
 pub struct BuildPanel {
     run: Entity<RunPanel>,
     workspace: WeakEntity<Workspace>,
+    this: WeakEntity<Self>,
     focus: FocusHandle,
     /// Modules and groups the user closed; everything is open until then.
     closed_modules: HashSet<String>,
@@ -73,6 +116,21 @@ pub struct BuildPanel {
     execute: TextField,
     history: Vec<String>,
     skip_tests: bool,
+    /// The analyzer replaced the task tree.
+    analyzer: bool,
+    search: TextField,
+    /// The search field takes the keys: a click in it turns the mode on.
+    search_active: bool,
+    only_conflicts: bool,
+    /// Every artifact of the model, with the paths that bring it in.
+    artifacts: Vec<Artifact>,
+    /// The model the artifacts were built from.
+    analyzed: Option<Arc<ProjectModel>>,
+    analyzer_selected: Option<usize>,
+    analyzer_list_scroll: ScrollHandle,
+    analyzer_details_scroll: ScrollHandle,
+    /// Why the last command of the analyzer did nothing.
+    message: Option<String>,
     _run: Subscription,
 }
 
@@ -84,9 +142,11 @@ impl BuildPanel {
     ) -> Entity<Self> {
         cx.new(|cx| {
             let _run = cx.observe(&run, |_, _, cx| cx.notify());
+            let this = cx.entity().downgrade();
             Self {
                 run,
                 workspace,
+                this,
                 focus: cx.focus_handle(),
                 closed_modules: HashSet::new(),
                 closed_groups: HashSet::new(),
@@ -96,6 +156,16 @@ impl BuildPanel {
                 execute: TextField::default(),
                 history: Vec::new(),
                 skip_tests: false,
+                analyzer: false,
+                search: TextField::default(),
+                search_active: false,
+                only_conflicts: false,
+                artifacts: Vec::new(),
+                analyzed: None,
+                analyzer_selected: None,
+                analyzer_list_scroll: ScrollHandle::new(),
+                analyzer_details_scroll: ScrollHandle::new(),
+                message: None,
                 _run,
             }
         })
@@ -120,6 +190,15 @@ impl BuildPanel {
         self.rows(cx)
             .into_iter()
             .map(|row| format!("{}{}", "  ".repeat(row.depth), row.label))
+            .collect()
+    }
+
+    /// The grey marks of the visible tree, next to the row that has them, for tests.
+    #[cfg(test)]
+    pub(crate) fn hints(&self, cx: &App) -> Vec<(String, String)> {
+        self.rows(cx)
+            .into_iter()
+            .filter_map(|row| row.hint.map(|hint| (row.label, hint)))
             .collect()
     }
 
@@ -172,11 +251,85 @@ impl BuildPanel {
         self.reload(cx);
     }
 
+    /// Opens the analyzer as the toolbar button and Find Action do, for tests.
+    #[cfg(test)]
+    pub(crate) fn show_analyzer_now(&mut self, cx: &mut Context<Self>) {
+        self.open_analyzer(cx);
+    }
+
+    /// The artifacts the analyzer lists, as the left list shows them, for tests.
+    #[cfg(test)]
+    pub(crate) fn analyzer_labels(&mut self, _cx: &mut Context<Self>) -> Vec<String> {
+        let indices = self.filtered();
+        indices
+            .into_iter()
+            .map(|index| {
+                let artifact = &self.artifacts[index];
+                artifact_label(artifact)
+            })
+            .collect()
+    }
+
+    /// The lines of the right pane of the analyzer, for tests.
+    #[cfg(test)]
+    pub(crate) fn analyzer_details(&mut self, _cx: &mut Context<Self>) -> Vec<String> {
+        self.details()
+    }
+
+    /// Types into the search field of the analyzer, for tests.
+    #[cfg(test)]
+    pub(crate) fn search_for(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.search = TextField::from_text(text);
+        self.search_active = true;
+        self.analyzer_selected = None;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn analyzer_open(&self) -> bool {
+        self.analyzer
+    }
+
+    #[cfg(test)]
+    pub(crate) fn only_conflicts(&self) -> bool {
+        self.only_conflicts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_only_conflicts(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.only_conflicts = on;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_artifact(&mut self, index: usize, cx: &mut Context<Self>) {
+        let filtered = self.filtered();
+        if let Some(&artifact) = filtered.get(index) {
+            self.analyzer_selected = Some(artifact);
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> Option<String> {
+        self.message.clone()
+    }
+
+    /// The model the panel shows, for tests.
+    fn model(&self, cx: &App) -> Option<Arc<ProjectModel>> {
+        self.run.read(cx).model()
+    }
+
     fn rows(&self, cx: &App) -> Vec<Row> {
         let tree = self.run.read(cx).build_tree();
+        let model = self.model(cx);
         let mut rows = Vec::new();
         for module in &tree {
-            rows.push(module_row(module, &self.closed_modules));
+            let found = model
+                .as_deref()
+                .and_then(|model| model.dependencies_of(&module.id));
+            let has_dependencies = found.is_some_and(|found| !found.scopes.is_empty());
+            rows.push(module_row(module, has_dependencies, &self.closed_modules));
             if self.closed_modules.contains(&module.id) {
                 continue;
             }
@@ -188,7 +341,36 @@ impl BuildPanel {
                     continue;
                 }
                 for task in &group.tasks {
-                    rows.push(task_row(module, group, task));
+                    rows.push(task_row(module, task));
+                }
+            }
+            let Some(found) = found.filter(|_| has_dependencies) else {
+                continue;
+            };
+            let key = dependencies_key(&module.id);
+            let open = !self.closed_groups.contains(&key);
+            rows.push(dependencies_row(module, open));
+            if !open {
+                continue;
+            }
+            for scope in &found.scopes {
+                let key = scope_key(&module.id, &scope.name);
+                let open = !self.closed_groups.contains(&key);
+                rows.push(scope_row(module, &scope.name, open));
+                if !open {
+                    continue;
+                }
+                for root in &scope.roots {
+                    let mut chain = Vec::new();
+                    push_dependency_rows(
+                        module,
+                        &scope.name,
+                        root,
+                        &mut chain,
+                        3,
+                        &self.closed_groups,
+                        &mut rows,
+                    );
                 }
             }
         }
@@ -206,12 +388,13 @@ impl BuildPanel {
                 toggle(&mut self.closed_modules, &row.module);
                 cx.notify();
             }
-            RowKind::Group => {
-                if let Some(key) = row.group_key() {
-                    toggle(&mut self.closed_groups, &key);
+            RowKind::Group | RowKind::Dependencies | RowKind::Scope => {
+                if let Some(key) = &row.key {
+                    toggle(&mut self.closed_groups, key);
                 }
                 cx.notify();
             }
+            RowKind::Dependency => self.go_to_dependency(&row, window, cx),
         }
     }
 
@@ -250,7 +433,7 @@ impl BuildPanel {
                 .rows(cx)
                 .into_iter()
                 .nth(index)
-                .is_some_and(|row| row.kind == RowKind::Task);
+                .is_some_and(|row| matches!(row.kind, RowKind::Task | RowKind::Dependency));
             if second {
                 self.activate(index, window, cx);
                 return;
@@ -281,6 +464,30 @@ impl BuildPanel {
             }
             cx.stop_propagation();
             return;
+        }
+        if self.analyzer {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.search_active = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "up" | "down" => {
+                    cx.stop_propagation();
+                    self.move_analyzer_selection(event.keystroke.key == "down", cx);
+                    return;
+                }
+                _ => {}
+            }
+            if self.search_active {
+                if self.search.key_with_clipboard(event, false, cx) {
+                    self.analyzer_selected = None;
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
         }
         match event.keystroke.key.as_str() {
             "up" => {
@@ -324,6 +531,24 @@ impl BuildPanel {
         cx.notify();
     }
 
+    fn move_analyzer_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let filtered = self.filtered();
+        if filtered.is_empty() {
+            return;
+        }
+        let at = self
+            .analyzer_selected
+            .and_then(|selected| filtered.iter().position(|index| *index == selected));
+        let next = match (at, forward) {
+            (Some(at), true) => (at + 1).min(filtered.len() - 1),
+            (Some(at), false) => at.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => filtered.len() - 1,
+        };
+        self.analyzer_selected = Some(filtered[next]);
+        cx.notify();
+    }
+
     fn collapse_or_parent(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.selected else {
             return;
@@ -337,12 +562,11 @@ impl BuildPanel {
                 RowKind::Module => {
                     self.closed_modules.insert(row.module);
                 }
-                RowKind::Group => {
-                    if let Some(key) = row.group_key() {
-                        self.closed_groups.insert(key);
+                _ => {
+                    if let Some(key) = &row.key {
+                        self.closed_groups.insert(key.clone());
                     }
                 }
-                RowKind::Task => {}
             }
             cx.notify();
             return;
@@ -369,12 +593,11 @@ impl BuildPanel {
                 RowKind::Module => {
                     self.closed_modules.remove(&row.module);
                 }
-                RowKind::Group => {
-                    if let Some(key) = row.group_key() {
-                        self.closed_groups.remove(&key);
+                _ => {
+                    if let Some(key) = &row.key {
+                        self.closed_groups.remove(key);
                     }
                 }
-                RowKind::Task => {}
             }
             cx.notify();
             return;
@@ -426,10 +649,18 @@ impl BuildPanel {
     }
 
     fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        let model = self.model(cx);
         for module in self.run.read(cx).build_tree() {
             for group in &module.groups {
                 self.closed_groups
                     .insert(group_key(&module.id, &group.name));
+            }
+            if model
+                .as_deref()
+                .and_then(|model| model.dependencies_of(&module.id))
+                .is_some_and(|found| !found.scopes.is_empty())
+            {
+                self.closed_groups.insert(dependencies_key(&module.id));
             }
             self.closed_modules.insert(module.id);
         }
@@ -517,6 +748,381 @@ impl BuildPanel {
             .ok();
     }
 
+    /// Opens the analyzer in place of the task tree.
+    pub(crate) fn open_analyzer(&mut self, cx: &mut Context<Self>) {
+        self.analyzer = true;
+        self.search = TextField::default();
+        self.search_active = true;
+        self.message = None;
+        self.refresh_artifacts(cx);
+        cx.notify();
+    }
+
+    fn close_analyzer(&mut self, cx: &mut Context<Self>) {
+        self.analyzer = false;
+        self.search_active = false;
+        self.message = None;
+        cx.notify();
+    }
+
+    fn toggle_analyzer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        if self.analyzer {
+            self.close_analyzer(cx);
+        } else {
+            self.open_analyzer(cx);
+        }
+    }
+
+    /// Rebuilds the artifact list when the model changed.
+    fn refresh_artifacts(&mut self, cx: &App) {
+        let model = self.model(cx);
+        let same = match (&self.analyzed, &model) {
+            (Some(cached), Some(current)) => Arc::ptr_eq(cached, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.artifacts = model
+            .as_deref()
+            .map(dependencies::analyze)
+            .unwrap_or_default();
+        self.analyzed = model;
+        self.analyzer_selected = None;
+    }
+
+    /// The indices of the artifacts the filters keep.
+    fn filtered(&mut self) -> Vec<usize> {
+        let query = self.search.text.trim().to_lowercase();
+        self.artifacts
+            .iter()
+            .enumerate()
+            .filter(|(_, artifact)| !self.only_conflicts || artifact.conflict())
+            .filter(|(_, artifact)| {
+                query.is_empty() || artifact.name.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn selected_artifact(&self) -> Option<&Artifact> {
+        self.analyzer_selected
+            .and_then(|index| self.artifacts.get(index))
+    }
+
+    /// The lines of the right pane: every path of the selected artifact and the versions
+    /// that lost.
+    fn details(&self) -> Vec<String> {
+        let Some(artifact) = self.selected_artifact() else {
+            return Vec::new();
+        };
+        let mut details = vec![artifact.coordinates()];
+        let losing: Vec<&String> = artifact.losing().collect();
+        if !losing.is_empty() {
+            let losing: Vec<&str> = losing.iter().map(|version| version.as_str()).collect();
+            details.push(format!("Omitted for conflict: {}", losing.join(", ")));
+        }
+        for usage in &artifact.usages {
+            details.push(usage.path());
+            if let Some(mark) = usage.mark() {
+                details.push(format!("    {mark}"));
+            }
+            details.push(format!("    {} [{}]", usage.module_name, usage.scope));
+        }
+        details
+    }
+
+    /// A double click or Enter on a dependency: its declaration in the build file of the
+    /// module, when that file is the one that declares it.
+    fn go_to_dependency(&mut self, row: &Row, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dependency) = &row.dependency else {
+            return;
+        };
+        let Some(found) = self
+            .model(cx)
+            .as_deref()
+            .and_then(|model| model.dependencies_of(&row.module))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(path) = found.build_file.clone() else {
+            self.message = Some("The module does not name the file it is declared in".into());
+            cx.notify();
+            return;
+        };
+        let coordinates = dependency.coordinates.clone();
+        let workspace = self.workspace.clone();
+        let handle = window.window_handle();
+        // The editor reads the file in the background: the caret moves once its text is
+        // there. The window is not held meanwhile.
+        cx.spawn(async move |this, cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.open_file(path.clone(), window, cx)
+                        })
+                        .ok();
+                })
+                .ok();
+            for _ in 0..200 {
+                let done = this
+                    .update(cx, |panel, cx| {
+                        panel.show_declaration(&path, &coordinates, cx)
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// One attempt to put the caret on the declaration: `false` while the editor of the
+    /// build file still has no text.
+    fn show_declaration(&mut self, path: &Path, coordinates: &str, cx: &mut Context<Self>) -> bool {
+        let editor = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.view_of(path))
+            .ok()
+            .flatten()
+            .and_then(|view| view.downcast::<EditorView>().ok());
+        let Some(editor) = editor else {
+            return false;
+        };
+        let Some(text) = editor.read(cx).text() else {
+            return false;
+        };
+        if let Some(offset) = dependencies::declaration_offset(&text, coordinates) {
+            editor.update(cx, |editor, cx| editor.go_to(Spot::Offset(offset), cx));
+        }
+        true
+    }
+
+    /// Go to Declaration of the analyzer: the build file of the first path of the
+    /// selected artifact.
+    pub(crate) fn go_to_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(artifact) = self.selected_artifact() else {
+            return;
+        };
+        let Some(usage) = artifact.usages.first() else {
+            return;
+        };
+        let row = Row {
+            kind: RowKind::Dependency,
+            depth: 0,
+            label: String::new(),
+            expandable: false,
+            open: false,
+            module: usage.module.clone(),
+            module_name: usage.module_name.clone(),
+            task: None,
+            program: false,
+            key: None,
+            hint: None,
+            dependency: Some(DependencyRow {
+                coordinates: artifact.coordinates(),
+            }),
+        };
+        self.go_to_dependency(&row, window, cx);
+    }
+
+    /// Copy Coordinates of the analyzer.
+    pub(crate) fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(artifact) = self.selected_artifact() else {
+            return;
+        };
+        let text = artifact.coordinates();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Exclude of the analyzer: an exclusion in the first-level dependency the selected
+    /// path comes through, made in the editor of the build file and saved as a user edit.
+    pub(crate) fn exclude_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.message = None;
+        let Some(artifact) = self.selected_artifact().cloned() else {
+            return;
+        };
+        // A first-level dependency has nothing to be excluded from.
+        let artifact_name = artifact.name.clone();
+        let usage = artifact.usages.iter().find(|usage| {
+            usage
+                .declared()
+                .and_then(Coordinates::parse)
+                .map(|declared| declared.artifact_name())
+                .is_some_and(|name| name != artifact_name)
+        });
+        let Some(usage) = usage.cloned() else {
+            self.message = Some(
+                "The artifact is a first-level dependency, so there is nothing to exclude it from"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(declared) = usage.declared().map(str::to_owned) else {
+            return;
+        };
+        let Some(coordinates) = Coordinates::parse(&artifact.coordinates()) else {
+            return;
+        };
+        let Some(module) = self
+            .model(cx)
+            .as_deref()
+            .and_then(|model| model.module(&usage.module))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(found) = self
+            .model(cx)
+            .as_deref()
+            .and_then(|model| model.dependencies_of(&usage.module))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(tool) = self.run.read(cx).build_system() else {
+            self.message = Some("The project has no build tool".into());
+            cx.notify();
+            return;
+        };
+        let Some(path) = found.build_file.clone() else {
+            self.message = Some("The module does not name the file it is declared in".into());
+            cx.notify();
+            return;
+        };
+        let request = Exclusion {
+            group: coordinates.group,
+            artifact: coordinates.artifact,
+            declared,
+        };
+        let job = ExcludeJob {
+            tool,
+            module,
+            root: self
+                .model(cx)
+                .map_or_else(PathBuf::new, |model| model.root.clone()),
+            path,
+            request,
+        };
+        let workspace = self.workspace.clone();
+        let handle = window.window_handle();
+        // The editor of the build file reads the file in the background: the edit waits
+        // for its text instead of holding the window.
+        cx.spawn(async move |this, cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.open_file(job.path.clone(), window, cx)
+                        })
+                        .ok();
+                })
+                .ok();
+            for _ in 0..200 {
+                let done = this
+                    .update(cx, |panel, cx| panel.apply_exclusion(&job, cx))
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// One attempt of an exclusion: `false` while the editor of the build file still has
+    /// no text, `true` when the edit was made or refused.
+    fn apply_exclusion(&mut self, job: &ExcludeJob, cx: &mut Context<Self>) -> bool {
+        let editor = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.view_of(&job.path))
+            .ok()
+            .flatten()
+            .and_then(|view| view.downcast::<EditorView>().ok());
+        let Some(editor) = editor else {
+            return false;
+        };
+        let Some(text) = editor.read(cx).text() else {
+            return false;
+        };
+        let edit = match job
+            .tool
+            .exclude(&job.root, &job.module, &job.path, &job.request, &text)
+        {
+            Ok(Some(edit)) => edit,
+            Ok(None) => {
+                self.message = Some(format!(
+                    "{} does not declare {} with a form this window can change",
+                    job.path.file_name().unwrap_or_default().to_string_lossy(),
+                    job.request.declared
+                ));
+                cx.notify();
+                return true;
+            }
+            Err(error) => {
+                self.message = Some(error.to_string());
+                cx.notify();
+                return true;
+            }
+        };
+        editor.update(cx, |editor, cx| {
+            editor.apply_edits(
+                vec![text_core::Edit::new(edit.start..edit.end, edit.text)],
+                cx,
+            )
+        });
+        self.workspace
+            .update(cx, |workspace, cx| workspace.save_editor(&job.path, cx))
+            .ok();
+        self.run.update(cx, |run, cx| run.model_file_changed(cx));
+        true
+    }
+
+    fn show_analyzer_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.selected_artifact().is_none() {
+            return;
+        }
+        let this = self.this.clone();
+        let go_to = this.clone();
+        let copy = this.clone();
+        let exclude = this;
+        let entries = vec![
+            MenuEntry::new("Go to Declaration", move |window, cx| {
+                go_to
+                    .update(cx, |panel, cx| panel.go_to_selected(window, cx))
+                    .ok();
+            })
+            .icon("general/locate"),
+            MenuEntry::new("Copy Coordinates", move |_, cx| {
+                copy.update(cx, |panel, cx| panel.copy_selected(cx)).ok();
+            })
+            .icon("general/copy"),
+            MenuEntry::new("Exclude", move |window, cx| {
+                exclude
+                    .update(cx, |panel, cx| panel.exclude_selected(window, cx))
+                    .ok();
+            })
+            .icon("general/minus"),
+        ];
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
+    }
+
     fn toolbar(
         &self,
         theme: &Theme,
@@ -561,6 +1167,18 @@ impl BuildPanel {
         .child(
             tool_button("build-collapse-all", "general/collapseAll", 4, theme)
                 .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
+        )
+        .child(
+            tool_button("build-analyze", "nodes/library", 5, theme)
+                .when(self.analyzer, |this| this.bg(theme.pressed))
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_analyzer(window, cx))),
+        )
+        .child(
+            tool_button("build-download-sources", "general/download", 6, theme).on_click(
+                cx.listener(|_, _, window, cx| {
+                    crate::library_sources::download_all(window, cx);
+                }),
+            ),
         )
     }
 
@@ -622,20 +1240,209 @@ impl BuildPanel {
             .child(field)
             .children(history)
     }
+
+    /// The analyzer in place of the task tree: the list of the artifacts on the left, the
+    /// paths of the selected one on the right.
+    fn analyzer_body(&mut self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        self.refresh_artifacts(cx);
+        let filtered = self.filtered();
+        let selected = self.analyzer_selected;
+        let rows = filtered.iter().enumerate().map(|(position, index)| {
+            let artifact_index = *index;
+            let artifact = &self.artifacts[artifact_index];
+            let label = artifact_label(artifact);
+            let conflict = artifact.conflict();
+            let chosen = selected == Some(artifact_index);
+            div()
+                .id(("dependencies-artifact", position))
+                .debug_selector(move || format!("dependencies-artifact-{position}"))
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .h(px(ROW_HEIGHT))
+                .px(px(SPACE_S))
+                .rounded(px(ROW_RADIUS))
+                .text_size(px(TEXT_SMALL))
+                .when(chosen, |this| this.bg(theme.selection_inactive))
+                .when(!chosen, |this| {
+                    this.hover(move |style| style.bg(theme.hover))
+                })
+                .child(div().flex_1().overflow_hidden().child(label))
+                .when(conflict, |this| {
+                    this.child(div().text_color(theme.text_secondary).child("conflict"))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.analyzer_selected = Some(artifact_index);
+                    this.search_active = false;
+                    cx.notify();
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.analyzer_selected = Some(artifact_index);
+                        this.show_analyzer_menu(event.position, cx);
+                        cx.notify();
+                    }),
+                )
+        });
+        let empty = filtered.is_empty();
+        let details = self.details();
+        let message = self.message.clone();
+        let search_empty = self.search.text.is_empty();
+        let search_color = if search_empty {
+            theme.text_secondary
+        } else {
+            theme.text
+        };
+        let search = div()
+            .id("dependencies-search-frame")
+            .debug_selector(|| "dependencies-search-frame".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(if self.search_active {
+                theme.accent
+            } else {
+                theme.border
+            })
+            .text_color(search_color)
+            .children(text_field_children_named(
+                "dependencies-search",
+                &self.search,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                16.,
+                self.search_active,
+            ))
+            .when(search_empty, |this| this.child("Search artifacts"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.search_active = true;
+                cx.notify();
+            }));
+        let only_conflicts =
+            filter_button(self.only_conflicts, theme).on_click(cx.listener(|this, _, _, cx| {
+                this.only_conflicts = !this.only_conflicts;
+                this.analyzer_selected = None;
+                cx.notify();
+            }));
+        let details_rows: Vec<Div> = details
+            .iter()
+            .map(|line| {
+                div()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text)
+                    .child(line.clone())
+            })
+            .collect();
+        let list = scrollable(
+            "dependencies-list",
+            &self.analyzer_list_scroll,
+            div()
+                .id("dependencies-list")
+                .flex()
+                .flex_col()
+                .py(px(SPACE_XS))
+                .when(empty, |this| {
+                    this.child(
+                        div()
+                            .px(px(SPACE_S))
+                            .py(px(SPACE_S))
+                            .text_color(theme.text_secondary)
+                            .child("No artifacts"),
+                    )
+                })
+                .children(rows),
+            theme,
+            window,
+            cx,
+        );
+        let details_pane = scrollable(
+            "dependencies-details",
+            &self.analyzer_details_scroll,
+            div()
+                .id("dependencies-details")
+                .flex()
+                .flex_col()
+                .gap(px(SPACE_XS))
+                .px(px(SPACE_M))
+                .py(px(SPACE_S))
+                .children(details_rows)
+                .when_some(message, |this, message| {
+                    this.child(div().text_color(theme.text_secondary).child(message))
+                }),
+            theme,
+            window,
+            cx,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .px(px(SPACE_S))
+                    .py(px(SPACE_XS))
+                    .child(search.flex_1())
+                    .child(only_conflicts),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .w(px(LIST_WIDTH))
+                            .flex_none()
+                            .border_r_1()
+                            .border_color(theme.border)
+                            .child(list),
+                    )
+                    .child(div().flex_1().min_w_0().child(details_pane)),
+            )
+            .child(
+                div()
+                    .px(px(SPACE_S))
+                    .py(px(SPACE_XS))
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child("Right-click a path for Go to Declaration, Copy Coordinates or Exclude"),
+            )
+    }
 }
 
-fn module_row(module: &BuildModule, closed: &HashSet<String>) -> Row {
+fn artifact_label(artifact: &Artifact) -> String {
+    if artifact.selected.is_empty() {
+        artifact.name.clone()
+    } else {
+        format!("{}:{}", artifact.name, artifact.selected)
+    }
+}
+
+fn module_row(module: &BuildModule, has_dependencies: bool, closed: &HashSet<String>) -> Row {
     Row {
         kind: RowKind::Module,
         depth: 0,
         label: module.name.clone(),
-        expandable: !module.groups.is_empty(),
+        expandable: !module.groups.is_empty() || has_dependencies,
         open: !closed.contains(&module.id),
         module: module.id.clone(),
         module_name: module.name.clone(),
-        group: None,
         task: None,
         program: false,
+        key: None,
+        hint: None,
+        dependency: None,
     }
 }
 
@@ -648,13 +1455,15 @@ fn group_row(module: &BuildModule, group: &BuildGroup, open: bool) -> Row {
         open,
         module: module.id.clone(),
         module_name: module.name.clone(),
-        group: Some(group.name.clone()),
         task: None,
         program: false,
+        key: Some(group_key(&module.id, &group.name)),
+        hint: None,
+        dependency: None,
     }
 }
 
-fn task_row(module: &BuildModule, group: &BuildGroup, task: &BuildTask) -> Row {
+fn task_row(module: &BuildModule, task: &BuildTask) -> Row {
     Row {
         kind: RowKind::Task,
         depth: 2,
@@ -663,14 +1472,114 @@ fn task_row(module: &BuildModule, group: &BuildGroup, task: &BuildTask) -> Row {
         open: false,
         module: module.id.clone(),
         module_name: module.name.clone(),
-        group: Some(group.name.clone()),
         task: Some(task.name.clone()),
         program: task.program,
+        key: None,
+        hint: None,
+        dependency: None,
+    }
+}
+
+/// `Dependencies` of a module: the node the scopes hang under.
+fn dependencies_row(module: &BuildModule, open: bool) -> Row {
+    Row {
+        kind: RowKind::Dependencies,
+        depth: 1,
+        label: "Dependencies".into(),
+        expandable: true,
+        open,
+        module: module.id.clone(),
+        module_name: module.name.clone(),
+        task: None,
+        program: false,
+        key: Some(dependencies_key(&module.id)),
+        hint: None,
+        dependency: None,
+    }
+}
+
+fn scope_row(module: &BuildModule, scope: &str, open: bool) -> Row {
+    Row {
+        kind: RowKind::Scope,
+        depth: 2,
+        label: scope_name(scope),
+        expandable: true,
+        open,
+        module: module.id.clone(),
+        module_name: module.name.clone(),
+        task: None,
+        program: false,
+        key: Some(scope_key(&module.id, scope)),
+        hint: None,
+        dependency: None,
+    }
+}
+
+fn push_dependency_rows(
+    module: &BuildModule,
+    scope: &str,
+    node: &Dependency,
+    chain: &mut Vec<String>,
+    depth: usize,
+    closed: &HashSet<String>,
+    rows: &mut Vec<Row>,
+) {
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
+    chain.push(node.coordinates.clone());
+    let key = dependency_key(&module.id, scope, chain);
+    let open = !closed.contains(&key);
+    rows.push(Row {
+        kind: RowKind::Dependency,
+        depth,
+        label: dependencies::short_name(&node.coordinates),
+        expandable: !node.children.is_empty(),
+        open,
+        module: module.id.clone(),
+        module_name: module.name.clone(),
+        task: None,
+        program: false,
+        key: Some(key),
+        hint: dependencies::conflict_mark(node),
+        dependency: Some(DependencyRow {
+            coordinates: node.coordinates.clone(),
+        }),
+    });
+    if open {
+        for child in &node.children {
+            push_dependency_rows(module, scope, child, chain, depth + 1, closed, rows);
+        }
+    }
+    chain.pop();
+}
+
+/// `compile` as the tree shows it: the tool writes the name in its own case.
+fn scope_name(scope: &str) -> String {
+    let mut characters = scope.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }
 
 fn group_key(module: &str, group: &str) -> String {
     format!("{module}\u{0}{group}")
+}
+
+fn dependencies_key(module: &str) -> String {
+    format!("{module}\u{0}dependencies")
+}
+
+fn scope_key(module: &str, scope: &str) -> String {
+    format!("{module}\u{0}dependencies\u{0}{scope}")
+}
+
+fn dependency_key(module: &str, scope: &str, chain: &[String]) -> String {
+    format!(
+        "{module}\u{0}dependencies\u{0}{scope}\u{0}{}",
+        chain.join("\u{1}")
+    )
 }
 
 fn toggle(set: &mut HashSet<String>, value: &str) {
@@ -708,6 +1617,26 @@ fn skip_button(on: bool, theme: &Theme) -> Stateful<Div> {
         .child("Skip Tests")
 }
 
+/// The `Only conflicts` switch of the analyzer.
+fn filter_button(on: bool, theme: &Theme) -> Stateful<Div> {
+    let (hover, pressed) = (theme.hover, theme.pressed);
+    div()
+        .id("dependencies-only-conflicts")
+        .debug_selector(|| "dependencies-only-conflicts".to_owned())
+        .flex()
+        .items_center()
+        .gap(px(SPACE_XS))
+        .flex_none()
+        .h(px(CONTROL_HEIGHT))
+        .px(px(SPACE_S))
+        .rounded(px(CONTROL_RADIUS))
+        .text_size(px(TEXT_SMALL))
+        .when(on, |this| this.bg(pressed))
+        .when(!on, |this| this.hover(move |style| style.bg(hover)))
+        .child(checkbox(on, theme))
+        .child("Only conflicts")
+}
+
 impl Render for BuildPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -732,18 +1661,21 @@ impl Render for BuildPanel {
                         RowKind::Module => "nodes/module",
                         RowKind::Group => "nodes/folder",
                         RowKind::Task => "run/run",
+                        RowKind::Dependencies => "nodes/library",
+                        RowKind::Scope => "nodes/folder",
+                        RowKind::Dependency => "nodes/library",
                     };
                     let style = TreeRow {
                         id: ("build-row", index).into(),
                         depth: row.depth,
                         label: row.label.clone().into(),
-                        hint: None,
+                        hint: row.hint.clone().map(Into::into),
                         icon,
                         expandable: row.expandable,
                         open: row.open,
                         selected: selected == Some(index),
                     };
-                    let task = row.kind == RowKind::Task;
+                    let actionable = matches!(row.kind, RowKind::Task | RowKind::Dependency);
                     let element = tree_row(style, &theme).on_click(cx.listener(
                         move |this, event, window, cx| this.click(index, event, window, cx),
                     ));
@@ -755,7 +1687,7 @@ impl Render for BuildPanel {
                             cx.notify();
                         }),
                     );
-                    let element = if task {
+                    let element = if actionable {
                         element.cursor_pointer()
                     } else {
                         element
@@ -771,6 +1703,36 @@ impl Render for BuildPanel {
         } else {
             ""
         };
+        let body = if self.analyzer {
+            self.analyzer_body(&theme, window, cx).into_any_element()
+        } else {
+            scrollable(
+                "build-rows",
+                &self.scroll,
+                div()
+                    .id("build-rows")
+                    .flex()
+                    .flex_col()
+                    .pt(px(SPACE_S))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .children(rows)
+                    .when(!hint.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .px(px(ROW_MARGIN + SPACE_M))
+                                .text_color(theme.text_secondary)
+                                .child(hint),
+                        )
+                    }),
+                &theme,
+                window,
+                cx,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
         island(&theme)
             .id("build-panel")
             .key_context("BuildPanel ToolWindow")
@@ -781,33 +1743,7 @@ impl Render for BuildPanel {
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .child(panel_header(title, GROUP, hide, &theme))
             .child(self.toolbar(&theme, loading, skip_supported, cx))
-            .child(
-                scrollable(
-                    "build-rows",
-                    &self.scroll,
-                    div()
-                        .id("build-rows")
-                        .flex()
-                        .flex_col()
-                        .pt(px(SPACE_S))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .children(rows)
-                        .when(!hint.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .px(px(ROW_MARGIN + SPACE_M))
-                                    .text_color(theme.text_secondary)
-                                    .child(hint),
-                            )
-                        }),
-                    &theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_h_0(),
-            )
+            .child(body)
             .when(self.execute_open, |this| {
                 this.child(self.execute_popup(&theme, cx))
             })

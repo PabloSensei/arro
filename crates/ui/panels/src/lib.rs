@@ -3,6 +3,7 @@
 mod agents;
 mod annotate;
 mod ansi;
+mod beans;
 mod branches;
 mod build;
 mod call_hierarchy;
@@ -17,12 +18,14 @@ mod conflict;
 mod console_input;
 mod copy_class;
 mod coverage;
+pub mod database_panel;
 mod debug;
 mod diff_view;
 mod docker;
 mod documentation;
 mod editor_menu;
 mod editor_tab;
+mod endpoints;
 mod file_tree;
 mod finder;
 mod folder_compare;
@@ -34,6 +37,9 @@ mod http;
 mod index;
 mod inspect;
 mod items;
+pub mod jshell_panel;
+mod library_sources;
+mod live_panel;
 mod marks;
 mod merge_view;
 mod method_hierarchy;
@@ -44,6 +50,7 @@ mod performance;
 mod places;
 mod plugins;
 mod problems;
+mod profiler;
 mod project;
 mod project_state;
 mod project_structure;
@@ -58,6 +65,9 @@ mod settings_catalog;
 mod settings_keymap;
 mod settings_templates;
 mod shelf;
+mod spring_data;
+mod stack_trace_dialog;
+mod stack_traces;
 mod start;
 mod structure;
 mod term_grid;
@@ -73,6 +83,10 @@ mod window_popups;
 mod window_tests;
 #[cfg(test)]
 mod window_tests_actions;
+#[cfg(test)]
+mod window_tests_actions_on_save;
+#[cfg(test)]
+mod window_tests_actuator;
 #[cfg(test)]
 mod window_tests_annotate;
 #[cfg(test)]
@@ -106,6 +120,8 @@ mod window_tests_lang;
 #[cfg(test)]
 mod window_tests_layout;
 #[cfg(test)]
+mod window_tests_library_sources;
+#[cfg(test)]
 mod window_tests_live;
 #[cfg(test)]
 mod window_tests_log_graph;
@@ -115,6 +131,8 @@ mod window_tests_lookup;
 #[cfg(test)]
 mod window_tests_m11;
 #[cfg(test)]
+mod window_tests_markdown_images;
+#[cfg(test)]
 mod window_tests_menu_main;
 #[cfg(test)]
 mod window_tests_menus;
@@ -122,6 +140,8 @@ mod window_tests_menus;
 mod window_tests_perf;
 #[cfg(test)]
 mod window_tests_real;
+#[cfg(test)]
+mod window_tests_real_actions_on_save;
 #[cfg(test)]
 mod window_tests_real_drag;
 #[cfg(test)]
@@ -148,6 +168,12 @@ mod window_tests_virtual;
 mod window_tests_window;
 
 #[cfg(test)]
+mod window_tests_database;
+
+#[cfg(test)]
+mod window_tests_jshell;
+
+#[cfg(test)]
 mod window_tests_doc_window;
 #[cfg(test)]
 mod window_tests_folding;
@@ -162,6 +188,9 @@ mod window_tests_shelf;
 
 #[cfg(test)]
 mod window_tests_stable;
+
+#[cfg(test)]
+mod window_tests_index_isolation;
 
 #[cfg(test)]
 mod window_tests_inspect;
@@ -203,6 +232,8 @@ mod window_tests_reentrancy;
 
 #[cfg(test)]
 mod window_tests_dead_buttons;
+#[cfg(test)]
+mod window_tests_dependencies;
 
 #[cfg(test)]
 mod window_tests_server_setup;
@@ -240,6 +271,8 @@ mod window_tests_idle_events;
 #[cfg(test)]
 mod window_tests_inlay_hints;
 #[cfg(test)]
+mod window_tests_inline_values;
+#[cfg(test)]
 mod window_tests_menu_gaps;
 #[cfg(test)]
 mod window_tests_mouse_navigation;
@@ -247,6 +280,12 @@ mod window_tests_mouse_navigation;
 mod window_tests_scrollbars;
 #[cfg(test)]
 mod window_tests_semantic_tokens;
+
+#[cfg(test)]
+mod window_tests_resource_bundles;
+
+#[cfg(test)]
+mod window_tests_spring_config;
 
 #[cfg(test)]
 mod window_tests_settings_tools;
@@ -334,6 +373,9 @@ mod window_tests_diff_views;
 mod window_tests_merge;
 
 #[cfg(test)]
+mod window_tests_merge_growth;
+
+#[cfg(test)]
 mod window_tests_macos_menu;
 
 #[cfg(test)]
@@ -354,7 +396,24 @@ mod window_tests_services;
 #[cfg(test)]
 mod window_tests_coverage;
 #[cfg(test)]
+mod window_tests_endpoints;
+#[cfg(test)]
 mod window_tests_logpoints;
+#[cfg(test)]
+mod window_tests_profiler;
+#[cfg(test)]
+mod window_tests_profiler_allocations;
+#[cfg(test)]
+mod window_tests_spring_beans;
+#[cfg(test)]
+mod window_tests_spring_data;
+#[cfg(test)]
+mod window_tests_stack_traces;
+
+#[cfg(test)]
+mod window_tests_database_polish;
+#[cfg(test)]
+mod window_tests_switcher_icons;
 
 mod choice;
 mod invalidate;
@@ -371,9 +430,10 @@ use lang_api::{FileChange, LanguageSupport, ProjectProblemsQuery, ask};
 use tool_gateway::LanguageTools;
 use ui_kit::*;
 use workspace::{
-    AI_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, INSPECTION_TOOL,
-    LOG_TOOL, Launch, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL,
-    STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    AI_TOOL, BEANS_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL,
+    DockSide, ENDPOINTS_TOOL, INSPECTION_TOOL, LOG_TOOL, Launch, PERFORMANCE_TOOL, PROBLEMS_TOOL,
+    PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL,
+    TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
 };
 
 use crate::index::{IndexEvent, ProjectIndex};
@@ -381,11 +441,14 @@ use crate::navigation::Navigator;
 
 pub use agents::{AgentLanguages, AgentOptions};
 pub use coverage::{ActiveCoverage, CoverageColumn};
+pub use database_panel::{ActiveDatabase, DatabasePanel, set_database_support};
 pub use debug::{ActiveDebug, BreakpointsChanged, DebugPanel};
 pub use index::SearchSetup;
 pub use inspect::{ActiveInspect, Finding, InspectHub};
 pub use invalidate::CacheLocations;
+pub use jshell_panel::{ActiveJShell, JShellPanel, set_jshell_support};
 pub use problems::{ActiveProblems, Problem, ProblemsHub, ProblemsState};
+pub use profiler::{ActiveProfiler, ProfileColumn, ProfilerTab};
 pub use run::ProjectSetup;
 pub use script::parse_script;
 pub use settings_templates::TemplatesSetup;
@@ -530,6 +593,16 @@ pub fn connect_server(
     }
     let restart = support.clone();
     cx.set_global(Semantic(support.clone()));
+    spring_data::follow(support.clone(), cx);
+    if let Some(panel) = cx.try_global::<endpoints::ActiveEndpoints>() {
+        let panel = panel.0.clone();
+        panel.update(cx, |panel, cx| panel.language_ready(cx));
+    }
+    if let Some(panel) = cx.try_global::<beans::ActiveBeans>() {
+        let panel = panel.0.clone();
+        let support = support.clone();
+        panel.update(cx, |panel, cx| panel.language_ready(support, cx));
+    }
     workspace.register_command(
         "language.restart_server",
         "Restart Language Server",
@@ -708,7 +781,10 @@ fn install(
 
     cx.set_global(outline::SymbolsFor(search.symbols_for));
     let weak = cx.weak_entity();
-    workspace.set_editor_factory(editor_tab::factory(weak.clone()));
+    workspace.set_editor_factory(editor_tab::factory(
+        weak.clone(),
+        workspace.state_dir().to_path_buf(),
+    ));
     let git = git::GitState::create(workspace.root().to_path_buf(), weak.clone(), cx);
     cx.set_global(git::ActiveGit(git.clone()));
     git::bind_actions(git.clone(), window.window_handle(), cx);
@@ -819,6 +895,22 @@ fn install(
     );
     cx.set_global(http::ActiveHttp(http));
     http::install(cx);
+    library_sources::install(cx);
+    library_sources::register(workspace, cx);
+
+    let state_dir = workspace.state_dir().to_path_buf();
+    let database = database_panel::DatabasePanel::create(weak.clone(), state_dir.clone(), cx);
+    let focus = database.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        DATABASE_TOOL,
+        database.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(database_panel::ActiveDatabase(database));
+    database_panel::install(state_dir, cx);
+    jshell_panel::install(workspace, weak.clone(), cx);
 
     let root = workspace.root().to_path_buf();
     let runs = run::RunPanel::create(root, project.clone(), weak.clone(), cx);
@@ -833,6 +925,7 @@ fn install(
     workspace.set_run_controls(run::RunPanel::controls(&runs));
     cx.set_global(script::ActiveRunPanel(runs.clone()));
     let coverage_source = runs.clone();
+    let profiler_source = runs.clone();
 
     let debug = debug::DebugPanel::create(
         workspace.root().to_path_buf(),
@@ -937,6 +1030,17 @@ fn install(
     );
     cx.set_global(coverage::ActiveCoverage(coverage));
 
+    let profiler = profiler::ProfilerPanel::create(weak.clone(), profiler_source, cx);
+    let focus = profiler.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        PROFILER_TOOL,
+        profiler.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(profiler::ActiveProfiler(profiler));
+
     let usages = usages::UsagesHub::create(root.clone(), weak.clone(), cx);
     let usages_panel = usages.read(cx).panel().clone();
     let focus = usages_panel.read(cx).focus();
@@ -993,6 +1097,17 @@ fn install(
     );
     cx.set_global(method_hierarchy::ActiveMethodHierarchy(method_hierarchy));
 
+    let stack_traces = stack_traces::StackTracePanel::create(weak.clone(), cx);
+    let focus = stack_traces.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        STACK_TRACE_TOOL,
+        stack_traces.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(stack_traces::ActiveStackTrace(stack_traces));
+
     let keymap_file = workspace.keymap_path().to_path_buf();
     let templates_file = workspace.settings_dir().join(templates::TEMPLATES_FILE);
     let (index, events) =
@@ -1002,6 +1117,37 @@ fn install(
     let runs = cx.global::<script::ActiveRunPanel>().0.clone();
     runs.update(cx, |runs, _| runs.set_files(files.clone()));
     commands::register(workspace, &index, &files);
+    let endpoints = endpoints::EndpointsPanel::create(files.clone(), weak.clone(), cx);
+    let focus = endpoints.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        ENDPOINTS_TOOL,
+        endpoints.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(endpoints::ActiveEndpoints(endpoints.clone()));
+    endpoints.update(cx, |panel, cx| panel.language_ready(cx));
+    workspace.register_command(
+        "window.show_endpoints",
+        "Endpoints",
+        |workspace, window, cx| workspace.show_tool(ENDPOINTS_TOOL, window, cx),
+    );
+    let beans_hub = beans::BeanHub::create(cx);
+    cx.set_global(beans::ActiveBeanHub(beans_hub.clone()));
+    let beans_panel = beans::BeansPanel::create(beans_hub, weak.clone(), cx);
+    let focus = beans_panel.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Right,
+        BEANS_TOOL,
+        beans_panel.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(beans::ActiveBeans(beans_panel));
+    workspace.register_command("window.show_beans", "Beans", |workspace, window, cx| {
+        workspace.show_tool(BEANS_TOOL, window, cx)
+    });
     window_features::register(workspace, window, cx);
     let inspect = inspect::InspectHub::create(
         root,
@@ -1080,11 +1226,14 @@ fn release_globals(cx: &mut App) {
     }
     forget![
         agents::ActiveAgents,
+        beans::ActiveBeanHub,
+        beans::ActiveBeans,
         call_hierarchy::ActiveCallHierarchy,
         debug::ActiveDebug,
         debug::ActiveDebugHub,
         docker::ActiveDocker,
         documentation::ActiveDocumentation,
+        endpoints::ActiveEndpoints,
         finder::ActiveFinder,
         git::ActiveGit,
         git_log::ActiveGitLog,
@@ -1096,9 +1245,12 @@ fn release_globals(cx: &mut App) {
         plugins::ActivePlugins,
         problems::ActiveProblems,
         project::ActiveProjectPanel,
+        run::DebugOutput,
         script::ActiveBuildPanel,
         script::ActiveCommitPanel,
         script::ActiveRunPanel,
+        spring_data::Followed,
+        stack_traces::ActiveStackTrace,
         structure::ActiveStructure,
         terminal_panel::ActiveTerminal,
         todo::ActiveTodo,
@@ -1241,6 +1393,22 @@ fn disk_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context<Wo
     }
     folders.sort();
     folders.dedup();
+    if let Some(panel) = cx.try_global::<endpoints::ActiveEndpoints>() {
+        let panel = panel.0.clone();
+        panel.update(cx, |panel, cx| panel.disk_changed(changes, cx));
+    }
+    if let Some(semantic) = cx.try_global::<Semantic>() {
+        let support = semantic.0.clone();
+        let touched = changes.iter().any(|change| match change {
+            FsChange::Created(path) | FsChange::Changed(path) | FsChange::Removed(path) => {
+                support.matches(path)
+            }
+            FsChange::Rescan => true,
+        });
+        if touched && let Some(beans) = support.beans() {
+            beans.sources_changed();
+        }
+    }
     if folders.is_empty() {
         return;
     }

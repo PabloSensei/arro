@@ -11,7 +11,7 @@ members = [
 exclude = ["spikes", "vendor"]
 
 [workspace.package]
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 publish = false
 
@@ -20,6 +20,7 @@ base = { path = "crates/foundation/base" }
 chardetng = "1"
 container = { path = "crates/services/container" }
 dap-client = { path = "crates/services/dap-client" }
+database = { path = "crates/services/database" }
 encoding_rs = "0.8"
 gpui-kit = "=0.9.0"
 gpui_windows = { package = "gpui-pre-windows", version = "=0.3.11" }
@@ -40,6 +41,7 @@ proc-sup = { path = "crates/foundation/proc-sup" }
 project-model = { path = "crates/services/project-model" }
 proptest = "1"
 regex = "1"
+repl = { path = "crates/services/repl" }
 ropey = "=2.0.0-beta.1"
 runner = { path = "crates/services/runner" }
 semantic-router = { path = "crates/services/semantic-router" }

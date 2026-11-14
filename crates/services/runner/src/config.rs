@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base::Result;
@@ -190,6 +191,8 @@ pub enum ConfigFieldKind {
     Path,
     Bool,
     Choice(Vec<String>),
+    /// Text the dialog shows with a button that copies it; the user cannot change it.
+    ReadOnly,
 }
 
 /// One editable field of a configuration. The provider reads and writes the value in
@@ -236,6 +239,17 @@ impl ConfigField {
             key,
             label,
             kind: ConfigFieldKind::Path,
+            hint: None,
+        }
+    }
+
+    /// A line the user copies rather than edits, such as the command that starts a
+    /// program for the debugger elsewhere.
+    pub fn read_only(key: &'static str, label: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            kind: ConfigFieldKind::ReadOnly,
             hint: None,
         }
     }
@@ -289,6 +303,18 @@ pub struct RunPlan {
     pub grace: Duration,
 }
 
+/// A debugger that attaches to a program somebody else started, such as a JVM waiting
+/// for the debugger on a remote machine. A configuration of this kind has no command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachPlan {
+    pub host: String,
+    pub port: u16,
+    /// Names the program in the Debug window.
+    pub name: String,
+    /// The project name the adapter knows, when it needs one.
+    pub project: Option<String>,
+}
+
 /// Turns a stored configuration into a command, and finds what can be run at all.
 pub trait RunConfigProvider: Send + Sync {
     fn id(&self) -> &'static str;
@@ -319,6 +345,16 @@ pub trait RunConfigProvider: Send + Sync {
         self.plan(config, model)
     }
 
+    /// The address a debugger attaches to, for a configuration that starts nothing and
+    /// waits for a program somebody else runs. `None` for a configuration that starts.
+    fn attach_plan(
+        &self,
+        _config: &RunConfig,
+        _model: &ProjectModel,
+    ) -> Result<Option<AttachPlan>> {
+        Ok(None)
+    }
+
     /// The same program with a coverage agent, and the file the agent writes. A
     /// provider without coverage keeps the error of this default.
     fn coverage_plan(
@@ -338,11 +374,68 @@ pub trait RunConfigProvider: Send + Sync {
         Err(format!("{} cannot read coverage", self.id()).into())
     }
 
+    /// Whether [`RunConfigProvider::profile_plan`] makes a plan. The menus offer Profile
+    /// only for a provider that has it.
+    fn supports_profiler(&self) -> bool {
+        false
+    }
+
+    /// The same program with its samples recorded, and the file the runtime writes. A
+    /// provider that cannot record keeps the error of this default.
+    fn profile_plan(
+        &self,
+        _config: &RunConfig,
+        _model: &ProjectModel,
+    ) -> Result<crate::ProfilePlan> {
+        Err(format!("{} cannot record a profile", self.id()).into())
+    }
+
+    /// Reads the recording of the last run of [`RunConfigProvider::profile_plan`], or a
+    /// file the user opened.
+    fn profile_snapshot(
+        &self,
+        _recording: &Path,
+        _model: &ProjectModel,
+    ) -> Result<lang_api::ProfileSnapshot> {
+        Err(format!("{} cannot read a profile", self.id()).into())
+    }
+
+    /// Reads a recording with everything it holds: the CPU samples, the allocations and
+    /// the classes they made. A provider that gives only the CPU tree keeps this default.
+    fn profile_report(
+        &self,
+        recording: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::ProfileReport> {
+        self.profile_snapshot(recording, model)
+            .map(lang_api::ProfileReport::of)
+    }
+
+    /// The recordings of this provider still on disk, the newest first.
+    fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
+        Ok(Vec::new())
+    }
+
+    /// Every file one profile run left: a runtime may write one recording per JVM.
+    fn profile_run_recordings(&self, recording: &Path) -> Vec<PathBuf> {
+        vec![recording.to_owned()]
+    }
+
     /// The fields the dialog edits, in the order it shows them. A field that does not
     /// apply to this configuration, such as one of a framework the program does not use,
     /// is left out.
     fn fields(&self, _config: &RunConfig) -> Vec<ConfigField> {
         Vec::new()
+    }
+
+    /// The live sections of the application this configuration starts, when it is one
+    /// that publishes them. The language reads them; the window only shows them.
+    fn live_application(
+        &self,
+        _config: &RunConfig,
+        _model: &ProjectModel,
+    ) -> Option<Arc<dyn crate::LiveApplication>> {
+        None
     }
 
     /// The text of a field, as the dialog shows it.

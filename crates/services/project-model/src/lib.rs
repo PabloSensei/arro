@@ -14,7 +14,8 @@ pub use environment::{
     RuntimeReason,
 };
 pub use model::{
-    BuildGroup, BuildModule, BuildTask, MAIN_UNIT, Module, PathEntry, PathKind, ProjectModel,
-    TEST_UNIT, Unit,
+    BuildGroup, BuildModule, BuildTask, Coordinates, Dependency, DependencyScope, Exclusion,
+    FileEdit, MAIN_UNIT, Module, ModuleDependencies, PathEntry, PathKind, ProjectModel, TEST_UNIT,
+    Unit,
 };
-pub use open::{BuildSystem, ProjectSession, SyncEvent, TaskOptions, open_project};
+pub use open::{BuildSystem, ProjectSession, RecordedTask, SyncEvent, TaskOptions, open_project};

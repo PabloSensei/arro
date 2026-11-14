@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Counters of the layout for the window tests of the application.
+test-support = []
+
 [dependencies]
 base.workspace = true
 display-map = { path = "../../editor/display-map" }
@@ -18,3 +22,8 @@ syntax = { path = "../../editor/syntax" }
 templates = { path = "../../editor/templates" }
 text-core = { path = "../../editor/text-core" }
 ui-kit = { path = "../ui-kit" }
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "_ring",
+    "platform-verifier",
+] }

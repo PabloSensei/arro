@@ -41,3 +41,12 @@ if (listener != null) {
         }
     }
 }
+
+// A profile run of the tests: the recording flag reaches every test JVM, as the agent of
+// a debug or coverage run does.
+def profileFlag = properties['ide.profile.flag']
+if (profileFlag != null) {
+    allprojects {
+        tasks.withType(Test).configureEach { test -> test.jvmArgs profileFlag }
+    }
+}

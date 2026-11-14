@@ -37,19 +37,23 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// How many times the display ranged the result against its first text, for tests of big
-/// files: the chunks are read when the window needs them, not on every keystroke.
+// How many times the display ranged the result against its first text, for tests of big
+// files: the chunks are read when the window needs them, not on every keystroke. The
+// count belongs to the thread of a test, so windows of tests that run side by side do not
+// add to each other's numbers.
 #[cfg(test)]
-static CHUNK_RECOMPUTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static CHUNK_RECOMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn chunk_recomputes() -> usize {
-    CHUNK_RECOMPUTES.load(std::sync::atomic::Ordering::Relaxed)
+    CHUNK_RECOMPUTES.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
 pub(crate) fn reset_chunk_recomputes() {
-    CHUNK_RECOMPUTES.store(0, std::sync::atomic::Ordering::Relaxed);
+    CHUNK_RECOMPUTES.with(|count| count.set(0));
 }
 
 /// One changed place of the file, in the text the result started with.
@@ -336,7 +340,7 @@ impl MergeView {
             return display.ranges.clone();
         }
         #[cfg(test)]
-        CHUNK_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CHUNK_RECOMPUTES.with(|count| count.set(count.get() + 1));
         let hunks = vcs::line_hunks(&self.initial_result, &text);
         let starts = line_starts(&text);
         let ranges = self

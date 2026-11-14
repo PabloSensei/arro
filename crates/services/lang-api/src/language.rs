@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::{
     ActionProvider, AddOverridableMethodsProvider, CallHierarchyProvider,
@@ -12,7 +13,10 @@ use crate::{
     SourceTextProvider, SymbolProvider, SyntaxProvider, WorkspaceDiagnosticsProvider,
     WorkspaceSymbolProvider,
 };
-use crate::{ExpectedTypeProvider, ExternalDocProvider, SignatureInfoProvider};
+use crate::{
+    ExpectedTypeProvider, ExternalDocProvider, LibraryClassProvider, SignatureInfoProvider,
+    SourcesProvider,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LanguageId(pub &'static str);
@@ -30,7 +34,38 @@ pub trait LanguageSupport: Send + Sync {
         false
     }
 
+    /// Other languages of the same project, for files the main language does not
+    /// match: its configuration files, for one. The editor asks each of them for such
+    /// a file and keeps the first that matches; highlighting still comes from
+    /// `file-syntax`, so these languages bring completion, documentation and checks.
+    fn embedded_languages(&self) -> Vec<Arc<dyn LanguageSupport>> {
+        Vec::new()
+    }
+
+    /// Whether a place with no declaration shows its documentation instead. A
+    /// language whose places map onto configuration files answers `true`, so that
+    /// Ctrl+B on a key opens what the language knows about it.
+    fn definition_falls_back_to_hover(&self) -> bool {
+        false
+    }
+
     fn syntax(&self) -> &dyn SyntaxProvider;
+
+    /// The language whose text lives inside the text of this one, such as the query of a
+    /// string literal. The window asks it for the entries and the checks of those places.
+    fn embedded_text(&self) -> Option<&dyn crate::EmbeddedTextProvider> {
+        None
+    }
+
+    /// Reads a pasted stack trace or thread dump and finds the places of its frames.
+    fn stack_traces(&self) -> Option<&crate::TraceProvider> {
+        None
+    }
+
+    /// Asks a running program for the stacks of its threads.
+    fn thread_dump(&self) -> Option<&crate::DumpProvider> {
+        None
+    }
 
     /// Declarations of one source file, read natively.
     fn symbols(&self) -> Option<&dyn SymbolProvider> {
@@ -109,6 +144,17 @@ pub trait LanguageSupport: Send + Sync {
     }
 
     fn source_text(&self) -> Option<&SourceTextProvider> {
+        None
+    }
+
+    /// Which class of a library a read-only tab shows, and whether its sources are
+    /// attached. A class whose sources are missing gets a line above its tab.
+    fn library_class(&self) -> Option<&LibraryClassProvider> {
+        None
+    }
+
+    /// Fetches and attaches the sources of library classes.
+    fn library_sources(&self) -> Option<&SourcesProvider> {
         None
     }
 
@@ -250,6 +296,18 @@ pub trait LanguageSupport: Send + Sync {
     /// The documentation comments of a source file, read natively. The editor shows
     /// them as rendered blocks.
     fn documentation_comments(&self) -> Option<&dyn crate::DocumentationCommentProvider> {
+        None
+    }
+
+    /// The HTTP handlers of one source file, read natively. The Endpoints window scans
+    /// the whole project with it off the UI thread.
+    fn endpoints(&self) -> Option<&dyn crate::EndpointProvider> {
+        None
+    }
+
+    /// The dependency-injection model of the project, read natively in the background.
+    /// The answer stream sends the model again after every change of the sources.
+    fn beans(&self) -> Option<&dyn crate::BeanProvider> {
         None
     }
 
