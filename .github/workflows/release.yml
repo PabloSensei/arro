@@ -27,6 +27,7 @@ env:
   JDTLS_URL: https://download.eclipse.org/jdtls/snapshots/jdt-language-server-1.63.0-202610191322.tar.gz
   DEBUG_ARCHIVE: vscjava.vscode-java-debug-0.60.0.vsix
   DEBUG_URL: https://open-vsx.org/api/vscjava/vscode-java-debug/0.60.0/file/vscjava.vscode-java-debug-0.60.0.vsix
+  MAVEN_VERSION: "3.9.11"
   JACOCO_VERSION: "0.8.15"
   ASM_VERSION: "9.10.1"
   MAVEN_CENTRAL: https://repo1.maven.org/maven2
@@ -147,6 +148,19 @@ jobs:
           for part in asm asm-commons asm-tree; do
             curl -fsSL --retry 3 -o "$jacoco/lib/$part-$ASM_VERSION.jar"               "$MAVEN_CENTRAL/org/ow2/asm/$part/$ASM_VERSION/$part-$ASM_VERSION.jar"
           done
+
+      # The Maven extension among the helpers compiles against Maven 3.9, which the
+      # macOS runner does not carry; the archive comes from Apache with its SHA-512.
+      - name: Maven 3.9
+        run: |
+          base="https://archive.apache.org/dist/maven/maven-3/$MAVEN_VERSION/binaries"
+          file="apache-maven-$MAVEN_VERSION-bin.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o "$file" "$base/$file"
+          curl -fsSL --retry 3 -o "$file.sha512" "$base/$file.sha512"
+          echo "$(cut -d' ' -f1 "$file.sha512")  $file" | shasum -a 512 -c -
+          tar -xzf "$file"
+          echo "MAVEN_HOME=$RUNNER_TEMP/apache-maven-$MAVEN_VERSION" >> "$GITHUB_ENV"
 
       # The runner is Apple silicon. `xtask dist --target macos` names the archive after
       # the machine it built on, `macos-aarch64` here and `macos-x86_64` on an Intel Mac.

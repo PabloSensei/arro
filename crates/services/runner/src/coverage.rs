@@ -84,7 +84,9 @@ mod tests {
     use project_model::ProjectModel;
 
     use super::*;
-    use crate::{RunConfigProvider, TestListen};
+    use crate::RunConfigProvider;
+    #[cfg(windows)]
+    use crate::TestListen;
 
     struct Fake {
         exec: PathBuf,
