@@ -97,14 +97,84 @@ pub struct VariableError {
     pub message: String,
 }
 
+/// What an adapter said it can do with the requests added for methods and fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub function_breakpoints: bool,
+    pub data_breakpoints: bool,
+    pub restart_frame: bool,
+}
+
+/// The kind of a breakpoint: a place in a file, a method, or a field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BreakpointKind {
+    #[default]
+    Line,
+    Function,
+    Data,
+}
+
 /// A breakpoint as the adapter knows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Breakpoint {
     pub file: PathBuf,
     /// The line the adapter reports, zero when it did not.
     pub line: u32,
+    pub kind: BreakpointKind,
+    /// The id the adapter gave the breakpoint, when it gave one.
+    pub id: Option<i64>,
     pub verified: bool,
     pub message: Option<String>,
+}
+
+/// A method breakpoint: the adapter stops at the entry of `name`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FunctionBreakpointSpec {
+    /// The name the adapter expects, `com.example.Foo#bar` for a JVM one.
+    pub name: String,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
+    /// A disabled breakpoint is not sent to the adapter.
+    pub enabled: bool,
+}
+
+/// How a field watchpoint reacts to the field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DataAccessType {
+    Read,
+    #[default]
+    Write,
+    ReadWrite,
+}
+
+impl DataAccessType {
+    pub fn as_dap(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadWrite => "readWrite",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadWrite => "read and write",
+        }
+    }
+}
+
+/// A field watchpoint: the adapter stops when the field is read or written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DataBreakpointSpec {
+    /// The id the adapter gave the field, `com.example.Foo#bar` for a JVM one.
+    pub data_id: String,
+    pub access_type: DataAccessType,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
+    /// A disabled breakpoint is not sent to the adapter.
+    pub enabled: bool,
 }
 
 /// A breakpoint as the window sets it. `hit_condition` is the DAP text form, so an adapter
@@ -179,6 +249,12 @@ pub struct Snapshot {
     /// Output events and notes of the adapter, in arrival order.
     pub console: Vec<ConsoleLine>,
     pub breakpoints: Vec<Breakpoint>,
+    /// What the adapter said about the method breakpoints, in the order they were sent.
+    pub function_breakpoints: Vec<Breakpoint>,
+    /// What the adapter said about the field watchpoints, in the order they were sent.
+    pub data_breakpoints: Vec<Breakpoint>,
+    /// The requests the adapter supports, from its capabilities.
+    pub capabilities: Capabilities,
     /// What the adapter offers for exceptions, from its capabilities.
     pub exception_filters: Vec<ExceptionFilter>,
     /// The process id the adapter reported for the debuggee, when it did.
@@ -222,6 +298,12 @@ pub enum Command {
     },
     /// The filters the adapter should stop on, by id from its capabilities.
     SetExceptionBreakpoints(Vec<String>),
+    /// Replaces every method breakpoint of the session.
+    SetFunctionBreakpoints(Vec<FunctionBreakpointSpec>),
+    /// Replaces every field watchpoint of the session.
+    SetDataBreakpoints(Vec<DataBreakpointSpec>),
+    /// Returns the execution of a frame to its start, when the adapter allows it.
+    RestartFrame(i64),
     AddWatch(String),
     RemoveWatch(String),
     /// Evaluate an expression in the console of the selected frame.

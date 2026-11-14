@@ -14,9 +14,10 @@ use lang_api::{
 use text_core::TextStore;
 use ui_kit::*;
 
-use crate::actions::Pick;
+use crate::actions::{Own, Pick};
 use crate::semantic::{MAX_SHOWN, NO_ANSWER, first, is_word, offset_at, uri_path};
 use crate::view::{DetailedUsage, EditorEvent, EditorView, Usage, UsagesUpdate};
+use keymap::editor as editor_actions;
 
 /// The places of the answer, each carrying the name the popup shows.
 fn usages_of(name: &str, spans: Vec<SourceSpan>) -> Vec<Usage> {
@@ -908,32 +909,160 @@ impl EditorView {
         Some(receiver)
     }
 
-    /// Ctrl+Alt+Shift+T: every refactoring the server offers at the selection.
+    /// The key of a refactoring of the editor as the menus write it: the binding of the
+    /// open keymap first, the IDEA file for an action the window binds itself, F5.
+    fn hinted(&self, cx: &App, action: &str, idea: &str) -> String {
+        let key = self
+            .current_keymap(cx)
+            .shortcuts_for(action)
+            .first()
+            .map(ToString::to_string)
+            .or_else(|| keymap::idea_shortcut(idea));
+        key.map_or_else(String::new, |key| {
+            keymap::shortcut_label(&key, keymap::platform())
+        })
+    }
+
+    /// Runs a refactoring picked by name in Refactor This, as its key would.
+    pub(crate) fn run_own(&mut self, own: Own, cx: &mut Context<Self>) {
+        match own {
+            Own::Rename => self.start_rename(cx),
+            Own::ChangeSignature => self.change_signature(cx),
+            Own::Move => self.start_move(cx),
+            Own::Copy => cx.emit(EditorEvent::CopyElement),
+            Own::SafeDelete => self.safe_delete(cx),
+            Own::ExtractMethod => self.refactor(Refactoring::ExtractMethod, cx),
+            Own::ExtractVariable => self.refactor(Refactoring::ExtractVariable, cx),
+            Own::ExtractField => self.refactor(Refactoring::ExtractField, cx),
+            Own::ExtractConstant => self.refactor(Refactoring::ExtractConstant, cx),
+            Own::IntroduceParameter => self.refactor(Refactoring::IntroduceParameter, cx),
+            Own::Inline => self.refactor(Refactoring::Inline, cx),
+        }
+    }
+
+    /// Ctrl+Alt+Shift+T: every refactoring the server offers at the selection, then the
+    /// ones of the editor that the server did not name, each with its key.
     pub(crate) fn refactor_this(&mut self, cx: &mut Context<Self>) {
         let Some(span) = self.selection_span() else {
             return;
         };
         let only = Some(ActionKind::Refactor);
-        self.ask_actions(span, only, cx, |this, _, caret, entries, cx| {
-            let mut move_row = false;
-            let rows = entries
-                .into_iter()
-                .filter_map(|entry| {
-                    let code = entry.code.as_deref().unwrap_or_default();
-                    if code.starts_with("refactor.move") {
-                        if move_row {
-                            return None;
-                        }
-                        move_row = true;
-                        return Some(Pick::Move { label: entry.title });
-                    }
-                    if code.starts_with("refactor.change.signature") {
-                        return Some(Pick::ChangeSignature { label: entry.title });
-                    }
-                    let has_work = !entry.edits.is_empty() || !entry.renames.is_empty();
-                    has_work.then_some(Pick::Action(entry))
-                })
-                .collect();
+        // The keys of the editor's own rows, read before the answer arrives.
+        let own = [
+            (
+                Own::Rename,
+                "Rename",
+                editor_actions::RENAME,
+                "RenameElement",
+                None,
+            ),
+            (
+                Own::ChangeSignature,
+                "Change Signature",
+                editor_actions::CHANGE_SIGNATURE,
+                "ChangeSignature",
+                Some("refactor.change.signature"),
+            ),
+            (Own::Move, "Move", editor_actions::MOVE, "Move", None),
+            (
+                Own::Copy,
+                "Copy",
+                "workspace.copy_element",
+                "CopyElement",
+                None,
+            ),
+            (
+                Own::SafeDelete,
+                "Safe Delete",
+                editor_actions::SAFE_DELETE,
+                "SafeDelete",
+                None,
+            ),
+            (
+                Own::ExtractMethod,
+                "Extract Method",
+                editor_actions::EXTRACT_METHOD,
+                "ExtractMethod",
+                Some("refactor.extract.function"),
+            ),
+            (
+                Own::ExtractVariable,
+                "Extract Variable",
+                editor_actions::EXTRACT_VARIABLE,
+                "IntroduceVariable",
+                Some("refactor.extract.variable"),
+            ),
+            (
+                Own::ExtractField,
+                "Extract Field",
+                editor_actions::EXTRACT_FIELD,
+                "IntroduceField",
+                Some("refactor.extract.field"),
+            ),
+            (
+                Own::ExtractConstant,
+                "Extract Constant",
+                editor_actions::EXTRACT_CONSTANT,
+                "IntroduceConstant",
+                Some("refactor.extract.constant"),
+            ),
+            (
+                Own::IntroduceParameter,
+                "Introduce Parameter",
+                editor_actions::INTRODUCE_PARAMETER,
+                "IntroduceParameter",
+                Some("refactor.introduce.parameter"),
+            ),
+            (
+                Own::Inline,
+                "Inline",
+                editor_actions::INLINE,
+                "Inline",
+                Some("refactor.inline"),
+            ),
+        ];
+        let hints: Vec<String> = own
+            .iter()
+            .map(|(_, _, action, idea, _)| self.hinted(cx, action, idea))
+            .collect();
+        self.ask_actions(span, only, cx, move |this, _, caret, entries, cx| {
+            let mut codes = Vec::new();
+            let mut rows: Vec<Pick> = Vec::new();
+            for entry in entries {
+                let code = entry.code.clone().unwrap_or_default();
+                codes.push(code.clone());
+                // A move of the server needs a destination of its own; the editor's
+                // own Move row below runs F6, which moves the file.
+                if code.starts_with("refactor.move") {
+                    continue;
+                }
+                if code.starts_with("refactor.change.signature") {
+                    rows.push(Pick::ChangeSignature { label: entry.title });
+                    continue;
+                }
+                if let Some(handle) = entry.handle {
+                    rows.push(Pick::Form {
+                        label: entry.title,
+                        handle,
+                    });
+                    continue;
+                }
+                if !entry.edits.is_empty() || !entry.renames.is_empty() {
+                    rows.push(Pick::Action(entry));
+                }
+            }
+            // The editor's own refactorings come after the contextual ones of the
+            // server, and only when the server named no action of that kind.
+            for ((own, label, _, _, code), hint) in own.into_iter().zip(hints) {
+                if code.is_some_and(|code| codes.iter().any(|known| known.starts_with(code))) {
+                    continue;
+                }
+                rows.push(Pick::Refactor {
+                    label: label.to_owned(),
+                    hint,
+                    own,
+                });
+            }
             this.show_picks(caret, rows, "No refactorings here", cx);
         });
     }
@@ -958,6 +1087,10 @@ impl EditorView {
                 0 => this.show_note(caret, refactoring.missing(), cx),
                 1 => {
                     let entry = found.remove(0);
+                    if let Some(handle) = entry.handle {
+                        cx.emit(EditorEvent::RefactorForm(handle));
+                        return;
+                    }
                     let change = WorkspaceChange {
                         edits: entry.edits,
                         renames: entry.renames,
@@ -965,7 +1098,20 @@ impl EditorView {
                     this.apply_change(version, change, cx);
                 }
                 _ => {
-                    let rows = found.into_iter().map(Pick::Action).collect();
+                    // Some of the rows ask for values first, in a form of the window.
+                    let rows = found
+                        .into_iter()
+                        .filter_map(|entry| match entry.handle {
+                            Some(handle) => Some(Pick::Form {
+                                label: entry.title,
+                                handle,
+                            }),
+                            None if !entry.edits.is_empty() || !entry.renames.is_empty() => {
+                                Some(Pick::Action(entry))
+                            }
+                            None => None,
+                        })
+                        .collect();
                     this.show_picks(caret, rows, refactoring.missing(), cx);
                 }
             }

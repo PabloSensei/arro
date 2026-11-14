@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "crossbeam-channel",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "agent-pty"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "agent-core",
  "agent-testkit",
@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "agent-testkit"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "serde_json",
  "terminal",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "agent-try"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "agent-core",
  "agent-pty",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "base"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "arc-swap",
 ]
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "change-tracker"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "agent-core",
  "base",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "container"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "proc-sup",
@@ -1532,7 +1532,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dap-client"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "lang-fixture",
  "proc-sup",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "display-map"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "proptest",
  "text-core",
@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "dockerfile-syntax"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "syntax",
  "tree-sitter",
@@ -1734,7 +1734,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "editor-view"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "display-map",
@@ -1988,14 +1988,23 @@ dependencies = [
 
 [[package]]
 name = "file-syntax"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "syntax",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-batch",
+ "tree-sitter-css",
+ "tree-sitter-groovy",
+ "tree-sitter-html",
+ "tree-sitter-javascript",
  "tree-sitter-json",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-md",
  "tree-sitter-properties",
+ "tree-sitter-sequel",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
  "tree-sitter-xml",
  "tree-sitter-yaml",
 ]
@@ -2180,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "fs-watch"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "ignore",
  "notify 9.0.0-rc.7",
@@ -3603,7 +3612,7 @@ checksum = "913a7d294ad056474749152107309fdee3ec17d2482d1ab70fdc61a81c64b9a3"
 
 [[package]]
 name = "ide"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "backtrace",
  "base",
@@ -3625,14 +3634,14 @@ dependencies = [
 
 [[package]]
 name = "ide-askpass"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "vcs",
 ]
 
 [[package]]
 name = "ide-ctrl"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "platform",
  "proc-sup",
@@ -3879,7 +3888,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "java-exec"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "java-project",
@@ -3897,7 +3906,7 @@ dependencies = [
 
 [[package]]
 name = "java-lang"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "dap-client",
@@ -3933,7 +3942,7 @@ dependencies = [
 
 [[package]]
 name = "java-project"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "proc-sup",
@@ -3947,7 +3956,7 @@ dependencies = [
 
 [[package]]
 name = "java-syntax"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "lang-api",
  "syntax",
@@ -3958,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "jdtls-adapter"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "lsp-client",
@@ -4050,7 +4059,7 @@ dependencies = [
 
 [[package]]
 name = "keymap"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "serde_json",
  "test-support",
@@ -4118,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "lang-api"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "futures-channel",
@@ -4130,7 +4139,7 @@ dependencies = [
 
 [[package]]
 name = "lang-fixture"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "serde_json",
 ]
@@ -4237,7 +4246,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local-history"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "flate2",
  "test-support",
@@ -4280,7 +4289,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lsp-client"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "lsp-types",
  "platform",
@@ -4450,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-server"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -5339,7 +5348,7 @@ dependencies = [
 
 [[package]]
 name = "panels"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "agent-core",
  "agent-pty",
@@ -5657,7 +5666,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "libc",
  "test-support",
@@ -5695,7 +5704,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-host"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "keymap",
@@ -5856,7 +5865,7 @@ dependencies = [
 
 [[package]]
 name = "proc-sup"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "platform",
@@ -5884,7 +5893,7 @@ dependencies = [
 
 [[package]]
 name = "project-model"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "proc-sup",
@@ -6517,7 +6526,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "proc-sup",
@@ -6899,7 +6908,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "futures-executor",
@@ -6946,7 +6955,7 @@ checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "semantic-router"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "futures-util",
@@ -7137,7 +7146,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidecar"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "lsp-client",
  "platform",
@@ -7365,7 +7374,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "store"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "rusqlite",
  "test-support",
@@ -7525,7 +7534,7 @@ dependencies = [
 
 [[package]]
 name = "syntax"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "lang-api",
  "streaming-iterator",
@@ -7626,7 +7635,7 @@ dependencies = [
 
 [[package]]
 name = "templates"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -7657,7 +7666,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "alacritty_terminal",
  "base",
@@ -7670,11 +7679,11 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.13"
+version = "0.1.14"
 
 [[package]]
 name = "text-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -7686,7 +7695,7 @@ dependencies = [
 
 [[package]]
 name = "theme"
-version = "0.1.13"
+version = "0.1.14"
 
 [[package]]
 name = "thiserror"
@@ -7991,7 +8000,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tool-gateway"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "dap-client",
@@ -8097,6 +8106,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-css"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5cbc5e18f29a2c6d6435891f42569525cf95435a3e01c2f1947abcde178686f"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-dockerfile-updated"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8107,10 +8126,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-groovy"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a20016017f0865ba902ca50354f92429de5de8df994e64ab7fae087a13c40ed"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-html"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-java-orchard"
 version = "0.5.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330cac0e7aa34a11457fb60aaa94bae6dc0bc424dcf17c0bdc93dd469a644239"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-javascript"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -8127,16 +8176,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-kotlin-ng"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e800ebbda938acfbf224f4d2c34947a31994b1295ee6e819b65226c7b51b4450"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-language"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
 
 [[package]]
+name = "tree-sitter-md"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ed661bfe3c264961425f77cd89ad2998bf5d629e71ce8bab1e5d7e940d6246e"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-properties"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a6c2f38dea68abd782573bb6ec3dbd14175cce2953f693055743925d785ceeb"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-sequel"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "711e236e1ae0708f911d8413c3b5656f522416cba683ea91589aebc49eda1b5a"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-toml-ng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -8213,7 +8312,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "gpui-kit",
  "gpui-pre-windows",
@@ -8307,7 +8406,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "flate2",
  "platform",
@@ -8473,7 +8572,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vcs"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "imara-diff",
@@ -9010,7 +9109,7 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "window-language"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "dap-client",
@@ -9664,7 +9763,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "keymap",
  "platform",
@@ -9680,7 +9779,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base",
  "encoding_rs",
@@ -9808,7 +9907,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "keymap",
  "pdb-addr2line",

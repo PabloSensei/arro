@@ -22,9 +22,10 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
+use crate::annotate::BlameNote;
 use crate::bar::{Bar, LastFind};
 use crate::blocks::{brace_pairs, enclosing_block};
-use crate::element::{EditorElement, GUTTER_WIDTH, Layout, StripeKind, TEXT_INSET};
+use crate::element::{ANNOTATE_WIDTH, EditorElement, GUTTER_WIDTH, Layout, StripeKind, TEXT_INSET};
 use crate::live::LiveTemplates;
 use crate::refactor::Refactoring;
 use crate::scrollbar::{Axis, Drag};
@@ -240,6 +241,17 @@ impl OutlineItem {
     }
 }
 
+/// A declaration whose name starts on a line, as the gutter chooses the kind of a
+/// breakpoint there. `owner` is the type that declares it, when the language names one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineDeclaration {
+    /// Buffer line from zero.
+    pub line: usize,
+    pub name: String,
+    pub owner: Option<String>,
+    pub kind: OutlineKind,
+}
+
 /// The bookmarks of all files seen in this window, by path, lines from zero.
 #[derive(Default)]
 struct BookmarkStore(std::collections::HashMap<PathBuf, Vec<(u32, Option<char>)>>);
@@ -358,6 +370,11 @@ pub enum EditorEvent {
     ApplyChange(lang_api::WorkspaceChange),
     /// Ctrl+F6: the window shows the Change Signature form for this place.
     ChangeSignature(lang_api::DocumentSpot),
+    /// Refactor This picked an action of the server that needs values: the window shows
+    /// its form, and the handle names the action for the language.
+    RefactorForm(String),
+    /// Refactor This picked Copy: the window copies the current file, as F5 does.
+    CopyElement,
     /// Ctrl+Q repeated or the pin button: the window shows the Documentation tool window.
     ShowDocumentation,
     /// Ctrl+Alt+H: the window shows the call hierarchy of this place.
@@ -380,6 +397,8 @@ pub enum EditorEvent {
     DebugRunMark(u32),
     /// The gutter was clicked away from the fold column: the line, from zero.
     GutterClick(u32),
+    /// A blame label was clicked: the window shows this commit in the history.
+    BlameCommit(String),
     /// Ctrl+Shift+V: the window shows what was copied, [`EditorView::paste_text`] takes the pick.
     PasteHistory,
     /// Shift+F11: the window lists [`bookmarks`].
@@ -545,6 +564,8 @@ pub struct EditorView {
     wrap_locked: bool,
     show_whitespace: bool,
     outline: Vec<OutlineItem>,
+    /// The declarations whose names start on a line, for the kind of a gutter breakpoint.
+    line_declarations: Vec<LineDeclaration>,
     outline_serial: u64,
     /// Bumped after every answer about the outline, even an empty one.
     outline_generation: u64,
@@ -573,6 +594,8 @@ pub struct EditorView {
     pub(crate) scrollbar_drag: Option<crate::scrollbar::Drag>,
     /// The hint of the mark under the pointer: its text and where it stands.
     stripe_hint: Option<(String, Point<Pixels>)>,
+    /// The hint of the blame label under the pointer, and where it stands.
+    annotate_hint: Option<(String, Point<Pixels>)>,
     pub(crate) autoscroll: bool,
     /// The next autoscroll puts the caret near the middle, as a jump to a place does.
     pub(crate) reveal_center: bool,
@@ -585,6 +608,10 @@ pub struct EditorView {
     pub(crate) breakpoints: Vec<u32>,
     /// The breakpoints that go away at the first stop, painted as an outline.
     pub(crate) temporary_breakpoints: Vec<u32>,
+    /// Buffer lines of the method breakpoints, painted as a diamond.
+    pub(crate) function_breakpoints: Vec<u32>,
+    /// Buffer lines of the field watchpoints, painted as an eye.
+    pub(crate) field_watchpoints: Vec<u32>,
     pub(crate) gutter_marks: Vec<GutterMark>,
     selecting: bool,
     was_dirty: bool,
@@ -626,6 +653,8 @@ pub struct EditorView {
     pub(crate) code_lens_task: Option<Task<()>>,
     /// The documentation comments of the language and the choices made for each.
     pub(crate) docs: crate::rendered_doc::RenderedDocs,
+    /// The preview of a markdown file beside its text, `None` for other files.
+    pub(crate) preview: Option<crate::markdown_preview::MarkdownPreview>,
     /// Keys waiting for the next frame, so the latency of a key includes the paint.
     pending_frames: Vec<Instant>,
 }
@@ -662,7 +691,8 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let view = Self::empty(path, style, cx);
+        let mut view = Self::empty(path, style, cx);
+        view.preview = crate::markdown_preview::MarkdownPreview::state_for(&view.path, cx);
         let language = cx
             .try_global::<Languages>()
             .and_then(|languages| (languages.resolve)(&view.path));
@@ -941,6 +971,7 @@ impl EditorView {
             wrap_locked: false,
             show_whitespace: false,
             outline: Vec::new(),
+            line_declarations: Vec::new(),
             outline_serial: 0,
             outline_generation: 0,
             syntax_generation: 0,
@@ -957,6 +988,7 @@ impl EditorView {
             scrollbar_hovered: false,
             scrollbar_drag: None,
             stripe_hint: None,
+            annotate_hint: None,
             autoscroll: false,
             reveal_center: false,
             caret_on: true,
@@ -966,6 +998,8 @@ impl EditorView {
             run_marks: Vec::new(),
             breakpoints: Vec::new(),
             temporary_breakpoints: Vec::new(),
+            function_breakpoints: Vec::new(),
+            field_watchpoints: Vec::new(),
             gutter_marks: Vec::new(),
             selecting: false,
             was_dirty: false,
@@ -990,6 +1024,7 @@ impl EditorView {
             code_lens_resolved: Vec::new(),
             code_lens_task: None,
             docs: crate::rendered_doc::RenderedDocs::default(),
+            preview: None,
             pending_frames: Vec::with_capacity(8),
         }
     }
@@ -1141,6 +1176,30 @@ impl EditorView {
 
     pub fn temporary_breakpoints(&self) -> &[u32] {
         &self.temporary_breakpoints
+    }
+
+    /// Replaces the method breakpoints in the gutter, painted as diamonds.
+    pub fn set_function_breakpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
+        if self.function_breakpoints != lines {
+            self.function_breakpoints = lines;
+            cx.notify();
+        }
+    }
+
+    pub fn function_breakpoints(&self) -> &[u32] {
+        &self.function_breakpoints
+    }
+
+    /// Replaces the field watchpoints in the gutter, painted as eyes.
+    pub fn set_field_watchpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
+        if self.field_watchpoints != lines {
+            self.field_watchpoints = lines;
+            cx.notify();
+        }
+    }
+
+    pub fn field_watchpoints(&self) -> &[u32] {
+        &self.field_watchpoints
     }
 
     /// Marks of the changes against the last commit, as the gutter paints them.
@@ -1418,6 +1477,55 @@ impl EditorView {
             self.gutter_marks = marks;
             cx.notify();
         }
+    }
+
+    /// Puts the blame of the lines in the column before the text. The lines are counted
+    /// from one.
+    pub fn set_annotations(&mut self, lines: &[(u32, BlameNote)], cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.state {
+            state.set_annotations(lines);
+            cx.notify();
+        }
+    }
+
+    /// Takes the blame column away.
+    pub fn clear_annotations(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.state
+            && state.has_annotations()
+        {
+            state.clear_annotations();
+            self.annotate_hint = None;
+            cx.notify();
+        }
+    }
+
+    /// Whether the blame column is on.
+    pub fn has_annotations(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(EditorState::has_annotations)
+    }
+
+    /// The painted labels of the blame column with their line from zero and their commit.
+    pub fn annotation_lines(&self) -> Vec<(u32, String, String)> {
+        self.state
+            .as_ref()
+            .map(EditorState::annotation_labels)
+            .unwrap_or_default()
+    }
+
+    /// The room of the blame column left of the text, from zero when it is off.
+    pub(crate) fn annotation_width(&self) -> f32 {
+        if self.has_annotations() {
+            ANNOTATE_WIDTH
+        } else {
+            0.
+        }
+    }
+
+    /// The room of the gutter and of the blame column before the text.
+    pub(crate) fn gutter_room(&self) -> f32 {
+        GUTTER_WIDTH + self.annotation_width()
     }
 
     /// The text as the buffer holds it now, with LF line ends. `None` while loading.
@@ -2032,6 +2140,26 @@ impl EditorView {
         &self.outline
     }
 
+    /// Replaces the declarations whose names start on a line, from the same language
+    /// answer as the outline.
+    pub fn set_line_declarations(
+        &mut self,
+        declarations: Vec<LineDeclaration>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.line_declarations != declarations {
+            self.line_declarations = declarations;
+            cx.notify();
+        }
+    }
+
+    /// The declaration whose name starts on the buffer line, if the language marked one.
+    pub fn declaration_on_line(&self, line: usize) -> Option<&LineDeclaration> {
+        self.line_declarations
+            .iter()
+            .find(|declaration| declaration.line == line)
+    }
+
     /// How many answers about the outline have come back. A test waits for this to grow
     /// instead of waiting for a clock.
     pub fn outline_generation(&self) -> u64 {
@@ -2419,7 +2547,7 @@ impl EditorView {
     }
 
     /// The keymap of the editor now. `install_keymap` replaces it for open editors too.
-    fn current_keymap<'a>(&'a self, cx: &'a App) -> &'a Keymap {
+    pub(crate) fn current_keymap<'a>(&'a self, cx: &'a App) -> &'a Keymap {
         cx.try_global::<Keys>()
             .map_or(self.keymap.as_ref(), |keys| keys.0.as_ref())
     }
@@ -2935,6 +3063,12 @@ impl EditorView {
             .is_some_and(|layout| position.x < layout.bounds.left() + px(GUTTER_WIDTH))
     }
 
+    /// Whether a right click at `position` belongs to the gutter or to the blame column,
+    /// where the menu offers the annotation.
+    pub fn gutter_menu_at(&self, position: Point<Pixels>) -> bool {
+        self.in_gutter(position) || self.in_annotations(position)
+    }
+
     /// Row and text column under `position`. Outside the text it clamps to the nearest.
     pub(crate) fn hit(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
         let layout = self.layout.as_ref()?;
@@ -2945,7 +3079,7 @@ impl EditorView {
             .iter()
             .position(|laid_out| position.y < laid_out.y + line_height)
             .unwrap_or(layout.rows.len().checked_sub(1)?);
-        let x = position.x - layout.bounds.left() - px(GUTTER_WIDTH + TEXT_INSET)
+        let x = position.x - layout.bounds.left() - px(self.gutter_room() + TEXT_INSET)
             + px(self.scroll_left);
         Some((
             shown,
@@ -2958,6 +3092,47 @@ impl EditorView {
         let row = self.layout.as_ref()?.rows.get(shown)?;
         // A block row speaks for the line under it.
         Some(row.line.offset_of(column, Bias::Left))
+    }
+
+    /// Whether `position` is in the blame column left of the text.
+    fn in_annotations(&self, position: Point<Pixels>) -> bool {
+        let Some(layout) = &self.layout else {
+            return false;
+        };
+        let width = self.annotation_width();
+        width > 0.
+            && position.x >= layout.bounds.left() + px(GUTTER_WIDTH)
+            && position.x < layout.bounds.left() + px(GUTTER_WIDTH + width)
+    }
+
+    /// The label of the blame column under `position`, the line it belongs to and where
+    /// the label stands.
+    fn annotation_under(
+        &self,
+        position: Point<Pixels>,
+    ) -> Option<(&BlameNote, usize, Point<Pixels>)> {
+        if !self.in_annotations(position) {
+            return None;
+        }
+        let layout = self.layout.as_ref()?;
+        let line_height = px(self.style.line_height);
+        let shown = layout.rows.iter().find(|laid_out| {
+            !laid_out.is_block
+                && !laid_out.line.continuation
+                && position.y >= laid_out.y
+                && position.y < laid_out.y + line_height
+        })?;
+        let note = self
+            .state
+            .as_ref()?
+            .annotation_label_at(shown.buffer_line)?;
+        Some((note, shown.buffer_line, point(position.x, shown.y)))
+    }
+
+    /// The hint of the blame label under the pointer: its text and where it stands.
+    fn annotate_hint_at(&self, position: Point<Pixels>) -> Option<(String, Point<Pixels>)> {
+        let (note, _, at) = self.annotation_under(position)?;
+        Some((note.details.clone(), at))
     }
 
     /// A press on a scroll bar: a mark goes to its line, the thumb is grabbed and the
@@ -3047,6 +3222,21 @@ impl EditorView {
         let Some((shown, column)) = self.hit(event.position) else {
             return;
         };
+        // The blame column takes the click: a label opens its commit, the rest is dead.
+        if self.in_annotations(event.position) {
+            let row = &layout.rows[shown];
+            let labelled = !row.is_block && !row.line.continuation;
+            let commit = labelled
+                .then_some(self.state.as_ref())
+                .flatten()
+                .and_then(|state| state.annotation_label_at(row.buffer_line))
+                .filter(|note| note.has_commit())
+                .map(|note| note.commit.clone());
+            if let Some(commit) = commit {
+                cx.emit(EditorEvent::BlameCommit(commit));
+            }
+            return;
+        }
         if layout.rows[shown].is_doc {
             if let Some(link) = layout.rows[shown]
                 .doc_links
@@ -3194,6 +3384,11 @@ impl EditorView {
     /// A right click puts the caret where the pointer is, unless it lands inside a
     /// selection, and then asks the window for the menu of the editor.
     pub(crate) fn right_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        // The blame column has no text: the menu opens and the caret stays where it is.
+        if self.in_annotations(event.position) {
+            cx.emit(EditorEvent::ContextMenu(event.position));
+            return;
+        }
         let Some(offset) = self.offset_at(event.position) else {
             return;
         };
@@ -3269,6 +3464,12 @@ impl EditorView {
         let hint = hint.filter(|(text, _)| !text.is_empty());
         if hint != self.stripe_hint {
             self.stripe_hint = hint;
+            cx.notify();
+        }
+
+        let annotate_hint = self.annotate_hint_at(event.position);
+        if annotate_hint != self.annotate_hint {
+            self.annotate_hint = annotate_hint;
             cx.notify();
         }
 
@@ -3435,7 +3636,7 @@ impl EditorView {
         let (layout, state) = (self.layout.as_ref()?, self.state.as_ref()?);
         let at = state.display().to_display(offset);
         let shown = layout.rows.iter().find(|shown| shown.row == at.row)?;
-        let x = layout.bounds.left() + px(GUTTER_WIDTH + TEXT_INSET) - px(self.scroll_left)
+        let x = layout.bounds.left() + px(self.gutter_room() + TEXT_INSET) - px(self.scroll_left)
             + shown.text.x_for_index(at.column);
         Some(point(x, shown.y + px(self.style.line_height)))
     }
@@ -3463,7 +3664,7 @@ impl EditorView {
         let (layout, state) = (self.layout.as_ref()?, self.state.as_ref()?);
         let at = state.display().to_display(offset);
         let shown = layout.rows.iter().find(|shown| shown.row == at.row)?;
-        let x = layout.bounds.left() + px(GUTTER_WIDTH + TEXT_INSET) - px(self.scroll_left)
+        let x = layout.bounds.left() + px(self.gutter_room() + TEXT_INSET) - px(self.scroll_left)
             + shown.text.x_for_index(at.column);
         Some(popup_placement(
             x,
@@ -3512,6 +3713,34 @@ impl EditorView {
                 .text_size(px(UI_SIZE))
                 .text_color(theme.text)
                 .child(text.clone());
+            popups.push(
+                deferred(
+                    anchored()
+                        .position(point(position.x + px(12.), position.y + px(16.)))
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
+        if let Some((text, position)) = &self.annotate_hint {
+            let rows: Vec<AnyElement> = text
+                .lines()
+                .map(|line| {
+                    div()
+                        .whitespace_nowrap()
+                        .child(line.to_owned())
+                        .into_any_element()
+                })
+                .collect();
+            let body = surface(&theme)
+                .debug_selector(|| "editor-annotate-hint".to_owned())
+                .max_w(px(520.))
+                .p_2()
+                .text_size(px(UI_SIZE))
+                .text_color(theme.text)
+                .children(rows);
             popups.push(
                 deferred(
                     anchored()
@@ -3650,9 +3879,19 @@ impl EditorView {
                 let selected = row == menu.selected;
                 div()
                     .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(SPACE_L))
                     .when(selected, |row| row.bg(theme.selection))
                     .text_color(theme.text)
                     .child(menu.rows[row].label().to_owned())
+                    .children(menu.rows[row].hint().map(|hint| {
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_muted)
+                            .child(hint.to_owned())
+                    }))
             });
             let list = surface(&theme)
                 .debug_selector(|| "actions-popup".to_owned())
@@ -4172,6 +4411,7 @@ impl Render for EditorView {
         for started in self.pending_frames.drain(..) {
             perf::observe("editor.keystroke", started.elapsed());
         }
+        self.prepare_preview(cx);
         let head = self.state.as_ref().map(EditorState::head);
         if self
             .context_info
@@ -4203,18 +4443,24 @@ impl Render for EditorView {
             Some(message) => root.p_4().child(message.clone()),
             None => {
                 let bar = self.render_bar(cx);
+                let toolbar = self.preview_toolbar(cx);
                 let crumbs = self.render_crumbs(cx);
                 let widget = self.render_problem_widget(cx);
                 let text = div()
+                    .id("editor-text")
+                    .debug_selector(|| "editor-text".to_owned())
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .w_full()
                     .child(EditorElement::new(cx.entity()))
                     .children(widget);
+                let text = self.preview_area(text.into_any_element(), window, cx);
                 root.flex()
                     .flex_col()
                     .children(bar)
+                    .children(toolbar)
                     .child(text)
                     .children(crumbs)
                     .children(popups)

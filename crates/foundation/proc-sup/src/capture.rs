@@ -15,6 +15,9 @@ const POLL: Duration = Duration::from_millis(20);
 /// hold the pipes open for hours, so the end of a pipe is not worth waiting for.
 const DRAIN: Duration = Duration::from_millis(200);
 const GRACE: Duration = Duration::from_secs(5);
+/// The shortest gap between two looks at the process table while output flows. A quiet
+/// run takes none: output is the only event that can bring a new program.
+const ADOPT_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct Captured {
     pub status: ExitStatus,
@@ -53,10 +56,19 @@ pub fn capture(spec: &ProcessSpec, cancel: &Cancel) -> Result<Captured, CaptureE
     let stdout = keep_tail(process.take_stdout());
     let stderr = keep_tail(process.take_stderr());
 
+    let mut adopted: Option<Instant> = None;
     let status = loop {
         if cancel.is_cancelled() {
             process.shut_down(GRACE)?;
             return Err(CaptureError::Cancelled);
+        }
+        // Output is the only sign of life a program gives, and the moment a program it
+        // started outside the job is worth pulling in.
+        if (stdout.take_arrived() | stderr.take_arrived())
+            && adopted.is_none_or(|last| last.elapsed() >= ADOPT_INTERVAL)
+        {
+            process.adopt();
+            adopted = Some(Instant::now());
         }
         if let Some(status) = process.try_wait()? {
             break status;
@@ -78,6 +90,8 @@ pub fn capture(spec: &ProcessSpec, cancel: &Cancel) -> Result<Captured, CaptureE
 struct Tail {
     bytes: Vec<u8>,
     done: bool,
+    /// Set by the reader when new bytes arrived, taken by the caller of the run.
+    arrived: bool,
 }
 
 struct TailHandle(Arc<Mutex<Tail>>);
@@ -89,6 +103,11 @@ impl TailHandle {
 
     fn is_done(&self) -> bool {
         self.lock().done
+    }
+
+    /// Whether new bytes arrived since the last call, which then clears the mark.
+    fn take_arrived(&self) -> bool {
+        std::mem::take(&mut self.lock().arrived)
     }
 
     fn text(&self) -> String {
@@ -109,6 +128,7 @@ fn keep_tail(pipe: Option<impl Read + Send + 'static>) -> TailHandle {
         let mut chunk = [0; 8192];
         while let Ok(count @ 1..) = pipe.read(&mut chunk) {
             let mut tail = writer.lock();
+            tail.arrived = true;
             tail.bytes.extend_from_slice(&chunk[..count]);
             let extra = tail.bytes.len().saturating_sub(KEPT_BYTES);
             tail.bytes.drain(..extra);

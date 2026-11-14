@@ -271,7 +271,7 @@ fn editor_of(
 /// An editor of a text that is not the document of a tab: the version before, or the
 /// working text when no tab of the file is open. It reads the bookmarks of the file and
 /// never replaces them in the window list.
-fn text_view(
+pub(crate) fn text_view(
     path: PathBuf,
     text: String,
     format: FileFormat,
@@ -296,7 +296,7 @@ fn lines_of(text: &str) -> Vec<String> {
 }
 
 /// The byte offset of the start of every line.
-fn line_starts(text: &str) -> Vec<usize> {
+pub(crate) fn line_starts(text: &str) -> Vec<usize> {
     std::iter::once(0)
         .chain(text.match_indices('\n').map(|(index, _)| index + 1))
         .collect()

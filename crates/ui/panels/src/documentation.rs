@@ -333,6 +333,7 @@ impl Render for DocumentationPanel {
                     on_link,
                     on_select: None,
                     selection: None,
+                    base: None,
                 };
                 let content =
                     div()

@@ -25,6 +25,10 @@ const DIRECTORY_LITERALS: &[&str] = &["target", "build"];
 const WORD_EXCEPTIONS: &[(&str, &str)] = &[
     // `QuickJavaDoc` is the IntelliJ IDEA id of Quick Documentation, the key of its binding.
     ("keymap", "java"),
+    // The editor colours a Gradle build script by its file name; it knows the extension,
+    // not the build tool.
+    ("file-syntax", "gradle"),
+    ("panels", "gradle"),
 ];
 
 /// The only crates outside `crates/java` that may know a language. The application
@@ -374,10 +378,13 @@ impl FileScan<'_> {
 }
 
 /// Splits on non-alphanumerics and camelCase humps, so `JAVA_HOME`, `javaHome` and
-/// `ClassPath` all match while `javadoc` does not.
+/// `ClassPath` all match while `javadoc` does not. `JavaScript` is another language, not
+/// a `Java` hump, so it is taken out before the split.
 fn forbidden_words(line: &str) -> Vec<&'static str> {
     let mut found = Vec::new();
     for token in line.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let token = token.replace("JavaScript", "");
+        let token = token.as_str();
         let lower = token.to_ascii_lowercase();
         let mut hump_start = 0;
         let mut humps = Vec::new();
@@ -422,6 +429,15 @@ mod tests {
         ] {
             assert_eq!(forbidden_words(line), ["java"], "{line}");
         }
+        for line in [
+            "JavaScript",
+            "javascript",
+            "LANGUAGE_JAVASCRIPT",
+            "TypeScript",
+        ] {
+            assert!(forbidden_words(line).is_empty(), "{line}");
+        }
+        assert_eq!(forbidden_words("JavaScriptJavaParser"), ["java"]);
         assert_eq!(
             forbidden_words("ClassPath classpath_entries"),
             ["classpath", "classpath"]

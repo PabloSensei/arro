@@ -90,6 +90,19 @@ impl ConflictView {
             .ok();
     }
 
+    /// Opens the three panes of a conflicted file: ours, the result and theirs.
+    fn open_merge(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.git.read(cx).merge_available(path) {
+            return;
+        }
+        let Some(absolute) = self.git.read(cx).absolute(path) else {
+            return;
+        };
+        let git = self.git.clone();
+        let workspace = self.workspace.clone();
+        crate::merge_view::MergeView::open(git, workspace, absolute, window, cx);
+    }
+
     fn abort(&mut self, cx: &mut Context<Self>) {
         self.git.update(cx, |git, cx| git.abort_operation(cx));
     }
@@ -134,6 +147,9 @@ impl ConflictView {
         let yours = path.clone();
         let theirs = path.clone();
         let resolve = path.clone();
+        let merge = path.clone();
+        let double = path.clone();
+        let merge_available = self.git.read(cx).merge_available(&path);
         div()
             .id(("conflict-row", index))
             .debug_selector(move || format!("conflict-row-{index}"))
@@ -148,6 +164,11 @@ impl ConflictView {
                 let hover = theme.hover;
                 move |style| style.bg(hover)
             })
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if event.click_count() >= 2 {
+                    this.open_merge(&double, window, cx);
+                }
+            }))
             .child(div().flex_1().min_w_0().overflow_hidden().child(path))
             .child(
                 Self::button(("conflict-yours", index), "Accept Yours", false, theme)
@@ -163,6 +184,13 @@ impl ConflictView {
                         this.accept(theirs.clone(), ConflictSide::Theirs, cx)
                     })),
             )
+            .children(merge_available.then(|| {
+                Self::button(("conflict-merge", index), "Merge...", false, theme)
+                    .debug_selector(move || format!("conflict-merge-{index}"))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.open_merge(&merge, window, cx)),
+                    )
+            }))
             .child(
                 Self::button(("conflict-open", index), "Open", false, theme)
                     .debug_selector(move || format!("conflict-open-{index}"))
@@ -193,6 +221,8 @@ impl Render for ConflictView {
         let title = match operation {
             Operation::Merge => "Merge Conflicts",
             Operation::Rebase => "Rebase Conflicts",
+            Operation::CherryPick => "Cherry-Pick Conflicts",
+            Operation::Revert => "Revert Conflicts",
             Operation::None => "Conflicts",
         };
         let rows: Vec<_> = conflicts
@@ -246,6 +276,25 @@ impl Render for ConflictView {
             Operation::Rebase if none => div()
                 .child(
                     Self::button(("conflict-continue", 0), "Continue Rebase", true, &theme)
+                        .debug_selector(|| "conflict-continue".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
+                )
+                .into_any_element(),
+            Operation::CherryPick if none => div()
+                .child(
+                    Self::button(
+                        ("conflict-continue", 0),
+                        "Continue Cherry-Pick",
+                        true,
+                        &theme,
+                    )
+                    .debug_selector(|| "conflict-continue".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
+                )
+                .into_any_element(),
+            Operation::Revert if none => div()
+                .child(
+                    Self::button(("conflict-continue", 0), "Continue Revert", true, &theme)
                         .debug_selector(|| "conflict-continue".to_owned())
                         .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
                 )

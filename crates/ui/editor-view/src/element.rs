@@ -21,6 +21,10 @@ use crate::view::{
 pub(crate) const GUTTER_WIDTH: f32 = 64.;
 pub(crate) const TEXT_INSET: f32 = 3.;
 pub(crate) const FOLD_X: f32 = 43.;
+/// The room of the blame column left of the text, when the column is on.
+pub(crate) const ANNOTATE_WIDTH: f32 = 180.;
+/// The room between the left edge of the blame column and its label.
+const ANNOTATE_INSET: f32 = 4.;
 /// Where the run mark of a line is, over the line number.
 pub(crate) const RUN_X: f32 = 6.;
 const NUMBER_RIGHT: f32 = 23.;
@@ -49,6 +53,8 @@ pub(crate) struct LaidOutRow {
     run: Option<(RunMarkState, Hsla)>,
     /// A bookmark without a name takes the place of the line number.
     bookmark: bool,
+    /// The label of the blame column on this row, on the first line of a run of a commit.
+    annotation: Option<ShapedLine>,
     current: bool,
     indent: usize,
     /// The row is a block above the text and holds no line of the buffer.
@@ -592,13 +598,15 @@ impl Element for EditorElement {
             .width();
         let line_height = style.line_height;
 
-        let text_x = bounds.left() + px(GUTTER_WIDTH + TEXT_INSET);
-        let text_width =
-            (bounds.size.width - px(GUTTER_WIDTH + TEXT_INSET + scrollbar::BAND)).max(px(1.));
+        let annotate = self.view.read(cx).annotation_width();
+        let text_x = bounds.left() + px(GUTTER_WIDTH + TEXT_INSET + annotate);
+        let text_width = (bounds.size.width
+            - px(GUTTER_WIDTH + TEXT_INSET + annotate + scrollbar::BAND))
+        .max(px(1.));
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let mut text_bounds = bounds;
-        text_bounds.origin.x += px(GUTTER_WIDTH);
-        text_bounds.size.width -= px(GUTTER_WIDTH + scrollbar::BAND);
+        text_bounds.origin.x += px(GUTTER_WIDTH + annotate);
+        text_bounds.size.width -= px(GUTTER_WIDTH + annotate + scrollbar::BAND);
         let text_hitbox = window.insert_hitbox(text_bounds, HitboxBehavior::Normal);
 
         let decor = self.decor.clone();
@@ -930,6 +938,25 @@ impl Element for EditorElement {
                     .then(|| view.rendered_doc_at_line(buffer_line))
                     .flatten();
                 let doc_range = display.doc_range(row);
+                let annotation = if annotate > 0. && !block && doc_row.is_none() && !continuation {
+                    state.annotation_label_at(buffer_line).map(|note| {
+                        let runs = [crate::element::run(
+                            note.label.len(),
+                            &code_font,
+                            style.line_number,
+                            false,
+                        )];
+                        let used = if note.label.is_empty() { 0 } else { 1 };
+                        text_system.shape_line(
+                            note.label.clone().into(),
+                            px(NUMBER_SIZE),
+                            &runs[..used],
+                            None,
+                        )
+                    })
+                } else {
+                    None
+                };
                 rows.push(LaidOutRow {
                     row,
                     buffer_line,
@@ -942,6 +969,7 @@ impl Element for EditorElement {
                     fold,
                     run,
                     bookmark: !block && matches!(bookmark, Some(None)),
+                    annotation,
                     current,
                     indent,
                     is_block: block || doc_row.is_some(),
@@ -960,6 +988,7 @@ impl Element for EditorElement {
                 let x = f32::from(shown.text.x_for_index(shown.line.column_of(head)));
                 let width = f32::from(bounds.size.width)
                     - GUTTER_WIDTH
+                    - annotate
                     - TEXT_INSET
                     - scrollbar::BAND
                     - f32::from(char_width) * 2.;
@@ -1473,9 +1502,12 @@ impl Element for EditorElement {
             cx,
         );
         window.set_cursor_style(CursorStyle::IBeam, &prepaint.text_hitbox);
+        let annotate = self.view.read(cx).annotation_width();
         let marks = self.view.read(cx).gutter_marks.clone();
         let breakpoints = self.view.read(cx).breakpoints.clone();
         let temporary_breakpoints = self.view.read(cx).temporary_breakpoints.clone();
+        let function_breakpoints = self.view.read(cx).function_breakpoints.clone();
+        let field_watchpoints = self.view.read(cx).field_watchpoints.clone();
         let show_whitespace = self.view.read(cx).show_whitespace();
         let indent_columns = self.view.read(cx).indent_columns().max(1);
         let code_vision_hovered = self.view.read(cx).code_vision_hovered;
@@ -1591,12 +1623,63 @@ impl Element for EditorElement {
                 ));
             }
 
+            // The blame column has a background of its own, so the labels stand apart
+            // from the text; the gutter keeps the editor background.
+            if annotate > 0. {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(gutter_right, bounds.top()),
+                        size(px(annotate), bounds.size.height),
+                    ),
+                    style.caret_row,
+                ));
+                window.paint_quad(vertical(gutter_right + px(annotate)));
+            }
+
             for shown in &prepaint.layout.rows {
                 if shown.is_block && !shown.is_doc {
                     continue;
                 }
                 let line = shown.buffer_line as u32;
-                if !shown.is_doc && breakpoints.contains(&line) {
+                if !shown.is_doc && function_breakpoints.contains(&line) {
+                    // A method breakpoint is a diamond, not a filled dot.
+                    let suffix = if style.dark { "_dark" } else { "" };
+                    let mark = Bounds::new(
+                        point(bounds.left() + px(RUN_X + 1.), shown.y + px(3.)),
+                        size(px(14.), px(14.)),
+                    );
+                    let path: SharedString =
+                        format!("icons/debug/functionBreakpoint{suffix}.svg").into();
+                    window
+                        .paint_svg(
+                            mark,
+                            path,
+                            None,
+                            TransformationMatrix::unit(),
+                            style.error,
+                            cx,
+                        )
+                        .ok();
+                } else if !shown.is_doc && field_watchpoints.contains(&line) {
+                    // A field watchpoint is an eye.
+                    let suffix = if style.dark { "_dark" } else { "" };
+                    let mark = Bounds::new(
+                        point(bounds.left() + px(RUN_X + 1.), shown.y + px(3.)),
+                        size(px(14.), px(14.)),
+                    );
+                    let path: SharedString =
+                        format!("icons/debug/fieldWatchpoint{suffix}.svg").into();
+                    window
+                        .paint_svg(
+                            mark,
+                            path,
+                            None,
+                            TransformationMatrix::unit(),
+                            style.error,
+                            cx,
+                        )
+                        .ok();
+                } else if !shown.is_doc && breakpoints.contains(&line) {
                     let dot = Bounds::new(
                         point(bounds.left() + px(RUN_X + 3.), shown.y + px(5.)),
                         size(px(10.), px(10.)),
@@ -1691,6 +1774,18 @@ impl Element for EditorElement {
                             None,
                             TransformationMatrix::unit(),
                             style.line_number_current,
+                            cx,
+                        )
+                        .ok();
+                }
+                if let Some(label) = &shown.annotation {
+                    label
+                        .paint(
+                            point(gutter_right + px(ANNOTATE_INSET), shown.y + px(2.)),
+                            px(18.),
+                            TextAlign::Left,
+                            None,
+                            window,
                             cx,
                         )
                         .ok();

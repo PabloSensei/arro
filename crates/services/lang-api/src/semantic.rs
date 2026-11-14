@@ -444,8 +444,8 @@ pub struct ActionQuery {
     pub only: Option<ActionKind>,
 }
 
-/// An action with its edits already computed. Actions that only the server can run
-/// are left out.
+/// An action with its edits already computed, or one whose server runs it from values
+/// the user picks first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionEntry {
     pub title: String,
@@ -455,6 +455,69 @@ pub struct ActionEntry {
     pub preferred: bool,
     pub edits: Vec<SourceEdit>,
     pub renames: Vec<FileRename>,
+    /// The provider's own token of an action that needs a form before it runs, passed
+    /// back in [`ActionParametersQuery`]. `None` when the edits are all it needs.
+    pub handle: Option<String>,
+}
+
+/// What an action needs from the user before it runs. The window draws a small form
+/// of it; an action without one runs from the edits of its [`ActionEntry`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActionParameters {
+    pub title: String,
+    /// The rows to tick, such as the members of a new interface.
+    pub members: Vec<ActionMember>,
+    pub members_label: String,
+    /// The values to type, such as the name of a new type.
+    pub fields: Vec<ActionField>,
+    /// The places a new file may go, of which the action needs exactly one.
+    pub choices: Vec<ActionChoice>,
+    pub choices_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionMember {
+    pub name: String,
+    pub detail: Option<String>,
+    pub checked: bool,
+    /// The value the provider expects back for this row.
+    pub value: String,
+}
+
+/// A value the form asks for, with the key the provider gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionField {
+    pub key: String,
+    pub label: String,
+    pub value: String,
+}
+
+/// One row of a single choice, with the value the provider expects back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionChoice {
+    pub name: String,
+    pub detail: Option<String>,
+    pub value: String,
+}
+
+/// The token of an action whose form the window shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionParametersQuery(pub String);
+
+/// The values of a filled form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionApplyRequest {
+    pub handle: String,
+    pub members: Vec<String>,
+    pub fields: Vec<ActionField>,
+    pub choice: Option<String>,
+}
+
+/// The edits of a filled form, or the reason the language refused it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActionOutcome {
+    pub change: WorkspaceChange,
+    pub error: Option<String>,
 }
 
 /// A file that a change moves, by URI.
@@ -675,6 +738,10 @@ pub type FormatProvider = dyn Provider<FormatQuery, Vec<DocumentEdit>>;
 /// A range of a document formatted on its own.
 pub type RangeFormatProvider = dyn Provider<RangeFormatQuery, Vec<DocumentEdit>>;
 pub type ActionProvider = dyn Provider<ActionQuery, Vec<ActionEntry>>;
+/// The form of an action whose server computes its edits only from the values the
+/// user picks, as the provider token of its [`ActionEntry`] names it.
+pub type ActionParametersProvider = dyn Provider<ActionParametersQuery, Option<ActionParameters>>;
+pub type ActionApplyProvider = dyn Provider<ActionApplyRequest, ActionOutcome>;
 /// Alt+F7: every use of the symbol at a spot, its declaration included.
 pub type ReferencesProvider = dyn Provider<DocumentSpot, Vec<SourceSpan>>;
 pub type RenameProvider = dyn Provider<RenameQuery, WorkspaceChange>;

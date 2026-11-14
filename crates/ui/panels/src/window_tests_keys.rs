@@ -336,6 +336,7 @@ fn action(
             edits,
         }],
         renames: Vec::new(),
+        handle: None,
     }
 }
 

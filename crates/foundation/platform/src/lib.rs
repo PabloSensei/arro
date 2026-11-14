@@ -37,6 +37,11 @@ mod process_stats;
 #[path = "process_stats_unix.rs"]
 mod process_stats;
 #[cfg(windows)]
+mod process_tree;
+#[cfg(unix)]
+#[path = "process_tree_unix.rs"]
+mod process_tree;
+#[cfg(windows)]
 mod shell;
 #[cfg(unix)]
 #[path = "shell_unix.rs"]
@@ -63,6 +68,7 @@ pub use process_stats::{
     ProcessEntry, is_console_process, process_created, process_table, terminate_process,
 };
 pub use process_stats::{ProcessMemory, label_process, process_tree};
+pub use process_tree::ProcessTree;
 pub use shell::{NO_BROWSER_ENV, open_url, recorded_urls};
 pub use trash::move_to_trash;
 pub use waiter::ProcessWaiter;

@@ -16,10 +16,11 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use java_lang::{JavaProject, JdtlsConfig, Runtime, State};
 use lang_api::{
-    ActionEntry, ActionKind, ActionQuery, Confidence, DiagnosticsQuery, DocumentEdit, DocumentSpot,
-    FormatQuery, LanguageSupport, MoveKind, MoveQuery, MoveRequest, NavigationKind,
-    NavigationQuery, RenameQuery, Replies, Severity, SourceSpan, SymbolEntry, SymbolQuery,
-    TextPoint, TextSpan, WorkspaceChange, ask,
+    ActionApplyProvider, ActionApplyRequest, ActionEntry, ActionField, ActionKind,
+    ActionParametersProvider, ActionParametersQuery, ActionQuery, Confidence, DiagnosticsQuery,
+    DocumentEdit, DocumentSpot, FileChange, FormatQuery, LanguageSupport, MoveKind, MoveQuery,
+    MoveRequest, NavigationKind, NavigationQuery, RenameQuery, Replies, Severity, SourceSpan,
+    SymbolEntry, SymbolQuery, TextPoint, TextSpan, WorkspaceChange, apply_to_text, ask,
 };
 use lsp_client::lsp_types::Position;
 use lsp_client::lsp_types::Uri;
@@ -868,4 +869,250 @@ async fn dropping_the_project_ends_jdtls() {
     let process_id = started.process_id.unwrap();
     drop(project);
     assert_ends(process_id).await;
+}
+
+const SHAPE: &str = r#"package probe;
+
+public class Shape {
+
+    private final String name;
+
+    public Shape(String name) {
+        this.name = name;
+    }
+
+    public String name() {
+        return name;
+    }
+
+    public double area() {
+        return 0;
+    }
+}
+"#;
+
+const BASE: &str = r#"package probe;
+
+public abstract class Base {
+}
+"#;
+
+const CHILD: &str = r#"package probe;
+
+public class Child extends Base {
+
+    private int count;
+
+    public int value() {
+        return count;
+    }
+}
+"#;
+
+/// Writes the files a change brings into being, from an empty text, as the window
+/// does for the new interface of an Extract Interface.
+fn apply_created(change: &WorkspaceChange) {
+    for source in &change.edits {
+        let Some(uri) = Uri::from_str(&source.uri).ok() else {
+            continue;
+        };
+        let Some(path) = file_path(&uri) else {
+            continue;
+        };
+        if path.exists() {
+            continue;
+        }
+        let text = apply_to_text("", &source.edits);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+    }
+}
+
+/// The form of the Extract Interface action, filled in as the window fills it.
+async fn check_extract_interface(fixture: Fixture) {
+    let Fixture { probe, config } = fixture;
+    let shape_path = probe.with_file_name("Shape.java");
+    let view_path = probe.with_file_name("ShapeView.java");
+    // A failed earlier run may have left the interface behind.
+    let _ = fs::remove_file(&view_path);
+    fs::write(&shape_path, SHAPE).unwrap();
+    let project = JavaProject::open(config, Trust::Trusted).unwrap();
+    let mut status = project.status();
+    until(&mut status, |status| status.state == State::Ready).await;
+    let server = project.server().unwrap();
+    let mut shape = Open {
+        project: &project,
+        uri: uri_of(&shape_path),
+        text: SHAPE.to_owned(),
+        version: 1,
+    };
+    server.open(&shape.uri, 1, shape.text.as_str().into());
+    wait_error(&project, &shape.uri, false).await;
+
+    // The server names the refactoring, and its form says what it needs.
+    let actions = shape
+        .actions(shape.span("class Shape"), Some(ActionKind::Refactor))
+        .await;
+    let interface = actions
+        .iter()
+        .find(|entry| entry.code.as_deref() == Some("refactor.extract.interface"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{:?}",
+                actions.iter().map(|entry| &entry.title).collect::<Vec<_>>()
+            )
+        });
+    let handle = interface
+        .handle
+        .clone()
+        .expect("the row carries its command");
+
+    let parameters: &ActionParametersProvider = project.action_parameters().unwrap();
+    let form = first(ask(parameters, ActionParametersQuery(handle.clone())))
+        .await
+        .expect("the server describes the form")
+        .expect("the row has a form");
+    let area = form
+        .members
+        .iter()
+        .find(|member| member.name == "area")
+        .unwrap_or_else(|| panic!("{:?}", form.members));
+    assert!(
+        form.members.iter().any(|member| member.name == "name"),
+        "{:?}",
+        form.members
+    );
+    let field = form
+        .fields
+        .iter()
+        .find(|field| field.key == "name")
+        .expect("the form asks for the name of the interface");
+    assert_eq!(field.value, "ShapeInterface", "{field:?}");
+    let destination = form
+        .choices
+        .iter()
+        .find(|choice| choice.name == "probe")
+        .unwrap_or_else(|| {
+            panic!(
+                "{:?}",
+                form.choices
+                    .iter()
+                    .map(|choice| &choice.name)
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    // Extract only one member, so the interface holds what was picked.
+    let apply: &ActionApplyProvider = project.action_apply().unwrap();
+    let outcome = first(ask(
+        apply,
+        ActionApplyRequest {
+            handle,
+            members: vec![area.value.clone()],
+            fields: vec![ActionField {
+                key: field.key.clone(),
+                label: field.label.clone(),
+                value: "ShapeView".to_owned(),
+            }],
+            choice: Some(destination.value.clone()),
+        },
+    ))
+    .await
+    .expect("the server answers with the edits");
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(!outcome.change.is_empty(), "{outcome:?}");
+
+    // The window applies the edits of the open class and writes the new interface.
+    let visible = WorkspaceChange {
+        edits: outcome
+            .change
+            .edits
+            .iter()
+            .filter(|source| source.uri == shape.uri)
+            .cloned()
+            .collect(),
+        renames: Vec::new(),
+    };
+    apply_change(&mut [&mut shape], &visible);
+    apply_created(&outcome.change);
+    assert!(
+        shape.text.contains("implements ShapeView"),
+        "{}",
+        shape.text
+    );
+    let view = fs::read_to_string(&view_path).expect("the interface file exists");
+    assert!(view.contains("public interface ShapeView"), "{view}");
+    assert!(view.contains("double area();"), "{view}");
+    assert!(!view.contains("String name();"), "{view}");
+
+    // The server reads the new file and finds no error in the class.
+    let view_uri = uri_of(&view_path);
+    server.file_changed(&view_uri, FileChange::Created);
+    wait_error(&project, &shape.uri, false).await;
+
+    project.stop().await;
+    let _ = fs::remove_file(&shape_path);
+    let _ = fs::remove_file(&view_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "runs jdtls on a corpus project"]
+async fn extract_interface_creates_the_file_and_implements_it() {
+    check_extract_interface(fixture(
+        "petclinic",
+        ".",
+        &["build.gradle", "settings.gradle"],
+    ))
+    .await;
+}
+
+/// Pull Members Up is not a command of jdtls 1.63: its refactorings at a method of a
+/// subclass never move it to the superclass. The test records that, so a version of
+/// the server that gains the refactoring fails here and the row can be added.
+async fn check_no_pull_up(fixture: Fixture) {
+    let Fixture { probe, config } = fixture;
+    let base_path = probe.with_file_name("Base.java");
+    let child_path = probe.with_file_name("Child.java");
+    fs::write(&base_path, BASE).unwrap();
+    fs::write(&child_path, CHILD).unwrap();
+    let project = JavaProject::open(config, Trust::Trusted).unwrap();
+    let mut status = project.status();
+    until(&mut status, |status| status.state == State::Ready).await;
+    let server = project.server().unwrap();
+    let child = Open {
+        project: &project,
+        uri: uri_of(&child_path),
+        text: CHILD.to_owned(),
+        version: 1,
+    };
+    server.open(&uri_of(&base_path), 1, BASE.into());
+    server.open(&child.uri, 1, child.text.as_str().into());
+    wait_error(&project, &child.uri, false).await;
+
+    let actions = child
+        .actions(child.span("value()"), Some(ActionKind::Refactor))
+        .await;
+    let titles: Vec<String> = actions.iter().map(|entry| entry.title.clone()).collect();
+    assert!(
+        !titles
+            .iter()
+            .any(|title| title.to_lowercase().contains("pull")),
+        "{titles:?}"
+    );
+    assert!(child.text.contains("public int value()"));
+
+    project.stop().await;
+    let _ = fs::remove_file(&base_path);
+    let _ = fs::remove_file(&child_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "runs jdtls on a corpus project"]
+async fn pull_members_up_has_no_action_in_jdtls() {
+    check_no_pull_up(fixture(
+        "petclinic",
+        ".",
+        &["build.gradle", "settings.gradle"],
+    ))
+    .await;
 }

@@ -322,6 +322,7 @@ fn the_problems_menu_jumps_shows_fixes_copies_and_survives_an_empty_window(
             }],
         }],
         renames: Vec::new(),
+        handle: None,
     }]);
     let window = open_language_window(cx, root.clone(), language);
     cx.run_until_parked();

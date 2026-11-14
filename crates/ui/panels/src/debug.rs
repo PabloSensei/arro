@@ -10,8 +10,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dap_client::{
-    Breakpoint, BreakpointSpec, Command, ConsoleLine, DebugService, DebugSessionToken, DebugState,
-    Debugger, Frame, Scope, Snapshot, StepTarget, Thread, Variable,
+    Breakpoint, BreakpointSpec, Command, ConsoleLine, DataAccessType, DataBreakpointSpec,
+    DebugService, DebugSessionToken, DebugState, Debugger, Frame, FunctionBreakpointSpec, Scope,
+    Snapshot, StepTarget, Thread, Variable,
 };
 use runner::{Console, ConsoleEvent, RunPlan, Step, Stream};
 use serde::{Deserialize, Serialize};
@@ -154,6 +155,13 @@ fn enabled() -> bool {
     true
 }
 
+/// The entry point of a program, as the adapter names the frame: `main` or
+/// `demo.Main.main(String[])`. It has no caller to return to.
+fn is_main_frame(frame: &Frame) -> bool {
+    let name = frame.name.trim();
+    name == "main" || name.starts_with("main(") || name.contains(".main(")
+}
+
 impl BreakpointSetting {
     fn new(file: PathBuf, line: u32) -> Self {
         Self {
@@ -178,10 +186,145 @@ impl BreakpointSetting {
     }
 }
 
+/// A method breakpoint: the name the adapter gets and the properties the user set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FunctionBreakpointSetting {
+    file: PathBuf,
+    /// The line of the declaration, from one; zero for a point that did not come from
+    /// the gutter.
+    #[serde(default)]
+    line: u32,
+    /// The type that declares the method, when the language named it.
+    #[serde(default)]
+    owner: Option<String>,
+    name: String,
+    #[serde(default)]
+    condition: Option<String>,
+    #[serde(default)]
+    hit_condition: Option<String>,
+    #[serde(default = "enabled")]
+    enabled: bool,
+}
+
+impl FunctionBreakpointSetting {
+    fn new(file: PathBuf, line: u32, owner: Option<String>, name: String) -> Self {
+        Self {
+            file,
+            line,
+            owner,
+            name,
+            condition: None,
+            hit_condition: None,
+            enabled: true,
+        }
+    }
+
+    /// The name the adapter reads: `com.example.Foo#bar`.
+    fn dap_name(&self) -> String {
+        match self.owner.as_deref().filter(|owner| !owner.is_empty()) {
+            Some(owner) => format!("{owner}#{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    fn spec(&self) -> FunctionBreakpointSpec {
+        FunctionBreakpointSpec {
+            name: self.dap_name(),
+            condition: self.condition.clone(),
+            hit_condition: self.hit_condition.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+/// A field watchpoint: the field the adapter stops on and what stops it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DataBreakpointSetting {
+    /// The file of the declaration, when the point came from the gutter.
+    #[serde(default)]
+    file: PathBuf,
+    /// The line of the declaration, from one; zero for a point that came from Variables.
+    #[serde(default)]
+    line: u32,
+    /// The type that declares the field, when the language named it.
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    field: String,
+    /// The id the adapter gave the field, `com.example.Foo#bar`.
+    data_id: String,
+    #[serde(default)]
+    read: bool,
+    #[serde(default = "enabled")]
+    write: bool,
+    #[serde(default)]
+    condition: Option<String>,
+    #[serde(default)]
+    hit_condition: Option<String>,
+    #[serde(default = "enabled")]
+    enabled: bool,
+}
+
+impl DataBreakpointSetting {
+    fn from_declaration(file: PathBuf, line: u32, owner: String, field: String) -> Self {
+        let data_id = format!("{owner}#{field}");
+        Self {
+            file,
+            line,
+            owner: Some(owner),
+            field,
+            data_id,
+            read: false,
+            write: true,
+            condition: None,
+            hit_condition: None,
+            enabled: true,
+        }
+    }
+
+    fn from_variable(data_id: String, field: String) -> Self {
+        Self {
+            file: PathBuf::new(),
+            line: 0,
+            owner: data_id
+                .split_once('#')
+                .map(|(owner, _)| owner.to_owned())
+                .filter(|owner| !owner.is_empty()),
+            field,
+            data_id,
+            read: false,
+            write: true,
+            condition: None,
+            hit_condition: None,
+            enabled: true,
+        }
+    }
+
+    fn access(&self) -> DataAccessType {
+        match (self.read, self.write) {
+            (true, true) => DataAccessType::ReadWrite,
+            (true, false) => DataAccessType::Read,
+            _ => DataAccessType::Write,
+        }
+    }
+
+    fn spec(&self) -> DataBreakpointSpec {
+        DataBreakpointSpec {
+            data_id: self.data_id.clone(),
+            access_type: self.access(),
+            condition: self.condition.clone(),
+            hit_condition: self.hit_condition.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct SavedState {
     breakpoints: Vec<BreakpointSetting>,
+    function_breakpoints: Vec<FunctionBreakpointSetting>,
+    data_breakpoints: Vec<DataBreakpointSetting>,
     exception_filters: Vec<String>,
 }
 
@@ -246,12 +389,20 @@ pub struct DebugPanel {
     asking_targets_window: Option<AnyWindowHandle>,
     /// Breakpoints in file and line order, with their properties.
     breakpoints: Vec<BreakpointSetting>,
+    /// Method breakpoints, with their properties.
+    function_breakpoints: Vec<FunctionBreakpointSetting>,
+    /// Field watchpoints, with their properties.
+    data_breakpoints: Vec<DataBreakpointSetting>,
     /// Filters of the adapter the user turned on.
     enabled_filters: BTreeSet<String>,
     watch: Vec<String>,
     expanded: BTreeSet<i64>,
     /// The breakpoints of the last snapshot, to notice the adapter's answers.
     shown_breakpoints: Vec<Breakpoint>,
+    /// The method breakpoint answers of the last snapshot.
+    shown_function_breakpoints: Vec<Breakpoint>,
+    /// The field watchpoint answers of the last snapshot.
+    shown_data_breakpoints: Vec<Breakpoint>,
     /// Output of the build step and of a test run, before the adapter's own console.
     local_console: Vec<ConsoleLine>,
     /// The console the adapter sent last, to keep the shown log in order as the lines the
@@ -308,10 +459,14 @@ impl DebugPanel {
             asking_targets: false,
             asking_targets_window: None,
             breakpoints: saved.breakpoints,
+            function_breakpoints: saved.function_breakpoints,
+            data_breakpoints: saved.data_breakpoints,
             enabled_filters: saved.exception_filters.into_iter().collect(),
             watch: Vec::new(),
             expanded: BTreeSet::new(),
             shown_breakpoints: Vec::new(),
+            shown_function_breakpoints: Vec::new(),
+            shown_data_breakpoints: Vec::new(),
             local_console: Vec::new(),
             seen_console: Vec::new(),
             console_input: ConsoleInput::new(),
@@ -415,6 +570,12 @@ impl DebugPanel {
         cx.notify();
     }
 
+    /// Selects a frame the way a click on its row does.
+    pub fn select_frame(&mut self, frame: i64, cx: &mut Context<Self>) {
+        self.send(Command::SelectFrame(frame), cx);
+        cx.notify();
+    }
+
     /// Opens or closes a variable with children the way a click on it does.
     pub fn toggle_expanded(&mut self, reference: i64, cx: &mut Context<Self>) {
         if self.expanded.contains(&reference) {
@@ -471,12 +632,14 @@ impl DebugPanel {
         project: Option<String>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let debugger = service.attach(
+        let debugger = service.attach_with_breakpoints(
             host,
             port,
             name,
             project,
             self.specs(),
+            self.function_specs(),
+            self.data_specs(),
             self.watch.clone(),
             self.filter_list(),
         )?;
@@ -496,12 +659,14 @@ impl DebugPanel {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let session = service.begin_session();
-        let debugger = service.attach_ready(
+        let debugger = service.attach_ready_with_breakpoints(
             host,
             port,
             name,
             project,
             self.specs(),
+            self.function_specs(),
+            self.data_specs(),
             self.watch.clone(),
             self.filter_list(),
         )?;
@@ -524,6 +689,8 @@ impl DebugPanel {
         self.debugger = None;
         self.snapshot = Snapshot::default();
         self.shown_breakpoints.clear();
+        self.shown_function_breakpoints.clear();
+        self.shown_data_breakpoints.clear();
         self.expanded.clear();
         self.selected_variable = None;
         self.variable_edit = None;
@@ -548,11 +715,13 @@ impl DebugPanel {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        match pending.service.start(
+        match pending.service.start_with_breakpoints(
             pending.program,
             pending.name,
             pending.entry,
             self.specs(),
+            self.function_specs(),
+            self.data_specs(),
             self.watch.clone(),
             self.filter_list(),
         ) {
@@ -681,6 +850,350 @@ impl DebugPanel {
         self.changed(cx);
     }
 
+    /// The method breakpoints of this file, from one, for the gutter and tests.
+    pub fn function_breakpoint_lines(&self, file: &Path) -> Vec<u32> {
+        let mut lines: Vec<u32> = self
+            .function_breakpoints
+            .iter()
+            .filter(|breakpoint| breakpoint.file == file && breakpoint.line > 0)
+            .map(|breakpoint| breakpoint.line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// The field watchpoints of this file, from one, for the gutter and tests.
+    pub fn field_watchpoint_lines(&self, file: &Path) -> Vec<u32> {
+        let mut lines: Vec<u32> = self
+            .data_breakpoints
+            .iter()
+            .filter(|watch| watch.file == file && watch.line > 0)
+            .map(|watch| watch.line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// The names the adapter receives for the method breakpoints, for tests.
+    pub fn function_breakpoint_names(&self) -> Vec<String> {
+        self.function_breakpoints
+            .iter()
+            .map(FunctionBreakpointSetting::dap_name)
+            .collect()
+    }
+
+    /// The ids the adapter receives for the field watchpoints, for tests.
+    pub fn data_breakpoint_ids(&self) -> Vec<String> {
+        self.data_breakpoints
+            .iter()
+            .map(|watch| watch.data_id.clone())
+            .collect()
+    }
+
+    /// A click on the gutter of a method declaration: a method breakpoint, or none.
+    pub fn toggle_function_breakpoint(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        owner: Option<String>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let found = self
+            .function_breakpoints
+            .iter()
+            .position(|breakpoint| breakpoint.file == file && breakpoint.line == line);
+        match found {
+            Some(index) => {
+                self.function_breakpoints.remove(index);
+            }
+            None => {
+                self.function_breakpoints
+                    .push(FunctionBreakpointSetting::new(file, line, owner, name));
+            }
+        }
+        self.send_function_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    /// A click on the gutter of a field declaration: a watchpoint on its writes.
+    pub fn toggle_field_watchpoint(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        owner: Option<String>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = owner.filter(|owner| !owner.is_empty()) else {
+            // Without the type the adapter cannot name the field: the line stops the
+            // program instead of the field.
+            self.toggle_breakpoint(file, line, cx);
+            return;
+        };
+        let found = self
+            .data_breakpoints
+            .iter()
+            .position(|watch| watch.file == file && watch.line == line);
+        match found {
+            Some(index) => {
+                self.data_breakpoints.remove(index);
+            }
+            None => {
+                self.data_breakpoints
+                    .push(DataBreakpointSetting::from_declaration(
+                        file, line, owner, name,
+                    ));
+            }
+        }
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    /// Add Field Watchpoint of a variable in the Variables tree. The adapter names the
+    /// field from the object that holds it.
+    pub fn add_field_watchpoint(&mut self, reference: i64, name: String, cx: &mut Context<Self>) {
+        let Some(debugger) = self.debugger.clone() else {
+            return;
+        };
+        let requested = name.clone();
+        let panel = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let answer = debugger
+                .request(
+                    "dataBreakpointInfo",
+                    serde_json::json!({"variablesReference": reference, "name": requested}),
+                )
+                .await;
+            panel
+                .update(cx, |panel, cx| {
+                    panel.receive_field_watchpoint(requested, answer, cx)
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn receive_field_watchpoint(
+        &mut self,
+        name: String,
+        answer: Result<serde_json::Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let data_id = answer
+            .as_ref()
+            .ok()
+            .and_then(|body| body.get("dataId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .filter(|data_id| !data_id.is_empty());
+        let Some(data_id) = data_id else {
+            let message = match answer {
+                Err(error) => error,
+                Ok(body) => body
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "the adapter cannot watch this field".to_owned()),
+            };
+            self.local_console.push(ConsoleLine::new(
+                format!("Add Field Watchpoint: {message}"),
+                true,
+            ));
+            self.trim_console();
+            cx.notify();
+            return;
+        };
+        if !self
+            .data_breakpoints
+            .iter()
+            .any(|watch| watch.data_id == data_id)
+        {
+            self.data_breakpoints
+                .push(DataBreakpointSetting::from_variable(data_id, name));
+        }
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn remove_function_breakpoint(&mut self, file: PathBuf, line: u32, cx: &mut Context<Self>) {
+        self.function_breakpoints
+            .retain(|breakpoint| breakpoint.file != file || breakpoint.line != line);
+        self.send_function_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn remove_data_breakpoint(&mut self, data_id: String, cx: &mut Context<Self>) {
+        self.data_breakpoints
+            .retain(|watch| watch.data_id != data_id);
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn set_function_enabled(&mut self, file: PathBuf, line: u32, on: bool, cx: &mut Context<Self>) {
+        if let Some(setting) = self
+            .function_breakpoints
+            .iter_mut()
+            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
+        {
+            setting.enabled = on;
+        }
+        self.send_function_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn set_function_condition(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.trim().to_owned();
+        if let Some(setting) = self
+            .function_breakpoints
+            .iter_mut()
+            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
+        {
+            setting.condition = (!text.is_empty()).then_some(text);
+        }
+        self.send_function_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn set_function_hit_condition(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.trim().to_owned();
+        if let Some(setting) = self
+            .function_breakpoints
+            .iter_mut()
+            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
+        {
+            setting.hit_condition = (!text.is_empty()).then_some(text);
+        }
+        self.send_function_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn set_data_enabled(&mut self, data_id: String, on: bool, cx: &mut Context<Self>) {
+        if let Some(setting) = self
+            .data_breakpoints
+            .iter_mut()
+            .find(|watch| watch.data_id == data_id)
+        {
+            setting.enabled = on;
+        }
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    /// Cycles the access of a field watchpoint: write, read, both.
+    fn cycle_data_access(&mut self, data_id: String, cx: &mut Context<Self>) {
+        if let Some(setting) = self
+            .data_breakpoints
+            .iter_mut()
+            .find(|watch| watch.data_id == data_id)
+        {
+            match setting.access() {
+                DataAccessType::Write => {
+                    setting.write = false;
+                    setting.read = true;
+                }
+                DataAccessType::Read => {
+                    setting.write = true;
+                    setting.read = true;
+                }
+                DataAccessType::ReadWrite => {
+                    setting.write = true;
+                    setting.read = false;
+                }
+            }
+        }
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn set_data_condition(&mut self, data_id: String, text: String, cx: &mut Context<Self>) {
+        let text = text.trim().to_owned();
+        if let Some(setting) = self
+            .data_breakpoints
+            .iter_mut()
+            .find(|watch| watch.data_id == data_id)
+        {
+            setting.condition = (!text.is_empty()).then_some(text);
+        }
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    fn set_data_hit_condition(&mut self, data_id: String, text: String, cx: &mut Context<Self>) {
+        let text = text.trim().to_owned();
+        if let Some(setting) = self
+            .data_breakpoints
+            .iter_mut()
+            .find(|watch| watch.data_id == data_id)
+        {
+            setting.hit_condition = (!text.is_empty()).then_some(text);
+        }
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    /// Drop Frame: the selected frame starts again from its first line.
+    pub fn restart_frame(&mut self, cx: &mut Context<Self>) {
+        if let Some(frame) = self.selected_frame().cloned() {
+            self.restart_frame_of(frame.id, cx);
+        }
+    }
+
+    fn restart_frame_of(&mut self, frame: i64, cx: &mut Context<Self>) {
+        let Some(found) = self
+            .snapshot
+            .frames
+            .iter()
+            .find(|candidate| candidate.id == frame)
+            .cloned()
+        else {
+            return;
+        };
+        if self.restart_frame_enabled_for(&found) {
+            self.send(Command::RestartFrame(frame), cx);
+        }
+    }
+
+    /// Whether the adapter can drop the selected frame. The outermost frame has no
+    /// caller to return to, and an adapter may refuse the request.
+    pub fn restart_frame_enabled(&self) -> bool {
+        self.selected_frame()
+            .is_some_and(|frame| self.restart_frame_enabled_for(frame))
+    }
+
+    fn restart_frame_enabled_for(&self, frame: &Frame) -> bool {
+        self.snapshot.capabilities.restart_frame
+            && matches!(self.snapshot.state, DebugState::Stopped { .. })
+            && !self
+                .snapshot
+                .frames
+                .last()
+                .is_some_and(|last| last.id == frame.id)
+            && !is_main_frame(frame)
+    }
+
+    fn selected_frame(&self) -> Option<&Frame> {
+        let selected = self.snapshot.selected_frame?;
+        self.snapshot
+            .frames
+            .iter()
+            .find(|frame| frame.id == selected)
+    }
+
     /// A condition of the DAP form. An empty text clears it.
     fn set_condition(&mut self, file: PathBuf, line: u32, text: String, cx: &mut Context<Self>) {
         let text = text.trim().to_owned();
@@ -745,6 +1258,28 @@ impl DebugPanel {
             .collect()
     }
 
+    fn function_specs(&self) -> Vec<FunctionBreakpointSpec> {
+        self.function_breakpoints
+            .iter()
+            .map(FunctionBreakpointSetting::spec)
+            .collect()
+    }
+
+    fn data_specs(&self) -> Vec<DataBreakpointSpec> {
+        self.data_breakpoints
+            .iter()
+            .map(DataBreakpointSetting::spec)
+            .collect()
+    }
+
+    fn send_function_breakpoints(&self, cx: &mut Context<Self>) {
+        self.send(Command::SetFunctionBreakpoints(self.function_specs()), cx);
+    }
+
+    fn send_data_breakpoints(&self, cx: &mut Context<Self>) {
+        self.send(Command::SetDataBreakpoints(self.data_specs()), cx);
+    }
+
     fn filter_list(&self) -> Vec<String> {
         self.enabled_filters.iter().cloned().collect()
     }
@@ -782,6 +1317,8 @@ impl DebugPanel {
                 .filter(|breakpoint| !breakpoint.temporary)
                 .cloned()
                 .collect(),
+            function_breakpoints: self.function_breakpoints.clone(),
+            data_breakpoints: self.data_breakpoints.clone(),
             exception_filters: self.filter_list(),
         };
         let Ok(json) = serde_json::to_string(&saved) else {
@@ -816,8 +1353,12 @@ impl DebugPanel {
             }
             return;
         };
-        let breakpoints_changed = snapshot.breakpoints != self.shown_breakpoints;
+        let breakpoints_changed = snapshot.breakpoints != self.shown_breakpoints
+            || snapshot.function_breakpoints != self.shown_function_breakpoints
+            || snapshot.data_breakpoints != self.shown_data_breakpoints;
         self.shown_breakpoints = snapshot.breakpoints.clone();
+        self.shown_function_breakpoints = snapshot.function_breakpoints.clone();
+        self.shown_data_breakpoints = snapshot.data_breakpoints.clone();
         if let Some(hub) = cx.try_global::<ActiveDebugHub>() {
             hub.0.set(snapshot.clone());
         }
@@ -1037,6 +1578,60 @@ impl DebugPanel {
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.show_menu(position, vec![entry], cx)
+            })
+            .ok();
+    }
+
+    /// The context menu of a frame: Drop Frame, when the adapter allows it.
+    fn frame_menu(&mut self, frame: Frame, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let panel = cx.weak_entity();
+        let frame_id = frame.id;
+        let entry = if self.restart_frame_enabled_for(&frame) {
+            MenuEntry::new("Drop Frame", move |_, cx| {
+                panel
+                    .update(cx, |panel, cx| panel.restart_frame_of(frame_id, cx))
+                    .ok();
+            })
+        } else {
+            MenuEntry::disabled("Drop Frame")
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![entry], cx)
+            })
+            .ok();
+    }
+
+    /// The context menu of a variable: Set Value and Add Field Watchpoint.
+    fn variable_menu(
+        &mut self,
+        target: VariableTarget,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.weak_entity();
+        let reference = target.reference;
+        let name = target.name.clone();
+        let watch_panel = panel.clone();
+        let watch = MenuEntry::new("Add Field Watchpoint", move |_, cx| {
+            watch_panel
+                .update(cx, |panel, cx| {
+                    panel.add_field_watchpoint(reference, name.clone(), cx)
+                })
+                .ok();
+        });
+        let set_panel = panel;
+        let set = MenuEntry::new("Set Value", move |_, cx| {
+            set_panel
+                .update(cx, |panel, cx| {
+                    panel.selected_variable = Some(target.clone());
+                    panel.start_value_edit(cx);
+                })
+                .ok();
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![watch, set], cx)
             })
             .ok();
     }
@@ -1550,6 +2145,139 @@ impl DebugPanel {
             .ok();
     }
 
+    fn ask_function_condition(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .function_breakpoints
+            .iter()
+            .find(|setting| setting.file == file && setting.line == line)
+            .and_then(|setting| setting.condition.clone())
+            .unwrap_or_default();
+        let panel = cx.weak_entity();
+        let submit = move |text: String, cx: &mut App| {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.set_function_condition(file.clone(), line, text, cx)
+                })
+                .ok();
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show_with(
+                    "Method Breakpoint Condition",
+                    &current,
+                    submit,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    fn ask_function_hit_condition(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .function_breakpoints
+            .iter()
+            .find(|setting| setting.file == file && setting.line == line)
+            .and_then(|setting| setting.hit_condition.clone())
+            .unwrap_or_default();
+        let panel = cx.weak_entity();
+        let submit = move |text: String, cx: &mut App| {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.set_function_hit_condition(file.clone(), line, text, cx)
+                })
+                .ok();
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show_with(
+                    "Method Breakpoint Hit Count",
+                    &current,
+                    submit,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    fn ask_data_condition(&mut self, data_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .data_breakpoints
+            .iter()
+            .find(|setting| setting.data_id == data_id)
+            .and_then(|setting| setting.condition.clone())
+            .unwrap_or_default();
+        let panel = cx.weak_entity();
+        let submit = move |text: String, cx: &mut App| {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.set_data_condition(data_id.clone(), text, cx)
+                })
+                .ok();
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show_with(
+                    "Field Watchpoint Condition",
+                    &current,
+                    submit,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    fn ask_data_hit_condition(
+        &mut self,
+        data_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .data_breakpoints
+            .iter()
+            .find(|setting| setting.data_id == data_id)
+            .and_then(|setting| setting.hit_condition.clone())
+            .unwrap_or_default();
+        let panel = cx.weak_entity();
+        let submit = move |text: String, cx: &mut App| {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.set_data_hit_condition(data_id.clone(), text, cx)
+                })
+                .ok();
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show_with(
+                    "Field Watchpoint Hit Count",
+                    &current,
+                    submit,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+            .ok();
+    }
+
     fn render_tree(
         &mut self,
         theme: &Theme,
@@ -1607,6 +2335,7 @@ impl DebugPanel {
             let selected = self.snapshot.selected_frame == Some(frame.id);
             let frame = frame.clone();
             let frame_id = frame.id;
+            let menu_frame = frame.clone();
             let where_ = frame
                 .source
                 .as_ref()
@@ -1626,6 +2355,13 @@ impl DebugPanel {
                         this.open_frame(&frame, window, cx);
                         cx.notify();
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.frame_menu(menu_frame.clone(), event.position, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .into_any_element(),
             );
         }
@@ -1798,6 +2534,7 @@ impl DebugPanel {
             );
         } else {
             let click_target = target.clone();
+            let menu_target = target.clone();
             let selector_name = name.clone();
             let row = row(format!("var-{name}"), &text, selected, theme)
                 .debug_selector(move || format!("var-{selector_name}"))
@@ -1807,7 +2544,15 @@ impl DebugPanel {
                         this.toggle_expanded(reference, cx);
                     }
                     cx.notify();
-                }));
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.selected_variable = Some(menu_target.clone());
+                        this.variable_menu(menu_target.clone(), event.position, cx);
+                        cx.stop_propagation();
+                    }),
+                );
             rows.push(row.into_any_element());
         }
         if let Some(error) = self
@@ -2769,6 +3514,7 @@ impl Render for DebugPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let (active, stopped) = self.state();
+        let can_drop = self.restart_frame_enabled();
         let workspace = self.workspace.clone();
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
@@ -2799,6 +3545,10 @@ impl Render for DebugPanel {
             .child(
                 tool_button("debug-out", "Step Out", Some("Shift+F8"), stopped, &theme)
                     .on_click(cx.listener(|this, _, _, cx| this.step_out(cx))),
+            )
+            .child(
+                tool_button("debug-drop-frame", "Drop Frame", None, can_drop, &theme)
+                    .on_click(cx.listener(|this, _, _, cx| this.restart_frame(cx))),
             )
             .child(
                 tool_button("debug-stop", "Stop", Some("Ctrl+F2"), active, &theme)
@@ -3051,6 +3801,22 @@ impl Render for BreakpointsView {
             .as_ref()
             .map(|panel| panel.read(cx).snapshot.breakpoints.clone())
             .unwrap_or_default();
+        let function_settings = panel
+            .as_ref()
+            .map(|panel| panel.read(cx).function_breakpoints.clone())
+            .unwrap_or_default();
+        let data_settings = panel
+            .as_ref()
+            .map(|panel| panel.read(cx).data_breakpoints.clone())
+            .unwrap_or_default();
+        let function_answers = panel
+            .as_ref()
+            .map(|panel| panel.read(cx).snapshot.function_breakpoints.clone())
+            .unwrap_or_default();
+        let data_answers = panel
+            .as_ref()
+            .map(|panel| panel.read(cx).snapshot.data_breakpoints.clone())
+            .unwrap_or_default();
         let filters = panel
             .as_ref()
             .map(|panel| panel.read(cx).snapshot.exception_filters.clone())
@@ -3234,6 +4000,271 @@ impl Render for BreakpointsView {
             };
             rows.push(row.into_any_element());
         }
+        rows.push(section("Method breakpoints", &theme));
+        for (index, setting) in function_settings.iter().enumerate() {
+            let on = setting.enabled;
+            let file = setting.file.clone();
+            let line = setting.line;
+            let enabled_file = file.clone();
+            let condition_file = file.clone();
+            let hit_file = file.clone();
+            let remove_file = file.clone();
+            let condition = setting.condition.clone().unwrap_or_default();
+            let hit = setting.hit_condition.clone().unwrap_or_default();
+            let answer = function_answers.get(index);
+            let message = answer.and_then(|answer| answer.message.clone());
+            let verified = answer.is_none_or(|answer| answer.verified);
+            let row = div()
+                .id(SharedString::from(format!(
+                    "dialog-function-{}-{line}",
+                    setting.file.display()
+                )))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .py(px(SPACE_S))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-function-enabled-{}-{line}",
+                            setting.file.display()
+                        )))
+                        .w(px(14.))
+                        .cursor_pointer()
+                        .child(if on { "☑" } else { "☐" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.set_function_enabled(enabled_file.clone(), line, !on, cx)
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(icon_sized("nodes/method", 14., &theme))
+                .child(
+                    div()
+                        .w(px(210.))
+                        .truncate()
+                        .text_color(if on { theme.text } else { theme.text_disabled })
+                        .child(setting.dap_name()),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-function-condition-{}-{line}",
+                            setting.file.display()
+                        )))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(if condition.is_empty() {
+                            "if: <none>".to_owned()
+                        } else {
+                            format!("if: {condition}")
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let file = condition_file.clone();
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.ask_function_condition(file, line, window, cx)
+                                });
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-function-hit-{}-{line}",
+                            setting.file.display()
+                        )))
+                        .w(px(110.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(if hit.is_empty() {
+                            "hit: <any>".to_owned()
+                        } else {
+                            format!("hit: {hit}")
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let file = hit_file.clone();
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.ask_function_hit_condition(file, line, window, cx)
+                                });
+                            }
+                        })),
+                )
+                .child(
+                    icon_button(
+                        SharedString::from(format!(
+                            "dialog-function-remove-{}-{line}",
+                            setting.file.display()
+                        )),
+                        "general/closeSmall",
+                        "Remove Method Breakpoint",
+                        None,
+                        &theme,
+                    )
+                    .size(px(20.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(panel) = this.panel.upgrade() {
+                            panel.update(cx, |panel, cx| {
+                                panel.remove_function_breakpoint(remove_file.clone(), line, cx)
+                            });
+                        }
+                        cx.notify();
+                    })),
+                );
+            rows.push(if !verified && on {
+                row.child(
+                    div()
+                        .text_color(theme.warning_mark)
+                        .child(message.unwrap_or_else(|| "not accepted".into())),
+                )
+                .into_any_element()
+            } else {
+                row.into_any_element()
+            });
+        }
+        rows.push(section("Field watchpoints", &theme));
+        for (index, setting) in data_settings.iter().enumerate() {
+            let on = setting.enabled;
+            let data_id = setting.data_id.clone();
+            let enabled_id = data_id.clone();
+            let condition_id = data_id.clone();
+            let hit_id = data_id.clone();
+            let access_id = data_id.clone();
+            let remove_id = data_id.clone();
+            let condition = setting.condition.clone().unwrap_or_default();
+            let hit = setting.hit_condition.clone().unwrap_or_default();
+            let answer = data_answers.get(index);
+            let message = answer.and_then(|answer| answer.message.clone());
+            let verified = answer.is_none_or(|answer| answer.verified);
+            let row = div()
+                .id(SharedString::from(format!("dialog-watch-{data_id}")))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .py(px(SPACE_S))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-watch-enabled-{data_id}"
+                        )))
+                        .w(px(14.))
+                        .cursor_pointer()
+                        .child(if on { "☑" } else { "☐" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.set_data_enabled(enabled_id.clone(), !on, cx)
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(icon_sized("nodes/field", 14., &theme))
+                .child(
+                    div()
+                        .w(px(180.))
+                        .truncate()
+                        .text_color(if on { theme.text } else { theme.text_disabled })
+                        .child(data_id.clone()),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("dialog-watch-access-{data_id}")))
+                        .w(px(110.))
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(format!("on: {}", setting.access().label()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.cycle_data_access(access_id.clone(), cx)
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-watch-condition-{data_id}"
+                        )))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(if condition.is_empty() {
+                            "if: <none>".to_owned()
+                        } else {
+                            format!("if: {condition}")
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let id = condition_id.clone();
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.ask_data_condition(id, window, cx)
+                                });
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("dialog-watch-hit-{data_id}")))
+                        .w(px(90.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(if hit.is_empty() {
+                            "hit: <any>".to_owned()
+                        } else {
+                            format!("hit: {hit}")
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let id = hit_id.clone();
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.ask_data_hit_condition(id, window, cx)
+                                });
+                            }
+                        })),
+                )
+                .child(
+                    icon_button(
+                        SharedString::from(format!("dialog-watch-remove-{data_id}")),
+                        "general/closeSmall",
+                        "Remove Field Watchpoint",
+                        None,
+                        &theme,
+                    )
+                    .size(px(20.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(panel) = this.panel.upgrade() {
+                            panel.update(cx, |panel, cx| {
+                                panel.remove_data_breakpoint(remove_id.clone(), cx)
+                            });
+                        }
+                        cx.notify();
+                    })),
+                );
+            rows.push(if !verified && on {
+                row.child(
+                    div()
+                        .text_color(theme.warning_mark)
+                        .child(message.unwrap_or_else(|| "not accepted".into())),
+                )
+                .into_any_element()
+            } else {
+                row.into_any_element()
+            });
+        }
         rows.push(section("Exception breakpoints", &theme));
         if filters.is_empty() {
             rows.push(
@@ -3338,6 +4369,20 @@ pub(crate) fn refresh_breakpoints(
         .map(|line| line - 1)
         .collect();
     view.set_temporary_breakpoints(temporary, cx);
+    let function = panel.read(cx).function_breakpoint_lines(view.path());
+    let function: Vec<u32> = function
+        .into_iter()
+        .filter(|line| *line > 0)
+        .map(|line| line - 1)
+        .collect();
+    view.set_function_breakpoints(function, cx);
+    let fields = panel.read(cx).field_watchpoint_lines(view.path());
+    let fields: Vec<u32> = fields
+        .into_iter()
+        .filter(|line| *line > 0)
+        .map(|line| line - 1)
+        .collect();
+    view.set_field_watchpoints(fields, cx);
 }
 
 /// The toolbar and the debug keys of the window.
@@ -3431,8 +4476,8 @@ mod tests {
     use ui_kit::gpui::{AppContext, Entity, ScrollHandle, TestAppContext, WeakEntity};
 
     use super::{
-        BreakpointSpec, ConsoleEvent, DebugPanel, DebugService, Debugger, OutputBuffers, RunPlan,
-        Snapshot,
+        BreakpointSpec, ConsoleEvent, DataBreakpointSetting, DebugPanel, DebugService, Debugger,
+        FunctionBreakpointSetting, OutputBuffers, RunPlan, SavedState, Snapshot,
     };
 
     /// Counts the launches; a start after Stop would be a failure of the panel.
@@ -3486,10 +4531,14 @@ mod tests {
                 asking_targets: false,
                 asking_targets_window: None,
                 breakpoints: Vec::new(),
+                function_breakpoints: Vec::new(),
+                data_breakpoints: Vec::new(),
                 enabled_filters: BTreeSet::new(),
                 watch: Vec::new(),
                 expanded: BTreeSet::new(),
                 shown_breakpoints: Vec::new(),
+                shown_function_breakpoints: Vec::new(),
+                shown_data_breakpoints: Vec::new(),
                 local_console: Vec::new(),
                 seen_console: Vec::new(),
                 console_input: crate::console_input::ConsoleInput::new(),
@@ -3505,6 +4554,33 @@ mod tests {
                 scroll_side: ScrollHandle::new(),
             })
         })
+    }
+
+    #[test]
+    fn method_and_field_settings_survive_the_saved_state() {
+        let saved = SavedState {
+            breakpoints: Vec::new(),
+            function_breakpoints: vec![FunctionBreakpointSetting::new(
+                PathBuf::from("C:/demo/Probe"),
+                4,
+                Some("demo.Probe".into()),
+                "work".into(),
+            )],
+            data_breakpoints: vec![DataBreakpointSetting::from_declaration(
+                PathBuf::from("C:/demo/Probe"),
+                2,
+                "demo.Probe".into(),
+                "value".into(),
+            )],
+            exception_filters: vec!["uncaught".into()],
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let back: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.function_breakpoints[0].dap_name(), "demo.Probe#work");
+        assert_eq!(back.data_breakpoints[0].data_id, "demo.Probe#value");
+        assert!(back.data_breakpoints[0].write);
+        assert_eq!(back.data_breakpoints[0].line, 2);
+        assert_eq!(back.exception_filters, ["uncaught"]);
     }
 
     // ping.exe and cmd.exe stand in for the build and the program.

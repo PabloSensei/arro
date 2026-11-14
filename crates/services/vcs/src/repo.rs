@@ -11,6 +11,7 @@ const RECORD: char = '\u{1e}';
 const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1e";
 const BRANCH_FORMAT: &str =
     "--format=%(HEAD)%1f%(refname)%1f%(objectname)%1f%(upstream:short)%1f%(upstream:track)%1e";
+const LABEL_FORMAT: &str = "--format=%(HEAD)%1f%(refname)%1f%(objectname)%1f%(*objectname)%1e";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Branch {
@@ -34,6 +35,25 @@ pub struct Commit {
     /// Seconds since 1970.
     pub time: i64,
     pub subject: String,
+}
+
+/// A reference the log shows as a label: a local branch, a remote branch or a tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefLabel {
+    /// The commit the reference points at.
+    pub commit: String,
+    /// `main`, `origin/main` or `v0.1.12`.
+    pub name: String,
+    pub kind: RefKind,
+    /// HEAD points at this branch.
+    pub current: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
+    Local,
+    Remote,
+    Tag,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -61,6 +81,17 @@ pub struct CommitOptions {
     pub author: Option<String>,
 }
 
+/// The three versions of a file git left in conflict: the stages of the index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConflictVersions {
+    /// `:1:path`, the common ancestor. `None` when both sides added the file.
+    pub base: Option<Vec<u8>>,
+    /// `:2:path`, ours. `None` when we deleted the file.
+    pub yours: Option<Vec<u8>>,
+    /// `:3:path`, theirs. `None` when they deleted the file.
+    pub theirs: Option<Vec<u8>>,
+}
+
 /// The current text of a file against the last commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDiff {
@@ -86,6 +117,53 @@ pub enum Operation {
     None,
     Merge,
     Rebase,
+    CherryPick,
+    Revert,
+}
+
+/// What Reset Current Branch to Here does with the index and the working tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResetMode {
+    /// Keeps the changes, staged for commit.
+    #[default]
+    Soft,
+    /// Keeps the changes, not staged.
+    Mixed,
+    /// Throws the changes away.
+    Hard,
+    /// Keeps the changes and leaves them not staged.
+    Keep,
+}
+
+impl ResetMode {
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Soft => "--soft",
+            Self::Mixed => "--mixed",
+            Self::Hard => "--hard",
+            Self::Keep => "--keep",
+        }
+    }
+
+    /// The line the Reset dialog shows under the name of the mode.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Soft => "Keep all local changes. Changes will be staged for commit.",
+            Self::Mixed => "Keep all local changes. Changes will not be staged for commit.",
+            Self::Hard => "Discard all local changes.",
+            Self::Keep => "Keep all local changes. Staged changes will be unstaged and kept.",
+        }
+    }
+
+    /// The name of the mode in the menu of git.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Soft => "Soft",
+            Self::Mixed => "Mixed",
+            Self::Hard => "Hard",
+            Self::Keep => "Keep",
+        }
+    }
 }
 
 /// How Update Project brings the upstream in.
@@ -616,6 +694,8 @@ impl Repository {
         match self.operation()? {
             Operation::Merge => self.run(["merge", "--abort"]).map(drop)?,
             Operation::Rebase => self.run(["rebase", "--abort"]).map(drop)?,
+            Operation::CherryPick => self.run(["cherry-pick", "--abort"]).map(drop)?,
+            Operation::Revert => self.run(["revert", "--abort"]).map(drop)?,
             Operation::None => return Ok(None),
         }
         self.stash_with_id(autostash)
@@ -647,6 +727,21 @@ impl Repository {
         self.git.run(&self.root, ["add", "--", path]).map(drop)
     }
 
+    /// The three versions of a conflicted file from the index stages: the common
+    /// ancestor, ours and theirs. A stage the index has no entry for is `None`, as for a
+    /// file one side added or deleted.
+    pub fn conflict_versions(
+        &self,
+        blobs: &mut BlobReader,
+        path: &str,
+    ) -> io::Result<ConflictVersions> {
+        Ok(ConflictVersions {
+            base: blobs.read(&format!(":1:{path}"))?,
+            yours: blobs.read(&format!(":2:{path}"))?,
+            theirs: blobs.read(&format!(":3:{path}"))?,
+        })
+    }
+
     /// Reads `.git/MERGE_MSG`, the message a merge commit starts with.
     pub fn merge_message(&self) -> io::Result<String> {
         let path = self.git_path("MERGE_MSG")?;
@@ -656,8 +751,9 @@ impl Repository {
             .to_owned())
     }
 
-    /// Ends a merge with `message`, or continues a rebase. A merge has to have no conflicts.
-    /// Returns the stash when the local changes did not apply cleanly and still wait there.
+    /// Ends a merge with `message`, or continues a rebase, a cherry-pick or a revert. A
+    /// merge has to have no conflicts. Returns the stash when the local changes did not
+    /// apply cleanly and still wait there.
     pub fn finish(&self, message: &str) -> io::Result<Option<Stash>> {
         let autostash = self.autostash_id()?;
         match self.operation()? {
@@ -673,6 +769,12 @@ impl Repository {
             }
             Operation::Rebase => self
                 .run(["-c", "core.editor=true", "rebase", "--continue"])
+                .map(drop)?,
+            Operation::CherryPick => self
+                .run(["-c", "core.editor=true", "cherry-pick", "--continue"])
+                .map(drop)?,
+            Operation::Revert => self
+                .run(["-c", "core.editor=true", "revert", "--continue"])
                 .map(drop)?,
             Operation::None => return Ok(None),
         }
@@ -739,7 +841,7 @@ impl Repository {
         })
     }
 
-    /// What git waits for: a merge, a rebase, or nothing.
+    /// What git waits for: a merge, a rebase, a cherry-pick, a revert, or nothing.
     pub fn operation(&self) -> io::Result<Operation> {
         let rebase = self.git_path("rebase-merge")?;
         if rebase.exists() || self.git_path("rebase-apply")?.exists() {
@@ -747,6 +849,12 @@ impl Repository {
         }
         if self.git_path("MERGE_HEAD")?.exists() {
             return Ok(Operation::Merge);
+        }
+        if self.git_path("CHERRY_PICK_HEAD")?.exists() {
+            return Ok(Operation::CherryPick);
+        }
+        if self.git_path("REVERT_HEAD")?.exists() {
+            return Ok(Operation::Revert);
         }
         Ok(Operation::None)
     }
@@ -783,6 +891,46 @@ impl Repository {
             })
         });
         Ok(branches.collect())
+    }
+
+    /// The branches and tags of the repository in one call, for the labels of the log.
+    /// The branch HEAD points at is marked current.
+    pub fn labels(&self) -> io::Result<Vec<RefLabel>> {
+        let output = self.run([
+            "for-each-ref",
+            LABEL_FORMAT,
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ])?;
+        let labels = output.split(RECORD).filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split(FIELD);
+            let current = fields.next()? == "*";
+            let reference = fields.next()?;
+            let object = fields.next()?;
+            // An annotated tag names the tag object; the peeled field is its commit.
+            let peeled = fields.next().unwrap_or_default();
+            let commit = if peeled.is_empty() { object } else { peeled }.to_owned();
+            let (name, kind) = if let Some(name) = reference.strip_prefix("refs/heads/") {
+                (name, RefKind::Local)
+            } else if let Some(name) = reference.strip_prefix("refs/remotes/") {
+                (name, RefKind::Remote)
+            } else {
+                (reference.strip_prefix("refs/tags/")?, RefKind::Tag)
+            };
+            // `origin/HEAD` only points at another branch.
+            if kind == RefKind::Remote && name.ends_with("/HEAD") {
+                return None;
+            }
+            let name = name.to_owned();
+            Some(RefLabel {
+                commit,
+                name,
+                kind,
+                current,
+            })
+        });
+        Ok(labels.collect())
     }
 
     pub fn switch(&self, branch: &str) -> io::Result<()> {
@@ -891,7 +1039,9 @@ impl Repository {
         }
         let limit = format!("--max-count={limit}");
         let skip = format!("--skip={skip}");
-        let mut args = vec!["log", LOG_FORMAT, &limit, &skip];
+        // A parent always follows its children, so the graph of the window has no line
+        // that has to go back up.
+        let mut args = vec!["log", LOG_FORMAT, "--topo-order", &limit, &skip];
         if let Some(path) = path {
             args.push("--");
             args.push(path);
@@ -959,6 +1109,75 @@ impl Repository {
                 .map(str::to_owned),
         );
         Ok(())
+    }
+
+    /// Checks out the revision itself, leaving HEAD detached, as Checkout Revision of the
+    /// log does. Local changes git cannot keep are an error, as they are for a branch.
+    pub fn checkout_commit(&self, commit: &str) -> io::Result<()> {
+        self.git
+            .run(&self.root, ["switch", "--detach", commit])
+            .map(drop)
+    }
+
+    /// New Tag of the log: a lightweight tag at `commit`.
+    pub fn create_tag(&self, name: &str, commit: &str) -> io::Result<()> {
+        self.git.run(&self.root, ["tag", name, commit]).map(drop)
+    }
+
+    /// New Branch of the log: a branch at `commit`, checked out when `checkout` is set.
+    pub fn branch_from(&self, name: &str, commit: &str, checkout: bool) -> io::Result<()> {
+        self.git.run(&self.root, ["branch", name, commit])?;
+        if checkout {
+            self.switch(name)?;
+        }
+        Ok(())
+    }
+
+    /// Replays `commits` onto the current branch, the oldest first, as Cherry-Pick does.
+    /// A conflict is not an error: it is in the report with `Operation::CherryPick`, which
+    /// [`Repository::finish`] or [`Repository::abort`] ends.
+    pub fn cherry_pick(&self, commits: &[String]) -> io::Result<UpdateReport> {
+        if commits.is_empty() {
+            return Err(io::Error::other("no commit is chosen"));
+        }
+        let before = self.stash_ids()?;
+        let mut args = vec!["cherry-pick"];
+        let order = self.oldest_first(commits)?;
+        args.extend(order.iter().map(String::as_str));
+        let result = self
+            .git
+            .run(&self.root, &args)
+            .map(|output| String::from_utf8_lossy(&output).into_owned());
+        self.report_update(result, before)
+    }
+
+    /// Reverts `commit` with the message git writes itself, as Revert Commit does. A
+    /// conflict comes back with `Operation::Revert`.
+    pub fn revert_commit(&self, commit: &str) -> io::Result<UpdateReport> {
+        let before = self.stash_ids()?;
+        let result = self.run(["revert", "--no-edit", commit]);
+        self.report_update(result, before)
+    }
+
+    /// Moves the current branch to `commit`, keeping or throwing the changes away as the
+    /// Reset dialog chose.
+    pub fn reset(&self, commit: &str, mode: ResetMode) -> io::Result<()> {
+        self.git
+            .run(&self.root, ["reset", mode.flag(), commit])
+            .map(drop)
+    }
+
+    /// The commits from the oldest to the newest: the log lists them the other way, and
+    /// cherry-pick replays them in this order.
+    fn oldest_first(&self, commits: &[String]) -> io::Result<Vec<String>> {
+        let mut dated = Vec::with_capacity(commits.len());
+        for (position, commit) in commits.iter().enumerate() {
+            let time = self.run(["show", "-s", "--format=%ct", commit])?;
+            let time: i64 = time.trim().parse().unwrap_or(0);
+            dated.push((time, position, commit.clone()));
+        }
+        dated.sort_by_key(|(time, position, _)| (*time, *position));
+        Ok(dated.into_iter().map(|(_, _, commit)| commit).collect())
     }
 }
 

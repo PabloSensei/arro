@@ -269,6 +269,40 @@ fn open(
                             .ok();
                     });
                 }
+                EditorEvent::RefactorForm(handle_text) => {
+                    let handle_text = handle_text.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::refactor_form::RefactorFormDialog::show(
+                                            handle_text.clone(),
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::CopyElement => {
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.run_command("workspace.copy_element", window, cx)
+                                })
+                                .ok();
+                        })
+                        .ok();
+                }
                 EditorEvent::CallHierarchy(spot) => {
                     let Some(hub) = cx.try_global::<crate::call_hierarchy::ActiveCallHierarchy>()
                     else {
@@ -405,8 +439,68 @@ fn open(
                         let panel = panel.0.clone();
                         let path = view.read(cx).path().to_path_buf();
                         let line = *line + 1;
-                        panel.update(cx, |panel, cx| panel.toggle_breakpoint(path, line, cx));
+                        let declaration = view
+                            .read(cx)
+                            .declaration_on_line((line - 1) as usize)
+                            .cloned();
+                        match declaration {
+                            Some(declaration)
+                                if matches!(
+                                    declaration.kind,
+                                    editor_view::OutlineKind::Method
+                                        | editor_view::OutlineKind::Constructor
+                                        | editor_view::OutlineKind::Function
+                                ) =>
+                            {
+                                panel.update(cx, |panel, cx| {
+                                    panel.toggle_function_breakpoint(
+                                        path,
+                                        line,
+                                        declaration.owner,
+                                        declaration.name,
+                                        cx,
+                                    )
+                                });
+                            }
+                            Some(declaration)
+                                if matches!(
+                                    declaration.kind,
+                                    editor_view::OutlineKind::Field
+                                        | editor_view::OutlineKind::Constant
+                                ) =>
+                            {
+                                panel.update(cx, |panel, cx| {
+                                    panel.toggle_field_watchpoint(
+                                        path,
+                                        line,
+                                        declaration.owner,
+                                        declaration.name,
+                                        cx,
+                                    )
+                                });
+                            }
+                            _ => panel
+                                .update(cx, |panel, cx| panel.toggle_breakpoint(path, line, cx)),
+                        }
                     }
+                }
+                EditorEvent::BlameCommit(id) => {
+                    let id = id.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    // The click lands while the window is being updated: the log opens
+                    // after that update is over.
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::git_log::show_commit(&id, workspace, window, cx)
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
                 }
                 EditorEvent::RunMark(line) => {
                     let view = view.clone();
@@ -425,9 +519,10 @@ fn open(
                         .ok();
                 }
                 EditorEvent::ContextMenu(position) => {
+                    let gutter = view.read(cx).gutter_menu_at(*position);
                     let model = runner
                         .read_with(cx, |workspace, _| {
-                            crate::editor_menu::MenuModel::of(workspace)
+                            crate::editor_menu::MenuModel::of(workspace).in_gutter(gutter)
                         })
                         .ok();
                     if let Some(model) = model {

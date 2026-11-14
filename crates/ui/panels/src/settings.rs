@@ -1,7 +1,8 @@
 //! The Settings window, Ctrl+Alt+S: a titled window with a close button, a search over the
 //! pages, and OK, Cancel and Apply. The pages of the settings file keep a draft until
 //! Apply or OK; Theme, Keymap, the templates and the Project SDK row apply at once, as
-//! their own windows and files do.
+//! their own windows and files do. The window opens with the caret in the search field,
+//! and a click on a page or a setting takes it out until the field is clicked again.
 
 use std::path::{Path, PathBuf};
 
@@ -198,6 +199,8 @@ pub struct SettingsView {
     highlight: Option<&'static str>,
     /// The search over the pages, drawn above the tree.
     search: TextField,
+    /// Whether the caret of the search field is shown. The window opens with it in the
+    /// field, and a click on a page or a setting takes it out.
     search_editing: bool,
     /// The name of the SDK of the project, empty until the environment is read.
     sdk: String,
@@ -264,7 +267,7 @@ impl SettingsView {
             page,
             highlight: target,
             search: TextField::default(),
-            search_editing: false,
+            search_editing: true,
             sdk: "not set".to_owned(),
             runtimes: Vec::new(),
             repository: String::new(),
@@ -328,9 +331,10 @@ impl SettingsView {
     }
 
     /// Edits the draft only: nothing reaches the window or the settings file until Apply
-    /// or OK.
+    /// or OK. The control that was used takes the caret out of the search field.
     fn change(&mut self, change: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
         change(&mut self.draft);
+        self.search_editing = false;
         cx.notify();
     }
 
@@ -339,6 +343,7 @@ impl SettingsView {
             return;
         };
         row.enabled = !row.enabled;
+        self.search_editing = false;
         cx.notify();
     }
 
@@ -507,7 +512,7 @@ impl SettingsView {
     }
 
     /// The search keys. Escape in a filled field clears it; in an empty one it cancels the
-    /// window, as the close button does.
+    /// window, as the close button does. Up and Down walk the pages the query keeps.
     fn search_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" {
             if self.search.text.is_empty() {
@@ -516,6 +521,17 @@ impl SettingsView {
                 self.search = TextField::default();
                 cx.notify();
             }
+            cx.stop_propagation();
+            return;
+        }
+        let modifiers = event.keystroke.modifiers;
+        if matches!(event.keystroke.key.as_str(), "up" | "down")
+            && !modifiers.alt
+            && !modifiers.control
+            && !modifiers.platform
+        {
+            let step = if event.keystroke.key == "up" { -1 } else { 1 };
+            self.step_page(step, cx);
             cx.stop_propagation();
             return;
         }
@@ -532,6 +548,29 @@ impl SettingsView {
             cx.notify();
         }
         cx.stop_propagation();
+    }
+
+    /// Up and Down in the search walk the pages of the tree the query keeps, in its order.
+    fn step_page(&mut self, step: isize, cx: &mut Context<Self>) {
+        let pages = settings_catalog::pages_matching(&self.search.text);
+        let Some(last) = pages.len().checked_sub(1) else {
+            return;
+        };
+        let at = pages
+            .iter()
+            .position(|page| *page == self.page)
+            .unwrap_or(0);
+        let next = if step < 0 {
+            at.saturating_sub(1)
+        } else {
+            (at + 1).min(last)
+        };
+        let page = pages[next];
+        if page != self.page {
+            self.page = page.target();
+            self.highlight = None;
+            cx.notify();
+        }
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -814,11 +853,16 @@ fn setting_row(
     entry: &Setting,
     control: impl IntoElement,
     highlighted: bool,
+    chosen: bool,
     theme: &Theme,
 ) -> Div {
+    let id = entry.id;
     row(entry.title, control, theme)
         .px(px(ROW_PADDING_X))
         .rounded(px(CONTROL_RADIUS))
+        .when(chosen, |this| {
+            this.debug_selector(move || format!("settings-chosen-{}", id.replace('_', "-")))
+        })
         .when(highlighted, |this| this.bg(theme.selection))
 }
 
@@ -1128,6 +1172,7 @@ impl Render for SettingsView {
                                 let label = if dark { "Dark" } else { "Light" };
                                 pill("theme", label, true, &theme)
                                     .on_click(cx.listener(|this, _, _, cx| {
+                                        this.search_editing = false;
                                         this.workspace
                                             .update(cx, |workspace, cx| workspace.toggle_theme(cx))
                                             .ok();
@@ -1238,7 +1283,13 @@ impl Render for SettingsView {
                     };
                     let highlighted = self.highlight == Some(entry.id)
                         || (!query.is_empty() && entry.matches(&query));
-                    content.push(setting_row(entry, control, highlighted, &theme));
+                    content.push(setting_row(
+                        entry,
+                        control,
+                        highlighted,
+                        self.highlight == Some(entry.id),
+                        &theme,
+                    ));
                 }
             }
         }

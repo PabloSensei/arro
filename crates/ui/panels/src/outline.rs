@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use editor_view::{EditorView, OutlineItem, OutlineKind, Semantic};
+use editor_view::{EditorView, LineDeclaration, OutlineItem, OutlineKind, Semantic};
 use futures_util::StreamExt;
 use lang_api::{FileSymbol, FileSymbolsQuery, Symbol, SymbolKind, SymbolProvider, ask, offset_in};
 use ui_kit::*;
@@ -73,6 +73,69 @@ pub fn items_of(symbols: &[Symbol]) -> Vec<OutlineItem> {
             name_range: symbol.name_range.clone(),
         })
         .collect()
+}
+
+/// The line of a byte offset in `text`, from zero.
+fn line_of(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+}
+
+/// The declarations whose names start on a line, from the symbols of the language.
+pub fn declarations_of(symbols: &[Symbol], text: &str) -> Vec<LineDeclaration> {
+    symbols
+        .iter()
+        .map(|symbol| LineDeclaration {
+            line: line_of(text, symbol.name_range.start),
+            name: symbol.name.clone(),
+            owner: symbol.container.clone(),
+            kind: kind_of(symbol.kind),
+        })
+        .collect()
+}
+
+/// The qualified name of a type below `owner`, with `$` between nested types the way
+/// some adapters name them.
+fn type_name(owner: Option<&str>, owner_is_type: bool, name: &str) -> String {
+    match owner.filter(|owner| !owner.is_empty()) {
+        Some(owner) if owner_is_type => format!("{owner}${name}"),
+        Some(owner) => format!("{owner}.{name}"),
+        None => name.to_owned(),
+    }
+}
+
+fn server_declarations(
+    items: &[FileSymbol],
+    text: &str,
+    owner: Option<&str>,
+    owner_is_type: bool,
+    found: &mut Vec<LineDeclaration>,
+) {
+    for symbol in items {
+        if symbol.kind == SymbolKind::Module {
+            server_declarations(&symbol.children, text, Some(&symbol.name), false, found);
+            continue;
+        }
+        found.push(LineDeclaration {
+            line: line_of(text, offset_in(text, symbol.name_range.start)),
+            name: symbol.name.clone(),
+            owner: owner.map(str::to_owned),
+            kind: kind_of(symbol.kind),
+        });
+        if symbol.kind.is_type() {
+            let qualified = type_name(owner, owner_is_type, &symbol.name);
+            server_declarations(&symbol.children, text, Some(&qualified), true, found);
+        }
+    }
+}
+
+/// The declarations the server sends, with the type that owns each one.
+pub fn declarations_of_server(items: &[FileSymbol], text: &str) -> Vec<LineDeclaration> {
+    let mut found = Vec::new();
+    server_declarations(items, text, None, false, &mut found);
+    found
 }
 
 /// `processFindForm(int, Owner): String` and `owners: OwnerRepository`: the name of the
@@ -152,6 +215,7 @@ pub fn refresh(view: &Entity<EditorView>, wait: bool, cx: &mut App) {
             return;
         };
         let mut found = Vec::new();
+        let mut declarations = Vec::new();
         if let (Some(support), Some(uri)) = (server, uri)
             && let Some(provider) = support.file_symbols()
         {
@@ -160,19 +224,26 @@ pub fn refresh(view: &Entity<EditorView>, wait: bool, cx: &mut App) {
                 && !answer.value.is_empty()
             {
                 found = items_of_server(&answer.value, &text);
+                declarations = declarations_of_server(&answer.value, &text);
             }
         }
         if found.is_empty()
             && let Some(provider) = native
         {
-            found = cx
+            let (items, lines) = cx
                 .background_executor()
-                .spawn(async move { items_of(&provider.file_symbols(&path, &text)) })
+                .spawn(async move {
+                    let symbols = provider.file_symbols(&path, &text);
+                    (items_of(&symbols), declarations_of(&symbols, &text))
+                })
                 .await;
+            found = items;
+            declarations = lines;
         }
         weak.update(cx, |view, cx| {
             if view.outline_serial() == serial {
                 view.set_outline(found, cx);
+                view.set_line_declarations(declarations, cx);
             }
         })
         .ok();
@@ -239,5 +310,113 @@ mod checks {
         assert_eq!((items[0].depth, items[0].range.clone()), (1, 10..40));
         assert!(items[0].kind.is_block());
         assert_eq!(icon_of(items[0].kind), "nodes/method");
+    }
+
+    #[test]
+    fn a_declaration_of_a_line_keeps_the_type_that_owns_it() {
+        let text = "package demo;\n\nclass Probe {\n    int value;\n    void work() {}\n}\n";
+        let at = text.find("work").unwrap();
+        let symbols = [Symbol {
+            name: "work".into(),
+            kind: SymbolKind::Method,
+            container: Some("demo.Probe".into()),
+            depth: 1,
+            range: 0..text.len(),
+            name_range: at..at + 4,
+        }];
+        let declarations = super::declarations_of(&symbols, text);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].line, 4);
+        assert_eq!(declarations[0].owner.as_deref(), Some("demo.Probe"));
+        assert_eq!(declarations[0].kind, editor_view::OutlineKind::Method);
+    }
+
+    fn file_symbol(
+        text: &str,
+        name: &str,
+        kind: SymbolKind,
+        name_at: usize,
+        children: Vec<FileSymbol>,
+    ) -> FileSymbol {
+        let line = text[..name_at].matches('\n').count();
+        let line_start = text[..name_at].rfind('\n').map_or(0, |index| index + 1);
+        FileSymbol {
+            name: name.into(),
+            detail: None,
+            kind,
+            range: TextSpan {
+                start: TextPoint {
+                    line: 0,
+                    character: 0,
+                },
+                end: TextPoint {
+                    line: 6,
+                    character: 0,
+                },
+            },
+            name_range: TextSpan {
+                start: TextPoint {
+                    line: line as u32,
+                    character: (name_at - line_start) as u32,
+                },
+                end: TextPoint {
+                    line: line as u32,
+                    character: (name_at - line_start + name.len()) as u32,
+                },
+            },
+            children,
+        }
+    }
+
+    #[test]
+    fn a_server_declaration_names_the_package_and_the_nested_types() {
+        let text = "package demo;\n\nclass Probe {\n    void work() {}\n    class Inner {\n        int field;\n    }\n}\n";
+        let items = vec![file_symbol(
+            text,
+            "demo",
+            SymbolKind::Module,
+            text.find("demo").unwrap(),
+            vec![file_symbol(
+                text,
+                "Probe",
+                SymbolKind::Class,
+                text.find("Probe").unwrap(),
+                vec![
+                    file_symbol(
+                        text,
+                        "work",
+                        SymbolKind::Method,
+                        text.find("work").unwrap(),
+                        vec![],
+                    ),
+                    file_symbol(
+                        text,
+                        "Inner",
+                        SymbolKind::Class,
+                        text.find("Inner").unwrap(),
+                        vec![file_symbol(
+                            text,
+                            "field",
+                            SymbolKind::Field,
+                            text.find("field").unwrap(),
+                            vec![],
+                        )],
+                    ),
+                ],
+            )],
+        )];
+        let declarations = super::declarations_of_server(&items, text);
+        let work = declarations
+            .iter()
+            .find(|declaration| declaration.name == "work")
+            .expect("the method");
+        assert_eq!(work.owner.as_deref(), Some("demo.Probe"));
+        assert_eq!(work.line, 3);
+        let field = declarations
+            .iter()
+            .find(|declaration| declaration.name == "field")
+            .expect("the field of the nested class");
+        assert_eq!(field.owner.as_deref(), Some("demo.Probe$Inner"));
+        assert_eq!(field.line, 5);
     }
 }

@@ -264,6 +264,14 @@ impl LanguageSupport for JavaProject {
         Some(self.providers.as_ref())
     }
 
+    fn action_parameters(&self) -> Option<&lang_api::ActionParametersProvider> {
+        Some(&self.forms)
+    }
+
+    fn action_apply(&self) -> Option<&lang_api::ActionApplyProvider> {
+        Some(&self.forms)
+    }
+
     fn highlights(&self) -> Option<&HighlightProvider> {
         Some(self.providers.as_ref())
     }

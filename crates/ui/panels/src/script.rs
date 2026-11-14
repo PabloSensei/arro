@@ -33,8 +33,10 @@
 //!
 //! `click:SELECTOR` presses the left button in the middle of the element a spot names,
 //! as the mouse does and without the real cursor. The stripe buttons (`stripe-s-project`,
-//! `stripe-s-bookmarks`, ...), the places popup (`places-popup`, `places-empty`) and the
-//! notification balloon (`notification`) have spots, which a release build records as
+//! `stripe-s-bookmarks`, ...), the places popup (`places-popup`, `places-empty`), the
+//! notification balloon (`notification`) and the tab of a markdown file (`markdown-mode-*`
+//! for the buttons of the modes, `markdown-editor-text` and `markdown-preview-text` for
+//! its two panels) have spots, which a release build records as
 //! well as a debug one. `expect:SELECTOR` and `expect-not:SELECTOR` check that the spot
 //! was drawn on the next frame, `expect-tool:TOOL` and `expect-no-tool:TOOL` check that a
 //! tool window is open or closed. `close-notification` hides the balloon as its close

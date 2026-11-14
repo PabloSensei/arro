@@ -22,29 +22,50 @@ pub struct MockDap {
 impl MockDap {
     /// Binds a free port and starts serving. The first connection gets the scenario.
     pub fn start() -> std::io::Result<Self> {
-        Self::start_with_threads(0, None)
+        Self::start_with_threads(0, None, false)
     }
 
     /// The same scenario with `virtual_threads` extra threads, named the way the JDK
     /// names a virtual thread. A test reads a large thread list without a real JVM.
     pub fn start_with_virtual_threads(virtual_threads: usize) -> std::io::Result<Self> {
-        Self::start_with_threads(virtual_threads, None)
+        Self::start_with_threads(virtual_threads, None, false)
     }
 
     /// The scenario with the stack frame of a real file, for the window actions that open
     /// the place of a frame.
     pub fn start_with_stack_source(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()))
+        Self::start_with_threads(0, Some(source.into()), false)
     }
 
-    fn start_with_threads(virtual_threads: usize, source: Option<String>) -> std::io::Result<Self> {
+    /// The scenario of an adapter that lists the requests for method breakpoints, field
+    /// watchpoints and frame restarts among its capabilities.
+    pub fn start_with_breakpoint_kinds() -> std::io::Result<Self> {
+        Self::start_with_threads(0, None, true)
+    }
+
+    /// The same, on a real file, for the window tests of the gutter.
+    pub fn start_with_breakpoint_kinds_for(source: impl Into<String>) -> std::io::Result<Self> {
+        Self::start_with_threads(0, Some(source.into()), true)
+    }
+
+    fn start_with_threads(
+        virtual_threads: usize,
+        source: Option<String>,
+        breakpoint_kinds: bool,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?.to_string();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = seen.clone();
         let thread = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
-                let _ = serve(stream, &recorded, virtual_threads, source.as_deref());
+                let _ = serve(
+                    stream,
+                    &recorded,
+                    virtual_threads,
+                    source.as_deref(),
+                    breakpoint_kinds,
+                );
             }
         });
         Ok(Self {
@@ -89,6 +110,7 @@ fn serve(
     seen: &Mutex<Vec<Value>>,
     virtual_threads: usize,
     source: Option<&str>,
+    breakpoint_kinds: bool,
 ) -> std::io::Result<()> {
     let source = source.unwrap_or("C:/fixture/demo.sample");
     let mut writer = stream.try_clone()?;
@@ -114,22 +136,22 @@ fn serve(
         seq += 1;
         match command {
             "initialize" => {
-                respond(
-                    &mut writer,
-                    seq,
-                    request_seq,
-                    command,
-                    json!({
-                        "supportsConfigurationDoneRequest": true,
-                        "supportsExceptionInfoRequest": true,
-                        "supportsStepInTargetsRequest": true,
-                        "supportsSetVariable": true,
-                        "exceptionBreakpointFilters": [
-                            {"filter": "caught", "label": "Caught Exceptions", "default": false},
-                            {"filter": "uncaught", "label": "Uncaught Exceptions", "default": true}
-                        ]
-                    }),
-                )?;
+                let mut body = json!({
+                    "supportsConfigurationDoneRequest": true,
+                    "supportsExceptionInfoRequest": true,
+                    "supportsStepInTargetsRequest": true,
+                    "supportsSetVariable": true,
+                    "exceptionBreakpointFilters": [
+                        {"filter": "caught", "label": "Caught Exceptions", "default": false},
+                        {"filter": "uncaught", "label": "Uncaught Exceptions", "default": true}
+                    ]
+                });
+                if breakpoint_kinds {
+                    body["supportsFunctionBreakpoints"] = json!(true);
+                    body["supportsDataBreakpoints"] = json!(true);
+                    body["supportsRestartFrame"] = json!(true);
+                }
+                respond(&mut writer, seq, request_seq, command, body)?;
                 seq += 1;
                 event(&mut writer, seq, "initialized", json!({}))?;
             }
@@ -184,6 +206,94 @@ fn serve(
                     request_seq,
                     command,
                     json!({"breakpoints": entries}),
+                )?;
+            }
+            "setFunctionBreakpoints" => {
+                let breakpoints = arguments
+                    .get("breakpoints")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let entries: Vec<Value> = breakpoints
+                    .iter()
+                    .enumerate()
+                    .map(|(index, breakpoint)| {
+                        let name = breakpoint
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if name == "missing.Type#method" {
+                            return json!({"verified": false, "message": "no such type"});
+                        }
+                        json!({"id": 300 + index as i64, "verified": true})
+                    })
+                    .collect();
+                respond(
+                    &mut writer,
+                    seq,
+                    request_seq,
+                    command,
+                    json!({"breakpoints": entries}),
+                )?;
+            }
+            "dataBreakpointInfo" => {
+                let name = arguments
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                respond(
+                    &mut writer,
+                    seq,
+                    request_seq,
+                    command,
+                    json!({
+                        "dataId": format!("demo.Probe#{name}"),
+                        "description": format!("Probe.{name} : int"),
+                        "accessTypes": ["read", "write", "readWrite"],
+                        "canPersist": true
+                    }),
+                )?;
+            }
+            "setDataBreakpoints" => {
+                let breakpoints = arguments
+                    .get("breakpoints")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let entries: Vec<Value> = breakpoints
+                    .iter()
+                    .enumerate()
+                    .map(|(index, breakpoint)| {
+                        let data_id = breakpoint
+                            .get("dataId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if data_id == "demo.Probe#missing" {
+                            return json!({"verified": false, "message": "no such field"});
+                        }
+                        json!({"id": 400 + index as i64, "verified": true})
+                    })
+                    .collect();
+                respond(
+                    &mut writer,
+                    seq,
+                    request_seq,
+                    command,
+                    json!({"breakpoints": entries}),
+                )?;
+            }
+            "restartFrame" => {
+                respond(&mut writer, seq, request_seq, command, json!({}))?;
+                seq += 1;
+                event(
+                    &mut writer,
+                    seq,
+                    "stopped",
+                    json!({
+                        "reason": "restartframe",
+                        "threadId": 1,
+                        "allThreadsStopped": true,
+                    }),
                 )?;
             }
             "setExceptionBreakpoints" => {

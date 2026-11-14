@@ -698,6 +698,98 @@ async fn conditional_and_hit_count_breakpoints_on_petclinic() {
     }
 }
 
+/// A method breakpoint set before the launch stops at the entry of the method, and Drop
+/// Frame sends the selected frame back to its first line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs IDE_CORPUS and MAVEN_USER_HOME with the debug plugin"]
+async fn a_method_breakpoint_and_drop_frame_on_petclinic() {
+    let fixture = fixture();
+    let project = Arc::new(
+        JavaProject::open(fixture.config.clone(), Trust::Trusted).expect("the project opens"),
+    );
+    ready(&project).await;
+    let service = JavaDebugger::new(project.clone(), Handle::current());
+    let jdk = fixture.config.java_home.clone();
+    let spec = probe_process(&fixture, &jdk, 25, "probe.DebugProbe");
+
+    let debugger = service
+        .start_with_breakpoints(
+            spec,
+            "DebugProbe".into(),
+            None,
+            Vec::new(),
+            vec![dap_client::FunctionBreakpointSpec {
+                name: "probe.DebugProbe#add".into(),
+                condition: None,
+                hit_condition: None,
+                enabled: true,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("the session starts");
+
+    let stopped = wait_for(&debugger, |snapshot| {
+        matches!(&snapshot.state, DebugState::Stopped { reason } if reason == "function breakpoint")
+            && snapshot
+                .frames
+                .iter()
+                .any(|frame| frame.name.contains("add"))
+    });
+    let frame = stopped
+        .frames
+        .iter()
+        .find(|frame| frame.name.contains("add"))
+        .expect("a frame in add");
+    assert_eq!(
+        frame.line, BREAK_LINE,
+        "the breakpoint stopped at the entry"
+    );
+    assert_eq!(
+        stopped
+            .function_breakpoints
+            .first()
+            .map(|answer| answer.verified),
+        Some(true),
+        "the adapter accepted the method breakpoint: {:?}",
+        stopped.function_breakpoints
+    );
+
+    // One step away from the entry, so the restarted frame has somewhere to return from.
+    debugger.send(DebugCommand::Next);
+    let stepped = wait_for(&debugger, |snapshot| {
+        matches!(&snapshot.state, DebugState::Stopped { reason } if reason == "step")
+            && snapshot
+                .frames
+                .iter()
+                .any(|frame| frame.name.contains("add") && frame.line > BREAK_LINE)
+    });
+    let frame_id = stepped.selected_frame.expect("the stepped frame");
+
+    debugger.send(DebugCommand::RestartFrame(frame_id));
+    let restarted = wait_for(&debugger, |snapshot| {
+        matches!(&snapshot.state, DebugState::Stopped { reason } if reason == "restartframe")
+            && snapshot
+                .frames
+                .iter()
+                .any(|frame| frame.name.contains("add") && frame.line == BREAK_LINE)
+    });
+    let process_id = restarted.process_id.expect("the process id");
+
+    debugger.send(DebugCommand::Disconnect);
+    wait_for(&debugger, |snapshot| {
+        snapshot.state == DebugState::Terminated
+    });
+    timeout(Duration::from_secs(30), async {
+        while is_running(process_id) {
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the debuggee outlived the session");
+}
+
 /// An exception breakpoint from the adapter capabilities stops the debuggee on a throw.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs IDE_CORPUS and MAVEN_USER_HOME with the debug plugin"]

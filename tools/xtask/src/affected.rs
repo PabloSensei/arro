@@ -1,9 +1,12 @@
 //! `affected`: the workspace crates a change touches. A file belongs to the crate with
 //! the longest directory prefix, and a crate is affected when it is changed itself or
 //! when any workspace crate depends on it, directly or transitively, tests included.
+//! A file outside the crates, such as a script or a query, touches the crates whose
+//! sources name it, and everything when none does.
 //! The command prints the crates as `-p` arguments or runs their checks.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -15,6 +18,18 @@ const XTASK: &str = "xtask";
 
 /// Directories outside the crates that no check compiles.
 const QUIET_DIRS: &[&str] = &["team", "docs", ".github"];
+
+/// Root files outside the crates that change how every crate builds.
+const ROOT_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "deny.toml",
+];
+
+/// Root directories outside the crates that change how every crate builds. `vendor` holds
+/// patched dependencies that reach the crates through the manifest, not through a mention.
+const ROOT_DIRS: &[&str] = &[".cargo", "vendor"];
 
 /// The checks `--run` can start.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,7 +183,7 @@ struct Package {
 
 /// What a changed file belongs to.
 enum Target {
-    Crate(String),
+    Crates(Vec<String>),
     Everything,
     Nothing,
 }
@@ -178,6 +193,9 @@ struct Workspace {
     packages: Vec<Package>,
     /// A crate name and the workspace crates that depend on it.
     dependents: HashMap<String, Vec<String>>,
+    /// A crate name and the texts of its own `*.rs` and `Cargo.toml` files, read once
+    /// so a file outside the crates is matched against them without more disk work.
+    sources: HashMap<String, Vec<String>>,
 }
 
 impl Workspace {
@@ -236,7 +254,7 @@ impl Workspace {
                 }
             }
         }
-        Ok(Self::new(entries, edges))
+        Ok(Self::new(entries, edges).with_sources(root))
     }
 
     fn new(packages: Vec<Package>, edges: Vec<(String, String)>) -> Self {
@@ -253,7 +271,21 @@ impl Workspace {
         Self {
             packages,
             dependents,
+            sources: HashMap::new(),
         }
+    }
+
+    /// Reads the sources of every crate once, so one command run touches the disk once
+    /// whatever the number of changed files.
+    fn with_sources(mut self, root: &Path) -> Self {
+        let mut sources = HashMap::new();
+        for package in &self.packages {
+            let mut texts = Vec::new();
+            collect_sources(&root.join(&package.directory), &mut texts);
+            sources.insert(package.name.clone(), texts);
+        }
+        self.sources = sources;
+        self
     }
 
     /// The names of the crates changed by `changed`, sorted, with their dependents.
@@ -268,8 +300,8 @@ impl Workspace {
                         .map(|package| package.name.clone())
                         .collect();
                 }
-                Target::Crate(name) => {
-                    seeds.insert(name);
+                Target::Crates(names) => {
+                    seeds.extend(names);
                 }
                 Target::Nothing => {}
             }
@@ -291,19 +323,50 @@ impl Workspace {
             .collect()
     }
 
-    /// The crate whose directory is the longest whole-segment prefix of `path`.
+    /// The crates whose directory is the longest whole-segment prefix of `path`, or the
+    /// crates that name a file outside the crates in their sources.
     fn target(&self, path: &str) -> Target {
         if let Some(name) = self.package_of(path) {
-            return Target::Crate(name.to_owned());
+            return Target::Crates(vec![name.to_owned()]);
         }
         let first = path.split('/').next().unwrap_or_default();
         let quiet = QUIET_DIRS.contains(&first) || path.ends_with(".md");
         if quiet {
             return Target::Nothing;
         }
-        // Root manifests, the toolchain, `.cargo`, queries, assets and anything else
-        // outside the crates change how every crate builds.
-        Target::Everything
+        // Root manifests, the toolchain and `.cargo` change how every crate builds.
+        if ROOT_FILES.contains(&path) || ROOT_DIRS.iter().any(|dir| within(dir, path)) {
+            return Target::Everything;
+        }
+        // A script, a query or an asset outside the crates is read by the crates that
+        // name it: `include_str!("../../../../queries/xml/highlights.scm")` names the
+        // file, `join("../../queries/xml")` names its directory.
+        let readers = self.readers(path);
+        if readers.is_empty() {
+            // Nothing in the workspace names the file, so it may change any build.
+            return Target::Everything;
+        }
+        Target::Crates(readers)
+    }
+
+    /// The crates whose sources name the file `path`, by the whole path or its directory.
+    fn readers(&self, path: &str) -> Vec<String> {
+        let mut needles = vec![path.to_owned()];
+        if let Some(directory) = path.rsplit_once('/').map(|(directory, _)| directory) {
+            needles.push(format!("{directory}/"));
+            needles.push(format!("{directory}\""));
+        }
+        self.packages
+            .iter()
+            .filter(|package| {
+                self.sources.get(&package.name).is_some_and(|texts| {
+                    texts
+                        .iter()
+                        .any(|text| needles.iter().any(|needle| text.contains(needle)))
+                })
+            })
+            .map(|package| package.name.clone())
+            .collect()
     }
 
     fn package_of(&self, path: &str) -> Option<&str> {
@@ -327,6 +390,36 @@ fn within(directory: &str, path: &str) -> bool {
         || path
             .strip_prefix(directory)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a file inside a crate can name a path outside it: a Rust source or the
+/// manifest of the crate itself.
+fn reads_source(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rs")
+        || path.file_name().is_some_and(|name| name == "Cargo.toml")
+}
+
+/// Collects the texts of the source files under `directory`, subdirectories included.
+/// An unreadable file is skipped, which leaves the fallback of the caller in charge.
+fn collect_sources(directory: &Path, texts: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if entry.file_name() != "target" {
+                collect_sources(&path, texts);
+            }
+        } else if reads_source(&path)
+            && let Ok(text) = fs::read_to_string(&path)
+        {
+            texts.push(text);
+        }
+    }
 }
 
 fn array(value: &Value) -> &[Value] {
@@ -361,6 +454,19 @@ mod tests {
 
     fn paths(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    /// A graph whose crates have the given source texts.
+    fn sources(graph: Workspace, texts: &[(&str, &[&str])]) -> Workspace {
+        let mut graph = graph;
+        graph.sources = texts
+            .iter()
+            .map(|(name, texts)| {
+                let texts = texts.iter().map(|text| (*text).to_owned()).collect();
+                ((*name).to_owned(), texts)
+            })
+            .collect();
+        graph
     }
 
     #[test]
@@ -480,6 +586,147 @@ mod tests {
         assert_eq!(
             status_path("R  crates/old/src/lib.rs -> crates/new/src/lib.rs"),
             Some("crates/new/src/lib.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_file_outside_the_crates_belongs_to_the_crates_that_name_it() {
+        let graph = sources(
+            workspace(
+                &[
+                    ("reader", "crates/reader"),
+                    ("other", "crates/other"),
+                    ("app", "crates/app"),
+                ],
+                &[("app", "reader")],
+            ),
+            &[
+                (
+                    "reader",
+                    &[
+                        r#"const HIGHLIGHTS: &str = include_str!("../../../../queries/xml/highlights.scm");"#,
+                        r#"let script = root.join("../../../tools/smoke/release.script");"#,
+                    ],
+                ),
+                ("other", &["fn run() {}"]),
+            ],
+        );
+        // The source spells both paths from its own directory, with `../` in front.
+        assert_eq!(
+            graph.affected(&paths(&["queries/xml/highlights.scm"])),
+            ["app", "reader"]
+        );
+        assert_eq!(
+            graph.affected(&paths(&["tools/smoke/release.script"])),
+            ["app", "reader"]
+        );
+        // Naming one file of a directory names the directory, so its other files count.
+        assert_eq!(
+            graph.affected(&paths(&["queries/xml/folds.scm"])),
+            ["app", "reader"]
+        );
+        // Nobody names the file, so it may change any crate.
+        assert_eq!(
+            graph.affected(&paths(&["assets/icons/logo.svg"])),
+            ["app", "other", "reader"]
+        );
+    }
+
+    #[test]
+    fn a_directory_mention_covers_every_file_below_it() {
+        let graph = sources(
+            workspace(
+                &[
+                    ("quoted", "crates/quoted"),
+                    ("slashed", "crates/slashed"),
+                    ("other", "crates/other"),
+                ],
+                &[],
+            ),
+            &[
+                ("quoted", &[r#"root.join("../../queries/xml")"#]),
+                ("slashed", &[r#"root.join("../../queries/yaml/")"#]),
+                ("other", &["fn run() {}"]),
+            ],
+        );
+        assert_eq!(
+            graph.affected(&paths(&["queries/xml/highlights.scm"])),
+            ["quoted"]
+        );
+        assert_eq!(
+            graph.affected(&paths(&["queries/yaml/folds.scm"])),
+            ["slashed"]
+        );
+        assert_eq!(
+            graph.affected(&paths(&["queries/java/highlights.scm"])),
+            ["other", "quoted", "slashed"]
+        );
+    }
+
+    #[test]
+    fn a_root_manifest_wins_over_a_mention_in_a_source() {
+        // The crate names the root manifest, yet a root manifest changes every build.
+        let graph = sources(
+            workspace(&[("one", "crates/one"), ("two", "crates/two")], &[]),
+            &[("one", &["// the root Cargo.toml"])],
+        );
+        for path in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "deny.toml",
+            ".cargo/config.toml",
+        ] {
+            assert_eq!(graph.affected(&paths(&[path])), ["one", "two"], "{path}");
+        }
+    }
+
+    #[test]
+    fn the_real_graph_reads_the_release_script_only_in_panels_and_the_app() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let graph = Workspace::load(&root).unwrap();
+        let affected = graph.affected(&paths(&["tools/smoke/release.script"]));
+        for name in ["panels", "ide"] {
+            assert!(
+                affected.iter().any(|it| it == name),
+                "{name} does not read the release script: {affected:?}"
+            );
+        }
+        assert!(
+            !affected.iter().any(|it| it == "text-core"),
+            "the release script affected text-core: {affected:?}"
+        );
+    }
+
+    #[test]
+    fn the_real_graph_reads_the_xml_queries_only_in_file_syntax() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let graph = Workspace::load(&root).unwrap();
+        let affected = graph.affected(&paths(&["queries/xml/highlights.scm"]));
+        // `panels` and `ide` depend on `file-syntax`, so they follow it.
+        for name in ["file-syntax", "panels", "ide"] {
+            assert!(
+                affected.iter().any(|it| it == name),
+                "{name} does not read the xml queries: {affected:?}"
+            );
+        }
+        assert!(
+            !affected.iter().any(|it| it == "java-syntax"),
+            "the xml queries affected java-syntax: {affected:?}"
+        );
+    }
+
+    #[test]
+    fn the_real_graph_stays_everything_for_a_root_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let graph = Workspace::load(&root).unwrap();
+        let affected = graph.affected(&paths(&["Cargo.toml"]));
+        assert_eq!(affected.len(), graph.packages.len());
+        let affected = graph.affected(&paths(&["vendor/gpui-pre-windows/src/events.rs"]));
+        assert_eq!(
+            affected.len(),
+            graph.packages.len(),
+            "a vendored dependency reaches the crates through the manifest"
         );
     }
 

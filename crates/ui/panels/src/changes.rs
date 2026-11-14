@@ -28,11 +28,14 @@ struct PendingFile {
     path: PathBuf,
     text: String,
     format: text_core::FileFormat,
+    /// The change brings the file into being, so there is no text to keep around it.
+    new: bool,
 }
 
 /// Applies the edits of closed files to their text on disk: every file keeps its
 /// encoding, byte order mark and line ends, and either all of them change or none do.
-/// Returns the files that could not be applied.
+/// A file that does not exist yet is created from the text of its edits; a failure
+/// takes the new files away again. Returns the files that could not be applied.
 fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
     let mut pending: Vec<PendingFile> = Vec::with_capacity(files.len());
     let mut failed = Vec::new();
@@ -50,15 +53,44 @@ fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
                 path: path.clone(),
                 text: apply_to_text(&decoded.text, edits),
                 format: decoded.format,
+                new: false,
             }),
+            // An extract interface and the like bring a file into being: its edits are
+            // the whole text of the new file.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                pending.push(PendingFile {
+                    path: path.clone(),
+                    text: apply_to_text("", edits),
+                    format: text_core::FileFormat::default(),
+                    new: true,
+                });
+            }
             Err(error) => failed.push(format!("{}: {error}", path.display())),
         }
     }
     if !failed.is_empty() {
         return failed;
     }
+    // The new files come first: nothing of the old ones has changed if one fails, and
+    // a failure of the old ones takes the new files away again.
+    let mut created = Vec::new();
+    for file in pending.iter().filter(|file| file.new) {
+        let written = file
+            .path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| text_core::write_file(&file.path, &file.text, &file.format));
+        match written {
+            Ok(()) => created.push(file.path.clone()),
+            Err(error) => {
+                remove_files(&created);
+                return vec![format!("{}: {error}", file.path.display())];
+            }
+        }
+    }
     let updates: Vec<text_core::FileUpdate<'_>> = pending
         .iter()
+        .filter(|file| !file.new)
         .map(|file| text_core::FileUpdate {
             path: &file.path,
             text: &file.text,
@@ -67,7 +99,16 @@ fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
         .collect();
     match text_core::write_files(&updates) {
         Ok(()) => Vec::new(),
-        Err(error) => vec![error.to_string()],
+        Err(error) => {
+            remove_files(&created);
+            vec![error.to_string()]
+        }
+    }
+}
+
+fn remove_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -407,6 +448,44 @@ mod tests {
         let failed = apply_to_files(&[(path.clone(), vec![replace(0, 0, 3, "1")])]);
         assert!(failed.is_empty(), "{failed:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"\xEF\xBB\xBF1\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn a_change_brings_a_new_file_into_being_from_an_empty_text() {
+        let directory = directory("new-file");
+        let made = directory.join("new").join("Made.txt");
+
+        let failed = apply_to_files(&[(made.clone(), vec![replace(0, 0, 0, "made\n")])]);
+
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(std::fs::read_to_string(&made).unwrap(), "made\n");
+    }
+
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn a_failed_file_leaves_no_new_file_behind() {
+        let directory = directory("new-file-rollback");
+        let made = directory.join("Made.txt");
+        let closed = directory.join("Closed.txt");
+        std::fs::write(&closed, "closed").unwrap();
+        let mut permissions = std::fs::metadata(&closed).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&closed, permissions).unwrap();
+
+        let failed = apply_to_files(&[
+            (made.clone(), vec![replace(0, 0, 0, "made\n")]),
+            (closed.clone(), vec![replace(0, 0, 6, "CLOSED")]),
+        ]);
+
+        assert!(
+            failed.iter().any(|file| file.contains("Closed.txt")),
+            "{failed:?}"
+        );
+        assert!(!made.exists());
+
+        let mut permissions = std::fs::metadata(&closed).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&closed, permissions).unwrap();
     }
 
     #[test]

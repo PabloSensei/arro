@@ -1,6 +1,7 @@
 //! Tool windows and popups on top of the workspace.
 
 mod agents;
+mod annotate;
 mod ansi;
 mod branches;
 mod build;
@@ -32,6 +33,7 @@ mod index;
 mod inspect;
 mod items;
 mod marks;
+mod merge_view;
 mod method_hierarchy;
 mod navigation;
 mod outline;
@@ -44,6 +46,7 @@ mod project;
 mod project_state;
 mod project_structure;
 mod prompt;
+mod refactor_form;
 mod reformat;
 mod run;
 mod run_configs;
@@ -68,6 +71,8 @@ mod window_popups;
 mod window_tests;
 #[cfg(test)]
 mod window_tests_actions;
+#[cfg(test)]
+mod window_tests_annotate;
 #[cfg(test)]
 mod window_tests_complete;
 #[cfg(test)]
@@ -97,6 +102,9 @@ mod window_tests_layout;
 #[cfg(test)]
 mod window_tests_live;
 #[cfg(test)]
+mod window_tests_log_graph;
+
+#[cfg(test)]
 mod window_tests_lookup;
 #[cfg(test)]
 mod window_tests_m11;
@@ -110,6 +118,8 @@ mod window_tests_perf;
 mod window_tests_real;
 #[cfg(test)]
 mod window_tests_real_drag;
+#[cfg(test)]
+mod window_tests_refactor_this;
 #[cfg(test)]
 mod window_tests_run;
 #[cfg(test)]
@@ -282,6 +292,8 @@ mod window_tests_cached_views;
 #[cfg(test)]
 mod window_tests_keys_macos;
 #[cfg(test)]
+mod window_tests_markdown_preview;
+#[cfg(test)]
 mod window_tests_mask_hint;
 
 #[cfg(test)]
@@ -309,10 +321,18 @@ mod window_tests_settings_window;
 mod window_tests_diff_views;
 
 #[cfg(test)]
+mod window_tests_merge;
+
+#[cfg(test)]
 mod window_tests_macos_menu;
 
 #[cfg(test)]
+mod window_tests_breakpoint_kinds;
+#[cfg(test)]
 mod window_tests_field_caret;
+
+#[cfg(test)]
+mod window_tests_log_actions;
 
 mod choice;
 mod invalidate;

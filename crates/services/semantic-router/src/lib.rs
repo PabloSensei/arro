@@ -46,7 +46,8 @@ use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 
 pub use providers::{
-    GenerateRequests, LspProviders, PromptSource, semantic_tokens_from_lsp, workspace_change,
+    GenerateRequests, LspProviders, PromptSource, RefactorSteps, semantic_tokens_from_lsp,
+    workspace_change,
 };
 
 /// Where a capability is answered. Native modes arrive with M12.

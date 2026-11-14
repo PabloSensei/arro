@@ -685,3 +685,41 @@ fn compare_shows_the_commits_and_files_of_both_branches() {
     assert_eq!(compare.only_current, Vec::new());
     assert!(compare.files.contains(&"main.txt".to_owned()));
 }
+
+#[test]
+fn blame_names_the_commit_of_every_line_and_the_message_of_each_commit() {
+    let root = temp_dir("blame");
+    init(&root);
+    fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let repo = open(&root);
+    let first = commit(&repo, "first", &[]);
+    configure(&root, "Second Author", "second@example.invalid");
+    fs::write(root.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+    let second = commit(&repo, "second", &[]);
+
+    let lines = repo.blame("a.txt").unwrap();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].commit, first);
+    assert_eq!(lines[0].author, "Test");
+    assert_eq!(lines[2].commit, first);
+    assert_eq!(lines[1].commit, second);
+    assert_eq!(lines[1].author, "Second Author");
+    assert_eq!(lines[1].email, "second@example.invalid");
+    assert_eq!(
+        lines.iter().map(|line| line.line).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+
+    // A line that only lives in the working tree has no commit.
+    fs::write(root.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+    let lines = repo.blame("a.txt").unwrap();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[3].author, "Not Committed Yet");
+    assert!(!lines[3].is_committed());
+
+    let messages = repo
+        .commit_messages(&[first.clone(), second.clone()])
+        .unwrap();
+    assert_eq!(messages.get(&first).map(String::as_str), Some("first"));
+    assert_eq!(messages.get(&second).map(String::as_str), Some("second"));
+}

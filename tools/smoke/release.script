@@ -1,5 +1,5 @@
 # The release smoke run: every button of the stripes, every pair of the right stripe,
-# and the terminal. Run it from the repository root with
+# the terminal and the preview of a markdown file. Run it from the repository root with
 #   arro --state-dir target/smoke-state --script-file tools/smoke/release.script .
 # The lines of the checks and the summary land in target/smoke-report.txt as well as
 # in the terminal.
@@ -210,4 +210,18 @@ show:terminal
 expect-tool:terminal
 type:ping -t 127.0.0.1\n
 wait:2000
+
+# The preview of a markdown file: the text and the rendered document stand beside each
+# other, and the three buttons of the modes switch them. The file is the readme of the
+# project the run opens, and the terminal above stays live until the window goes.
+open:README.md
+expect:markdown-editor-text
+expect:markdown-preview-text
+click:markdown-mode-editor
+expect-not:markdown-preview-text
+click:markdown-mode-preview
+expect-not:markdown-editor-text
+click:markdown-mode-split
+expect:markdown-editor-text
+expect:markdown-preview-text
 close-window

@@ -173,6 +173,9 @@ pub(crate) struct MockService {
     starts: AtomicUsize,
     /// The file the stack frame of the scenario names.
     source: PathBuf,
+    /// Whether the adapter advertises the method and field requests and the frame
+    /// restart among its capabilities.
+    breakpoint_kinds: bool,
 }
 
 impl MockService {
@@ -186,6 +189,23 @@ impl MockService {
             server: Mutex::new(None),
             starts: AtomicUsize::new(0),
             source,
+            breakpoint_kinds: false,
+        })
+    }
+
+    /// The same session on an adapter that lists the requests of method breakpoints,
+    /// field watchpoints and frame restarts.
+    pub(crate) fn with_breakpoint_kinds(source: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("the test runtime starts"),
+            server: Mutex::new(None),
+            starts: AtomicUsize::new(0),
+            source,
+            breakpoint_kinds: true,
         })
     }
 
@@ -197,8 +217,12 @@ impl MockService {
         exception_filters: Vec<String>,
     ) -> Result<Debugger, String> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        let server = lang_fixture::MockDap::start_with_stack_source(self.source.to_string_lossy())
-            .map_err(|error| error.to_string())?;
+        let server = if self.breakpoint_kinds {
+            lang_fixture::MockDap::start_with_breakpoint_kinds_for(self.source.to_string_lossy())
+        } else {
+            lang_fixture::MockDap::start_with_stack_source(self.source.to_string_lossy())
+        }
+        .map_err(|error| error.to_string())?;
         let address = server.address().to_owned();
         *self
             .server
@@ -277,9 +301,24 @@ pub(crate) struct Setup {
 }
 
 pub(crate) fn setup(cx: &mut TestAppContext, name: &str) -> Setup {
+    setup_with_service(cx, name, false)
+}
+
+/// The same window on an adapter that advertises the requests of method breakpoints,
+/// field watchpoints and frame restarts.
+pub(crate) fn setup_with_breakpoint_kinds(cx: &mut TestAppContext, name: &str) -> Setup {
+    setup_with_service(cx, name, true)
+}
+
+fn setup_with_service(cx: &mut TestAppContext, name: &str, breakpoint_kinds: bool) -> Setup {
     let root = sample_project(name);
     let runs = Arc::new(Mutex::new(Vec::new()));
-    let service = MockService::new(root.join("src").join("main.txt"));
+    let source = root.join("src").join("main.txt");
+    let service = if breakpoint_kinds {
+        MockService::with_breakpoint_kinds(source)
+    } else {
+        MockService::new(source)
+    };
     let project = ProjectSetup {
         tool: Some(Arc::new(ProbeTool {
             model: model(&root),

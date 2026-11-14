@@ -331,6 +331,24 @@ const ICONS: &[Icon] = &[
         paint: Paint::Main,
     },
     Icon {
+        name: "general/editorAndPreview",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "columns-2",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
+        name: "general/editorOnly",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "file-text",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
         name: "general/expandAll",
         size: 16,
         shape: Shape::Lucide {
@@ -1089,7 +1107,7 @@ mod tests {
     fn every_icon_file_exists_and_has_the_expected_shape() {
         let directory = root().join(ICON_DIR);
         let files = expected_files();
-        assert_eq!(files.len(), 159);
+        assert_eq!(files.len(), 163);
         for (name, size) in files {
             let path = directory.join(&name);
             let text = fs::read_to_string(&path)

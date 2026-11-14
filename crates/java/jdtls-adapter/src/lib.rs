@@ -657,7 +657,12 @@ fn extended_capabilities() -> Value {
         // Move is the exception: F6 asks the move requests directly and needs this on,
         // otherwise jdtls returns a move with no edits.
         "moveRefactoringSupport": true,
-        "advancedExtractRefactoringSupport": false,
+        // Extract, assign and invert come as commands then; the editor asks
+        // `java/getRefactorEdit` for their edits, or for the values of a small form.
+        "advancedExtractRefactoringSupport": true,
+        // Extract Interface appears only with this and the flag above. The editor shows
+        // its form and asks `java/checkExtractInterfaceStatus` for the members.
+        "extractInterfaceSupport": true,
         // The command proposal carries no edits; the editor asks `java/getRefactorEdit`
         // for them, which is how the hint appears without a dialog.
         "advancedIntroduceParameterRefactoringSupport": true,

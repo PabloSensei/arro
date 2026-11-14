@@ -122,7 +122,7 @@ impl EntityInputHandler for EditorView {
             .iter()
             .find(|laid_out| laid_out.row == row.row)?;
         let x = bounds.left()
-            + px(crate::element::GUTTER_WIDTH + TEXT_INSET)
+            + px(self.gutter_room() + TEXT_INSET)
             + shown.text.x_for_index(row.column)
             - px(self.scroll_left);
         Some(Bounds::new(

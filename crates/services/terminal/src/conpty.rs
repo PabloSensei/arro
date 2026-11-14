@@ -2,7 +2,6 @@
 //! because the conhost built into Windows lags behind. The system API stays as the fallback, so a
 //! checkout without the vendored files still works.
 
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, c_void};
 use std::fs;
@@ -16,12 +15,8 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
 
-use platform::{
-    Job, allow_ctrl_c_in_children, is_console_process, process_created, process_table,
-    terminate_process,
-};
+use platform::{Job, ProcessTree, allow_ctrl_c_in_children};
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_ALG_HANDLE, BCRYPT_SHA256_ALGORITHM, BCryptCloseAlgorithmProvider, BCryptHash,
@@ -45,11 +40,6 @@ use crate::session::SpawnSpec;
 
 /// Keeps grapheme handling in conhost aligned with the per-char widths of `Term`.
 const GLYPH_WIDTH_WCSWIDTH: u32 = 0x10;
-
-/// Rounds of the cleanup after the shell exits, and the pause between them. A program
-/// started in the moment the shell died is found by the next round.
-const CLEANUP_ROUNDS: usize = 5;
-const CLEANUP_PAUSE: Duration = Duration::from_millis(50);
 
 const DIRECTORY_VARIABLE: &str = "IDE_CONPTY_DIR";
 
@@ -352,19 +342,9 @@ pub(crate) struct Pty {
     process: OwnedHandle,
     job: Job,
     pub(crate) pid: u32,
-    /// When the shell was created. A later process that took its id is not a child.
-    started: Option<u64>,
     /// The programs the shell started, pulled out of the shell into the job.
-    tracked: Mutex<Vec<TrackedProcess>>,
+    tree: ProcessTree,
     adopt_calls: AtomicU64,
-}
-
-/// A program of the session tree. The creation time tells a reused id apart from the
-/// process that was seen first; `None` means the process was gone before it was read.
-#[derive(Clone, Copy)]
-struct TrackedProcess {
-    pid: u32,
-    created: Option<u64>,
 }
 
 impl Pty {
@@ -410,8 +390,7 @@ impl Pty {
             process,
             job,
             pid,
-            started: process_created(pid),
-            tracked: Mutex::new(Vec::new()),
+            tree: ProcessTree::new(pid),
             adopt_calls: AtomicU64::new(0),
         };
         Ok((pty, File::from(input_write), File::from(output_read)))
@@ -480,108 +459,16 @@ impl Pty {
     /// the session and must not die with it. Returns how many processes were added.
     pub(crate) fn adopt(&self) -> usize {
         self.adopt_calls.fetch_add(1, Ordering::Relaxed);
-        let entries = process_table();
-        let mut below: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut live: HashSet<u32> = HashSet::new();
-        for entry in &entries {
-            live.insert(entry.pid);
-            if let Some(parent) = entry.parent {
-                below.entry(parent).or_default().push(entry.pid);
-            }
-        }
-        let mut created: HashMap<u32, Option<u64>> = HashMap::new();
-        let mut tracked = self
-            .tracked
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A walk starts from the shell and from every program already found. The id of a
-        // dead parent stays in the snapshot, so orphans of the shell are still reachable.
-        let mut pending = Vec::new();
-        if let Some(started) = self.started {
-            match creation_of(self.pid, &mut created) {
-                Some(actual) if actual == started => pending.push(self.pid),
-                Some(_) => {}
-                // Gone from the snapshot: the id is only a parent link now.
-                None if !live.contains(&self.pid) => pending.push(self.pid),
-                None => {}
-            }
-        } else {
-            pending.push(self.pid);
-        }
-        for process in tracked.iter_mut() {
-            if process.created.is_none() {
-                process.created = creation_of(process.pid, &mut created);
-            }
-            let ours = match creation_of(process.pid, &mut created) {
-                Some(actual) => process.created == Some(actual),
-                // Gone: its children may still name it as their parent.
-                None => !live.contains(&process.pid),
-            };
-            if ours {
-                pending.push(process.pid);
-            }
-        }
-        let mut seen: HashSet<u32> = tracked.iter().map(|process| process.pid).collect();
-        seen.insert(self.pid);
-        let mut added = 0;
-        while let Some(parent) = pending.pop() {
-            let Some(children) = below.get(&parent) else {
-                continue;
-            };
-            for &pid in children {
-                if !seen.insert(pid) {
-                    continue;
-                }
-                let created = creation_of(pid, &mut created);
-                // A program of the session is never older than its shell.
-                if let (Some(started), Some(created)) = (self.started, created)
-                    && created < started
-                {
-                    continue;
-                }
-                // Only the console tree goes with the session. A window program and
-                // everything below it stay alive, and so does an image whose subsystem
-                // cannot be read: nothing of someone else's is ended on a guess.
-                if is_console_process(pid) != Some(true) {
-                    continue;
-                }
-                let _ = self.job.assign_id(pid);
-                tracked.push(TrackedProcess { pid, created });
-                pending.push(pid);
-                added += 1;
-            }
-        }
-        added
+        self.tree.adopt(&self.job)
     }
 
     /// Ends every program of the shell in rounds. The shell may have started one in the
     /// moment it died, and the snapshot keeps the parent id of a dead process, so the
-    /// next round still finds such a late child.
+    /// next round still finds such a late child. This runs on the thread that waits for
+    /// the session, so the rounds stay there.
     pub(crate) fn kill_tree(&self) {
-        for round in 0..CLEANUP_ROUNDS {
-            let added = self.adopt();
-            let known: Vec<TrackedProcess> = self
-                .tracked
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            for process in known {
-                if let Some(created) = process.created {
-                    let _ = terminate_process(process.pid, created);
-                }
-            }
-            // A round without a new id means no parent is left that could start another.
-            if added == 0 && round > 0 {
-                return;
-            }
-            thread::sleep(CLEANUP_PAUSE);
-        }
+        self.tree.kill_blocking(&self.job);
     }
-}
-
-/// The creation time of `pid`, read once per snapshot.
-fn creation_of(pid: u32, cache: &mut HashMap<u32, Option<u64>>) -> Option<u64> {
-    *cache.entry(pid).or_insert_with(|| process_created(pid))
 }
 
 impl Drop for Pty {

@@ -366,6 +366,92 @@ impl JavaDebugger {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn start_with(
+        &self,
+        program: ProcessSpec,
+        name: String,
+        entry: Option<PathBuf>,
+        breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<dap_client::FunctionBreakpointSpec>,
+        data_breakpoints: Vec<dap_client::DataBreakpointSpec>,
+        watch: Vec<String>,
+        exception_filters: Vec<String>,
+    ) -> Result<Debugger, String> {
+        let mut process = program.start().map_err(|error| error.to_string())?;
+        let process_id = process.pid();
+        let stderr = process
+            .take_stderr()
+            .ok_or_else(|| "the debuggee has no error stream".to_owned())?;
+        let (port_sender, port_receiver) = channel();
+        let (output, output_receiver) = output_sender();
+        let stdout = process.take_stdout();
+        let stdout_output = output.clone();
+        let stdout_port = port_sender.clone();
+        thread::spawn(move || {
+            if let Some(stdout) = stdout {
+                read_stream(stdout, stdout_output, false, Some(stdout_port));
+            }
+        });
+        let stderr_output = output.clone();
+        thread::spawn(move || read_stream(stderr, stderr_output, true, Some(port_sender)));
+
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (snapshots, incoming) = channel();
+        let debugger = with_program_input(Debugger::new(commands, incoming), &mut process);
+        let extension = self.extension();
+        extension.session_started(&debugger);
+        let failures = snapshots.clone();
+        self.runtime.spawn(async move {
+            match start_session(
+                extension,
+                process_id,
+                port_receiver,
+                name,
+                entry,
+                breakpoints,
+                function_breakpoints,
+                data_breakpoints,
+                watch,
+                exception_filters,
+                snapshots,
+            )
+            .await
+            {
+                Ok(session) => {
+                    // The process lives until the session ends; dropping it kills the debuggee.
+                    let _process = process;
+                    if let Err(error) = dap_client::run_with_output(
+                        session,
+                        receiver,
+                        Some(output_receiver),
+                        failures.clone(),
+                    )
+                    .await
+                    {
+                        let snapshot = Snapshot {
+                            state: dap_client::DebugState::Terminated,
+                            console: vec![dap_client::ConsoleLine::new(error.to_string(), true)],
+                            process_id: Some(process_id),
+                            ..Snapshot::default()
+                        };
+                        let _ = failures.send(Arc::new(snapshot));
+                    }
+                }
+                Err(message) => {
+                    let snapshot = Snapshot {
+                        state: dap_client::DebugState::Terminated,
+                        console: vec![dap_client::ConsoleLine::new(message, true)],
+                        process_id: Some(process_id),
+                        ..Snapshot::default()
+                    };
+                    let _ = failures.send(Arc::new(snapshot));
+                }
+            }
+        });
+        Ok(debugger)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn attach_with(
         &self,
         host: String,
@@ -373,6 +459,8 @@ impl JavaDebugger {
         name: String,
         project: Option<String>,
         breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<dap_client::FunctionBreakpointSpec>,
+        data_breakpoints: Vec<dap_client::DataBreakpointSpec>,
         watch: Vec<String>,
         exception_filters: Vec<String>,
         wait: bool,
@@ -394,6 +482,8 @@ impl JavaDebugger {
                 name,
                 project,
                 breakpoints,
+                function_breakpoints,
+                data_breakpoints,
                 watch,
                 exception_filters,
                 failures.clone(),
@@ -441,76 +531,39 @@ impl DebugService for JavaDebugger {
         watch: Vec<String>,
         exception_filters: Vec<String>,
     ) -> Result<Debugger, String> {
-        let mut process = program.start().map_err(|error| error.to_string())?;
-        let process_id = process.pid();
-        let stderr = process
-            .take_stderr()
-            .ok_or_else(|| "the debuggee has no error stream".to_owned())?;
-        let (port_sender, port_receiver) = channel();
-        let (output, output_receiver) = output_sender();
-        let stdout = process.take_stdout();
-        let stdout_output = output.clone();
-        let stdout_port = port_sender.clone();
-        thread::spawn(move || {
-            if let Some(stdout) = stdout {
-                read_stream(stdout, stdout_output, false, Some(stdout_port));
-            }
-        });
-        let stderr_output = output.clone();
-        thread::spawn(move || read_stream(stderr, stderr_output, true, Some(port_sender)));
+        self.start_with(
+            program,
+            name,
+            entry,
+            breakpoints,
+            Vec::new(),
+            Vec::new(),
+            watch,
+            exception_filters,
+        )
+    }
 
-        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (snapshots, incoming) = channel();
-        let debugger = with_program_input(Debugger::new(commands, incoming), &mut process);
-        let extension = self.extension();
-        extension.session_started(&debugger);
-        let failures = snapshots.clone();
-        self.runtime.spawn(async move {
-            match start_session(
-                extension,
-                process_id,
-                port_receiver,
-                name,
-                entry,
-                breakpoints,
-                watch,
-                exception_filters,
-                snapshots,
-            )
-            .await
-            {
-                Ok(session) => {
-                    // The process lives until the session ends; dropping it kills the debuggee.
-                    let _process = process;
-                    if let Err(error) = dap_client::run_with_output(
-                        session,
-                        receiver,
-                        Some(output_receiver),
-                        failures.clone(),
-                    )
-                    .await
-                    {
-                        let snapshot = Snapshot {
-                            state: dap_client::DebugState::Terminated,
-                            console: vec![dap_client::ConsoleLine::new(error.to_string(), true)],
-                            process_id: Some(process_id),
-                            ..Snapshot::default()
-                        };
-                        let _ = failures.send(Arc::new(snapshot));
-                    }
-                }
-                Err(message) => {
-                    let snapshot = Snapshot {
-                        state: dap_client::DebugState::Terminated,
-                        console: vec![dap_client::ConsoleLine::new(message, true)],
-                        process_id: Some(process_id),
-                        ..Snapshot::default()
-                    };
-                    let _ = failures.send(Arc::new(snapshot));
-                }
-            }
-        });
-        Ok(debugger)
+    fn start_with_breakpoints(
+        &self,
+        program: ProcessSpec,
+        name: String,
+        entry: Option<PathBuf>,
+        breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<dap_client::FunctionBreakpointSpec>,
+        data_breakpoints: Vec<dap_client::DataBreakpointSpec>,
+        watch: Vec<String>,
+        exception_filters: Vec<String>,
+    ) -> Result<Debugger, String> {
+        self.start_with(
+            program,
+            name,
+            entry,
+            breakpoints,
+            function_breakpoints,
+            data_breakpoints,
+            watch,
+            exception_filters,
+        )
     }
 
     fn attach(
@@ -529,6 +582,34 @@ impl DebugService for JavaDebugger {
             name,
             project,
             breakpoints,
+            Vec::new(),
+            Vec::new(),
+            watch,
+            exception_filters,
+            true,
+        )
+    }
+
+    fn attach_with_breakpoints(
+        &self,
+        host: String,
+        port: u16,
+        name: String,
+        project: Option<String>,
+        breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<dap_client::FunctionBreakpointSpec>,
+        data_breakpoints: Vec<dap_client::DataBreakpointSpec>,
+        watch: Vec<String>,
+        exception_filters: Vec<String>,
+    ) -> Result<Debugger, String> {
+        self.attach_with(
+            host,
+            port,
+            name,
+            project,
+            breakpoints,
+            function_breakpoints,
+            data_breakpoints,
             watch,
             exception_filters,
             true,
@@ -551,6 +632,34 @@ impl DebugService for JavaDebugger {
             name,
             project,
             breakpoints,
+            Vec::new(),
+            Vec::new(),
+            watch,
+            exception_filters,
+            false,
+        )
+    }
+
+    fn attach_ready_with_breakpoints(
+        &self,
+        host: String,
+        port: u16,
+        name: String,
+        project: Option<String>,
+        breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<dap_client::FunctionBreakpointSpec>,
+        data_breakpoints: Vec<dap_client::DataBreakpointSpec>,
+        watch: Vec<String>,
+        exception_filters: Vec<String>,
+    ) -> Result<Debugger, String> {
+        self.attach_with(
+            host,
+            port,
+            name,
+            project,
+            breakpoints,
+            function_breakpoints,
+            data_breakpoints,
             watch,
             exception_filters,
             false,
@@ -584,6 +693,8 @@ async fn start_session(
     name: String,
     entry: Option<PathBuf>,
     breakpoints: Vec<BreakpointSpec>,
+    function_breakpoints: Vec<dap_client::FunctionBreakpointSpec>,
+    data_breakpoints: Vec<dap_client::DataBreakpointSpec>,
     watch: Vec<String>,
     exception_filters: Vec<String>,
     snapshots: Sender<Arc<Snapshot>>,
@@ -634,6 +745,8 @@ async fn start_session(
             .as_ref()
             .map_or(name.clone(), |main| main.main_class.clone()),
         breakpoints,
+        function_breakpoints,
+        data_breakpoints,
         exception_filters,
         watch,
         process_id: Some(process_id),
@@ -648,6 +761,8 @@ async fn attach_session(
     name: String,
     project: Option<String>,
     breakpoints: Vec<BreakpointSpec>,
+    function_breakpoints: Vec<dap_client::FunctionBreakpointSpec>,
+    data_breakpoints: Vec<dap_client::DataBreakpointSpec>,
     watch: Vec<String>,
     exception_filters: Vec<String>,
     _snapshots: Sender<Arc<Snapshot>>,
@@ -670,6 +785,8 @@ async fn attach_session(
         attach_port: Some(port),
         name,
         breakpoints,
+        function_breakpoints,
+        data_breakpoints,
         exception_filters,
         watch,
         process_id: None,

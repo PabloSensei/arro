@@ -72,6 +72,23 @@ pub struct GenerateRequests {
     pub delegate_generate: &'static str,
 }
 
+/// The refactorings of a server that its code actions do not carry edits for. The
+/// commands the editor cannot run from a command alone are split in two: `forms` need
+/// values from the user, `deferred` run through a picker of the editor.
+#[derive(Clone, Copy, Default)]
+pub struct RefactorSteps {
+    /// The commands whose form the editor asks for before the server computes the edits.
+    pub forms: &'static [&'static str],
+    /// The commands the editor runs another way, such as a move to a picked destination.
+    pub deferred: &'static [&'static str],
+}
+
+impl RefactorSteps {
+    fn needs_a_form(self, command: &str) -> bool {
+        self.forms.contains(&command) || self.deferred.contains(&command)
+    }
+}
+
 /// All capabilities of one server. Queries run on `runtime`, `start` returns at once.
 pub struct LspProviders {
     router: Arc<Router>,
@@ -84,6 +101,7 @@ pub struct LspProviders {
     super_request: Option<&'static str>,
     refactor_action: Option<&'static str>,
     refactor_edit_request: Option<&'static str>,
+    refactor_steps: RefactorSteps,
     move_destinations_request: Option<&'static str>,
     move_request: Option<&'static str>,
     change_signature_info_request: Option<&'static str>,
@@ -309,11 +327,13 @@ fn lsp_kind(kind: ActionKind) -> lsp::CodeActionKind {
     }
 }
 
-/// An action the editor can apply by itself, with its edits; `None` for the rest.
-/// `edit_command` is the command of the server whose one argument is a workspace edit.
+/// An action the editor can apply by itself, with its edits, or with its form; `None`
+/// for the rest. `edit_command` is the command of the server whose one argument is a
+/// workspace edit, `refactor_action` the command that carries a refactoring.
 fn action_entry(
     action: lsp::CodeActionOrCommand,
     edit_command: Option<&str>,
+    refactor_action: Option<&str>,
 ) -> Option<ActionEntry> {
     let (title, code, preferred, edit, command) = match action {
         lsp::CodeActionOrCommand::Command(command) => {
@@ -341,13 +361,22 @@ fn action_entry(
             preferred,
             edits: Vec::new(),
             renames: Vec::new(),
+            handle: None,
         });
     }
-    let edit = match (edit, command) {
-        (Some(edit), _) => edit,
+    let (edit, handle) = match (edit, command) {
+        (Some(edit), _) => (edit, None),
         (None, Some(command)) if Some(command.command.as_str()) == edit_command => {
             let argument = command.arguments?.into_iter().next()?;
-            serde_json::from_value(argument).ok()?
+            (serde_json::from_value(argument).ok()?, None)
+        }
+        // The editor asks for the edits later: a form of the user or a picker comes
+        // first. The handle is the command and the title of its row, as opaque as the
+        // provider wants.
+        (None, Some(command)) if Some(command.command.as_str()) == refactor_action => {
+            let arguments = command.arguments.unwrap_or_default();
+            let handle = serde_json::json!({"title": title, "arguments": arguments});
+            (lsp::WorkspaceEdit::default(), Some(handle.to_string()))
         }
         _ => return None,
     };
@@ -359,57 +388,64 @@ fn action_entry(
         preferred,
         edits: change.edits,
         renames: change.renames,
+        handle,
     })
 }
 
 /// Refactorings the server offers only as a command carry their edits behind another
 /// request: asking for them turns an action with no edit into one the editor applies
-/// like any other.
+/// like any other. Commands that need values the editor collects first keep their
+/// place and are run from the handle of their entry. `None` for an action the server
+/// refused, whose row would only promise what cannot run.
 async fn resolve_action(
     router: &Router,
     action: lsp::CodeActionOrCommand,
     refactor_action: Option<&str>,
     edit_request: Option<&str>,
-) -> lsp::CodeActionOrCommand {
+    steps: RefactorSteps,
+) -> Option<lsp::CodeActionOrCommand> {
     let lsp::CodeActionOrCommand::CodeAction(mut action) = action else {
-        return action;
+        return Some(action);
     };
     if action.edit.is_some() {
-        return lsp::CodeActionOrCommand::CodeAction(action);
+        return Some(lsp::CodeActionOrCommand::CodeAction(action));
     }
     let (Some(command), Some(refactor_action), Some(edit_request)) =
         (&action.command, refactor_action, edit_request)
     else {
-        return lsp::CodeActionOrCommand::CodeAction(action);
+        return Some(lsp::CodeActionOrCommand::CodeAction(action));
     };
     if command.command != refactor_action {
-        return lsp::CodeActionOrCommand::CodeAction(action);
+        return Some(lsp::CodeActionOrCommand::CodeAction(action));
     }
     let arguments = command.arguments.clone().unwrap_or_default();
     let Some(name) = arguments.first().and_then(|name| name.as_str()) else {
-        return lsp::CodeActionOrCommand::CodeAction(action);
+        return Some(lsp::CodeActionOrCommand::CodeAction(action));
     };
     let Some(context) = arguments.get(1).cloned() else {
-        return lsp::CodeActionOrCommand::CodeAction(action);
+        return Some(lsp::CodeActionOrCommand::CodeAction(action));
     };
-    // Only the introduce parameter command is resolved here: the extract ones come
-    // with their edits already, and move needs a destination from F6.
-    if name != "introduceParameter" {
-        return lsp::CodeActionOrCommand::CodeAction(action);
+    if steps.needs_a_form(name) {
+        return Some(lsp::CodeActionOrCommand::CodeAction(action));
     }
+    let extra = arguments.get(2..).unwrap_or_default();
     let params = serde_json::json!({
         "command": name,
-        "commandArguments": [],
+        "commandArguments": extra,
         "context": context,
         "options": {"tabSize": 4, "insertSpaces": true},
     });
-    if let Ok(reply) = router.extension(edit_request, params).await
-        && let Some(edit) = reply.get("edit")
-        && let Ok(edit) = serde_json::from_value::<lsp::WorkspaceEdit>(edit.clone())
-    {
-        action.edit = Some(edit);
+    match router.extension(edit_request, params).await {
+        Ok(reply) => {
+            let edit = reply
+                .get("edit")
+                .and_then(|edit| serde_json::from_value::<lsp::WorkspaceEdit>(edit.clone()).ok())?;
+            action.edit = Some(edit);
+            Some(lsp::CodeActionOrCommand::CodeAction(action))
+        }
+        // No answer: the row would promise an action that cannot run.
+        Err(_) => None,
     }
-    lsp::CodeActionOrCommand::CodeAction(action)
 }
 
 async fn action_entries(
@@ -418,11 +454,20 @@ async fn action_entries(
     edit_command: Option<&str>,
     refactor_action: Option<&str>,
     refactor_edit_request: Option<&str>,
+    refactor_steps: RefactorSteps,
 ) -> Vec<ActionEntry> {
     let mut entries = Vec::new();
     for action in response.into_iter().flatten() {
-        let action = resolve_action(router, action, refactor_action, refactor_edit_request).await;
-        entries.extend(action_entry(action, edit_command));
+        let action = resolve_action(
+            router,
+            action,
+            refactor_action,
+            refactor_edit_request,
+            refactor_steps,
+        )
+        .await;
+        entries
+            .extend(action.and_then(|action| action_entry(action, edit_command, refactor_action)));
     }
     entries
 }
@@ -562,6 +607,7 @@ async fn prompt_entry(
         preferred: false,
         edits: change.edits,
         renames: change.renames,
+        handle: None,
     })
 }
 
@@ -1138,6 +1184,7 @@ impl LspProviders {
             super_request: None,
             refactor_action: None,
             refactor_edit_request: None,
+            refactor_steps: RefactorSteps::default(),
             move_destinations_request: None,
             move_request: None,
             change_signature_info_request: None,
@@ -1180,6 +1227,13 @@ impl LspProviders {
     pub fn with_refactor_action(mut self, command: &'static str, request: &'static str) -> Self {
         self.refactor_action = Some(command);
         self.refactor_edit_request = Some(request);
+        self
+    }
+
+    /// Names the commands of the refactoring action that need more than its arguments:
+    /// the ones with a form of the editor and the ones it runs through a picker.
+    pub fn with_refactor_steps(mut self, steps: RefactorSteps) -> Self {
+        self.refactor_steps = steps;
         self
     }
 
@@ -1537,6 +1591,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for LspProviders {
         let edit_command = self.edit_command;
         let refactor_action = self.refactor_action;
         let refactor_edit_request = self.refactor_edit_request;
+        let refactor_steps = self.refactor_steps;
         let prompt_sources = self.prompt_sources.clone();
         self.answer(cancel, reply, async move {
             let place = Place {
@@ -1558,6 +1613,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for LspProviders {
                         edit_command,
                         refactor_action,
                         refactor_edit_request,
+                        refactor_steps,
                     )
                     .await
                 }
@@ -3082,6 +3138,7 @@ mod tests {
                 }]},
             })),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(entry.kind, Some(ActionKind::OrganizeImports));
@@ -3124,11 +3181,36 @@ mod tests {
                 },
             })),
             Some("lang.applyEdit"),
+            Some("lang.applyRefactoringCommand"),
         )
         .unwrap();
         assert_eq!(entry.kind, Some(ActionKind::Refactor));
         assert_eq!(entry.code.as_deref(), Some("refactor.change.signature"));
         assert!(entry.edits.is_empty() && entry.renames.is_empty());
+    }
+
+    #[test]
+    fn an_action_that_needs_values_carries_the_command_as_its_handle() {
+        let entry = action_entry(
+            action(json!({
+                "title": "Extract interface...",
+                "kind": "refactor.extract.interface",
+                "command": {
+                    "title": "Extract interface...",
+                    "command": "lang.applyRefactor",
+                    "arguments": ["extractInterface", {"textDocument": {"uri": "file:///a/B.x"}}],
+                },
+            })),
+            Some("lang.applyEdit"),
+            Some("lang.applyRefactor"),
+        )
+        .unwrap();
+        assert_eq!(entry.code.as_deref(), Some("refactor.extract.interface"));
+        assert!(entry.edits.is_empty() && entry.renames.is_empty());
+        let handle: serde_json::Value =
+            serde_json::from_str(entry.handle.as_deref().unwrap()).unwrap();
+        assert_eq!(handle["title"], "Extract interface...");
+        assert_eq!(handle["arguments"][0], "extractInterface");
     }
 
     #[test]
@@ -3141,9 +3223,9 @@ mod tests {
                            "end": {"line": 0, "character": 0}},
                  "newText": "import a.C;\n"}]}}],
         });
-        let entry = action_entry(action(command.clone()), Some("lang.applyEdit")).unwrap();
+        let entry = action_entry(action(command.clone()), Some("lang.applyEdit"), None).unwrap();
         assert_eq!(entry.edits[0].edits[0].text, "import a.C;\n");
-        assert!(action_entry(action(command), None).is_none());
+        assert!(action_entry(action(command), None, None).is_none());
     }
 
     #[test]

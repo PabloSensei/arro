@@ -13,6 +13,8 @@ use workspace::Workspace;
 pub(crate) struct MenuModel {
     can_run: bool,
     can_debug: bool,
+    /// The click was in the gutter: the menu adds the rows of the blame column.
+    gutter: bool,
     shortcuts: HashMap<&'static str, Option<SharedString>>,
 }
 
@@ -59,8 +61,15 @@ impl MenuModel {
         Self {
             can_run: workspace.can_run(),
             can_debug: workspace.can_debug(),
+            gutter: false,
             shortcuts,
         }
+    }
+
+    /// The same menu for a right click in the gutter, where the blame column rows belong.
+    pub(crate) fn in_gutter(mut self, gutter: bool) -> Self {
+        self.gutter = gutter;
+        self
     }
 
     fn key(&self, action: &str) -> Option<SharedString> {
@@ -298,6 +307,26 @@ fn build(
             key("workspace::ShowBranches"),
             || Box::new(workspace::ShowBranches),
         ));
+        if model.gutter {
+            // The row toggles, as the gutter menu of IDEA does: the column of the open
+            // editor is either annotated already or gets its blame now.
+            let (label, command) = if view.read(cx).has_annotations() {
+                ("Close Annotations", crate::git::CLOSE_ANNOTATIONS_COMMAND)
+            } else {
+                ("Annotate with Git Blame", crate::git::ANNOTATE_COMMAND)
+            };
+            let runner = workspace.clone();
+            entries.push(
+                MenuEntry::new(label, move |window, cx| {
+                    runner
+                        .update(cx, |workspace, cx| {
+                            workspace.run_command(command, window, cx)
+                        })
+                        .ok();
+                })
+                .icon("general/vcs"),
+            );
+        }
     }
 
     entries

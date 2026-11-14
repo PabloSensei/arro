@@ -229,6 +229,22 @@ pub fn macos_keys(id: &str) -> Option<&'static [&'static str]> {
     table.get(id).copied()
 }
 
+/// The first key of an IDEA action of the default keymap file, `f5`, on this platform.
+/// It is for a row that shows the key of a window action which is not a command of the
+/// keymap, such as Copy Element.
+pub fn idea_shortcut(id: &str) -> Option<String> {
+    static TABLE: OnceLock<HashMap<String, Vec<Shortcut>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let file = if crate::platform().uses_command() {
+            IDEA_DEFAULT_MACOS
+        } else {
+            IDEA_DEFAULT
+        };
+        idea_shortcuts(file).unwrap_or_default()
+    });
+    table.get(id)?.first().map(ToString::to_string)
+}
+
 /// IDEA action id to its shortcuts, from a file in the `idea-default.json` format.
 pub fn idea_shortcuts(json: &str) -> Result<HashMap<String, Vec<Shortcut>>, KeymapError> {
     let bad = |message: &str| KeymapError::BadKeymapFile(message.to_owned());

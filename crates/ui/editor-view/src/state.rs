@@ -16,6 +16,7 @@ use text_core::{
     transform_offset, write_file,
 };
 
+use crate::annotate::BlameNote;
 use crate::blocks::{brace_pairs, containing_block, element_list_at, enclosing_block, units_in};
 use crate::semantic::{TokenSpan, normalize_tokens, shift_tokens};
 
@@ -90,6 +91,9 @@ pub struct EditorState {
     place_cursor: Option<usize>,
     /// Bookmarks as the offset of a place on their line, which follows the text.
     bookmarks: Vec<(usize, Option<char>)>,
+    /// The blame of the lines by the offset of the start of the line; `None` when the
+    /// column is off. The offsets follow the text as the bookmarks do.
+    annotations: Option<Vec<(usize, BlameNote)>>,
     /// The window keeps the bookmarks of this file from this view; a second view of the
     /// document only reads them, so the two never erase each other in the shared list.
     writes_bookmarks: bool,
@@ -132,6 +136,25 @@ fn column_of_char(text: &str, chars: usize) -> usize {
         .map_or(text.len(), |(at, _)| at)
 }
 
+/// Moves the offset of a blame label with the text. Text inserted exactly at the offset
+/// leaves the label with the line that follows it, so a line typed above takes no label
+/// and the lines under it keep theirs.
+fn shift_annotation(offset: usize, edits: &[Edit]) -> usize {
+    let mut delta = 0isize;
+    for edit in edits {
+        if edit.range.end < offset {
+            delta += edit.text.len() as isize - edit.range.len() as isize;
+        } else if edit.range.start < offset {
+            return (edit.range.start as isize + delta) as usize + edit.text.len();
+        } else if edit.range.start == offset && edit.range.is_empty() {
+            delta += edit.text.len() as isize;
+        } else {
+            break;
+        }
+    }
+    (offset as isize + delta) as usize
+}
+
 impl EditorState {
     pub fn new(
         text: &str,
@@ -163,6 +186,7 @@ impl EditorState {
             places: Vec::new(),
             place_cursor: None,
             bookmarks: Vec::new(),
+            annotations: None,
             writes_bookmarks: true,
             overwrite: false,
             auto_closers: Vec::new(),
@@ -195,6 +219,7 @@ impl EditorState {
             places: Vec::new(),
             place_cursor: None,
             bookmarks: self.bookmarks.clone(),
+            annotations: self.annotations.clone(),
             writes_bookmarks: false,
             overwrite: false,
             auto_closers: Vec::new(),
@@ -659,6 +684,11 @@ impl EditorState {
             for (at, _) in &mut self.bookmarks {
                 *at = transform_offset(*at, step);
             }
+            if let Some(notes) = &mut self.annotations {
+                for (at, _) in notes.iter_mut() {
+                    *at = shift_annotation(*at, step);
+                }
+            }
             self.auto_closers
                 .retain(|at| !step.iter().any(|edit| edit.range.contains(at)));
             for at in &mut self.auto_closers {
@@ -667,6 +697,9 @@ impl EditorState {
         }
         normalize_spans(&mut self.spans, self.buffer.store().len());
         normalize_tokens(&mut self.tokens, self.buffer.store().len());
+        if let Some(notes) = &mut self.annotations {
+            notes.dedup_by_key(|(at, _)| *at);
+        }
         if by_user {
             self.remember_place();
         }
@@ -1221,6 +1254,76 @@ impl EditorState {
         let store = self.buffer.store();
         let found = self.bookmarks.iter().find(|(_, m)| *m == Some(mnemonic));
         found.map(|(at, _)| store.offset_to_line((*at).min(store.len())))
+    }
+
+    /// Puts the blame of the lines in the column before the text. The lines are counted
+    /// from one; one past the end of the text is left out.
+    pub fn set_annotations(&mut self, lines: &[(u32, BlameNote)]) {
+        let store = self.buffer.store();
+        let count = store.line_count();
+        let mut notes: Vec<(usize, BlameNote)> = lines
+            .iter()
+            .filter(|(line, _)| (*line as usize) >= 1 && (*line as usize) <= count)
+            .map(|(line, note)| (store.line_to_offset(*line as usize - 1), note.clone()))
+            .collect();
+        notes.sort_by_key(|(at, _)| *at);
+        notes.dedup_by_key(|(at, _)| *at);
+        self.annotations = Some(notes);
+    }
+
+    /// Takes the blame column away.
+    pub fn clear_annotations(&mut self) {
+        self.annotations = None;
+    }
+
+    /// Whether the blame column is on.
+    pub fn has_annotations(&self) -> bool {
+        self.annotations.is_some()
+    }
+
+    /// The blame of `line`, whichever line of its group it is.
+    fn annotation_of_line(&self, line: usize) -> Option<&BlameNote> {
+        let notes = self.annotations.as_deref()?;
+        let store = self.buffer.store();
+        if line >= store.line_count() {
+            return None;
+        }
+        let start = store.line_to_offset(line);
+        let index = notes.partition_point(|(at, _)| *at <= start);
+        let (at, note) = notes.get(index.checked_sub(1)?)?;
+        (store.offset_to_line(*at) == line).then_some(note)
+    }
+
+    /// The blame whose label the column paints on `line`: the first line of a run of one
+    /// commit carries the label of the whole run.
+    pub fn annotation_label_at(&self, line: usize) -> Option<&BlameNote> {
+        let note = self.annotation_of_line(line)?;
+        let follows = line > 0
+            && self
+                .annotation_of_line(line - 1)
+                .is_some_and(|previous| previous.commit == note.commit);
+        (!follows).then_some(note)
+    }
+
+    /// The painted labels with their line from zero and their commit, for a test.
+    pub fn annotation_labels(&self) -> Vec<(u32, String, String)> {
+        let Some(notes) = &self.annotations else {
+            return Vec::new();
+        };
+        let store = self.buffer.store();
+        let mut labels = Vec::new();
+        let mut previous: Option<(usize, &BlameNote)> = None;
+        for (at, note) in notes {
+            let line = store.offset_to_line((*at).min(store.len()));
+            let follows = previous.is_some_and(|(before, previous)| {
+                before + 1 == line && previous.commit == note.commit
+            });
+            if !follows {
+                labels.push((line as u32, note.label.clone(), note.commit.clone()));
+            }
+            previous = Some((line, note));
+        }
+        labels
     }
 
     /// Soft wrap at this many columns, `None` for no wrap.
@@ -2370,6 +2473,37 @@ c",
         state.select_range(4..4);
         state.toggle_bookmark(Some('1'));
         assert_eq!(state.bookmarks(), [(0, None), (2, Some('1'))]);
+    }
+
+    #[test]
+    fn a_blame_label_follows_its_line_and_a_typed_line_takes_none() {
+        let mut state = state("one\ntwo\nthree");
+        let note = |commit: &str| crate::annotate::BlameNote {
+            commit: commit.to_owned(),
+            label: commit.to_owned(),
+            details: String::new(),
+        };
+        state.set_annotations(&[(1, note("a")), (2, note("b"))]);
+        assert_eq!(
+            state.annotation_labels(),
+            [
+                (0, "a".to_owned(), "a".to_owned()),
+                (1, "b".to_owned(), "b".to_owned())
+            ]
+        );
+
+        // Enter at the end of the first line: the empty line under it has no label and
+        // the label of `two` moves down with its text.
+        state.select_range(3..3);
+        type_in(&mut state, "\n");
+        assert_eq!(
+            state
+                .annotation_labels()
+                .iter()
+                .map(|(line, label, _)| (*line, label.clone()))
+                .collect::<Vec<_>>(),
+            [(0, "a".to_owned()), (2, "b".to_owned())]
+        );
     }
 
     #[test]

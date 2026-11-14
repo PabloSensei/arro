@@ -15,6 +15,7 @@ use ui_kit::gpui::{TestAppContext, VisualTestContext, WindowHandle};
 use ui_kit::{point, px};
 use workspace::{Settings, Workspace};
 
+use crate::settings::SettingsView;
 use crate::window_tests::{
     bounds_of, click, draw, open_sample_window, press, type_text, wait_for_signal,
 };
@@ -293,5 +294,138 @@ fn dragging_the_title_moves_the_window(cx: &mut TestAppContext) {
     assert!(
         (moved_y - 60.).abs() <= 4.,
         "the window follows the pointer down: {moved_y}"
+    );
+}
+
+#[gpui::test]
+fn typing_right_after_the_shortcut_reaches_the_search(cx: &mut TestAppContext) {
+    let (window, _file) = open_settings(cx, "settings-window-search-focus");
+
+    assert!(
+        has(cx, window, "settings-search-field-caret"),
+        "the window opens with the caret in the search field"
+    );
+    type_text(cx, window, "font");
+    draw(cx, window);
+
+    assert!(
+        has(cx, window, "settings-search-field-caret"),
+        "the caret stays in the search field while typing"
+    );
+    assert!(
+        has(cx, window, "settings-page-appearance"),
+        "the page with the font settings stays"
+    );
+    assert!(
+        !has(cx, window, "settings-page-project"),
+        "the typing filtered the pages"
+    );
+    assert!(
+        has(cx, window, "settings-editor-font-family"),
+        "the matched setting is on the page"
+    );
+
+    press(cx, window, "escape");
+    draw(cx, window);
+    assert!(
+        has(cx, window, "settings"),
+        "the first Escape of the caret only clears the search"
+    );
+    press(cx, window, "escape");
+    draw(cx, window);
+    assert!(
+        !has(cx, window, "settings"),
+        "Escape in the empty search cancels the window"
+    );
+}
+
+#[gpui::test]
+fn a_click_on_a_setting_takes_the_caret_and_a_click_in_the_search_brings_it_back(
+    cx: &mut TestAppContext,
+) {
+    let (window, _file) = open_settings(cx, "settings-window-search-return");
+
+    click(cx, window, "settings-font-up");
+    draw(cx, window);
+    assert!(
+        !has(cx, window, "settings-search-field-caret"),
+        "the click on the setting takes the caret out of the search"
+    );
+
+    click(cx, window, "settings-search");
+    draw(cx, window);
+    assert!(
+        has(cx, window, "settings-search-field-caret"),
+        "the click in the field brings the caret back"
+    );
+    type_text(cx, window, "font");
+    draw(cx, window);
+    assert!(
+        !has(cx, window, "settings-page-project"),
+        "the typing of the returned caret filters the pages"
+    );
+}
+
+#[gpui::test]
+fn a_setting_of_find_action_opens_with_the_caret_in_the_search(cx: &mut TestAppContext) {
+    let (_root, window) = open_sample_window(cx, "settings-window-search-target");
+    window
+        .update(cx, |workspace, window, cx| {
+            SettingsView::show_at(workspace, window, cx, Some("font_size"));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+    bounds_of(cx, window, "settings");
+
+    assert!(
+        has(cx, window, "settings-search-field-caret"),
+        "the window of Find Action opens with the caret in the search field"
+    );
+    assert!(
+        has(cx, window, "settings-chosen-font-size"),
+        "the target row is drawn as chosen"
+    );
+    type_text(cx, window, "size");
+    draw(cx, window);
+
+    assert!(
+        has(cx, window, "settings-search-field-caret"),
+        "the caret stays in the search field while typing"
+    );
+    assert!(
+        has(cx, window, "settings-page-appearance"),
+        "the page of the target stays"
+    );
+    assert!(
+        !has(cx, window, "settings-page-project"),
+        "the typing filtered the pages"
+    );
+    assert!(
+        has(cx, window, "settings-chosen-font-size"),
+        "the target row stays marked while typing"
+    );
+}
+
+#[gpui::test]
+fn the_arrows_of_the_search_walk_the_pages(cx: &mut TestAppContext) {
+    let (window, _file) = open_settings(cx, "settings-window-search-arrows");
+    assert!(
+        has(cx, window, "settings-font-up"),
+        "the window opens on Appearance"
+    );
+
+    press(cx, window, "down");
+    draw(cx, window);
+    assert!(
+        has(cx, window, "settings-soft-wrap"),
+        "Down moves to the next page of the tree"
+    );
+
+    press(cx, window, "up");
+    draw(cx, window);
+    assert!(
+        has(cx, window, "settings-font-up"),
+        "Up returns to the page before it"
     );
 }

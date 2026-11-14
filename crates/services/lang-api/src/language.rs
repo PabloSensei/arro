@@ -120,6 +120,16 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The form of an action that needs values before its server computes the edits.
+    fn action_parameters(&self) -> Option<&crate::ActionParametersProvider> {
+        None
+    }
+
+    /// The edits of a filled form, asked with the token of its action.
+    fn action_apply(&self) -> Option<&crate::ActionApplyProvider> {
+        None
+    }
+
     fn highlights(&self) -> Option<&HighlightProvider> {
         None
     }

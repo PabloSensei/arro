@@ -1364,6 +1364,28 @@ fn register_git_commands(workspace: &mut Workspace) {
             git.update(cx, |git, cx| git.restore_deleted_branch(cx));
         },
     );
+    workspace.register_command(
+        crate::git::ANNOTATE_COMMAND,
+        "Annotate with Git Blame",
+        |_, _, cx| {
+            let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+                return;
+            };
+            // The blame saves the open files and reads the repository: both wait for the
+            // end of the update that ran the command.
+            cx.defer(move |cx| git.update(cx, |git, cx| git.annotate(cx)));
+        },
+    );
+    workspace.register_command(
+        crate::git::CLOSE_ANNOTATIONS_COMMAND,
+        "Close Annotations",
+        |_, _, cx| {
+            let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+                return;
+            };
+            cx.defer(move |cx| git.update(cx, |git, cx| git.close_annotations(cx)));
+        },
+    );
 }
 
 /// `host:port`, the form the Attach to JVM prompt takes. Only the user names the host.

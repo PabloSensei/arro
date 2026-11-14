@@ -11,8 +11,9 @@ mod threads;
 
 pub use client::{Client, Error, Event, REQUEST_TIMEOUT, ResponseError};
 pub use model::{
-    Breakpoint, BreakpointSpec, Command, ConsoleLine, DebugState, Debugger, Evaluation,
-    ExceptionFilter, Frame, OutputLine, ReloadOutcome, Scope, Snapshot, StepTarget, Thread,
+    Breakpoint, BreakpointKind, BreakpointSpec, Capabilities, Command, ConsoleLine, DataAccessType,
+    DataBreakpointSpec, DebugState, Debugger, Evaluation, ExceptionFilter, Frame,
+    FunctionBreakpointSpec, OutputLine, ReloadOutcome, Scope, Snapshot, StepTarget, Thread,
     Variable, VariableError, WatchValue, line_of, source_path,
 };
 pub use session::{Launch, normalise, output_sender, run, run_with_output};
@@ -78,6 +79,83 @@ pub trait DebugService: Send + Sync + 'static {
             watch,
             exception_filters,
         )
+    }
+
+    /// Like [`DebugService::start`], with the method breakpoints and field watchpoints
+    /// the window already keeps. A language that can send them before the program runs
+    /// overrides this; the default sends them right after the session starts.
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_breakpoints(
+        &self,
+        program: ProcessSpec,
+        name: String,
+        entry: Option<std::path::PathBuf>,
+        breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<FunctionBreakpointSpec>,
+        data_breakpoints: Vec<DataBreakpointSpec>,
+        watch: Vec<String>,
+        exception_filters: Vec<String>,
+    ) -> Result<Debugger, String> {
+        let debugger = self.start(program, name, entry, breakpoints, watch, exception_filters)?;
+        let _ = debugger.send(Command::SetFunctionBreakpoints(function_breakpoints));
+        let _ = debugger.send(Command::SetDataBreakpoints(data_breakpoints));
+        Ok(debugger)
+    }
+
+    /// Like [`DebugService::attach`], with the method breakpoints and field watchpoints.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_with_breakpoints(
+        &self,
+        host: String,
+        port: u16,
+        name: String,
+        project: Option<String>,
+        breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<FunctionBreakpointSpec>,
+        data_breakpoints: Vec<DataBreakpointSpec>,
+        watch: Vec<String>,
+        exception_filters: Vec<String>,
+    ) -> Result<Debugger, String> {
+        let debugger = self.attach(
+            host,
+            port,
+            name,
+            project,
+            breakpoints,
+            watch,
+            exception_filters,
+        )?;
+        let _ = debugger.send(Command::SetFunctionBreakpoints(function_breakpoints));
+        let _ = debugger.send(Command::SetDataBreakpoints(data_breakpoints));
+        Ok(debugger)
+    }
+
+    /// Like [`DebugService::attach_ready`], with the method breakpoints and field watchpoints.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_ready_with_breakpoints(
+        &self,
+        host: String,
+        port: u16,
+        name: String,
+        project: Option<String>,
+        breakpoints: Vec<BreakpointSpec>,
+        function_breakpoints: Vec<FunctionBreakpointSpec>,
+        data_breakpoints: Vec<DataBreakpointSpec>,
+        watch: Vec<String>,
+        exception_filters: Vec<String>,
+    ) -> Result<Debugger, String> {
+        let debugger = self.attach_ready(
+            host,
+            port,
+            name,
+            project,
+            breakpoints,
+            watch,
+            exception_filters,
+        )?;
+        let _ = debugger.send(Command::SetFunctionBreakpoints(function_breakpoints));
+        let _ = debugger.send(Command::SetDataBreakpoints(data_breakpoints));
+        Ok(debugger)
     }
 
     /// Called when a debuggee this process launches starts. The token ends the session

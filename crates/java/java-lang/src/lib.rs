@@ -10,6 +10,7 @@ mod live_templates;
 mod lombok;
 mod problems;
 mod project;
+mod refactor;
 mod session;
 mod setup;
 

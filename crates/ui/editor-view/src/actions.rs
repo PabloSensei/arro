@@ -17,16 +17,39 @@ use crate::view::{EditorEvent, EditorView};
 /// The caret rests this long before its occurrences are asked for.
 const HIGHLIGHT_DELAY: Duration = Duration::from_millis(250);
 
+/// A refactoring the editor runs itself, by the same code as its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Own {
+    Rename,
+    ChangeSignature,
+    Move,
+    Copy,
+    SafeDelete,
+    ExtractMethod,
+    ExtractVariable,
+    ExtractField,
+    ExtractConstant,
+    IntroduceParameter,
+    Inline,
+}
+
 /// A row of a pick list: an action to apply or a place to go to.
 pub(crate) enum Pick {
     Action(ActionEntry),
-    /// A move needs a destination from a second list, so the pick only starts it.
-    Move {
-        label: String,
-    },
     /// A change of signature opens a form of the window, so the pick only starts it.
     ChangeSignature {
         label: String,
+    },
+    /// A refactoring of the editor, with the key that runs it from the text.
+    Refactor {
+        label: String,
+        hint: String,
+        own: Own,
+    },
+    /// An action of the server that asks for values in a form before it runs.
+    Form {
+        label: String,
+        handle: String,
     },
     Place {
         label: String,
@@ -48,11 +71,20 @@ impl Pick {
     pub fn label(&self) -> &str {
         match self {
             Self::Action(entry) => &entry.title,
-            Self::Move { label }
-            | Self::ChangeSignature { label }
+            Self::ChangeSignature { label }
+            | Self::Refactor { label, .. }
+            | Self::Form { label, .. }
             | Self::Place { label, .. }
             | Self::Generate { label, .. }
             | Self::Unwrap { label, .. } => label,
+        }
+    }
+
+    /// The key beside the row, as the menus write it.
+    pub fn hint(&self) -> Option<&str> {
+        match self {
+            Self::Refactor { hint, .. } if !hint.is_empty() => Some(hint),
+            _ => None,
         }
     }
 }
@@ -362,8 +394,11 @@ impl EditorView {
                     (Some(Pick::Action(entry)), Some(version)) => {
                         self.apply_entry(version, entry, cx);
                     }
-                    (Some(Pick::Move { .. }), _) => self.start_move(cx),
                     (Some(Pick::ChangeSignature { .. }), _) => self.change_signature(cx),
+                    (Some(Pick::Refactor { own, .. }), _) => self.run_own(own, cx),
+                    (Some(Pick::Form { handle, .. }), _) => {
+                        cx.emit(EditorEvent::RefactorForm(handle))
+                    }
                     (Some(Pick::Place { target, .. }), _) => self.go_to_location(&target, cx),
                     (Some(Pick::Generate { kind, .. }), _) => self.start_generation(kind, cx),
                     (Some(Pick::Unwrap { edit, .. }), _) => self.apply_unwrap(edit, cx),

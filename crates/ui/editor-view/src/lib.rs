@@ -2,6 +2,7 @@
 //! nothing about the toolkit; `EditorView` turns events into commands and paints.
 
 mod actions;
+mod annotate;
 mod bar;
 mod blocks;
 mod code_lens;
@@ -13,6 +14,7 @@ mod hierarchy;
 mod hippie;
 mod input;
 mod live;
+mod markdown_preview;
 mod quick_doc;
 mod refactor;
 mod regions;
@@ -23,9 +25,11 @@ mod state;
 mod style;
 mod view;
 
+pub use annotate::BlameNote;
 pub use decor::PaneDecor;
 pub use element::StripeKind;
 pub use live::{KeyUse, LiveTemplates, TemplateList};
+pub use markdown_preview::PreviewMode;
 pub use quick_doc::{
     DocAlign, DocBlock, DocHost, DocInline, DocLinkHandler, DocSelectEvent, DocSelectHandler,
     display_text as display_documentation, parse as parse_documentation, render_document,
@@ -45,7 +49,7 @@ pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, Statem
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
     BookmarkEntry, DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView,
-    GutterKind, GutterMark, InlayPaint, Languages, OutlineItem, OutlineKind, ProblemSummary,
-    RowPaint, RunMark, RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate, bookmarks,
-    clipboard_history, highlight_text, install_keymap,
+    GutterKind, GutterMark, InlayPaint, Languages, LineDeclaration, OutlineItem, OutlineKind,
+    ProblemSummary, RowPaint, RunMark, RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate,
+    bookmarks, clipboard_history, highlight_text, install_keymap,
 };

@@ -113,3 +113,64 @@ fn a_json_and_an_xml_file_come_with_highlighted_spans(cx: &mut TestAppContext) {
         "Ctrl+/ takes the block comment away again"
     );
 }
+
+#[gpui::test]
+fn a_gradle_script_and_a_markdown_file_come_with_highlighted_spans(cx: &mut TestAppContext) {
+    let root = scratch("file-syntax-gradle");
+    fs::write(
+        root.join("build.gradle"),
+        "// build script\ndef name = \"app\"\n\nif (name) {\n    println(\"built\")\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("README.md"),
+        "# Build\n\n```groovy\ndef build() {}\n```\n",
+    )
+    .unwrap();
+    let window = open_window(cx, root.clone());
+    cx.run_until_parked();
+    use_file_syntax(cx);
+
+    let gradle = root.join("build.gradle");
+    open_path(cx, window, &gradle);
+    wait_for_parse_signal(cx, window, &gradle);
+    let view = editor_of(cx, window, &gradle);
+    let text = buffer_of(cx, &view);
+    let spans = view.read_with(cx, |view, _| view.highlight_spans().to_vec());
+    assert!(!spans.is_empty(), "the Gradle script is coloured");
+    let comments = coloured(&spans, &text, HighlightKind::Comment);
+    assert!(
+        comments
+            .iter()
+            .any(|comment| comment.contains("build script")),
+        "a Groovy comment keeps its colour: {comments:?}"
+    );
+    let keywords = coloured(&spans, &text, HighlightKind::Keyword);
+    assert!(
+        keywords.iter().any(|keyword| keyword == "def"),
+        "a Groovy keyword keeps its colour: {keywords:?}"
+    );
+    let strings = coloured(&spans, &text, HighlightKind::String);
+    assert!(
+        strings.iter().any(|string| string.contains("app")),
+        "a Groovy string keeps its colour: {strings:?}"
+    );
+
+    let markdown = root.join("README.md");
+    open_path(cx, window, &markdown);
+    wait_for_parse_signal(cx, window, &markdown);
+    let view = editor_of(cx, window, &markdown);
+    let text = buffer_of(cx, &view);
+    let spans = view.read_with(cx, |view, _| view.highlight_spans().to_vec());
+    assert!(!spans.is_empty(), "the Markdown file is coloured");
+    let headings = coloured(&spans, &text, HighlightKind::Keyword);
+    assert!(
+        headings.iter().any(|heading| heading == "Build"),
+        "a Markdown heading keeps its colour: {headings:?}"
+    );
+    let languages = coloured(&spans, &text, HighlightKind::Annotation);
+    assert!(
+        languages.iter().any(|language| language == "groovy"),
+        "the language of a fenced block keeps its colour: {languages:?}"
+    );
+}

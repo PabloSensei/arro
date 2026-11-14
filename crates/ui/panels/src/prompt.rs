@@ -9,7 +9,18 @@ use workspace::Workspace;
 
 pub use ui_kit::TextField;
 
+/// What Enter of a prompt without an option sends back.
 type Submit = Rc<dyn Fn(String, &mut App)>;
+
+/// What Enter of a prompt with an option sends back.
+type SubmitOption = Rc<dyn Fn(String, bool, &mut App)>;
+
+/// What Enter of the prompt sends back: the text, and the tick of the option row when the
+/// prompt has one.
+enum Answer {
+    Text(Submit),
+    TextAndOption(SubmitOption),
+}
 
 pub struct Prompt {
     title: SharedString,
@@ -17,9 +28,11 @@ pub struct Prompt {
     /// A question to confirm with Enter instead of a field.
     confirm: bool,
     field: TextField,
+    /// The tick under the field and whether it is on. New Branch asks for Checkout.
+    option: Option<(SharedString, bool)>,
     focus: FocusHandle,
     workspace: WeakEntity<Workspace>,
-    submit: Submit,
+    submit: Answer,
 }
 
 impl Prompt {
@@ -31,7 +44,17 @@ impl Prompt {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        Self::open(title, hint, "", false, submit, workspace, window, cx);
+        Self::open(
+            title,
+            hint,
+            "",
+            false,
+            None,
+            Answer::Text(Rc::new(submit)),
+            workspace,
+            window,
+            cx,
+        );
     }
 
     /// Like [`Prompt::show`] with `text` already in the field, for a rename.
@@ -43,7 +66,43 @@ impl Prompt {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        Self::open(title, "", text, false, submit, workspace, window, cx);
+        Self::open(
+            title,
+            "",
+            text,
+            false,
+            None,
+            Answer::Text(Rc::new(submit)),
+            workspace,
+            window,
+            cx,
+        );
+    }
+
+    /// Like [`Prompt::show`] with a tick under the field, on by `checked`, whose state
+    /// reaches `submit` with the text: New Branch of the log asks whether to check out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_with_option(
+        title: &str,
+        hint: &str,
+        option: &str,
+        checked: bool,
+        submit: impl Fn(String, bool, &mut App) + 'static,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::open(
+            title,
+            hint,
+            "",
+            false,
+            Some((option.to_string().into(), checked)),
+            Answer::TextAndOption(Rc::new(submit)),
+            workspace,
+            window,
+            cx,
+        );
     }
 
     /// A question that Enter answers yes to, and Escape or a click elsewhere no.
@@ -56,7 +115,17 @@ impl Prompt {
         cx: &mut Context<Workspace>,
     ) {
         let submit = move |_: String, cx: &mut App| submit(cx);
-        Self::open(title, question, "", true, submit, workspace, window, cx);
+        Self::open(
+            title,
+            question,
+            "",
+            true,
+            None,
+            Answer::Text(Rc::new(submit)),
+            workspace,
+            window,
+            cx,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -65,7 +134,8 @@ impl Prompt {
         hint: &str,
         text: &str,
         confirm: bool,
-        submit: impl Fn(String, &mut App) + 'static,
+        option: Option<(SharedString, bool)>,
+        submit: Answer,
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -78,9 +148,10 @@ impl Prompt {
             hint: hint.into(),
             confirm,
             field: TextField::from_text(text),
+            option,
             focus: cx.focus_handle(),
             workspace: weak,
-            submit: Rc::new(submit),
+            submit,
         });
         let focus = view.read(cx).focus.clone();
         workspace.show_overlay(view.into(), focus, window, cx);
@@ -90,7 +161,13 @@ impl Prompt {
         if event.keystroke.key == "enter" {
             let text = self.field.text.trim().to_string();
             if self.confirm || !text.is_empty() {
-                (self.submit)(text, cx);
+                match &self.submit {
+                    Answer::Text(submit) => submit(text, cx),
+                    Answer::TextAndOption(submit) => {
+                        let checked = self.option.as_ref().is_some_and(|(_, on)| *on);
+                        submit(text, checked, cx);
+                    }
+                }
             }
             self.close(window, cx);
         } else if !self.confirm && self.field.key_with_clipboard(event, false, cx) {
@@ -118,6 +195,29 @@ impl Render for Prompt {
         } else {
             theme.text
         };
+        let option = self.option.clone().map(|(label, on)| {
+            let hover = theme.hover;
+            div()
+                .id("prompt-option")
+                .debug_selector(|| "prompt-option".to_owned())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .flex_none()
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_XS))
+                .rounded(px(ROW_RADIUS))
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(checkbox(on, &theme))
+                .child(label)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some((_, on)) = &mut this.option {
+                        *on = !*on;
+                    }
+                    cx.notify();
+                }))
+        });
         let body = surface(&theme)
             .id("prompt")
             .debug_selector(|| "prompt".to_owned())
@@ -161,7 +261,8 @@ impl Render for Prompt {
                     ))
                     .when(empty, |this| this.child(self.hint.clone()))
                     .into_any_element()
-            });
+            })
+            .children(option);
         div()
             .absolute()
             .left(left)

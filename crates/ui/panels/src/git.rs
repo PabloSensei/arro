@@ -11,8 +11,8 @@ use std::time::Duration;
 use editor_view::{EditorView, GutterKind, GutterMark};
 use ui_kit::*;
 use vcs::{
-    Change, ConflictSide, FileStatus, GitRunner, Hunk, LineChangeKind, Operation, Repository,
-    Stash, Status, UpdateMode, UpdateReport,
+    BlameLine, Change, ConflictSide, FileStatus, GitRunner, Hunk, LineChangeKind, Operation,
+    Repository, ResetMode, Stash, Status, UpdateMode, UpdateReport,
 };
 use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
@@ -46,6 +46,11 @@ fn push_rejected(error: &std::io::Error) -> bool {
 
 /// A command that puts the branch of the last Delete back.
 pub const RESTORE_BRANCH_COMMAND: &str = "git.restore_deleted_branch";
+
+/// The command of the gutter menu that puts the blame of a file before its text, and the
+/// one that takes the column away.
+pub const ANNOTATE_COMMAND: &str = "git.annotate";
+pub const CLOSE_ANNOTATIONS_COMMAND: &str = "git.close_annotations";
 
 /// A change on disk waits for this long, so a save of many files is one read of the status.
 const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -112,6 +117,9 @@ pub struct GitState {
     autostash: bool,
     /// The message a merge commit starts with.
     merge_message: String,
+    /// The conflicted files whose bytes are not text, by path relative to the root: Merge
+    /// has three versions to show only for a text file.
+    binary_conflicts: HashSet<String>,
     /// The branches the user left, newest first, as the Recent section of the popup lists
     /// them.
     recent: Vec<String>,
@@ -125,6 +133,9 @@ pub struct GitState {
     stale: bool,
     /// A read waits for the debounce to pass; further changes need no second read.
     scheduled: bool,
+    /// How many commands have finished, so a view such as the log reloads after each of
+    /// them even when HEAD does not move.
+    revision: u64,
 }
 
 pub struct ActiveGit(pub Entity<GitState>);
@@ -135,9 +146,12 @@ impl Global for ActiveGit {}
 struct Refreshed {
     status: Result<Status, String>,
     hunks: HashMap<PathBuf, Vec<Hunk>>,
+    /// The blame of every editor that shows the column, with the messages of its commits.
+    blames: HashMap<PathBuf, (Vec<BlameLine>, HashMap<String, String>)>,
     operation: Operation,
     autostash: bool,
     merge_message: String,
+    binary_conflicts: HashSet<String>,
 }
 
 impl GitState {
@@ -154,12 +168,14 @@ impl GitState {
             operation: Operation::None,
             autostash: false,
             merge_message: String::new(),
+            binary_conflicts: HashSet::new(),
             recent: Vec::new(),
             last_deleted: None,
             window: None,
             active: true,
             stale: false,
             scheduled: false,
+            revision: 0,
         });
         let configured = cx.try_global::<Settings>().cloned().unwrap_or_default();
         let found = cx.background_executor().spawn(async move {
@@ -222,6 +238,18 @@ impl GitState {
         self.operation
     }
 
+    /// How many git commands the state has finished, for the views that reload after an
+    /// operation which leaves HEAD in place, such as New Tag.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Whether the index or the working tree differs from the last commit, so that a
+    /// reset can tell the user what Hard throws away.
+    pub fn has_local_changes(&self) -> bool {
+        !self.status.files.is_empty()
+    }
+
     /// Git holds local changes it puts back when the operation ends.
     pub fn autostash(&self) -> bool {
         self.autostash
@@ -239,6 +267,12 @@ impl GitState {
             .filter(|file| file.index == Change::Conflicted || file.worktree == Change::Conflicted)
             .map(|file| file.path.clone())
             .collect()
+    }
+
+    /// Whether Merge can show the three versions of a conflict: a binary file has no text
+    /// to split into chunks, so only the two sides can be taken.
+    pub fn merge_available(&self, path: &str) -> bool {
+        !self.binary_conflicts.contains(path)
     }
 
     pub fn kind_of(&self, path: &Path) -> Option<Kind> {
@@ -313,6 +347,11 @@ impl GitState {
             .iter()
             .filter_map(|(path, view)| Some((path.clone(), view.read(cx).text()?)))
             .collect();
+        let annotated: Vec<(PathBuf, String)> = editors
+            .iter()
+            .filter(|(_, view)| view.read(cx).has_annotations())
+            .map(|(path, _)| (path.clone(), relative_of(repo.root(), path)))
+            .collect();
         let job = cx.background_executor().spawn(async move {
             let status = repo.status().map_err(|error| error.to_string());
             let operation = repo.operation().unwrap_or_default();
@@ -330,12 +369,37 @@ impl GitState {
                     }
                 }
             }
+            // A binary file has no three texts to merge: the row keeps only the two sides.
+            let binary_conflicts = match &status {
+                Ok(status) => status
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        file.index == Change::Conflicted || file.worktree == Change::Conflicted
+                    })
+                    .filter(|file| {
+                        text_core::read_file(&repo.root().join(&file.path))
+                            .is_ok_and(|decoded| !decoded.lossless)
+                    })
+                    .map(|file| file.path.clone())
+                    .collect(),
+                Err(_) => HashSet::new(),
+            };
+            let mut blames = HashMap::new();
+            for (path, relative) in annotated {
+                if let Ok(lines) = repo.blame(&relative) {
+                    let messages = messages_of(&repo, &lines);
+                    blames.insert(path, (lines, messages));
+                }
+            }
             Refreshed {
                 status,
                 hunks,
+                blames,
                 operation,
                 autostash,
                 merge_message,
+                binary_conflicts,
             }
         });
         cx.spawn(async move |this, cx| {
@@ -372,11 +436,14 @@ impl GitState {
         let Refreshed {
             status,
             hunks,
+            blames,
             operation,
             autostash,
             merge_message,
+            binary_conflicts,
         } = refreshed;
         let dark = cx.global::<Theme>().dark;
+        self.binary_conflicts = binary_conflicts;
         match status {
             Ok(status) => {
                 if status != self.status
@@ -397,6 +464,10 @@ impl GitState {
             Err(message) => self.last_error = Some(message),
         }
         for (path, view) in editors {
+            if let Some((lines, messages)) = blames.get(&path) {
+                let notes = crate::annotate::notes(lines, messages);
+                view.update(cx, |view, cx| view.set_annotations(&notes, cx));
+            }
             let marks = hunks.get(&path).map(|hunks| marks_of(hunks, dark));
             if let Some(marks) = marks {
                 view.update(cx, |view, cx| view.set_gutter_marks(marks, cx));
@@ -468,6 +539,7 @@ impl GitState {
                     Ok(value) => done(this, value, cx),
                     Err(message) => this.report(what, message, cx),
                 }
+                this.revision = this.revision.wrapping_add(1);
                 this.refresh(cx);
                 cx.notify();
             })
@@ -912,6 +984,172 @@ impl GitState {
             move |this, (), cx| {
                 this.remember_recent(&shown);
                 this.tell("Branch", format!("Created {shown}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// Checkout Revision of the log: the commit itself, with HEAD detached. Local changes
+    /// git cannot keep are the error of the command, as they are for a branch.
+    pub fn checkout_revision(&mut self, commit: String, cx: &mut Context<Self>) {
+        let short = short_commit(&commit);
+        self.run(
+            "Checkout Revision",
+            move |repo| repo.checkout_commit(&commit),
+            move |this, (), cx| {
+                this.reload_everything(cx);
+                this.tell("Checkout", format!("Checked out revision {short}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// New Branch of the log: the name and whether the branch is checked out, as the
+    /// dialog of IDEA asks.
+    pub fn ask_branch_at_commit(
+        &mut self,
+        start: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show_with_option(
+                    "New Branch",
+                    "Branch name",
+                    "Checkout branch",
+                    true,
+                    move |name, checkout, cx| {
+                        let start = start.clone();
+                        me.update(cx, |this, cx| {
+                            this.create_branch_at(name, start, checkout, cx)
+                        })
+                        .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    fn create_branch_at(
+        &mut self,
+        name: String,
+        start: String,
+        checkout: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = name.clone();
+        self.run(
+            "New branch",
+            move |repo| repo.branch_from(&name, &start, checkout),
+            move |this, (), cx| {
+                if checkout {
+                    this.remember_recent(&shown);
+                    this.tell("Branch", format!("Created and checked out {shown}"), cx);
+                } else {
+                    this.tell("Branch", format!("Created {shown}"), cx);
+                }
+            },
+            cx,
+        );
+    }
+
+    /// New Tag of the log: the name of the tag at the chosen commit.
+    pub fn ask_tag_at_commit(
+        &mut self,
+        commit: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show(
+                    "New Tag",
+                    "Tag name",
+                    move |name, cx| {
+                        let commit = commit.clone();
+                        me.update(cx, |this, cx| this.create_tag(name, commit, cx))
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    fn create_tag(&mut self, name: String, commit: String, cx: &mut Context<Self>) {
+        let shown = name.clone();
+        self.run(
+            "New Tag",
+            move |repo| repo.create_tag(&name, &commit),
+            move |this, (), cx| this.tell("Tag", format!("Created tag {shown}"), cx),
+            cx,
+        );
+    }
+
+    /// Cherry-Pick of the log: the commit on the current branch. A conflict opens the
+    /// Conflicts window, which continues or aborts the operation.
+    pub fn cherry_pick(&mut self, commit: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Cherry-Pick", message, cx);
+            return;
+        }
+        let short = short_commit(&commit);
+        self.run(
+            "Cherry-Pick",
+            move |repo| repo.cherry_pick(std::slice::from_ref(&commit)),
+            move |this, report, cx| {
+                this.finish_branch_update(
+                    report,
+                    "Cherry-Pick",
+                    format!("Cherry-picked {short}"),
+                    cx,
+                )
+            },
+            cx,
+        );
+    }
+
+    /// Revert Commit of the log: an opposite commit on the current branch. A conflict
+    /// opens the Conflicts window, as a merge does.
+    pub fn revert_commit(&mut self, commit: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Revert", message, cx);
+            return;
+        }
+        let short = short_commit(&commit);
+        self.run(
+            "Revert",
+            move |repo| repo.revert_commit(&commit),
+            move |this, report, cx| {
+                this.finish_branch_update(report, "Revert", format!("Reverted {short}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// Reset Current Branch to Here: the branch moves to the commit, keeping or throwing
+    /// the local changes away as the dialog chose.
+    pub fn reset_to(&mut self, commit: String, mode: ResetMode, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Reset", message, cx);
+            return;
+        }
+        let short = short_commit(&commit);
+        let label = mode.label();
+        self.run(
+            "Reset",
+            move |repo| repo.reset(&commit, mode),
+            move |this, (), cx| {
+                this.reload_everything_from_disk(cx);
+                this.tell("Reset", format!("Reset to {short} ({label})"), cx)
             },
             cx,
         );
@@ -1672,6 +1910,74 @@ impl GitState {
             })
             .ok();
     }
+
+    /// The active editor that shows text, for the actions that act on its column.
+    fn active_editor(&self, cx: &mut Context<Self>) -> Option<(PathBuf, Entity<EditorView>)> {
+        let (path, view) = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_editor())
+            .ok()??;
+        Some((path, view.downcast::<EditorView>().ok()?))
+    }
+
+    /// Git > Annotate with Git Blame: the blame of the active file in a column before its
+    /// text. The read stays off the UI thread, however long the history of the file is.
+    pub fn annotate(&mut self, cx: &mut Context<Self>) {
+        let Some((path, view)) = self.active_editor(cx) else {
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if view.read(cx).has_annotations() {
+            return;
+        }
+        // The blame reads the working tree, so the unsaved text has to reach the disk
+        // first; then the labels belong to the lines on screen.
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Annotate", message, cx);
+            return;
+        }
+        let relative = relative_of(repo.root(), &path);
+        let job = cx.background_executor().spawn(async move {
+            let lines = repo.blame(&relative).map_err(|error| error.to_string())?;
+            let messages = messages_of(&repo, &lines);
+            Ok::<_, String>((lines, messages))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            match result {
+                Ok((lines, messages)) => {
+                    let notes = crate::annotate::notes(&lines, &messages);
+                    view.update(cx, |view, cx| view.set_annotations(&notes, cx));
+                }
+                Err(message) => {
+                    this.update(cx, |this, cx| this.report("Annotate", message, cx))
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Close Annotations: takes the blame column of the active editor away.
+    pub fn close_annotations(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, view)) = self.active_editor(cx) {
+            view.update(cx, |view, cx| view.clear_annotations(cx));
+        }
+    }
+}
+
+/// The full messages of the commits the blame names, by id, for the hint of a label.
+fn messages_of(repo: &Repository, lines: &[BlameLine]) -> HashMap<String, String> {
+    let mut ids: Vec<String> = lines
+        .iter()
+        .filter(|line| line.is_committed())
+        .map(|line| line.commit.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    repo.commit_messages(&ids).unwrap_or_default()
 }
 
 /// Marks of the hunks for the gutter of an editor.
@@ -1710,6 +2016,11 @@ pub fn relative_of(root: &Path, path: &Path) -> String {
     relative.to_string_lossy().replace('\\', "/")
 }
 
+/// The first seven characters of a commit id, as the log shows them.
+pub(crate) fn short_commit(id: &str) -> String {
+    id.chars().take(7).collect()
+}
+
 /// The branch in the status bar, with ahead/behind counts and the operation in progress.
 fn branch_label(status: &Status, operation: Operation, autostash: bool) -> Option<String> {
     let mut label = status.branch.clone().or_else(|| {
@@ -1727,6 +2038,8 @@ fn branch_label(status: &Status, operation: Operation, autostash: bool) -> Optio
     match operation {
         Operation::Merge => label.push_str(" (merging)"),
         Operation::Rebase => label.push_str(" (rebasing)"),
+        Operation::CherryPick => label.push_str(" (cherry-picking)"),
+        Operation::Revert => label.push_str(" (reverting)"),
         Operation::None => {}
     }
     if autostash && operation != Operation::None {
@@ -1748,6 +2061,7 @@ fn stash_left_message(stash: &Stash) -> String {
 pub fn bind_actions(git: Entity<GitState>, window: AnyWindowHandle, cx: &mut App) {
     use workspace::{PushChanges, RevertChange, ShowBranches, ShowCommit, UpdateProject};
     crate::diff_view::bind_keys(cx);
+    crate::merge_view::bind_keys(cx);
     crate::branches::bind_keys(cx);
     git.update(cx, |this, _| this.window = Some(window));
     let state = git.clone();

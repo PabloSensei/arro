@@ -4,6 +4,7 @@
 //! draws them in the colours of the editor.
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -56,6 +57,14 @@ pub enum DocBlock {
         header: Vec<Vec<DocInline>>,
         rows: Vec<Vec<Vec<DocInline>>>,
     },
+    /// A picture alone in its paragraph: the text for the places that do not draw it
+    /// and the address it comes from.
+    Image {
+        alt: String,
+        url: String,
+    },
+    /// A quoted part of the answer with the blocks it holds.
+    Quote(Vec<DocBlock>),
     Divider,
 }
 
@@ -131,27 +140,54 @@ impl QuickDoc {
 /// HTML tags of documentation comments are read as markdown first, and other tags are
 /// dropped while their text stays.
 pub fn parse(text: &str) -> Vec<DocBlock> {
-    let normalized = html_to_markdown(text);
-    let Ok(root) = markdown::to_mdast(&normalized, &markdown::ParseOptions::gfm()) else {
-        return vec![DocBlock::Paragraph(vec![DocInline::Text(
-            text.trim().to_owned(),
-        )])];
-    };
-    let mdast::Node::Root(root) = root else {
-        return Vec::new();
-    };
-    let mut blocks = Vec::new();
-    push_blocks(&root.children, &mut blocks);
-    blocks
+    parse_blocks(text, true).0
 }
 
-fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>) {
+/// The blocks of a markdown file and the line each one starts on, counted from zero.
+/// HTML is left as it is, so the lines stay the lines of the file: a preview follows
+/// the scroll of the editor by them.
+pub(crate) fn parse_with_lines(text: &str) -> (Vec<DocBlock>, Vec<usize>) {
+    parse_blocks(text, false)
+}
+
+fn parse_blocks(text: &str, html: bool) -> (Vec<DocBlock>, Vec<usize>) {
+    let normalized = html.then(|| html_to_markdown(text));
+    let source = normalized.as_deref().unwrap_or(text);
+    let fallback = || {
+        (
+            vec![DocBlock::Paragraph(vec![DocInline::Text(
+                text.trim().to_owned(),
+            )])],
+            vec![0],
+        )
+    };
+    let Ok(root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
+        return fallback();
+    };
+    let mdast::Node::Root(root) = root else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut blocks = Vec::new();
+    let mut lines = Vec::new();
+    push_blocks(&root.children, &mut blocks, &mut lines);
+    (blocks, lines)
+}
+
+fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>, lines: &mut Vec<usize>) {
     for node in nodes {
+        let line = node
+            .position()
+            .map_or(0, |position| position.start.line.saturating_sub(1));
+        let before = blocks.len();
         match node {
             mdast::Node::Paragraph(paragraph) => {
-                let inlines = inlines_of(&paragraph.children);
-                if !inlines.is_empty() {
-                    blocks.push(DocBlock::Paragraph(inlines));
+                if let Some((alt, url)) = single_image(&paragraph.children) {
+                    blocks.push(DocBlock::Image { alt, url });
+                } else {
+                    let inlines = inlines_of(&paragraph.children);
+                    if !inlines.is_empty() {
+                        blocks.push(DocBlock::Paragraph(inlines));
+                    }
                 }
             }
             mdast::Node::Heading(heading) => {
@@ -170,7 +206,7 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>) {
                         continue;
                     };
                     let mut inlines = Vec::new();
-                    collect_item(&item.children, &mut inlines);
+                    collect_item(item, &mut inlines);
                     if !inlines.is_empty() {
                         items.push(inlines);
                     }
@@ -194,7 +230,14 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>) {
                 }
             }
             mdast::Node::ThematicBreak(_) => blocks.push(DocBlock::Divider),
-            mdast::Node::Blockquote(quote) => push_blocks(&quote.children, blocks),
+            mdast::Node::Blockquote(quote) => {
+                let mut inner = Vec::new();
+                let mut inner_lines = Vec::new();
+                push_blocks(&quote.children, &mut inner, &mut inner_lines);
+                if !inner.is_empty() {
+                    blocks.push(DocBlock::Quote(inner));
+                }
+            }
             mdast::Node::Html(html) => {
                 let text = strip_tags(&html.value);
                 let text = text.trim();
@@ -204,7 +247,18 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>) {
             }
             _ => {}
         }
+        for _ in before..blocks.len() {
+            lines.push(line);
+        }
     }
+}
+
+/// The text and the address of the only picture of a paragraph.
+fn single_image(nodes: &[mdast::Node]) -> Option<(String, String)> {
+    let [mdast::Node::Image(image)] = nodes else {
+        return None;
+    };
+    Some((image.alt.clone(), image.url.clone()))
 }
 
 /// A table of the answer: the first row is the header, the alignment of a column comes
@@ -245,15 +299,19 @@ fn table_block(table: &mdast::Table) -> Option<DocBlock> {
 }
 
 /// A list item whose child is not a paragraph, such as a nested list, keeps its text in
-/// the same line rather than making another block.
-fn collect_item(nodes: &[mdast::Node], inlines: &mut Vec<DocInline>) {
-    for node in nodes {
+/// the same line rather than making another block. A task item starts with its mark.
+fn collect_item(item: &mdast::ListItem, inlines: &mut Vec<DocInline>) {
+    if let Some(checked) = item.checked {
+        let mark = if checked { "\u{2611} " } else { "\u{2610} " };
+        merge(inlines, vec![DocInline::Text(mark.to_owned())]);
+    }
+    for node in &item.children {
         match node {
             mdast::Node::Paragraph(paragraph) => merge(inlines, inlines_of(&paragraph.children)),
             mdast::Node::List(list) => {
                 for child in &list.children {
                     if let mdast::Node::ListItem(item) = child {
-                        collect_item(&item.children, inlines);
+                        collect_item(item, inlines);
                     }
                 }
             }
@@ -350,48 +408,7 @@ pub(crate) fn plain_text(doc: &QuickDoc) -> String {
         out.push_str("\n\n");
     }
     for block in &doc.blocks {
-        match block {
-            DocBlock::Paragraph(inlines) => {
-                out.push_str(&plain_inlines(inlines));
-                out.push('\n');
-            }
-            DocBlock::Heading { text, .. } => {
-                out.push_str(&plain_inlines(text));
-                out.push('\n');
-            }
-            DocBlock::List { items, .. } => {
-                for item in items {
-                    out.push_str("- ");
-                    out.push_str(&plain_inlines(item));
-                    out.push('\n');
-                }
-            }
-            DocBlock::Code { text, .. } => {
-                out.push_str(text);
-                if !text.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            DocBlock::Table {
-                alignments,
-                header,
-                rows,
-            } => {
-                let columns = table_columns(alignments, header, rows);
-                for cells in std::iter::once(header).chain(rows) {
-                    for column in 0..columns {
-                        if let Some(cell) = cells.get(column) {
-                            out.push_str(&plain_inlines(cell));
-                        }
-                        if column + 1 < columns {
-                            out.push_str(" | ");
-                        }
-                    }
-                    out.push('\n');
-                }
-            }
-            DocBlock::Divider => out.push('\n'),
-        }
+        plain_block(&mut out, block);
     }
     out.trim().to_owned()
 }
@@ -404,6 +421,11 @@ pub fn display_text(blocks: &[DocBlock], diagnostic: Option<&str>) -> String {
         out.push_str(diagnostic);
         out.push_str("\n\n");
     }
+    display_blocks(&mut out, blocks);
+    out
+}
+
+fn display_blocks(out: &mut String, blocks: &[DocBlock]) {
     for block in blocks {
         match block {
             DocBlock::Paragraph(inlines) => {
@@ -450,10 +472,70 @@ pub fn display_text(blocks: &[DocBlock], diagnostic: Option<&str>) -> String {
                     out.push('\n');
                 }
             }
+            DocBlock::Image { alt, .. } => {
+                out.push_str(alt);
+                out.push('\n');
+            }
+            DocBlock::Quote(inner) => display_blocks(out, inner),
             DocBlock::Divider => out.push('\n'),
         }
     }
-    out
+}
+
+/// The block as the copy button writes it: a list has one `- ` per item, whatever the
+/// numbers the popup shows.
+fn plain_block(out: &mut String, block: &DocBlock) {
+    match block {
+        DocBlock::Paragraph(inlines) => {
+            out.push_str(&plain_inlines(inlines));
+            out.push('\n');
+        }
+        DocBlock::Heading { text, .. } => {
+            out.push_str(&plain_inlines(text));
+            out.push('\n');
+        }
+        DocBlock::List { items, .. } => {
+            for item in items {
+                out.push_str("- ");
+                out.push_str(&plain_inlines(item));
+                out.push('\n');
+            }
+        }
+        DocBlock::Code { text, .. } => {
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        DocBlock::Table {
+            alignments,
+            header,
+            rows,
+        } => {
+            let columns = table_columns(alignments, header, rows);
+            for cells in std::iter::once(header).chain(rows) {
+                for column in 0..columns {
+                    if let Some(cell) = cells.get(column) {
+                        out.push_str(&plain_inlines(cell));
+                    }
+                    if column + 1 < columns {
+                        out.push_str(" | ");
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        DocBlock::Image { alt, .. } => {
+            out.push_str(alt);
+            out.push('\n');
+        }
+        DocBlock::Quote(inner) => {
+            for block in inner {
+                plain_block(out, block);
+            }
+        }
+        DocBlock::Divider => out.push('\n'),
+    }
 }
 
 fn bullet_of(ordered: bool, start: u32, index: usize) -> String {
@@ -477,7 +559,8 @@ fn table_columns(
         .unwrap_or(0)
 }
 
-fn plain_inlines(inlines: &[DocInline]) -> String {
+/// The plain text of a run, for the block walkers and for the preview of a file.
+pub(crate) fn plain_inlines(inlines: &[DocInline]) -> String {
     let mut out = String::new();
     for inline in inlines {
         match inline {
@@ -960,7 +1043,7 @@ impl EditorView {
     pub(crate) fn hover_word_at(&self, position: Point<Pixels>) -> Option<Range<usize>> {
         let layout = self.layout.as_ref()?;
         let state = self.state.as_ref()?;
-        if position.x < layout.bounds.left() + px(crate::element::GUTTER_WIDTH)
+        if position.x < layout.bounds.left() + px(self.gutter_room())
             || position.x >= layout.bounds.right()
             || position.y < layout.bounds.top()
             || position.y >= layout.bounds.bottom()
@@ -1310,6 +1393,7 @@ impl EditorView {
             on_link,
             on_select: Some(on_select),
             selection: doc.selection.clone(),
+            base: None,
         };
         let content = div()
             .flex()
@@ -1410,12 +1494,15 @@ pub type DocLinkHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
 pub type DocSelectHandler = Rc<dyn Fn(DocSelectEvent, &mut Window, &mut App)>;
 
 /// What a rendered answer asks of the place that shows it: where a link goes and how a
-/// character of the text starts, moves or ends a selection.
+/// character of the text starts, moves or ends a selection. `base` is the folder of the
+/// file the answer describes, so a picture with a relative address can be drawn; the popup
+/// of a server answer has none and shows the text of the picture instead.
 pub struct DocHost {
     pub name: String,
     pub on_link: DocLinkHandler,
     pub on_select: Option<DocSelectHandler>,
     pub selection: Option<Range<usize>>,
+    pub base: Option<std::path::PathBuf>,
 }
 
 /// A mouse event on one character of the answer, with its byte offset in the text.
@@ -1434,6 +1521,29 @@ pub enum DocSelectEvent {
 
 /// The width of a column of a table, so that a wide one scrolls sideways.
 const TABLE_COLUMN_WIDTH: f32 = 180.;
+/// The widest a picture of a file gets in its preview.
+const PICTURE_WIDTH: f32 = 480.;
+
+/// The file a picture of the answer comes from, when the address points at one of the
+/// formats the window draws.
+fn image_path(base: &Path, url: &str) -> Option<PathBuf> {
+    let url = url.split(['#', '?']).next().unwrap_or_default();
+    if url.is_empty() || url.contains("://") {
+        return None;
+    }
+    let path = Path::new(url);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif" | "tif" | "tiff"
+    )
+    .then_some(path)
+}
 
 /// Draws an answer with the colours of the editor. The same blocks reach the popup and
 /// the Documentation tool window.
@@ -1446,21 +1556,10 @@ pub fn render_document(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let mut state = DocRender {
-        style,
-        theme,
-        host,
-        cursor: 0,
-        next_link: 0,
-        link_tokens: Vec::new(),
-        table: 0,
-        word: 0,
-    };
+    let mut state = DocRenderer::new(style, theme, host);
     let mut column = div().flex().flex_col().w_full().gap(px(SPACE_S));
     if let Some(diagnostic) = diagnostic {
-        state.cursor += diagnostic.len();
-        state.cursor += 2;
-        let inlines = [DocInline::Text(diagnostic.to_owned())];
+        let text = state.label(diagnostic, theme.stripe_error);
         column = column.child(
             div()
                 .debug_selector(|| format!("{}-diagnostic", host.name))
@@ -1470,13 +1569,53 @@ pub fn render_document(
                 .p(px(SPACE_S))
                 .text_size(px(UI_SIZE))
                 .text_color(theme.stripe_error)
-                .child(state.inlines(&inlines, UI_SIZE, theme.stripe_error, false, true)),
+                .child(text),
         );
     }
     for block in blocks {
         column = column.child(state.block(block, window, cx));
     }
     column.into_any_element()
+}
+
+/// Draws the blocks of an answer one at a time, so that a caller can put each of them in
+/// an element of its own: the preview of a file scrolls to the block the editor shows and
+/// wraps every block for that.
+pub(crate) struct DocRenderer<'a>(DocRender<'a>);
+
+impl<'a> DocRenderer<'a> {
+    pub(crate) fn new(style: &'a EditorStyle, theme: &'a Theme, host: &'a DocHost) -> Self {
+        Self(DocRender {
+            style,
+            theme,
+            host,
+            cursor: 0,
+            next_link: 0,
+            link_tokens: Vec::new(),
+            table: 0,
+            word: 0,
+        })
+    }
+
+    /// One block, in the order of the answer: the cursor keeps the offsets of a selection
+    /// running from the first block to the last.
+    pub(crate) fn block(
+        &mut self,
+        block: &DocBlock,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        self.0.block(block, window, cx)
+    }
+
+    /// A warning above the blocks, such as the problem under the pointer. Its text is
+    /// part of the answer, so the offsets of a selection start after it.
+    fn label(&mut self, text: &str, color: Hsla) -> Div {
+        self.0.cursor += text.len();
+        self.0.cursor += 2;
+        let inlines = [DocInline::Text(text.to_owned())];
+        self.0.inlines(&inlines, UI_SIZE, color, false, true)
+    }
 }
 
 struct DocRender<'a> {
@@ -1593,6 +1732,24 @@ impl DocRender<'_> {
                 header,
                 rows,
             } => self.table(alignments, header, rows, window, cx),
+            DocBlock::Image { alt, url } => {
+                self.cursor += 1;
+                self.image(alt, url)
+            }
+            DocBlock::Quote(inner) => {
+                let mut column = div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(px(SPACE_XS))
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .pl(px(SPACE_M));
+                for block in inner {
+                    column = column.child(self.block(block, window, cx));
+                }
+                column.into_any_element()
+            }
             DocBlock::Divider => {
                 self.cursor += 1;
                 div().w_full().h(px(1.)).bg(theme.border).into_any_element()
@@ -1699,6 +1856,37 @@ impl DocRender<'_> {
         )
         .h(px(row_height * count as f32))
         .into_any_element()
+    }
+
+    /// A picture of the text: drawn from the folder of the file when the viewer knows
+    /// that folder and the address is a picture, the text of it otherwise.
+    fn image(&mut self, alt: &str, url: &str) -> AnyElement {
+        let theme = self.theme;
+        let text = if alt.is_empty() { url } else { alt };
+        let Some(base) = &self.host.base else {
+            let inlines = [DocInline::Text(text.to_owned())];
+            return self
+                .inlines(&inlines, UI_SIZE, theme.code, false, true)
+                .into_any_element();
+        };
+        let Some(path) = image_path(base, url) else {
+            let inlines = [DocInline::Text(text.to_owned())];
+            return self
+                .inlines(&inlines, UI_SIZE, theme.code, false, true)
+                .into_any_element();
+        };
+        let inlines = [DocInline::Text(text.to_owned())];
+        let caption = self
+            .inlines(&inlines, UI_SIZE, theme.text_secondary, false, true)
+            .into_any_element();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_XS))
+            .w_full()
+            .child(img(path.as_path()).max_w(px(PICTURE_WIDTH)))
+            .child(caption)
+            .into_any_element()
     }
 
     fn inlines(
@@ -1899,7 +2087,9 @@ fn heading_size(level: usize) -> f32 {
         1 => 18.,
         2 => 16.,
         3 => 15.,
-        _ => 14.,
+        4 => 14.,
+        5 => 13.,
+        _ => 12.,
     }
 }
 
@@ -1958,19 +2148,26 @@ fn estimate_height(doc: &QuickDoc, line_height: f32) -> f32 {
         rows += 1. + (diagnostic.len() / 70) as f32;
     }
     for block in &doc.blocks {
-        rows += match block {
-            DocBlock::Paragraph(inlines) => {
-                let text = plain_inlines(inlines);
-                (1 + text.len() / 70) as f32
-            }
-            DocBlock::Heading { .. } => 1.5,
-            DocBlock::List { items, .. } => items.len() as f32,
-            DocBlock::Code { text, .. } => text.lines().count().max(1) as f32,
-            DocBlock::Table { header, rows, .. } => (header.len().max(1) + rows.len()) as f32 * 1.6,
-            DocBlock::Divider => 1.,
-        };
+        rows += block_rows(block);
     }
     rows * line_height.max(16.) + 24.
+}
+
+/// Rough rows of one block before layout, for placing the popup.
+fn block_rows(block: &DocBlock) -> f32 {
+    match block {
+        DocBlock::Paragraph(inlines) => {
+            let text = plain_inlines(inlines);
+            (1 + text.len() / 70) as f32
+        }
+        DocBlock::Heading { .. } => 1.5,
+        DocBlock::List { items, .. } => items.len() as f32,
+        DocBlock::Code { text, .. } => text.lines().count().max(1) as f32,
+        DocBlock::Table { header, rows, .. } => (header.len().max(1) + rows.len()) as f32 * 1.6,
+        DocBlock::Image { .. } => 6.,
+        DocBlock::Quote(inner) => inner.iter().map(block_rows).sum(),
+        DocBlock::Divider => 1.,
+    }
 }
 
 /// A place in the file of a link: `#L5` and `#L5-L9` name the line from one.
@@ -1995,7 +2192,12 @@ pub fn split_line_fragment(url: &str) -> (String, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DocBlock, DocInline, parse, plain_inlines, split_line_fragment};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        DocBlock, DocInline, heading_size, parse, parse_with_lines, plain_inlines,
+        split_line_fragment,
+    };
 
     const HOVER: &str = "```text\npublic static String format(String format, Object... args)\n```\n\nReturns a formatted string with the **format** string and the `args` that follow it.\n\n**Parameters:**\n`format` - a [pattern](https://example.com/pattern) with `%s`\n`args` - the values\n\n**Returns:**\nthe text\n\n**Throws:**\n`IllegalState` - when the pattern is wrong\n\n<p>See <code>Formatter</code> for the rules.</p>\n\n- one\n- two\n\n---\n";
 
@@ -2129,6 +2331,84 @@ mod tests {
         assert_eq!(
             split_line_fragment("https://example.com/#part"),
             ("https://example.com/#part".to_owned(), 0)
+        );
+    }
+
+    #[test]
+    fn a_picture_alone_in_a_paragraph_is_a_block_of_its_own() {
+        let blocks = parse("![a diagram](img/a.png)\n\nSee ![an icon](img/i.svg) here.");
+        let DocBlock::Image { alt, url } = &blocks[0] else {
+            panic!("the picture is a block: {blocks:?}");
+        };
+        assert_eq!(alt, "a diagram");
+        assert_eq!(url, "img/a.png");
+        let DocBlock::Paragraph(inlines) = &blocks[1] else {
+            panic!("a paragraph follows: {blocks:?}");
+        };
+        assert!(
+            plain_inlines(inlines).contains("an icon"),
+            "a picture inside a line keeps its text: {inlines:?}"
+        );
+    }
+
+    #[test]
+    fn a_quote_keeps_the_blocks_it_holds() {
+        let blocks = parse("> quoted words\n>\n> - one\n> - two\n");
+        let DocBlock::Quote(inner) = &blocks[0] else {
+            panic!("the quote is a block: {blocks:?}");
+        };
+        assert!(matches!(&inner[0], DocBlock::Paragraph(_)));
+        assert!(matches!(&inner[1], DocBlock::List { items, .. } if items.len() == 2));
+    }
+
+    #[test]
+    fn a_task_item_starts_with_its_mark() {
+        let blocks = parse("- [x] done\n- [ ] open\n- plain\n");
+        let DocBlock::List { items, .. } = &blocks[0] else {
+            panic!("a list: {blocks:?}");
+        };
+        assert!(plain_inlines(&items[0]).starts_with('\u{2611}'));
+        assert!(plain_inlines(&items[1]).starts_with('\u{2610}'));
+        assert_eq!(plain_inlines(&items[2]), "plain");
+    }
+
+    #[test]
+    fn headings_of_every_level_have_their_own_size() {
+        let sizes: Vec<f32> = (1..=6).map(heading_size).collect();
+        let mut unique = sizes.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), 6, "six levels, six sizes: {sizes:?}");
+        assert!(
+            sizes.windows(2).all(|pair| pair[0] > pair[1]),
+            "a deeper heading is smaller: {sizes:?}"
+        );
+    }
+
+    #[test]
+    fn every_block_remembers_the_line_it_starts_on() {
+        let (blocks, lines) = parse_with_lines("# One\n\ntext\n\n> quote\n\n---\n");
+        assert_eq!(blocks.len(), lines.len());
+        assert_eq!(lines, [0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn five_thousand_lines_are_parsed_without_a_blow_up() {
+        let mut text = String::new();
+        for index in 0..1000 {
+            text.push_str(&format!(
+                "## Section {index}\n\ntext with **bold** and `code`.\n\n- one\n- two\n\n"
+            ));
+        }
+        assert!(text.lines().count() >= 5000, "the sample is a long file");
+        let started = Instant::now();
+        let (blocks, lines) = parse_with_lines(&text);
+        let elapsed = started.elapsed();
+        assert_eq!(blocks.len(), lines.len());
+        // The parse runs off the window thread; this bound only catches a blow-up. A
+        // debug build takes about 0.8 s on this machine, a release build less.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a 5000-line file took {elapsed:?}"
         );
     }
 }

@@ -15,7 +15,7 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use crate::element::{GUTTER_WIDTH, TEXT_INSET};
+use crate::element::TEXT_INSET;
 use crate::state::EditorState;
 use crate::view::{EditorView, TemplateSettings};
 
@@ -718,7 +718,7 @@ impl EditorView {
             .iter()
             .find(|laid_out| laid_out.row == row.row)?;
         let x = layout.bounds.left()
-            + px(GUTTER_WIDTH + TEXT_INSET)
+            + px(self.gutter_room() + TEXT_INSET)
             + shown.text.x_for_index(row.column)
             - px(self.scroll_left);
         Some(point(x, shown.y + px(self.style.line_height)))

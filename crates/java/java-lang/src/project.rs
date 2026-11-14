@@ -31,6 +31,7 @@ use tokio::time::sleep;
 use crate::debug::DebugExtension;
 use crate::language::{JavaSyntax, LANGUAGE_ID, is_import_line};
 use crate::lombok::LombokSupport;
+use crate::refactor::RefactorForms;
 
 const SOURCE: SourceId = SourceId::new("jdtls");
 
@@ -104,6 +105,8 @@ pub struct JavaProject {
     pub(crate) class_files: ClassFiles,
     pub(crate) problems: ProjectProblems,
     pub(crate) debug: DebugExtension,
+    /// The refactorings whose values the window asks for before the server edits.
+    pub(crate) forms: RefactorForms,
     /// The Lombok agent: found in the project dependencies and applied with a restart.
     lombok: Arc<LombokSupport>,
 }
@@ -459,6 +462,18 @@ impl JavaProject {
                 "java.action.applyRefactoringCommand",
                 "java/getRefactorEdit",
             )
+            // Extract interface and the two field refactorings need values the user
+            // picks: what to extract, the name and the package, where a field starts.
+            .with_refactor_steps(semantic_router::RefactorSteps {
+                forms: &["extractInterface", "extractField", "convertVariableToField"],
+                deferred: &[
+                    "changeSignature",
+                    "moveFile",
+                    "moveType",
+                    "moveInstanceMethod",
+                    "moveStaticMember",
+                ],
+            })
             .with_move_requests("java/getMoveDestinations", "java/move")
             .with_import_line(is_import_line)
             .with_change_signature(
@@ -500,6 +515,7 @@ impl JavaProject {
             runtime: Handle::current(),
         };
         let debug = DebugExtension::with_router(router.clone(), autobuild);
+        let forms = RefactorForms::new(router.clone(), Handle::current());
         Ok(Self {
             sidecar,
             spec,
@@ -512,6 +528,7 @@ impl JavaProject {
             class_files,
             problems,
             debug,
+            forms,
             lombok,
         })
     }

@@ -13,9 +13,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::client::{Client, Event};
 use crate::model::{
-    Breakpoint, BreakpointSpec, Command, ConsoleLine, DebugState, Evaluation, ExceptionFilter,
-    Frame, OutputLine, Scope, Snapshot, StepTarget, Thread, Variable, VariableError, WatchValue,
-    line_of, source_path,
+    Breakpoint, BreakpointKind, BreakpointSpec, Capabilities, Command, ConsoleLine,
+    DataBreakpointSpec, DebugState, Evaluation, ExceptionFilter, Frame, FunctionBreakpointSpec,
+    OutputLine, Scope, Snapshot, StepTarget, Thread, Variable, VariableError, WatchValue, line_of,
+    source_path,
 };
 
 /// What starts a session. `attach_port` is the port the debuggee listens on.
@@ -34,6 +35,10 @@ pub struct Launch {
     /// Names the debuggee in the console and in the process list of the adapter.
     pub name: String,
     pub breakpoints: Vec<BreakpointSpec>,
+    /// Method breakpoints, sent before the adapter resumes the program.
+    pub function_breakpoints: Vec<FunctionBreakpointSpec>,
+    /// Field watchpoints, sent before the adapter resumes the program.
+    pub data_breakpoints: Vec<DataBreakpointSpec>,
     /// Filters of the adapter the session starts with.
     pub exception_filters: Vec<String>,
     pub watch: Vec<String>,
@@ -73,6 +78,8 @@ pub async fn run_with_output(
         },
         watch: launch.watch.clone(),
         breakpoints: BTreeMap::new(),
+        function_breakpoints: launch.function_breakpoints.clone(),
+        data_breakpoints: launch.data_breakpoints.clone(),
         exception_filters: launch.exception_filters.iter().cloned().collect(),
         project: launch.project.clone(),
         attach_host: launch.attach_host.clone(),
@@ -141,6 +148,10 @@ struct Session {
     watch: Vec<String>,
     /// Settings per file and line, as the window set them.
     breakpoints: BTreeMap<PathBuf, BTreeMap<u32, BreakpointSpec>>,
+    /// Method breakpoints, as the window set them.
+    function_breakpoints: Vec<FunctionBreakpointSpec>,
+    /// Field watchpoints, as the window set them.
+    data_breakpoints: Vec<DataBreakpointSpec>,
     exception_filters: BTreeSet<String>,
     project: Option<String>,
     attach_host: Option<String>,
@@ -181,6 +192,7 @@ impl Session {
             "supportsProgressReporting": false,
         });
         let capabilities = self.client.request("initialize", arguments).await?;
+        self.state.capabilities = capabilities_of(&capabilities);
         self.state.exception_filters = filters_of(&capabilities);
         let mut arguments = json!({"name": self.name});
         if let Some(port) = self.attach_port {
@@ -281,6 +293,8 @@ impl Session {
                     self.state.breakpoints.push(Breakpoint {
                         file: file.to_path_buf(),
                         line,
+                        kind: BreakpointKind::Line,
+                        id: item.get("id").and_then(Value::as_i64),
                         verified: item
                             .get("verified")
                             .and_then(Value::as_bool)
@@ -294,6 +308,8 @@ impl Session {
                         self.state.breakpoints.push(Breakpoint {
                             file: file.to_path_buf(),
                             line,
+                            kind: BreakpointKind::Line,
+                            id: None,
                             verified: true,
                             message: None,
                         });
@@ -307,6 +323,8 @@ impl Session {
                     self.state.breakpoints.push(Breakpoint {
                         file: file.to_path_buf(),
                         line,
+                        kind: BreakpointKind::Line,
+                        id: None,
                         verified: false,
                         message: Some("not accepted".into()),
                     });
@@ -319,6 +337,98 @@ impl Session {
         let files: Vec<PathBuf> = self.breakpoints.keys().cloned().collect();
         for file in files {
             self.send_breakpoints(&file).await;
+        }
+        self.send_function_breakpoints().await;
+        self.send_data_breakpoints().await;
+    }
+
+    /// Sends every enabled method breakpoint and keeps what the adapter made of them.
+    async fn send_function_breakpoints(&mut self) {
+        let requested: Vec<Value> = self
+            .function_breakpoints
+            .iter()
+            .filter(|spec| spec.enabled && !spec.name.trim().is_empty())
+            .map(|spec| {
+                let mut entry = json!({"name": spec.name});
+                if let Some(condition) = spec.condition.as_deref().filter(|text| !text.is_empty()) {
+                    entry["condition"] = json!(condition);
+                }
+                if let Some(hit) = spec
+                    .hit_condition
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                {
+                    entry["hitCondition"] = json!(hit);
+                }
+                entry
+            })
+            .collect();
+        if !self.state.capabilities.function_breakpoints {
+            if !requested.is_empty() {
+                self.console(
+                    "method breakpoints: the adapter does not support them".to_owned(),
+                    true,
+                );
+            }
+            return;
+        }
+        let answer = self
+            .client
+            .request("setFunctionBreakpoints", json!({"breakpoints": requested}))
+            .await;
+        self.state.function_breakpoints.clear();
+        match answer {
+            Ok(body) => {
+                self.state.function_breakpoints =
+                    breakpoint_answers(&body, BreakpointKind::Function)
+            }
+            Err(error) => self.console(format!("method breakpoints: {error}"), true),
+        }
+    }
+
+    /// Sends every enabled field watchpoint and keeps what the adapter made of them.
+    async fn send_data_breakpoints(&mut self) {
+        let requested: Vec<Value> = self
+            .data_breakpoints
+            .iter()
+            .filter(|spec| spec.enabled && !spec.data_id.trim().is_empty())
+            .map(|spec| {
+                let mut entry = json!({
+                    "dataId": spec.data_id,
+                    "accessType": spec.access_type.as_dap(),
+                });
+                if let Some(condition) = spec.condition.as_deref().filter(|text| !text.is_empty()) {
+                    entry["condition"] = json!(condition);
+                }
+                if let Some(hit) = spec
+                    .hit_condition
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                {
+                    entry["hitCondition"] = json!(hit);
+                }
+                entry
+            })
+            .collect();
+        if !self.state.capabilities.data_breakpoints {
+            if !requested.is_empty() {
+                self.console(
+                    "field watchpoints: the adapter does not support them".to_owned(),
+                    true,
+                );
+            }
+            return;
+        }
+        let answer = self
+            .client
+            .request("setDataBreakpoints", json!({"breakpoints": requested}))
+            .await;
+        self.state.data_breakpoints.clear();
+        match answer {
+            Ok(body) => {
+                self.state.data_breakpoints = breakpoint_answers(&body, BreakpointKind::Data)
+            }
+            Err(error) => self.console(format!("field watchpoints: {error}"), true),
         }
     }
 
@@ -428,6 +538,29 @@ impl Session {
         let Some(item) = body.get("breakpoint") else {
             return;
         };
+        let message = item
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let verified = item
+            .get("verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let id = item.get("id").and_then(Value::as_i64);
+        let mut answered = false;
+        if let Some(id) = id
+            && let Some(breakpoint) = self
+                .state
+                .breakpoints
+                .iter_mut()
+                .chain(self.state.function_breakpoints.iter_mut())
+                .chain(self.state.data_breakpoints.iter_mut())
+                .find(|breakpoint| breakpoint.id == Some(id))
+        {
+            breakpoint.verified = verified;
+            breakpoint.message = message.clone();
+            answered = true;
+        }
         let file = source_path(item.get("source")).or_else(|| {
             self.state
                 .breakpoints
@@ -438,19 +571,12 @@ impl Session {
             return;
         };
         let line = line_of(item);
-        let message = item
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let verified = item
-            .get("verified")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if let Some(breakpoint) = self
-            .state
-            .breakpoints
-            .iter_mut()
-            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
+        if !answered
+            && let Some(breakpoint) = self
+                .state
+                .breakpoints
+                .iter_mut()
+                .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
         {
             breakpoint.verified = verified;
             breakpoint.message = message.clone();
@@ -552,6 +678,23 @@ impl Session {
             Command::SetExceptionBreakpoints(filters) => {
                 self.exception_filters = filters.into_iter().collect();
                 self.send_exception_filters().await;
+            }
+            Command::SetFunctionBreakpoints(specs) => {
+                self.function_breakpoints = specs;
+                self.send_function_breakpoints().await;
+            }
+            Command::SetDataBreakpoints(specs) => {
+                self.data_breakpoints = specs;
+                self.send_data_breakpoints().await;
+            }
+            Command::RestartFrame(frame) => {
+                if let Err(error) = self
+                    .client
+                    .request("restartFrame", json!({"frameId": frame}))
+                    .await
+                {
+                    self.console(format!("restart frame: {error}"), true);
+                }
             }
             Command::AddWatch(expression) => {
                 let expression = expression.trim().to_owned();
@@ -903,6 +1046,45 @@ fn variables_of(body: &Value) -> Vec<Variable> {
         .unwrap_or_default()
 }
 
+/// The requests an adapter offers in its capabilities.
+fn capabilities_of(capabilities: &Value) -> Capabilities {
+    let flag = |key: &str| {
+        capabilities
+            .get(key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    Capabilities {
+        function_breakpoints: flag("supportsFunctionBreakpoints"),
+        data_breakpoints: flag("supportsDataBreakpoints"),
+        restart_frame: flag("supportsRestartFrame"),
+    }
+}
+
+/// The answers to `setFunctionBreakpoints` or `setDataBreakpoints`, which carry no place.
+fn breakpoint_answers(body: &Value, kind: BreakpointKind) -> Vec<Breakpoint> {
+    body.get("breakpoints")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .map(|item| Breakpoint {
+                    kind,
+                    id: item.get("id").and_then(Value::as_i64),
+                    verified: item
+                        .get("verified")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    message: item
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    ..Breakpoint::default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The exception filters an adapter offers in its capabilities.
 fn filters_of(capabilities: &Value) -> Vec<ExceptionFilter> {
     capabilities
@@ -961,6 +1143,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::model::DataAccessType;
 
     #[test]
     fn filters_come_from_the_capabilities() {
@@ -976,5 +1159,154 @@ mod tests {
         assert_eq!(filters[0].filter, "caught");
         assert!(filters[1].default);
         assert!(!filters[0].default);
+    }
+
+    #[test]
+    fn the_capabilities_name_the_requests_of_methods_and_fields() {
+        let capabilities = capabilities_of(&json!({
+            "supportsFunctionBreakpoints": true,
+            "supportsDataBreakpoints": true,
+            "supportsRestartFrame": true
+        }));
+        assert_eq!(
+            capabilities,
+            Capabilities {
+                function_breakpoints: true,
+                data_breakpoints: true,
+                restart_frame: true,
+            }
+        );
+        assert_eq!(capabilities_of(&json!({})), Capabilities::default());
+    }
+
+    #[test]
+    fn an_answer_about_a_method_or_field_breakpoint_keeps_its_id() {
+        let answers = breakpoint_answers(
+            &json!({
+                "breakpoints": [
+                    {"id": 7, "verified": true},
+                    {"id": 8, "verified": false, "message": "no such field"},
+                ]
+            }),
+            BreakpointKind::Data,
+        );
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].id, Some(7));
+        assert_eq!(answers[0].kind, BreakpointKind::Data);
+        assert!(!answers[1].verified);
+        assert_eq!(answers[1].message.as_deref(), Some("no such field"));
+    }
+
+    #[test]
+    fn every_access_type_has_its_dap_name() {
+        assert_eq!(DataAccessType::Read.as_dap(), "read");
+        assert_eq!(DataAccessType::Write.as_dap(), "write");
+        assert_eq!(DataAccessType::ReadWrite.as_dap(), "readWrite");
+    }
+
+    fn launch_at(address: String) -> Launch {
+        Launch {
+            address,
+            adapter_id: "fixture".into(),
+            name: "fixture".into(),
+            function_breakpoints: vec![FunctionBreakpointSpec {
+                name: "demo.Probe#work".into(),
+                condition: Some("flag".into()),
+                hit_condition: Some("2".into()),
+                enabled: true,
+            }],
+            data_breakpoints: vec![DataBreakpointSpec {
+                data_id: "demo.Probe#value".into(),
+                access_type: DataAccessType::ReadWrite,
+                condition: None,
+                hit_condition: None,
+                enabled: true,
+            }],
+            ..Launch::default()
+        }
+    }
+
+    async fn wait_stopped(debugger: &crate::model::Debugger) -> Arc<Snapshot> {
+        for _ in 0..400 {
+            if let Some(snapshot) = debugger.poll()
+                && matches!(snapshot.state, DebugState::Stopped { .. })
+            {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the session did not stop");
+    }
+
+    /// The three requests of this kind reach the adapter, with the fields it reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn method_field_and_frame_requests_reach_the_adapter() {
+        let server = lang_fixture::MockDap::start_with_breakpoint_kinds().unwrap();
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (snapshots, incoming) = std::sync::mpsc::channel();
+        let launch = launch_at(server.address().to_owned());
+        let running = tokio::spawn(run(launch, receiver, snapshots));
+        let debugger = crate::model::Debugger::new(commands, incoming);
+
+        let stopped = wait_stopped(&debugger).await;
+        assert!(stopped.capabilities.function_breakpoints);
+        assert!(stopped.capabilities.data_breakpoints);
+        assert!(stopped.capabilities.restart_frame);
+        assert_eq!(stopped.function_breakpoints.len(), 1, "the answer is kept");
+
+        debugger.send(Command::RestartFrame(12));
+        let restarted = loop {
+            if let Some(snapshot) = debugger.poll()
+                && matches!(&snapshot.state, DebugState::Stopped { reason } if reason == "restartframe")
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            restarted.state,
+            DebugState::Stopped {
+                reason: "restartframe".into()
+            }
+        );
+
+        let requests = server.requests();
+        let functions = requests
+            .iter()
+            .find(|request| request["command"] == "setFunctionBreakpoints")
+            .expect("the method breakpoints were sent");
+        assert_eq!(
+            functions["arguments"]["breakpoints"][0]["name"],
+            "demo.Probe#work"
+        );
+        assert_eq!(
+            functions["arguments"]["breakpoints"][0]["condition"],
+            "flag"
+        );
+        assert_eq!(
+            functions["arguments"]["breakpoints"][0]["hitCondition"],
+            "2"
+        );
+        let fields = requests
+            .iter()
+            .find(|request| request["command"] == "setDataBreakpoints")
+            .expect("the field watchpoints were sent");
+        assert_eq!(
+            fields["arguments"]["breakpoints"][0]["dataId"],
+            "demo.Probe#value"
+        );
+        assert_eq!(
+            fields["arguments"]["breakpoints"][0]["accessType"],
+            "readWrite"
+        );
+        let restart = requests
+            .iter()
+            .find(|request| request["command"] == "restartFrame")
+            .expect("the frame restart was sent");
+        assert_eq!(restart["arguments"]["frameId"], 12);
+
+        debugger.send(Command::Disconnect);
+        running.await.unwrap().unwrap();
+        server.join();
     }
 }
