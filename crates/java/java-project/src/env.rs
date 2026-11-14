@@ -26,6 +26,8 @@ pub struct BuildEnv {
     pub helpers: Option<PathBuf>,
     /// Where `ide-ctrl` lies, when it is not next to the executable.
     pub ctrl_helper: Option<PathBuf>,
+    /// The coverage tools of a test, which wins over the folders of the environment.
+    pub coverage: Option<crate::CoverageTools>,
 }
 
 impl BuildEnv {
@@ -41,7 +43,7 @@ impl BuildEnv {
             return Ok(helpers.into());
         }
         let exe = std::env::current_exe()?;
-        Ok(exe.with_file_name("helpers"))
+        Ok(helpers_for(&exe))
     }
 
     /// The JDK that builds and runs this project. The choice of the user in Project
@@ -65,6 +67,21 @@ impl BuildEnv {
         }
         spec
     }
+}
+
+/// The `helpers` folder of the program at `exe`: next to the program when it is there,
+/// then the `helpers` of the resources of a macOS bundle, then next to the program, where
+/// the caller reports it missing.
+fn helpers_for(exe: &Path) -> PathBuf {
+    let beside = exe.with_file_name("helpers");
+    if beside.is_dir() {
+        return beside;
+    }
+    let resources = platform::resources_dir(exe).join("helpers");
+    if resources.is_dir() {
+        return resources;
+    }
+    beside
 }
 
 /// Picks the tool of the project in `root`, Maven first when both are present: a project
@@ -99,4 +116,66 @@ pub(crate) fn fresh_directory(directory: &Path) -> Result<PathBuf> {
     }
     fs::create_dir_all(directory)?;
     Ok(directory.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_helpers_of_a_bundle_are_in_its_resources() {
+        let directory = test_support::TempDir::new("helpers-bundle");
+        let macos = directory
+            .path()
+            .join("Arro.app")
+            .join("Contents")
+            .join("MacOS");
+        fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("arro");
+        fs::write(&exe, b"").unwrap();
+        let helpers = directory
+            .path()
+            .join("Arro.app")
+            .join("Contents")
+            .join("Resources")
+            .join("helpers");
+        fs::create_dir_all(&helpers).unwrap();
+
+        assert_eq!(helpers_for(&exe), helpers);
+    }
+
+    #[test]
+    fn the_helpers_next_to_the_program_win_over_the_resources() {
+        let directory = test_support::TempDir::new("helpers-beside");
+        let macos = directory
+            .path()
+            .join("Arro.app")
+            .join("Contents")
+            .join("MacOS");
+        fs::create_dir_all(macos.join("helpers")).unwrap();
+        let exe = macos.join("arro");
+        fs::write(&exe, b"").unwrap();
+        let resources = directory
+            .path()
+            .join("Arro.app")
+            .join("Contents")
+            .join("Resources")
+            .join("helpers");
+        fs::create_dir_all(&resources).unwrap();
+
+        assert_eq!(helpers_for(&exe), macos.join("helpers"));
+    }
+
+    #[test]
+    fn missing_helpers_are_looked_for_next_to_the_program() {
+        let directory = test_support::TempDir::new("helpers-missing");
+        let exe = directory
+            .path()
+            .join("Arro.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("arro");
+
+        assert_eq!(helpers_for(&exe), exe.with_file_name("helpers"));
+    }
 }

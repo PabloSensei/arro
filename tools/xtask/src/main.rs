@@ -44,8 +44,9 @@ commands:
   affected [--base REF] [--run test|clippy|both] [--list]
                              the workspace crates a change touches and their dependents,
                              REF is main by default; prints `-p` names or runs the checks
-  build-helpers --out DIR [--maven-lib DIR]
-                             the helper jars that run in project JVMs, needs a JDK
+  build-helpers --out DIR [--maven-lib DIR] [--jacoco-lib DIR]
+                             the helper jars that run in project JVMs, needs a JDK;
+                             the JaCoCo jars come from DIR or the local Maven repositories
   dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--target windows|linux|macos]
                              release Arro, helpers, jdtls, java-debug, README, run-arro.cmd
                              and THIRD-PARTY.txt; the jdtls and java-debug archives come
@@ -85,6 +86,32 @@ fn main() -> ExitCode {
         ["build-helpers", "--out", out, "--maven-lib", lib] => {
             helpers::run(&root, Path::new(out), Some(Path::new(lib)))
         }
+        ["build-helpers", "--out", out, "--jacoco-lib", lib] => {
+            helpers::run_with(&root, Path::new(out), None, Some(Path::new(lib)))
+        }
+        [
+            "build-helpers",
+            "--out",
+            out,
+            "--maven-lib",
+            maven,
+            "--jacoco-lib",
+            lib,
+        ]
+        | [
+            "build-helpers",
+            "--out",
+            out,
+            "--jacoco-lib",
+            lib,
+            "--maven-lib",
+            maven,
+        ] => helpers::run_with(
+            &root,
+            Path::new(out),
+            Some(Path::new(maven)),
+            Some(Path::new(lib)),
+        ),
         ["dist", args @ ..] => dist_command(&root, args),
         ["symbolize", args @ ..] => symbolize_command(&root, args),
         ["release-assets", "--out", out] => release::run(Path::new(out)),

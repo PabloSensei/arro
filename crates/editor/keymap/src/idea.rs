@@ -189,7 +189,6 @@ pub const NOT_IN_MVP: &[(&str, &str)] = &[
         "ServiceView.ShowServices",
         "The Services window lists what it has; no filter action.",
     ),
-    ("SwitchCoverage", "Coverage is not in MVP-1."),
     ("SwitchHeaderSource", "Java has no header and source pair."),
     ("TextSearchAction", "Search Everywhere covers text search."),
     (

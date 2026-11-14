@@ -4,6 +4,7 @@
 
 mod config;
 mod console;
+mod coverage;
 mod tasks;
 mod testing;
 
@@ -13,6 +14,7 @@ pub use config::{
     parse_environment, save_configs, split_arguments,
 };
 pub use console::{Console, ConsoleEvent, ConsoleEvents, Step, Stream};
+pub use coverage::{CoverageOwner, CoveragePlan, TestCoverageRun};
 pub use tasks::{BuildTaskProvider, PROVIDER_ID as BUILD_TASK_PROVIDER};
 pub use testing::{
     FindTests, STOPPED_BY_USER, TestCounts, TestDebug, TestEvent, TestKind, TestListen, TestNode,

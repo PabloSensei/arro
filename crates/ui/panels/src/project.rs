@@ -1945,6 +1945,23 @@ impl ProjectPanel {
             });
             entries.push(show);
         }
+        // The request file of the HTTP client goes last, so the rows above keep their
+        // places in the menu.
+        entries.push(MenuEntry::separator());
+        let (request_panel, request_folder) = (
+            cx.weak_entity(),
+            target_folder(&self.root_path(), Some((path.as_path(), is_folder))),
+        );
+        entries.push(
+            MenuEntry::new("New HTTP Request", move |window, cx| {
+                let (template, folder) = (crate::tree_ops::http_request(), request_folder.clone());
+                let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    this.ask_new(template, folder, window, cx)
+                };
+                Self::later(window, request_panel.clone(), cx, ask);
+            })
+            .icon("fileTypes/text"),
+        );
         (position, entries)
     }
 
@@ -1959,16 +1976,24 @@ impl ProjectPanel {
 
     fn rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<Div> {
         let theme = *cx.global::<Theme>();
+        let coverage = cx
+            .try_global::<crate::script::ActiveRunPanel>()
+            .and_then(|panel| panel.0.read(cx).coverage());
         range
             .map(|index| {
                 let row = &self.tree.rows()[index];
                 let selected = self.selection.contains(&row.path);
                 let name = row.name.clone();
+                let hint = if index == 0 {
+                    Some(row.path.display().to_string())
+                } else {
+                    coverage_text(coverage.as_deref(), &row.path, row.folder)
+                };
                 let style = TreeRow {
                     id: ("tree", index).into(),
                     depth: row.depth,
                     label: row.name.clone().into(),
-                    hint: (index == 0).then(|| row.path.display().to_string().into()),
+                    hint: hint.map(Into::into),
                     icon: self.row_icon(index),
                     expandable: row.folder,
                     open: row.open,
@@ -2009,6 +2034,31 @@ impl ProjectPanel {
             })
             .collect()
     }
+}
+
+/// The percentage of the covered lines of a file, or of every file under a folder, as the
+/// project tree shows it after a run with coverage.
+fn coverage_text(
+    report: Option<&lang_api::CoverageReport>,
+    path: &Path,
+    folder: bool,
+) -> Option<String> {
+    let report = report?;
+    let (covered, total) = if folder {
+        report
+            .files
+            .iter()
+            .filter(|file| file.path.starts_with(path))
+            .fold((0, 0), |(covered, total), file| {
+                let counters = file.line_counters();
+                (covered + counters.covered, total + counters.total)
+            })
+    } else {
+        let counters = report.file(path)?.line_counters();
+        (counters.covered, counters.total)
+    };
+    let counters = lang_api::Counters { covered, total };
+    counters.percent().map(|percent| format!("{percent}%"))
 }
 
 impl Render for ProjectPanel {

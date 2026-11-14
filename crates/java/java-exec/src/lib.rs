@@ -2,6 +2,7 @@
 //! the provider that turns a stored configuration into a command, finding tests and running
 //! them through the build tool.
 
+mod coverage;
 mod flags;
 mod mains;
 mod pathing;
@@ -9,6 +10,7 @@ mod provider;
 mod test_sources;
 mod testing;
 
+pub use coverage::{exec_file, report};
 pub use flags::JvmFlags;
 pub use mains::{EntryPoint, find_entry_points, parse_entry_points};
 pub use pathing::{classpath_jar, write_classpath_jar};

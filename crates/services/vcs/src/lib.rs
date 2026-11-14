@@ -8,6 +8,7 @@ mod blob;
 mod diff;
 mod git;
 mod merge;
+mod rebase;
 mod repo;
 mod shelve;
 mod status;
@@ -23,6 +24,7 @@ pub use diff::{
 };
 pub use git::GitRunner;
 pub use merge::{Segment, SegmentKind, ThreeWay, merge};
+pub use rebase::{RebaseAction, RebasePlan, RebaseReport, RebaseStep};
 pub use repo::{
     Branch, Commit, CommitOptions, CommitRequest, Compare, ConflictSide, ConflictVersions,
     FileDiff, Operation, RefKind, RefLabel, Repository, ResetMode, Stash, UpdateMode, UpdateReport,

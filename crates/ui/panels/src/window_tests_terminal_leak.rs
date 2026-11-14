@@ -3,6 +3,7 @@
 //! program that outlives its shell is no longer a child of anything a walk from this
 //! process can reach.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,14 +69,41 @@ fn run_endless_program(cx: &mut TestAppContext, session: &TerminalSession) -> u3
     program.expect("the program of the terminal has a process id")
 }
 
-/// The program of `endless_program`, while it still has its shell as its parent.
+/// The program of `endless_program`, while its session still runs.
+///
+/// The search walks the whole tree of the shell, not its direct children only. On Linux
+/// the session starts `/bin/sh` (dash), which runs the real shell as its child instead of
+/// replacing itself, so the program of the shell is a grandchild of the pid the session
+/// reports. Windows starts the shell itself, and macOS `/bin/sh` is bash, which replaces
+/// itself, so there the walk finds the program one level lower.
 fn child_of(shell: u32) -> Option<u32> {
-    process_tree()
-        .into_iter()
-        .find(|process| {
-            process.parent == Some(shell) && process.name.eq_ignore_ascii_case(endless_image())
-        })
-        .map(|process| process.pid)
+    let tree = process_tree();
+    let mut below: HashMap<u32, Vec<u32>> = HashMap::new();
+    for process in &tree {
+        if let Some(parent) = process.parent {
+            below.entry(parent).or_default().push(process.pid);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut pending = vec![shell];
+    while let Some(parent) = pending.pop() {
+        let Some(children) = below.get(&parent) else {
+            continue;
+        };
+        for &pid in children {
+            if !seen.insert(pid) {
+                continue;
+            }
+            let ours = tree.iter().any(|process| {
+                process.pid == pid && process.name.eq_ignore_ascii_case(endless_image())
+            });
+            if ours {
+                return Some(pid);
+            }
+            pending.push(pid);
+        }
+    }
+    None
 }
 
 /// The live children of `shell` that were created with the session or later. The id of a

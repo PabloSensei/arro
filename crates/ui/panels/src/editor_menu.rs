@@ -329,5 +329,20 @@ fn build(
         }
     }
 
+    if model.gutter && ::http_client::is_request_file(&path) {
+        entries.push(MenuEntry::separator());
+        let clicked = view.clone();
+        entries.push(
+            MenuEntry::new("Run All Requests", move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        crate::http::run_all(&clicked, workspace, window, cx)
+                    })
+                    .ok();
+            })
+            .icon("run/run"),
+        );
+    }
+
     entries
 }

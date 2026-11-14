@@ -519,6 +519,13 @@ impl EditorState {
         &self.spans
     }
 
+    /// The colours of a format without a grammar, which the application computes from
+    /// the lines. They are cut to the text, as a parse of an older version would be.
+    pub(crate) fn set_spans(&mut self, mut spans: Vec<HighlightSpan>) {
+        normalize_spans(&mut spans, self.buffer.store().len());
+        self.spans = spans;
+    }
+
     pub(crate) fn tokens(&self) -> &[TokenSpan] {
         &self.tokens
     }

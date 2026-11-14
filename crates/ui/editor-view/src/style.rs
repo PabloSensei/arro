@@ -41,6 +41,8 @@ pub struct EditorStyle {
     pub code_vision: Hsla,
     /// The background of a rendered documentation comment.
     pub doc_background: Hsla,
+    /// The background of a code span inside running text.
+    pub inline_code_background: Hsla,
     pub fold_background: Hsla,
     pub fold_text: Hsla,
     pub error_mark: Hsla,
@@ -108,6 +110,7 @@ impl EditorStyle {
             inlay_background: theme.inlay_bg,
             code_vision: theme.text_muted,
             doc_background: theme.fold_bg,
+            inline_code_background: theme.hover,
             fold_background: theme.fold_bg,
             fold_text: theme.fold_text,
             // No theme token yet: the red of an IDEA error stripe.
@@ -163,14 +166,39 @@ impl EditorStyle {
             HighlightKind::Field | HighlightKind::Constant => self.field,
             HighlightKind::Function => self.function,
             HighlightKind::Annotation => self.annotation,
+            HighlightKind::Strong | HighlightKind::Emphasis | HighlightKind::Strikethrough => {
+                self.code
+            }
+            HighlightKind::InlineCode => self.string,
+            HighlightKind::Link => self.accent,
+            HighlightKind::LinkUrl | HighlightKind::Marker => self.comment,
         }
     }
 
     pub(crate) fn is_italic(&self, kind: HighlightKind) -> bool {
         matches!(
             kind,
-            HighlightKind::DocComment | HighlightKind::DocTag | HighlightKind::Constant
+            HighlightKind::DocComment
+                | HighlightKind::DocTag
+                | HighlightKind::Constant
+                | HighlightKind::Emphasis
         ) || (kind == HighlightKind::Comment && !self.dark)
+    }
+
+    pub(crate) fn is_bold(&self, kind: HighlightKind) -> bool {
+        kind == HighlightKind::Strong
+    }
+
+    pub(crate) fn is_strikethrough(&self, kind: HighlightKind) -> bool {
+        kind == HighlightKind::Strikethrough
+    }
+
+    /// The background a highlighted range gets, if any.
+    pub(crate) fn background_of(&self, kind: HighlightKind) -> Option<Hsla> {
+        match kind {
+            HighlightKind::InlineCode => Some(self.inline_code_background),
+            _ => None,
+        }
     }
 
     /// How the semantic token of `kind` with `modifiers` is drawn. `None` leaves the

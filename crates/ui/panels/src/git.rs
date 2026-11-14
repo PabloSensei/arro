@@ -12,7 +12,7 @@ use editor_view::{EditorView, GutterKind, GutterMark};
 use ui_kit::*;
 use vcs::{
     BlameLine, Change, ConflictSide, FileStatus, GitRunner, Hunk, LineChangeKind, Operation,
-    Repository, ResetMode, Stash, Status, UpdateMode, UpdateReport,
+    RebasePlan, RebaseReport, Repository, ResetMode, Stash, Status, UpdateMode, UpdateReport,
 };
 use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
@@ -46,6 +46,10 @@ fn push_rejected(error: &std::io::Error) -> bool {
 
 /// A command that puts the branch of the last Delete back.
 pub const RESTORE_BRANCH_COMMAND: &str = "git.restore_deleted_branch";
+
+/// The command of the button a rebase stopped for an edit shows: it continues the rebase
+/// with the message git wrote.
+pub const CONTINUE_REBASE_COMMAND: &str = "git.rebase_continue";
 
 /// The command of the gutter menu that puts the blame of a file before its text, and the
 /// one that takes the column away.
@@ -1252,6 +1256,56 @@ impl GitState {
             );
         } else if report.operation == Operation::None {
             self.tell(what, done, cx);
+        }
+        if !report.conflicts.is_empty() || report.operation != Operation::None {
+            self.open_conflicts(cx);
+        }
+    }
+
+    /// Replays the plan of the Rebase dialog. A stop for an edit or a conflict opens the
+    /// Conflicts window, which continues or aborts the rebase, and the notification of the
+    /// edit names the commit git waits at.
+    pub fn start_rebase(&mut self, plan: RebasePlan, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Rebase", message, cx);
+            return;
+        }
+        self.run(
+            "Rebase",
+            move |repo| repo.rebase(&plan),
+            |this, report, cx| this.finish_rebase(report, cx),
+            cx,
+        );
+    }
+
+    fn finish_rebase(&mut self, report: RebaseReport, cx: &mut Context<Self>) {
+        self.operation = report.operation;
+        self.autostash = report.autostash;
+        self.reload_everything_from_disk(cx);
+        let stopped = report.stopped.clone();
+        if let Some(stash) = &report.stash {
+            self.report("Rebase", stash_left_message(stash), cx);
+        } else if !report.conflicts.is_empty() {
+            self.tell(
+                "Rebase",
+                format!("{} file(s) in conflict", report.conflicts.len()),
+                cx,
+            );
+        } else if let Some(id) = stopped {
+            let text = format!("Rebase stopped at {} for editing", short_commit(&id));
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user_with_command(
+                        "Rebase",
+                        text,
+                        "Continue Rebase",
+                        CONTINUE_REBASE_COMMAND,
+                        cx,
+                    )
+                })
+                .ok();
+        } else if report.operation == Operation::None {
+            self.tell("Rebase", "The rebase is finished", cx);
         }
         if !report.conflicts.is_empty() || report.operation != Operation::None {
             self.open_conflicts(cx);

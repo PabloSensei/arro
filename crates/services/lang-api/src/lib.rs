@@ -5,6 +5,7 @@
 
 mod answer;
 mod code_lens;
+mod coverage;
 mod documentation;
 mod hierarchy;
 mod inlay;
@@ -18,6 +19,9 @@ pub use answer::{Answer, Confidence, SourceId};
 pub use code_lens::{
     CodeLensCommand, CodeLensEntry, CodeLensKind, CodeLensProvider, CodeLensQuery,
     CodeLensResolveProvider, CodeLensResolveQuery, CodeVisionSettings, kind_of,
+};
+pub use coverage::{
+    BranchCoverage, Counters, CoverageReport, FileCoverage, LineCoverage, LineState, TypeCoverage,
 };
 pub use documentation::{
     DocumentationBlock, DocumentationComment, DocumentationCommentProvider, DocumentationInline,

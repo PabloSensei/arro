@@ -10,7 +10,7 @@ use ui_kit::metrics::*;
 
 use workspace::{COMMIT_TOOL, DEBUG_TOOL, LOG_TOOL, PROJECT_TOOL, RUN_TOOL, Workspace};
 
-use crate::window_tests::{bounds_of, draw, open_path, open_window, press};
+use crate::window_tests::{bounds_of, click, draw, open_path, open_window, press};
 use crate::window_tests_git::{git_state, repository_with_origin};
 use crate::window_tests_run::debug_panel;
 use crate::window_tests_ui::wait_for;
@@ -108,7 +108,7 @@ fn tool_window_rows_buttons_and_headers_share_the_metrics(cx: &mut TestAppContex
     header_height(cx, window, "run-header");
     button_bar(cx, window, &["run-rerun", "run-stop"]);
 
-    // Debug: its own bar of buttons and the row of a breakpoint.
+    // Debug: its own bar of buttons and the row of a breakpoint in the list.
     let path = root.join("main.txt");
     open_path(cx, window, &path);
     let debug = debug_panel(cx);
@@ -120,12 +120,14 @@ fn tool_window_rows_buttons_and_headers_share_the_metrics(cx: &mut TestAppContex
     });
     show_tool(cx, window, DEBUG_TOOL);
     header_height(cx, window, "debug-header");
-    button_bar(cx, window, &["debug-continue", "debug-over", "debug-into"]);
+    button_bar(cx, window, &["debug-rerun", "debug-continue"]);
+    click(cx, window, "debug-breakpoints");
+    draw(cx, window);
     assert!(
-        has(cx, window, "debug-breakpoint-0"),
+        has(cx, window, "debug-breakpoint-row-0"),
         "the breakpoint row is on screen"
     );
-    row_height(cx, window, "debug-breakpoint-0");
+    row_height(cx, window, "debug-breakpoint-row-0");
 
     // Commit: the header and the row of the changed file.
     show_tool(cx, window, COMMIT_TOOL);

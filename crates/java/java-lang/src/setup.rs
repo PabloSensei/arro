@@ -144,15 +144,15 @@ impl Search {
     }
 
     /// The folders that hold `jdtls-*` and `vscode-java-debug-*`: next to `arro.exe`
-    /// first, then `IDE_TOOLS` and its `tools`. In the bundle of macOS the program sits in
-    /// `Contents/MacOS` and the tools in `Contents/Resources/tools`.
+    /// first, then the resources of a macOS bundle, then `IDE_TOOLS` and its `tools`.
     fn tool_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(exe_dir) = &self.exe_dir {
-            dirs.push(exe_dir.join("tools"));
-            #[cfg(target_os = "macos")]
-            if let Some(contents) = exe_dir.parent() {
-                dirs.push(contents.join("Resources").join("tools"));
+            let beside = exe_dir.join("tools");
+            dirs.push(beside.clone());
+            let resources = platform::resources_dir_of(exe_dir).join("tools");
+            if resources != beside {
+                dirs.push(resources);
             }
         }
         if let Some(tools) = &self.tools {
@@ -364,6 +364,27 @@ mod tests {
         assert_eq!(toolchain.jdtls_home, jdtls_home);
         assert_eq!(toolchain.debug_plugin, debug_plugin);
         assert_eq!(toolchain.java_home, java_home);
+    }
+
+    #[test]
+    fn the_tools_of_a_bundle_are_in_its_resources() {
+        let app = scratch("bundle-tools");
+        let exe_dir = app.join("Arro.app").join("Contents").join("MacOS");
+        fs::create_dir_all(&exe_dir).unwrap();
+        let tools = app
+            .join("Arro.app")
+            .join("Contents")
+            .join("Resources")
+            .join("tools");
+        let jdtls_home = jdtls(&tools, "1.63.0");
+        let debug_plugin = debug_jar(&tools, "0.60.0");
+        let mut found = search(&exe_dir);
+        found.java_home = Some(PathBuf::from(r"C:\chosen\jdk"));
+
+        let toolchain = discover(&found).unwrap();
+
+        assert_eq!(toolchain.jdtls_home, jdtls_home);
+        assert_eq!(toolchain.debug_plugin, debug_plugin);
     }
 
     #[test]

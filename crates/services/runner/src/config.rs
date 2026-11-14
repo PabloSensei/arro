@@ -307,10 +307,35 @@ pub trait RunConfigProvider: Send + Sync {
         None
     }
 
+    /// Whether [`RunConfigProvider::coverage_plan`] makes a plan. The menus offer Run
+    /// with Coverage only for a provider that has it.
+    fn supports_coverage(&self) -> bool {
+        false
+    }
+
     /// The same program under a debugger. Providers that cannot debug keep the
     /// plain plan and say so by their name.
     fn debug_plan(&self, config: &RunConfig, model: &ProjectModel) -> Result<RunPlan> {
         self.plan(config, model)
+    }
+
+    /// The same program with a coverage agent, and the file the agent writes. A
+    /// provider without coverage keeps the error of this default.
+    fn coverage_plan(
+        &self,
+        _config: &RunConfig,
+        _model: &ProjectModel,
+    ) -> Result<crate::CoveragePlan> {
+        Err(format!("{} cannot collect coverage", self.id()).into())
+    }
+
+    /// Reads the data of the last run of [`RunConfigProvider::coverage_plan`].
+    fn coverage_report(
+        &self,
+        _exec: &Path,
+        _model: &ProjectModel,
+    ) -> Result<lang_api::CoverageReport> {
+        Err(format!("{} cannot read coverage", self.id()).into())
     }
 
     /// The fields the dialog edits, in the order it shows them. A field that does not

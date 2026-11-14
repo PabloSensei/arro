@@ -11,7 +11,7 @@ members = [
 exclude = ["spikes", "vendor"]
 
 [workspace.package]
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 publish = false
 
@@ -67,6 +67,7 @@ tree-sitter-yaml = "=0.7.2"
 updater = { path = "crates/services/updater" }
 vcs = { path = "crates/services/vcs" }
 workspace-core = { path = "crates/services/workspace-core" }
+http-client = { path = "crates/services/http-client" }
 
 [patch.crates-io]
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }

@@ -18,6 +18,7 @@ pub fn config() -> LanguageConfig {
         statements: None,
         indent_unit: "    ",
         file_mask: "Dockerfile",
+        injections: Vec::new(),
     }
 }
 

@@ -7,7 +7,7 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::graph;
-use vcs::{Commit, RefKind, RefLabel, ResetMode};
+use vcs::{Commit, RebaseAction, RebasePlan, RefKind, RefLabel, ResetMode};
 use workspace::{LOG_TOOL, Workspace};
 
 use crate::diff_view::DiffView;
@@ -30,6 +30,11 @@ const MAX_LANES: usize = 10;
 /// width of the longest of them: a longer name is cut.
 const LABEL_HEIGHT: f32 = 16.;
 const LABEL_WIDTH: f32 = 180.;
+/// The width of the Rebase dialog, the width of its action cell and the height of the
+/// message field of a Reword.
+const REBASE_WIDTH: f32 = 760.;
+const REBASE_ACTION_WIDTH: f32 = 96.;
+const REBASE_MESSAGE_HEIGHT: f32 = 96.;
 
 actions!(
     git_log_panel,
@@ -421,6 +426,39 @@ impl GitLogPanel {
         });
     }
 
+    /// Interactively Rebase from Here: reads the plan of the commits from the chosen one
+    /// to HEAD, then opens the dialog of the plan. A commit that is not on the branch, or
+    /// a range with a merge, is a notification instead of a dialog.
+    fn open_rebase(&mut self, commit: String, window: AnyWindowHandle, cx: &mut Context<Self>) {
+        let Some(repo) = self.git.read(cx).repo() else {
+            return;
+        };
+        let job = cx
+            .background_executor()
+            .spawn(async move { repo.rebase_plan(&commit).map_err(|error| error.to_string()) });
+        let workspace = self.workspace.clone();
+        let git = self.git.clone();
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |_, cx| match result {
+                Ok(plan) => {
+                    window
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    RebaseView::open(git.clone(), plan, workspace, window, cx)
+                                })
+                                .ok();
+                        })
+                        .ok();
+                }
+                Err(message) => git.update(cx, |git, cx| git.report("Rebase", message, cx)),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Ctrl+Alt+N: a branch that starts at the selected commit.
     fn ask_branch_from_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(commit) = self.selected_commit() else {
@@ -641,6 +679,20 @@ impl GitLogPanel {
                     .ok();
             })
             .icon("general/vcs"),
+        );
+
+        let rebased = id.clone();
+        let panel = cx.weak_entity();
+        entries.push(
+            MenuEntry::new("Interactively Rebase from Here...", move |window, cx| {
+                let commit = rebased.clone();
+                let window = window.window_handle();
+                panel
+                    .update(cx, |panel, cx| panel.open_rebase(commit, window, cx))
+                    .ok();
+            })
+            .icon("general/vcs")
+            .id("git-log-interactive-rebase"),
         );
 
         let compared = short_commit(&id);
@@ -1143,6 +1195,544 @@ impl Render for ResetView {
             .left(left)
             .top(top)
             .child(enter("reset-enter", body))
+    }
+}
+
+/// Interactively Rebase from Here: the commits from the chosen one to HEAD, oldest first,
+/// with the action of each of them. The plan starts the rebase; a Reword opens a field
+/// with the message of the commit in the dialog itself.
+pub struct RebaseView {
+    git: Entity<GitState>,
+    workspace: WeakEntity<Workspace>,
+    focus: FocusHandle,
+    plan: RebasePlan,
+    /// The plan as the dialog opened it, for Reset.
+    original: RebasePlan,
+    selected: usize,
+    /// The row whose list of actions is open.
+    open_action: Option<usize>,
+    /// The message field takes the keys of the user.
+    editing: bool,
+    message: TextField,
+    scroll: ScrollHandle,
+}
+
+impl RebaseView {
+    fn open(
+        git: Entity<GitState>,
+        plan: RebasePlan,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        let weak = cx.weak_entity();
+        let message = plan
+            .steps
+            .first()
+            .map(|step| TextField::from_text(step.message.clone()))
+            .unwrap_or_default();
+        let original = plan.clone();
+        let view = cx.new(|cx| Self {
+            git,
+            workspace: weak,
+            focus: cx.focus_handle(),
+            plan,
+            original,
+            selected: 0,
+            open_action: None,
+            editing: false,
+            message,
+            scroll: ScrollHandle::new(),
+        });
+        let focus = view.read(cx).focus.clone();
+        workspace.show_overlay(view.clone().into(), focus, window, cx);
+        view
+    }
+
+    /// Writes the text of the field back into the step it belongs to.
+    fn sync_message(&mut self) {
+        if let Some(step) = self.plan.steps.get_mut(self.selected)
+            && step.action == RebaseAction::Reword
+        {
+            step.message = self.message.text.clone();
+        }
+    }
+
+    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.plan.steps.len() {
+            return;
+        }
+        self.sync_message();
+        self.selected = index;
+        self.editing = false;
+        self.open_action = None;
+        let message = self.plan.steps[index].message.clone();
+        self.message = TextField::from_text(message);
+        cx.notify();
+    }
+
+    fn set_action(&mut self, index: usize, action: RebaseAction, cx: &mut Context<Self>) {
+        if index >= self.plan.steps.len() {
+            return;
+        }
+        // The first commit of the list has nothing before it to squash or fix up.
+        if index == 0 && matches!(action, RebaseAction::Squash | RebaseAction::Fixup) {
+            return;
+        }
+        self.sync_message();
+        self.plan.steps[index].action = action;
+        self.selected = index;
+        self.open_action = None;
+        if action == RebaseAction::Reword {
+            let message = self.plan.steps[index].message.clone();
+            self.message = TextField::from_text(message);
+            self.editing = true;
+        } else {
+            self.editing = false;
+        }
+        cx.notify();
+    }
+
+    /// Alt+Up and Alt+Down: the selected commit takes the place of its neighbour.
+    fn move_selected(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let target = self.selected as isize + delta;
+        if target < 0 || target as usize >= self.plan.steps.len() {
+            return;
+        }
+        let target = target as usize;
+        self.sync_message();
+        self.plan.steps.swap(self.selected, target);
+        self.selected = target;
+        let first = &mut self.plan.steps[0];
+        if matches!(first.action, RebaseAction::Squash | RebaseAction::Fixup) {
+            first.action = RebaseAction::Pick;
+        }
+        cx.notify();
+    }
+
+    fn reset_plan(&mut self, cx: &mut Context<Self>) {
+        self.plan = self.original.clone();
+        self.selected = 0;
+        self.open_action = None;
+        self.editing = false;
+        let message = self.plan.steps[0].message.clone();
+        self.message = TextField::from_text(message);
+        cx.notify();
+    }
+
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_message();
+        let plan = self.plan.clone();
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+        self.git.update(cx, |git, cx| git.start_rebase(plan, cx));
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        let key = stroke.key.as_str();
+        if self.editing {
+            if key == "escape" {
+                self.sync_message();
+                self.editing = false;
+                cx.stop_propagation();
+                cx.notify();
+            } else if self.message.key_with_clipboard(event, true, cx) {
+                self.sync_message();
+                cx.stop_propagation();
+                cx.notify();
+            } else {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if key == "escape" {
+            self.close(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if stroke.modifiers.alt && key == "up" {
+            self.move_selected(-1, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if stroke.modifiers.alt && key == "down" {
+            self.move_selected(1, cx);
+            cx.stop_propagation();
+            return;
+        }
+        match key {
+            "up" => {
+                self.select(self.selected.saturating_sub(1), cx);
+                cx.stop_propagation();
+                return;
+            }
+            "down" => {
+                let last = self.plan.steps.len().saturating_sub(1);
+                self.select((self.selected + 1).min(last), cx);
+                cx.stop_propagation();
+                return;
+            }
+            _ => {}
+        }
+        let plain =
+            !stroke.modifiers.control && !stroke.modifiers.alt && !stroke.modifiers.platform;
+        if plain && key.len() == 1 {
+            let pressed = key.chars().next().unwrap_or_default();
+            if let Some(action) = RebaseAction::from_key(pressed) {
+                let selected = self.selected;
+                self.set_action(selected, action, cx);
+                cx.stop_propagation();
+            }
+        }
+    }
+
+    fn button(
+        id: &'static str,
+        label: &'static str,
+        primary: bool,
+        theme: &Theme,
+    ) -> Stateful<Div> {
+        let (hover, pressed) = (theme.hover, theme.pressed);
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(if primary {
+                theme.accent
+            } else {
+                theme.popup_border
+            })
+            .when(primary, |this| {
+                this.bg(theme.accent).text_color(theme.over_accent)
+            })
+            .when(!primary, |this| {
+                this.hover(move |style| style.bg(hover))
+                    .active(move |style| style.bg(pressed))
+            })
+            .child(label)
+    }
+
+    fn row(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let step = &self.plan.steps[index];
+        let selected = self.selected == index;
+        let short = short_commit(&step.id);
+        let action = step.action;
+        let subject = step.subject.clone();
+        let author = step.author.clone();
+        let hover = theme.selection_hover;
+        div()
+            .id(("rebase-row", index))
+            .debug_selector(move || format!("rebase-row-{index}"))
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .px(px(ROW_PADDING_X))
+            .rounded(px(ROW_RADIUS))
+            .when(selected, |this| this.bg(theme.selection_inactive))
+            .when(!selected, |this| this.hover(move |style| style.bg(hover)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let open = this.open_action != Some(index);
+                this.select(index, cx);
+                this.open_action = open.then_some(index);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id(("rebase-action", index))
+                    .debug_selector(move || format!("rebase-action-{index}"))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(SPACE_XS))
+                    .flex_none()
+                    .w(px(REBASE_ACTION_WIDTH))
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.popup_border)
+                    .hover({
+                        let hover = theme.hover;
+                        move |style| style.bg(hover)
+                    })
+                    .child(action.label())
+                    .child(icon_sized(
+                        if self.open_action == Some(index) {
+                            "general/chevronUp"
+                        } else {
+                            "general/chevronDown"
+                        },
+                        TEXT_SMALL,
+                        theme,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let open = this.open_action != Some(index);
+                        this.select(index, cx);
+                        this.open_action = open.then_some(index);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex_none()
+                    .font_family(MONO_FONT)
+                    .text_color(theme.link)
+                    .child(short),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(subject),
+            )
+            .child(
+                div()
+                    .w(px(120.))
+                    .flex_none()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(theme.text_secondary)
+                    .child(author),
+            )
+    }
+
+    /// The list of actions of one row, open under the row as a dropdown.
+    fn action_menu(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let first = index == 0;
+        let entries = RebaseAction::ALL.into_iter().map(move |action| {
+            let disabled = first && matches!(action, RebaseAction::Squash | RebaseAction::Fixup);
+            let hover = theme.hover;
+            let name: SharedString = format!("rebase-option-{index}-{}", action.name()).into();
+            div()
+                .id(name.clone())
+                .debug_selector(move || name.to_string())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(SPACE_M))
+                .flex_none()
+                .h(px(ROW_HEIGHT))
+                .px(px(SPACE_S))
+                .rounded(px(ROW_RADIUS))
+                .text_color(if disabled {
+                    theme.text_muted
+                } else {
+                    theme.text
+                })
+                .when(!disabled, |this| {
+                    this.cursor_pointer()
+                        .hover(move |style| style.bg(hover))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.set_action(index, action, cx)),
+                        )
+                })
+                .child(action.label())
+                .child(action.key().to_ascii_uppercase().to_string())
+        });
+        div()
+            .id(("rebase-menu", index))
+            .debug_selector(move || format!("rebase-menu-{index}"))
+            .flex()
+            .flex_col()
+            .flex_none()
+            .mx(px(SPACE_M))
+            .my(px(SPACE_XS))
+            .p(px(SPACE_XS))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popup_bg)
+            .children(entries)
+    }
+
+    fn message_editor(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let step = &self.plan.steps[self.selected];
+        let show_caret = self.editing;
+        div()
+            .id("rebase-message")
+            .debug_selector(|| "rebase-message".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(SPACE_XS))
+            .child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .child(format!("Message of {}", short_commit(&step.id))),
+            )
+            .child(
+                div()
+                    .id("rebase-message-field")
+                    .debug_selector(|| "rebase-message-field".to_owned())
+                    .h(px(REBASE_MESSAGE_HEIGHT))
+                    .p(px(SPACE_M))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.popup_border)
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .text_color(theme.text)
+                    .children(text_field_lines_named(
+                        "rebase-message-field",
+                        &self.message,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        18.,
+                        show_caret,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.editing = true;
+                        cx.notify();
+                    })),
+            )
+    }
+}
+
+impl Render for RebaseView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let viewport = window.viewport_size();
+        let width = px(REBASE_WIDTH).min(viewport.width - px(40.));
+        let height = viewport.height * 0.7;
+        let left = (viewport.width - width) / 2.;
+        let top = viewport.height * 0.14;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for index in 0..self.plan.steps.len() {
+            rows.push(self.row(index, &theme, cx).into_any_element());
+            if self.open_action == Some(index) {
+                rows.push(self.action_menu(index, &theme, cx).into_any_element());
+            }
+        }
+        let editing_message = self
+            .plan
+            .steps
+            .get(self.selected)
+            .is_some_and(|step| step.action == RebaseAction::Reword);
+        let count = self.plan.steps.len();
+        let oldest = self
+            .plan
+            .steps
+            .first()
+            .map(|step| short_commit(&step.id))
+            .unwrap_or_default();
+        let body = surface(&theme)
+            .id("rebase-view")
+            .debug_selector(|| "rebase-view".to_owned())
+            .key_context("Rebase")
+            .track_focus(&self.focus)
+            .occlude()
+            .w(width)
+            .h(height)
+            .p(px(POPUP_PADDING))
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_M))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .gap(px(SPACE_XS))
+                    .child(
+                        div()
+                            .text_size(px(TEXT_TITLE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Rebase"),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.text_secondary)
+                            .child(format!("{count} commit(s) from {oldest} to HEAD")),
+                    ),
+            )
+            .child(
+                scrollable(
+                    "rebase-commits",
+                    &self.scroll,
+                    div()
+                        .id("rebase-commits")
+                        .flex()
+                        .flex_col()
+                        .px(px(SPACE_M))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .children(rows),
+                    &theme,
+                    window,
+                    cx,
+                )
+                .flex_1()
+                .min_h_0(),
+            )
+            .children(editing_message.then(|| self.message_editor(&theme, cx)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(SPACE_S))
+                    .flex_none()
+                    .child(
+                        Self::button("rebase-reset", "Reset", false, &theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_plan(cx))),
+                    )
+                    .child(
+                        Self::button("rebase-cancel", "Cancel", false, &theme)
+                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .child(
+                        Self::button("rebase-start", "Start Rebasing", true, &theme)
+                            .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
+                    ),
+            );
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .child(enter("rebase-enter", body))
+    }
+}
+
+#[cfg(test)]
+impl RebaseView {
+    /// The subjects of the plan, oldest first.
+    pub fn subjects(&self) -> Vec<String> {
+        self.plan
+            .steps
+            .iter()
+            .map(|step| step.subject.clone())
+            .collect()
+    }
+
+    /// The action of every row, oldest first.
+    pub fn actions(&self) -> Vec<RebaseAction> {
+        self.plan.steps.iter().map(|step| step.action).collect()
     }
 }
 

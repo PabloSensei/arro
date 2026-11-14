@@ -51,7 +51,7 @@ pub fn language_for(path: &Path) -> Option<LanguageConfig> {
 }
 
 pub fn symbols_for(path: &Path) -> Option<&'static dyn SymbolProvider> {
-    is_source(path).then(|| java_syntax::symbols() as &dyn SymbolProvider)
+    is_source(path).then(|| java_syntax::java_symbols() as &dyn SymbolProvider)
 }
 
 /// How a project builds and runs.

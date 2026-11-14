@@ -1189,6 +1189,24 @@ impl Provider<FileSymbolsQuery, Vec<FileSymbol>> for JavaProject {
                 None => Vec::new(),
             };
             if let Some(text) = read_source(&uri, &router) {
+                // A server may list the types of a file without their package. The
+                // debugger names a field or a method by the type that owns it, and that
+                // name has the package: the outline puts the package around the types.
+                let package = package_of(&text);
+                if !package.is_empty()
+                    && !symbols
+                        .iter()
+                        .any(|symbol| symbol.kind == SymbolKind::Module)
+                {
+                    symbols = vec![FileSymbol {
+                        name: package,
+                        detail: None,
+                        kind: SymbolKind::Module,
+                        range: TextSpan::default(),
+                        name_range: TextSpan::default(),
+                        children: symbols,
+                    }];
+                }
                 enrich_fields(&mut symbols, &text);
             }
             let _ = reply.send(Answer::new(symbols, Confidence::Certain, SOURCE));

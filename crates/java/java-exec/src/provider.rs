@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base::Result;
-use java_project::{BuildEnv, Jdk};
+use java_project::{BuildEnv, CoverageTools, Jdk};
 use proc_sup::ProcessSpec;
 use project_model::{BuildSystem, MAIN_UNIT, Module, ProjectModel};
 use runner::{
-    ConfigField, ConfigTemplate, LaunchPoint, RunConfig, RunConfigProvider, RunPlan,
+    ConfigField, ConfigTemplate, CoveragePlan, LaunchPoint, RunConfig, RunConfigProvider, RunPlan,
     format_environment, join_arguments, parse_environment, split_arguments,
 };
 use serde::{Deserialize, Serialize};
@@ -107,7 +107,7 @@ impl JavaProvider {
     }
 
     fn program(&self, target: &JavaTarget, model: &ProjectModel, jdk: &Jdk) -> Result<ProcessSpec> {
-        self.program_with(target, model, jdk, false)
+        self.program_with(target, model, jdk, false, None)
     }
 
     fn program_with(
@@ -116,6 +116,7 @@ impl JavaProvider {
         model: &ProjectModel,
         jdk: &Jdk,
         debug: bool,
+        coverage: Option<(&CoverageTools, &Path)>,
     ) -> Result<ProcessSpec> {
         let unit = target.unit.as_deref().unwrap_or(MAIN_UNIT);
         let module = model
@@ -140,6 +141,9 @@ impl JavaProvider {
             .input();
         if debug {
             spec = spec.arg(flags.debug_agent("127.0.0.1", 0, true));
+        }
+        if let Some((tools, exec)) = coverage {
+            spec = spec.arg(tools.java_agent(exec));
         }
         if target.spring_boot {
             spec = spec.arg(SPRING_ANSI);
@@ -216,9 +220,51 @@ impl RunConfigProvider for JavaProvider {
             .flatten();
         Ok(RunPlan {
             before,
-            program: self.program_with(&target, model, &jdk, true)?,
+            program: self.program_with(&target, model, &jdk, true, None)?,
             grace: GRACE,
         })
+    }
+
+    fn supports_coverage(&self) -> bool {
+        true
+    }
+
+    /// The same program with the coverage agent, whose data goes to a file of the cache
+    /// of the project.
+    fn coverage_plan(&self, config: &RunConfig, model: &ProjectModel) -> Result<CoveragePlan> {
+        if !model.resolved {
+            return Err("the project model has no dependencies yet, sync first".into());
+        }
+        let target: JavaTarget = config.settings.clone().try_into()?;
+        let jdk = self.jdk(model)?;
+        let tools = self.env.coverage_tools()?;
+        if !tools.agent.is_file() {
+            return Err(format!("no coverage agent at {}", tools.agent.display()).into());
+        }
+        let exec = crate::coverage::exec_file(&self.env.cache_root(), &config.name)?;
+        let before = config
+            .assemble_first
+            .then(|| self.tool.assemble_if_needed(&model.root))
+            .transpose()?
+            .flatten();
+        let program = self.program_with(&target, model, &jdk, false, Some((&tools, &exec)))?;
+        Ok(CoveragePlan {
+            plan: RunPlan {
+                before,
+                program,
+                grace: GRACE,
+            },
+            exec,
+            note: None,
+        })
+    }
+
+    fn coverage_report(
+        &self,
+        exec: &Path,
+        model: &ProjectModel,
+    ) -> Result<lang_api::CoverageReport> {
+        crate::coverage::report(&self.env, exec, model)
     }
 
     fn launch_points(&self, text: &str, file: &Path, model: &ProjectModel) -> Vec<LaunchPoint> {

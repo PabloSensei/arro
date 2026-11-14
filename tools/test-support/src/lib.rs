@@ -100,6 +100,37 @@ pub fn root() -> PathBuf {
     system_temp().join(ROOT)
 }
 
+/// A directory link at `link` to `target`, for a test that opens a project through one.
+/// Windows needs the right to create symbolic links, so a junction serves there; a system
+/// that allows neither makes the test skip.
+pub fn link_dir(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return Ok(());
+        }
+        let made = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/j"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success();
+        if made {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "this system made neither a symbolic link nor a junction",
+            ))
+        }
+    }
+}
+
 /// The system temp folder as the file system names it. On macOS it is `/var/folders/...`,
 /// a link to `/private/var/folders/...`, and git and the file watcher report the real
 /// path, which the tests compare with the one they made.
@@ -249,5 +280,18 @@ mod tests {
     fn a_scratch_folder_is_there_after_the_call() {
         let path = scratch("check-scratch");
         assert!(path.is_dir());
+    }
+
+    #[test]
+    fn a_link_reaches_the_folder_it_names() {
+        let target = TempDir::new("link-target");
+        fs::write(target.join("a.txt"), "a").unwrap();
+        let holder = TempDir::new("link-holder");
+        let link = holder.join("link");
+        if link_dir(&target, &link).is_err() {
+            eprintln!("the test is skipped: this system made no directory link");
+            return;
+        }
+        assert!(link.join("a.txt").is_file());
     }
 }

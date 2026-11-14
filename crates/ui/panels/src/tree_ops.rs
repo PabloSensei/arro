@@ -49,6 +49,19 @@ pub fn basic_templates() -> Vec<FileTemplate> {
     ]
 }
 
+/// The New list row that starts a request file of the HTTP client.
+pub fn http_request() -> FileTemplate {
+    FileTemplate {
+        label: "HTTP Request",
+        icon: "fileTypes/text",
+        extension: "http",
+        creates: Creates::File,
+        content: |_, _, name| {
+            format!("### {name}\nGET http://localhost:8080/\nAccept: application/json\n\n")
+        },
+    }
+}
+
 /// What one creation will put on disk.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Creation {

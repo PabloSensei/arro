@@ -21,6 +21,7 @@ editor-view = { path = "../editor-view" }
 fs-watch = { path = "../../foundation/fs-watch" }
 futures-channel = "0.3"
 futures-util = "0.3"
+http-client.workspace = true
 keymap = { path = "../../editor/keymap" }
 lang-api.workspace = true
 local-history = { path = "../../services/local-history" }

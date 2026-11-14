@@ -16,6 +16,7 @@ mod compare;
 mod conflict;
 mod console_input;
 mod copy_class;
+mod coverage;
 mod debug;
 mod diff_view;
 mod docker;
@@ -29,6 +30,7 @@ mod git;
 mod git_log;
 mod history;
 mod history_view;
+mod http;
 mod index;
 mod inspect;
 mod items;
@@ -86,11 +88,15 @@ mod window_tests_editing;
 #[cfg(test)]
 mod window_tests_file_syntax;
 #[cfg(test)]
+mod window_tests_first_open;
+#[cfg(test)]
 mod window_tests_git;
 #[cfg(test)]
 mod window_tests_hierarchy;
 #[cfg(test)]
 mod window_tests_hotswap;
+#[cfg(test)]
+mod window_tests_http_client;
 #[cfg(test)]
 mod window_tests_import;
 #[cfg(test)]
@@ -269,6 +275,8 @@ mod window_tests_console_input;
 #[cfg(test)]
 mod window_tests_debug_input;
 #[cfg(test)]
+mod window_tests_debug_layout;
+#[cfg(test)]
 mod window_tests_diff_side;
 #[cfg(test)]
 mod window_tests_folder_compare;
@@ -291,6 +299,8 @@ mod window_tests_cached_views;
 
 #[cfg(test)]
 mod window_tests_keys_macos;
+#[cfg(test)]
+mod window_tests_markdown_inline;
 #[cfg(test)]
 mod window_tests_markdown_preview;
 #[cfg(test)]
@@ -334,6 +344,18 @@ mod window_tests_field_caret;
 #[cfg(test)]
 mod window_tests_log_actions;
 
+#[cfg(test)]
+mod window_tests_interactive_rebase;
+#[cfg(test)]
+mod window_tests_overlap;
+#[cfg(test)]
+mod window_tests_services;
+
+#[cfg(test)]
+mod window_tests_coverage;
+#[cfg(test)]
+mod window_tests_logpoints;
+
 mod choice;
 mod invalidate;
 
@@ -349,15 +371,16 @@ use lang_api::{FileChange, LanguageSupport, ProjectProblemsQuery, ask};
 use tool_gateway::LanguageTools;
 use ui_kit::*;
 use workspace::{
-    AI_TOOL, COMMIT_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, INSPECTION_TOOL, LOG_TOOL,
-    Launch, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL,
-    TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    AI_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, INSPECTION_TOOL,
+    LOG_TOOL, Launch, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL,
+    STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
 };
 
 use crate::index::{IndexEvent, ProjectIndex};
 use crate::navigation::Navigator;
 
 pub use agents::{AgentLanguages, AgentOptions};
+pub use coverage::{ActiveCoverage, CoverageColumn};
 pub use debug::{ActiveDebug, BreakpointsChanged, DebugPanel};
 pub use index::SearchSetup;
 pub use inspect::{ActiveInspect, Finding, InspectHub};
@@ -784,6 +807,19 @@ fn install(
     );
     cx.set_global(docker::ActiveDocker(services));
 
+    let state_dir = workspace.state_dir().to_path_buf();
+    let http = http::HttpPanel::create(weak.clone(), state_dir, cx);
+    let focus = http.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        workspace::HTTP_TOOL,
+        http.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(http::ActiveHttp(http));
+    http::install(cx);
+
     let root = workspace.root().to_path_buf();
     let runs = run::RunPanel::create(root, project.clone(), weak.clone(), cx);
     let focus = runs.read(cx).focus();
@@ -796,6 +832,7 @@ fn install(
     );
     workspace.set_run_controls(run::RunPanel::controls(&runs));
     cx.set_global(script::ActiveRunPanel(runs.clone()));
+    let coverage_source = runs.clone();
 
     let debug = debug::DebugPanel::create(
         workspace.root().to_path_buf(),
@@ -888,6 +925,17 @@ fn install(
     );
     problems::bind_actions(problems.clone(), weak.clone(), window.window_handle(), cx);
     cx.set_global(problems::ActiveProblems(problems));
+
+    let coverage = coverage::CoveragePanel::create(weak.clone(), coverage_source, cx);
+    let focus = coverage.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        COVERAGE_TOOL,
+        coverage.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(coverage::ActiveCoverage(coverage));
 
     let usages = usages::UsagesHub::create(root.clone(), weak.clone(), cx);
     let usages_panel = usages.read(cx).panel().clone();
@@ -1040,6 +1088,7 @@ fn release_globals(cx: &mut App) {
         finder::ActiveFinder,
         git::ActiveGit,
         git_log::ActiveGitLog,
+        http::ActiveHttp,
         index::ActiveIndex,
         inspect::ActiveInspect,
         method_hierarchy::ActiveMethodHierarchy,

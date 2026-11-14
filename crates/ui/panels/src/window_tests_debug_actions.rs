@@ -176,6 +176,9 @@ pub(crate) struct MockService {
     /// Whether the adapter advertises the method and field requests and the frame
     /// restart among its capabilities.
     breakpoint_kinds: bool,
+    /// Whether the adapter supports logpoints: a breakpoint with a message prints it and
+    /// does not stop the program.
+    log_points: bool,
 }
 
 impl MockService {
@@ -190,6 +193,7 @@ impl MockService {
             starts: AtomicUsize::new(0),
             source,
             breakpoint_kinds: false,
+            log_points: false,
         })
     }
 
@@ -206,6 +210,23 @@ impl MockService {
             starts: AtomicUsize::new(0),
             source,
             breakpoint_kinds: true,
+            log_points: false,
+        })
+    }
+
+    /// The same session on an adapter that supports logpoints.
+    pub(crate) fn with_log_points(source: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("the test runtime starts"),
+            server: Mutex::new(None),
+            starts: AtomicUsize::new(0),
+            source,
+            breakpoint_kinds: false,
+            log_points: true,
         })
     }
 
@@ -217,7 +238,9 @@ impl MockService {
         exception_filters: Vec<String>,
     ) -> Result<Debugger, String> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        let server = if self.breakpoint_kinds {
+        let server = if self.log_points {
+            lang_fixture::MockDap::start_with_log_points(self.source.to_string_lossy())
+        } else if self.breakpoint_kinds {
             lang_fixture::MockDap::start_with_breakpoint_kinds_for(self.source.to_string_lossy())
         } else {
             lang_fixture::MockDap::start_with_stack_source(self.source.to_string_lossy())
@@ -307,14 +330,30 @@ pub(crate) fn setup(cx: &mut TestAppContext, name: &str) -> Setup {
 /// The same window on an adapter that advertises the requests of method breakpoints,
 /// field watchpoints and frame restarts.
 pub(crate) fn setup_with_breakpoint_kinds(cx: &mut TestAppContext, name: &str) -> Setup {
-    setup_with_service(cx, name, true)
+    setup_with_modes(cx, name, true, false)
+}
+
+/// The same window on an adapter that supports logpoints.
+pub(crate) fn setup_with_log_points(cx: &mut TestAppContext, name: &str) -> Setup {
+    setup_with_modes(cx, name, false, true)
 }
 
 fn setup_with_service(cx: &mut TestAppContext, name: &str, breakpoint_kinds: bool) -> Setup {
+    setup_with_modes(cx, name, breakpoint_kinds, false)
+}
+
+fn setup_with_modes(
+    cx: &mut TestAppContext,
+    name: &str,
+    breakpoint_kinds: bool,
+    log_points: bool,
+) -> Setup {
     let root = sample_project(name);
     let runs = Arc::new(Mutex::new(Vec::new()));
     let source = root.join("src").join("main.txt");
-    let service = if breakpoint_kinds {
+    let service = if log_points {
+        MockService::with_log_points(source)
+    } else if breakpoint_kinds {
         MockService::with_breakpoint_kinds(source)
     } else {
         MockService::new(source)

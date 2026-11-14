@@ -75,6 +75,7 @@ pub fn config() -> LanguageConfig {
         statements: Some(STATEMENTS),
         indent_unit: "    ",
         file_mask: "*.java !*Test.java",
+        injections: Vec::new(),
     }
 }
 
@@ -86,4 +87,52 @@ pub fn symbols() -> &'static TagSymbols {
         TagSymbols::new(tree_sitter_java_orchard::LANGUAGE.into(), query)
             .expect("the symbols query fits the grammar")
     })
+}
+
+/// The same declarations with the binary name of the type that owns each one: the package
+/// with dots and nested types with `$`, the way a JVM debugger names a field or a method.
+pub struct JavaSymbols(&'static TagSymbols);
+
+impl lang_api::SymbolProvider for JavaSymbols {
+    fn file_symbols(&self, _path: &std::path::Path, text: &str) -> Vec<lang_api::Symbol> {
+        let mut symbols = self.0.symbols(text);
+        qualify_owners(&mut symbols);
+        symbols
+    }
+}
+
+/// Replaces the dotted container of a declaration with the binary name of its type.
+fn qualify_owners(symbols: &mut [lang_api::Symbol]) {
+    use lang_api::SymbolKind;
+
+    let Some(package) = symbols
+        .iter()
+        .find(|symbol| symbol.kind == SymbolKind::Module)
+        .map(|symbol| symbol.name.clone())
+    else {
+        return;
+    };
+    for symbol in symbols.iter_mut() {
+        if symbol.kind == SymbolKind::Module {
+            continue;
+        }
+        let Some(container) = symbol.container.as_mut() else {
+            continue;
+        };
+        // A top-level type already has the package, and a field or a method has its type.
+        if *container == package {
+            continue;
+        }
+        if let Some(rest) = container.strip_prefix(&format!("{package}.")) {
+            *container = format!("{package}.{}", rest.replace('.', "$"));
+        } else {
+            *container = format!("{package}.{}", container.replace('.', "$"));
+        }
+    }
+}
+
+/// The declarations of a Java file for the outline and the debugger.
+pub fn java_symbols() -> &'static JavaSymbols {
+    static SYMBOLS: OnceLock<JavaSymbols> = OnceLock::new();
+    SYMBOLS.get_or_init(|| JavaSymbols(symbols()))
 }

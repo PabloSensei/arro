@@ -11,6 +11,7 @@ def listener = properties['ide.test.listener']
 def port = properties['ide.test.port']
 def token = properties['ide.test.token']
 def debugAgent = properties['ide.debug.agent']
+def coverageAgent = properties['ide.coverage.agent']
 
 if (listener != null) {
     allprojects {
@@ -30,6 +31,9 @@ if (listener != null) {
                 // The agent names its port before the tests start and the debugger waits
                 // for that line, so the output must flow at once.
                 test.testLogging.showStandardStreams = true
+            }
+            if (coverageAgent != null) {
+                test.jvmArgs coverageAgent
             }
             // The IDE asked for a run: an up-to-date or cached result sends no events.
             test.outputs.upToDateWhen { false }

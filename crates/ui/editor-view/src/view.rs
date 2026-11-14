@@ -47,6 +47,27 @@ pub struct Languages {
 
 impl Global for Languages {}
 
+/// Colour spans of a format that has no grammar, from its lines alone. The application
+/// names the format and gives the spans; the editor only paints them.
+pub struct PlainSyntax {
+    pub resolve: fn(&Path, &str) -> Option<Vec<HighlightSpan>>,
+    /// Files where Ctrl+Enter asks the application to run what is there rather than
+    /// split the line.
+    pub runs_on_enter: fn(&Path) -> bool,
+}
+
+impl Global for PlainSyntax {}
+
+/// The builder of the row the application puts above the text of a kind of file.
+pub type FileBarBuilder =
+    dyn Fn(&Path, &mut Window, &mut Context<EditorView>) -> Option<AnyElement>;
+
+/// A row the application puts above the text of a kind of file, for instance the
+/// environment selector of a request file.
+pub struct FileBar(pub Rc<FileBarBuilder>);
+
+impl Global for FileBar {}
+
 /// The live templates and the new-file templates of the user, over the built-ins of the
 /// languages. The Settings window writes it; every editor reads it before a template key.
 #[derive(Clone, Default)]
@@ -303,6 +324,43 @@ pub struct RunMark {
     pub color: Hsla,
 }
 
+/// How a line looks after a run with coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverageState {
+    /// The line ran.
+    Covered,
+    /// The line ran, but a branch of it was not taken.
+    Partial,
+    /// The line did not run.
+    NotCovered,
+}
+
+/// The coverage stripe of one line of the gutter. The colour is the caller's, the view
+/// knows nothing about how the numbers were collected.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoverageMark {
+    /// Buffer line from zero.
+    pub line: u32,
+    pub state: CoverageState,
+    /// The instructions of the line that ran.
+    pub hits: u32,
+    /// The branches of the line, `covered` and `total`.
+    pub branches: Option<(u32, u32)>,
+    pub color: Hsla,
+}
+
+impl CoverageMark {
+    /// The hint of the mark under the pointer.
+    pub fn hint(&self) -> String {
+        match self.branches {
+            Some((covered, total)) => {
+                format!("Hits: {}\nCovered {covered} of {total} branches", self.hits)
+            }
+            None => format!("Hits: {}", self.hits),
+        }
+    }
+}
+
 /// What a changed line looks like in the gutter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GutterKind {
@@ -393,10 +451,17 @@ pub enum EditorEvent {
     Moved,
     /// A run mark was clicked: the line it stands on, from zero.
     RunMark(u32),
+    /// Ctrl+Enter in a file whose format runs something, such as a request file: the
+    /// line of the caret, from zero.
+    RunRequest(u32),
     /// Alt+click on a run mark: run the same test under the debugger.
     DebugRunMark(u32),
-    /// The gutter was clicked away from the fold column: the line, from zero.
-    GutterClick(u32),
+    /// The gutter was clicked away from the fold column: the line, from zero, and
+    /// whether Shift was held, which puts a breakpoint that does not stop the program.
+    GutterClick {
+        line: u32,
+        shift: bool,
+    },
     /// A blame label was clicked: the window shows this commit in the history.
     BlameCommit(String),
     /// Ctrl+Shift+V: the window shows what was copied, [`EditorView::paste_text`] takes the pick.
@@ -596,6 +661,8 @@ pub struct EditorView {
     stripe_hint: Option<(String, Point<Pixels>)>,
     /// The hint of the blame label under the pointer, and where it stands.
     annotate_hint: Option<(String, Point<Pixels>)>,
+    /// The hint of the coverage stripe under the pointer, and where it stands.
+    coverage_hint: Option<(String, Point<Pixels>)>,
     pub(crate) autoscroll: bool,
     /// The next autoscroll puts the caret near the middle, as a jump to a place does.
     pub(crate) reveal_center: bool,
@@ -604,8 +671,11 @@ pub struct EditorView {
     pub(crate) layout: Option<Rc<Layout>>,
     pub(crate) gutter_hovered: bool,
     pub(crate) run_marks: Vec<RunMark>,
+    pub(crate) coverage: Vec<CoverageMark>,
     /// Buffer lines of the breakpoints, from zero.
     pub(crate) breakpoints: Vec<u32>,
+    /// The breakpoints that do not stop the program, painted as a muted point.
+    pub(crate) muted_breakpoints: Vec<u32>,
     /// The breakpoints that go away at the first stop, painted as an outline.
     pub(crate) temporary_breakpoints: Vec<u32>,
     /// Buffer lines of the method breakpoints, painted as a diamond.
@@ -804,6 +874,7 @@ impl EditorView {
         if let (Some(saved), Some(state)) = (saved, &mut view.state) {
             state.set_bookmarks(&saved);
         }
+        view.refresh_plain_spans(cx);
         view.attach(cx);
         view.remember_text(cx);
         cx.notify();
@@ -989,6 +1060,7 @@ impl EditorView {
             scrollbar_drag: None,
             stripe_hint: None,
             annotate_hint: None,
+            coverage_hint: None,
             autoscroll: false,
             reveal_center: false,
             caret_on: true,
@@ -996,7 +1068,9 @@ impl EditorView {
             layout: None,
             gutter_hovered: false,
             run_marks: Vec::new(),
+            coverage: Vec::new(),
             breakpoints: Vec::new(),
+            muted_breakpoints: Vec::new(),
             temporary_breakpoints: Vec::new(),
             function_breakpoints: Vec::new(),
             field_watchpoints: Vec::new(),
@@ -1154,6 +1228,18 @@ impl EditorView {
         &self.run_marks
     }
 
+    /// Replaces the coverage stripes of the gutter.
+    pub fn set_coverage(&mut self, marks: Vec<CoverageMark>, cx: &mut Context<Self>) {
+        if self.coverage != marks {
+            self.coverage = marks;
+            cx.notify();
+        }
+    }
+
+    pub fn coverage(&self) -> &[CoverageMark] {
+        &self.coverage
+    }
+
     /// Replaces the breakpoints in the gutter. Lines are buffer lines from zero.
     pub fn set_breakpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
         if self.breakpoints != lines {
@@ -1164,6 +1250,18 @@ impl EditorView {
 
     pub fn breakpoints(&self) -> &[u32] {
         &self.breakpoints
+    }
+
+    /// Replaces the breakpoints in the gutter that do not stop the program.
+    pub fn set_muted_breakpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
+        if self.muted_breakpoints != lines {
+            self.muted_breakpoints = lines;
+            cx.notify();
+        }
+    }
+
+    pub fn muted_breakpoints(&self) -> &[u32] {
+        &self.muted_breakpoints
     }
 
     /// Replaces the temporary breakpoints in the gutter, the ones an outline marks.
@@ -1375,6 +1473,7 @@ impl EditorView {
                         self.options.tab_size,
                     );
                 }
+                self.refresh_plain_spans(cx);
                 self.attach(cx);
                 self.reveal(cx);
                 let saved = cx
@@ -2012,6 +2111,7 @@ impl EditorView {
             if self.bar.is_some() {
                 self.refresh_matches(false, cx);
             }
+            self.refresh_plain_spans(cx);
         } else {
             // The status line shows the caret, so the window follows moves too.
             cx.emit(EditorEvent::Moved);
@@ -2176,6 +2276,51 @@ impl EditorView {
     /// reaches the editor with its language.
     pub fn highlight_spans(&self) -> &[HighlightSpan] {
         self.state.as_ref().map_or(&[], |state| state.spans())
+    }
+
+    /// Asks the application for the colours of a format without a grammar and puts them
+    /// on the text.
+    fn refresh_plain_spans(&mut self, cx: &App) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if state.language().is_some() {
+            return;
+        }
+        let Some(plain) = cx.try_global::<PlainSyntax>() else {
+            return;
+        };
+        let snapshot = state.snapshot();
+        let text = snapshot.slice(0..snapshot.len());
+        if let Some(spans) = (plain.resolve)(&self.path, &text) {
+            state.set_spans(spans);
+        }
+    }
+
+    /// Whether Ctrl+Enter belongs to the application in this file.
+    fn runs_on_enter(&self, cx: &App) -> bool {
+        cx.try_global::<PlainSyntax>()
+            .is_some_and(|plain| (plain.runs_on_enter)(&self.path))
+    }
+
+    /// The row the application adds above the text of this file.
+    fn file_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let bar = cx.try_global::<FileBar>().map(|bar| bar.0.clone())?;
+        let path = self.path.clone();
+        bar(&path, window, cx)
+    }
+
+    /// The colour the editor paints at `offset`: the colour of the highlight span that
+    /// covers it, or the plain code colour. A test of markup compares the colours of
+    /// plain text and of the words inside a span.
+    pub fn painted_color_at(&self, offset: usize) -> Option<Hsla> {
+        let state = self.state.as_ref()?;
+        if offset >= state.store().len() {
+            return None;
+        }
+        let mut font = ui_kit::font(self.style.font_family.clone());
+        font.features = FontFeatures::disable_ligatures();
+        Some(crate::element::look_at(offset, state.spans(), &self.style, &font).color)
     }
 
     /// Numbers the next request for the outline, so that an older answer can be dropped.
@@ -2703,6 +2848,19 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
+        // Ctrl+Enter in a format the application runs sends the thing at the caret
+        // instead of splitting the line.
+        if stroke.ctrl
+            && !stroke.alt
+            && !stroke.shift
+            && stroke.key == "enter"
+            && self.runs_on_enter(cx)
+        {
+            let line = self.caret_line().unwrap_or(0) as u32;
+            cx.emit(EditorEvent::RunRequest(line));
+            cx.stop_propagation();
+            return;
+        }
         let lookup = self
             .current_keymap(cx)
             .lookup(std::slice::from_ref(&stroke), &[actions::CONTEXT]);
@@ -3135,6 +3293,27 @@ impl EditorView {
         Some((note.details.clone(), at))
     }
 
+    /// The hint of the coverage stripe under the pointer, when the pointer is in the
+    /// gutter: its text and where it stands.
+    fn coverage_hint_at(&self, position: Point<Pixels>) -> Option<(String, Point<Pixels>)> {
+        let layout = self.layout.as_ref()?;
+        if !self.in_gutter(position) || position.x < layout.bounds.left() {
+            return None;
+        }
+        let line_height = px(self.style.line_height);
+        let shown = layout.rows.iter().find(|laid_out| {
+            !laid_out.is_block
+                && !laid_out.line.continuation
+                && position.y >= laid_out.y
+                && position.y < laid_out.y + line_height
+        })?;
+        let mark = self
+            .coverage
+            .iter()
+            .find(|mark| mark.line as usize == shown.buffer_line)?;
+        Some((mark.hint(), point(position.x, shown.y)))
+    }
+
     /// A press on a scroll bar: a mark goes to its line, the thumb is grabbed and the
     /// track scrolls to the pointer. True when the press belonged to a bar.
     fn bar_pressed(
@@ -3335,7 +3514,10 @@ impl EditorView {
         let in_gutter = event.position.x - layout.bounds.left() < px(GUTTER_WIDTH);
         if in_gutter && !line.continuation {
             if let Some(buffer_line) = run_line {
-                cx.emit(EditorEvent::GutterClick(buffer_line as u32));
+                cx.emit(EditorEvent::GutterClick {
+                    line: buffer_line as u32,
+                    shift: event.modifiers.shift,
+                });
             }
             return;
         }
@@ -3470,6 +3652,12 @@ impl EditorView {
         let annotate_hint = self.annotate_hint_at(event.position);
         if annotate_hint != self.annotate_hint {
             self.annotate_hint = annotate_hint;
+            cx.notify();
+        }
+
+        let coverage_hint = self.coverage_hint_at(event.position);
+        if coverage_hint != self.coverage_hint {
+            self.coverage_hint = coverage_hint;
             cx.notify();
         }
 
@@ -3737,6 +3925,34 @@ impl EditorView {
             let body = surface(&theme)
                 .debug_selector(|| "editor-annotate-hint".to_owned())
                 .max_w(px(520.))
+                .p_2()
+                .text_size(px(UI_SIZE))
+                .text_color(theme.text)
+                .children(rows);
+            popups.push(
+                deferred(
+                    anchored()
+                        .position(point(position.x + px(12.), position.y + px(16.)))
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
+        if let Some((text, position)) = &self.coverage_hint {
+            let rows: Vec<AnyElement> = text
+                .lines()
+                .map(|line| {
+                    div()
+                        .whitespace_nowrap()
+                        .child(line.to_owned())
+                        .into_any_element()
+                })
+                .collect();
+            let body = surface(&theme)
+                .debug_selector(|| "editor-coverage-hint".to_owned())
+                .max_w(px(420.))
                 .p_2()
                 .text_size(px(UI_SIZE))
                 .text_color(theme.text)
@@ -4446,6 +4662,7 @@ impl Render for EditorView {
                 let toolbar = self.preview_toolbar(cx);
                 let crumbs = self.render_crumbs(cx);
                 let widget = self.render_problem_widget(cx);
+                let file_bar = self.file_bar(window, cx);
                 let text = div()
                     .id("editor-text")
                     .debug_selector(|| "editor-text".to_owned())
@@ -4461,6 +4678,7 @@ impl Render for EditorView {
                     .flex_col()
                     .children(bar)
                     .children(toolbar)
+                    .children(file_bar)
                     .child(text)
                     .children(crumbs)
                     .children(popups)

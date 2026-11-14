@@ -30,6 +30,10 @@ const DEFAULT_LINE_SPACING: f32 = 1.;
 pub const MAX_INDENT_SIZE: f32 = 16.;
 /// The longest wait before the completion list opens on its own, in milliseconds.
 pub const MAX_COMPLETION_DELAY_MS: u32 = 5000;
+/// How long an HTTP request may take before it is stopped.
+pub const DEFAULT_HTTP_TIMEOUT_SECONDS: u32 = 60;
+/// The longest timeout the Settings window allows.
+pub const MAX_HTTP_TIMEOUT_SECONDS: u32 = 600;
 pub const COMPLETION_DELAY_STEP_MS: u32 = 100;
 
 /// What a save does with the spaces and tabs at the end of a line.
@@ -212,6 +216,8 @@ pub struct Settings {
     pub render_doc_comments: bool,
     /// Unsaved files are written when the window loses the focus or the tab changes.
     pub autosave: bool,
+    /// The first open of a project shows its README, rendered when it is markdown.
+    pub open_readme_on_first_open: bool,
     /// The home of the runtime that runs the project; empty means the one found by the
     /// environment.
     pub runtime_home: String,
@@ -273,6 +279,8 @@ pub struct Settings {
     pub diff_side_by_side: bool,
     /// The branch popup groups local and remote branches by the folders of their names.
     pub git_group_by_directory: bool,
+    /// How long an HTTP request may take before it is stopped, in seconds.
+    pub http_timeout_seconds: u32,
 }
 
 impl Default for Settings {
@@ -303,6 +311,7 @@ impl Default for Settings {
             code_vision_implementations: true,
             render_doc_comments: false,
             autosave: true,
+            open_readme_on_first_open: true,
             runtime_home: String::new(),
             memory_low_percent: DEFAULT_MEMORY_LOW_PERCENT,
             memory_low_megabytes: DEFAULT_MEMORY_LOW_MEGABYTES,
@@ -336,6 +345,7 @@ impl Default for Settings {
             terminal_environment: String::new(),
             diff_side_by_side: true,
             git_group_by_directory: true,
+            http_timeout_seconds: DEFAULT_HTTP_TIMEOUT_SECONDS,
         }
     }
 }
@@ -408,6 +418,7 @@ impl Settings {
         self.tab_size = self.tab_size.clamp(1, MAX_INDENT_SIZE as u32);
         self.indent_size = self.indent_size.clamp(1, MAX_INDENT_SIZE as u32);
         self.completion_delay_ms = self.completion_delay_ms.min(MAX_COMPLETION_DELAY_MS);
+        self.http_timeout_seconds = self.http_timeout_seconds.clamp(1, MAX_HTTP_TIMEOUT_SECONDS);
         self
     }
 

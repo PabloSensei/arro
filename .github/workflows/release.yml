@@ -1,6 +1,7 @@
 # Builds the Linux and macOS archives, attaches them to the draft release that
-# team/release.sh made with the Windows archive, checks the whole set and only then
-# publishes the release: nobody can download a release without its archives.
+# team/release.sh made with the Windows archive, runs the Linux and macOS tests
+# (build.yml), checks the whole set and only then publishes the release: nobody can
+# download a release without its archives or with failing tests.
 # Without a tag the run is a trial: the Linux archive becomes an artifact of the run.
 name: release
 
@@ -26,9 +27,17 @@ env:
   JDTLS_URL: https://download.eclipse.org/jdtls/snapshots/jdt-language-server-1.63.0-202610191322.tar.gz
   DEBUG_ARCHIVE: vscjava.vscode-java-debug-0.60.0.vsix
   DEBUG_URL: https://open-vsx.org/api/vscjava/vscode-java-debug/0.60.0/file/vscjava.vscode-java-debug-0.60.0.vsix
+  JACOCO_VERSION: "0.8.15"
+  ASM_VERSION: "9.10.1"
+  MAVEN_CENTRAL: https://repo1.maven.org/maven2
   TAG: ${{ inputs.tag }}
 
 jobs:
+  # The tests of Linux and macOS run beside the archives; the release waits for them.
+  tests:
+    name: Tests
+    uses: ./.github/workflows/build.yml
+
   linux:
     name: Linux archive
     runs-on: ubuntu-latest
@@ -40,6 +49,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/tools/download-jdtls" "$RUNNER_TEMP/tools/download-java-debug"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-jdtls/$JDTLS_ARCHIVE" "$JDTLS_URL"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-java-debug/$DEBUG_ARCHIVE" "$DEBUG_URL"
+          # JaCoCo for Run with Coverage: `xtask dist` checks the SHA-256 of every jar.
+          jacoco="$RUNNER_TEMP/tools/download-jacoco"
+          mkdir -p "$jacoco/agent" "$jacoco/lib"
+          curl -fsSL --retry 3 -o "$jacoco/agent/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"
+          curl -fsSL --retry 3 -o "$jacoco/lib/org.jacoco.core-$JACOCO_VERSION.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.core/$JACOCO_VERSION/org.jacoco.core-$JACOCO_VERSION.jar"
+          for part in asm asm-commons asm-tree; do
+            curl -fsSL --retry 3 -o "$jacoco/lib/$part-$ASM_VERSION.jar"               "$MAVEN_CENTRAL/org/ow2/asm/$part/$ASM_VERSION/$part-$ASM_VERSION.jar"
+          done
 
       # The binary links against the glibc of the system it is built on, and a newer
       # glibc does not start on an older one. The archive is built in Ubuntu 22.04
@@ -122,6 +139,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/tools/download-jdtls" "$RUNNER_TEMP/tools/download-java-debug"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-jdtls/$JDTLS_ARCHIVE" "$JDTLS_URL"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-java-debug/$DEBUG_ARCHIVE" "$DEBUG_URL"
+          # JaCoCo for Run with Coverage: `xtask dist` checks the SHA-256 of every jar.
+          jacoco="$RUNNER_TEMP/tools/download-jacoco"
+          mkdir -p "$jacoco/agent" "$jacoco/lib"
+          curl -fsSL --retry 3 -o "$jacoco/agent/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"
+          curl -fsSL --retry 3 -o "$jacoco/lib/org.jacoco.core-$JACOCO_VERSION.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.core/$JACOCO_VERSION/org.jacoco.core-$JACOCO_VERSION.jar"
+          for part in asm asm-commons asm-tree; do
+            curl -fsSL --retry 3 -o "$jacoco/lib/$part-$ASM_VERSION.jar"               "$MAVEN_CENTRAL/org/ow2/asm/$part/$ASM_VERSION/$part-$ASM_VERSION.jar"
+          done
 
       # The runner is Apple silicon. `xtask dist --target macos` names the archive after
       # the machine it built on, `macos-aarch64` here and `macos-x86_64` on an Intel Mac.
@@ -154,7 +179,7 @@ jobs:
   # the Linux program asks for no glibc past 2.35 and each archive holds its program.
   publish:
     name: Check and publish
-    needs: [linux, macos]
+    needs: [linux, macos, tests]
     if: inputs.tag != ''
     runs-on: ubuntu-latest
     steps:

@@ -133,8 +133,14 @@ fn server_declarations(
 
 /// The declarations the server sends, with the type that owns each one.
 pub fn declarations_of_server(items: &[FileSymbol], text: &str) -> Vec<LineDeclaration> {
+    // A module often stands next to the declarations of the file rather than around
+    // them: it names the place where all of them live.
+    let module = items
+        .iter()
+        .find(|symbol| symbol.kind == SymbolKind::Module)
+        .map(|symbol| symbol.name.as_str());
     let mut found = Vec::new();
-    server_declarations(items, text, None, false, &mut found);
+    server_declarations(items, text, module, false, &mut found);
     found
 }
 

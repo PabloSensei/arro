@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{BlobReader, Change, GitRunner, Hunk, Status, line_hunks, parse_status};
+use crate::rebase;
+use crate::{
+    BlobReader, Change, GitRunner, Hunk, RebasePlan, RebaseReport, Status, line_hunks, parse_status,
+};
 
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
@@ -428,8 +431,8 @@ impl Repository {
             }
         }
         let output = command
-            .env("GIT_SEQUENCE_EDITOR", copy_command(&todo_file))
-            .env("GIT_EDITOR", copy_command(&message_file))
+            .env("GIT_SEQUENCE_EDITOR", rebase::copy_command(&todo_file))
+            .env("GIT_EDITOR", rebase::copy_command(&message_file))
             .output();
         let _ = std::fs::remove_dir_all(&folder);
         match output {
@@ -693,7 +696,10 @@ impl Repository {
         let autostash = self.autostash_id()?;
         match self.operation()? {
             Operation::Merge => self.run(["merge", "--abort"]).map(drop)?,
-            Operation::Rebase => self.run(["rebase", "--abort"]).map(drop)?,
+            Operation::Rebase => {
+                self.run(["rebase", "--abort"]).map(drop)?;
+                self.clean_rebase();
+            }
             Operation::CherryPick => self.run(["cherry-pick", "--abort"]).map(drop)?,
             Operation::Revert => self.run(["revert", "--abort"]).map(drop)?,
             Operation::None => return Ok(None),
@@ -767,9 +773,11 @@ impl Repository {
                         .map(drop)?;
                 }
             }
-            Operation::Rebase => self
-                .run(["-c", "core.editor=true", "rebase", "--continue"])
-                .map(drop)?,
+            Operation::Rebase => {
+                self.run(["-c", "core.editor=true", "rebase", "--continue"])
+                    .map(drop)?;
+                self.clean_rebase();
+            }
             Operation::CherryPick => self
                 .run(["-c", "core.editor=true", "cherry-pick", "--continue"])
                 .map(drop)?,
@@ -1179,6 +1187,100 @@ impl Repository {
         dated.sort_by_key(|(time, position, _)| (*time, *position));
         Ok(dated.into_iter().map(|(_, _, commit)| commit).collect())
     }
+
+    /// The commits from `commit` to HEAD, oldest first, as the Rebase dialog lists them.
+    /// The commit has to be on the current branch and the range has to have no merge.
+    pub fn rebase_plan(&self, commit: &str) -> io::Result<RebasePlan> {
+        rebase::plan(&self.git, &self.root, commit)
+    }
+
+    /// Replays the plan onto the commit it starts after, or onto the root, with the local
+    /// changes stashed around it. A stop for an edit or a conflict is in the report, not
+    /// an error.
+    pub fn rebase(&self, plan: &RebasePlan) -> io::Result<RebaseReport> {
+        // A rebase that waits for the user reads its messages and the rest of the todo
+        // from the folder below, so a second plan must not replace them.
+        if self.operation()? != Operation::None {
+            return Err(io::Error::other(
+                "git waits for another operation to end, continue or abort it first",
+            ));
+        }
+        let folder = self.git_path(rebase::FOLDER)?;
+        let todo = rebase::write_todo(plan, &folder)?;
+        let before = self.stash_ids()?;
+        let mut command = self.git.command(&self.root);
+        command.args(["rebase", "--interactive", "--autostash"]);
+        match &plan.base {
+            Some(base) => {
+                command.arg(base);
+            }
+            None => {
+                command.arg("--root");
+            }
+        }
+        let output = command
+            .env("GIT_SEQUENCE_EDITOR", rebase::copy_command(&todo))
+            // Squash opens the editor for the combined message; the default one is what
+            // git itself writes, and no window may wait for a key of the user.
+            .env("GIT_EDITOR", "true")
+            .output()?;
+        let operation = self.operation()?;
+        let conflicts = self.conflicts()?;
+        if operation == Operation::None {
+            rebase::clean(&folder);
+            if output.status.success() {
+                return Ok(RebaseReport::default());
+            }
+            return Err(git_failure(&output.stderr));
+        }
+        let stopped = if conflicts.is_empty() {
+            self.stopped_commit()?
+        } else {
+            None
+        };
+        if !output.status.success() && conflicts.is_empty() && stopped.is_none() {
+            // An `exec` line failed: git waits, the text says why.
+            return Err(git_failure(&output.stderr));
+        }
+        Ok(RebaseReport {
+            operation,
+            conflicts,
+            autostash: self.autostash()?,
+            stash: self.stash_since(&before)?,
+            stopped,
+        })
+    }
+
+    /// The commit git stopped an interactive rebase at for an edit.
+    fn stopped_commit(&self) -> io::Result<Option<String>> {
+        for name in ["rebase-merge/stopped-sha", "rebase-apply/original-commit"] {
+            let Ok(text) = std::fs::read_to_string(self.git_path(name)?) else {
+                continue;
+            };
+            let id = text.trim();
+            if !id.is_empty() {
+                return Ok(Some(id.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Removes the todo list and the messages of a rebase that ended. A rebase that still
+    /// waits for the user needs them for the `exec` lines of the rest of the todo.
+    fn clean_rebase(&self) {
+        if self
+            .operation()
+            .is_ok_and(|operation| operation == Operation::None)
+            && let Ok(folder) = self.git_path(rebase::FOLDER)
+        {
+            rebase::clean(&folder);
+        }
+    }
+}
+
+/// The text of git for a command that failed.
+fn git_failure(stderr: &[u8]) -> io::Error {
+    io::Error::other(format!("git: {}", String::from_utf8_lossy(stderr).trim()))
 }
 
 /// How many commits of each side Compare shows.
@@ -1236,12 +1338,6 @@ fn temp_path(kind: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let serial = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("ide-{kind}-{}-{serial}", std::process::id()))
-}
-
-/// An editor for git that puts `source` in place of the file git opens. Git runs the
-/// editor through its own shell and adds the file as the last argument.
-fn copy_command(source: &Path) -> String {
-    format!("cp \"{}\"", source.to_string_lossy().replace('\\', "/"))
 }
 
 /// The original failure plus where git kept the local changes, so the window can say it.

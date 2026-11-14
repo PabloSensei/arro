@@ -23,4 +23,5 @@ tree-sitter-xml.workspace = true
 tree-sitter-yaml.workspace = true
 
 [dev-dependencies]
+text-core = { path = "../text-core" }
 tree-sitter.workspace = true

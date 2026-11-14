@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use syntax::{FoldStyle, LanguageConfig};
+use syntax::{FoldStyle, Injection, LanguageConfig};
 
 const BRACED_FOLD_STYLES: &[FoldStyle] = &[FoldStyle {
     capture: "fold",
@@ -61,6 +61,7 @@ pub fn json() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.json",
+        injections: Vec::new(),
     }
 }
 
@@ -77,6 +78,7 @@ pub fn xml() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.xml",
+        injections: Vec::new(),
     }
 }
 
@@ -93,6 +95,7 @@ pub fn yaml() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.yml *.yaml",
+        injections: Vec::new(),
     }
 }
 
@@ -109,6 +112,7 @@ pub fn shell() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.sh",
+        injections: Vec::new(),
     }
 }
 
@@ -125,6 +129,7 @@ pub fn batch() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.bat *.cmd",
+        injections: Vec::new(),
     }
 }
 
@@ -141,6 +146,7 @@ pub fn properties() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.properties",
+        injections: Vec::new(),
     }
 }
 
@@ -157,6 +163,7 @@ pub fn groovy() -> LanguageConfig {
         statements: None,
         indent_unit: "    ",
         file_mask: "*.groovy *.gradle Jenkinsfile",
+        injections: Vec::new(),
     }
 }
 
@@ -173,6 +180,7 @@ pub fn kotlin() -> LanguageConfig {
         statements: None,
         indent_unit: "    ",
         file_mask: "*.kt *.kts",
+        injections: Vec::new(),
     }
 }
 
@@ -189,6 +197,7 @@ pub fn toml() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.toml",
+        injections: Vec::new(),
     }
 }
 
@@ -205,6 +214,7 @@ pub fn sql() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.sql",
+        injections: Vec::new(),
     }
 }
 
@@ -221,6 +231,7 @@ pub fn html() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.html *.htm",
+        injections: Vec::new(),
     }
 }
 
@@ -237,6 +248,7 @@ pub fn css() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.css",
+        injections: Vec::new(),
     }
 }
 
@@ -253,6 +265,7 @@ pub fn javascript() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.js *.mjs *.cjs",
+        injections: Vec::new(),
     }
 }
 
@@ -271,6 +284,7 @@ pub fn typescript() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.ts",
+        injections: Vec::new(),
     }
 }
 
@@ -288,6 +302,7 @@ pub fn tsx() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.tsx",
+        injections: Vec::new(),
     }
 }
 
@@ -304,7 +319,41 @@ pub fn markdown() -> LanguageConfig {
         statements: None,
         indent_unit: "  ",
         file_mask: "*.md *.markdown",
+        injections: vec![
+            // The inline grammar reads the text inside the block grammar's paragraphs,
+            // headings and list items.
+            Injection {
+                node: "inline",
+                text_node: None,
+                name_node: None,
+                skip_nodes: &["block_continuation"],
+                language: Some(tree_sitter_md::INLINE_LANGUAGE.into()),
+                highlights: Some(include_str!(
+                    "../../../../queries/markdown/highlights_inline.scm"
+                )),
+                resolve: None,
+                replace: false,
+            },
+            // A fenced block names its language in the info string.
+            Injection {
+                node: "fenced_code_block",
+                text_node: Some("code_fence_content"),
+                name_node: Some("info_string"),
+                skip_nodes: &["block_continuation"],
+                language: None,
+                highlights: None,
+                resolve: Some(language_by_name),
+                replace: true,
+            },
+        ],
     }
+}
+
+/// The language a name of a document stands for, such as the language of a fenced
+/// block. The name is a file extension or a common word for one.
+pub fn language_by_name(name: &str) -> Option<LanguageConfig> {
+    let name = name.split_whitespace().next()?.to_ascii_lowercase();
+    language_for(Path::new(&format!("fence.{name}")))
 }
 
 /// The format of `path` by its extension, whatever its case. `Jenkinsfile` has no
@@ -322,17 +371,17 @@ pub fn language_for(path: &Path) -> Option<LanguageConfig> {
         "json" | "jsonc" => json(),
         "xml" | "xsd" | "xsl" | "svg" | "fxml" | "iml" => xml(),
         "yml" | "yaml" => yaml(),
-        "sh" | "bash" | "zsh" => shell(),
+        "sh" | "bash" | "zsh" | "shell" => shell(),
         "bat" | "cmd" => batch(),
         "properties" => properties(),
         "groovy" | "gradle" => groovy(),
-        "kt" | "kts" => kotlin(),
+        "kt" | "kts" | "kotlin" => kotlin(),
         "toml" => toml(),
         "sql" => sql(),
         "html" | "htm" => html(),
         "css" => css(),
-        "js" | "mjs" | "cjs" => javascript(),
-        "ts" => typescript(),
+        "js" | "mjs" | "cjs" | "javascript" => javascript(),
+        "ts" | "typescript" => typescript(),
         "tsx" => tsx(),
         "md" | "markdown" => markdown(),
         _ => return None,
@@ -341,6 +390,11 @@ pub fn language_for(path: &Path) -> Option<LanguageConfig> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::Duration;
+
+    use syntax::{DocumentId, HighlightKind, HighlightSpan, SyntaxService, SyntaxSnapshot};
+    use text_core::{Change, Edit, RopeStore, TextStore};
     use tree_sitter::StreamingIterator;
 
     use super::*;
@@ -858,5 +912,127 @@ def build() {\n\
         assert_eq!(html().block_comment, Some(("<!--", "-->")));
         assert_eq!(markdown().line_comment, None);
         assert_eq!(markdown().block_comment, Some(("<!--", "-->")));
+    }
+
+    /// A syntax thread with one document, and the snapshots of its parses.
+    fn syntax(config: LanguageConfig, text: &str) -> (SyntaxService, Receiver<SyntaxSnapshot>) {
+        let service = SyntaxService::new();
+        let (sender, receiver) = channel();
+        service.open(DocumentId(1), config, move |snapshot| {
+            sender.send(snapshot).ok();
+        });
+        service.update(
+            DocumentId(1),
+            1,
+            RopeStore::from_text(text),
+            &Change::default(),
+        );
+        (service, receiver)
+    }
+
+    fn snapshot(receiver: &Receiver<SyntaxSnapshot>) -> SyntaxSnapshot {
+        receiver.recv_timeout(Duration::from_secs(10)).unwrap()
+    }
+
+    /// The text of the spans of `kind`.
+    fn texts(spans: &[HighlightSpan], text: &str, kind: HighlightKind) -> Vec<String> {
+        spans
+            .iter()
+            .filter(|span| span.kind == kind)
+            .map(|span| text[span.start as usize..span.end as usize].to_owned())
+            .collect()
+    }
+
+    fn coloured(spans: &[HighlightSpan], text: &str, kind: HighlightKind, wanted: &str) {
+        let found = texts(spans, text, kind);
+        assert!(
+            found.iter().any(|item| item == wanted),
+            "{wanted} as {kind:?} in {found:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_inline_markup_is_coloured() {
+        let text = "**b** *i* `c` [t](u) ~~s~~\n";
+        let (service, receiver) = syntax(markdown(), text);
+        let snapshot = snapshot(&receiver);
+        drop(service);
+        let spans = &snapshot.highlights;
+        coloured(spans, text, HighlightKind::Strong, "b");
+        coloured(spans, text, HighlightKind::Emphasis, "i");
+        coloured(spans, text, HighlightKind::InlineCode, "c");
+        coloured(spans, text, HighlightKind::Link, "t");
+        coloured(spans, text, HighlightKind::LinkUrl, "u");
+        coloured(spans, text, HighlightKind::Strikethrough, "s");
+        assert!(
+            texts(spans, text, HighlightKind::Marker).contains(&"*".to_owned()),
+            "the emphasis marks are muted: {:?}",
+            texts(spans, text, HighlightKind::Marker)
+        );
+        assert!(
+            texts(spans, text, HighlightKind::Marker).contains(&"[".to_owned()),
+            "the link marks are muted: {:?}",
+            texts(spans, text, HighlightKind::Marker)
+        );
+    }
+
+    #[test]
+    fn markdown_fenced_code_takes_the_language_of_its_info_string() {
+        let text = "```json\n{\"name\": \"app\", \"port\": 8080}\n```\n\n```nope\nplain\n```\n";
+        let (service, receiver) = syntax(markdown(), text);
+        let snapshot = snapshot(&receiver);
+        drop(service);
+        let spans = &snapshot.highlights;
+        coloured(spans, text, HighlightKind::Field, "\"name\"");
+        coloured(spans, text, HighlightKind::String, "\"app\"");
+        coloured(spans, text, HighlightKind::Number, "8080");
+        let strings = texts(spans, text, HighlightKind::String);
+        assert!(
+            !strings.iter().any(|item| item.contains("port")),
+            "a known language replaces the plain string of its block: {strings:?}"
+        );
+        assert!(
+            strings.iter().any(|item| item.trim() == "plain"),
+            "an unknown language stays a plain block: {strings:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_markup_inside_a_block_quote_skips_the_quote_marks() {
+        let text = "> first line\n> second **bold** line\n\n> ```json\n> {\"k\": 1}\n> ```\n";
+        let (service, receiver) = syntax(markdown(), text);
+        let snapshot = snapshot(&receiver);
+        drop(service);
+        let spans = &snapshot.highlights;
+        coloured(spans, text, HighlightKind::Strong, "bold");
+        coloured(spans, text, HighlightKind::Field, "\"k\"");
+        coloured(spans, text, HighlightKind::Number, "1");
+    }
+
+    #[test]
+    fn an_edit_inside_an_inline_range_updates_its_spans() {
+        let text = "Some **bold** words\n";
+        let (service, receiver) = syntax(markdown(), text);
+        let first = snapshot(&receiver);
+        assert!(texts(&first.highlights, text, HighlightKind::Strong).contains(&"bold".to_owned()));
+
+        let edited = "Some **brave** words\n";
+        service.update(
+            DocumentId(1),
+            2,
+            RopeStore::from_text(edited),
+            &Change {
+                steps: vec![vec![Edit::new(7..11, "brave")]],
+            },
+        );
+        let second = snapshot(&receiver);
+        assert!(
+            texts(&second.highlights, edited, HighlightKind::Strong).contains(&"brave".to_owned()),
+            "{:?}",
+            second.highlights
+        );
+        assert!(
+            !texts(&second.highlights, edited, HighlightKind::Strong).contains(&"bold".to_owned())
+        );
     }
 }

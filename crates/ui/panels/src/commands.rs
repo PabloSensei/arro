@@ -925,7 +925,7 @@ fn new_element_same_place(
     let folder = current_path(workspace, window, cx)
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| workspace.root().to_path_buf());
-    let templates = cx
+    let mut templates = cx
         .try_global::<crate::project::FileTemplates>()
         .map(|templates| templates.0.clone())
         .unwrap_or_default();
@@ -940,6 +940,9 @@ fn new_element_same_place(
         workspace.notify_user("New", "No file templates", cx);
         return;
     }
+    // The request file of the HTTP client goes last, so the rows the key offered
+    // before keep their places.
+    templates.push(crate::tree_ops::http_request());
     let entries = templates
         .into_iter()
         .map(|template| {
@@ -1328,6 +1331,18 @@ fn register_git_commands(workspace: &mut Workspace) {
             git.update(cx, |git, cx| git.abort_operation(cx));
         });
     });
+    workspace.register_command(
+        crate::git::CONTINUE_REBASE_COMMAND,
+        "Continue Rebase",
+        |_, _, cx| {
+            let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+                return;
+            };
+            cx.defer(move |cx| {
+                git.update(cx, |git, cx| git.finish_operation(String::new(), cx));
+            });
+        },
+    );
     workspace.register_command("git.show_log", "Git Log", |workspace, window, cx| {
         let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
             return;

@@ -8,7 +8,7 @@ publish.workspace = true
 syntax = { path = "../../editor/syntax" }
 tree-sitter.workspace = true
 tree-sitter-java-orchard.workspace = true
+lang-api.workspace = true
 
 [dev-dependencies]
-lang-api.workspace = true
 text-core = { path = "../../editor/text-core" }

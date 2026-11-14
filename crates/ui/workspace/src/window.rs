@@ -21,7 +21,9 @@ use crate::about::AboutView;
 use crate::chrome::{ChromeView, EditorChromeSignal, StatusBarView, TabBarView};
 use crate::editor::{EditorFactory, EditorStatus, FileIcons};
 use crate::launch::{AppInfo, Launch};
-use crate::layout::{DockState, Layout, PaneState, WindowPlacement, save_dark_theme, save_layout};
+use crate::layout::{
+    DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_dark_theme, save_layout,
+};
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
 use crate::settings::{DefaultLayout, SETTINGS_FILE, Settings};
@@ -121,6 +123,12 @@ actions!(
         RerunInspection,
         // Project Structure, Ctrl+Alt+Shift+S: the dialog is in `panels`.
         ProjectStructure,
+        RunWithCoverage,
+        RunTestsWithCoverage,
+        HideCoverage,
+        ToggleCoverage,
+        // The HTTP Response window, opened automatically when a request runs.
+        ToggleHttp,
     ]
 );
 
@@ -247,6 +255,7 @@ window_keys![
     ("shift-numpad_add", FullyExpandTreeNode, Some("ToolWindow"), None, Some("shift-numpad_add")),
     ("ctrl-f5", Synchronize, Some("ProjectPanel"), Some("Refresh"), None),
     ("ctrl-shift-f5", Synchronize, Some("ProjectPanel"), Some("ForceRefresh"), None),
+    ("ctrl-alt-f6", ToggleCoverage, None, Some("SwitchCoverage"), None),
 ];
 
 /// The first key of a window action on one platform, `ctrl-f9`, or `None` when the
@@ -374,6 +383,8 @@ pub const LOG_TOOL: &str = "log";
 pub const CALL_HIERARCHY_TOOL: &str = "call-hierarchy";
 pub const METHOD_HIERARCHY_TOOL: &str = "method-hierarchy";
 pub const INSPECTION_TOOL: &str = "inspection-results";
+pub const COVERAGE_TOOL: &str = "coverage";
+pub const HTTP_TOOL: &str = "http-response";
 
 pub(crate) struct DockTool {
     pub id: &'static str,
@@ -678,6 +689,62 @@ fn read_branch(root: &Path) -> Option<String> {
     Some(branch.to_string())
 }
 
+/// The names a README of the project root may have, in the order the window tries them: a
+/// markdown one first, then plain text.
+const README_NAMES: [&str; 3] = ["readme.md", "readme.txt", "readme"];
+
+/// The README of the project root, spelled as the disk spells it.
+fn readme_path(root: &Path) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    // Two spellings of one name on a case-sensitive system give a steady choice.
+    entries.sort();
+    README_NAMES.iter().find_map(|wanted| {
+        entries
+            .iter()
+            .find(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+            })
+            .cloned()
+    })
+}
+
+/// The path with its file name as the disk spells it, so that a tab carries the name the
+/// file has there. The folder stays as given: resolving it would move a path out of the
+/// project root when the root or one of its folders is a link.
+fn on_disk_path(path: PathBuf) -> PathBuf {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return path;
+        };
+        let wanted = name.to_string_lossy();
+        let found = std::fs::read_dir(parent).ok().and_then(|entries| {
+            entries.flatten().find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&wanted)
+            })
+        });
+        match found {
+            Some(entry) => parent.join(entry.file_name()),
+            None => path,
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        path
+    }
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -777,10 +844,11 @@ impl Workspace {
             }
             let pane = layout.active_pane.min(panes.len() - 1);
             let state = &mut panes[pane];
+            let key = ::platform::path_key(&path);
             state.active = state
                 .tabs
                 .iter()
-                .position(|tab| *tab == path)
+                .position(|tab| ::platform::path_key(tab) == key)
                 .unwrap_or_else(|| {
                     state.tabs.push(path);
                     state.tabs.len() - 1
@@ -1206,8 +1274,13 @@ impl Workspace {
         }
     }
 
-    /// Opens the tabs of the saved layout, after the panels are in place.
-    pub(crate) fn restore_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the tabs of the saved layout, after the panels are in place. A project that
+    /// opens for the first time shows its README, rendered when it is markdown.
+    pub fn restore_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first_open = self
+            .store
+            .as_ref()
+            .is_none_or(|store| !has_saved_layout(store, &self.root));
         let states = std::mem::take(&mut self.layout.panes);
         let mut panes = Vec::with_capacity(states.len());
         let mut seen = HashSet::new();
@@ -1215,7 +1288,7 @@ impl Workspace {
             let mut tabs: Vec<Tab> = Vec::new();
             let mut active = 0;
             for (index, path) in state.tabs.iter().enumerate() {
-                if !path.is_file() || !seen.insert(path) {
+                if !path.is_file() || !seen.insert(::platform::path_key(path)) {
                     continue;
                 }
                 let mut tab = self.tab_for(path.clone(), window, cx);
@@ -1238,6 +1311,30 @@ impl Workspace {
             self.renumber_bars(cx);
         }
         self.focus_active(window, cx);
+        if first_open {
+            self.show_readme(window, cx);
+        }
+    }
+
+    /// Opens the README of the project root on the first open of the project: alone when
+    /// it is markdown, as plain text otherwise.
+    fn show_readme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let asked = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.open_readme_on_first_open);
+        if !asked {
+            return;
+        }
+        let Some(path) = readme_path(&self.root) else {
+            return;
+        };
+        self.open_file(path.clone(), window, cx);
+        if let Some(index) = self.panes[self.active_pane].position(&path) {
+            let tab = &self.panes[self.active_pane].tabs[index];
+            if let Some(show) = &tab.editor.show_preview_only {
+                show(cx);
+            }
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -1392,8 +1489,9 @@ impl Workspace {
 
     /// Writes the open editor of `path` if it has unsaved text.
     pub fn save_editor(&self, path: &Path, cx: &mut App) {
+        let key = ::platform::path_key(path);
         let tabs = self.panes.iter().flat_map(|pane| pane.tabs.iter());
-        for tab in tabs.filter(|tab| tab.path == path) {
+        for tab in tabs.filter(|tab| ::platform::path_key(&tab.path) == key) {
             (tab.editor.save)(cx);
         }
     }
@@ -1401,8 +1499,9 @@ impl Workspace {
     /// Writes the open editor of `path` before it returns. `Err` says why the text is still
     /// not on disk, for a caller that needs the file written, like Commit.
     pub fn save_editor_now(&self, path: &Path, cx: &mut App) -> Result<(), String> {
+        let key = ::platform::path_key(path);
         let tabs = self.panes.iter().flat_map(|pane| pane.tabs.iter());
-        for tab in tabs.filter(|tab| tab.path == path) {
+        for tab in tabs.filter(|tab| ::platform::path_key(&tab.path) == key) {
             if !(tab.editor.status)(cx).dirty {
                 continue;
             }
@@ -1487,6 +1586,39 @@ impl Workspace {
         if let Some(run) = self.run.clone() {
             (run.rerun_tests)(window, cx);
             self.show_tool(RUN_TOOL, window, cx);
+        }
+    }
+
+    /// Runs the selected configuration with the coverage agent and shows its window.
+    pub fn run_with_coverage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.coverage)(window, cx);
+            self.show_tool(COVERAGE_TOOL, window, cx);
+        }
+    }
+
+    /// Runs the tests of the last run with the coverage agent.
+    pub fn run_tests_with_coverage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.run_tests_coverage)(window, cx);
+            self.show_tool(COVERAGE_TOOL, window, cx);
+        }
+    }
+
+    /// Hides the coverage stripes and the rows of the Coverage window, and closes it.
+    pub fn hide_coverage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.hide_coverage)(window, cx);
+        }
+        if self.tool_open(COVERAGE_TOOL) {
+            self.toggle_tool(COVERAGE_TOOL, window, cx);
+        }
+    }
+
+    /// Ctrl+Alt+F6: shows or hides the coverage stripes without closing the window.
+    pub fn toggle_coverage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.toggle_coverage)(window, cx);
         }
     }
 
@@ -2143,6 +2275,14 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The group and the index of the tab of one file, whatever case its path is typed in.
+    fn open_tab(&self, path: &Path) -> Option<(usize, usize)> {
+        self.panes
+            .iter()
+            .enumerate()
+            .find_map(|(pane, item)| Some((pane, item.position(path)?)))
+    }
+
     fn tab_for(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Tab {
         let title = path.file_name().unwrap_or_default().to_string_lossy();
         let factory = self.editor_factory.as_ref();
@@ -2158,12 +2298,11 @@ impl Workspace {
 
     /// A file has one view: two buffers of it would overwrite each other on save.
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let panes = self.panes.iter().enumerate();
-        let mut existing = panes.filter_map(|(pane, item)| Some((pane, item.position(&path)?)));
-        if let Some((pane, index)) = existing.next() {
+        if let Some((pane, index)) = self.open_tab(&path) {
             self.select_tab(pane, index, window, cx);
             return;
         }
+        let path = on_disk_path(path);
         let tab = self.tab_for(path, window, cx);
         self.save_active(cx);
         let pane = &mut self.panes[self.active_pane];
@@ -2179,16 +2318,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((pane, index)) = self
-            .panes
-            .iter()
-            .enumerate()
-            .find_map(|(pane, item)| Some((pane, item.position(&path)?)))
-        {
+        if let Some((pane, index)) = self.open_tab(&path) {
             self.select_tab_keeping_edits(pane, index, window, cx);
             return;
         }
-        let tab = self.tab_for(path, window, cx);
+        let tab = self.tab_for(on_disk_path(path), window, cx);
         let pane = self.active_pane;
         let index = {
             let pane = &mut self.panes[pane];
@@ -2224,16 +2358,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = self
-            .panes
-            .iter()
-            .enumerate()
-            .find_map(|(pane, item)| Some((pane, item.position(&path)?)));
-        if let Some((pane, index)) = existing {
+        if let Some((pane, index)) = self.open_tab(&path) {
             self.select_tab(pane, index, window, cx);
             return;
         }
-        let tab = self.tab_for(path, window, cx);
+        let tab = self.tab_for(on_disk_path(path), window, cx);
         self.save_active(cx);
         if self.panes.len() == 1 {
             self.split_down = down;
@@ -2284,14 +2413,16 @@ impl Workspace {
     /// A buffer of `path` was edited: the file goes to the front of the edited list and
     /// the layout is written a moment later, so the list outlives the window.
     pub fn remember_edited(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let key = ::platform::path_key(path);
         if self
             .recent_edited
             .first()
-            .is_some_and(|known| known == path)
+            .is_some_and(|known| ::platform::path_key(known) == key)
         {
             return;
         }
-        self.recent_edited.retain(|known| known != path);
+        self.recent_edited
+            .retain(|known| ::platform::path_key(known) != key);
         self.recent_edited.insert(0, path.to_path_buf());
         self.recent_edited.truncate(RECENT_EDITED_LIMIT);
         self.layout_changed(cx);
@@ -3094,6 +3225,12 @@ impl Workspace {
     pub fn open_tabs(&self) -> Vec<Vec<PathBuf>> {
         let paths = |pane: &Pane| pane.tabs.iter().map(|tab| tab.path.clone()).collect();
         self.panes.iter().map(paths).collect()
+    }
+
+    /// Titles of open tabs pane by pane, for scripts and tests.
+    pub fn tab_titles(&self) -> Vec<Vec<String>> {
+        let titles = |pane: &Pane| pane.tabs.iter().map(|tab| tab.title.to_string()).collect();
+        self.panes.iter().map(titles).collect()
     }
 
     /// Whether the editor of the active tab holds the focus, for scripts and tests.
@@ -3939,8 +4076,9 @@ impl Workspace {
 
     /// The view of the tab that holds `path`, if one is open.
     pub fn view_of(&self, path: &Path) -> Option<AnyView> {
+        let key = ::platform::path_key(path);
         let mut tabs = self.panes.iter().flat_map(|pane| &pane.tabs);
-        tabs.find(|tab| tab.path == path)
+        tabs.find(|tab| ::platform::path_key(&tab.path) == key)
             .map(|tab| tab.editor.view.clone())
     }
 

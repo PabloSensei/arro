@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{Result, dist, notice};
+use crate::{Result, dist, helpers, notice};
 
 const APP: &str = "Arro.app";
 /// The name of the program inside the bundle and the one the Finder shows.
@@ -56,7 +56,12 @@ pub fn run(root: &Path, out: &Path, tools: Option<&Path>, zip: bool) -> Result {
     )?;
     fs::write(resources.join(format!("{DISPLAY_NAME}.icns")), icon(&root)?)?;
 
+    // The helpers of Maven, the test listener and the coverage report live in
+    // Contents/Resources/helpers, the tools in Contents/Resources/tools.
+    let jacoco = dist::jacoco_lib(&tools)?;
+    helpers::run_with(&root, &resources.join("helpers"), None, Some(&jacoco))?;
     let java = dist::install_java_tools_macos(&resources, &tools)?;
+    dist::install_coverage_agent(&resources, &tools)?;
     let triple = format!("{}-apple-darwin", env::consts::ARCH);
     dist::write_text(
         &resources.join("README.txt"),

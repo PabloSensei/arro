@@ -5,7 +5,7 @@
 use editor_view::{EditorView, RunMark, RunMarkState};
 use runner::{LaunchPoint, RunConfig, TestRequest, TestSite, TestState};
 use ui_kit::*;
-use workspace::{DEBUG_TOOL, RUN_TOOL, Workspace};
+use workspace::{COVERAGE_TOOL, DEBUG_TOOL, RUN_TOOL, Workspace};
 
 use crate::run::RunPanel;
 use crate::run_configs::RunConfigDialog;
@@ -67,6 +67,16 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
             .into_iter()
             .map(|point| RunMark {
                 line: point.line.saturating_sub(1),
+                state: RunMarkState::Ready,
+                color: mark_color(READY, dark),
+            }),
+    );
+    // Every request of a request file starts on its own line.
+    marks.extend(
+        crate::http::request_lines(view.path(), &text)
+            .into_iter()
+            .map(|line| RunMark {
+                line,
                 state: RunMarkState::Ready,
                 color: mark_color(READY, dark),
             }),
@@ -135,6 +145,7 @@ pub(crate) fn launch_menu(
     panel: Entity<RunPanel>,
     config: RunConfig,
     workspace: WeakEntity<Workspace>,
+    coverage: bool,
 ) -> Vec<MenuEntry> {
     let name = config.name.clone();
     let platform = keymap::platform();
@@ -177,6 +188,9 @@ pub(crate) fn launch_menu(
     if let Some(hint) = window_hint("workspace::Debug") {
         debug = debug.shortcut(hint);
     }
+    let coverage_config = config.clone();
+    let coverage_panel = panel.clone();
+    let coverage_workspace = workspace.clone();
     let modify_config = config;
     let modify_panel = panel.clone();
     let modify_workspace = workspace;
@@ -193,7 +207,27 @@ pub(crate) fn launch_menu(
             })
             .ok();
     });
-    vec![run, debug, modify]
+    let mut entries = vec![run, debug];
+    if coverage {
+        let mut entry = MenuEntry::new(format!("Run '{name}' with Coverage"), move |window, cx| {
+            coverage_panel.update(cx, |panel, cx| {
+                panel.choose_configuration(coverage_config.clone(), cx);
+                panel.run_coverage(cx);
+            });
+            coverage_workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_tool(COVERAGE_TOOL, window, cx)
+                })
+                .ok();
+        })
+        .icon("run/coverage");
+        if let Some(hint) = window_hint("workspace::RunWithCoverage") {
+            entry = entry.shortcut(hint);
+        }
+        entries.push(entry);
+    }
+    entries.push(modify);
+    entries
 }
 
 /// A click on a mark: a program opens its menu, a test runs as it always did.
@@ -204,6 +238,10 @@ pub(crate) fn run_mark_clicked(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if ::http_client::is_request_file(view.read(cx).path()) {
+        crate::http::run_line(view, line, workspace, window, cx);
+        return;
+    }
     if launch_at_line(view.read(cx), line, cx).is_some() {
         show_launch_menu(view, line, workspace, window, cx);
         return;
@@ -250,7 +288,8 @@ pub(crate) fn show_launch_menu(
     let Some(panel) = panel_of(cx) else {
         return;
     };
-    let entries = launch_menu(panel, config, cx.weak_entity());
+    let coverage = panel.read(cx).supports_coverage(&config.provider);
+    let entries = launch_menu(panel, config, cx.weak_entity(), coverage);
     workspace.show_menu(window.mouse_position(), entries, cx);
 }
 

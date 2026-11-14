@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use editor_view::{
-    CompletionCase, EditorEvent, EditorOptions, EditorStyle, EditorView, SaveOptions, Spot,
-    TrimTrailing,
+    CompletionCase, EditorEvent, EditorOptions, EditorStyle, EditorView, PreviewMode, SaveOptions,
+    Spot, TrimTrailing,
 };
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -134,6 +134,7 @@ fn open(
         cx.observe_global::<Theme>(|view: &mut EditorView, cx| {
             let style = style_of(cx);
             view.set_style(style, cx);
+            crate::coverage::refresh(view, cx);
         })
         .detach();
         cx.observe_global::<Settings>(|view: &mut EditorView, cx| {
@@ -141,6 +142,7 @@ fn open(
             view.set_style(style, cx);
             view.set_options(options_of(cx), cx);
             marks::refresh(view, cx);
+            crate::coverage::refresh(view, cx);
         })
         .detach();
         if let Some(panel) = cx
@@ -153,6 +155,10 @@ fn open(
             .detach();
             cx.subscribe(&panel, |view, _, _: &crate::run::ConfigsChanged, cx| {
                 marks::refresh(view, cx)
+            })
+            .detach();
+            cx.subscribe(&panel, |view, _, _: &crate::run::CoverageChanged, cx| {
+                crate::coverage::refresh(view, cx)
             })
             .detach();
         }
@@ -190,8 +196,10 @@ fn open(
                                 view.update(cx, |view, cx| view.safe_delete_at_offset(offset, cx));
                             });
                         }
+                        crate::http::file_opened(&view, cx);
                     }
                     view.update(cx, marks::refresh);
+                    view.update(cx, crate::coverage::refresh);
                     outline::refresh(&view, matches!(event, EditorEvent::Changed), cx);
                     if matches!(event, EditorEvent::Changed) {
                         places::remember(&view, cx);
@@ -434,11 +442,12 @@ fn open(
                         })
                         .detach();
                 }
-                EditorEvent::GutterClick(line) => {
+                EditorEvent::GutterClick { line, shift } => {
                     if let Some(panel) = cx.try_global::<debug::ActiveDebug>() {
                         let panel = panel.0.clone();
                         let path = view.read(cx).path().to_path_buf();
                         let line = *line + 1;
+                        let shift = *shift;
                         let declaration = view
                             .read(cx)
                             .declaration_on_line((line - 1) as usize)
@@ -479,8 +488,17 @@ fn open(
                                     )
                                 });
                             }
-                            _ => panel
-                                .update(cx, |panel, cx| panel.toggle_breakpoint(path, line, cx)),
+                            _ => {
+                                if shift {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.toggle_non_suspending_breakpoint(path, line, cx)
+                                    });
+                                } else {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.toggle_breakpoint(path, line, cx)
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -515,6 +533,13 @@ fn open(
                     runner
                         .update(cx, |workspace, cx| {
                             marks::debug_mark_clicked(&view, *line as usize, workspace, window, cx)
+                        })
+                        .ok();
+                }
+                EditorEvent::RunRequest(line) => {
+                    runner
+                        .update(cx, |workspace, cx| {
+                            crate::http::run_line(&view, *line as usize, workspace, window, cx)
                         })
                         .ok();
                 }
@@ -691,6 +716,14 @@ fn open(
     let (caret, restore, format) = (view.clone(), view.clone(), view.clone());
     let indent = view.clone();
     let reload = view.clone();
+    let show_preview_only = view.read(cx).preview_mode().is_some().then(|| {
+        let preview = view.clone();
+        Rc::new(move |cx: &mut App| {
+            preview.update(cx, |view, cx| {
+                view.set_preview_mode(PreviewMode::PreviewOnly, cx)
+            });
+        }) as Rc<dyn Fn(&mut App)>
+    });
     EditorTab {
         view: view.into(),
         focus,
@@ -725,6 +758,7 @@ fn open(
             };
             indent.update(cx, |view, cx| view.set_indent(tabs, size, cx));
         }),
+        show_preview_only,
     }
 }
 

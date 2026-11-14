@@ -14,6 +14,8 @@ mod popups;
 mod rows;
 mod script;
 mod scrollbars;
+#[cfg(any(test, feature = "test-support"))]
+mod test_bounds;
 mod text_field;
 mod widgets;
 
@@ -26,6 +28,8 @@ pub use popups::surface;
 pub use rows::*;
 pub use script::*;
 pub use scrollbars::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_bounds::*;
 pub use text_field::{
     TextField, text_field_children, text_field_children_named, text_field_lines,
     text_field_lines_named,

@@ -15,6 +15,18 @@ const TEST_LISTENER: &str = "ide-test-listener.jar";
 /// Builds the test listener, then compiles `helpers/maven-ext` against the libraries of a
 /// Maven distribution.
 pub fn run(root: &Path, out: &Path, maven_lib: Option<&Path>) -> Result {
+    run_with(root, out, maven_lib, None)
+}
+
+/// The same with the jars of JaCoCo, which `--jacoco-lib` names; without them they are
+/// looked for in the local Maven repositories. A machine without them builds every other
+/// helper and says that the coverage one is missing.
+pub fn run_with(
+    root: &Path,
+    out: &Path,
+    maven_lib: Option<&Path>,
+    jacoco_lib: Option<&Path>,
+) -> Result {
     fs::create_dir_all(out)?;
     test_listener(root, out)?;
     let maven_lib = match maven_lib {
@@ -63,6 +75,7 @@ pub fn run(root: &Path, out: &Path, maven_lib: Option<&Path>) -> Result {
     check(&mut jar)?;
     fs::remove_dir_all(&classes)?;
     println!("{}", jar_file.display());
+    coverage_report(root, out, jacoco_lib)?;
     Ok(())
 }
 
@@ -248,4 +261,136 @@ fn javac(classes: &Path) -> Command {
         .arg("-d")
         .arg(classes);
     javac
+}
+
+/// The helper that reads the data of a JaCoCo agent, with the jars it loads next to it.
+const COVERAGE_FOLDER: &str = "coverage";
+/// The parts of JaCoCo and ASM the report helper links to, as Maven names them.
+const JACOCO_ARTIFACTS: [&str; 4] = [
+    "org/jacoco/org.jacoco.core",
+    "org/ow2/asm/asm",
+    "org/ow2/asm/asm-commons",
+    "org/ow2/asm/asm-tree",
+];
+
+fn coverage_report(root: &Path, out: &Path, jacoco_lib: Option<&Path>) -> Result {
+    let jars = match jacoco_lib {
+        Some(directory) => jars_in(directory),
+        None => find_jacoco_jars(),
+    };
+    if jars.is_empty() {
+        eprintln!(
+            "warning: no JaCoCo jars found in the local Maven repositories; \
+             coverage-report.jar is not built, pass --jacoco-lib DIR with org.jacoco.core and the ASM jars"
+        );
+        return Ok(());
+    }
+    let helper = root.join("helpers/coverage-report");
+    let classes = out.join("coverage-report-classes");
+    if classes.exists() {
+        fs::remove_dir_all(&classes)?;
+    }
+    fs::create_dir_all(&classes)?;
+    let mut sources = Vec::new();
+    collect_sources(&helper.join("src"), &mut sources)?;
+    let classpath = env::join_paths(&jars)?;
+    check(javac(&classes).arg("-cp").arg(&classpath).args(&sources))?;
+    let directory = out.join(COVERAGE_FOLDER);
+    if directory.exists() {
+        fs::remove_dir_all(&directory)?;
+    }
+    fs::create_dir_all(&directory)?;
+    let jar_file = directory.join("coverage-report.jar");
+    let mut jar = Command::new(tool("jar"));
+    jar.arg("--create")
+        .arg("--file")
+        .arg(&jar_file)
+        .arg("-C")
+        .arg(&classes)
+        .arg(".");
+    check(&mut jar)?;
+    fs::remove_dir_all(&classes)?;
+    for jar in &jars {
+        if let Some(name) = jar.file_name() {
+            fs::copy(jar, directory.join(name))?;
+        }
+    }
+    println!("{}", jar_file.display());
+    Ok(())
+}
+
+fn jars_in(directory: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut jars: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().is_some_and(|extension| extension == "jar")
+        })
+        .collect();
+    jars.sort();
+    jars
+}
+
+/// The newest jar of every part of JaCoCo in the local repositories of Maven.
+fn find_jacoco_jars() -> Vec<PathBuf> {
+    let mut repositories: Vec<PathBuf> = Vec::new();
+    if let Some(home) = env::var_os("MAVEN_USER_HOME").map(PathBuf::from) {
+        repositories.push(home.join("repository"));
+    }
+    if let Some(home) = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+    {
+        repositories.push(home.join(".m2").join("repository"));
+    }
+    JACOCO_ARTIFACTS
+        .iter()
+        .filter_map(|artifact| newest_jar(&repositories, artifact))
+        .collect()
+}
+
+fn newest_jar(repositories: &[PathBuf], artifact: &str) -> Option<PathBuf> {
+    let mut jars = Vec::new();
+    for repository in repositories {
+        for version in children(&repository.join(artifact)) {
+            jars.extend(
+                fs::read_dir(&version)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.is_file()
+                            && path.extension().is_some_and(|extension| extension == "jar")
+                            && !path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .ends_with("-sources.jar")
+                    }),
+            );
+        }
+    }
+    jars.sort_by_cached_key(|path| version_order(&name_of(path)));
+    jars.pop()
+}
+
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The numbers of the version in a jar name: `asm-9.10.1.jar` is `[9, 10, 1]`.
+fn version_order(name: &str) -> Vec<u64> {
+    let tail = name.strip_suffix(".jar").unwrap_or(name);
+    let tail = tail.rsplit('-').next().unwrap_or(tail);
+    tail.split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap_or(u64::MAX))
+        .collect()
 }

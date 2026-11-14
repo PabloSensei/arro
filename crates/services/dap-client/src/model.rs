@@ -178,13 +178,16 @@ pub struct DataBreakpointSpec {
 }
 
 /// A breakpoint as the window sets it. `hit_condition` is the DAP text form, so an adapter
-/// may read it as a number or as an expression.
+/// may read it as a number or as an expression. A `log_message` makes the breakpoint a
+/// logpoint of the adapter: the adapter prints it instead of stopping, and `{expression}`
+/// in the text is replaced with the value of the expression when the adapter supports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BreakpointSpec {
     pub file: PathBuf,
     pub line: u32,
     pub condition: Option<String>,
     pub hit_condition: Option<String>,
+    pub log_message: Option<String>,
     pub enabled: bool,
 }
 
@@ -195,6 +198,7 @@ impl Default for BreakpointSpec {
             line: 0,
             condition: None,
             hit_condition: None,
+            log_message: None,
             enabled: true,
         }
     }
@@ -308,6 +312,9 @@ pub enum Command {
     RemoveWatch(String),
     /// Evaluate an expression in the console of the selected frame.
     Evaluate(String),
+    /// Evaluate an expression at a breakpoint that suspends the program and print its
+    /// value in the console, one line per hit.
+    EvaluateLog(String),
     /// Evaluate an expression in the selected frame for the popup at the caret.
     EvaluateQuick(String),
     /// Gives a variable a new value; `reference` is the group or object that holds it.

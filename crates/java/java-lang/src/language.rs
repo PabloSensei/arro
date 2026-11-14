@@ -165,7 +165,7 @@ impl LanguageSupport for JavaProject {
     }
 
     fn symbols(&self) -> Option<&dyn SymbolProvider> {
-        Some(java_syntax::symbols())
+        Some(java_syntax::java_symbols())
     }
 
     fn server(&self) -> Option<&dyn SemanticServer> {

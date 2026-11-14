@@ -41,6 +41,7 @@ mod process_tree;
 #[cfg(unix)]
 #[path = "process_tree_unix.rs"]
 mod process_tree;
+mod resources;
 #[cfg(windows)]
 mod shell;
 #[cfg(unix)]
@@ -58,7 +59,7 @@ pub use job::Job;
 pub use memory::{MemoryPressure, MemoryState, MemoryThresholds, physical_memory};
 pub use mode::{make_executable, mode, set_mode};
 pub use os::version as os_version;
-pub use path::CanonPath;
+pub use path::{CanonPath, path_key};
 pub use process::{
     ConsoleSignal, NO_WINDOW, SUSPENDED_NO_WINDOW, allow_ctrl_c_in_children, resume_process,
     signal_console_of,
@@ -69,6 +70,7 @@ pub use process_stats::{
 };
 pub use process_stats::{ProcessMemory, label_process, process_tree};
 pub use process_tree::ProcessTree;
+pub use resources::{resources_dir, resources_dir_of};
 pub use shell::{NO_BROWSER_ENV, open_url, recorded_urls};
 pub use trash::move_to_trash;
 pub use waiter::ProcessWaiter;

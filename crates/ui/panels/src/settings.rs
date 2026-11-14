@@ -1395,7 +1395,9 @@ impl Render for SettingsView {
             .items_center()
             .justify_between()
             .flex_none()
-            .h(px(24.))
+            // The close button is a control of the header height: a shorter title would
+            // leave it sticking out of the bar that the pointer drags.
+            .h(px(CONTROL_HEIGHT))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {

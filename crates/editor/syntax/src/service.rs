@@ -2,14 +2,15 @@
 //! a newer snapshot replaces one that is still waiting.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 
 use streaming_iterator::StreamingIterator;
 use text_core::{Change, Edit, RopeStore, TextStore};
-use tree_sitter::{InputEdit, Parser, Point, Query, QueryCursor, Tree};
+use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, Tree};
 
 use crate::highlight::{Capture, HighlightKind, HighlightSpan, flatten};
-use crate::language::LanguageConfig;
+use crate::language::{Injection, LanguageConfig};
 use crate::outline::{FoldRange, folds, region_folds};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -138,9 +139,19 @@ struct Session {
     indents: Arc<Query>,
     capture_kinds: Vec<Option<HighlightKind>>,
     tree: Option<Tree>,
+    /// A parse of one injected language over all its ranges of the document.
+    layers: HashMap<(Language, &'static str), LayerSession>,
     /// The text `tree` was parsed from.
     text: RopeStore,
     listener: Listener,
+}
+
+/// The parser and the query of one language injected into a document.
+struct LayerSession {
+    parser: Parser,
+    query: Query,
+    capture_kinds: Vec<Option<HighlightKind>>,
+    tree: Option<Tree>,
 }
 
 impl Session {
@@ -150,11 +161,7 @@ impl Session {
         let highlights = Query::new(&language.grammar, language.highlights).ok()?;
         let folds = Query::new(&language.grammar, language.folds).ok()?;
         let indents = Arc::new(Query::new(&language.grammar, language.indents).ok()?);
-        let capture_kinds = highlights
-            .capture_names()
-            .iter()
-            .map(|name| HighlightKind::from_capture(name))
-            .collect();
+        let capture_kinds = capture_kinds(&highlights);
         Some(Self {
             language,
             parser,
@@ -163,17 +170,28 @@ impl Session {
             indents,
             capture_kinds,
             tree: None,
+            layers: HashMap::new(),
             text: RopeStore::default(),
             listener,
         })
     }
 
     fn parse(&mut self, job: Job) {
-        if let Some(tree) = &mut self.tree {
+        if self.tree.is_some() {
             let mut text = self.text.clone();
             for step in &job.steps {
                 for edit in step.iter().rev() {
-                    tree.edit(&input_edit(&text, edit));
+                    let input = input_edit(&text, edit);
+                    if let Some(tree) = &mut self.tree {
+                        tree.edit(&input);
+                    }
+                    // A layer spans the whole document, so an edit of the text is the
+                    // same edit for every layer tree.
+                    for layer in self.layers.values_mut() {
+                        if let Some(tree) = &mut layer.tree {
+                            tree.edit(&input);
+                        }
+                    }
                     text.replace(edit.range.clone(), &edit.text);
                 }
             }
@@ -182,7 +200,18 @@ impl Session {
         let Some(tree) = self.parser.parse(&source, self.tree.as_ref()) else {
             return;
         };
-        let highlights = self.highlights(&tree, source.as_bytes());
+        let mut captures = query_captures(
+            &self.highlights,
+            &self.capture_kinds,
+            &tree,
+            source.as_bytes(),
+            0,
+        );
+        let replaced = self.layer_captures(&tree, source.as_bytes(), &mut captures);
+        if !replaced.is_empty() {
+            captures.retain(|capture| !replaced.contains(&capture.range));
+        }
+        let highlights = flatten(captures);
         let folds = {
             let mut found = folds(
                 &tree,
@@ -204,22 +233,235 @@ impl Session {
         });
     }
 
-    fn highlights(&self, tree: &Tree, source: &[u8]) -> Vec<HighlightSpan> {
-        let mut cursor = QueryCursor::new();
-        let mut captures = Vec::new();
-        let mut matches = cursor.matches(&self.highlights, tree.root_node(), source);
-        while let Some(found) = matches.next() {
-            for capture in found.captures() {
-                if let Some(kind) = self.capture_kinds[capture.index as usize] {
-                    captures.push(Capture {
-                        range: capture.node.byte_range(),
-                        pattern: found.pattern_index,
-                        kind,
-                    });
+    /// Parses every injected layer over all its ranges at once and adds its captures.
+    /// Returns the ranges the layers replace in the outer highlights.
+    fn layer_captures(
+        &mut self,
+        tree: &Tree,
+        source: &[u8],
+        captures: &mut Vec<Capture>,
+    ) -> Vec<Range<usize>> {
+        let mut groups: HashMap<(Language, &'static str), Vec<tree_sitter::Range>> = HashMap::new();
+        let mut replaced = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            for injection in &self.language.injections {
+                if node.kind() != injection.node {
+                    continue;
+                }
+                let text = match injection.text_node {
+                    Some(kind) => match child_of_kind(node, kind) {
+                        Some(child) => child,
+                        None => continue,
+                    },
+                    None => node,
+                };
+                let range = text.range();
+                if range.start_byte == range.end_byte {
+                    continue;
+                }
+                let Some((language, highlights)) = injection_language(injection, node, source)
+                else {
+                    continue;
+                };
+                if injection.replace {
+                    replaced.push(range.start_byte..range.end_byte);
+                }
+                groups
+                    .entry((language, highlights))
+                    .or_default()
+                    .extend(text_ranges(text, injection.skip_nodes, source));
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+
+        let base = self.highlights.pattern_count();
+        for ((language, highlights), mut ranges) in groups {
+            ranges.sort_by_key(|range| range.start_byte);
+            let mut free = 0;
+            let ranges: Vec<_> = ranges
+                .into_iter()
+                .filter(|range| {
+                    if range.start_byte < free {
+                        return false;
+                    }
+                    free = range.end_byte;
+                    true
+                })
+                .collect();
+            let Some(layer) = self.layer_session(language, highlights) else {
+                continue;
+            };
+            if layer.parser.set_included_ranges(&ranges).is_err() {
+                continue;
+            }
+            let old = layer.tree.take();
+            let Some(parsed) = layer.parser.parse(source, old.as_ref()) else {
+                layer.tree = old;
+                continue;
+            };
+            captures.extend(query_captures(
+                &layer.query,
+                &layer.capture_kinds,
+                &parsed,
+                source,
+                base,
+            ));
+            layer.tree = Some(parsed);
+        }
+        replaced
+    }
+
+    /// The session of an injected language, with its parser, its query and its tree.
+    fn layer_session(
+        &mut self,
+        language: Language,
+        highlights: &'static str,
+    ) -> Option<&mut LayerSession> {
+        let key = (language.clone(), highlights);
+        if !self.layers.contains_key(&key) {
+            let mut parser = Parser::new();
+            parser.set_language(&language).ok()?;
+            let query = Query::new(&language, highlights).ok()?;
+            let capture_kinds = capture_kinds(&query);
+            self.layers.insert(
+                key.clone(),
+                LayerSession {
+                    parser,
+                    query,
+                    capture_kinds,
+                    tree: None,
+                },
+            );
+        }
+        self.layers.get_mut(&key)
+    }
+}
+
+/// The capture of every name of `query` in `tree`, with `pattern_base` added to the
+/// pattern number so that a layer wins ties over the query of the outer language.
+fn query_captures(
+    query: &Query,
+    capture_kinds: &[Option<HighlightKind>],
+    tree: &Tree,
+    source: &[u8],
+    pattern_base: usize,
+) -> Vec<Capture> {
+    let mut cursor = QueryCursor::new();
+    let mut captures = Vec::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source);
+    while let Some(found) = matches.next() {
+        for capture in found.captures() {
+            if let Some(kind) = capture_kinds[capture.index as usize] {
+                captures.push(Capture {
+                    range: capture.node.byte_range(),
+                    pattern: pattern_base + found.pattern_index,
+                    kind,
+                });
+            }
+        }
+    }
+    captures
+}
+
+fn capture_kinds(query: &Query) -> Vec<Option<HighlightKind>> {
+    query
+        .capture_names()
+        .iter()
+        .map(|name| HighlightKind::from_capture(name))
+        .collect()
+}
+
+/// The language an injection parses and the query that colours it.
+fn injection_language(
+    injection: &Injection,
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<(Language, &'static str)> {
+    match injection.name_node {
+        Some(kind) => {
+            let name = child_of_kind(node, kind)?;
+            let name = source.get(name.byte_range())?;
+            let name = std::str::from_utf8(name).ok()?;
+            let name = name.split_whitespace().next()?;
+            let config = (injection.resolve?)(name)?;
+            Some((config.grammar, config.highlights))
+        }
+        None => Some((injection.language.clone()?, injection.highlights?)),
+    }
+}
+
+fn child_of_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+/// The text of `node` without the children that hold container syntax, such as the
+/// marks each line of a block carries in its own language.
+fn text_ranges(node: tree_sitter::Node, skip: &[&str], source: &[u8]) -> Vec<tree_sitter::Range> {
+    let range = node.range();
+    let mut cuts: Vec<Range<usize>> = Vec::new();
+    if !skip.is_empty() {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if skip.contains(&child.kind()) {
+                let cut = child.byte_range();
+                if cut.start < cut.end {
+                    cuts.push(cut);
                 }
             }
         }
-        flatten(captures)
+    }
+    if cuts.is_empty() {
+        return vec![range];
+    }
+    cuts.sort_by_key(|cut| cut.start);
+    let mut ranges = Vec::with_capacity(cuts.len() + 1);
+    let mut at = range.start_byte;
+    let mut point = range.start_point;
+    for cut in cuts {
+        let start = cut.start.clamp(at, range.end_byte);
+        if start > at {
+            let start_point = point;
+            advance(source, at, start, &mut point);
+            ranges.push(tree_sitter::Range {
+                start_byte: at,
+                end_byte: start,
+                start_point,
+                end_point: point,
+            });
+            at = start;
+        }
+        let end = cut.end.clamp(at, range.end_byte);
+        advance(source, at, end, &mut point);
+        at = end;
+    }
+    if at < range.end_byte {
+        let start_point = point;
+        advance(source, at, range.end_byte, &mut point);
+        ranges.push(tree_sitter::Range {
+            start_byte: at,
+            end_byte: range.end_byte,
+            start_point,
+            end_point: point,
+        });
+    }
+    ranges
+}
+
+/// Moves `point` over the bytes `source[from..to]`.
+fn advance(source: &[u8], from: usize, to: usize, point: &mut Point) {
+    for &byte in &source[from..to] {
+        if byte == b'\n' {
+            point.row += 1;
+            point.column = 0;
+        } else {
+            point.column += 1;
+        }
     }
 }
 

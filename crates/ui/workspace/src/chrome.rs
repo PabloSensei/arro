@@ -16,20 +16,21 @@ use crate::window::{
     AI_TOOL, BOOKMARKS_POPUP, BalloonAction, BuildProject, COMMIT_TOOL, ChooseDebugConfiguration,
     ChooseRunConfiguration, CloseTab, Compile, CopyElement, DEBUG_TOOL, Debug, Dismiss, DockSide,
     EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto,
-    ForceStepOver, FullyExpandTreeNode, GotoRelated, HideToolWindow, LOG_TOOL, MenuRow,
-    MoveToOtherGroup, NewElementSamePlace, NextProblem, NextProjectWindow, NextTab, OpenFolder,
-    Overlay, PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem, PreviousProjectWindow,
-    ProjectStructure, PushChanges, QuickEvaluate, QuitApp, RUN_TOOL, ReopenTab, Rerun, RerunTests,
-    ResizeStep, ResizeToolWindowDown, ResizeToolWindowLeft, ResizeToolWindowRight,
-    ResizeToolWindowUp, Resume, Run, RunToCursor, SERVICES_TOOL, STRUCTURE_TOOL, SaveAll,
-    ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch, ShowSettings, SmartStepInto,
-    SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop, StopBackgroundProcesses, Synchronize,
-    TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi, ToggleBreakpoint, ToggleCommit,
-    ToggleDebug, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
+    ForceStepOver, FullyExpandTreeNode, GotoRelated, HTTP_TOOL, HideCoverage, HideToolWindow,
+    LOG_TOOL, MenuRow, MoveToOtherGroup, NewElementSamePlace, NextProblem, NextProjectWindow,
+    NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem,
+    PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate, QuitApp, RUN_TOOL,
+    ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown, ResizeToolWindowLeft,
+    ResizeToolWindowRight, ResizeToolWindowUp, Resume, Run, RunTestsWithCoverage, RunToCursor,
+    RunWithCoverage, SERVICES_TOOL, STRUCTURE_TOOL, SaveAll, ShowBranches, ShowCommit,
+    ShowExecutionPoint, ShowSearch, ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto,
+    StepOut, StepOver, Stop, StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL,
+    TabLeft, TabRight, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDebug,
+    ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
     ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
     UpdateProject, VcsQuickList, ViewBreakpoints, Workspace,
 };
-use crate::window::{TODO_TOOL, ToggleProblems, ToggleTodo};
+use crate::window::{TODO_TOOL, ToggleHttp, ToggleProblems, ToggleTodo};
 
 /// Wider than the gap itself so that the edge is easy to catch.
 const EDGE_GRIP: f32 = 6.;
@@ -786,6 +787,16 @@ impl Workspace {
         .debug_selector(|| "t-debug".to_owned())
         .on_click(cx.listener(|this, _, window, cx| this.debug_selected(window, cx)))
         .child(icon_sized("run/debug", ICON, theme));
+        let coverage = button_frame(
+            "t-coverage",
+            "Run with Coverage",
+            self.shortcut_of_key("workspace::RunWithCoverage")
+                .map(Into::into),
+            theme,
+        )
+        .debug_selector(|| "t-coverage".to_owned())
+        .on_click(cx.listener(|this, _, window, cx| this.run_with_coverage(window, cx)))
+        .child(icon_sized("run/coverage", ICON, theme));
         let active = state.running || self.debug_state(cx).active;
         let stop = active.then(|| {
             button_frame(
@@ -798,12 +809,15 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| this.stop_run(window, cx)))
             .child(icon_sized("run/stop", ICON, theme))
         });
+        // The coverage button first of the run group, so that Stop and the tools keep
+        // the places the toolbar tests measure.
         div()
             .id("run-group")
             .debug_selector(|| "run-group".to_owned())
             .flex()
             .items_center()
             .gap(px(SPACE_XS))
+            .child(coverage)
             .child(configs)
             .child(run)
             .child(debug)
@@ -1205,6 +1219,7 @@ impl Workspace {
                 self.action_row("Terminal", ToggleTerminal),
                 self.action_row("AI Assistant", ToggleAi),
                 command("window.show_documentation", "Documentation"),
+                self.action_row("HTTP Response", ToggleHttp),
             ],
         );
 
@@ -1359,6 +1374,9 @@ impl Workspace {
             vec![
                 self.action_row("Run", Run),
                 self.action_row("Debug", Debug),
+                self.action_row("Run with Coverage", RunWithCoverage),
+                self.action_row("Run Tests with Coverage", RunTestsWithCoverage),
+                self.action_row("Hide Coverage", HideCoverage),
                 command(workspace_keys::RUN_ANYTHING, "Run Anything"),
                 command(workspace_keys::RUN_CLASS, "Run Test at Caret"),
                 self.action_row("Rerun Tests", RerunTests),
@@ -2546,6 +2564,20 @@ impl Render for Workspace {
                 this.run_command("workspace.compile", window, cx);
             }))
             .on_action(cx.listener(|this, _: &RerunTests, window, cx| this.rerun_tests(window, cx)))
+            .on_action(cx.listener(|this, _: &RunWithCoverage, window, cx| {
+                this.run_with_coverage(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RunTestsWithCoverage, window, cx| {
+                this.run_tests_with_coverage(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &HideCoverage, window, cx| this.hide_coverage(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleCoverage, window, cx| {
+                    this.toggle_coverage(window, cx)
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &StopBackgroundProcesses, window, cx| {
                     this.stop_background(window, cx)
@@ -2583,6 +2615,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleTodo, window, cx| {
                 this.toggle_tool(TODO_TOOL, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleHttp, window, cx| {
+                this.toggle_tool(HTTP_TOOL, window, cx)
             }))
             .on_action(cx.listener(|this, _: &MoveToOtherGroup, window, cx| {
                 this.move_to_other_group(window, cx)

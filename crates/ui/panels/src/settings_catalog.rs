@@ -24,6 +24,7 @@ pub enum SettingsPage {
     Git,
     Tools,
     Terminal,
+    HttpClient,
     EditorLiveTemplates,
     EditorPostfix,
     EditorFileTemplates,
@@ -54,7 +55,7 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 18] = [
+    pub const ALL: [SettingsPage; 19] = [
         SettingsPage::Appearance,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
@@ -71,6 +72,7 @@ impl SettingsPage {
         SettingsPage::Git,
         SettingsPage::Tools,
         SettingsPage::Terminal,
+        SettingsPage::HttpClient,
         SettingsPage::Plugins,
         SettingsPage::Keymap,
     ];
@@ -92,6 +94,7 @@ impl SettingsPage {
             SettingsPage::Git => "Git",
             SettingsPage::Tools => "Tools",
             SettingsPage::Terminal => "Terminal",
+            SettingsPage::HttpClient => "HTTP Client",
             SettingsPage::EditorLiveTemplates => "Live Templates",
             SettingsPage::EditorPostfix => "Postfix Completion",
             SettingsPage::EditorFileTemplates => "File and Code Templates",
@@ -181,6 +184,7 @@ pub enum SettingField {
     CompletionAutoPopup,
     CompletionDelay,
     Autosave,
+    OpenReadmeOnFirstOpen,
     UpdatesCheckAutomatically,
     SemanticHighlighting,
     InlayParameterNames,
@@ -209,6 +213,7 @@ pub enum SettingField {
     RenderDocComments,
     DiffSideBySide,
     GitGroupByDirectory,
+    HttpTimeout,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -296,6 +301,14 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Toggle,
         field: SettingField::Autosave,
         keywords: "autosave save focus editor",
+    },
+    Setting {
+        id: "open_readme_on_first_open",
+        title: "Open README when a project is opened for the first time",
+        page: SettingsPage::Project,
+        kind: SettingKind::Toggle,
+        field: SettingField::OpenReadmeOnFirstOpen,
+        keywords: "readme markdown first open project start",
     },
     Setting {
         id: "updates_check_automatically",
@@ -649,6 +662,14 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::GitGroupByDirectory,
         keywords: "branch popup folders group directory remote version control",
     },
+    Setting {
+        id: "http_timeout",
+        title: "HTTP request timeout",
+        page: SettingsPage::HttpClient,
+        kind: SettingKind::Number,
+        field: SettingField::HttpTimeout,
+        keywords: "http rest request timeout seconds network client",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -731,6 +752,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::CodeVisionImplementations => Some(settings.code_vision_implementations),
         SettingField::RenderDocComments => Some(settings.render_doc_comments),
         SettingField::Autosave => Some(settings.autosave),
+        SettingField::OpenReadmeOnFirstOpen => Some(settings.open_readme_on_first_open),
         SettingField::UpdatesCheckAutomatically => Some(settings.updates_check_automatically),
         SettingField::SemanticHighlighting => Some(settings.semantic_highlighting),
         SettingField::QuickDocOnHover => Some(settings.quick_doc_on_hover),
@@ -767,7 +789,8 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::GitUpdateMethod
         | SettingField::TerminalShell
         | SettingField::TerminalStartDirectory
-        | SettingField::TerminalEnvironment => None,
+        | SettingField::TerminalEnvironment
+        | SettingField::HttpTimeout => None,
     }
 }
 
@@ -808,6 +831,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             settings.render_doc_comments = !settings.render_doc_comments;
         }
         Some(SettingField::Autosave) => settings.autosave = !settings.autosave,
+        Some(SettingField::OpenReadmeOnFirstOpen) => {
+            settings.open_readme_on_first_open = !settings.open_readme_on_first_open;
+        }
         Some(SettingField::UpdatesCheckAutomatically) => {
             settings.updates_check_automatically = !settings.updates_check_automatically;
         }
@@ -864,7 +890,8 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::GitUpdateMethod
             | SettingField::TerminalShell
             | SettingField::TerminalStartDirectory
-            | SettingField::TerminalEnvironment,
+            | SettingField::TerminalEnvironment
+            | SettingField::HttpTimeout,
         )
         | None => {
             return false;
@@ -882,6 +909,7 @@ pub fn number(settings: &Settings, id: &str) -> Option<f32> {
         SettingField::TabSize => Some(settings.tab_size as f32),
         SettingField::IndentSize => Some(settings.indent_size as f32),
         SettingField::CompletionDelay => Some(settings.completion_delay_ms as f32),
+        SettingField::HttpTimeout => Some(settings.http_timeout_seconds as f32),
         _ => None,
     }
 }
@@ -896,6 +924,7 @@ pub fn number_label(settings: &Settings, id: &str) -> Option<String> {
         }
         SettingField::UiScale | SettingField::LineSpacing => format!("{value:.1}"),
         SettingField::CompletionDelay => format!("{value} ms"),
+        SettingField::HttpTimeout => format!("{value} s"),
         _ => format!("{value}"),
     })
 }
@@ -937,6 +966,14 @@ pub fn adjust_number(settings: &mut Settings, id: &str, delta: f32) -> bool {
                 MAX_COMPLETION_DELAY_MS as f32,
             ) as u32;
             settings.completion_delay_ms = value;
+        }
+        SettingField::HttpTimeout => {
+            let value = update(
+                settings.http_timeout_seconds as f32,
+                1.,
+                workspace::MAX_HTTP_TIMEOUT_SECONDS as f32,
+            ) as u32;
+            settings.http_timeout_seconds = value;
         }
         _ => return false,
     }

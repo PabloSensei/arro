@@ -1,6 +1,7 @@
 //! Maven and Gradle projects: finding the tool and the JDK, a quick scan of project files,
 //! and the full model the tool reports through the helpers in `helpers/`.
 
+mod coverage;
 mod env;
 mod environment;
 mod fingerprint;
@@ -11,6 +12,7 @@ mod maven;
 mod pom;
 mod test_runs;
 
+pub use coverage::CoverageTools;
 pub use env::{BuildEnv, detect_build_system};
 pub use environment::{
     ProjectSettings, ResolvedEnvironment, language_level, load_settings, project_jdk,

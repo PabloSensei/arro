@@ -1,9 +1,9 @@
 //! The About window: the version of this build, what the product is, and the way to a bug
 //! report. It is a modal view of the workspace, without a web view of its own.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use ::platform::open_url;
+use ::platform::{open_url, resources_dir};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -93,14 +93,12 @@ impl AboutView {
     }
 }
 
-/// `THIRD-PARTY.txt` and `NOTICE.txt` next to the running executable, when they exist.
+/// `THIRD-PARTY.txt` and `NOTICE.txt` in the resources of the program, when they exist.
 fn notice_files() -> Vec<PathBuf> {
-    let Some(folder) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
+    let Ok(program) = std::env::current_exe() else {
         return Vec::new();
     };
+    let folder = resources_dir(&program);
     NOTICES
         .iter()
         .map(|name| folder.join(name))

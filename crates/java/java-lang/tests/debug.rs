@@ -657,6 +657,7 @@ async fn conditional_and_hit_count_breakpoints_on_petclinic() {
                     line: BREAK_LINE,
                     condition,
                     hit_condition: hit,
+                    log_message: None,
                     enabled: true,
                 }],
                 vec!["a".into()],

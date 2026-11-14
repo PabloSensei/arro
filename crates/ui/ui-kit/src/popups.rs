@@ -628,6 +628,14 @@ fn menu_level(
                     })
                 };
             }
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let parts: Vec<String> = path.iter().map(|index| index.to_string()).collect();
+                row = row.child(crate::bounds_probe(
+                    format!("menu-{}", parts.join("-")),
+                    Some(entry.label.clone()),
+                ));
+            }
         }
 
         row = row.child(

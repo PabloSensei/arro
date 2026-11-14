@@ -14,9 +14,11 @@ use std::thread;
 use std::time::Duration;
 
 use base::{Cancel, Result};
+use lang_api::CoverageReport;
 use project_model::ProjectModel;
 use serde::Deserialize;
 
+use crate::coverage::{CoveragePlan, CoverageStart, StartKind};
 use crate::{Console, RunPlan};
 
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
@@ -86,6 +88,26 @@ pub trait TestProvider: Send + Sync {
         _debug: &TestDebug,
     ) -> Result<RunPlan> {
         self.plan(model, request, listen)
+    }
+
+    /// The same tests with the coverage agent in their JVM, and the file the agent
+    /// writes. A provider without coverage keeps the error of this default.
+    fn coverage_plan(
+        &self,
+        _model: &ProjectModel,
+        _request: &TestRequest,
+        _listen: &TestListen,
+    ) -> Result<CoveragePlan> {
+        Err(format!("{} cannot collect coverage", std::any::type_name::<Self>()).into())
+    }
+
+    /// Reads the data of the last run of [`TestProvider::coverage_plan`].
+    fn coverage_report(
+        &self,
+        _exec: &std::path::Path,
+        _model: &ProjectModel,
+    ) -> Result<CoverageReport> {
+        Err("this test provider cannot read coverage".into())
     }
 
     /// A line of the test output that says the test JVM listens for the debugger. A
@@ -170,7 +192,7 @@ impl TestRun {
         model: &ProjectModel,
         request: &TestRequest,
     ) -> Result<Self> {
-        Self::start_with(provider, model, request, None)
+        Self::start_with(provider, model, request, StartKind::Plain).map(|(run, _)| run)
     }
 
     /// Starts the tests under a debugger and says where it may attach. The test JVM
@@ -203,7 +225,7 @@ impl TestRun {
             port,
         };
         let ready = provider.debug_ready();
-        let run = Self::start_with(provider, model, request, Some(&debug))?;
+        let (run, _) = Self::start_with(provider, model, request, StartKind::Debug(&debug))?;
         let ready = match ready {
             Some(marker) => {
                 !stop.is_cancelled() && run.console().wait_for_output(marker, DEBUG_READY, stop)
@@ -220,12 +242,12 @@ impl TestRun {
         Ok((run, debug))
     }
 
-    fn start_with(
+    pub(crate) fn start_with(
         provider: &dyn TestProvider,
         model: &ProjectModel,
         request: &TestRequest,
-        debug: Option<&TestDebug>,
-    ) -> Result<Self> {
+        kind: StartKind<'_>,
+    ) -> Result<(Self, Option<CoverageStart>)> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let listen = TestListen {
@@ -241,22 +263,37 @@ impl TestRun {
         thread::Builder::new()
             .name("test-events".into())
             .spawn(move || accept(&listener, &token, &sender, &stopped))?;
-        let plan = match debug {
-            Some(debug) => provider.debug_plan(model, request, &listen, debug),
-            None => provider.plan(model, request, &listen),
+        let plan = match kind {
+            StartKind::Debug(debug) => provider
+                .debug_plan(model, request, &listen, debug)
+                .map(|plan| (plan, None)),
+            StartKind::Plain => provider
+                .plan(model, request, &listen)
+                .map(|plan| (plan, None)),
+            StartKind::Coverage => {
+                provider
+                    .coverage_plan(model, request, &listen)
+                    .map(|coverage| {
+                        let CoveragePlan { plan, exec, note } = coverage;
+                        (plan, Some(CoverageStart { exec, note }))
+                    })
+            }
         };
-        let plan = match plan {
+        let (plan, coverage) = match plan {
             Ok(plan) => plan,
             Err(error) => {
                 stop.store(true, Ordering::Relaxed);
                 return Err(error);
             }
         };
-        Ok(Self {
-            events,
-            stop,
-            console: Console::start(plan),
-        })
+        Ok((
+            Self {
+                events,
+                stop,
+                console: Console::start(plan),
+            },
+            coverage,
+        ))
     }
 
     pub fn events(&self) -> &Receiver<TestEvent> {

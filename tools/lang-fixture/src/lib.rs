@@ -22,36 +22,43 @@ pub struct MockDap {
 impl MockDap {
     /// Binds a free port and starts serving. The first connection gets the scenario.
     pub fn start() -> std::io::Result<Self> {
-        Self::start_with_threads(0, None, false)
+        Self::start_with_threads(0, None, false, false)
     }
 
     /// The same scenario with `virtual_threads` extra threads, named the way the JDK
     /// names a virtual thread. A test reads a large thread list without a real JVM.
     pub fn start_with_virtual_threads(virtual_threads: usize) -> std::io::Result<Self> {
-        Self::start_with_threads(virtual_threads, None, false)
+        Self::start_with_threads(virtual_threads, None, false, false)
     }
 
     /// The scenario with the stack frame of a real file, for the window actions that open
     /// the place of a frame.
     pub fn start_with_stack_source(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), false)
+        Self::start_with_threads(0, Some(source.into()), false, false)
     }
 
     /// The scenario of an adapter that lists the requests for method breakpoints, field
     /// watchpoints and frame restarts among its capabilities.
     pub fn start_with_breakpoint_kinds() -> std::io::Result<Self> {
-        Self::start_with_threads(0, None, true)
+        Self::start_with_threads(0, None, true, false)
     }
 
     /// The same, on a real file, for the window tests of the gutter.
     pub fn start_with_breakpoint_kinds_for(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), true)
+        Self::start_with_threads(0, Some(source.into()), true, false)
+    }
+
+    /// The scenario of an adapter that supports logpoints: a breakpoint with a message
+    /// prints the message and does not stop the program.
+    pub fn start_with_log_points(source: impl Into<String>) -> std::io::Result<Self> {
+        Self::start_with_threads(0, Some(source.into()), false, true)
     }
 
     fn start_with_threads(
         virtual_threads: usize,
         source: Option<String>,
         breakpoint_kinds: bool,
+        log_points: bool,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?.to_string();
@@ -65,6 +72,7 @@ impl MockDap {
                     virtual_threads,
                     source.as_deref(),
                     breakpoint_kinds,
+                    log_points,
                 );
             }
         });
@@ -111,6 +119,7 @@ fn serve(
     virtual_threads: usize,
     source: Option<&str>,
     breakpoint_kinds: bool,
+    log_points: bool,
 ) -> std::io::Result<()> {
     let source = source.unwrap_or("C:/fixture/demo.sample");
     let mut writer = stream.try_clone()?;
@@ -119,6 +128,7 @@ fn serve(
     let mut stopped = false;
     let mut exception_filters: Vec<String> = Vec::new();
     let mut exception_stopped = false;
+    let mut has_log_points = false;
     let mut text_value = "\"hello\"".to_owned();
     while let Some(message) = read_message(&mut reader)? {
         if message.get("type").and_then(Value::as_str) != Some("request") {
@@ -151,6 +161,9 @@ fn serve(
                     body["supportsDataBreakpoints"] = json!(true);
                     body["supportsRestartFrame"] = json!(true);
                 }
+                if log_points {
+                    body["supportsLogPoints"] = json!(true);
+                }
                 respond(&mut writer, seq, request_seq, command, body)?;
                 seq += 1;
                 event(&mut writer, seq, "initialized", json!({}))?;
@@ -171,6 +184,13 @@ fn serve(
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                let messages: Vec<String> = breakpoints
+                    .iter()
+                    .filter_map(|breakpoint| breakpoint.get("logMessage"))
+                    .filter_map(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                    .map(str::to_owned)
+                    .collect();
                 let entries: Vec<Value> = breakpoints
                     .iter()
                     .enumerate()
@@ -207,6 +227,20 @@ fn serve(
                     command,
                     json!({"breakpoints": entries}),
                 )?;
+                // A logpoint prints its message on a hit and leaves the program running.
+                if log_points {
+                    has_log_points = !messages.is_empty();
+                    for message in messages {
+                        seq += 1;
+                        let text = log_text(&message);
+                        event(
+                            &mut writer,
+                            seq,
+                            "output",
+                            json!({"category": "stdout", "output": text}),
+                        )?;
+                    }
+                }
             }
             "setFunctionBreakpoints" => {
                 let breakpoints = arguments
@@ -327,17 +361,19 @@ fn serve(
                 )?;
                 if !stopped {
                     stopped = true;
-                    seq += 1;
-                    event(
-                        &mut writer,
-                        seq,
-                        "stopped",
-                        json!({
-                            "reason": "breakpoint",
-                            "threadId": 1,
-                            "allThreadsStopped": true,
-                        }),
-                    )?;
+                    if !has_log_points {
+                        seq += 1;
+                        event(
+                            &mut writer,
+                            seq,
+                            "stopped",
+                            json!({
+                                "reason": "breakpoint",
+                                "threadId": 1,
+                                "allThreadsStopped": true,
+                            }),
+                        )?;
+                    }
                 }
             }
             "threads" => {
@@ -500,6 +536,38 @@ fn serve(
         }
     }
     Ok(())
+}
+
+/// The console text of a log message: an expression in braces becomes the value of the
+/// fixture, as an adapter that supports logpoints substitutes it.
+fn log_text(message: &str) -> String {
+    let mut text = String::new();
+    let mut rest = message;
+    while let Some(start) = rest.find('{') {
+        text.push_str(&rest[..start]);
+        let Some(end) = rest[start + 1..].find('}') else {
+            text.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let expression = &rest[start + 1..start + 1 + end];
+        text.push_str(fixture_value(expression));
+        rest = &rest[start + 1 + end + 1..];
+    }
+    text.push_str(rest);
+    text.push('\n');
+    text
+}
+
+/// The value the fixture gives an expression of a log message.
+fn fixture_value(expression: &str) -> &'static str {
+    if expression.contains("text") {
+        "\"hello\""
+    } else if expression.contains("items") {
+        "ArrayList (2)"
+    } else {
+        "42"
+    }
 }
 
 fn respond(

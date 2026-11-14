@@ -255,6 +255,9 @@ impl Session {
                 {
                     entry["hitCondition"] = json!(hit);
                 }
+                if let Some(message) = spec.log_message.as_deref().filter(|text| !text.is_empty()) {
+                    entry["logMessage"] = json!(message);
+                }
                 entry
             })
             .collect::<Vec<_>>();
@@ -718,6 +721,13 @@ impl Session {
                 match answer {
                     Ok(value) => self.console(format!("> {expression}\n{value}"), false),
                     Err(error) => self.console(format!("> {expression}\n{error}"), true),
+                }
+            }
+            Command::EvaluateLog(expression) => {
+                let answer = self.evaluate(&expression, "repl").await;
+                match answer {
+                    Ok(value) => self.console(value, false),
+                    Err(error) => self.console(format!("{expression}: {error}"), true),
                 }
             }
             Command::EvaluateQuick(expression) => {

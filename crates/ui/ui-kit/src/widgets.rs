@@ -76,7 +76,10 @@ pub fn button_frame(
 ) -> Stateful<Div> {
     let (hover, pressed) = (theme.hover, theme.pressed);
     let label = label.into();
-    div()
+    let id = id.into();
+    #[cfg(any(test, feature = "test-support"))]
+    let name = id.to_string();
+    let button = div()
         .id(id)
         .flex()
         .items_center()
@@ -87,7 +90,10 @@ pub fn button_frame(
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .tooltip(move |_, cx| tooltip(label.clone(), shortcut.clone(), cx))
-        .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
+        .tooltip_show_delay(TOOLTIP_CREATE_DELAY);
+    #[cfg(any(test, feature = "test-support"))]
+    let button = button.child(crate::bounds_probe(name, None));
+    button
 }
 
 /// Text button with an optional leading icon and a trailing chevron.
@@ -98,7 +104,11 @@ pub fn toolbar_dropdown(
     theme: &Theme,
 ) -> Stateful<Div> {
     let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
+    let label = label.into();
+    let id = id.into();
+    #[cfg(any(test, feature = "test-support"))]
+    let name = id.to_string();
+    let dropdown = div()
         .id(id)
         .flex()
         .items_center()
@@ -111,8 +121,11 @@ pub fn toolbar_dropdown(
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .children(leading)
-        .child(label.into())
-        .child(icon_sized("general/chevronDown", TEXT_SMALL, theme))
+        .child(label.clone())
+        .child(icon_sized("general/chevronDown", TEXT_SMALL, theme));
+    #[cfg(any(test, feature = "test-support"))]
+    let dropdown = dropdown.child(crate::bounds_probe(name, Some(label)));
+    dropdown
 }
 
 /// Minimize, maximize and close: the areas Windows answers for itself.
@@ -138,7 +151,7 @@ pub fn window_button(
         theme.pressed
     };
     let over = theme.over_accent;
-    div()
+    let button = div()
         .id(id)
         .debug_selector(move || id.to_owned())
         .group(id)
@@ -161,7 +174,10 @@ pub fn window_button(
                 .when(danger, |this| {
                     this.group_hover(id, move |style| style.text_color(over))
                 }),
-        )
+        );
+    #[cfg(any(test, feature = "test-support"))]
+    let button = button.child(crate::bounds_probe(id, None));
+    button
 }
 
 /// A button of the tool window stripes.
@@ -174,7 +190,10 @@ pub fn stripe_button(
     theme: &Theme,
 ) -> Stateful<Div> {
     let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
+    let id = id.into();
+    #[cfg(any(test, feature = "test-support"))]
+    let name = id.to_string();
+    let button = div()
         .id(id)
         .flex()
         .items_center()
@@ -187,7 +206,10 @@ pub fn stripe_button(
         .active(move |style| style.bg(pressed))
         .tooltip(move |_, cx| tooltip(label.clone(), shortcut.clone(), cx))
         .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
-        .child(icon_sized(icon_name, ICON, theme))
+        .child(icon_sized(icon_name, ICON, theme));
+    #[cfg(any(test, feature = "test-support"))]
+    let button = button.child(crate::bounds_probe(name, None));
+    button
 }
 
 /// Rounded panel: the unit of the Islands layout.

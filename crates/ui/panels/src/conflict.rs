@@ -301,10 +301,12 @@ impl Render for ConflictView {
                 .into_any_element(),
             _ => div()
                 .text_color(theme.text_secondary)
-                .child(if none {
-                    "No conflicts"
-                } else {
-                    "Take a side or edit a file, then mark it resolved"
+                .child(match (operation, none) {
+                    (Operation::Rebase, true) => {
+                        "The rebase is stopped. Continue when the commit is ready, or abort."
+                    }
+                    (_, true) => "No conflicts",
+                    _ => "Take a side or edit a file, then mark it resolved",
                 })
                 .into_any_element(),
         };

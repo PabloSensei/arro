@@ -197,6 +197,28 @@ impl Probe {
     }
 }
 
+/// A source file with a static field and an object that holds a field, compiled for the
+/// field watchpoint tests.
+pub struct WatchProbe {
+    pub path: PathBuf,
+    /// The line of the static field declaration, from one.
+    pub field_line: u32,
+    /// The line of the stop before the writes, from one.
+    pub break_line: u32,
+    /// The line that writes the static field, from one.
+    pub write_line: u32,
+    /// The line that writes the field of the object, from one.
+    pub object_write_line: u32,
+    classes: PathBuf,
+}
+
+impl WatchProbe {
+    /// The classes folder, which the debuggee command line carries.
+    pub fn classes(&self) -> &Path {
+        &self.classes
+    }
+}
+
 /// One open project with jdtls, the build tool of the test and the debugger of the
 /// language. Dropping it ends the server once the last clone of the language is gone.
 pub struct RealLanguage {
@@ -328,15 +350,61 @@ impl RealLanguage {
         }
         fs::write(&source, PROBE).map_err(|error| error.to_string())?;
         let classes = self.state_dir.join("probe-classes");
-        let _ = fs::remove_dir_all(&classes);
-        fs::create_dir_all(&classes).map_err(|error| error.to_string())?;
+        self.compile_probe(&source, &classes)?;
+        Ok(Probe {
+            path: source,
+            line: BREAK_LINE,
+            classes,
+        })
+    }
+
+    /// Compiles the probe of the whole debug session: a local `int` and an object with
+    /// children, a call, and output on both sides of the breakpoint.
+    pub fn install_flow_probe(&self) -> Result<Probe, String> {
+        let source = self.root.join("src/main/java/probe/DebugProbe.java");
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(&source, FLOW_PROBE).map_err(|error| error.to_string())?;
+        let classes = self.state_dir.join("probe-classes-flow");
+        self.compile_probe(&source, &classes)?;
+        Ok(Probe {
+            path: source,
+            line: FLOW_BREAK_LINE,
+            classes,
+        })
+    }
+
+    /// Compiles the probe of the field watchpoints: a static field and an object with one
+    /// field, each written once after the stop.
+    pub fn install_watch_probe(&self) -> Result<WatchProbe, String> {
+        let source = self.root.join("src/main/java/probe/DebugProbe.java");
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(&source, WATCH_PROBE).map_err(|error| error.to_string())?;
+        let classes = self.state_dir.join("probe-classes-watch");
+        self.compile_probe(&source, &classes)?;
+        Ok(WatchProbe {
+            path: source,
+            field_line: WATCH_FIELD_LINE,
+            break_line: WATCH_BREAK_LINE,
+            write_line: WATCH_WRITE_LINE,
+            object_write_line: WATCH_OBJECT_WRITE_LINE,
+            classes,
+        })
+    }
+
+    fn compile_probe(&self, source: &Path, classes: &Path) -> Result<(), String> {
+        let _ = fs::remove_dir_all(classes);
+        fs::create_dir_all(classes).map_err(|error| error.to_string())?;
         let compiled = Command::new(self.java_home.join("bin/javac.exe"))
             .arg("-g")
             .arg("--release")
             .arg("8")
             .arg("-d")
-            .arg(&classes)
-            .arg(&source)
+            .arg(classes)
+            .arg(source)
             .output()
             .map_err(|error| error.to_string())?;
         if !compiled.status.success() {
@@ -345,11 +413,7 @@ impl RealLanguage {
                 String::from_utf8_lossy(&compiled.stderr)
             ));
         }
-        Ok(Probe {
-            path: source,
-            line: BREAK_LINE,
-            classes,
-        })
+        Ok(())
     }
 
     /// Compiles a probe class with a `main` and a line to stop on. The class starts
@@ -416,6 +480,23 @@ impl RealLanguage {
             root: self.root.clone(),
             java: self.java_home.join("bin/java.exe"),
             classes: probe.classes.clone(),
+        })]
+    }
+
+    /// The configuration that starts the watch probe under the debugger.
+    pub fn watch_providers(&self, probe: &WatchProbe) -> Vec<Arc<dyn RunConfigProvider>> {
+        vec![Arc::new(ProbeRun {
+            root: self.root.clone(),
+            java: self.java_home.join("bin/java.exe"),
+            classes: probe.classes.clone(),
+        })]
+    }
+
+    /// The configuration that starts the flow probe under the debugger, on the JDK of
+    /// the server.
+    pub fn flow_providers(&self, probe: &Probe) -> Vec<Arc<dyn RunConfigProvider>> {
+        vec![Arc::new(FlowRun {
+            program: self.debug_process_with(probe, &self.java_home),
         })]
     }
 }
@@ -1001,8 +1082,108 @@ impl RunConfigProvider for ProbeRun {
     }
 }
 
+/// One configuration that starts the flow probe under the debugger.
+struct FlowRun {
+    program: ProcessSpec,
+}
+
+impl RunConfigProvider for FlowRun {
+    fn id(&self) -> &'static str {
+        "flow"
+    }
+
+    fn discover(&self, _: &ProjectModel) -> base::Result<Vec<RunConfig>> {
+        Ok(vec![RunConfig {
+            name: "DebugProbe".into(),
+            provider: "flow".into(),
+            assemble_first: false,
+            settings: Default::default(),
+        }])
+    }
+
+    fn plan(&self, _: &RunConfig, _: &ProjectModel) -> base::Result<RunPlan> {
+        Ok(RunPlan {
+            before: None,
+            program: self.program.clone(),
+            grace: Duration::from_secs(1),
+        })
+    }
+
+    fn debug_plan(&self, _: &RunConfig, _: &ProjectModel) -> base::Result<RunPlan> {
+        Ok(RunPlan {
+            before: None,
+            program: self.program.clone(),
+            grace: Duration::from_secs(1),
+        })
+    }
+}
+
 /// The line of `int sum = a + b;`, from one.
 const BREAK_LINE: u32 = 20;
+
+/// The line of `static int counter;` in [`WATCH_PROBE`], from one.
+const WATCH_FIELD_LINE: u32 = 5;
+
+/// The line of `int stop = 1;` in [`WATCH_PROBE`], from one.
+const WATCH_BREAK_LINE: u32 = 10;
+
+/// The line of `counter = stop;` in [`WATCH_PROBE`], from one.
+const WATCH_WRITE_LINE: u32 = 11;
+
+/// The line of `holder.value = stop + 1;` in [`WATCH_PROBE`], from one.
+const WATCH_OBJECT_WRITE_LINE: u32 = 12;
+
+/// The probe of the field watchpoints: a static field, and a local object with a field of
+/// its own. The normal breakpoint stops before both writes.
+const WATCH_PROBE: &str = r#"package probe;
+
+public class DebugProbe {
+
+    static int counter;
+
+    public static void main(String[] args) {
+        System.out.println("watch-start");
+        Holder holder = new Holder();
+        int stop = 1;
+        counter = stop;
+        holder.value = stop + 1;
+        System.out.println("counter=" + counter + " value=" + holder.value);
+    }
+
+    static class Holder {
+        int value;
+    }
+}
+"#;
+
+/// The line of `int sum = add(total, 1);` in [`FLOW_PROBE`], from one.
+const FLOW_BREAK_LINE: u32 = 13;
+
+/// The probe of the whole debug session: a local `int` and an object with children, a
+/// call, and output on both sides of the breakpoint.
+const FLOW_PROBE: &str = r#"package probe;
+
+import java.util.ArrayList;
+
+public class DebugProbe {
+
+    public static void main(String[] args) {
+        System.out.println("probe-stdout");
+        int total = 0;
+        ArrayList<String> items = new ArrayList<>();
+        items.add("alpha");
+        items.add("beta");
+        int sum = add(total, 1);
+        System.out.println("total=" + total);
+        System.out.println("items=" + items.size());
+    }
+
+    static int add(int a, int b) {
+        int sum = a + b;
+        return sum;
+    }
+}
+"#;
 
 /// The line of `int total = add(1, 2);` in [`VIRTUAL_PROBE`], from one.
 const VIRTUAL_BREAK_LINE: u32 = 25;

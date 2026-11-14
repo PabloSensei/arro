@@ -47,6 +47,18 @@ impl fmt::Display for CanonPath {
     }
 }
 
+/// The form two paths that name one file share on this system: macOS ignores case, the
+/// other systems compare the spelling as it is.
+#[cfg(target_os = "macos")]
+pub fn path_key(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn path_key(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +96,23 @@ mod tests {
         let path = CanonPath::new("no-such-file.txt").unwrap();
 
         assert!(path.as_path().is_absolute());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paths_that_differ_in_case_name_one_file() {
+        assert_eq!(
+            path_key(Path::new("/home/user/README.md")),
+            path_key(Path::new("/home/user/readme.md"))
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn paths_that_differ_in_case_are_two_files() {
+        assert_ne!(
+            path_key(Path::new("/home/user/README.md")),
+            path_key(Path::new("/home/user/readme.md"))
+        );
     }
 }

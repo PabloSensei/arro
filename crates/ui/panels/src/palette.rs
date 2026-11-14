@@ -18,8 +18,9 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{
-    AI_TOOL, COMMIT_TOOL, DEBUG_TOOL, FileIcons, LOG_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL,
-    SERVICES_TOOL, STRUCTURE_TOOL, Settings, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    AI_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DEBUG_TOOL, FileIcons, HTTP_TOOL, LOG_TOOL, PROBLEMS_TOOL,
+    PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL, Settings, TERMINAL_TOOL, TODO_TOOL,
+    USAGES_TOOL, Workspace,
 };
 
 use crate::index::ProjectIndex;
@@ -216,7 +217,7 @@ const TABS: [(Tab, &str); 5] = [
 ];
 
 /// The tool windows the Switcher lists, in the order they appear there.
-const TOOLS: [(&str, &str, &str); 12] = [
+const TOOLS: [(&str, &str, &str); 14] = [
     (PROJECT_TOOL, "Project", "toolwindows/project"),
     (COMMIT_TOOL, "Commit", "toolwindows/commit"),
     (LOG_TOOL, "Git Log", "general/vcs"),
@@ -229,6 +230,8 @@ const TOOLS: [(&str, &str, &str); 12] = [
     (PROBLEMS_TOOL, "Problems", "toolwindows/problems"),
     (USAGES_TOOL, "Usages", "codeInsight/search"),
     (AI_TOOL, "AI Sessions", "own/aiSessions"),
+    (COVERAGE_TOOL, "Coverage", "run/coverage"),
+    (HTTP_TOOL, "HTTP Response", "toolwindows/services"),
 ];
 
 /// The commands of Search Everywhere that begin with `/`.

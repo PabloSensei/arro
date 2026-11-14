@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 base.workspace = true
+lang-api.workspace = true
 proc-sup.workspace = true
 project-model.workspace = true
 serde = { version = "1", features = ["derive"] }

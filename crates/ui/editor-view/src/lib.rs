@@ -48,8 +48,9 @@ pub use style::{EditorStyle, SemanticLook};
 pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
-    BookmarkEntry, DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView,
-    GutterKind, GutterMark, InlayPaint, Languages, LineDeclaration, OutlineItem, OutlineKind,
-    ProblemSummary, RowPaint, RunMark, RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate,
-    bookmarks, clipboard_history, highlight_text, install_keymap,
+    BookmarkEntry, CoverageMark, CoverageState, DetailedUsage, DocumentationQuery, EditorEvent,
+    EditorOptions, EditorView, FileBar, GutterKind, GutterMark, InlayPaint, Languages,
+    LineDeclaration, OutlineItem, OutlineKind, PlainSyntax, ProblemSummary, RowPaint, RunMark,
+    RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history,
+    highlight_text, install_keymap,
 };

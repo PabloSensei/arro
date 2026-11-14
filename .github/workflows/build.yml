@@ -1,19 +1,22 @@
-# Builds and tests Arro on the three systems the project supports. No secrets, no
-# publishing: the release archives are made by hand with `cargo xtask dist`.
+# Builds and tests Arro on Linux and macOS. No secrets, no publishing. The release
+# workflow calls it and publishes a release only when it passes, so a push of a
+# release snapshot does not run it a second time. Windows is tested on the
+# maintainer's machine (`xtask ci` in team/release.sh) before every release.
 name: build
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+# Called from the release workflow, github.workflow names the caller: a release run
+# never cancels a run started by hand or by a pull request, nor the other way round.
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,8 +27,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Windows
-            os: windows-latest
           - name: Linux
             os: ubuntu-latest
           - name: macOS
@@ -70,22 +71,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
-      # The license tests of xtask run cargo-deny on Windows.
-      - name: cargo-deny
-        if: runner.os == 'Windows'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # The Windows runner names its temporary folder in the short 8.3 form (RUNNER~1),
-      # while the paths the program reads back are long; the tests compare both.
       - name: Tests
-        env:
-          TEMP: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
         run: cargo test --workspace --no-fail-fast
 
   # A real language server and a real debug adapter that are neither the ones the

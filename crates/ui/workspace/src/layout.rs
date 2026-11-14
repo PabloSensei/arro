@@ -97,6 +97,12 @@ pub fn load_layout(store: &Store, root: &Path) -> Layout {
         .unwrap_or_default()
 }
 
+/// Whether this project was opened before: it has a saved layout, however damaged it is.
+/// A project without one opens for the first time.
+pub fn has_saved_layout(store: &Store, root: &Path) -> bool {
+    store.get(&layout_key(root)).ok().flatten().is_some()
+}
+
 pub fn save_layout(store: &Store, root: &Path, json: &str) -> Result<(), store::Error> {
     store.put(&layout_key(root), json)
 }

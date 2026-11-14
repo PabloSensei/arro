@@ -16,6 +16,19 @@ pub enum HighlightKind {
     Constant,
     Function,
     Annotation,
+    /// Bold text.
+    Strong,
+    /// Italic text.
+    Emphasis,
+    Strikethrough,
+    /// A code span inside running text.
+    InlineCode,
+    /// The text of a link.
+    Link,
+    /// The address a link points to.
+    LinkUrl,
+    /// The punctuation marks around markup.
+    Marker,
 }
 
 impl HighlightKind {
@@ -32,6 +45,14 @@ impl HighlightKind {
             "constant" => Self::Constant,
             "function" => Self::Function,
             "annotation" => Self::Annotation,
+            "markup.strong" => Self::Strong,
+            "markup.emphasis" => Self::Emphasis,
+            "markup.strikethrough" => Self::Strikethrough,
+            "markup.raw" => Self::InlineCode,
+            "markup.link" => Self::Link,
+            "markup.link.url" => Self::LinkUrl,
+            "markup.escape" => Self::Marker,
+            "punctuation.special" => Self::Marker,
             _ => return None,
         })
     }

@@ -52,6 +52,12 @@ impl fmt::Display for CanonPath {
     }
 }
 
+/// The form two paths that name one file share on this system: Windows ignores case, so
+/// `README.md` and `readme.md` of one folder give one key.
+pub fn path_key(path: &Path) -> PathBuf {
+    PathBuf::from(normal_form(&path.to_string_lossy()).to_lowercase())
+}
+
 fn normal_form(path: &str) -> String {
     let plain = match path.strip_prefix(r"\\?\UNC\") {
         Some(share) => format!(r"\\{share}"),
@@ -117,5 +123,17 @@ mod tests {
         let path = CanonPath::new("no-such-file.txt").unwrap();
 
         assert!(path.as_path().is_absolute());
+    }
+
+    #[test]
+    fn paths_that_differ_in_case_name_one_file() {
+        assert_eq!(
+            path_key(Path::new(r"c:\dir\README.md")),
+            path_key(Path::new(r"C:\DIR\readme.md"))
+        );
+        assert_eq!(
+            path_key(Path::new(r"\\?\c:\dir\a.txt")),
+            path_key(Path::new(r"c:\dir\A.TXT"))
+        );
     }
 }

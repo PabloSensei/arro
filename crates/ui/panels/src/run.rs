@@ -16,8 +16,8 @@ use project_model::{
     TaskOptions, open_project,
 };
 use runner::{
-    Console, ConsoleEvent, FindTests, RunConfig, RunConfigProvider, RunPlan, STOPPED_BY_USER, Step,
-    Stream, TestProvider, TestRequest, TestRun,
+    Console, ConsoleEvent, CoverageOwner, FindTests, RunConfig, RunConfigProvider, RunPlan,
+    STOPPED_BY_USER, Step, Stream, TestProvider, TestRequest, TestRun,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -37,6 +37,12 @@ use tests::{TestView, title_of};
 pub(crate) struct ConfigsChanged;
 
 impl EventEmitter<ConfigsChanged> for RunPanel {}
+
+/// The coverage of the last run changed, or was hidden: the stripes of the editors and
+/// the rows of the Coverage window follow it.
+pub struct CoverageChanged;
+
+impl EventEmitter<CoverageChanged> for RunPanel {}
 
 /// How a project is built and run, and what it can create. The application fills it,
 /// panels only pass it on.
@@ -180,6 +186,21 @@ pub struct RunPanel {
     console_input: ConsoleInput,
     /// The program step of the console started; a build step before it reads nothing.
     program_started: bool,
+    /// The coverage of the last run, when it has data and is not hidden.
+    coverage: Option<Arc<lang_api::CoverageReport>>,
+    /// Whether the stripes of the coverage are shown.
+    coverage_visible: bool,
+    /// A coverage run whose report comes when it ends.
+    coverage_pending: Option<PendingCoverage>,
+    /// A report of an older run that arrives after a newer one started is dropped.
+    coverage_generation: u64,
+}
+
+/// The data file of a coverage run and the provider that reads it once the run ends.
+struct PendingCoverage {
+    exec: PathBuf,
+    owner: CoverageOwner,
+    generation: u64,
 }
 
 /// A console whose main process ended, kept for the output that follows.
@@ -277,6 +298,10 @@ impl RunPanel {
                 model_reload: 0,
                 console_input: ConsoleInput::new(),
                 program_started: false,
+                coverage: None,
+                coverage_visible: false,
+                coverage_pending: None,
+                coverage_generation: 0,
             }
         })
     }
@@ -292,7 +317,27 @@ impl RunPanel {
 
     /// The toolbar widget on this panel.
     pub fn controls(panel: &Entity<Self>) -> RunControls {
-        let (state, run, debug, stop, select, build, rerun, compile, rerun_tests, background, save) = (
+        let (
+            state,
+            run,
+            debug,
+            stop,
+            select,
+            build,
+            rerun,
+            compile,
+            rerun_tests,
+            background,
+            save,
+            coverage,
+            run_tests_coverage,
+            hide_coverage,
+            toggle_coverage,
+        ) = (
+            panel.clone(),
+            panel.clone(),
+            panel.clone(),
+            panel.clone(),
             panel.clone(),
             panel.clone(),
             panel.clone(),
@@ -326,6 +371,16 @@ impl RunPanel {
                 background.update(cx, |this, cx| this.stop_background(position, cx))
             }),
             save: Rc::new(move |_, cx| save.update(cx, |this, cx| this.save_selected(cx))),
+            coverage: Rc::new(move |_, cx| coverage.update(cx, |this, cx| this.run_coverage(cx))),
+            run_tests_coverage: Rc::new(move |_, cx| {
+                run_tests_coverage.update(cx, |this, cx| this.rerun_tests_coverage(cx))
+            }),
+            hide_coverage: Rc::new(move |_, cx| {
+                hide_coverage.update(cx, |this, cx| this.hide_coverage(cx))
+            }),
+            toggle_coverage: Rc::new(move |_, cx| {
+                toggle_coverage.update(cx, |this, cx| this.toggle_coverage(cx))
+            }),
         }
     }
 
@@ -654,6 +709,14 @@ impl RunPanel {
         self.changed(cx);
     }
 
+    /// Whether the provider of this configuration makes a coverage plan.
+    pub(crate) fn supports_coverage(&self, provider_id: &str) -> bool {
+        self.providers
+            .iter()
+            .find(|provider| provider.id() == provider_id)
+            .is_some_and(|provider| provider.supports_coverage())
+    }
+
     /// A configuration that runs a task of the build tool, made by its provider. The
     /// configuration is stored at once, as the build tool window creates it, and the
     /// dialog then edits it.
@@ -837,6 +900,259 @@ impl RunPanel {
         };
         let title = config.name.clone();
         self.launch(title, cx, move || plan(&*provider, &config, &model));
+    }
+
+    /// Runs the selected configuration with the coverage agent. The old data goes at
+    /// once; the new report replaces it when the run ends.
+    pub fn run_coverage(&mut self, cx: &mut Context<Self>) {
+        if self.starting {
+            return;
+        }
+        if self.busy() {
+            self.tell("Busy", "Stop what is running first", cx);
+            return;
+        }
+        let Some(config) = self
+            .selected
+            .and_then(|index| self.configs.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let model = self.session.as_ref().and_then(ProjectSession::model);
+        let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
+            self.tell("Cannot run", "The project is still loading", cx);
+            return;
+        };
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id() == config.provider)
+            .cloned()
+        else {
+            let text = format!("Nothing runs configurations of kind {}", config.provider);
+            self.tell("Cannot run", text, cx);
+            return;
+        };
+        self.begin_coverage();
+        self.coverage_changed(cx);
+        self.waiting = false;
+        self.waiting_tests = None;
+        self.queued_tests = None;
+        self.rerun = false;
+        self.archive_console();
+        self.title = config.name.clone().into();
+        self.lines.clear();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
+        self.console_input.restart();
+        self.program_started = false;
+        self.tests.clear();
+        cx.emit(TestsChanged);
+        let owner = provider.clone();
+        let generation = self.coverage_generation;
+        let plan = cx
+            .background_executor()
+            .spawn(async move { provider.coverage_plan(&config, &model) });
+        cx.spawn(async move |this, cx| {
+            let plan = plan.await;
+            this.update(cx, |this, cx| {
+                this.starting = false;
+                match plan {
+                    Ok(coverage) => {
+                        if let Some(note) = &coverage.note {
+                            this.note(note, false);
+                        }
+                        this.coverage_pending = Some(PendingCoverage {
+                            exec: coverage.exec,
+                            owner: CoverageOwner::Configuration(owner),
+                            generation,
+                        });
+                        this.console = Some(Console::start(coverage.plan));
+                        this.console_running = true;
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        this.note(&message, true);
+                        this.tell("Cannot run with coverage", message, cx);
+                    }
+                }
+                this.changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.starting = true;
+        self.changed(cx);
+    }
+
+    /// Alt+Shift+R with coverage: the test request of the last run.
+    pub fn rerun_tests_coverage(&mut self, cx: &mut Context<Self>) {
+        match self.tests.request.clone() {
+            Some(request) => self.run_tests_coverage(request, cx),
+            None => self.tell("Run Tests with Coverage", "No tests ran yet", cx),
+        }
+    }
+
+    /// Runs the tests through the build tool with the coverage agent in their JVM.
+    pub fn run_tests_coverage(&mut self, request: TestRequest, cx: &mut Context<Self>) {
+        if self.starting {
+            return;
+        }
+        if self.busy() {
+            self.tell("Busy", "Stop what is running first", cx);
+            return;
+        }
+        let Some(provider) = self.test_provider.clone() else {
+            self.tell("Cannot run tests", "The project has no build tool", cx);
+            return;
+        };
+        let model = self.session.as_ref().and_then(ProjectSession::model);
+        let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
+            self.tell("Cannot run tests", "The project is still loading", cx);
+            return;
+        };
+        self.begin_coverage();
+        self.coverage_changed(cx);
+        self.waiting_tests = None;
+        self.queued_tests = None;
+        self.rerun = false;
+        self.archive_console();
+        self.title = title_of(&request).into();
+        self.lines.clear();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
+        self.console_input.restart();
+        self.program_started = false;
+        self.tests.begin(request.clone());
+        self.starting = true;
+        let owner = provider.clone();
+        let generation = self.coverage_generation;
+        let plan = cx.background_executor().spawn(async move {
+            TestRun::coverage_start(&*provider, &model, &request).map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let started = plan.await;
+            this.update(cx, |this, cx| {
+                this.starting = false;
+                match started {
+                    Ok(started) => {
+                        if let Some(note) = &started.note {
+                            this.note(note, false);
+                        }
+                        this.coverage_pending = Some(PendingCoverage {
+                            exec: started.exec,
+                            owner: CoverageOwner::Tests(owner),
+                            generation,
+                        });
+                        this.tests.run = Some(started.run);
+                    }
+                    Err(message) => {
+                        this.note(&message, true);
+                        this.tell("Cannot run tests with coverage", message, cx);
+                        this.tests.finished = true;
+                    }
+                }
+                cx.emit(TestsChanged);
+                this.changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.emit(TestsChanged);
+        self.changed(cx);
+    }
+
+    /// Starts over the coverage of the window: the old data is dropped before the run, as
+    /// a new run with coverage replaces it.
+    fn begin_coverage(&mut self) {
+        self.coverage_generation = self.coverage_generation.wrapping_add(1);
+        self.coverage = None;
+        self.coverage_visible = true;
+        self.coverage_pending = None;
+    }
+
+    /// The data of the run that just ended, read in the background.
+    fn finish_coverage(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.coverage_pending.take() else {
+            return;
+        };
+        let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
+            return;
+        };
+        let PendingCoverage {
+            exec,
+            owner,
+            generation,
+        } = pending;
+        let report = cx
+            .background_executor()
+            .spawn(async move { owner.report(&exec, &model) });
+        cx.spawn(async move |this, cx| {
+            let report = report.await;
+            this.update(cx, |this, cx| {
+                if this.coverage_generation != generation {
+                    return;
+                }
+                match report {
+                    Ok(report) => {
+                        this.coverage = Some(Arc::new(report));
+                        this.coverage_visible = true;
+                        this.coverage_changed(cx);
+                    }
+                    Err(error) => {
+                        this.note(&format!("No coverage data: {error}"), true);
+                        this.changed(cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Hides the coverage stripes, clears the window and stops waiting for a report.
+    pub fn hide_coverage(&mut self, cx: &mut Context<Self>) {
+        self.coverage_generation = self.coverage_generation.wrapping_add(1);
+        self.coverage = None;
+        self.coverage_visible = false;
+        self.coverage_pending = None;
+        self.coverage_changed(cx);
+    }
+
+    /// Ctrl+Alt+F6: the stripes go and come back without closing the window.
+    pub fn toggle_coverage(&mut self, cx: &mut Context<Self>) {
+        if self.coverage.is_none() {
+            return;
+        }
+        self.coverage_visible = !self.coverage_visible;
+        self.coverage_changed(cx);
+    }
+
+    /// The report of the last run, when its stripes are shown.
+    pub fn coverage(&self) -> Option<Arc<lang_api::CoverageReport>> {
+        self.coverage.clone().filter(|_| self.coverage_visible)
+    }
+
+    pub fn coverage_visible(&self) -> bool {
+        self.coverage_visible
+    }
+
+    /// The percentage of the covered lines of a file, for the project tree.
+    pub fn coverage_percent(&self, path: &StdPath) -> Option<u32> {
+        let report = self.coverage()?;
+        report.file(path)?.line_counters().percent()
+    }
+
+    fn coverage_changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(CoverageChanged);
+        let project = cx
+            .try_global::<crate::project::ActiveProjectPanel>()
+            .map(|project| project.0.clone());
+        if let Some(project) = project {
+            project.update(cx, |_, cx| cx.notify());
+        }
+        self.changed(cx);
     }
 
     /// Runs a task of the root project of the build tool, `package` for one. The console
@@ -1731,6 +2047,15 @@ impl RunPanel {
         #[cfg(test)]
         let tests_ran = self.tests.run.is_some();
         changed |= self.poll_tests(cx);
+        let coverage_started =
+            exited.is_some() || (self.console.is_none() && !self.console_running);
+        if self.coverage_pending.is_some()
+            && coverage_started
+            && !self.starting
+            && self.tests.run.is_none()
+        {
+            self.finish_coverage(cx);
+        }
         // A test that waits for a process waits for this, not for a clock: the console is
         // closed, so every line of the program is in, and a test run is over only when
         // its result stream is.
@@ -2122,6 +2447,28 @@ pub(crate) fn info(text: impl Into<String>) -> Line {
 }
 
 pub(crate) fn line_element(line: &Line, theme: &Theme) -> AnyElement {
+    let text = highlighted(line, theme);
+    div()
+        .h(px(CODE_LINE_HEIGHT))
+        .px(px(LINE_PAD))
+        .whitespace_nowrap()
+        .child(text)
+        .into_any_element()
+}
+
+/// A line of a console that wraps at the width of its column: what the reader turns on
+/// for long lines. The height follows the number of the wrapped parts.
+pub(crate) fn wrapped_line_element(line: &Line, theme: &Theme) -> AnyElement {
+    div()
+        .min_h(px(CODE_LINE_HEIGHT))
+        .px(px(LINE_PAD))
+        .whitespace_normal()
+        .child(highlighted(line, theme))
+        .into_any_element()
+}
+
+/// The text of a line in the colours of the console, with no layout of its own.
+fn highlighted(line: &Line, theme: &Theme) -> StyledText {
     let (palette, error) = if theme.dark {
         (&ANSI_DARK, ERROR_DARK)
     } else {
@@ -2141,13 +2488,7 @@ pub(crate) fn line_element(line: &Line, theme: &Theme) -> AnyElement {
         };
         (range.clone(), highlight)
     });
-    let text = StyledText::new(line.text.clone()).with_highlights(highlights);
-    div()
-        .h(px(CODE_LINE_HEIGHT))
-        .px(px(LINE_PAD))
-        .whitespace_nowrap()
-        .child(text)
-        .into_any_element()
+    StyledText::new(line.text.clone()).with_highlights(highlights)
 }
 
 /// One console tab: the current run or an earlier one that still writes.

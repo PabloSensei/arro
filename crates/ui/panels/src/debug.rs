@@ -78,13 +78,21 @@ debug_keys![
 
 const POLL: Duration = Duration::from_millis(50);
 const GROUP: &str = "bottom-panel";
+/// The width of the frames column at rest and the default part of the panel.
 const TREE_WIDTH: f32 = 460.;
+/// The least the frames column can become when the divider moves.
+const MIN_TREE_WIDTH: f32 = 160.;
+/// The least the variables column keeps when the divider moves.
+const MIN_SIDE_WIDTH: f32 = 240.;
+/// The width of the divider between the two columns of the debugger.
+const SPLITTER_WIDTH: f32 = SPACE_S;
+/// How many pixels of the watch list stay visible before it scrolls.
+const WATCH_HEIGHT: f32 = 120.;
+/// The marks of the virtual thread page in `expanded`. Variable references are
+/// positive, so these keys never collide.
+const VIRTUAL_PAGE_BASE: i64 = -10;
 const MAX_CONSOLE: usize = 2_000;
 const EVENTS: usize = 2_000;
-/// The marks of the virtual group in `expanded`: the group is open or it is not, and
-/// the shown page. Variable references are positive, so these keys never collide.
-const VIRTUAL_GROUP: i64 = -1;
-const VIRTUAL_PAGE_BASE: i64 = -10;
 
 /// The panel of the window, for other panels and scripts.
 pub struct ActiveDebug(pub Entity<DebugPanel>);
@@ -146,6 +154,12 @@ struct BreakpointSetting {
     /// A breakpoint that stops the program when it is reached.
     #[serde(default = "enabled")]
     suspend: bool,
+    /// Whether the console says where the program reached the breakpoint.
+    #[serde(default)]
+    hit_message: bool,
+    /// An expression whose value the console shows on every hit.
+    #[serde(default)]
+    log_expression: Option<String>,
     /// A breakpoint that goes away at the first stop.
     #[serde(default)]
     temporary: bool,
@@ -171,17 +185,54 @@ impl BreakpointSetting {
             hit_condition: None,
             enabled: true,
             suspend: true,
+            hit_message: false,
+            log_expression: None,
             temporary: false,
         }
     }
 
+    /// The message the adapter prints instead of stopping the program. A point that
+    /// suspends the program has none: the window prints its message at the stop, and the
+    /// program stays where it is. A non-suspending point without a message prints
+    /// nothing, so it is not sent to the adapter at all.
+    fn log_message(&self) -> Option<String> {
+        if self.suspend {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.hit_message {
+            parts.push(self.reached_text());
+        }
+        if let Some(expression) = self
+            .log_expression
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            parts.push(format!("{{{expression}}}"));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
+    /// The place of the point in the text of the IDEA message. The adapter knows the
+    /// file at the time the breakpoint is set, not the method that will reach it.
+    fn reached_text(&self) -> String {
+        let name = self
+            .file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!("Breakpoint reached at {name}:{}", self.line)
+    }
+
     fn spec(&self) -> BreakpointSpec {
+        let log_message = self.log_message();
         BreakpointSpec {
             file: self.file.clone(),
             line: self.line,
             condition: self.condition.clone(),
             hit_condition: self.hit_condition.clone(),
-            enabled: self.enabled && self.suspend,
+            enabled: self.enabled && (self.suspend || log_message.is_some()),
+            log_message,
         }
     }
 }
@@ -340,6 +391,35 @@ struct PendingLaunch {
     entry: Option<PathBuf>,
 }
 
+/// The tab of the panel that is in front.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Front {
+    #[default]
+    Debugger,
+    Console,
+}
+
+/// The last launch of the panel, so that Rerun starts the same program again.
+#[derive(Clone)]
+struct Restart {
+    service: Arc<dyn DebugService>,
+    before: Option<proc_sup::ProcessSpec>,
+    program: proc_sup::ProcessSpec,
+    grace: Duration,
+    name: String,
+    entry: Option<PathBuf>,
+}
+
+impl Restart {
+    fn plan(&self) -> RunPlan {
+        RunPlan {
+            before: self.before.clone(),
+            program: self.program.clone(),
+            grace: self.grace,
+        }
+    }
+}
+
 /// A variable the user picked in the tree, with the group or object that holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VariableTarget {
@@ -417,6 +497,14 @@ pub struct DebugPanel {
     /// The process of the build step whose output comes now.
     build_process: Option<u32>,
     pending: Option<PendingLaunch>,
+    /// The launch of the last session, for Rerun.
+    restart: Option<Restart>,
+    /// Which tab is in front, the debugger trees or the console.
+    front: Front,
+    /// The width of the frames column, changed by the divider.
+    tree_width: f32,
+    /// Where the pointer was when the divider drag started.
+    split_from: Option<f32>,
     /// Held while a program this window launched is under the debugger; dropping it
     /// lets the language turn compilation on save back on.
     session: Option<Box<dyn DebugSessionToken>>,
@@ -425,6 +513,8 @@ pub struct DebugPanel {
     title: SharedString,
     scroll_tree: ScrollHandle,
     scroll_side: ScrollHandle,
+    scroll_variables: ScrollHandle,
+    scroll_watch: ScrollHandle,
 }
 
 impl EventEmitter<BreakpointsChanged> for DebugPanel {}
@@ -474,12 +564,18 @@ impl DebugPanel {
             build_output: OutputBuffers::default(),
             build_process: None,
             pending: None,
+            restart: None,
+            front: Front::Debugger,
+            tree_width: TREE_WIDTH,
+            split_from: None,
             session: None,
             store,
             root,
             title: "Debug".into(),
             scroll_tree: ScrollHandle::new(),
             scroll_side: ScrollHandle::new(),
+            scroll_variables: ScrollHandle::new(),
+            scroll_watch: ScrollHandle::new(),
         });
         let polling = panel.downgrade();
         cx.spawn(async move |cx| {
@@ -517,6 +613,23 @@ impl DebugPanel {
         self.watch.clone()
     }
 
+    /// The lines of the debug console, for tests.
+    #[cfg(test)]
+    pub(crate) fn console_lines(&self) -> Vec<String> {
+        self.local_console
+            .iter()
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
+    /// Shows the Debugger tab, for a test whose program takes input and brings the
+    /// console to the front.
+    #[cfg(test)]
+    pub(crate) fn show_debugger_front(&mut self, cx: &mut Context<Self>) {
+        self.front = Front::Debugger;
+        cx.notify();
+    }
+
     /// Selects a variable row the way a click does, for tests that cannot reach a row
     /// scrolled out of the window.
     #[cfg(test)]
@@ -535,10 +648,6 @@ impl DebugPanel {
         });
     }
 
-    fn virtual_open(&self) -> bool {
-        self.expanded.contains(&VIRTUAL_GROUP)
-    }
-
     fn virtual_page(&self) -> usize {
         self.expanded
             .iter()
@@ -546,15 +655,6 @@ impl DebugPanel {
             .map(|key| (VIRTUAL_PAGE_BASE - *key) as usize)
             .max()
             .unwrap_or(0)
-    }
-
-    fn toggle_virtual_group(&mut self, cx: &mut Context<Self>) {
-        if self.expanded.contains(&VIRTUAL_GROUP) {
-            self.expanded.remove(&VIRTUAL_GROUP);
-        } else {
-            self.expanded.insert(VIRTUAL_GROUP);
-        }
-        cx.notify();
     }
 
     fn set_virtual_page(&mut self, page: usize, cx: &mut Context<Self>) {
@@ -597,6 +697,14 @@ impl DebugPanel {
         entry: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        self.restart = Some(Restart {
+            service: service.clone(),
+            before: plan.before.clone(),
+            program: plan.program.clone(),
+            grace: plan.grace,
+            name: name.clone(),
+            entry: entry.clone(),
+        });
         self.reset_session();
         self.session = service.begin_session();
         if let Some(hub) = cx.try_global::<ActiveDebugHub>() {
@@ -709,6 +817,7 @@ impl DebugPanel {
         self.build_process = None;
         self.pending = None;
         self.session = None;
+        self.front = Front::Debugger;
     }
 
     fn launch_pending(&mut self, cx: &mut Context<Self>) {
@@ -780,6 +889,30 @@ impl DebugPanel {
         self.setting(file, line).map(|setting| setting.temporary)
     }
 
+    /// Whether the console says where the breakpoint was reached, for tests.
+    pub fn breakpoint_hit_message(&self, file: &Path, line: u32) -> Option<bool> {
+        self.setting(file, line).map(|setting| setting.hit_message)
+    }
+
+    /// The expression a breakpoint logs on every hit, for scripts and tests.
+    pub fn breakpoint_log_expression(&self, file: &Path, line: u32) -> Option<&str> {
+        self.setting(file, line)
+            .and_then(|setting| setting.log_expression.as_deref())
+    }
+
+    /// The lines of the breakpoints that do not stop the program, for the gutter.
+    pub fn non_suspending_breakpoint_lines(&self, file: &Path) -> Vec<u32> {
+        let mut lines: Vec<u32> = self
+            .breakpoints
+            .iter()
+            .filter(|breakpoint| breakpoint.file == file && !breakpoint.suspend)
+            .map(|breakpoint| breakpoint.line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
     /// The condition of a breakpoint, for scripts and tests.
     pub fn condition(&self, file: &Path, line: u32) -> Option<&str> {
         self.breakpoints
@@ -847,6 +980,39 @@ impl DebugPanel {
         self.breakpoints
             .retain(|breakpoint| breakpoint.file != file || breakpoint.line != line);
         self.send(Command::RemoveBreakpoint { file, line }, cx);
+        self.changed(cx);
+    }
+
+    /// Shift+click on the gutter: a breakpoint that does not stop the program and says
+    /// where it was reached, as IDEA has it.
+    pub fn toggle_non_suspending_breakpoint(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if line == 0 {
+            return;
+        }
+        let found = self
+            .breakpoints
+            .iter()
+            .position(|breakpoint| breakpoint.file == file && breakpoint.line == line);
+        match found {
+            Some(index) => {
+                self.breakpoints.remove(index);
+                self.send(Command::RemoveBreakpoint { file, line }, cx);
+            }
+            None => {
+                let mut setting = BreakpointSetting::new(file, line);
+                setting.suspend = false;
+                setting.hit_message = true;
+                self.send(Command::SetBreakpoint(setting.spec()), cx);
+                self.breakpoints.push(setting);
+            }
+        }
+        self.breakpoints
+            .sort_by(|left, right| (&left.file, left.line).cmp(&(&right.file, right.line)));
         self.changed(cx);
     }
 
@@ -1239,6 +1405,38 @@ impl DebugPanel {
         }
     }
 
+    pub(crate) fn set_hit_message(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(setting) = self.find(file, line) {
+            setting.hit_message = on;
+            let spec = setting.spec();
+            self.send(Command::SetBreakpoint(spec), cx);
+            self.changed(cx);
+        }
+    }
+
+    /// The expression of Evaluate and log. An empty text turns it off.
+    pub(crate) fn set_log_expression(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.trim().to_owned();
+        if let Some(setting) = self.find(file, line) {
+            setting.log_expression = (!text.is_empty()).then_some(text);
+            let spec = setting.spec();
+            self.send(Command::SetBreakpoint(spec), cx);
+            self.changed(cx);
+        }
+    }
+
     fn find(&mut self, file: PathBuf, line: u32) -> Option<&mut BreakpointSetting> {
         self.breakpoints
             .iter_mut()
@@ -1366,6 +1564,10 @@ impl DebugPanel {
         // thousand threads here would be the work the grouping avoids.
         self.snapshot = (*snapshot).clone();
         self.merge_console();
+        // A program that reads its input needs the line of the console at hand.
+        if self.takes_input() && self.front != Front::Console {
+            self.front = Front::Console;
+        }
         if matches!(self.snapshot.state, DebugState::Terminated) {
             self.session = None;
         }
@@ -1375,6 +1577,9 @@ impl DebugPanel {
             && self.snapshot.stops != self.seen_stops
         {
             self.seen_stops = self.snapshot.stops;
+            if self.log_stop(cx) {
+                self.send(Command::Continue, cx);
+            }
             self.finish_temporary(cx);
             self.finish_temporary_breakpoints(cx);
             self.finish_forced_step(cx);
@@ -1555,7 +1760,7 @@ impl DebugPanel {
     }
 
     /// Send EOF: the program sees the end of its input, and nothing more is typed.
-    fn send_eof(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn send_eof(&mut self, cx: &mut Context<Self>) {
         if !self.takes_input() {
             return;
         }
@@ -1638,6 +1843,23 @@ impl DebugPanel {
 
     pub fn resume(&mut self, _cx: &mut Context<Self>) {
         self.send(Command::Continue, _cx);
+    }
+
+    pub fn pause(&mut self, cx: &mut Context<Self>) {
+        self.send(Command::Pause, cx);
+    }
+
+    /// Ctrl+F5: the last launch starts again, in place of the running session.
+    pub fn rerun(&mut self, cx: &mut Context<Self>) {
+        let Some(restart) = self.restart.clone() else {
+            return;
+        };
+        if self.debugger.is_some() {
+            self.send(Command::Disconnect, cx);
+        }
+        let plan = restart.plan();
+        let (name, entry) = (restart.name.clone(), restart.entry.clone());
+        self.start_plan(restart.service, plan, name, entry, cx);
     }
 
     pub fn step_over(&mut self, _cx: &mut Context<Self>) {
@@ -1737,6 +1959,7 @@ impl DebugPanel {
             line,
             condition: None,
             hit_condition: None,
+            log_message: None,
             enabled: true,
         };
         self.send(Command::SetBreakpoint(spec), cx);
@@ -1772,6 +1995,49 @@ impl DebugPanel {
                 self.send(Command::SetBreakpoint(spec), cx);
             }
         }
+    }
+
+    /// Writes what a breakpoint that does not stop the program says, and evaluates its
+    /// expression. A message of a breakpoint that suspends the program is written here
+    /// too. Returns true when the program has to continue: the adapter stopped on a
+    /// point whose `logMessage` it did not read.
+    fn log_stop(&mut self, cx: &mut Context<Self>) -> bool {
+        // Only a breakpoint of the adapter says anything: a step or a pause lands on a
+        // line for reasons of its own.
+        let DebugState::Stopped { reason } = &self.snapshot.state else {
+            return false;
+        };
+        if !matches!(reason.as_str(), "breakpoint" | "data breakpoint") {
+            return false;
+        }
+        let Some(frame) = self
+            .snapshot
+            .frames
+            .iter()
+            .find(|frame| frame.source.is_some() && frame.line > 0)
+        else {
+            return false;
+        };
+        let (Some(file), line, name) = (frame.source.clone(), frame.line, frame.name.clone())
+        else {
+            return false;
+        };
+        let Some(setting) = self.setting(&file, line).cloned() else {
+            return false;
+        };
+        if setting.hit_message {
+            let file_name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let text = format!("Breakpoint reached at {name}({file_name}:{line})");
+            self.local_console.push(ConsoleLine::new(text, false));
+            self.trim_console();
+        }
+        if let Some(expression) = setting.log_expression.clone() {
+            self.send(Command::EvaluateLog(expression), cx);
+        }
+        !setting.suspend
     }
 
     /// A temporary breakpoint of Ctrl+Alt+Shift+F8 stops the program once and goes away.
@@ -2112,7 +2378,7 @@ impl DebugPanel {
             .ok();
     }
 
-    fn ask_hit_condition(
+    fn ask_log_expression(
         &mut self,
         file: PathBuf,
         line: u32,
@@ -2121,26 +2387,19 @@ impl DebugPanel {
     ) {
         let current = self
             .setting(&file, line)
-            .and_then(|setting| setting.hit_condition.clone())
+            .and_then(|setting| setting.log_expression.clone())
             .unwrap_or_default();
         let panel = cx.weak_entity();
         let submit = move |text: String, cx: &mut App| {
             panel
                 .update(cx, |panel, cx| {
-                    panel.set_hit_condition(file.clone(), line, text, cx)
+                    panel.set_log_expression(file.clone(), line, text, cx)
                 })
                 .ok();
         };
         self.workspace
             .update(cx, |workspace, cx| {
-                Prompt::show_with(
-                    "Breakpoint Hit Count",
-                    &current,
-                    submit,
-                    workspace,
-                    window,
-                    cx,
-                )
+                Prompt::show_with("Evaluate and log", &current, submit, workspace, window, cx)
             })
             .ok();
     }
@@ -2278,98 +2537,281 @@ impl DebugPanel {
             .ok();
     }
 
-    fn render_tree(
+    /// The state of the session for the right end of the toolbar. Nothing before the
+    /// first session: the empty body says it in place.
+    fn state_text(&self) -> Option<&str> {
+        match &self.snapshot.state {
+            DebugState::Inactive => None,
+            DebugState::Starting => Some("Starting"),
+            DebugState::Running => Some("Running"),
+            DebugState::Stopped { reason } => Some(reason.as_str()),
+            DebugState::Terminated => Some("Finished"),
+        }
+    }
+
+    /// The Debugger tab: the threads and frames on the left, the variables and watches
+    /// on the right, a divider between them.
+    fn render_debugger(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = if self.state().0 {
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .h_full()
+                .child(self.render_frames(theme, window, cx))
+                .child(self.splitter(theme, cx))
+                .child(self.render_variables(theme, window, cx))
+                .into_any_element()
+        } else if matches!(self.snapshot.state, DebugState::Terminated) {
+            empty_pane("debug-empty", "Finished", theme)
+        } else {
+            empty_pane("debug-empty", "Not started", theme)
+        };
+        div()
+            .debug_selector(|| "debug-body".to_owned())
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The thread of the stack: its name at the top of the frames, a click lists the
+    /// threads and selects one.
+    fn thread_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .snapshot
+            .current_thread
+            .and_then(|id| self.snapshot.threads.iter().find(|thread| thread.id == id))
+            .or_else(|| self.snapshot.threads.first());
+        let Some(thread) = current else {
+            return empty_line("debug-empty-threads", "No threads", theme);
+        };
+        let id = thread.id;
+        let label = format!("{}  #{}", thread.name, thread.id);
+        let hover = theme.hover;
+        div()
+            .id("debug-thread-picker")
+            .debug_selector(move || format!("thread-{id}"))
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .px(px(ROW_PADDING_X))
+            .cursor_pointer()
+            .text_size(px(CODE_SIZE))
+            .text_color(theme.text)
+            .hover(move |style| style.bg(hover))
+            .child(icon_sized("general/chevronDown", TEXT_SMALL, theme))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.show_threads(event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The list of threads under the picker. Only the current page of the virtual
+    /// threads is listed, so ten thousand of them do not become ten thousand rows.
+    fn show_threads(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let page = self.virtual_page();
+        let list =
+            dap_client::thread_list(&self.snapshot.threads, self.snapshot.current_thread, page);
+        let panel = cx.weak_entity();
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        if let Some(thread) = &list.stopped {
+            entries.push(thread_entry(panel.clone(), thread));
+        }
+        for thread in &list.platform {
+            entries.push(thread_entry(panel.clone(), thread));
+        }
+        for thread in &list.virtual_threads.threads {
+            entries.push(thread_entry(panel.clone(), thread));
+        }
+        if page > 0 {
+            let previous = panel.clone();
+            entries.push(MenuEntry::new("Previous virtual threads", move |_, cx| {
+                previous
+                    .update(cx, |panel, cx| panel.set_virtual_page(page - 1, cx))
+                    .ok();
+            }));
+        }
+        if page + 1 < list.virtual_threads.pages {
+            let next = panel;
+            entries.push(MenuEntry::new("Next virtual threads", move |_, cx| {
+                next.update(cx, |panel, cx| panel.set_virtual_page(page + 1, cx))
+                    .ok();
+            }));
+        }
+        if entries.is_empty() {
+            entries.push(MenuEntry::disabled("No threads"));
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
+    }
+
+    /// The left column of the Debugger tab: the thread picker and the frames.
+    fn render_frames(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let frames = self.snapshot.frames.clone();
+        let selected_frame = self.snapshot.selected_frame;
+        let body = if frames.is_empty() {
+            empty_pane("debug-empty-frames", "No frames", theme)
+        } else {
+            let rows = frames
+                .iter()
+                .map(|frame| {
+                    let selected = selected_frame == Some(frame.id);
+                    let frame = frame.clone();
+                    let frame_id = frame.id;
+                    let menu_frame = frame.clone();
+                    let where_ = frame
+                        .source
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let text = if frame.line == 0 {
+                        format!("{}  {}", frame.name, where_)
+                    } else {
+                        format!("{}  {}:{}", frame.name, where_, frame.line)
+                    };
+                    row(format!("frame-{}", frame.id), &text, selected, theme)
+                        .debug_selector(move || format!("frame-{frame_id}"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.send(Command::SelectFrame(frame.id), cx);
+                            this.open_frame(&frame, window, cx);
+                            cx.notify();
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.frame_menu(menu_frame.clone(), event.position, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<AnyElement>>();
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(section("Frames", theme))
+                .child(
+                    scrollable(
+                        "debug-tree",
+                        &self.scroll_tree,
+                        div()
+                            .id("debug-tree")
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_tree)
+                            .children(rows),
+                        theme,
+                        window,
+                        cx,
+                    )
+                    .flex_1()
+                    .min_h_0(),
+                )
+                .into_any_element()
+        };
+        div()
+            .debug_selector(|| "debug-frames".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(self.tree_width))
+            .h_full()
+            .min_h_0()
+            .child(self.thread_picker(theme, cx))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The right column of the Debugger tab: the scopes and the watch list.
+    fn render_variables(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scopes = self.snapshot.scopes.clone();
+        let body = if scopes.is_empty() {
+            empty_pane("debug-empty-variables", "No variables", theme)
+        } else {
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for scope in &scopes {
+                self.push_scope(scope, theme, 0, &mut rows, cx);
+            }
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(section("Variables", theme))
+                .child(
+                    scrollable(
+                        "debug-variables-list",
+                        &self.scroll_variables,
+                        div()
+                            .id("debug-variables-list")
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_variables)
+                            .children(rows),
+                        theme,
+                        window,
+                        cx,
+                    )
+                    .flex_1()
+                    .min_h_0(),
+                )
+                .into_any_element()
+        };
+        let watch = self.render_watch(theme, window, cx);
+        div()
+            .debug_selector(|| "debug-variables".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(body)
+            .child(watch)
+            .into_any_element()
+    }
+
+    /// The watch list under the variables, with the button that adds an expression.
+    fn render_watch(
         &mut self,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut rows: Vec<AnyElement> = Vec::new();
-        rows.push(section("Threads", theme));
-        let threads = dap_client::thread_list(
-            &self.snapshot.threads,
-            self.snapshot.current_thread,
-            self.virtual_page(),
-        );
-        if let Some(thread) = &threads.stopped {
-            rows.push(self.thread_row(thread, true, theme, cx));
-        }
-        if !threads.platform.is_empty() {
-            rows.push(
-                list_header(
-                    "threads-platform",
-                    &format!("Platform threads ({})", threads.platform.len()),
-                    theme,
-                )
-                .into_any_element(),
-            );
-            for thread in &threads.platform {
-                rows.push(self.thread_row(thread, false, theme, cx));
-            }
-        }
-        if threads.virtual_threads.total > 0 {
-            let open = self.virtual_open();
-            let label = format!(
-                "{} {}",
-                if open { "▾" } else { "▸" },
-                threads.virtual_threads.label()
-            );
-            rows.push(
-                list_header("threads-virtual", &label, theme)
-                    .cursor_pointer()
-                    .debug_selector(|| "threads-virtual".to_owned())
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_virtual_group(cx)))
-                    .into_any_element(),
-            );
-            if open {
-                for thread in &threads.virtual_threads.threads {
-                    rows.push(self.thread_row(thread, false, theme, cx));
-                }
-                if threads.virtual_threads.has_pages() {
-                    rows.push(self.virtual_pager(&threads.virtual_threads, theme, cx));
-                }
-            }
-        }
-        rows.push(section("Frames", theme));
-        for frame in &self.snapshot.frames {
-            let selected = self.snapshot.selected_frame == Some(frame.id);
-            let frame = frame.clone();
-            let frame_id = frame.id;
-            let menu_frame = frame.clone();
-            let where_ = frame
-                .source
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let text = if frame.line == 0 {
-                format!("{}  {}", frame.name, where_)
-            } else {
-                format!("{}  {}:{}", frame.name, where_, frame.line)
-            };
-            rows.push(
-                row(format!("frame-{}", frame.id), &text, selected, theme)
-                    .debug_selector(move || format!("frame-{frame_id}"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.send(Command::SelectFrame(frame.id), cx);
-                        this.open_frame(&frame, window, cx);
-                        cx.notify();
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.frame_menu(menu_frame.clone(), event.position, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .into_any_element(),
-            );
-        }
-        rows.push(section("Variables", theme));
-        for scope in &self.snapshot.scopes {
-            self.push_scope(scope, theme, 0, &mut rows, cx);
-        }
-        rows.push(section("Watch", theme));
         for watch in &self.snapshot.watch {
             let text = match &watch.error {
                 Some(error) => format!("{} = <{error}>", watch.expression),
@@ -2388,8 +2830,30 @@ impl DebugPanel {
                     .into_any_element(),
             );
         }
+        let mut list = div().flex().flex_col().flex_none().min_h_0();
+        if rows.is_empty() {
+            list = list.child(empty_line("debug-empty-watch", "No watches", theme));
+        } else {
+            list = list.child(
+                scrollable(
+                    "debug-watch-list",
+                    &self.scroll_watch,
+                    div()
+                        .id("debug-watch-list")
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_watch)
+                        .children(rows),
+                    theme,
+                    window,
+                    cx,
+                )
+                .max_h(px(WATCH_HEIGHT)),
+            );
+        }
         if let Some(field) = &self.watch_input {
-            rows.push(
+            list = list.child(
                 div()
                     .id("watch-input")
                     .debug_selector(|| "watch-input".to_owned())
@@ -2408,28 +2872,168 @@ impl DebugPanel {
                         theme.caret,
                         CODE_SIZE,
                         true,
-                    ))
+                    )),
+            );
+        }
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .pl(px(SPACE_M))
+            .pr(px(SPACE_S))
+            .child(
+                div()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child("Watch"),
+            )
+            .child(
+                icon_button("debug-watch", "general/add", "Add Watch", None, theme)
+                    .debug_selector(|| "debug-watch".to_owned())
+                    .size(px(20.))
+                    .on_click(cx.listener(|this, _, window, cx| this.ask_watch(window, cx))),
+            );
+        div()
+            .debug_selector(|| "debug-watch-part".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .min_h_0()
+            .child(header)
+            .child(list)
+            .into_any_element()
+    }
+
+    /// The Console tab: the output of the build and of the program, and the line the
+    /// program reads while it waits for input.
+    fn render_console(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut console_rows: Vec<AnyElement> = Vec::new();
+        for line in &self.local_console {
+            let color = if line.error {
+                theme.warning_mark
+            } else {
+                theme.code
+            };
+            console_rows.push(
+                div()
+                    .px(px(SPACE_M))
+                    .py(px(SPACE_XS))
+                    .font_family(MONO_FONT)
+                    .text_size(px(CODE_SIZE))
+                    .text_color(color)
+                    .child(line.text.clone())
                     .into_any_element(),
             );
         }
-        scrollable(
-            "debug-tree",
-            &self.scroll_tree,
+        if console_rows.is_empty() {
+            console_rows.push(empty_line("debug-empty-console", "No output", theme));
+        }
+        let console = div()
+            .id("debug-console")
+            .debug_selector(|| "debug-console".to_owned())
+            .flex()
+            .flex_col()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.console_menu(event.position, cx)
+                }),
+            )
+            .children(console_rows);
+        let scrolled = scrollable(
+            "debug-console-scroll",
+            &self.scroll_side,
             div()
-                .id("debug-tree")
+                .id("debug-console-scroll")
                 .flex()
                 .flex_col()
                 .overflow_y_scroll()
-                .track_scroll(&self.scroll_tree)
-                .children(rows),
+                .track_scroll(&self.scroll_side)
+                .child(console),
             theme,
             window,
             cx,
         )
-        .w(px(TREE_WIDTH))
-        .flex_none()
-        .h_full()
-        .into_any_element()
+        .flex_1()
+        .min_h_0();
+        // The line the user types stays at the bottom of the console, so it is at hand
+        // however far the output above has scrolled.
+        let mut body = div()
+            .debug_selector(|| "debug-console-body".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(scrolled);
+        if self.takes_input() {
+            body = body.child(
+                div()
+                    .id("debug-console-input-row")
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.console_menu(event.position, cx)
+                        }),
+                    )
+                    .child(self.console_input.element("debug-console-input", theme)),
+            );
+        }
+        body.into_any_element()
+    }
+
+    /// The divider between the frames and the variables: dragging it changes the width
+    /// of the frames column.
+    fn splitter(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let hover = theme.hover;
+        div()
+            .id("debug-splitter")
+            .debug_selector(|| "debug-splitter".to_owned())
+            .flex_none()
+            .w(px(SPLITTER_WIDTH))
+            .h_full()
+            .bg(theme.border)
+            .cursor_col_resize()
+            .hover(move |style| style.bg(hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.split_from = Some(f32::from(event.position.x));
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                let Some(from) = this.split_from else {
+                    return;
+                };
+                let now = f32::from(event.position.x);
+                let max = (f32::from(window.viewport_size().width) - MIN_SIDE_WIDTH - 2. * SPACE_M)
+                    .max(MIN_TREE_WIDTH);
+                this.tree_width = (this.tree_width + now - from).clamp(MIN_TREE_WIDTH, max);
+                this.split_from = Some(now);
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.split_from = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.split_from = None;
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
     }
 
     fn push_scope(
@@ -2581,290 +3185,6 @@ impl DebugPanel {
         for child in children {
             self.push_variable(child, reference, theme, depth + 1, rows, cx);
         }
-    }
-
-    fn thread_row(
-        &self,
-        thread: &Thread,
-        selected: bool,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = thread.id;
-        row(
-            format!("thread-{id}"),
-            &format!("{}  #{}", thread.name, thread.id),
-            selected,
-            theme,
-        )
-        .debug_selector(move || format!("thread-{id}"))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.send(Command::SelectThread(id), cx);
-            cx.notify();
-        }))
-        .into_any_element()
-    }
-
-    fn virtual_pager(
-        &self,
-        threads: &dap_client::VirtualThreads,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let page = threads.page;
-        let pages = threads.pages;
-        let mut pager = div()
-            .id("threads-virtual-pager")
-            .debug_selector(|| "threads-virtual-pager".to_owned())
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .px(px(24.))
-            .py(px(2.))
-            .text_size(px(TEXT_SMALL))
-            .text_color(theme.text_secondary)
-            .child(format!("page {}/{}", page + 1, pages));
-        if page > 0 {
-            pager = pager.child(
-                div()
-                    .id("threads-virtual-prev")
-                    .debug_selector(|| "threads-virtual-prev".to_owned())
-                    .cursor_pointer()
-                    .child("‹ previous")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_virtual_page(page - 1, cx);
-                    })),
-            );
-        }
-        if page + 1 < pages {
-            pager = pager.child(
-                div()
-                    .id("threads-virtual-next")
-                    .debug_selector(|| "threads-virtual-next".to_owned())
-                    .cursor_pointer()
-                    .child("next ›")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_virtual_page(page + 1, cx);
-                    })),
-            );
-        }
-        pager.into_any_element()
-    }
-
-    fn render_side(
-        &mut self,
-        theme: &Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        rows.push(section("Console", theme));
-        let mut console_rows: Vec<AnyElement> = Vec::new();
-        for line in &self.local_console {
-            let color = if line.error {
-                theme.warning_mark
-            } else {
-                theme.code
-            };
-            console_rows.push(
-                div()
-                    .px(px(SPACE_M))
-                    .py(px(SPACE_XS))
-                    .font_family(MONO_FONT)
-                    .text_size(px(CODE_SIZE))
-                    .text_color(color)
-                    .child(line.text.clone())
-                    .into_any_element(),
-            );
-        }
-        rows.push(
-            div()
-                .id("debug-console")
-                .debug_selector(|| "debug-console".to_owned())
-                .flex()
-                .flex_col()
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.console_menu(event.position, cx)
-                    }),
-                )
-                .children(console_rows)
-                .into_any_element(),
-        );
-        rows.push(section("Breakpoints", theme));
-        for (index, breakpoint) in self.breakpoints.iter().enumerate() {
-            rows.push(
-                div()
-                    .debug_selector(move || format!("debug-breakpoint-{index}"))
-                    .child(self.breakpoint_row(breakpoint, theme, cx))
-                    .into_any_element(),
-            );
-        }
-        let scrolled = scrollable(
-            "debug-side",
-            &self.scroll_side,
-            div()
-                .id("debug-side")
-                .flex()
-                .flex_col()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll_side)
-                .children(rows),
-            theme,
-            window,
-            cx,
-        )
-        .flex_1()
-        .min_w_0()
-        .min_h_0();
-        // The line the user types stays at the bottom of the panel, so it is at hand
-        // however far the output above has scrolled.
-        let mut side = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .child(scrolled);
-        if self.takes_input() {
-            side = side.child(
-                div()
-                    .id("debug-console-input-row")
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.console_menu(event.position, cx)
-                        }),
-                    )
-                    .child(self.console_input.element("debug-console-input", theme)),
-            );
-        }
-        side.into_any_element()
-    }
-
-    fn breakpoint_row(
-        &self,
-        breakpoint: &BreakpointSetting,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let answer = self
-            .snapshot
-            .breakpoints
-            .iter()
-            .find(|answer| answer.file == breakpoint.file && answer.line == breakpoint.line);
-        let message = answer.and_then(|answer| answer.message.clone());
-        let verified = answer.is_none_or(|answer| answer.verified);
-        let color = if breakpoint.enabled && !verified {
-            theme.warning_mark
-        } else if breakpoint.enabled {
-            theme.code
-        } else {
-            theme.text_disabled
-        };
-        let name = breakpoint
-            .file
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let line = breakpoint.line;
-        let condition = breakpoint.condition.clone().unwrap_or_default();
-        let hit = breakpoint.hit_condition.clone().unwrap_or_default();
-        let on = breakpoint.enabled;
-        let enabled_file = breakpoint.file.clone();
-        let condition_file = breakpoint.file.clone();
-        let hit_file = breakpoint.file.clone();
-        let remove_file = breakpoint.file.clone();
-        let row = div()
-            .id(SharedString::from(format!(
-                "breakpoint-{}-{line}",
-                breakpoint.file.display()
-            )))
-            .flex()
-            .items_center()
-            .gap(px(SPACE_S))
-            .h(px(ROW_HEIGHT))
-            .px(px(ROW_PADDING_X))
-            .text_color(color)
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "breakpoint-enabled-{}-{line}",
-                        breakpoint.file.display()
-                    )))
-                    .w(px(12.))
-                    .cursor_pointer()
-                    .child(if on { "☑" } else { "☐" })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_enabled(enabled_file.clone(), line, !on, cx);
-                    })),
-            )
-            .child(div().flex_none().child(format!("{name}:{line}")))
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "breakpoint-condition-{}-{line}",
-                        breakpoint.file.display()
-                    )))
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .cursor_pointer()
-                    .text_color(theme.text_secondary)
-                    .child(if condition.is_empty() {
-                        "if: <none>".to_owned()
-                    } else {
-                        format!("if: {condition}")
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.ask_condition(condition_file.clone(), line, window, cx);
-                    })),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "breakpoint-hit-{}-{line}",
-                        breakpoint.file.display()
-                    )))
-                    .flex_none()
-                    .cursor_pointer()
-                    .text_color(theme.text_secondary)
-                    .child(if hit.is_empty() {
-                        "hit: <any>".to_owned()
-                    } else {
-                        format!("hit: {hit}")
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.ask_hit_condition(hit_file.clone(), line, window, cx);
-                    })),
-            )
-            .child(
-                icon_button(
-                    SharedString::from(format!(
-                        "breakpoint-remove-{}-{line}",
-                        breakpoint.file.display()
-                    )),
-                    "general/closeSmall",
-                    "Remove Breakpoint",
-                    None,
-                    theme,
-                )
-                .size(px(20.))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.remove_breakpoint(remove_file.clone(), line, cx);
-                })),
-            );
-        let row = match message {
-            Some(message) => row.child(
-                div()
-                    .text_color(theme.warning_mark)
-                    .truncate()
-                    .child(message),
-            ),
-            None => row,
-        };
-        row.into_any_element()
     }
 
     /// The keys of the panel while it has the focus: the fields of New Watch and of Set
@@ -3463,20 +3783,6 @@ fn section(title: &str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A row that names a group of threads. It is not selectable; the group row adds its
-/// own click when it can be opened.
-fn list_header(id: impl Into<ElementId>, text: &str, theme: &Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .h(px(ROW_HEIGHT))
-        .px(px(SPACE_XL))
-        .text_size(px(TEXT_SMALL))
-        .text_color(theme.text_secondary)
-        .child(text.to_owned())
-}
-
 fn row(id: impl Into<ElementId>, text: &str, selected: bool, theme: &Theme) -> Stateful<Div> {
     div()
         .id(id)
@@ -3491,30 +3797,140 @@ fn row(id: impl Into<ElementId>, text: &str, selected: bool, theme: &Theme) -> S
         .child(text.to_owned())
 }
 
+/// A toolbar button that shows an icon and names itself, with its key, in a tooltip.
+/// A disabled button is dimmed and carries no click handler.
 fn tool_button(
     id: &'static str,
+    icon_name: &'static str,
     label: &'static str,
     hint: Option<&'static str>,
     enabled: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let shortcut = hint.map(Into::into);
-    let button = button_frame(id, label, shortcut, theme)
+    let image = if enabled {
+        icon(icon_name, theme)
+    } else {
+        icon(icon_name, theme).grayscale(true).opacity(0.4)
+    };
+    let selector = format!("{id}-icon");
+    let button = button_frame(id, label, hint.map(Into::into), theme)
         .debug_selector(move || id.to_owned())
         .child(
             div()
-                .px(px(SPACE_S))
-                .text_size(px(TEXT_SMALL))
-                .child(label.to_owned()),
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .debug_selector(move || selector.clone())
+                .child(image),
         );
     if enabled { button } else { button.opacity(0.4) }
+}
+
+/// The line between two groups of toolbar buttons.
+fn toolbar_divider(theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .w(px(DIVIDER_WIDTH))
+        .h(px(SPACE_XL))
+        .mx(px(SPACE_XS))
+        .bg(theme.border)
+}
+
+/// One of the two tabs above the body of the panel.
+fn front_tab(
+    id: &'static str,
+    label: &'static str,
+    front: Front,
+    current: Front,
+    theme: &Theme,
+    cx: &mut Context<DebugPanel>,
+) -> AnyElement {
+    let selected = front == current;
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex()
+        .items_center()
+        .flex_none()
+        .h(px(24.))
+        .px(px(SPACE_M))
+        .rounded(px(CONTROL_RADIUS))
+        .cursor_pointer()
+        .occlude()
+        .text_size(px(TEXT_SMALL))
+        .text_color(if selected {
+            theme.text
+        } else {
+            theme.text_secondary
+        })
+        .when(selected, |tab| tab.bg(theme.selection))
+        .when(!selected, |tab| {
+            tab.hover(move |style| style.bg(theme.hover))
+        })
+        .child(label)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.front = front;
+                cx.notify();
+            }),
+        )
+        .into_any_element()
+}
+
+/// One gray line in the middle of a part that has nothing to show.
+fn empty_pane(id: &'static str, text: &'static str, theme: &Theme) -> AnyElement {
+    div()
+        .debug_selector(move || id.to_owned())
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .items_center()
+        .justify_center()
+        .text_size(px(TEXT_SMALL))
+        .text_color(theme.text_secondary)
+        .child(text)
+        .into_any_element()
+}
+
+/// The same line with the height of a row, for a small part.
+fn empty_line(id: &'static str, text: &'static str, theme: &Theme) -> AnyElement {
+    div()
+        .debug_selector(move || id.to_owned())
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(ROW_HEIGHT))
+        .px(px(ROW_PADDING_X))
+        .text_size(px(TEXT_SMALL))
+        .text_color(theme.text_secondary)
+        .child(text)
+        .into_any_element()
+}
+
+/// A row of the thread drop-down that selects the thread of the stack.
+fn thread_entry(panel: WeakEntity<DebugPanel>, thread: &Thread) -> MenuEntry {
+    let id = thread.id;
+    let label = format!("{}  #{}", thread.name, thread.id);
+    MenuEntry::new(label, move |_, cx| {
+        panel
+            .update(cx, |panel, cx| {
+                panel.send(Command::SelectThread(id), cx);
+                cx.notify();
+            })
+            .ok();
+    })
 }
 
 impl Render for DebugPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let (active, stopped) = self.state();
+        let running = matches!(self.snapshot.state, DebugState::Running);
         let can_drop = self.restart_frame_enabled();
+        let can_restart = self.restart.is_some();
         let workspace = self.workspace.clone();
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
@@ -3531,68 +3947,162 @@ impl Render for DebugPanel {
             .px(px(SPACE_M))
             .debug_selector(|| "debug-toolbar".to_owned())
             .child(
-                tool_button("debug-continue", "Resume", Some("F9"), stopped, &theme)
-                    .on_click(cx.listener(|this, _, _, cx| this.resume(cx))),
-            )
-            .child(
-                tool_button("debug-over", "Step Over", Some("F8"), stopped, &theme)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_over(cx))),
-            )
-            .child(
-                tool_button("debug-into", "Step Into", Some("F7"), stopped, &theme)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_into(cx))),
-            )
-            .child(
-                tool_button("debug-out", "Step Out", Some("Shift+F8"), stopped, &theme)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_out(cx))),
-            )
-            .child(
-                tool_button("debug-drop-frame", "Drop Frame", None, can_drop, &theme)
-                    .on_click(cx.listener(|this, _, _, cx| this.restart_frame(cx))),
-            )
-            .child(
-                tool_button("debug-stop", "Stop", Some("Ctrl+F2"), active, &theme)
-                    .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                tool_button(
+                    "debug-rerun",
+                    "run/restart",
+                    "Rerun",
+                    Some("Ctrl+F5"),
+                    can_restart,
+                    &theme,
+                )
+                .when(can_restart, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.rerun(cx)))
+                }),
             )
             .child(
                 tool_button(
+                    "debug-continue",
+                    "run/run",
+                    "Resume",
+                    Some("F9"),
+                    stopped,
+                    &theme,
+                )
+                .when(stopped, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.resume(cx)))
+                }),
+            )
+            .child(
+                tool_button("debug-pause", "debug/pause", "Pause", None, running, &theme)
+                    .when(running, |button| {
+                        button.on_click(cx.listener(|this, _, _, cx| this.pause(cx)))
+                    }),
+            )
+            .child(
+                tool_button(
+                    "debug-stop",
+                    "run/stop",
+                    "Stop",
+                    Some("Ctrl+F2"),
+                    active,
+                    &theme,
+                )
+                .when(active, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                }),
+            )
+            .child(toolbar_divider(&theme))
+            .child(
+                tool_button(
+                    "debug-over",
+                    "debug/stepOver",
+                    "Step Over",
+                    Some("F8"),
+                    stopped,
+                    &theme,
+                )
+                .when(stopped, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.step_over(cx)))
+                }),
+            )
+            .child(
+                tool_button(
+                    "debug-into",
+                    "debug/stepInto",
+                    "Step Into",
+                    Some("F7"),
+                    stopped,
+                    &theme,
+                )
+                .when(stopped, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.step_into(cx)))
+                }),
+            )
+            .child(
+                tool_button(
+                    "debug-out",
+                    "debug/stepOut",
+                    "Step Out",
+                    Some("Shift+F8"),
+                    stopped,
+                    &theme,
+                )
+                .when(stopped, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.step_out(cx)))
+                }),
+            )
+            .child(
+                tool_button(
+                    "debug-run-to-cursor",
+                    "debug/runToCursor",
+                    "Run to Cursor",
+                    Some("Alt+F9"),
+                    stopped,
+                    &theme,
+                )
+                .when(stopped, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.run_to_cursor(false, cx)))
+                }),
+            )
+            .child(
+                tool_button(
+                    "debug-drop-frame",
+                    "debug/dropFrame",
+                    "Drop Frame",
+                    None,
+                    can_drop,
+                    &theme,
+                )
+                .when(can_drop, |button| {
+                    button.on_click(cx.listener(|this, _, _, cx| this.restart_frame(cx)))
+                }),
+            )
+            .child(toolbar_divider(&theme))
+            .child(
+                tool_button(
                     "debug-evaluate",
-                    "Evaluate",
+                    "debug/evaluate",
+                    "Evaluate Expression",
                     Some("Alt+F8"),
                     stopped,
                     &theme,
                 )
-                .on_click(cx.listener(|this, _, window, cx| this.ask_evaluate(window, cx))),
-            )
-            .child(
-                tool_button("debug-watch", "Add Watch", None, true, &theme)
-                    .on_click(cx.listener(|this, _, window, cx| this.ask_watch(window, cx))),
+                .when(stopped, |button| {
+                    button
+                        .on_click(cx.listener(|this, _, window, cx| this.ask_evaluate(window, cx)))
+                }),
             )
             .child(
                 tool_button(
                     "debug-breakpoints",
-                    "Breakpoints",
+                    "debug/breakpoints",
+                    "View Breakpoints",
                     Some("Ctrl+Shift+F8"),
                     true,
                     &theme,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.show_breakpoints(window, cx))),
             );
-        let state = match &self.snapshot.state {
-            DebugState::Inactive => "Not started",
-            DebugState::Starting => "Starting",
-            DebugState::Running => "Running",
-            DebugState::Stopped { reason } => reason.as_str(),
-            DebugState::Terminated => "Finished",
+        let state = self.state_text().map(str::to_owned);
+        let toolbar = match state {
+            Some(state) => toolbar.child(div().flex_1()).child(
+                div()
+                    .px(px(SPACE_S))
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child(state),
+            ),
+            None => toolbar,
         };
-        let state = state.to_owned();
         let body = div()
             .flex()
             .flex_1()
             .min_h_0()
-            .child(self.render_tree(&theme, window, cx))
-            .child(div().w(px(1.)).h_full().bg(theme.popup_border))
-            .child(self.render_side(&theme, window, cx));
+            .min_w_0()
+            .child(match self.front {
+                Front::Debugger => self.render_debugger(&theme, window, cx),
+                Front::Console => self.render_console(&theme, window, cx),
+            });
         island(&theme)
             .id("debug-panel")
             .key_context("DebugPanel ToolWindow")
@@ -3626,11 +4136,29 @@ impl Render for DebugPanel {
             .child(toolbar)
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .flex_none()
+                    .h(px(CONTROL_HEIGHT))
                     .px(px(SPACE_M))
-                    .pb(px(SPACE_XS))
-                    .text_size(px(TEXT_SMALL))
-                    .text_color(theme.line_number)
-                    .child(state.to_owned()),
+                    .debug_selector(|| "debug-tabs".to_owned())
+                    .child(front_tab(
+                        "debug-tab-debugger",
+                        "Debugger",
+                        Front::Debugger,
+                        self.front,
+                        &theme,
+                        cx,
+                    ))
+                    .child(front_tab(
+                        "debug-tab-console",
+                        "Console",
+                        Front::Console,
+                        self.front,
+                        &theme,
+                        cx,
+                    )),
             )
             .child(body)
             .into_any_element()
@@ -3678,13 +4206,15 @@ impl Render for BreakpointPopup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let setting = self.panel.read(cx).setting(&self.file, self.line).cloned();
-        let (condition, enabled, suspend) = match &setting {
+        let (condition, enabled, suspend, hit_message, log_expression) = match &setting {
             Some(setting) => (
                 setting.condition.clone().unwrap_or_default(),
                 setting.enabled,
                 setting.suspend,
+                setting.hit_message,
+                setting.log_expression.clone().unwrap_or_default(),
             ),
-            None => (String::new(), false, false),
+            None => (String::new(), false, false, false, String::new()),
         };
         let name = self
             .file
@@ -3696,10 +4226,17 @@ impl Render for BreakpointPopup {
         let condition_file = self.file.clone();
         let enabled_file = self.file.clone();
         let suspend_file = self.file.clone();
+        let message_file = self.file.clone();
+        let log_file = self.file.clone();
         let condition_text = if condition.is_empty() {
             "Condition: <none>".to_owned()
         } else {
             format!("Condition: {condition}")
+        };
+        let log_text = if log_expression.is_empty() {
+            "Evaluate and log: <none>".to_owned()
+        } else {
+            format!("Evaluate and log: {log_expression}")
         };
         let body = surface(&theme)
             .id("breakpoint-popup")
@@ -3744,7 +4281,7 @@ impl Render for BreakpointPopup {
             .child(
                 Self::row(
                     "breakpoint-popup-suspend",
-                    format!("Suspend: {}", if suspend { "on" } else { "off" }),
+                    format!("{} Suspend", if suspend { "☑" } else { "☐" }),
                     &theme,
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -3753,6 +4290,32 @@ impl Render for BreakpointPopup {
                     });
                     this.close(window, cx);
                 })),
+            )
+            .child(
+                Self::row(
+                    "breakpoint-popup-hit-message",
+                    format!(
+                        "{} Breakpoint hit message",
+                        if hit_message { "☑" } else { "☐" }
+                    ),
+                    &theme,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.panel.update(cx, |panel, cx| {
+                        panel.set_hit_message(message_file.clone(), line, !hit_message, cx)
+                    });
+                    this.close(window, cx);
+                })),
+            )
+            .child(
+                Self::row("breakpoint-popup-log-expression", log_text, &theme).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.panel.update(cx, |panel, cx| {
+                            panel.ask_log_expression(log_file.clone(), line, window, cx)
+                        });
+                        cx.notify();
+                    }),
+                ),
             )
             .child(
                 Self::row("breakpoint-popup-more", "More".to_owned(), &theme).on_click(
@@ -3826,7 +4389,7 @@ impl Render for BreakpointsView {
             .map(|panel| panel.read(cx).enabled_filters.clone())
             .unwrap_or_default();
         let mut rows: Vec<AnyElement> = Vec::new();
-        for setting in &settings {
+        for (index, setting) in settings.iter().enumerate() {
             let answer = answers
                 .iter()
                 .find(|answer| answer.file == setting.file && answer.line == setting.line);
@@ -3840,20 +4403,27 @@ impl Render for BreakpointsView {
             let condition = setting.condition.clone().unwrap_or_default();
             let hit = setting.hit_condition.clone().unwrap_or_default();
             let on = setting.enabled;
+            let suspend = setting.suspend;
+            let hit_message = setting.hit_message;
+            let log_expression = setting.log_expression.clone().unwrap_or_default();
             let line = setting.line;
             let enable_file = setting.file.clone();
             let condition_file = setting.file.clone();
             let hit_file = setting.file.clone();
+            let suspend_file = setting.file.clone();
+            let message_file = setting.file.clone();
+            let log_file = setting.file.clone();
             let remove_file = setting.file.clone();
             let row = div()
                 .id(SharedString::from(format!(
                     "dialog-breakpoint-{}-{line}",
                     setting.file.display()
                 )))
+                .debug_selector(move || format!("debug-breakpoint-row-{index}"))
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .py(px(SPACE_S))
+                .h(px(ROW_HEIGHT))
                 .child(
                     div()
                         .id(SharedString::from(format!(
@@ -3966,6 +4536,82 @@ impl Render for BreakpointsView {
                                     )
                                 })
                                 .ok();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-suspend-{}-{line}",
+                            setting.file.display()
+                        )))
+                        .debug_selector(|| "breakpoint-dialog-suspend".to_owned())
+                        .w(px(14.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(if suspend {
+                            "☑ suspend"
+                        } else {
+                            "☐ suspend"
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.set_suspend(suspend_file.clone(), line, !suspend, cx)
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-hit-message-{}-{line}",
+                            setting.file.display()
+                        )))
+                        .debug_selector(|| "breakpoint-dialog-hit-message".to_owned())
+                        .w(px(48.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(if hit_message { "☑ msg" } else { "☐ msg" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.set_hit_message(
+                                        message_file.clone(),
+                                        line,
+                                        !hit_message,
+                                        cx,
+                                    )
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dialog-log-{}-{line}",
+                            setting.file.display()
+                        )))
+                        .debug_selector(|| "breakpoint-dialog-log-expression".to_owned())
+                        .w(px(100.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme.text_secondary)
+                        .child(if log_expression.is_empty() {
+                            "log: <none>".to_owned()
+                        } else {
+                            format!("log: {log_expression}")
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let file = log_file.clone();
+                            if let Some(panel) = this.panel.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.ask_log_expression(file, line, window, cx)
+                                });
+                            }
                         })),
                 )
                 .child(
@@ -4326,8 +4972,15 @@ impl Render for BreakpointsView {
                 .children(rows)
                 .child(
                     div().flex().justify_end().child(
-                        tool_button("breakpoints-close", "Close", Some("Escape"), true, &theme)
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                        tool_button(
+                            "breakpoints-close",
+                            "general/close",
+                            "Close",
+                            Some("Escape"),
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     ),
                 ),
             &theme,
@@ -4362,6 +5015,13 @@ pub(crate) fn refresh_breakpoints(
         .map(|line| line - 1)
         .collect();
     view.set_breakpoints(lines, cx);
+    let muted = panel.read(cx).non_suspending_breakpoint_lines(view.path());
+    let muted: Vec<u32> = muted
+        .into_iter()
+        .filter(|line| *line > 0)
+        .map(|line| line - 1)
+        .collect();
+    view.set_muted_breakpoints(muted, cx);
     let temporary = panel.read(cx).temporary_breakpoint_lines(view.path());
     let temporary: Vec<u32> = temporary
         .into_iter()
@@ -4546,12 +5206,18 @@ mod tests {
                 build_output: OutputBuffers::default(),
                 build_process: None,
                 pending: None,
+                restart: None,
+                front: super::Front::Debugger,
+                tree_width: super::TREE_WIDTH,
+                split_from: None,
                 session: None,
                 store: None,
                 root: PathBuf::new(),
                 title: "Debug".into(),
                 scroll_tree: ScrollHandle::new(),
                 scroll_side: ScrollHandle::new(),
+                scroll_variables: ScrollHandle::new(),
+                scroll_watch: ScrollHandle::new(),
             })
         })
     }

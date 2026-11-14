@@ -62,6 +62,14 @@ pub struct RunControls {
     /// Writes the selected temporary configuration into the file, as OK of the dialog
     /// does.
     pub save: Action,
+    /// Runs the selected configuration with the coverage agent.
+    pub coverage: Action,
+    /// Runs the tests of the last run with the coverage agent.
+    pub run_tests_coverage: Action,
+    /// Hides the coverage stripes and closes the Coverage window.
+    pub hide_coverage: Action,
+    /// Shows or hides the coverage stripes.
+    pub toggle_coverage: Action,
 }
 
 /// Where a debug session is, for the toolbar and the keys.

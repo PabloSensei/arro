@@ -41,8 +41,10 @@ pub fn run(root: &Path, out: &Path, tools: Option<&Path>, archive: bool) -> Resu
     split_debug_info(&program, &dist::default_symbols_dir(&out))?;
     println!("{}", program.display());
 
-    helpers::run(&root, &out.join("helpers"), None)?;
+    let jacoco = dist::jacoco_lib(&tools)?;
+    helpers::run_with(&root, &out.join("helpers"), None, Some(&jacoco))?;
     let java = dist::install_java_tools_linux(&out, &tools)?;
+    dist::install_coverage_agent(&out, &tools)?;
 
     let commit =
         dist::git(&root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());

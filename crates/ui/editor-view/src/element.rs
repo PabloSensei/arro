@@ -255,57 +255,91 @@ pub(crate) struct EditorPrepaint {
     scrollbar_hovered: bool,
 }
 
-fn run(len: usize, font: &Font, color: Hsla, italic: bool) -> TextRun {
-    styled_run(len, font, color, italic, false)
+/// The look of a run: its colour, the background behind it and the marks a token,
+/// a diagnostic or markup may add.
+#[derive(Clone, Copy)]
+struct RunLook {
+    color: Hsla,
+    background: Option<Hsla>,
+    italic: bool,
+    bold: bool,
+    strikethrough: bool,
 }
 
-/// A run with the marks a semantic token or a diagnostic may add: italics for a static
-/// or abstract member, a line through the text of a deprecated one.
-fn styled_run(len: usize, font: &Font, color: Hsla, italic: bool, strikethrough: bool) -> TextRun {
+impl RunLook {
+    fn plain(color: Hsla) -> Self {
+        Self {
+            color,
+            background: None,
+            italic: false,
+            bold: false,
+            strikethrough: false,
+        }
+    }
+}
+
+fn run(len: usize, font: &Font, color: Hsla, italic: bool) -> TextRun {
+    styled_run(
+        len,
+        font,
+        RunLook {
+            italic,
+            ..RunLook::plain(color)
+        },
+    )
+}
+
+/// A run with the marks a semantic token, a diagnostic or markup may add: italics
+/// for a static or abstract member, a weight for bold text, a line through the text
+/// of a deprecated or struck one.
+fn styled_run(len: usize, font: &Font, look: RunLook) -> TextRun {
     let mut font = font.clone();
-    if italic {
+    if look.italic {
         font.style = FontStyle::Italic;
+    }
+    if look.bold {
+        font.weight = FontWeight::SEMIBOLD;
     }
     TextRun {
         len,
         font,
-        color,
-        background_color: None,
+        color: look.color,
+        background_color: look.background,
         underline: None,
-        strikethrough: strikethrough.then(|| StrikethroughStyle {
+        strikethrough: look.strikethrough.then(|| StrikethroughStyle {
             thickness: px(1.),
-            color: Some(color),
+            color: Some(look.color),
         }),
     }
 }
 
-/// Paints `len` characters with `color`, joining the run before it when the look is the
-/// same, so that a line of one colour stays one run.
-fn push_run(
-    runs: &mut Vec<TextRun>,
-    len: usize,
-    font: &Font,
-    color: Hsla,
-    italic: bool,
-    strikethrough: bool,
-) {
+/// Paints `len` characters with `look`, joining the run before it when the look is
+/// the same, so that a line of one colour stays one run.
+fn push_run(runs: &mut Vec<TextRun>, len: usize, font: &Font, look: RunLook) {
     if len == 0 {
         return;
     }
+    let weight = if look.bold {
+        FontWeight::SEMIBOLD
+    } else {
+        font.weight
+    };
     if let Some(last) = runs.last_mut()
-        && last.color == color
+        && last.color == look.color
+        && last.background_color == look.background
         && last.font.style
-            == if italic {
+            == if look.italic {
                 FontStyle::Italic
             } else {
                 FontStyle::Normal
             }
-        && last.strikethrough.is_some() == strikethrough
+        && last.font.weight == weight
+        && last.strikethrough.is_some() == look.strikethrough
     {
         last.len += len;
         return;
     }
-    runs.push(styled_run(len, font, color, italic, strikethrough));
+    runs.push(styled_run(len, font, look));
 }
 
 /// Text runs of the buffer text in `range`, gaps between spans are plain code. The runs
@@ -378,15 +412,18 @@ fn runs_in(
             .filter(|token| (token.start as usize) <= start && start < token.end as usize)
             .and_then(|token| style.token_style(token.kind, token.modifiers));
         if unused {
-            push_run(runs, end - start, font, style.unused, false, false);
+            push_run(runs, end - start, font, RunLook::plain(style.unused));
         } else if let Some(look) = token {
             push_run(
                 runs,
                 end - start,
                 font,
-                look.color,
-                look.italic,
-                look.strikethrough,
+                RunLook {
+                    color: look.color,
+                    italic: look.italic,
+                    strikethrough: look.strikethrough,
+                    ..RunLook::plain(look.color)
+                },
             );
         } else if let Some(span) = spans
             .get(span_at)
@@ -397,13 +434,33 @@ fn runs_in(
                 runs,
                 end - start,
                 font,
-                style.color_of(kind),
-                style.is_italic(kind),
-                false,
+                RunLook {
+                    color: style.color_of(kind),
+                    background: style.background_of(kind),
+                    italic: style.is_italic(kind),
+                    bold: style.is_bold(kind),
+                    strikethrough: style.is_strikethrough(kind),
+                },
             );
         } else {
-            push_run(runs, end - start, font, style.code, false, false);
+            push_run(runs, end - start, font, RunLook::plain(style.code));
         }
+    }
+}
+
+/// The run of one byte at `offset`: the look the editor gives it. The caller keeps
+/// the offset inside the text and on a character boundary.
+pub(crate) fn look_at(
+    offset: usize,
+    spans: &[HighlightSpan],
+    style: &EditorStyle,
+    font: &Font,
+) -> TextRun {
+    let mut runs = Vec::with_capacity(1);
+    runs_in(&mut runs, offset..offset + 1, spans, &[], &[], style, font);
+    match runs.pop() {
+        Some(run) => run,
+        None => styled_run(1, font, RunLook::plain(style.code)),
     }
 }
 
@@ -443,18 +500,21 @@ fn runs_of(
                 );
             }
             DisplayChunk::Tab { .. } => {
-                push_run(&mut runs, range.len(), font, style.code, false, false)
+                push_run(&mut runs, range.len(), font, RunLook::plain(style.code))
             }
-            DisplayChunk::Placeholder { .. } => {
-                push_run(&mut runs, range.len(), font, style.fold_text, false, false)
-            }
+            DisplayChunk::Placeholder { .. } => push_run(
+                &mut runs,
+                range.len(),
+                font,
+                RunLook::plain(style.fold_text),
+            ),
             DisplayChunk::Inlay { .. } => {
                 // Painted on its own at a smaller size; the row keeps the width.
                 let clear = Hsla {
                     a: 0.,
                     ..style.inlay
                 };
-                push_run(&mut runs, range.len(), font, clear, false, false)
+                push_run(&mut runs, range.len(), font, RunLook::plain(clear))
             }
         }
     }
@@ -1504,7 +1564,9 @@ impl Element for EditorElement {
         window.set_cursor_style(CursorStyle::IBeam, &prepaint.text_hitbox);
         let annotate = self.view.read(cx).annotation_width();
         let marks = self.view.read(cx).gutter_marks.clone();
+        let coverage = self.view.read(cx).coverage.clone();
         let breakpoints = self.view.read(cx).breakpoints.clone();
+        let muted_breakpoints = self.view.read(cx).muted_breakpoints.clone();
         let temporary_breakpoints = self.view.read(cx).temporary_breakpoints.clone();
         let function_breakpoints = self.view.read(cx).function_breakpoints.clone();
         let field_watchpoints = self.view.read(cx).field_watchpoints.clone();
@@ -1680,18 +1742,39 @@ impl Element for EditorElement {
                         )
                         .ok();
                 } else if !shown.is_doc && breakpoints.contains(&line) {
-                    let dot = Bounds::new(
-                        point(bounds.left() + px(RUN_X + 3.), shown.y + px(5.)),
-                        size(px(10.), px(10.)),
-                    );
-                    window.paint_quad(fill(dot, style.error).corner_radii(px(5.)));
-                    if temporary_breakpoints.contains(&line) {
-                        // A temporary breakpoint is a ring, not a filled dot.
-                        let hole = Bounds::new(
-                            point(bounds.left() + px(RUN_X + 5.), shown.y + px(7.)),
-                            size(px(6.), px(6.)),
+                    if muted_breakpoints.contains(&line) {
+                        // A point that does not stop the program is a muted point.
+                        let suffix = if style.dark { "_dark" } else { "" };
+                        let mark = Bounds::new(
+                            point(bounds.left() + px(RUN_X + 1.), shown.y + px(3.)),
+                            size(px(14.), px(14.)),
                         );
-                        window.paint_quad(fill(hole, style.background).corner_radii(px(3.)));
+                        let path: SharedString =
+                            format!("icons/debug/breakpointMuted{suffix}.svg").into();
+                        window
+                            .paint_svg(
+                                mark,
+                                path,
+                                None,
+                                TransformationMatrix::unit(),
+                                style.error,
+                                cx,
+                            )
+                            .ok();
+                    } else {
+                        let dot = Bounds::new(
+                            point(bounds.left() + px(RUN_X + 3.), shown.y + px(5.)),
+                            size(px(10.), px(10.)),
+                        );
+                        window.paint_quad(fill(dot, style.error).corner_radii(px(5.)));
+                        if temporary_breakpoints.contains(&line) {
+                            // A temporary breakpoint is a ring, not a filled dot.
+                            let hole = Bounds::new(
+                                point(bounds.left() + px(RUN_X + 5.), shown.y + px(7.)),
+                                size(px(6.), px(6.)),
+                            );
+                            window.paint_quad(fill(hole, style.background).corner_radii(px(3.)));
+                        }
                     }
                 }
                 let number_x = bounds.left() + px(NUMBER_RIGHT) - shown.number.width();
@@ -1795,6 +1878,21 @@ impl Element for EditorElement {
                 window.paint_quad(fill(*mark, *color).corner_radii(px(1.)));
             }
             window.paint_quad(vertical(gutter_right));
+            for shown in &prepaint.layout.rows {
+                if shown.is_block {
+                    continue;
+                }
+                if let Some(mark) = coverage
+                    .iter()
+                    .find(|mark| mark.line as usize == shown.buffer_line)
+                {
+                    // The stripe sits left of the run marks, so a program that starts on
+                    // the line keeps its button.
+                    let stripe =
+                        Bounds::new(point(bounds.left() + px(2.), shown.y), size(px(3.), height));
+                    window.paint_quad(fill(stripe, mark.color));
+                }
+            }
             paint_marks(&prepaint.layout.rows, &marks, gutter_right, height, window);
 
             let text_mask = prepaint.text_mask;
@@ -2180,7 +2278,7 @@ mod checks {
 mod token_checks {
     use lang_api::{SemanticTokenKind, SemanticTokenModifiers};
     use syntax::{HighlightKind, HighlightSpan};
-    use ui_kit::{Font, FontStyle, TextRun, font};
+    use ui_kit::{Font, FontStyle, FontWeight, TextRun, font};
 
     use crate::semantic::TokenSpan;
     use crate::style::EditorStyle;
@@ -2233,6 +2331,26 @@ mod token_checks {
         assert_eq!(out[0].color, style.semantic_field);
         assert_eq!(out[0].font.style, FontStyle::Normal);
         assert!(out[0].strikethrough.is_none());
+    }
+
+    #[test]
+    fn markdown_markup_draws_bold_italic_code_and_links() {
+        let style = EditorStyle::light();
+        let spans = [
+            span(0, 1, HighlightKind::Strong),
+            span(1, 2, HighlightKind::Emphasis),
+            span(2, 3, HighlightKind::InlineCode),
+            span(3, 4, HighlightKind::Link),
+        ];
+        let out = runs(&spans, &[], &[], 0..4, &style);
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert_eq!(out[0].color, style.code);
+        assert_eq!(out[0].font.weight, FontWeight::SEMIBOLD);
+        assert_eq!(out[1].color, style.code);
+        assert_eq!(out[1].font.style, FontStyle::Italic);
+        assert_eq!(out[2].color, style.string);
+        assert_eq!(out[2].background_color, Some(style.inline_code_background));
+        assert_eq!(out[3].color, style.accent);
     }
 
     #[test]

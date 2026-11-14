@@ -40,7 +40,9 @@ pub fn tab(
     } else {
         label
     };
-    div()
+    #[cfg(any(test, feature = "test-support"))]
+    let (name, shown_label) = (id.to_string(), Some(label.clone()));
+    let tab = div()
         .id(id)
         .group(group.clone())
         .flex()
@@ -103,7 +105,10 @@ pub fn tab(
                 } else {
                     icon_sized("general/closeSmall", 14., theme).into_any_element()
                 }),
-        )
+        );
+    #[cfg(any(test, feature = "test-support"))]
+    let tab = tab.child(crate::bounds_probe(name, shown_label));
+    tab
 }
 
 /// What a tree row shows. The list around it sets the side margins.
@@ -120,7 +125,9 @@ pub struct TreeRow {
 
 pub fn tree_row(row: TreeRow, theme: &Theme) -> Stateful<Div> {
     let hover = theme.selection_hover;
-    div()
+    #[cfg(any(test, feature = "test-support"))]
+    let (name, label) = (row.id.to_string(), Some(row.label.clone()));
+    let row = div()
         .id(row.id)
         .flex()
         .items_center()
@@ -155,7 +162,10 @@ pub fn tree_row(row: TreeRow, theme: &Theme) -> Stateful<Div> {
                 .text_color(theme.text_secondary)
                 .flex_none()
                 .child(hint)
-        }))
+        }));
+    #[cfg(any(test, feature = "test-support"))]
+    let row = row.child(crate::bounds_probe(name, label));
+    row
 }
 
 /// A breadcrumb in the status bar.

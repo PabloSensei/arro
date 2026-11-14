@@ -16,7 +16,9 @@ mod window;
 mod about;
 
 pub use about::AboutView;
-pub use editor::{EditorFactory, EditorStatus, EditorTab, FileIcons, IndentChoice, IndentSetter};
+pub use editor::{
+    EditorFactory, EditorStatus, EditorTab, FileIcons, IndentChoice, IndentSetter, PreviewOnly,
+};
 pub use invalidate::{apply_pending_invalidation, pending_invalidation, schedule_invalidation};
 pub use keys::KeyRow;
 pub use launch::{
@@ -25,24 +27,26 @@ pub use launch::{
 pub use layout::{DockState, Layout, PaneState, WindowPlacement};
 pub use run::{DebugControls, DebugRunState, RunControls, RunState};
 pub use settings::{
-    COMPLETION_DELAY_STEP_MS, CompletionCase, DefaultLayout, GitUpdateMethod, InlayParameterNames,
-    LINE_SPACING_STEP, MAX_COMPLETION_DELAY_MS, MAX_FONT_SIZE, MAX_INDENT_SIZE, MAX_LINE_SPACING,
-    MAX_UI_SCALE, MIN_FONT_SIZE, MIN_LINE_SPACING, MIN_UI_SCALE, SETTINGS_FILE, Settings,
-    TrimTrailingWhitespace, UI_SCALE_STEP,
+    COMPLETION_DELAY_STEP_MS, CompletionCase, DEFAULT_HTTP_TIMEOUT_SECONDS, DefaultLayout,
+    GitUpdateMethod, InlayParameterNames, LINE_SPACING_STEP, MAX_COMPLETION_DELAY_MS,
+    MAX_FONT_SIZE, MAX_HTTP_TIMEOUT_SECONDS, MAX_INDENT_SIZE, MAX_LINE_SPACING, MAX_UI_SCALE,
+    MIN_FONT_SIZE, MIN_LINE_SPACING, MIN_UI_SCALE, SETTINGS_FILE, Settings, TrimTrailingWhitespace,
+    UI_SCALE_STEP,
 };
 pub use window::{
-    AI_TOOL, BOOKMARKS_POPUP, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP, COMMIT_TOOL, CloseTab,
-    CommandFn, DEBUG_TOOL, DOCUMENTATION_TOOL, Debug, Dismiss, DockSide, Evaluate, INSPECTION_TOOL,
-    LOG_TOOL, METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE, MIN_EDITOR_SIZE, MenuRow, MenuShortcut,
-    NextProblem, NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, PreviousProblem,
-    ProjectOpener, ProjectStructure, PushChanges, RECENT_PLACES_POPUP, RUN_TOOL, RerunInspection,
-    Resume, RevertChange, Run, SERVICES_TOOL, STRUCTURE_TOOL, SelectInProject, ShowBranches,
-    ShowCommit, ShowSearch, ShowSettings, SplitRight, StepInto, StepOut, StepOver, Stop,
-    TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, TabListener, ToggleAi, ToggleBreakpoint, ToggleCommit,
-    ToggleDebug, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
-    ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList,
-    ViewBreakpoints, WINDOW_KEYS, WindowKey, Workspace, bind_keys, bind_keys_for, build_date,
-    build_version, window_key, window_step,
+    AI_TOOL, BOOKMARKS_POPUP, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP, COMMIT_TOOL,
+    COVERAGE_TOOL, CloseTab, CommandFn, DEBUG_TOOL, DOCUMENTATION_TOOL, Debug, Dismiss, DockSide,
+    Evaluate, HTTP_TOOL, INSPECTION_TOOL, LOG_TOOL, METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE,
+    MIN_EDITOR_SIZE, MenuRow, MenuShortcut, NextProblem, NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL,
+    PROJECT_TOOL, PreviousProblem, ProjectOpener, ProjectStructure, PushChanges,
+    RECENT_PLACES_POPUP, RUN_TOOL, RerunInspection, Resume, RevertChange, Run, SERVICES_TOOL,
+    STRUCTURE_TOOL, SelectInProject, ShowBranches, ShowCommit, ShowSearch, ShowSettings,
+    SplitRight, StepInto, StepOut, StepOver, Stop, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL,
+    TabListener, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleDebug, ToggleHttp, ToggleLog,
+    ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTerminal, ToggleTheme,
+    ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, WINDOW_KEYS,
+    WindowKey, Workspace, bind_keys, bind_keys_for, build_date, build_version, window_key,
+    window_step,
 };
 
 #[cfg(any(test, feature = "test-support"))]

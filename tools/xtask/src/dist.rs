@@ -34,6 +34,48 @@ const DEBUG_SHA256: &str = "f09ebe358a7b08b3c17b21b8d8207b0649acad120eb6f1604dc4
 const DEBUG_SOURCE: &str = "https://github.com/microsoft/java-debug";
 const DEBUG_DOWNLOAD: &str =
     "https://marketplace.visualstudio.com/items?itemName=vscjava.vscode-java-debug";
+/// JaCoCo for Run with Coverage: the agent that runs and test runs start with, and the
+/// parts the report helper links to. Maven Central serves each file at
+/// `<MAVEN_CENTRAL>/<path>/<file>`; the hashes pin them as they pin the servers.
+const JACOCO_VERSION: &str = "0.8.15";
+const ASM_VERSION: &str = "9.10.1";
+const JACOCO_SOURCE: &str = "https://github.com/jacoco/jacoco";
+const MAVEN_CENTRAL: &str = "https://repo1.maven.org/maven2";
+/// The ASM license, as the about page of the JaCoCo agent carries it.
+const ASM_LICENSE: &str = include_str!("../../../dist/licenses/ASM-BSD-3-Clause.txt");
+/// `(folder under download-jacoco, file, Maven path, SHA-256)`; the agent comes first.
+const JACOCO_FILES: [(&str, &str, &str, &str); 5] = [
+    (
+        "agent",
+        "org.jacoco.agent-0.8.15-runtime.jar",
+        "org/jacoco/org.jacoco.agent/0.8.15",
+        "fb5b0036a0899ea97edfa0fc2c7985b55f3f7c5695028163e5e60d4f3cf6075d",
+    ),
+    (
+        "lib",
+        "org.jacoco.core-0.8.15.jar",
+        "org/jacoco/org.jacoco.core/0.8.15",
+        "ade1e0fdb4cd80d8537b57c6edb70a1360c47fdc518c20c65314517479bc4d0d",
+    ),
+    (
+        "lib",
+        "asm-9.10.1.jar",
+        "org/ow2/asm/asm/9.10.1",
+        "ed825d10ab1399c8c0cb669e688cf0c8c82629b4c8399b58352b68e92ca10fcb",
+    ),
+    (
+        "lib",
+        "asm-commons-9.10.1.jar",
+        "org/ow2/asm/asm-commons/9.10.1",
+        "6d0abefb7cbf972ea16edb37ec14835372505063a45f976ab7ea889ed9497895",
+    ),
+    (
+        "lib",
+        "asm-tree-9.10.1.jar",
+        "org/ow2/asm/asm-tree/9.10.1",
+        "3dfb0d5b6a106cd40b5b250e39935fbf2f927f4477546a5369a3ac609cf0506b",
+    ),
+];
 
 /// What the language tools take in the output folder.
 pub(crate) struct JavaTools {
@@ -86,9 +128,11 @@ pub fn run(
     let conpty = conpty::install(&root, &out)?;
 
     let helpers_dir = out.join("helpers");
-    helpers::run(&root, &helpers_dir, None)?;
+    let jacoco = jacoco_lib(&tools)?;
+    helpers::run_with(&root, &helpers_dir, None, Some(&jacoco))?;
 
     let java_tools = install_java_tools(&out, &tools, JDTLS_SHA256, DEBUG_SHA256)?;
+    install_coverage_agent(&out, &tools)?;
 
     let commit = git(&root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let date = git(&root, &["log", "-1", "--format=%cs"]).unwrap_or_else(|| "unknown".into());
@@ -218,6 +262,36 @@ pub(crate) fn install_java_tools_macos(out: &Path, tools: &Path) -> Result<JavaT
 /// `config_linux`.
 pub(crate) fn install_java_tools_linux(out: &Path, tools: &Path) -> Result<JavaTools> {
     install_java_tools_for(out, tools, JDTLS_SHA256, DEBUG_SHA256, "config_linux")
+}
+
+/// Checks the pinned JaCoCo files in `tools/download-jacoco` and returns the folder of
+/// the jars the coverage report helper is built against. A missing or different file
+/// stops the release, as a missing server does.
+pub(crate) fn jacoco_lib(tools: &Path) -> Result<PathBuf> {
+    let base = tools.join("download-jacoco");
+    for (folder, file, path, sha256) in JACOCO_FILES {
+        verify_archive(
+            &base.join(folder).join(file),
+            sha256,
+            &format!("{MAVEN_CENTRAL}/{path}/{file}"),
+            "JaCoCo",
+        )?;
+    }
+    Ok(base.join("lib"))
+}
+
+/// Puts the JaCoCo agent into `<out>/tools/coverage`, where Run with Coverage looks for
+/// it next to the program (inside `Contents/Resources` of the macOS bundle).
+pub(crate) fn install_coverage_agent(out: &Path, tools: &Path) -> Result<PathBuf> {
+    let (folder, file, _, _) = JACOCO_FILES[0];
+    let target = out.join("tools").join("coverage");
+    fs::create_dir_all(&target)?;
+    fs::copy(
+        tools.join("download-jacoco").join(folder).join(file),
+        target.join(file),
+    )?;
+    println!("dist: {}", target.display());
+    Ok(target)
 }
 
 /// The same servers with the configuration folder of another system, which is all that
@@ -741,6 +815,15 @@ pub(crate) fn java_notice(tools: &JavaTools) -> String {
             );
         }
     }
+    text.push_str(&format!(
+        "\nJaCoCo {JACOCO_VERSION} runs Run with Coverage: its agent is bundled in\n\
+         tools\\coverage, and org.jacoco.core with ASM {ASM_VERSION} (asm, asm-commons,\n\
+         asm-tree) in helpers\\coverage. JaCoCo is licensed under the Eclipse Public\n\
+         License 2.0 (EPL-2.0), whose text is above. Sources: {JACOCO_SOURCE}\n\n\
+         ASM is licensed under the BSD 3-Clause License; its text follows.\n\n"
+    ));
+    text.push_str(ASM_LICENSE);
+    text.push('\n');
     text
 }
 
@@ -1269,6 +1352,8 @@ mod tests {
         assert!(text.contains("Eclipse Public License - v 1.0"));
         assert!(text.contains("laws of the State of New York"));
         assert!(text.contains("extension\\EPL-1.0.txt"));
+        assert!(text.contains("tools\\coverage"));
+        assert!(text.contains("Copyright (c) 2000-2011 INRIA, France Telecom"));
     }
 
     #[test]

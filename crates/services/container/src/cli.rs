@@ -81,6 +81,8 @@ pub struct Container {
     pub ports: String,
     /// The compose project it belongs to, for grouping in the tree.
     pub compose_project: Option<String>,
+    /// The directory the compose project was started from, for the calls of the project.
+    pub compose_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +137,21 @@ struct ServerVersion {
 pub enum ComposeAction {
     Up,
     Down,
+    Restart,
+    Stop,
+}
+
+impl ComposeAction {
+    /// The word of the subcommand. Up detaches, so a call from the panel ends and the
+    /// tree can be read again.
+    fn words(self) -> &'static [&'static str] {
+        match self {
+            Self::Up => &["up", "--detach"],
+            Self::Down => &["down"],
+            Self::Restart => &["restart"],
+            Self::Stop => &["stop"],
+        }
+    }
 }
 
 /// The `docker` CLI. It knows the contexts, the named pipe and the credentials of the
@@ -260,16 +277,7 @@ impl DockerCli {
     pub fn containers(&self) -> Result<Vec<Container>, String> {
         let text = self.run(&["ps", "--all", "--no-trunc", "--format", "json"])?;
         let lines: Vec<PsLine> = json_lines(&text)?;
-        let containers = lines.into_iter().map(|line| Container {
-            compose_project: label(&line.labels, "com.docker.compose.project"),
-            name: line.names.split(',').next().unwrap_or("").to_owned(),
-            id: line.id,
-            image: line.image,
-            state: ContainerState::parse(&line.state),
-            status: line.status,
-            ports: line.ports,
-        });
-        Ok(containers.collect())
+        Ok(lines.into_iter().map(container_of).collect())
     }
 
     pub fn images(&self) -> Result<Vec<Image>, String> {
@@ -315,6 +323,37 @@ impl DockerCli {
             .args(["logs", "--follow", "--tail", LOG_TAIL, id])
     }
 
+    /// Before the subcommand of a compose call: the project from the labels of its
+    /// containers, or the file of the project's root.
+    fn compose(&self, selector: &[&str], action: ComposeAction) -> Result<(), String> {
+        let mut args = vec!["compose"];
+        args.extend_from_slice(selector);
+        args.extend_from_slice(action.words());
+        self.run(&args).map(drop)
+    }
+
+    /// A compose call of the project named in the labels of its containers. The directory
+    /// is the root of the project: the CLI looks for the compose file there, not in the
+    /// directory the IDE happens to run in.
+    pub fn compose_project(
+        &self,
+        project: &str,
+        action: ComposeAction,
+        directory: &Path,
+    ) -> Result<(), String> {
+        let directory = directory.display().to_string();
+        self.compose(
+            &["--project-name", project, "--project-directory", &directory],
+            action,
+        )
+    }
+
+    /// The same for the compose file of the workspace root.
+    pub fn compose_file(&self, file: &Path, action: ComposeAction) -> Result<(), String> {
+        let file = file.display().to_string();
+        self.compose(&["--file", &file], action)
+    }
+
     /// For the built-in terminal: compose runs in front of the user and may ask things.
     pub fn compose_command_line(&self, file: &Path, action: ComposeAction) -> String {
         let mut words = self.words();
@@ -326,6 +365,8 @@ impl DockerCli {
         match action {
             ComposeAction::Up => words.push("up".into()),
             ComposeAction::Down => words.push("down".into()),
+            ComposeAction::Restart => words.push("restart".into()),
+            ComposeAction::Stop => words.push("stop".into()),
         }
         join_command_line(&words)
     }
@@ -373,6 +414,21 @@ fn label(labels: &str, name: &str) -> Option<String> {
         let (key, value) = pair.split_once('=')?;
         (key == name).then(|| value.to_owned())
     })
+}
+
+/// One line of `docker ps` as the tree knows it. The compose project comes from the
+/// labels, so the panel groups containers without a second call.
+fn container_of(line: PsLine) -> Container {
+    Container {
+        compose_project: label(&line.labels, "com.docker.compose.project"),
+        compose_dir: label(&line.labels, "com.docker.compose.project.working_dir"),
+        name: line.names.split(',').next().unwrap_or("").to_owned(),
+        id: line.id,
+        image: line.image,
+        state: ContainerState::parse(&line.state),
+        status: line.status,
+        ports: line.ports,
+    }
 }
 
 /// Quotes the way the C runtime of Windows reads a command line back into arguments.
@@ -463,6 +519,55 @@ mod tests {
             label(&lines[0].labels, "com.docker.compose.project").as_deref(),
             Some("petclinic")
         );
+    }
+
+    #[test]
+    fn a_compose_project_label_groups_the_container() {
+        let line = r#"{"ID":"4f2a","Image":"nginx","Labels":"com.docker.compose.project=petclinic,com.docker.compose.service=web,com.docker.compose.project.working_dir=C:/work/petclinic","Names":"petclinic-web-1","State":"running","Status":"Up 2 minutes"}"#;
+        let lines: Vec<PsLine> = json_lines(line).unwrap();
+
+        let container = container_of(lines.into_iter().next().unwrap());
+
+        assert_eq!(container.compose_project.as_deref(), Some("petclinic"));
+        assert_eq!(container.compose_dir.as_deref(), Some("C:/work/petclinic"));
+        assert_eq!(container.name, "petclinic-web-1");
+    }
+
+    #[test]
+    fn a_container_without_the_label_has_no_project() {
+        let line = r#"{"ID":"9c1d","Image":"hello-world","Labels":"","Names":"hello","State":"exited","Status":"Exited (0) 2 minutes ago"}"#;
+        let lines: Vec<PsLine> = json_lines(line).unwrap();
+
+        let container = container_of(lines.into_iter().next().unwrap());
+
+        assert_eq!(container.compose_project, None);
+        assert_eq!(container.state, ContainerState::Exited);
+    }
+
+    #[test]
+    fn the_project_label_is_found_among_other_labels() {
+        let labels = "maintainer=me,com.docker.compose.service=web,com.docker.compose.project=petclinic,org.example=x=y";
+
+        assert_eq!(
+            label(labels, "com.docker.compose.project").as_deref(),
+            Some("petclinic")
+        );
+        assert_eq!(
+            label(labels, "com.docker.compose.service").as_deref(),
+            Some("web")
+        );
+        assert_eq!(label(labels, "org.example").as_deref(), Some("x=y"));
+        assert_eq!(label("maintainer=me", "com.docker.compose.project"), None);
+        assert_eq!(label("", "com.docker.compose.project"), None);
+    }
+
+    #[test]
+    fn compose_actions_have_their_subcommands() {
+        let action = ComposeAction::Up;
+        assert_eq!(action.words(), ["up", "--detach"]);
+        assert_eq!(ComposeAction::Down.words(), ["down"]);
+        assert_eq!(ComposeAction::Restart.words(), ["restart"]);
+        assert_eq!(ComposeAction::Stop.words(), ["stop"]);
     }
 
     #[cfg(not(unix))]

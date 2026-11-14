@@ -17,7 +17,14 @@ pub fn read_file(path: &Path) -> io::Result<Decoded> {
 }
 
 /// Replaces the file in one step: a crash leaves the old content or the new one.
+///
+/// A target without write access is refused on every system. On Windows the rename
+/// fails on its own, but on Unix only the directory needs the write permission, so a
+/// rename would silently replace a read-only file.
 pub fn write_file(path: &Path, text: &str, format: &FileFormat) -> io::Result<()> {
+    if let Err(error) = check_writable(path) {
+        return Err(with_path(path, error));
+    }
     let bytes = encode(text, format);
     let temporary = temporary_path(path)?;
     let result = write_and_replace(&temporary, path, &bytes);
@@ -124,6 +131,19 @@ fn stage(file: &FileUpdate<'_>, index: usize) -> io::Result<PathBuf> {
 
 fn check_replaceable(path: &Path) -> io::Result<()> {
     let metadata = fs::metadata(path)?;
+    check_permissions(path, &metadata)
+}
+
+/// The check of [`write_file`], where a missing target is a file about to be created.
+fn check_writable(path: &Path) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) => check_permissions(path, &metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn check_permissions(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if metadata.permissions().readonly() {
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,

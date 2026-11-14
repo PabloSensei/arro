@@ -32,6 +32,9 @@ pub type IndentSetter = Rc<dyn Fn(IndentChoice, &mut App)>;
 /// Writes unsaved changes before it returns. `Some` says why the text is still not on disk.
 pub type SaveNow = Rc<dyn Fn(&mut App) -> Option<String>>;
 
+/// Shows the rendered document of a tab alone, as a README opens.
+pub type PreviewOnly = Rc<dyn Fn(&mut App)>;
+
 /// What the status bar shows about the active tab.
 #[derive(Clone, Default)]
 pub struct EditorStatus {
@@ -73,6 +76,9 @@ pub struct EditorTab {
     pub set_indent: IndentSetter,
     /// Takes the text on disk in place of the edits of the buffer; undo brings them back.
     pub reload_from_disk: Rc<dyn Fn(&mut App)>,
+    /// Shows the rendered document of the tab alone, the way a README opens; `None` for
+    /// a file without a preview.
+    pub show_preview_only: Option<PreviewOnly>,
 }
 
 /// Line ends and encodings the status bar offers, by the names `EditorTab::set_format` takes.

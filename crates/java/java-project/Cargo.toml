@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 base.workspace = true
+platform.workspace = true
 proc-sup.workspace = true
 project-model.workspace = true
 roxmltree = "0.21"

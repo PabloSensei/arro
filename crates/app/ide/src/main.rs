@@ -47,6 +47,13 @@ fn language_for(path: &Path) -> Option<LanguageConfig> {
     java_lang::language_for(path)
         .or_else(|| dockerfile_syntax::language_for(path))
         .or_else(|| file_syntax::language_for(path))
+        .map(|config| config.with_injection_resolver(language_by_name))
+}
+
+/// The language a code fence or another document names in its text.
+fn language_by_name(name: &str) -> Option<LanguageConfig> {
+    let name = name.split_whitespace().next()?;
+    language_for(Path::new(&format!("fence.{name}")))
 }
 
 fn class_text(folder: &Path, root: &Path, name: &str) -> String {
@@ -657,5 +664,36 @@ mod tests {
         let icons = file_icons();
         assert_eq!(icons.icon_for(Path::new("App.java")), "nodes/class");
         assert_eq!(icons.icon_for(Path::new("notes.md")), "fileTypes/text");
+    }
+
+    #[test]
+    fn a_fenced_block_named_java_is_parsed_as_java() {
+        use syntax::{DocumentId, HighlightKind, SyntaxService};
+        use text_core::{Change, RopeStore, TextStore};
+
+        let text = "```java\nclass Demo { int value = 7; }\n```\n";
+        let config = file_syntax::markdown().with_injection_resolver(language_by_name);
+        let service = SyntaxService::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        service.open(DocumentId(1), config, move |snapshot| {
+            sender.send(snapshot).ok();
+        });
+        service.update(
+            DocumentId(1),
+            1,
+            RopeStore::from_text(text),
+            &Change::default(),
+        );
+        let snapshot = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the parse");
+        let keywords: Vec<_> = snapshot
+            .highlights
+            .iter()
+            .filter(|span| span.kind == HighlightKind::Keyword)
+            .map(|span| &text[span.start as usize..span.end as usize])
+            .collect();
+        assert!(keywords.contains(&"class"), "{keywords:?}");
+        assert!(keywords.contains(&"int"), "{keywords:?}");
     }
 }

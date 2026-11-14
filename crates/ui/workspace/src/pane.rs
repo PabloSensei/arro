@@ -31,8 +31,13 @@ impl Pane {
         self.tabs.get(self.active)
     }
 
+    /// The index of the tab of one file: the spelling of the path does not count, as the
+    /// file systems of Windows and macOS do not.
     pub fn position(&self, path: &Path) -> Option<usize> {
-        self.tabs.iter().position(|tab| tab.path == path)
+        let key = ::platform::path_key(path);
+        self.tabs
+            .iter()
+            .position(|tab| ::platform::path_key(&tab.path) == key)
     }
 
     /// Removes a tab and keeps the selection on the tab that was next to it.
@@ -109,7 +114,8 @@ pub fn clamp_drop(pinned: &[bool], moving_pinned: bool, index: usize) -> usize {
 
 /// Remembers a closed file, the latest last, without repeats.
 pub fn remember_closed(closed: &mut Vec<PathBuf>, path: PathBuf) {
-    closed.retain(|known| *known != path);
+    let key = ::platform::path_key(&path);
+    closed.retain(|known| ::platform::path_key(known) != key);
     closed.push(path);
     if closed.len() > CLOSED_LIMIT {
         closed.remove(0);

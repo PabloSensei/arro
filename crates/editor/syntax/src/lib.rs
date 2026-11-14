@@ -8,7 +8,7 @@ mod service;
 mod symbols;
 
 pub use highlight::{HighlightKind, HighlightSpan, normalize_spans, shift_spans};
-pub use language::{FoldStyle, LanguageConfig, StatementRules};
+pub use language::{FoldStyle, Injection, LanguageConfig, StatementRules};
 pub use outline::{FoldRange, Region, custom_regions, enclosing_range, indent_after, region_folds};
 pub use service::{DocumentId, SyntaxService, SyntaxSnapshot};
 pub use symbols::TagSymbols;
