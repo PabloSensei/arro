@@ -422,17 +422,17 @@ impl KubeSection {
     }
 
     /// Whether the section holds a watch of the cluster.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn watching(&self) -> bool {
         self.watch.is_some()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn cli_calls(&self) -> u64 {
         self.cli.as_ref().map_or(0, Kubectl::calls)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn revealed_value(&self) -> Option<&str> {
         self.revealed.as_ref().map(|(_, value)| value.as_str())
     }
