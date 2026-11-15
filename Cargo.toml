@@ -11,7 +11,7 @@ members = [
 exclude = ["spikes", "vendor"]
 
 [workspace.package]
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 publish = false
 
@@ -70,12 +70,22 @@ updater = { path = "crates/services/updater" }
 vcs = { path = "crates/services/vcs" }
 workspace-core = { path = "crates/services/workspace-core" }
 http-client = { path = "crates/services/http-client" }
+kube = { path = "crates/services/kube" }
 
 [patch.crates-io]
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 
 [profile.release]
 debug = "line-tables-only"
+
+# Every build folder holds the whole workspace with its tests, and full debug info made
+# each one tens of gigabytes. Line tables keep file:line in panics and backtraces; nobody
+# steps through Arro itself in a debugger, and the dependencies need no debug info at all.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 # `xtask symbolize` reads file:line from the pdb of the test binary, and the environment
 # may build the dev profile without debug info. Both profiles need the same setting, or

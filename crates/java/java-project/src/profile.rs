@@ -599,7 +599,7 @@ fn same_frame(one: &ProfileFrame, other: &ProfileFrame) -> bool {
 
 /// The source of a class of the project, found under the source roots of the model. A
 /// nested class lives in the file of its outermost class.
-fn source_of(model: &ProjectModel, class: &str) -> Option<PathBuf> {
+pub(crate) fn source_of(model: &ProjectModel, class: &str) -> Option<PathBuf> {
     if class.is_empty() || class.starts_with('[') {
         return None;
     }

@@ -22,6 +22,7 @@ use syntax::LanguageConfig;
 use templates::TemplateLanguage;
 
 pub use java_lang::{BuildTools, NewProjectOptions};
+pub use java_project::heap::read as read_heap_dump;
 pub use java_project::{BuildEnv, Gradle, Jdk, Maven};
 pub use jdtls_adapter::{self, settings_of};
 use project_model::scaffold::Generator;
@@ -180,6 +181,22 @@ pub fn spring_data(root: &Path) -> Arc<dyn LanguageSupport> {
     java_lang::spring_data_support(root.to_path_buf())
 }
 
+/// The migrations of a project whose build model the test has read already: the files of
+/// its migration tool, the changelogs of its includes, and their state against a history
+/// table the window hands back.
+pub fn migrations(root: &Path, model: &ProjectModel) -> Arc<dyn lang_api::MigrationSupport> {
+    Arc::new(java_lang::DatabaseSupport::with_model(
+        root.to_path_buf(),
+        Arc::new(model.clone()),
+    ))
+}
+
+/// The changelogs of the migrations as a language of the editor, for their completion
+/// and their checks.
+pub fn changelogs(root: &Path) -> Arc<dyn LanguageSupport> {
+    java_lang::migrations_language(root.to_path_buf())
+}
+
 /// The support of the configuration files of a project whose class path and source roots
 /// the caller gives, for a window test that builds the jar itself.
 pub fn spring_config_with_sources(
@@ -191,6 +208,16 @@ pub fn spring_config_with_sources(
     support.set_classpath(classpath);
     support.set_sources(sources);
     support
+}
+
+/// The model of the beans of the sources of a project model, as the language reads it.
+pub fn bean_model(model: &ProjectModel) -> lang_api::BeanModel {
+    java_lang::bean_model_for(model)
+}
+
+/// The HTTP handlers of one source file, as the language reads them.
+pub fn endpoint_scan(path: &Path, text: &str) -> lang_api::EndpointScan {
+    java_lang::endpoint_scan(path, text)
 }
 
 /// The message bundles of a project: the `*.properties` files of a base name with their
@@ -1334,6 +1361,80 @@ pub fn write_spring_metadata_jar(folder: &Path) -> PathBuf {
         writer
             .start_file(
                 name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("an entry of the jar");
+        writer
+            .write_all(text.as_bytes())
+            .expect("the text of the jar");
+    }
+    writer.finish().expect("the finished jar");
+    file
+}
+
+/// A jar with the configuration metadata of a Quarkus extension, in the shape this IDE
+/// reads when an extension ships one.
+pub fn write_quarkus_metadata_jar(folder: &Path) -> PathBuf {
+    const METADATA: &str = r#"{
+        "groups": [
+            {"name": "quarkus.http", "type": "io.quarkus.vertx.http.HttpConfiguration"}
+        ],
+        "properties": [
+            {
+                "name": "quarkus.http.port",
+                "type": "java.lang.Integer",
+                "defaultValue": 8080,
+                "description": "The HTTP port."
+            },
+            {
+                "name": "quarkus.http.host",
+                "type": "java.lang.String",
+                "defaultValue": "0.0.0.0",
+                "description": "The HTTP host."
+            },
+            {
+                "name": "quarkus.application.name",
+                "type": "java.lang.String",
+                "description": "The name of the application."
+            }
+        ]
+    }"#;
+    write_jar(
+        folder,
+        "quarkus-metadata.jar",
+        &[("META-INF/quarkus-config-metadata.json", METADATA)],
+    )
+}
+
+/// A jar with the configuration metadata of Micronaut, which maps every key to its type.
+pub fn write_micronaut_metadata_jar(folder: &Path) -> PathBuf {
+    const METADATA: &str = r#"{
+        "micronaut.server.port": {
+            "type": "java.lang.Integer",
+            "defaultValue": 8080,
+            "description": "The port of the server."
+        },
+        "micronaut.server.host": {
+            "type": "java.lang.String",
+            "description": "The host of the server."
+        }
+    }"#;
+    write_jar(
+        folder,
+        "micronaut-metadata.jar",
+        &[("META-INF/micronaut/configuration-metadata.json", METADATA)],
+    )
+}
+
+fn write_jar(folder: &Path, name: &str, entries: &[(&str, &str)]) -> PathBuf {
+    let file = folder.join(name);
+    let mut writer = zip::ZipWriter::new(fs::File::create(&file).expect("the jar of the test"));
+    for (entry, text) in entries {
+        use std::io::Write as _;
+        writer
+            .start_file(
+                *entry,
                 zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Stored),
             )

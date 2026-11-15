@@ -380,7 +380,6 @@ pub trait RunConfigProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn discover(&self, model: &ProjectModel) -> Result<Vec<RunConfig>>;
     fn plan(&self, config: &RunConfig, model: &ProjectModel) -> Result<RunPlan>;
-
     /// The places in `text`, one source file, that start a program, for the gutter marks
     /// and the keys that run at the caret. A language that starts no file leaves it empty.
     fn launch_points(&self, _text: &str, _file: &Path, _model: &ProjectModel) -> Vec<LaunchPoint> {
@@ -480,6 +479,42 @@ pub trait RunConfigProvider: Send + Sync {
     /// The recordings of this provider still on disk, the newest first.
     fn profile_recordings(&self, _model: &ProjectModel) -> Result<Vec<lang_api::ProfileRecording>> {
         Ok(Vec::new())
+    }
+
+    /// Whether the files of this provider are heap dumps it can read. The window asks
+    /// every provider before it opens a file as text.
+    fn is_heap_dump(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// Whether this provider can dump and read the heap of its programs. The windows offer
+    /// Capture Memory Snapshot only for such a provider.
+    fn supports_heap_dump(&self) -> bool {
+        false
+    }
+
+    /// Writes the heap of the running program `pid` into `file`. Blocks, so it runs off
+    /// the UI thread; a provider without the tool keeps the error of this default.
+    fn capture_heap_dump(
+        &self,
+        _pid: u32,
+        _file: &Path,
+        _model: &ProjectModel,
+        _cancel: &base::Cancel,
+    ) -> Result<()> {
+        Err(format!("{} cannot capture a heap dump", self.id()).into())
+    }
+
+    /// Reads a heap dump into the model of the window. The progress is called as the file
+    /// is passed, so a large dump shows how far the reading is.
+    fn heap_dump(
+        &self,
+        _path: &Path,
+        _model: &ProjectModel,
+        _cancel: &base::Cancel,
+        _progress: &mut dyn FnMut(lang_api::HeapProgress),
+    ) -> Result<lang_api::HeapSnapshot> {
+        Err(format!("{} cannot read a heap dump", self.id()).into())
     }
 
     /// Every file one profile run left: a runtime may write one recording per JVM.

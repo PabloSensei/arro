@@ -21,6 +21,7 @@ use ui_kit::*;
 use workspace::{SERVICES_TOOL, TERMINAL_TOOL, Workspace};
 
 use crate::ansi::{Line, OutputBuffers, Style};
+use crate::kubernetes::KubeSection;
 use crate::prompt::Prompt;
 use crate::run::{RunPanel, error_style, info, line_element, wrapped_line_element};
 use crate::terminal_panel::ActiveTerminal;
@@ -156,6 +157,8 @@ pub struct DockerPanel {
     show_all_runs: bool,
     /// The panel drains the watch and the logs while this runs.
     polling: bool,
+    /// The Kubernetes node beside Docker, with its own watch and actions.
+    pub(crate) kube: KubeSection,
 }
 
 fn find_cli() -> Option<DockerCli> {
@@ -249,6 +252,7 @@ fn counter(containers: &[Container], members: &[usize]) -> String {
 impl DockerPanel {
     pub fn create(
         root: PathBuf,
+        state_dir: PathBuf,
         workspace: &Workspace,
         weak: WeakEntity<Workspace>,
         window: AnyWindowHandle,
@@ -268,6 +272,7 @@ impl DockerPanel {
                 .iter()
                 .map(|name| root.join(name))
                 .find(|path| path.is_file());
+            let kube = KubeSection::new(state_dir, weak.clone(), window, cx);
             let panel = Self {
                 workspace: weak,
                 window,
@@ -298,6 +303,7 @@ impl DockerPanel {
                 run_states: BTreeMap::new(),
                 show_all_runs,
                 polling: false,
+                kube,
             };
             if let Some(workspace) = observer.upgrade() {
                 cx.observe(&workspace, |this: &mut Self, _, cx| {
@@ -305,6 +311,10 @@ impl DockerPanel {
                 })
                 .detach();
             }
+            cx.observe_global::<workspace::Settings>(|this: &mut Self, cx| {
+                this.kube.settings_changed(cx)
+            })
+            .detach();
             panel
         })
     }
@@ -479,6 +489,7 @@ impl DockerPanel {
                 .iter()
                 .map(|line| format!("docker log {}", line.text)),
         );
+        lines.extend(self.kube.report());
         lines
     }
 
@@ -540,6 +551,7 @@ impl DockerPanel {
             self.watch = None;
             self.stop_logs(cx);
         }
+        self.kube.set_visible(open, cx);
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
@@ -856,6 +868,7 @@ impl DockerPanel {
     }
 
     fn select(&mut self, selected: Selected, cx: &mut Context<Self>) {
+        self.kube.clear_selection();
         let run = matches!(selected, Selected::Run(_));
         self.selected = Some(selected);
         self.tab = if run {
@@ -865,6 +878,17 @@ impl DockerPanel {
         };
         self.restart_logs(cx);
         self.save_state(cx);
+    }
+
+    /// A node of the Kubernetes section was clicked: the Docker selection and its log go
+    /// away, and the section shows the node on the right.
+    pub(crate) fn kube_select(&mut self, node: crate::kubernetes::Node, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.stop_logs(cx);
+        self.lines.clear();
+        self.output = OutputBuffers::default();
+        self.kube.select(node, cx);
+        cx.notify();
     }
 
     fn toggle_section(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -942,6 +966,10 @@ impl DockerPanel {
 
     /// The name of the node on the right and its state.
     fn selection_title(&self) -> (SharedString, SharedString) {
+        if self.kube.selected().is_some() {
+            let (title, hint) = self.kube.selection_title();
+            return (title.into(), hint.into());
+        }
         if let Some(name) = self.selected_run() {
             return (name.into(), String::new().into());
         }
@@ -1115,6 +1143,7 @@ impl DockerPanel {
             .into_any_element(),
         );
         if !up || !daemon_open {
+            rows.extend(self.kube.tree(theme, cx));
             return rows;
         }
         if let Some(context) = self
@@ -1260,6 +1289,7 @@ impl DockerPanel {
                 );
             }
         }
+        rows.extend(self.kube.tree(theme, cx));
         rows
     }
 
@@ -1469,12 +1499,10 @@ impl DockerPanel {
         Vec::new()
     }
 
-    fn header(
-        &self,
-        theme: &Theme,
-        show_labels: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    fn header(&self, theme: &Theme, show_labels: bool, cx: &mut Context<Self>) -> AnyElement {
+        if self.kube.selected().is_some() {
+            return self.kube.header(theme, show_labels, cx);
+        }
         let (title, hint) = match (self.selected_run(), self.selected_run_group()) {
             (Some(name), _) => (name.into(), self.run_state(name, cx).text().into()),
             (None, Some(group)) => self.run_group(group, cx).map_or_else(
@@ -1532,6 +1560,7 @@ impl DockerPanel {
                         )
                     })),
             )
+            .into_any_element()
     }
 
     fn header_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1741,6 +1770,9 @@ impl DockerPanel {
     }
 
     fn tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+        if self.kube.selected().is_some() {
+            return self.kube.tabs(theme, cx);
+        }
         if self.selected_run().is_some() {
             let live = self.selected_live(cx).is_some();
             return Some(
@@ -1810,6 +1842,9 @@ impl DockerPanel {
     }
 
     fn body(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        if self.kube.selected().is_some() {
+            return self.kube.body(theme, window, cx);
+        }
         if self.selected_run().is_some() {
             if self.tab == RightTab::Actuator && self.selected_live(cx).is_some() {
                 return self.run_live(theme, cx);
@@ -2290,7 +2325,7 @@ fn section_row(
 
 /// A button of the header: an icon, its name while the window has room for it, and a
 /// tooltip in every case. The name never takes the room of a neighbour.
-fn action_button(
+pub(crate) fn action_button(
     action: &'static str,
     icon_name: &'static str,
     label: &'static str,
@@ -2323,7 +2358,7 @@ fn action_button(
         .children(show_label.then(|| div().flex_none().child(label)))
 }
 
-fn tab_button(
+pub(crate) fn tab_button(
     id: &'static str,
     label: &'static str,
     active: bool,
@@ -2353,7 +2388,7 @@ fn tab_button(
         .child(label)
 }
 
-fn empty_state(text: &'static str, theme: &Theme) -> Div {
+pub(crate) fn empty_state(text: &'static str, theme: &Theme) -> Div {
     div()
         .flex()
         .flex_1()

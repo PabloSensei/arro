@@ -91,6 +91,19 @@ pub(crate) enum Pick {
         line: usize,
         expression: String,
     },
+    /// A correction of a misspelled word. A word of a declaration renames the symbol.
+    Spelling {
+        label: String,
+        range: Range<usize>,
+        replacement: String,
+        declaration: bool,
+    },
+    /// Alt+Enter saved a misspelled word to a dictionary.
+    SaveSpelling {
+        label: String,
+        word: String,
+        project: bool,
+    },
 }
 
 impl Pick {
@@ -105,7 +118,9 @@ impl Pick {
             | Self::Unwrap { label, .. }
             | Self::Suppress { label, .. }
             | Self::DisableInspection { label, .. }
-            | Self::EditInspection { label, .. } => label,
+            | Self::EditInspection { label, .. }
+            | Self::Spelling { label, .. }
+            | Self::SaveSpelling { label, .. } => label,
             Self::CreateTest { .. } => "Create Test",
             Self::InlineWatch { .. } => "Add Inline Watch",
         }
@@ -291,6 +306,97 @@ impl EditorView {
         self.apply_change(version, change, cx);
     }
 
+    /// Applies a correction of a misspelled word. A piece of a declaration name
+    /// renames the symbol, so every use follows; a word of prose is a plain edit.
+    fn apply_correction(
+        &mut self,
+        version: i32,
+        range: Range<usize>,
+        replacement: String,
+        declaration: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return;
+        };
+        if state.version() as i32 != version {
+            return;
+        }
+        if !declaration {
+            let span = TextSpan {
+                start: point_at(&state.store(), range.start),
+                end: point_at(&state.store(), range.end),
+            };
+            self.apply_document_edits(
+                vec![DocumentEdit {
+                    span,
+                    text: replacement,
+                }],
+                cx,
+            );
+            return;
+        }
+        let Some(provider) = lsp.support.rename() else {
+            let span = TextSpan {
+                start: point_at(&state.store(), range.start),
+                end: point_at(&state.store(), range.end),
+            };
+            self.apply_document_edits(
+                vec![DocumentEdit {
+                    span,
+                    text: replacement,
+                }],
+                cx,
+            );
+            return;
+        };
+        let text = state.text();
+        let (start, end) = Self::identifier_around(&text, range.clone());
+        let new_name = format!(
+            "{}{}{}",
+            &text[start..range.start],
+            replacement,
+            &text[range.end..end]
+        );
+        let Some(spot) = self.spot_at(start) else {
+            return;
+        };
+        let replies = ask(provider, lang_api::RenameQuery { spot, new_name });
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                if let Some((change, _)) = answer {
+                    this.apply_change(version, change, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The bytes of the identifier around `range`, which is a piece of it.
+    fn identifier_around(text: &str, range: Range<usize>) -> (usize, usize) {
+        let is_name =
+            |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+        let mut start = range.start.min(text.len());
+        while start > 0 {
+            let character = text[..start].chars().next_back().unwrap_or(' ');
+            if !is_name(character) {
+                break;
+            }
+            start -= character.len_utf8();
+        }
+        let mut end = range.end.min(text.len());
+        while end < text.len() {
+            let character = text[end..].chars().next().unwrap_or(' ');
+            if !is_name(character) {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        (start, end)
+    }
+
     /// Opens a pick list at the caret, or says `empty` when there is nothing.
     pub(crate) fn show_picks(
         &mut self,
@@ -462,6 +568,7 @@ impl EditorView {
             return rows;
         };
         let caret = state.selections().primary().head;
+        rows.extend(self.spelling_picks(caret));
         if !lsp.support.can_create_test(&state.text(), caret) {
             return rows;
         }
@@ -471,7 +578,38 @@ impl EditorView {
         rows
     }
 
-    /// The rows that suppress or turn off the check of the problem under `caret`.
+    /// The rows of a misspelled word: its corrections, saving the word to a dictionary
+    /// and turning the check off.
+    fn spelling_picks(&self, caret: usize) -> Vec<Pick> {
+        let Some(mark) = self.spelling_mark_at(caret) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for suggestion in &mark.suggestions {
+            rows.push(Pick::Spelling {
+                label: format!("Change to '{suggestion}'"),
+                range: mark.range.clone(),
+                replacement: suggestion.clone(),
+                declaration: mark.declaration,
+            });
+        }
+        rows.push(Pick::SaveSpelling {
+            label: format!("Save '{}' to project dictionary", mark.word),
+            word: mark.word.clone(),
+            project: true,
+        });
+        rows.push(Pick::SaveSpelling {
+            label: "Save to application dictionary".to_owned(),
+            word: mark.word.clone(),
+            project: false,
+        });
+        rows.push(Pick::DisableInspection {
+            label: "Disable spell checking".to_owned(),
+            id: lang_api::SPELLING_INSPECTION.to_owned(),
+            title: lang_api::SPELLING_TITLE.to_owned(),
+        });
+        rows
+    }
     fn inspection_picks(&self, caret: usize) -> Vec<Pick> {
         let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
             return Vec::new();
@@ -484,6 +622,10 @@ impl EditorView {
         else {
             return Vec::new();
         };
+        // The spelling check names itself in the rows of [`Self::spelling_picks`].
+        if mark.code.as_deref() == Some(lang_api::SPELLING_INSPECTION) {
+            return Vec::new();
+        }
         let Some(code) = mark.code.clone() else {
             return Vec::new();
         };
@@ -611,6 +753,18 @@ impl EditorView {
                     (Some(Pick::CreateTest { spot }), _) => cx.emit(EditorEvent::CreateTest(spot)),
                     (Some(Pick::InlineWatch { line, expression }), _) => {
                         cx.emit(EditorEvent::AddInlineWatch { line, expression })
+                    }
+                    (
+                        Some(Pick::Spelling {
+                            range,
+                            replacement,
+                            declaration,
+                            ..
+                        }),
+                        Some(version),
+                    ) => self.apply_correction(version, range, replacement, declaration, cx),
+                    (Some(Pick::SaveSpelling { word, project, .. }), _) => {
+                        cx.emit(EditorEvent::SaveSpelling { word, project })
                     }
                     _ => {}
                 }

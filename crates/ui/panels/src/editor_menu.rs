@@ -29,6 +29,7 @@ impl MenuModel {
             actions::GOTO_IMPLEMENTATION,
             actions::GOTO_SUPER,
             actions::SHOW_DIAGRAM,
+            actions::SHOW_SEQUENCE_DIAGRAM,
             actions::FIND_USAGES,
             actions::RENAME,
             actions::CHANGE_SIGNATURE,
@@ -160,6 +161,10 @@ fn build(
     let rename = matches && support.as_ref().is_some_and(|s| s.rename().is_some());
     let format = matches && support.as_ref().is_some_and(|s| s.format().is_some());
     let diagram = matches && support.as_ref().is_some_and(|s| s.type_graph().is_some());
+    let sequence = matches
+        && support
+            .as_ref()
+            .is_some_and(|s| s.sequence_diagram().is_some());
     let moves = matches
         && support
             .as_ref()
@@ -291,6 +296,11 @@ fn build(
     entries.push(MenuEntry::separator());
     entries.push(entry("Comment Line", actions::TOGGLE_COMMENT, true));
     entries.push(entry("Show Diagram", actions::SHOW_DIAGRAM, diagram));
+    entries.push(entry(
+        "Generate Sequence Diagram",
+        actions::SHOW_SEQUENCE_DIAGRAM,
+        sequence,
+    ));
 
     let (can_run, can_debug) = (model.can_run, model.can_debug);
     if can_run || can_debug {

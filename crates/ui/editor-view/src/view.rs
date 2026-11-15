@@ -467,6 +467,19 @@ pub struct PlaceTarget {
     pub offset: usize,
 }
 
+/// A badge of the gutter that opens a menu of actions rather than a list of places: the
+/// caller decides what those actions are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionMark {
+    /// Buffer line from zero.
+    pub line: u32,
+    /// The icon of the badge, from the icon set of the editor.
+    pub icon: SharedString,
+    pub color: Hsla,
+    /// The hint of the badge under the pointer.
+    pub hint: SharedString,
+}
+
 /// A badge in the gutter beside the line number: a click with one place goes to it, a
 /// click with several opens their list. The colour and the icon are the caller's.
 #[derive(Clone, Debug, PartialEq)]
@@ -603,6 +616,8 @@ pub enum EditorEvent {
     MethodHierarchy(lang_api::DocumentSpot),
     /// Ctrl+Alt+Shift+U: the window shows the diagram of the type at this place.
     ShowDiagram(lang_api::DocumentSpot),
+    /// The window shows the sequence diagram of the method at this place.
+    ShowSequenceDiagram(lang_api::DocumentSpot),
     /// Safe Delete of a type alone in its file: the window removes the file too.
     DeleteFile(PathBuf),
     /// A generation created files: the window writes them and opens the first one.
@@ -621,6 +636,9 @@ pub enum EditorEvent {
     EndpointMark(u32),
     /// A badge of the gutter was clicked: the line it stands on, from zero.
     PlaceMark(u32),
+    /// A badge of the gutter that opens a menu of actions was clicked: the line it
+    /// stands on, from zero.
+    ActionMark(u32),
     /// Ctrl+Enter in a file whose format runs something, such as a request file: the
     /// line of the caret, from zero.
     RunRequest(u32),
@@ -657,6 +675,12 @@ pub enum EditorEvent {
     DisableInspection {
         id: String,
         title: String,
+    },
+    /// Alt+Enter saved a misspelled word to the project dictionary or to the one of the
+    /// user. The window writes the file and asks the check again.
+    SaveSpelling {
+        word: String,
+        project: bool,
     },
     /// Alt+Enter chose to open the settings of a check.
     EditInspection(String),
@@ -890,6 +914,9 @@ pub struct EditorView {
     pub(crate) run_marks: Vec<RunMark>,
     pub(crate) endpoint_marks: Vec<EndpointMark>,
     pub(crate) place_marks: Vec<PlaceMark>,
+    /// The badges that open a menu of actions of their own, such as Apply for a YAML
+    /// document.
+    pub(crate) action_marks: Vec<ActionMark>,
     pub(crate) coverage: Vec<CoverageMark>,
     /// Buffer lines of the breakpoints, from zero.
     pub(crate) breakpoints: Vec<u32>,
@@ -955,6 +982,12 @@ pub struct EditorView {
     /// The program is stopped in this file, so a caret expression can become an inline
     /// watch.
     pub(crate) inline_watch_ready: bool,
+    /// The words a spelling check found, by the bytes of the text they cover.
+    pub(crate) spelling_marks: Vec<crate::spelling::SpellingMark>,
+    /// The buffer version the marks were checked at.
+    pub(crate) spelling_version: Option<i32>,
+    /// The buffer version whose check is on its way.
+    pub(crate) spelling_asked: Option<i32>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -1428,6 +1461,7 @@ impl EditorView {
             run_marks: Vec::new(),
             endpoint_marks: Vec::new(),
             place_marks: Vec::new(),
+            action_marks: Vec::new(),
             coverage: Vec::new(),
             breakpoints: Vec::new(),
             muted_breakpoints: Vec::new(),
@@ -1464,6 +1498,9 @@ impl EditorView {
             debug_values: Vec::new(),
             inline_watches: Vec::new(),
             inline_watch_ready: false,
+            spelling_marks: Vec::new(),
+            spelling_version: None,
+            spelling_asked: None,
         }
     }
 
@@ -1614,6 +1651,18 @@ impl EditorView {
 
     pub fn place_marks(&self) -> &[PlaceMark] {
         &self.place_marks
+    }
+
+    /// Replaces the badges of the gutter that open a menu of actions.
+    pub fn set_action_marks(&mut self, marks: Vec<ActionMark>, cx: &mut Context<Self>) {
+        if self.action_marks != marks {
+            self.action_marks = marks;
+            cx.notify();
+        }
+    }
+
+    pub fn action_marks(&self) -> &[ActionMark] {
+        &self.action_marks
     }
 
     /// Replaces the coverage stripes of the gutter.
@@ -3837,6 +3886,7 @@ impl EditorView {
             actions::IMPLEMENT_METHODS => return self.override_methods(true, cx),
             actions::CALL_HIERARCHY => return self.call_hierarchy(cx),
             actions::SHOW_DIAGRAM => return self.show_diagram(cx),
+            actions::SHOW_SEQUENCE_DIAGRAM => return self.show_sequence_diagram(cx),
             actions::GOTO_TYPE_DECLARATION => return self.type_declaration(cx),
             actions::QUICK_DEFINITION => return self.quick_definition(cx),
             actions::COPY_REFERENCE => return self.copy_reference(cx),
@@ -4333,6 +4383,16 @@ impl EditorView {
                     .any(|mark| mark.line as usize == buffer_line)
             {
                 cx.emit(EditorEvent::PlaceMark(buffer_line as u32));
+                return;
+            }
+            if x >= px(crate::element::ENDPOINT_X)
+                && x < px(crate::element::ENDPOINT_X + 16.)
+                && self
+                    .action_marks
+                    .iter()
+                    .any(|mark| mark.line as usize == buffer_line)
+            {
+                cx.emit(EditorEvent::ActionMark(buffer_line as u32));
                 return;
             }
             if x >= px(crate::element::ENDPOINT_X)

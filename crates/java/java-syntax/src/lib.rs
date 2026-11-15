@@ -1,15 +1,18 @@
 //! Grammar and queries of the language.
 
+mod config_keys;
 mod diagram;
 mod edit;
 mod endpoints;
 mod inline;
+mod spelling;
 mod spring_beans;
 mod spring_data;
 mod structural;
 
 use std::sync::OnceLock;
 
+pub use config_keys::{ConfigKey, config_key_at};
 pub use diagram::{
     DiagramField, DiagramFile, DiagramMethod, DiagramType, DiagramTypeKind, DiagramTypeRef,
     DiagramVisibility, diagram_file,
@@ -23,6 +26,7 @@ pub use edit::{
 pub use endpoints::endpoints;
 pub use inline::identifiers_around;
 pub use lang_api::StructuralTemplate as ReadyTemplate;
+pub use spelling::{Place as SpellPlaceFound, places as spelling_places};
 pub use spring_beans::{
     Annotation, Constructor, Field, File as SpringFile, Method, Parameter, Type, spring_file,
 };

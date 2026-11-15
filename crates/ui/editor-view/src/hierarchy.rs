@@ -494,4 +494,20 @@ impl EditorView {
         }
         cx.emit(EditorEvent::ShowDiagram(spot));
     }
+
+    /// The window shows the sequence diagram of the method at the caret.
+    pub(crate) fn show_sequence_diagram(&mut self, cx: &mut Context<Self>) {
+        let Some((spot, _)) = self.spot() else {
+            return;
+        };
+        if self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.support.sequence_diagram())
+            .is_none()
+        {
+            return;
+        }
+        cx.emit(EditorEvent::ShowSequenceDiagram(spot));
+    }
 }

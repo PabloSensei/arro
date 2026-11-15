@@ -2164,6 +2164,65 @@ impl RunPanel {
         &self.profile_recordings
     }
 
+    /// The provider and the model that read `path` as a heap dump, when the language can.
+    pub fn heap_reader(
+        &self,
+        path: &StdPath,
+    ) -> Option<(Arc<dyn RunConfigProvider>, ProjectModel)> {
+        let model = self
+            .session
+            .as_ref()
+            .and_then(ProjectSession::model)
+            .map_or_else(ProjectModel::default, |model| (*model).clone());
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.is_heap_dump(path))?
+            .clone();
+        Some((provider, model))
+    }
+
+    /// What Capture Memory Snapshot needs from the running program, when there is one.
+    pub fn heap_request(&self) -> Option<crate::heap_dump::HeapRequest> {
+        self.heap_request_for(self.program_pid?)
+    }
+
+    /// The same request for a program whose process the caller knows, such as the
+    /// debuggee the adapter reported.
+    pub fn heap_request_for(&self, pid: u32) -> Option<crate::heap_dump::HeapRequest> {
+        let model = self.session.as_ref().and_then(ProjectSession::model)?;
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.supports_heap_dump())?
+            .clone();
+        let name = self.run_config.clone().unwrap_or_else(|| "heap".to_owned());
+        let stem: String = name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let file = self
+            .root
+            .join(".arro")
+            .join("snapshots")
+            .join(format!("{stem}-{stamp}.hprof"));
+        Some(crate::heap_dump::HeapRequest {
+            pid,
+            provider,
+            model: (*model).clone(),
+            file,
+        })
+    }
+
     /// Whether a profile run records now: the window offers Stop and Show Snapshot.
     pub fn profile_running(&self) -> bool {
         self.profile_pending.is_some()
@@ -3949,6 +4008,19 @@ impl Render for RunPanel {
                     .debug_selector(|| "run-dump-threads".to_owned())
                     .on_click(cx.listener(|this, _, window, cx| this.dump_threads(window, cx)))
                     .child(dump_icon),
+            )
+            .child(
+                button_frame("run-heap-dump", "Capture Memory Snapshot", None, &theme)
+                    .debug_selector(|| "run-heap-dump".to_owned())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let workspace = this.workspace.clone();
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                crate::heap_dump::capture(workspace, window, cx)
+                            })
+                            .ok();
+                    }))
+                    .child(icon("general/logs", &theme)),
             )
             .children(profiling.then(|| {
                 button_frame("run-stop-snapshot", "Stop and Show Snapshot", None, &theme)

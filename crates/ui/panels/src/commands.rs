@@ -1269,7 +1269,10 @@ fn open_paths(_workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
                 if path.is_dir() {
                     workspace.open_project(path, cx);
                 } else {
-                    workspace.open_file(path, window, cx);
+                    let heap = crate::heap_dump::open_file(workspace, path.clone(), window, cx);
+                    if !heap {
+                        workspace.open_file(path, window, cx);
+                    }
                 }
             })
             .ok();

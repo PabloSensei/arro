@@ -9,22 +9,38 @@ change, and settings and data may move between versions. Most of Arro's code is 
 by AI and reviewed by a human.
 
 This folder holds arro, helpers/, tools/, arro.desktop, arro-256.png, install.sh, this
-file, THIRD-PARTY.txt and NOTICE.txt. There is no installer: unpack the archive anywhere,
-for example in ~/opt, and start ./arro. Arro keeps its settings, state, caches and logs
-outside this folder, in ~/.config/Arro and ~/.local/share/Arro.
+file, THIRD-PARTY.txt and NOTICE.txt. Unpack the archive anywhere and either start
+./arro in place or run ./install.sh, which copies the folder into the home directory,
+links arro in ~/.local/bin and puts the entry in the application menu. Arro keeps its
+settings, state, caches and logs outside the program folder, in ~/.config/Arro and
+~/.local/share/Arro.
 
 The application menu
 --------------------
 
-install.sh adds a shortcut to the menu of this user:
+install.sh installs Arro for the current user, without root:
 
-  ./install.sh
+  ./install.sh               into ~/.local/share/arro;
+  ./install.sh /some/folder  into another folder;
+  ./install.sh --uninstall   remove the folder, the link, the menu entry and the icons.
 
-It asks before it writes anything and puts arro.desktop into
-$XDG_DATA_HOME/applications (~/.local/share/applications by default) and the icon into
-the hicolor theme. Nothing runs it automatically, and no file of the system is changed.
-The shortcut names the folder you unpacked Arro into; move the folder and run install.sh
-again.
+It copies the program and everything next to it, makes the link ~/.local/bin/arro,
+writes arro.desktop into $XDG_DATA_HOME/applications (~/.local/share/applications by
+default) and the icons into the hicolor theme of the same folder. The menu entry opens
+the files and folders of a project with Arro, like the packages do. The databases of
+the menu and of the icon theme are refreshed when update-desktop-database and
+gtk-update-icon-cache are installed. No file outside the home folder is changed.
+
+Arro updates itself in the folder install.sh put it in. Moving that folder breaks the
+link and the menu entry: install again from the new place.
+
+Packages
+--------
+
+Debian and Ubuntu have a .deb, Fedora and openSUSE an .rpm; both install into
+/opt/arro and link arro from /usr/bin. A package installation belongs to the package
+manager: Arro does not replace those files itself and its update window opens the
+release page instead.
 
 What you need besides this folder
 ---------------------------------
@@ -96,8 +112,8 @@ The keymap follows IntelliJ IDEA, as on Windows:
 Limitations of this preview
 ---------------------------
 
-- The package is not signed and not distributed as a distribution package; there is no
-  .deb, .rpm or Flatpak yet.
+- The package is not signed and is not part of a distribution repository: the .deb and
+  the .rpm come from the release page only. There is no Flatpak yet.
 - The window is drawn through Wayland or X11 and needs libfontconfig, libwayland,
   libx11, libxcb and libxkbcommon at run time. On a headless machine Arro does not start.
 - The integrated terminal uses the system pseudo terminal of Linux; ConPTY of Windows is

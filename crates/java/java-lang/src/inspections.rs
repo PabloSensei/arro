@@ -71,6 +71,78 @@ const NATIVE: &[(&str, &str, &str, InspectionLevel)] = &[
         "Build Files",
         InspectionLevel::Info,
     ),
+    (
+        "jakarta.noBean",
+        "No bean of the injected type",
+        "CDI",
+        InspectionLevel::Warning,
+    ),
+    (
+        "jakarta.multipleBeans",
+        "More than one bean of the injected type",
+        "CDI",
+        InspectionLevel::Warning,
+    ),
+    (
+        "micronaut.noBean",
+        "No bean of the injected type",
+        "Micronaut",
+        InspectionLevel::Warning,
+    ),
+    (
+        "micronaut.multipleBeans",
+        "More than one bean of the injected type",
+        "Micronaut",
+        InspectionLevel::Warning,
+    ),
+    (
+        "quarkus.config.unknownProperty",
+        "Unknown Quarkus property",
+        "Quarkus",
+        InspectionLevel::Warning,
+    ),
+    (
+        "micronaut.config.unknownProperty",
+        "Unknown Micronaut property",
+        "Micronaut",
+        InspectionLevel::Warning,
+    ),
+    (
+        "flyway.duplicateVersion",
+        "Repeated Flyway version",
+        "Migrations",
+        InspectionLevel::Error,
+    ),
+    (
+        "flyway.invalidName",
+        "Flyway file name is not read by the tool",
+        "Migrations",
+        InspectionLevel::Error,
+    ),
+    (
+        "flyway.changedMigration",
+        "Applied migration was changed",
+        "Migrations",
+        InspectionLevel::Warning,
+    ),
+    (
+        "liquibase.duplicateChangeSet",
+        "Repeated changeset id and author",
+        "Migrations",
+        InspectionLevel::Error,
+    ),
+    (
+        "liquibase.includeNotFound",
+        "Include names no file",
+        "Migrations",
+        InspectionLevel::Error,
+    ),
+    (
+        lang_api::SPELLING_INSPECTION,
+        lang_api::SPELLING_TITLE,
+        lang_api::SPELLING_GROUP,
+        InspectionLevel::WeakWarning,
+    ),
 ];
 
 /// The compiler problems of Eclipse JDT that the server takes from its settings. The id

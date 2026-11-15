@@ -4,6 +4,8 @@
 //! JVMs of its tasks.
 
 #[allow(unused_imports)] // The tests read them through `super::*`.
+pub use java_project::heap::{capture_of, read as read_heap_dump};
+#[allow(unused_imports)] // The tests read them through `super::*`.
 pub use java_project::profile::{
     MAX_RECORDINGS, MAX_SAMPLES, PROFILE_FOLDER, parse_reader, parse_report, recording_file,
     recording_flag, recordings, report, report_of, run_recordings, snapshot, supported,

@@ -9,6 +9,7 @@ mod mains;
 mod pathing;
 mod profile;
 mod provider;
+mod quarkus;
 mod test_sources;
 mod testing;
 
@@ -22,5 +23,6 @@ pub use mains::{EntryPoint, find_entry_points, parse_entry_points};
 pub use pathing::{classpath_jar, write_classpath_jar};
 pub use profile::{recording_file, recording_flag};
 pub use provider::{DEBUG_AGENT, JavaProvider, JavaTarget, PROVIDER_ID};
+pub use quarkus::QuarkusDevProvider;
 pub use test_sources::{TestClass, TestMethod, find_tests, parse_tests};
 pub use testing::JavaTestProvider;

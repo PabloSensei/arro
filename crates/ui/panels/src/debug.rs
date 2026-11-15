@@ -5076,6 +5076,27 @@ impl Render for DebugPanel {
                     &theme,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.show_breakpoints(window, cx))),
+            )
+            .child(
+                tool_button(
+                    "debug-heap-dump",
+                    "general/logs",
+                    "Capture Memory Snapshot",
+                    None,
+                    active,
+                    &theme,
+                )
+                .when(active, |button| {
+                    button.on_click(cx.listener(|this, _, window, cx| {
+                        let workspace = this.workspace.clone();
+                        let pid = this.snapshot.process_id;
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                crate::heap_dump::capture_pid(workspace, pid, window, cx)
+                            })
+                            .ok();
+                    }))
+                }),
             );
         let state = self.state_text().map(str::to_owned);
         let toolbar = match state {

@@ -2359,6 +2359,8 @@ pub(crate) struct JavaMessages {
     /// messages and the server. Their source is the text itself, not the server.
     data_completion: Option<Arc<dyn Provider<DocumentSpot, CompletionList>>>,
     data_navigation: Option<Arc<dyn Provider<NavigationQuery, Vec<SourceSpan>>>>,
+    /// The configuration keys of the project, for the annotations that name one.
+    config: Option<Arc<crate::spring::SpringConfigSupport>>,
 }
 
 impl JavaMessages {
@@ -2375,6 +2377,7 @@ impl JavaMessages {
             runtime,
             data_completion: None,
             data_navigation: None,
+            config: None,
         }
     }
 
@@ -2387,6 +2390,13 @@ impl JavaMessages {
     ) -> Self {
         self.data_completion = Some(completion);
         self.data_navigation = Some(navigation);
+        self
+    }
+
+    /// Puts the keys of the configuration files in front of the server for the Java
+    /// annotations that name one.
+    pub(crate) fn with_config(mut self, config: Arc<crate::spring::SpringConfigSupport>) -> Self {
+        self.config = Some(config);
         self
     }
 
@@ -2405,6 +2415,26 @@ impl JavaMessages {
         let offset = offset_in(&text, point);
         java_key_candidate(&text, offset).then_some((text, offset))
     }
+
+    /// The text and the caret when the caret looks like the key of a configuration
+    /// annotation: `@ConfigProperty`, `@Property` or `@Value` near a string literal. The
+    /// parse itself runs off the caller's thread.
+    fn config_candidate(&self, uri: &str, point: TextPoint) -> Option<(Arc<str>, usize)> {
+        self.config.as_ref()?;
+        let text = self.text_of(uri)?;
+        let offset = offset_in(&text, point);
+        config_key_hint(&text, offset).then_some((text, offset))
+    }
+}
+
+/// Whether an annotation that names a configuration key is close to the offset.
+fn config_key_hint(text: &str, offset: usize) -> bool {
+    let mut start = offset.saturating_sub(400).min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let window = &text[start..offset.min(text.len())];
+    window.contains("@ConfigProperty") || window.contains("@Property") || window.contains("@Value")
 }
 
 /// Whether the caret sits in a string literal with a key call or a validation member
@@ -2423,6 +2453,30 @@ fn java_key_candidate(text: &str, offset: usize) -> bool {
 impl Provider<DocumentSpot, CompletionList> for JavaMessages {
     fn start(&self, query: DocumentSpot, cancel: Cancel, mut reply: Reply<CompletionList>) {
         let Some((text, offset)) = self.candidate(&query.uri, query.point) else {
+            if let Some((text, offset)) = self.config_candidate(&query.uri, query.point) {
+                let config = self.config.clone();
+                let inner = self.inner.clone();
+                let data = self.data_completion.clone();
+                self.runtime.spawn_blocking(move || {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    if let Some(config) = &config
+                        && let Some(list) = config.annotation_completion(&text, offset)
+                    {
+                        let _ = reply.send(Answer::new(list, Confidence::Certain, SOURCE));
+                        return;
+                    }
+                    match &data {
+                        Some(provider) => provider.start(query, cancel, reply),
+                        None => {
+                            (inner.as_ref() as &dyn Provider<DocumentSpot, CompletionList>)
+                                .start(query, cancel, reply);
+                        }
+                    }
+                });
+                return;
+            }
             match &self.data_completion {
                 Some(provider) => provider.start(query, cancel, reply),
                 None => (self.inner.as_ref() as &dyn Provider<DocumentSpot, CompletionList>)
@@ -2454,6 +2508,27 @@ impl Provider<DocumentSpot, CompletionList> for JavaMessages {
 impl Provider<DocumentSpot, HoverText> for JavaMessages {
     fn start(&self, query: DocumentSpot, cancel: Cancel, mut reply: Reply<HoverText>) {
         let Some((text, offset)) = self.candidate(&query.uri, query.point) else {
+            if let Some((text, offset)) = self.config_candidate(&query.uri, query.point) {
+                let config = self.config.clone();
+                let inner = self.inner.clone();
+                self.runtime.spawn_blocking(move || {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let text = config
+                        .as_ref()
+                        .and_then(|config| config.annotation_documentation(&text, offset))
+                        .unwrap_or_default();
+                    if !text.is_empty() {
+                        let _ =
+                            reply.send(Answer::new(HoverText(text), Confidence::Certain, SOURCE));
+                        return;
+                    }
+                    (inner.as_ref() as &dyn Provider<DocumentSpot, HoverText>)
+                        .start(query, cancel, reply);
+                });
+                return;
+            }
             (self.inner.as_ref() as &dyn Provider<DocumentSpot, HoverText>)
                 .start(query, cancel, reply);
             return;
@@ -2482,6 +2557,32 @@ impl Provider<NavigationQuery, Vec<SourceSpan>> for JavaMessages {
             .then(|| self.candidate(&query.spot.uri, query.spot.point))
             .flatten();
         let Some((text, offset)) = candidate else {
+            let config_candidate = (query.kind == NavigationKind::Definition)
+                .then(|| self.config_candidate(&query.spot.uri, query.spot.point))
+                .flatten();
+            if let Some((text, offset)) = config_candidate {
+                let config = self.config.clone();
+                let inner = self.inner.clone();
+                let data = self.data_navigation.clone();
+                self.runtime.spawn_blocking(move || {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    if let Some(config) = &config
+                        && let Some(spans) = config.annotation_navigation(&text, offset)
+                        && !spans.is_empty()
+                    {
+                        let _ = reply.send(Answer::new(spans, Confidence::Certain, SOURCE));
+                        return;
+                    }
+                    match &data {
+                        Some(provider) => provider.start(query, cancel, reply),
+                        None => (inner.as_ref() as &dyn Provider<NavigationQuery, Vec<SourceSpan>>)
+                            .start(query, cancel, reply),
+                    }
+                });
+                return;
+            }
             match &self.data_navigation {
                 Some(provider) => provider.start(query, cancel, reply),
                 None => (self.inner.as_ref() as &dyn Provider<NavigationQuery, Vec<SourceSpan>>)

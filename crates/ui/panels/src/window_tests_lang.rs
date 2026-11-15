@@ -18,9 +18,9 @@ use lang_api::{
     InlayHintQuery, InspectionInfo, InspectionSettings, LanguageFn, LanguageId, LanguageSupport,
     MoveDestination, MoveDestinationProvider, MoveOutcome, MoveProvider, MoveQuery, MoveRequest,
     NavigationProvider, NavigationQuery, Provider, Queries, ReferencesProvider, RenameProvider,
-    RenameQuery, SemanticServer, Severity, SourceEdit, SourceId, SourceSpan, SyntaxProvider,
-    TextPoint, TextSpan, WorkspaceChange, WorkspaceDiagnosticsProvider, WorkspaceDiagnosticsQuery,
-    offset_in,
+    RenameQuery, SemanticServer, Severity, SourceEdit, SourceId, SourceSpan, SpellPlace,
+    SpellQuery, SpellingProvider, SyntaxProvider, TextPoint, TextSpan, WorkspaceChange,
+    WorkspaceDiagnosticsProvider, WorkspaceDiagnosticsQuery, offset_in,
 };
 use platform::CanonPath;
 use ui_kit::gpui;
@@ -204,6 +204,8 @@ pub(crate) struct FakeLanguage {
     move_target: Mutex<Option<PathBuf>>,
     closed: Mutex<Option<PathBuf>>,
     restarts: AtomicUsize,
+    /// The places the spelling check reads, as the test set them.
+    spelling: Mutex<Vec<SpellPlace>>,
 }
 
 impl FakeLanguage {
@@ -223,6 +225,7 @@ impl FakeLanguage {
             move_target: Mutex::new(None),
             closed: Mutex::new(None),
             restarts: AtomicUsize::new(0),
+            spelling: Mutex::new(Vec::new()),
         })
     }
 
@@ -254,6 +257,11 @@ impl FakeLanguage {
 
     pub(crate) fn set_references(&self, spans: Vec<SourceSpan>) {
         *self.references.lock().unwrap() = spans;
+    }
+
+    /// The pieces of the text the spelling check reads.
+    pub(crate) fn set_spelling_places(&self, places: Vec<SpellPlace>) {
+        *self.spelling.lock().unwrap() = places;
     }
 
     /// The hints the fake server answers, by the byte offset of their place.
@@ -496,6 +504,13 @@ impl Provider<DocumentSpot, Vec<SourceSpan>> for FakeLanguage {
     }
 }
 
+impl SpellingProvider for FakeLanguage {
+    fn places(&self, _: &SpellQuery) -> Option<Vec<SpellPlace>> {
+        let places = self.spelling.lock().unwrap().clone();
+        (!places.is_empty()).then_some(places)
+    }
+}
+
 impl Provider<RenameQuery, WorkspaceChange> for FakeLanguage {
     fn start(
         &self,
@@ -679,6 +694,10 @@ impl LanguageSupport for FakeLanguage {
     }
 
     fn rename(&self) -> Option<&RenameProvider> {
+        Some(self)
+    }
+
+    fn spelling(&self) -> Option<&dyn SpellingProvider> {
         Some(self)
     }
 

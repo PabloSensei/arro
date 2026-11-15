@@ -87,12 +87,12 @@ jobs:
                 build-essential binutils ca-certificates cmake curl git pkg-config unzip \
                 openjdk-17-jdk-headless \
                 libfontconfig1-dev libwayland-dev libx11-dev libxcb1-dev \
-                libxkbcommon-dev libxkbcommon-x11-dev > /dev/null
+                libxkbcommon-dev libxkbcommon-x11-dev rpm > /dev/null
               git config --global --add safe.directory /src
               curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
               . "$HOME/.cargo/env"
               cargo run -q -p xtask -- dist --target linux \
-                --out "/work/dist/$NAME" --tools /work/tools --zip --deb
+                --out "/work/dist/$NAME" --tools /work/tools --zip --deb --rpm
               # The newest glibc the program asks for; anything past 2.35 would shut
               # out the systems this build is for.
               newest=$(objdump -T "/work/dist/$NAME/arro" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1)
@@ -103,7 +103,7 @@ jobs:
           cd "$RUNNER_TEMP/dist"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           cat "$name.tar.gz.sha256"
-          for package in arro_*_amd64.deb; do
+          for package in arro_*_amd64.deb arro-*.x86_64.rpm; do
             sha256sum "$package" > "$package.sha256"
             cat "$package.sha256"
           done
@@ -118,6 +118,8 @@ jobs:
             "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256 \
             "$RUNNER_TEMP/dist/"arro_*.deb \
             "$RUNNER_TEMP/dist/"arro_*.deb.sha256 \
+            "$RUNNER_TEMP/dist/"arro-*.x86_64.rpm \
+            "$RUNNER_TEMP/dist/"arro-*.x86_64.rpm.sha256 \
             --clobber
 
       - name: Keep the trial archive
@@ -130,6 +132,8 @@ jobs:
             ${{ runner.temp }}/dist/arro-*.tar.gz.sha256
             ${{ runner.temp }}/dist/arro_*.deb
             ${{ runner.temp }}/dist/arro_*.deb.sha256
+            ${{ runner.temp }}/dist/arro-*.x86_64.rpm
+            ${{ runner.temp }}/dist/arro-*.x86_64.rpm.sha256
           retention-days: 7
 
   macos:
@@ -222,7 +226,8 @@ jobs:
             "arro-$version-linux-x86_64.tar.gz" \
             "arro-$version-macos-aarch64.zip" \
             "arro-$version-macos-aarch64.dmg" \
-            "arro_${version}_amd64.deb"; do
+            "arro_${version}_amd64.deb" \
+            "arro-$version-1.x86_64.rpm"; do
             [ -f "$archive" ] || { echo "missing $archive"; exit 1; }
             [ -f "$archive.sha256" ] || { echo "missing $archive.sha256"; exit 1; }
             expected=$(cut -d' ' -f1 "$archive.sha256")
@@ -246,6 +251,17 @@ jobs:
           contents=$(dpkg-deb --contents "$deb")
           for path in ./opt/arro/arro ./usr/bin/arro ./usr/share/applications/arro.desktop; do
             echo "$contents" | grep -q " $path" || { echo "the package has no $path"; exit 1; }
+          done
+          sudo apt-get install -y -qq rpm > /dev/null
+          rpm="arro-$version-1.x86_64.rpm"
+          [ "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$version" ] \
+            || { echo "the rpm has another version"; exit 1; }
+          files=$(rpm -qpl "$rpm")
+          for path in /opt/arro/arro /usr/bin/arro /usr/share/applications/arro.desktop; do
+            echo "$files" | grep -qx "$path" || { echo "the rpm has no $path"; exit 1; }
+          done
+          for path in /opt /usr /usr/bin /usr/share; do
+            ! echo "$files" | grep -qx "$path" || { echo "the rpm owns $path"; exit 1; }
           done
 
       - name: Publish

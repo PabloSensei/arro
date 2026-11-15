@@ -16,19 +16,22 @@ mod language;
 mod live_templates;
 mod lombok;
 mod messages;
+mod migrations;
 pub mod newproject;
 mod problems;
 mod project;
 mod refactor;
+mod sequence;
 mod session;
 mod setup;
 mod sources;
+mod spelling;
 mod spring;
 mod spring_data;
 mod stack;
 mod test_creation;
 
-pub use beans::{BeanIndex, bean_index};
+pub use beans::{BeanIndex, bean_index, bean_model_for};
 pub use database::DatabaseSupport;
 pub use debug::{DebugExtension, DebugSession, JavaDebugger, ResolvedMain};
 pub use doc::documentation_comments;
@@ -40,7 +43,7 @@ pub use newproject::{NewProjectOptions, project_generators};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use java_exec::{JavaProvider, JavaTestProvider, parse_tests};
+use java_exec::{JavaProvider, JavaTestProvider, QuarkusDevProvider, parse_tests};
 use java_project::{BuildEnv, detect_build_system};
 use lang_api::SymbolProvider;
 use project_model::BuildSystem;
@@ -51,6 +54,7 @@ pub use jdtls_adapter::{ImportFailure, JdtlsConfig, Runtime};
 pub use language::{JavaSyntax, LANGUAGE_ID};
 pub use live_templates::templates_for;
 pub use messages::{MessageBundles, message_bundles};
+pub use migrations::{MigrationFiles, migrations_language};
 pub use project::{JavaProject, OpenError};
 pub use project_model::BuildTools;
 pub use session::{
@@ -96,6 +100,12 @@ pub struct ProjectBuild {
     pub cache_root: PathBuf,
 }
 
+/// The HTTP handlers of one source file, for a window that shows the endpoints of the
+/// project. A test support uses it as the language would.
+pub fn endpoint_scan(path: &Path, text: &str) -> lang_api::EndpointScan {
+    endpoints::scan(path, text)
+}
+
 /// The test classes and test methods of one Java source, for the run marks in the gutter.
 pub fn test_sites(source: &str, path: &Path) -> Vec<TestSite> {
     let mut sites = Vec::new();
@@ -131,15 +141,23 @@ pub fn project_build(
         ..BuildEnv::default()
     };
     let tool = detect_build_system(root, &env);
-    let providers = tool.iter().map(|tool| {
-        let provider = JavaProvider::new(env.clone(), tool.clone());
-        Arc::new(provider) as Arc<dyn RunConfigProvider>
-    });
+    let providers: Vec<Arc<dyn RunConfigProvider>> = tool
+        .iter()
+        .flat_map(|tool| {
+            [
+                Arc::new(JavaProvider::new(env.clone(), tool.clone()))
+                    as Arc<dyn RunConfigProvider>,
+                // A Quarkus module starts through its build tool; the provider finds the
+                // modules that use the framework and offers the Dev Mode of each.
+                Arc::new(QuarkusDevProvider::new(tool.clone())) as Arc<dyn RunConfigProvider>,
+            ]
+        })
+        .collect();
     let tests = tool
         .is_some()
         .then(|| Arc::new(JavaTestProvider::new(env.clone())) as Arc<dyn TestProvider>);
     ProjectBuild {
-        providers: providers.collect(),
+        providers,
         tests,
         cache_root: env.cache_root(),
         tool,

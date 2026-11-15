@@ -23,6 +23,7 @@ lsp-client.workspace = true
 semantic-router.workspace = true
 serde_json = "1.0.154"
 sidecar.workspace = true
+spelling = { path = "../../editor/spelling" }
 syntax = { path = "../../editor/syntax" }
 templates = { path = "../../editor/templates" }
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync", "time"] }

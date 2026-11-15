@@ -14,6 +14,10 @@ const CONTROLLERS: &[&str] = &["RestController", "Controller"];
 const CLASS_MAPPING: &str = "RequestMapping";
 /// The annotation of a path of the second family of frameworks.
 const CLASS_PATH: &str = "Path";
+/// The annotation of the Micronaut controller that prefixes its handlers.
+const MICRONAUT_CONTROLLER: &str = "Controller";
+/// The annotation of a handler of Quarkus Reactive Routes.
+const ROUTE: &str = "Route";
 
 /// The mappings whose name is their method, `GetMapping`.
 const METHOD_MAPPINGS: &[(&str, HttpMethod)] = &[
@@ -23,6 +27,17 @@ const METHOD_MAPPINGS: &[(&str, HttpMethod)] = &[
     ("DeleteMapping", HttpMethod::Delete),
     ("PatchMapping", HttpMethod::Patch),
     ("RequestMapping", HttpMethod::Any),
+];
+
+/// The annotations of Micronaut whose name is the method they answer, `@Get`.
+const MICRONAUT_METHODS: &[(&str, HttpMethod)] = &[
+    ("Get", HttpMethod::Get),
+    ("Post", HttpMethod::Post),
+    ("Put", HttpMethod::Put),
+    ("Delete", HttpMethod::Delete),
+    ("Patch", HttpMethod::Patch),
+    ("Head", HttpMethod::Head),
+    ("Options", HttpMethod::Options),
 ];
 
 /// The annotations whose name is the method they answer, `@GET`.
@@ -292,7 +307,9 @@ fn constants(body: Node<'_>, text: &str) -> HashMap<String, String> {
 }
 
 fn mapping_methods(annotation: Node<'_>, text: &str) -> Vec<HttpMethod> {
-    let Some(value) = argument(annotation, "method", text) else {
+    let value =
+        argument(annotation, "method", text).or_else(|| argument(annotation, "methods", text));
+    let Some(value) = value else {
         return Vec::new();
     };
     let mut methods = Vec::new();
@@ -339,8 +356,10 @@ fn parameters(method: Node<'_>, text: &str) -> Vec<EndpointParameter> {
             let annotation = annotation_name(annotation, text);
             let kind = match annotation {
                 "PathVariable" | "PathParam" => Some(EndpointParameterKind::Path),
-                "RequestParam" | "QueryParam" => Some(EndpointParameterKind::Query),
-                "RequestBody" => Some(EndpointParameterKind::Body),
+                "RequestParam" | "QueryParam" | "QueryValue" | "Param" => {
+                    Some(EndpointParameterKind::Query)
+                }
+                "RequestBody" | "Body" => Some(EndpointParameterKind::Body),
                 _ => None,
             };
             let Some(kind) = kind else {
@@ -386,6 +405,16 @@ fn join(prefix: &PathValue, path: &PathValue) -> String {
     }
 }
 
+/// The mapping style of a controller: which annotations name its handlers and where the
+/// prefix of the class comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mapping {
+    Spring,
+    JaxRs,
+    Micronaut,
+    Reactive,
+}
+
 fn visit_type(
     type_node: Node<'_>,
     package: &str,
@@ -417,18 +446,17 @@ fn visit_type(
     let body = type_node.child_by_field_name("body");
     let constants = body.map_or_else(HashMap::new, |body| constants(body, text));
 
-    let is_jax_rs = find_annotation(&annotations, CLASS_PATH, text).is_some();
-    let is_spring = CONTROLLERS
-        .iter()
-        .any(|controller| find_annotation(&annotations, controller, text).is_some());
-
-    if is_jax_rs || is_spring {
-        let prefixes = if is_jax_rs {
-            find_annotation(&annotations, CLASS_PATH, text)
-                .map(|annotation| path_values(annotation, text, &constants))
-        } else {
-            find_annotation(&annotations, CLASS_MAPPING, text)
-                .map(|annotation| path_values(annotation, text, &constants))
+    let mapping = mapping_of(&annotations, body, text);
+    if let Some(mapping) = mapping {
+        let prefixes = match mapping {
+            Mapping::JaxRs => find_annotation(&annotations, CLASS_PATH, text)
+                .map(|annotation| path_values(annotation, text, &constants)),
+            Mapping::Spring => find_annotation(&annotations, CLASS_MAPPING, text)
+                .map(|annotation| path_values(annotation, text, &constants)),
+            Mapping::Micronaut => find_annotation(&annotations, MICRONAUT_CONTROLLER, text)
+                .map(|annotation| path_values(annotation, text, &constants)),
+            Mapping::Reactive => find_annotation(&annotations, ROUTE, text)
+                .map(|annotation| route_paths(annotation, text, &constants)),
         };
         let prefixes = prefixes
             .filter(|prefixes| !prefixes.is_empty())
@@ -441,7 +469,7 @@ fn visit_type(
                     continue;
                 }
                 visit_method(
-                    method, &prefixes, &class, is_jax_rs, file, text, &constants, found,
+                    method, &prefixes, &class, mapping, file, text, &constants, found,
                 );
             }
         }
@@ -457,34 +485,161 @@ fn visit_type(
     }
 }
 
+/// How a type declares its handlers, when it declares any. JAX-RS wins over the rest,
+/// then a Reactive Route, then the path of a Micronaut controller, then the mappings of
+/// the first family of frameworks.
+fn mapping_of(annotations: &[Node<'_>], body: Option<Node<'_>>, text: &str) -> Option<Mapping> {
+    if find_annotation(annotations, CLASS_PATH, text).is_some() {
+        return Some(Mapping::JaxRs);
+    }
+    if find_annotation(annotations, ROUTE, text).is_some()
+        || body.is_some_and(|body| body_has_route(body, text))
+    {
+        return Some(Mapping::Reactive);
+    }
+    if let Some(controller) = find_annotation(annotations, MICRONAUT_CONTROLLER, text)
+        && (argument(controller, "value", text).is_some()
+            || body.is_some_and(|body| body_has_mapping(body, text)))
+    {
+        return Some(Mapping::Micronaut);
+    }
+    if CONTROLLERS
+        .iter()
+        .any(|controller| find_annotation(annotations, controller, text).is_some())
+    {
+        return Some(Mapping::Spring);
+    }
+    find_annotation(annotations, CLASS_MAPPING, text).map(|_| Mapping::Spring)
+}
+
+/// Whether a method of the body is a handler of Quarkus Reactive Routes.
+fn body_has_route(body: Node<'_>, text: &str) -> bool {
+    body_has(body, ROUTE, text)
+}
+
+/// Whether a method of the body is a handler of a Micronaut controller, which names its
+/// method without the `Mapping` word of the other family.
+fn body_has_mapping(body: Node<'_>, text: &str) -> bool {
+    let names: Vec<&str> = MICRONAUT_METHODS.iter().map(|(name, _)| *name).collect();
+    let mut cursor = body.walk();
+    for method in body.named_children(&mut cursor) {
+        if method.kind() != "method_declaration" {
+            continue;
+        }
+        if annotations(method)
+            .iter()
+            .any(|annotation| names.contains(&annotation_name(*annotation, text)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn body_has(body: Node<'_>, name: &str, text: &str) -> bool {
+    let mut cursor = body.walk();
+    for method in body.named_children(&mut cursor) {
+        if method.kind() == "method_declaration"
+            && find_annotation(&annotations(method), name, text).is_some()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The paths of a Reactive Route: `path` names the place, `value` is its shorter form.
+fn route_paths(
+    annotation: Node<'_>,
+    text: &str,
+    constants: &HashMap<String, String>,
+) -> Vec<PathValue> {
+    for key in ["path", "value"] {
+        if let Some(value) = argument(annotation, key, text) {
+            let values = values_of(value, text, constants);
+            if !values.is_empty() {
+                return values;
+            }
+        }
+    }
+    Vec::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn visit_method(
     method: Node<'_>,
     prefixes: &[PathValue],
     class: &str,
-    is_jax_rs: bool,
+    mapping: Mapping,
     file: &Path,
     text: &str,
     constants: &HashMap<String, String>,
     found: &mut Vec<Endpoint>,
 ) {
     let annotations = annotations(method);
-    let mut mappings: Vec<(HttpMethod, Option<Node<'_>>)> = Vec::new();
-    for annotation in &annotations {
-        let name = annotation_name(*annotation, text);
-        if is_jax_rs {
-            if let Some((_, http)) = METHOD_ANNOTATIONS.iter().find(|(word, _)| *word == name) {
-                mappings.push((*http, None));
+    let mut mappings: Vec<(HttpMethod, Vec<PathValue>)> = Vec::new();
+    match mapping {
+        Mapping::JaxRs => {
+            for annotation in &annotations {
+                let name = annotation_name(*annotation, text);
+                if let Some((_, http)) = METHOD_ANNOTATIONS.iter().find(|(word, _)| *word == name) {
+                    let paths = find_annotation(&annotations, CLASS_PATH, text)
+                        .map(|annotation| path_values(annotation, text, constants))
+                        .filter(|paths| !paths.is_empty())
+                        .unwrap_or_else(|| vec![PathValue::Literal(String::new())]);
+                    mappings.push((*http, paths));
+                }
             }
-            continue;
         }
-        if let Some((_, http)) = METHOD_MAPPINGS.iter().find(|(word, _)| *word == name) {
-            let methods = mapping_methods(*annotation, text);
-            if methods.is_empty() {
-                mappings.push((*http, Some(*annotation)));
-            } else {
-                for http in methods {
-                    mappings.push((http, Some(*annotation)));
+        Mapping::Micronaut => {
+            for annotation in &annotations {
+                let name = annotation_name(*annotation, text);
+                if let Some((_, http)) = MICRONAUT_METHODS.iter().find(|(word, _)| *word == name) {
+                    let paths = path_values(*annotation, text, constants);
+                    let paths = if paths.is_empty() {
+                        vec![PathValue::Literal(String::new())]
+                    } else {
+                        paths
+                    };
+                    mappings.push((*http, paths));
+                }
+            }
+        }
+        Mapping::Reactive => {
+            for annotation in &annotations {
+                if annotation_name(*annotation, text) != ROUTE {
+                    continue;
+                }
+                let mut paths = route_paths(*annotation, text, constants);
+                if paths.is_empty() {
+                    paths.push(PathValue::Literal(String::new()));
+                }
+                let methods = mapping_methods(*annotation, text);
+                if methods.is_empty() {
+                    mappings.push((HttpMethod::Any, paths));
+                } else {
+                    for http in methods {
+                        mappings.push((http, paths.clone()));
+                    }
+                }
+            }
+        }
+        Mapping::Spring => {
+            for annotation in &annotations {
+                let name = annotation_name(*annotation, text);
+                if let Some((_, http)) = METHOD_MAPPINGS.iter().find(|(word, _)| *word == name) {
+                    let methods = mapping_methods(*annotation, text);
+                    let mut paths = path_values(*annotation, text, constants);
+                    if paths.is_empty() {
+                        paths.push(PathValue::Literal(String::new()));
+                    }
+                    if methods.is_empty() {
+                        mappings.push((*http, paths));
+                    } else {
+                        for http in methods {
+                            mappings.push((http, paths.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -492,27 +647,11 @@ fn visit_method(
     if mappings.is_empty() {
         return;
     }
-    let method_paths = if is_jax_rs {
-        find_annotation(&annotations, CLASS_PATH, text)
-            .map(|annotation| path_values(annotation, text, constants))
-            .filter(|paths| !paths.is_empty())
-            .unwrap_or_else(|| vec![PathValue::Literal(String::new())])
-    } else {
-        Vec::new()
-    };
     let Some(name) = method.child_by_field_name("name") else {
         return;
     };
     let parameters = parameters(method, text);
-    for (http, annotation) in mappings {
-        let paths = if is_jax_rs {
-            method_paths.clone()
-        } else {
-            annotation
-                .map(|annotation| path_values(annotation, text, constants))
-                .filter(|paths| !paths.is_empty())
-                .unwrap_or_else(|| vec![PathValue::Literal(String::new())])
-        };
+    for (http, paths) in mappings {
         for prefix in prefixes {
             for path in &paths {
                 found.push(Endpoint {
@@ -670,5 +809,97 @@ class Shop {
         let body = &found[0].parameters[0];
         assert_eq!(body.kind, EndpointParameterKind::Body);
         assert_eq!(body.type_name.as_deref(), Some("Owner"));
+    }
+
+    #[test]
+    fn a_micronaut_controller_joins_the_path_of_its_type_and_its_methods() {
+        let source = r#"package demo;
+
+import io.micronaut.http.annotation.*;
+
+@Controller("/owners")
+class OwnerController {
+    @Get
+    Owner index() { return null; }
+
+    @Get("/{id}")
+    Owner show(@PathVariable String id) { return null; }
+
+    @Post("/{id}")
+    Owner update(@PathVariable String id, @Body Owner owner) { return null; }
+
+    @QueryValue
+    void search(@QueryValue("q") String query) {}
+}
+"#;
+        let found = scan(source);
+        assert_eq!(
+            paths(&found),
+            ["GET /owners", "GET /owners/{id}", "POST /owners/{id}"]
+        );
+        assert_eq!(found[0].class, "demo.OwnerController");
+        assert_eq!(found[1].parameters[0].kind, EndpointParameterKind::Path);
+        assert_eq!(found[2].parameters[1].kind, EndpointParameterKind::Body);
+    }
+
+    #[test]
+    fn a_micronaut_controller_without_a_value_still_names_its_handlers() {
+        let source = r#"@Controller
+class Shop {
+    @Put("/items")
+    String save() { return ""; }
+
+    @Delete("/items/{id}")
+    void remove(@PathVariable("id") long id) {}
+}
+"#;
+        let found = scan(source);
+        assert_eq!(paths(&found), ["PUT /items", "DELETE /items/{id}"]);
+    }
+
+    #[test]
+    fn a_reactive_route_takes_the_path_and_the_methods_of_its_annotation() {
+        let source = r#"package demo;
+
+import io.quarkus.vertx.web.Route;
+import io.quarkus.vertx.web.Route.HttpMethod;
+
+@Route(path = "/api")
+class Routes {
+    @Route(path = "/items", methods = Route.HttpMethod.GET)
+    void items() {}
+
+    @Route(path = "/items", methods = {HttpMethod.POST, HttpMethod.PUT})
+    void save() {}
+
+    @Route
+    void root() {}
+}
+"#;
+        let found = scan(source);
+        assert_eq!(
+            paths(&found),
+            [
+                "GET /api/items",
+                "POST /api/items",
+                "PUT /api/items",
+                "ANY /api"
+            ]
+        );
+        assert_eq!(found[0].class, "demo.Routes");
+        assert_eq!(&source[found[0].name_range.clone()], "items");
+    }
+
+    #[test]
+    fn a_reactive_route_parameter_named_by_param_is_a_query() {
+        let source = r#"class Routes {
+    @Route(path = "/items", methods = Route.HttpMethod.GET)
+    void items(@Param("q") String query) {}
+}
+"#;
+        let found = scan(source);
+        assert_eq!(paths(&found), ["GET /items"]);
+        assert_eq!(found[0].parameters[0].name, "q");
+        assert_eq!(found[0].parameters[0].kind, EndpointParameterKind::Query);
     }
 }

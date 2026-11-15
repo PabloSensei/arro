@@ -56,6 +56,8 @@ pub(crate) struct LaidOutRow {
     endpoint: Option<Hsla>,
     /// The badge of a place, with its icon and colour, when the line has one.
     place: Option<(SharedString, Hsla)>,
+    /// The badge of an action menu, with its icon and colour, when the line has one.
+    action: Option<(SharedString, Hsla)>,
     /// A bookmark without a name takes the place of the line number.
     bookmark: bool,
     /// The label of the blame column on this row, on the first line of a run of a commit.
@@ -629,6 +631,34 @@ fn baseline(line: &ShapedLine, height: Pixels) -> Pixels {
     (height - line.ascent - line.descent) * 0.5 + line.ascent
 }
 
+/// Pushes the green wave of a misspelled word: short pieces of a line that step up and
+/// down under the letters.
+fn wave(
+    underlines: &mut Vec<(Bounds<Pixels>, Hsla)>,
+    left: Pixels,
+    width: Pixels,
+    top: Pixels,
+    height: Pixels,
+    color: Hsla,
+) {
+    let step = px(4.);
+    let mut at = px(0.);
+    let mut high = true;
+    while at < width {
+        let piece = (width - at).min(step);
+        let rise = if high { px(3.) } else { px(1.) };
+        underlines.push((
+            Bounds::new(
+                point(left + at, top + height - rise),
+                size((piece - px(1.)).max(px(1.)), px(1.)),
+            ),
+            color,
+        ));
+        at += step;
+        high = !high;
+    }
+}
+
 impl Element for EditorElement {
     type RequestLayoutState = ();
     type PrepaintState = EditorPrepaint;
@@ -1075,6 +1105,16 @@ impl Element for EditorElement {
                             && mark.line as usize == buffer_line
                     })
                     .map(|mark| (mark.icon.clone(), mark.color));
+                let action = view
+                    .action_marks
+                    .iter()
+                    .find(|mark| {
+                        !block
+                            && doc_row.is_none()
+                            && !continuation
+                            && mark.line as usize == buffer_line
+                    })
+                    .map(|mark| (mark.icon.clone(), mark.color));
                 let doc_icon = (!continuation)
                     .then(|| view.rendered_doc_at_line(buffer_line))
                     .flatten();
@@ -1171,6 +1211,7 @@ impl Element for EditorElement {
                     run,
                     endpoint,
                     place,
+                    action,
                     bookmark: !block && matches!(bookmark, Some(None)),
                     annotation,
                     current,
@@ -1440,10 +1481,12 @@ impl Element for EditorElement {
                 if mark.unnecessary {
                     continue;
                 }
+                let spelling = mark.code.as_deref() == Some(lang_api::SPELLING_INSPECTION);
                 let color = match mark.severity {
                     Severity::Error => style.error_mark,
                     Severity::Warning => style.warning_mark,
-                    Severity::Information | Severity::Hint => continue,
+                    Severity::Information | Severity::Hint if !spelling => continue,
+                    Severity::Information | Severity::Hint => style.spell_mark,
                 };
                 for shown in &rows {
                     if shown.is_block {
@@ -1460,6 +1503,19 @@ impl Element for EditorElement {
                         .text
                         .x_for_index(shown.line.column_of(to))
                         .max(left + char_width);
+                    if spelling {
+                        // A misspelled word keeps the green wave of an IDE and no mark
+                        // on the gutter: it is no problem of the compiler.
+                        wave(
+                            &mut underlines,
+                            origin_x + left,
+                            right - left,
+                            shown.y,
+                            height,
+                            color,
+                        );
+                        continue;
+                    }
                     underlines.push((
                         Bounds::new(
                             point(origin_x + left, shown.y + height - px(2.)),
@@ -1592,6 +1648,11 @@ impl Element for EditorElement {
                 if let Some(lsp) = &view.lsp {
                     for mark in &lsp.marks {
                         if mark.unnecessary {
+                            continue;
+                        }
+                        if mark.code.as_deref() == Some(lang_api::SPELLING_INSPECTION) {
+                            // A misspelled word keeps no mark on the bar: the check is
+                            // no problem of the project.
                             continue;
                         }
                         let kind = match mark.severity {
@@ -1969,6 +2030,23 @@ impl Element for EditorElement {
                 }
                 if options.gutter_icons
                     && let Some((icon, color)) = &shown.place
+                {
+                    let mark = Bounds::new(
+                        point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
+                        size(px(16.), px(16.)),
+                    );
+                    window
+                        .paint_svg(
+                            mark,
+                            icon.clone(),
+                            None,
+                            TransformationMatrix::unit(),
+                            *color,
+                            cx,
+                        )
+                        .ok();
+                } else if options.gutter_icons
+                    && let Some((icon, color)) = &shown.action
                 {
                     let mark = Bounds::new(
                         point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),

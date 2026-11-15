@@ -50,6 +50,18 @@ mod shell;
 #[cfg(unix)]
 #[path = "shell_unix.rs"]
 mod shell;
+#[cfg(windows)]
+mod spelling;
+#[cfg(target_os = "macos")]
+#[path = "spelling_macos.rs"]
+mod spelling;
+#[cfg(all(unix, not(target_os = "macos")))]
+#[path = "spelling_unix.rs"]
+mod spelling;
+/// The thread of the system spell checker, which the platforms that have one share.
+/// A system without a checker keeps it for the tests of the queue alone.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+mod spelling_service;
 mod trash;
 mod url;
 #[cfg(windows)]
@@ -76,6 +88,7 @@ pub use process_stats::{ProcessMemory, label_process, process_tree};
 pub use process_tree::ProcessTree;
 pub use resources::{resources_dir, resources_dir_of};
 pub use shell::{NO_BROWSER_ENV, open_url, recorded_urls};
+pub use spelling::{spelling_check, spelling_source, spelling_suggest, spelling_supported};
 pub use trash::move_to_trash;
 pub use waiter::ProcessWaiter;
 

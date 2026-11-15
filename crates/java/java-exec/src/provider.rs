@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base::Cancel;
 use base::Result;
 use java_project::{BuildEnv, CoverageTools, Jdk};
 use proc_sup::ProcessSpec;
@@ -401,6 +402,35 @@ impl RunConfigProvider for JavaProvider {
 
     fn profile_run_recordings(&self, recording: &Path) -> Vec<std::path::PathBuf> {
         crate::profile::run_recordings(recording)
+    }
+
+    fn is_heap_dump(&self, path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("hprof"))
+    }
+
+    fn supports_heap_dump(&self) -> bool {
+        true
+    }
+
+    fn capture_heap_dump(
+        &self,
+        pid: u32,
+        file: &Path,
+        model: &ProjectModel,
+        cancel: &Cancel,
+    ) -> Result<()> {
+        crate::profile::capture_of(&self.env, pid, file, model, cancel)
+    }
+
+    fn heap_dump(
+        &self,
+        path: &Path,
+        model: &ProjectModel,
+        cancel: &Cancel,
+        progress: &mut dyn FnMut(lang_api::HeapProgress),
+    ) -> Result<lang_api::HeapSnapshot> {
+        crate::profile::read_heap_dump(path, model, cancel, progress)
     }
 
     fn launch_points(&self, text: &str, file: &Path, model: &ProjectModel) -> Vec<LaunchPoint> {

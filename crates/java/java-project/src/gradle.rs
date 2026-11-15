@@ -290,6 +290,9 @@ impl BuildSystem for Gradle {
                 if has_spring_boot(module) {
                     application.push(task("bootRun", true));
                 }
+                if has_quarkus(module) {
+                    application.push(task("quarkusDev", true));
+                }
                 BuildModule {
                     id: module.id.clone(),
                     name: module.name.clone(),
@@ -330,7 +333,7 @@ impl BuildSystem for Gradle {
         let spec = self.command(root)?.arg(task_name(module, task));
         // The application these tasks start may read its input, as a console program does.
         Ok(match task {
-            "run" | "bootRun" => spec.input(),
+            "run" | "bootRun" | "quarkusDev" => spec.input(),
             _ => spec,
         })
     }
@@ -339,7 +342,7 @@ impl BuildSystem for Gradle {
         let mut spec = self.command(root)?;
         let mut runs_program = false;
         for word in line.split_whitespace() {
-            runs_program |= matches!(word, "run" | "bootRun");
+            runs_program |= matches!(word, "run" | "bootRun" | "quarkusDev");
             spec = spec.arg(word);
         }
         Ok(match runs_program {
@@ -462,6 +465,11 @@ fn has_application(module: &Module) -> bool {
 /// Whether the module applies the Spring Boot plugin, which gives it a run task.
 fn has_spring_boot(module: &Module) -> bool {
     build_text(module).is_some_and(|text| text.contains("org.springframework.boot"))
+}
+
+/// Whether the module applies the Quarkus plugin, which gives it a dev task.
+fn has_quarkus(module: &Module) -> bool {
+    build_text(module).is_some_and(|text| text.contains("io.quarkus"))
 }
 
 fn build_text(module: &Module) -> Option<String> {
@@ -901,6 +909,59 @@ mod tests {
                 .iter()
                 .find(|task| task.name == "bootRun")
                 .is_some_and(|task| task.program)
+        );
+    }
+
+    #[test]
+    fn a_quarkus_module_gets_its_dev_task() {
+        let root = tree_project("quarkus");
+        fs::write(
+            root.join("app/build.gradle"),
+            "plugins { id 'io.quarkus' version '3.9.0' }",
+        )
+        .unwrap();
+        let model = ProjectModel {
+            root: root.clone(),
+            tool: "gradle".into(),
+            resolved: true,
+            modules: vec![
+                Module {
+                    id: ":".into(),
+                    name: "root".into(),
+                    dir: root.clone(),
+                    ..Module::default()
+                },
+                Module {
+                    id: ":app".into(),
+                    name: "app".into(),
+                    dir: root.join("app"),
+                    ..Module::default()
+                },
+            ],
+            ..ProjectModel::default()
+        };
+
+        let tree = Gradle::new(crate::BuildEnv::default()).task_tree(&model);
+
+        let app = tree.iter().find(|module| module.name == "app").unwrap();
+        let application = app
+            .groups
+            .iter()
+            .find(|group| group.name == "application")
+            .unwrap();
+        assert!(
+            application
+                .tasks
+                .iter()
+                .any(|task| task.name == "quarkusDev" && task.program)
+        );
+        let root = tree.iter().find(|module| module.name == "root").unwrap();
+        assert!(
+            !root
+                .groups
+                .iter()
+                .flat_map(|group| group.tasks.iter())
+                .any(|task| task.name == "quarkusDev")
         );
     }
 

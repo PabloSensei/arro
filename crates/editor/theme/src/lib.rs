@@ -142,6 +142,8 @@ tokens! {
     scrollbar_track: 0xffffff0d, 0x0000000d;
     // A warning on the scrollbar.
     warning_mark: 0xd9a441ff, 0xe0a530ff;
+    // A misspelled word under its green wave, apart from the warnings of a language.
+    spell_mark: 0x6ccf8eff, 0x1f8a36ff;
     // Folded text.
     fold_bg: 0x3a3733ff, 0xece6f7ff;
     fold_text: 0xb0aa9fff, 0x4f4a63ff;

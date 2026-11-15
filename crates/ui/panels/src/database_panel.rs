@@ -17,6 +17,10 @@ use database::{
     VendorTemplate,
 };
 use editor_view::{EditorView, RunFiles};
+use lang_api::{
+    MigrationHistory, MigrationHistoryRows, MigrationKind, MigrationModel, MigrationState,
+    MigrationSupport, MigrationTool,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -47,6 +51,28 @@ pub fn set_database_support(support: Arc<dyn Support>) {
 
 fn support() -> Option<Arc<dyn Support>> {
     SUPPORT.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The language side of the migrations, put in place before the window opens. It lives in
+/// a global so that a window test gives its own project without touching another one.
+pub struct ActiveMigrations(pub Option<Arc<dyn MigrationSupport>>);
+
+impl Global for ActiveMigrations {}
+
+/// The migrations support the application gave before the window was built.
+static MIGRATIONS: Mutex<Option<Arc<dyn MigrationSupport>>> = Mutex::new(None);
+
+/// Puts the language side of the migrations in place. The window copies it into
+/// [`ActiveMigrations`] when it is built.
+pub fn set_migration_support(support: Arc<dyn MigrationSupport>) {
+    if let Ok(mut slot) = MIGRATIONS.lock() {
+        *slot = Some(support);
+    }
+}
+
+/// The migrations support the application gave, for the global of the window.
+pub fn migration_support() -> Option<Arc<dyn MigrationSupport>> {
+    MIGRATIONS.lock().ok().and_then(|slot| slot.clone())
 }
 
 /// How often the window reads the events of its helpers.
@@ -179,6 +205,22 @@ pub struct DatabasePanel {
     password_field: bool,
     status: Option<String>,
     dialog: Option<Dialog>,
+    /// The migration files of the project, the checks over them and the actions of their
+    /// build plugin.
+    migrations: MigrationModel,
+    /// The migration node of the tree is open.
+    migrations_open: bool,
+    /// The history of the connected source was read, so the rows carry a state.
+    history_read: bool,
+    /// The statements that read the history tables and the rows they gave, one tool at a
+    /// time.
+    history_queue: VecDeque<MigrationHistory>,
+    history_columns: Vec<String>,
+    history_rows: Vec<Vec<String>>,
+    history_collected: Vec<MigrationHistoryRows>,
+    history_pending: Option<(SourceId, u64, MigrationTool)>,
+    /// The Clean action waiting for the answer of the user.
+    clean_pending: Option<lang_api::MigrationAction>,
     scripted: Option<Scripted>,
     /// Set while the task that reads the answers of the helpers runs: it runs only while
     /// at least one connection is alive.
@@ -229,6 +271,15 @@ impl DatabasePanel {
                 password_field: false,
                 status: None,
                 dialog: None,
+                migrations: MigrationModel::default(),
+                migrations_open: true,
+                history_read: false,
+                history_queue: VecDeque::new(),
+                history_columns: Vec::new(),
+                history_rows: Vec::new(),
+                history_collected: Vec::new(),
+                history_pending: None,
+                clean_pending: None,
                 scripted: None,
                 polling: false,
                 #[cfg(test)]
@@ -239,6 +290,7 @@ impl DatabasePanel {
                 result_scroll: ScrollHandle::new(),
             };
             panel.load_sources(cx);
+            panel.load_migrations(cx);
             panel.refresh_catalog();
             panel
         });
@@ -307,6 +359,213 @@ impl DatabasePanel {
             .iter()
             .any(|known| &known.id == source)
             .then(|| database::console_path(&self.state_dir, source))
+    }
+
+    /// The migrations of the project, as the tree shows them.
+    pub fn migrations(&self) -> &MigrationModel {
+        &self.migrations
+    }
+
+    /// Whether the migration node of the tree is open.
+    pub fn migrations_open(&self) -> bool {
+        self.migrations_open
+    }
+
+    /// The rows of a history table, as a scripted connection would answer, for the window
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn migration_history_for_test(
+        &mut self,
+        rows: Vec<MigrationHistoryRows>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_history(rows, cx);
+    }
+
+    /// Reads the migration files in the background, so the window shows them as soon as
+    /// the language knows the project.
+    fn load_migrations(&mut self, cx: &mut Context<Self>) {
+        let Some(support) = cx
+            .try_global::<ActiveMigrations>()
+            .and_then(|active| active.0.clone())
+        else {
+            return;
+        };
+        let job = cx
+            .background_executor()
+            .spawn(async move { support.model() });
+        cx.spawn(async move |this, cx| {
+            let model = job.await;
+            this.update(cx, |this, cx| {
+                this.migrations = model;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Sends the statements that read the history tables of the migrations, one tool at a
+    /// time, once a connection is up.
+    fn request_history(&mut self, source: SourceId, cx: &mut Context<Self>) {
+        if self.history_pending.is_some() || !self.history_queue.is_empty() {
+            return;
+        }
+        if !self.sessions.contains_key(&source) || self.migrations.histories.is_empty() {
+            return;
+        }
+        if self.scripted.is_some() {
+            return;
+        }
+        self.history_read = false;
+        self.history_collected.clear();
+        self.history_queue
+            .extend(self.migrations.histories.iter().cloned());
+        self.send_next_history(source, cx);
+    }
+
+    fn send_next_history(&mut self, source: SourceId, cx: &mut Context<Self>) {
+        let Some(history) = self.history_queue.pop_front() else {
+            let collected = std::mem::take(&mut self.history_collected);
+            self.apply_history(collected, cx);
+            return;
+        };
+        let id = self.next();
+        let Some(session) = self.sessions.get(&source) else {
+            return;
+        };
+        self.history_columns.clear();
+        self.history_rows.clear();
+        if session
+            .send(Command::Query {
+                id,
+                sql: history.sql,
+                timeout: None,
+                max_rows: None,
+            })
+            .is_ok()
+        {
+            self.history_pending = Some((source, id, history.tool));
+        }
+        cx.notify();
+    }
+
+    /// Asks the language to match the rows of the history tables against the files, in the
+    /// background, and shows the result.
+    fn apply_history(&mut self, rows: Vec<MigrationHistoryRows>, cx: &mut Context<Self>) {
+        if rows.is_empty() {
+            return;
+        }
+        let Some(support) = cx
+            .try_global::<ActiveMigrations>()
+            .and_then(|active| active.0.clone())
+        else {
+            return;
+        };
+        let job = cx
+            .background_executor()
+            .spawn(async move { support.with_history(&rows) });
+        cx.spawn(async move |this, cx| {
+            let model = job.await;
+            this.update(cx, |this, cx| {
+                this.migrations = model;
+                this.history_read = true;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The rows of the history table the helper answered: the id of the statement tells
+    /// them from the statements of the console.
+    fn history_event(&mut self, source: &SourceId, event: Event, cx: &mut Context<Self>) -> bool {
+        let Some((pending_source, id, tool)) = self.history_pending.clone() else {
+            return false;
+        };
+        if &pending_source != source {
+            return false;
+        }
+        match event {
+            Event::Columns {
+                id: event_id,
+                columns,
+            } if event_id == id => {
+                self.history_columns = columns.into_iter().map(|column| column.name).collect();
+                true
+            }
+            Event::Rows { id: event_id, rows } if event_id == id => {
+                for row in rows {
+                    self.history_rows
+                        .push(row.iter().map(history_text).collect());
+                }
+                true
+            }
+            Event::Done { id: event_id, .. } if event_id == id => {
+                self.history_pending = None;
+                self.history_collected.push(MigrationHistoryRows {
+                    tool,
+                    columns: std::mem::take(&mut self.history_columns),
+                    rows: std::mem::take(&mut self.history_rows),
+                });
+                self.send_next_history(source.clone(), cx);
+                true
+            }
+            Event::Error {
+                id: event_id,
+                message,
+                ..
+            } if event_id == id => {
+                self.history_pending = None;
+                self.history_queue.clear();
+                self.status = Some(format!(
+                    "The history of {} is not read: {message}",
+                    tool.name()
+                ));
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Runs an action of the migration plugin of the project through the Run window.
+    fn run_migration_action(
+        &mut self,
+        action: &lang_api::MigrationAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runs) = cx
+            .try_global::<crate::script::ActiveRunPanel>()
+            .map(|panel| panel.0.clone())
+        else {
+            return;
+        };
+        if action.unavailable.is_some() {
+            return;
+        }
+        if let Some(goal) = &action.goal {
+            runs.update(cx, |runs, cx| runs.run_goal(goal, cx));
+        } else if let Some(task) = &action.task {
+            runs.update(cx, |runs, cx| runs.run_task(task, cx));
+        } else {
+            return;
+        }
+        let workspace = self.workspace.clone();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(workspace::RUN_TOOL, window, cx)
+            })
+            .ok();
+    }
+
+    /// Opens a migration file or the file an include names.
+    fn open_migration(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| workspace.open_file(path, window, cx));
     }
 
     /// A source with a scripted connection, for the window tests: the tables it answers,
@@ -482,6 +741,9 @@ impl DatabasePanel {
     }
 
     fn event(&mut self, source: SourceId, event: Event, cx: &mut Context<Self>) {
+        if self.history_event(&source, event.clone(), cx) {
+            return;
+        }
         match event {
             Event::Ready { .. } => {}
             Event::Connected {
@@ -493,6 +755,7 @@ impl DatabasePanel {
                 self.auto_commit = auto_commit;
                 self.quotes.insert(source.clone(), quote);
                 self.status = Some(format!("Connected to {product}"));
+                self.request_history(source.clone(), cx);
                 self.request_schema(source, cx);
             }
             Event::Columns { id, columns } => {
@@ -756,6 +1019,10 @@ impl DatabasePanel {
         self.query_ids.remove(&source);
         self.quotes.remove(&source);
         self.schema_loading.remove(&source);
+        self.history_queue.clear();
+        self.history_pending = None;
+        self.history_collected.clear();
+        self.history_read = false;
         cx.notify();
     }
 
@@ -1069,6 +1336,7 @@ impl DatabasePanel {
 
     fn tree(&mut self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mut rows = Vec::new();
+        rows.extend(self.migration_rows(theme, cx));
         if self.sources.is_empty() {
             rows.push(
                 div()
@@ -1258,6 +1526,125 @@ impl DatabasePanel {
             cx,
         )
         .into_any_element()
+    }
+
+    /// The rows of the migrations above the sources: the tool, its files in the order it
+    /// runs them, and the state of each file when a connection read the history table.
+    fn migration_rows(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut rows = Vec::new();
+        if self.migrations.is_empty() {
+            return rows;
+        }
+        let tools = self
+            .migrations
+            .tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let open = self.migrations_open;
+        rows.push(
+            div()
+                .id("database-migrations")
+                .debug_selector(|| "database-migrations".to_owned())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_S))
+                .rounded(px(CONTROL_RADIUS))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .child(icon(
+                    if open {
+                        "general/chevronDown"
+                    } else {
+                        "general/chevronRight"
+                    },
+                    theme,
+                ))
+                .child(div().flex_1().overflow_hidden().child("Migrations"))
+                .child(
+                    div()
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_muted)
+                        .child(tools),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.migrations_open = !this.migrations_open;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if !open {
+            return rows;
+        }
+        let model = self.migrations.clone();
+        for (index, migration) in model.rows.iter().enumerate() {
+            let issue = model.issue_of(&migration.path);
+            let state = (self.history_read
+                && migration.kind != MigrationKind::Changelog
+                && migration.kind != MigrationKind::Include)
+                .then_some(migration.state);
+            let depth = migration.depth as f32;
+            let label = migration.label.clone();
+            let row_id = format!("database-migration-{index}");
+            let selector = if issue.is_some() {
+                format!("database-migration-{index}-issue")
+            } else {
+                row_id.clone()
+            };
+            let target = migration
+                .target
+                .clone()
+                .filter(|target| target.is_file())
+                .unwrap_or_else(|| migration.path.clone());
+            let muted = migration.kind == MigrationKind::ChangeSet
+                || migration.kind == MigrationKind::Include;
+            let row = div()
+                .id(row_id)
+                .debug_selector(move || selector.clone())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .h(px(CONTROL_HEIGHT))
+                .pl(px(SPACE_S + depth * SPACE_M))
+                .pr(px(SPACE_S))
+                .rounded(px(CONTROL_RADIUS))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .when(muted, |this| this.text_color(theme.text_muted))
+                        .when(issue.is_some(), |this| {
+                            this.text_color(theme.stripe_error).underline()
+                        })
+                        .child(label),
+                )
+                .when_some(state, |this, state| {
+                    this.child(
+                        div()
+                            .text_color(match state {
+                                MigrationState::Applied => theme.accent,
+                                MigrationState::Failed | MigrationState::Changed => {
+                                    theme.stripe_error
+                                }
+                                MigrationState::Pending => theme.text_muted,
+                            })
+                            .child(state.glyph()),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if !target.exists() {
+                        return;
+                    }
+                    this.open_migration(target.clone(), window, cx);
+                }));
+            rows.push(row.into_any_element());
+        }
+        rows
     }
 
     fn result_table(
@@ -1606,6 +1993,70 @@ impl DatabasePanel {
             .into_any_element()
     }
 
+    /// The question behind Clean: the tool drops every object of the schema, which no
+    /// undo brings back.
+    fn clean_dialog(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(action) = self.clean_pending.clone() else {
+            return div().into_any_element();
+        };
+        let name = self
+            .selected
+            .as_ref()
+            .and_then(|selected| self.sources.iter().find(|known| &known.id == selected))
+            .map_or_else(
+                || "the database of the project".to_owned(),
+                |source| source.name.clone(),
+            );
+        div()
+            .id("database-clean")
+            .debug_selector(|| "database-clean".to_owned())
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(SPACE_L))
+            .w(px(520.))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.stripe_error)
+            .bg(theme.popup_bg)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.stripe_error)
+                    .child(format!("{} {}", action.tool.name(), action.kind.label())),
+            )
+            .child(format!(
+                "This drops every object of the schema of {name} and every row of its \
+                 history. The data does not come back."
+            ))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(SPACE_S))
+                    .child(
+                        small_button("database-clean-cancel", "Cancel", theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.clean_pending = None;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        small_button("database-clean-confirm", "Clean", theme)
+                            .text_color(theme.stripe_error)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let Some(action) = this.clean_pending.take() else {
+                                    return;
+                                };
+                                this.run_migration_action(&action, window, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn toolbar(
         &mut self,
         theme: &Theme,
@@ -1751,6 +2202,35 @@ impl DatabasePanel {
             );
         }
         bar = bar.child(div().flex_1());
+        for (index, action) in self.migrations.actions.clone().iter().enumerate() {
+            let reason = action.unavailable.clone();
+            let mut button = small_button(
+                ("database-migrate", index),
+                &format!("{} {}", action.tool.name(), action.kind.label()),
+                theme,
+            )
+            .debug_selector(move || format!("database-migration-action-{index}"));
+            if let Some(reason) = reason {
+                let hint = SharedString::from(reason.clone());
+                button = button
+                    .text_color(theme.text_muted)
+                    .cursor_default()
+                    .tooltip(move |_, cx| tooltip(hint.clone(), None, cx));
+            } else {
+                button = button.on_click(cx.listener(move |this, _, window, cx| {
+                    let Some(action) = this.migrations.actions.get(index).cloned() else {
+                        return;
+                    };
+                    if action.kind == lang_api::MigrationActionKind::Clean {
+                        this.clean_pending = Some(action);
+                        cx.notify();
+                    } else {
+                        this.run_migration_action(&action, window, cx);
+                    }
+                }));
+            }
+            bar = bar.child(button);
+        }
         if let Some(status) = &self.status {
             bar = bar.child(
                 div()
@@ -1795,6 +2275,7 @@ impl Render for DatabasePanel {
         let tree = self.tree(&theme, window, cx);
         let result = self.result_table(&theme, window, cx);
         let dialog = self.dialog(&theme, cx);
+        let clean = self.clean_dialog(&theme, cx);
         let tree = div()
             .id("database-tree-pane")
             .flex()
@@ -1831,6 +2312,7 @@ impl Render for DatabasePanel {
             .child(panel_header("Database", "bottom-panel", hide, &theme))
             .child(toolbar)
             .child(dialog)
+            .child(clean)
             .child(div().flex().flex_1().min_h_0().child(tree).child(right))
     }
 }
@@ -1910,6 +2392,15 @@ fn column_text(column: &Column) -> String {
         text.push_str(" NOT NULL");
     }
     text
+}
+
+/// The text of a cell of a history row. A missing value is empty, so that two texts are
+/// compared as the database wrote them and never as `NULL`.
+fn history_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        other => value_text(other),
+    }
 }
 
 fn value_text(value: &Value) -> String {

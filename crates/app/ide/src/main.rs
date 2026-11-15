@@ -698,11 +698,13 @@ fn main() -> ExitCode {
                 language: java_lang::templates_for(Path::new("Arro.java")),
                 files: java_lang::file_templates(),
             };
-            panels::set_database_support(Arc::new(java_lang::DatabaseSupport::new(
+            let database = Arc::new(java_lang::DatabaseSupport::new(
                 launch.root.clone(),
                 project.tool.clone(),
                 project.cache_root.clone(),
-            )));
+            ));
+            panels::set_database_support(database.clone());
+            panels::set_migration_support(database);
             panels::set_jshell_support(Arc::new(java_lang::JShellSupport::new(
                 launch.root.clone(),
                 project.tool.clone(),

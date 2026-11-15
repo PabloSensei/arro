@@ -279,8 +279,10 @@ fn open(
                         crate::http::file_opened(&view, cx);
                     }
                     view.update(cx, marks::refresh);
+                    view.update(cx, crate::kubernetes::refresh_marks);
                     view.update(cx, crate::coverage::refresh);
                     crate::endpoints::editor_changed(&view, cx);
+                    crate::spelling::editor_changed(&view, cx);
                     outline::refresh(&view, matches!(event, EditorEvent::Changed), cx);
                     if matches!(event, EditorEvent::Changed) {
                         places::remember(&view, cx);
@@ -388,6 +390,15 @@ fn open(
                         })
                         .ok();
                 }
+                EditorEvent::SaveSpelling { word, project } => {
+                    let (word, project) = (word.clone(), *project);
+                    let workspace = runner.clone();
+                    workspace
+                        .update(cx, |_, cx| {
+                            crate::spelling::save_word(&word, project, cx);
+                        })
+                        .ok();
+                }
                 EditorEvent::EditInspection(id) => {
                     let id = id.clone();
                     let workspace = runner.clone();
@@ -457,6 +468,28 @@ fn open(
                                         crate::diagram::show(
                                             workspace,
                                             crate::diagram::DiagramSource::Spot(spot),
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::ShowSequenceDiagram(spot) => {
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    let spot = spot.clone();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::sequence_diagram::show(
+                                            workspace,
+                                            spot,
+                                            lang_api::SequenceSettings::default(),
                                             window,
                                             cx,
                                         )
@@ -692,6 +725,20 @@ fn open(
                     runner
                         .update(cx, |workspace, cx| {
                             crate::beans::show_place_menu(
+                                &view,
+                                *line as usize,
+                                workspace,
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                }
+                EditorEvent::ActionMark(line) => {
+                    let view = view.clone();
+                    runner
+                        .update(cx, |workspace, cx| {
+                            crate::kubernetes::show_document_menu(
                                 &view,
                                 *line as usize,
                                 workspace,

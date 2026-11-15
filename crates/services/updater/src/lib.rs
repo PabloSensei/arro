@@ -351,7 +351,8 @@ fn bundle_root(executable: &Path) -> PathBuf {
 /// Whether the program was installed from a package. Such an installation keeps its
 /// files under `/opt` or `/usr` on Linux, or in `Program Files` on Windows, and the
 /// user cannot write to them: the package manager owns the folder and replaces it,
-/// while the updater can only point at the release page. A folder of the user that lost
+/// while the updater can only point at the release page. The `.deb` and the `.rpm`
+/// share the tree, so both land in the same folders. A folder of the user that lost
 /// its write rights counts too, because the updater would fail halfway through it.
 pub fn installed_from_package(install_dir: &Path) -> bool {
     system_folder(install_dir) || (install_dir.is_dir() && !writable(install_dir))

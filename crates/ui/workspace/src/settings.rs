@@ -281,6 +281,9 @@ pub struct Settings {
     /// The home of the runtime that runs the project; empty means the one found by the
     /// environment.
     pub runtime_home: String,
+    /// Where Capture Memory Snapshot writes its files; empty means `.arro/snapshots` of
+    /// the project. A relative folder is relative to the project root.
+    pub heap_snapshot_folder: String,
     /// Memory below this share of the total and below `memory_low_megabytes` stops a
     /// language server so that the machine does not run out. Zero turns the stop off.
     pub memory_low_percent: f32,
@@ -358,6 +361,11 @@ pub struct Settings {
     pub git_group_by_directory: bool,
     /// How long an HTTP request may take before it is stopped, in seconds.
     pub http_timeout_seconds: u32,
+    /// The program that talks to Kubernetes; empty means the one on `PATH`.
+    pub kubectl_path: String,
+    /// The kubeconfig the Kubernetes tool window reads; empty means `KUBECONFIG` or the
+    /// usual file of the user.
+    pub kubeconfig_path: String,
 }
 
 impl Default for Settings {
@@ -403,6 +411,7 @@ impl Default for Settings {
             autosave: true,
             open_readme_on_first_open: true,
             runtime_home: String::new(),
+            heap_snapshot_folder: String::new(),
             memory_low_percent: DEFAULT_MEMORY_LOW_PERCENT,
             memory_low_megabytes: DEFAULT_MEMORY_LOW_MEGABYTES,
             reformat_optimize_imports: false,
@@ -445,6 +454,8 @@ impl Default for Settings {
             diff_side_by_side: true,
             git_group_by_directory: true,
             http_timeout_seconds: DEFAULT_HTTP_TIMEOUT_SECONDS,
+            kubectl_path: String::new(),
+            kubeconfig_path: String::new(),
         }
     }
 }

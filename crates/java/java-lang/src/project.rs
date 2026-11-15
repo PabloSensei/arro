@@ -129,6 +129,8 @@ pub struct JavaProject {
     /// The versions of the dependencies in the build files: the hints on an old one, the
     /// fixes and the entries of a version being typed.
     pub(crate) build_scripts: crate::build_scripts::BuildScriptSupport,
+    /// The changelogs of the schema migrations, for their completion and their checks.
+    pub(crate) migration_files: Arc<crate::MigrationFiles>,
     /// The answers of the message bundles in front of the answers of the server.
     pub(crate) java_messages: JavaMessages,
     /// The beans and the points of an injection of the project, read in the background
@@ -522,6 +524,7 @@ impl JavaProject {
         ));
         let model: Arc<std::sync::Mutex<Option<Arc<project_model::ProjectModel>>>> = Arc::default();
         let router = Router::new(sidecar.status());
+        let migration_files = crate::migrations_language(root.clone());
         let build_scripts = crate::build_scripts::BuildScriptSupport::new(
             root.clone(),
             cache.join(java_project::updates::CACHE_FOLDER),
@@ -602,6 +605,7 @@ impl JavaProject {
         messages.set_inspection_checks(checks.clone());
         data.set_inspection_checks(checks.clone());
         build_scripts.set_inspection_checks(checks.clone());
+        migration_files.set_inspection_checks(checks.clone());
         let completion_fallback: Arc<dyn Provider<DocumentSpot, CompletionList>> =
             providers.clone();
         let navigation_fallback: Arc<dyn Provider<NavigationQuery, Vec<SourceSpan>>> =
@@ -644,7 +648,8 @@ impl JavaProject {
             messages.clone(),
             Handle::current(),
         )
-        .with_data(native_completion, native_navigation);
+        .with_data(native_completion, native_navigation)
+        .with_config(spring.clone());
         Ok(Self {
             sidecar,
             spec,
@@ -665,6 +670,7 @@ impl JavaProject {
             spring,
             messages,
             build_scripts,
+            migration_files,
             java_messages,
             beans,
             data,

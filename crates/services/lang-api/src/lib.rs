@@ -12,13 +12,17 @@ mod diagram;
 mod documentation;
 mod embedded;
 mod endpoint;
+mod heap;
 mod hierarchy;
 mod inlay;
 mod inspection;
 mod language;
+mod migrations;
 mod profile;
 mod semantic;
+mod sequence;
 mod sources;
+mod spelling;
 mod stack;
 mod stream;
 mod structural;
@@ -49,6 +53,9 @@ pub use embedded::EmbeddedTextProvider;
 pub use endpoint::{
     Endpoint, EndpointParameter, EndpointParameterKind, EndpointProvider, EndpointScan, HttpMethod,
 };
+pub use heap::{
+    HeapClass, HeapField, HeapObject, HeapProgress, HeapSnapshot, HeapString, HeapValue,
+};
 pub use hierarchy::{
     AddOverridableMethodsProvider, AddOverridableMethodsRequest, CallDirection, CallHierarchyItem,
     CallHierarchyProvider, CallHierarchyQuery, DefinitionPreview, DefinitionPreviewProvider,
@@ -66,6 +73,11 @@ pub use inspection::{
     Suppressions,
 };
 pub use language::{LanguageId, LanguageSupport};
+pub use migrations::{
+    MigrationAction, MigrationActionKind, MigrationHistory, MigrationHistoryRows, MigrationIssue,
+    MigrationKind, MigrationModel, MigrationRow, MigrationState, MigrationSupport, MigrationTool,
+    NextMigration,
+};
 pub use profile::{
     ProfileFrame, ProfileMethod, ProfileNode, ProfileRecording, ProfileReport, ProfileSample,
     ProfileSamples, ProfileSnapshot, ProfileType, ProfileTypeTree, ProfileUnit, bytes_text,
@@ -101,9 +113,17 @@ pub use semantic::{
     WorkspaceDiagnosticsQuery,
 };
 pub use semantic::{UsageEntry, UsageKind, UsageProvider};
+pub use sequence::{
+    SequenceDiagram, SequenceDiagramProvider, SequenceFragment, SequenceFragmentKind,
+    SequenceMessage, SequenceMessageKind, SequenceParticipant, SequenceParticipantKind,
+    SequenceQuery, SequenceSection, SequenceSettings,
+};
 pub use sources::{
     LibraryClass, LibraryClassProvider, LibraryClassQuery, SourcesEvent, SourcesKind,
     SourcesProvider, SourcesRequest,
+};
+pub use spelling::{
+    SPELLING_GROUP, SPELLING_INSPECTION, SPELLING_TITLE, SpellPlace, SpellQuery, SpellingProvider,
 };
 pub use stack::{
     DumpAnswer, DumpProvider, DumpQuery, Frame, FrameOrigin, Line as StackLine, LineKind, Report,

@@ -1,9 +1,10 @@
-//! The Linux folder and its `tar.gz`: the program, the helper jars, the language tools,
-//! the icon, a desktop entry and an optional `install.sh`.
+//! The Linux folder, its `tar.gz` and its packages: the program, the helper jars, the
+//! language tools, the icon, a desktop entry and an `install.sh`; the `.deb` and the
+//! `.rpm` are packed from one tree.
 //!
-//! The package is built on Linux, where the release binary and the executable bits of
-//! `install.sh` come from. Everything that is text is written here, so the layout can be
-//! checked from any system.
+//! The folder and the packages are built on Linux, where the release binary and the
+//! executable bits of `install.sh` come from. Everything that is text is written here, so
+//! the layout can be checked from any system.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,20 +19,28 @@ const DESKTOP: &str = include_str!("../../../dist/arro.desktop");
 const INSTALL: &str = include_str!("../../../dist/install.sh");
 /// Where the package puts the program and everything next to it.
 const OPT_DIR: &str = "/opt/arro";
-/// The Debian packages of the libraries the release binary links against. The program
-/// is built in Ubuntu 22.04 with `libfontconfig1-dev`, `libwayland-dev`, `libx11-dev`,
-/// `libxcb1-dev`, `libxkbcommon-dev`, `libxkbcommon-x11-dev` and Vulkan, so these are
-/// the runtime packages of those build packages.
-const DEPENDS: [&str; 9] = [
-    "libc6",
-    "libfontconfig1",
-    "libfreetype6",
-    "libxkbcommon0",
-    "libxkbcommon-x11-0",
-    "libwayland-client0",
-    "libx11-xcb1",
-    "libxcb1",
-    "libvulkan1",
+/// The license of the project, as `LICENSE.md` and the README name it. The packages
+/// carry the same string.
+const LICENSE: &str = "FSL-1.1-ALv2";
+/// The release number of a package: the first build of a version.
+const RELEASE: &str = "1";
+/// The architecture of the packages. Only x86-64 is built.
+const ARCH: &str = "x86_64";
+/// The libraries the release binary links against, in the names of Debian and of Fedora
+/// and openSUSE. The program is built in Ubuntu 22.04 with `libfontconfig1-dev`,
+/// `libwayland-dev`, `libx11-dev`, `libxcb1-dev`, `libxkbcommon-dev`,
+/// `libxkbcommon-x11-dev` and Vulkan, so these are the runtime packages of those build
+/// packages. The second name is the one `dnf` and `zypper` know.
+const LIBRARIES: [(&str, &str); 9] = [
+    ("libc6", "glibc"),
+    ("libfontconfig1", "fontconfig"),
+    ("libfreetype6", "freetype"),
+    ("libxkbcommon0", "libxkbcommon"),
+    ("libxkbcommon-x11-0", "libxkbcommon-x11"),
+    ("libwayland-client0", "libwayland-client"),
+    ("libx11-xcb1", "libX11-xcb"),
+    ("libxcb1", "libxcb"),
+    ("libvulkan1", "vulkan-loader"),
 ];
 /// The PNG renders that become the icons of the package, by size.
 const ICON_PREFIX: &str = "arro-";
@@ -52,10 +61,22 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 fi
 exit 0
 ";
+/// The tools that make the package, with the command that installs them on the systems
+/// of the release.
+const RPMBUILD_MISSING: &str = "rpmbuild is not available: install the rpm-build \
+                                 package (dnf install rpm-build, or zypper install \
+                                 rpm-build), or build the .rpm on Fedora or openSUSE";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-pub fn run(root: &Path, out: &Path, tools: Option<&Path>, archive: bool, deb: bool) -> Result {
+pub fn run(
+    root: &Path,
+    out: &Path,
+    tools: Option<&Path>,
+    archive: bool,
+    deb: bool,
+    rpm: bool,
+) -> Result {
     let out = dist::absolute(out)?;
     let root = dist::absolute(root)?;
     if out == root {
@@ -123,6 +144,10 @@ pub fn run(root: &Path, out: &Path, tools: Option<&Path>, archive: bool, deb: bo
         let package = deb_package(&root, &out)?;
         println!("{}", package.display());
     }
+    if rpm {
+        let package = rpm_package(&root, &out)?;
+        println!("{}", package.display());
+    }
     Ok(())
 }
 
@@ -153,6 +178,11 @@ fn deb_name(version: &str) -> String {
 
 /// The control file of the package. `Version` has no `v`, as `dpkg` compares it.
 fn control_text(version: &str) -> String {
+    let depends = LIBRARIES
+        .iter()
+        .map(|(deb, _)| *deb)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "Package: arro\n\
          Version: {version}\n\
@@ -160,10 +190,10 @@ fn control_text(version: &str) -> String {
          Priority: optional\n\
          Architecture: amd64\n\
          Maintainer: Arro\n\
-         Depends: {}\n\
+         License: {LICENSE}\n\
+         Depends: {depends}\n\
          Description: A native IDE for Java\n\
-         \x20Arro is a fast native IDE for Java with its own Rust core.\n",
-        DEPENDS.join(", ")
+         \x20Arro is a fast native IDE for Java with its own Rust core.\n"
     )
 }
 
@@ -173,8 +203,9 @@ fn desktop_entry() -> String {
     DESKTOP.replace("@ARRO_DIR@", OPT_DIR)
 }
 
-/// Fills `tree` with the files of a `.deb` and leaves `dpkg-deb` to pack it.
-fn build_deb_tree(root: &Path, out: &Path, tree: &Path) -> Result {
+/// Fills `tree` with the files both packages carry: the release folder under
+/// `/opt/arro`, the link in `/usr/bin`, the desktop entry and the icons of the system.
+fn build_package_tree(root: &Path, out: &Path, tree: &Path) -> Result {
     let opt = tree.join("opt").join("arro");
     copy_tree(out, &opt, &NOT_IN_OPT)?;
 
@@ -187,6 +218,13 @@ fn build_deb_tree(root: &Path, out: &Path, tree: &Path) -> Result {
     write_file(&applications.join("arro.desktop"), &desktop_entry())?;
 
     install_icons(root, tree)?;
+    set_directory_modes(tree)?;
+    Ok(())
+}
+
+/// Fills `tree` with the files of a `.deb` and leaves `dpkg-deb` to pack it.
+fn build_deb_tree(root: &Path, out: &Path, tree: &Path) -> Result {
+    build_package_tree(root, out, tree)?;
 
     let debian = tree.join("DEBIAN");
     create_dir(&debian)?;
@@ -196,7 +234,202 @@ fn build_deb_tree(root: &Path, out: &Path, tree: &Path) -> Result {
     )?;
     write_script(&debian.join("postinst"))?;
     write_script(&debian.join("postrm"))?;
-    set_directory_modes(tree)?;
+    set_directory_modes(&debian)?;
+    Ok(())
+}
+
+/// The `.rpm` sits next to the release folder too. `rpmbuild` packs the same tree the
+/// `.deb` is built from, through a spec this module writes; a system without the tool
+/// stops with a message instead of writing half a package.
+fn rpm_package(root: &Path, out: &Path) -> Result<PathBuf> {
+    let parent = out.parent().ok_or("the output folder has no parent")?;
+    let archive = parent.join(rpm_name(env!("CARGO_PKG_VERSION")));
+    if archive.exists() {
+        fs::remove_file(&archive)?;
+    }
+    let work = parent.join(format!(".arro-rpm-{}-{}", std::process::id(), next_id()));
+    let result = build_rpm_work(root, out, &work).and_then(|built| copy_rpm(&built, &archive));
+    let _ = fs::remove_dir_all(&work);
+    if result.is_err() {
+        // A failed run must not leave a package that a later step may attach.
+        let _ = fs::remove_file(&archive);
+    }
+    result?;
+    Ok(archive)
+}
+
+/// `arro-0.1.16-1.x86_64.rpm`: the name `rpmbuild` gives the package of the spec.
+fn rpm_name(version: &str) -> String {
+    format!("arro-{version}-{RELEASE}.{ARCH}.rpm")
+}
+
+/// Assembles the tree in `work/rpmbuild/BUILD/stage`, writes the spec and calls
+/// `rpmbuild -bb`.
+fn build_rpm_work(root: &Path, out: &Path, work: &Path) -> Result<PathBuf> {
+    // The release folder holds the language servers: a system without the tool should
+    // say so before the tree is copied, not after minutes of work.
+    match Command::new("rpmbuild").arg("--version").output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => return Err(format!("rpmbuild --version failed: {}", output.status).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RPMBUILD_MISSING.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let top = work.join("rpmbuild");
+    for folder in ["BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"] {
+        fs::create_dir_all(top.join(folder))?;
+    }
+    let stage = top.join("BUILD").join("stage");
+    build_package_tree(root, out, &stage)?;
+    let spec = top.join("SPECS").join("arro.spec");
+    write_file(&spec, &spec_text(env!("CARGO_PKG_VERSION"), &stage)?)?;
+
+    let mut command = rpmbuild_command(&top, &spec, &stage);
+    match command.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => return Err(format!("rpmbuild -bb failed: {status}").into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RPMBUILD_MISSING.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let built = top
+        .join("RPMS")
+        .join(ARCH)
+        .join(rpm_name(env!("CARGO_PKG_VERSION")));
+    if !built.is_file() {
+        return Err(format!("rpmbuild wrote no {}", built.display()).into());
+    }
+    Ok(built)
+}
+
+/// Puts the package `rpmbuild` wrote next to the release folder under the name the
+/// release publishes.
+fn copy_rpm(built: &Path, archive: &Path) -> Result {
+    if archive.exists() {
+        fs::remove_file(archive)?;
+    }
+    fs::copy(built, archive)?;
+    Ok(())
+}
+
+/// `rpmbuild -bb --define "_topdir TOP" --define "arro_stage STAGE" SPEC`. The tree the
+/// spec installs is passed as a macro: from rpm 4.20 on `%{_builddir}` is a folder of the
+/// package itself, so `%install` cannot find the tree through it.
+fn rpmbuild_command(top: &Path, spec: &Path, stage: &Path) -> Command {
+    let mut command = Command::new("rpmbuild");
+    command
+        .arg("-bb")
+        .arg("--define")
+        .arg(format!("_topdir {}", top.display()))
+        .arg("--define")
+        .arg(format!("arro_stage {}", stage.display()))
+        .arg(spec);
+    command
+}
+
+/// A file or folder of the package tree, as `%files` names it.
+struct PackageEntry {
+    /// The path in the package, with `/` separators and a leading `/`.
+    path: String,
+    /// The mode of a file; `None` for a folder and a symbolic link.
+    mode: Option<u32>,
+    folder: bool,
+}
+
+/// The spec of the package: no sources are built, `%install` copies the assembled tree
+/// into the build root and `%files` names every path of that tree with its mode.
+fn spec_text(version: &str, tree: &Path) -> Result<String> {
+    let mut text = String::new();
+    // Nothing is built here, and the tree holds complete JDK and language server folders
+    // that the post-install steps would strip and rewrite: the debug package would be
+    // empty too. All three have to go before any section is read.
+    text.push_str("%global debug_package %{nil}\n");
+    text.push_str("%global __os_install_post %{nil}\n");
+    text.push_str("%global __brp_mangle_shebangs %{nil}\n");
+    text.push_str(&format!(
+        "\nName: arro\nVersion: {version}\nRelease: {RELEASE}\n"
+    ));
+    text.push_str("Summary: A native IDE for Java\n");
+    text.push_str(&format!("License: {LICENSE}\n"));
+    text.push_str("URL: https://github.com/PabloSensei/arro\n");
+    text.push_str(&format!("BuildArch: {ARCH}\n"));
+    // The binary links against the libraries below and nothing is built here, so the
+    // automatic dependency generator has nothing to read and must stay out.
+    text.push_str("AutoReqProv: no\n");
+    for (_, rpm) in LIBRARIES {
+        text.push_str(&format!("Requires: {rpm}\n"));
+    }
+    text.push_str("\n%description\n");
+    text.push_str("Arro is a fast native IDE for Java with its own Rust core.\n");
+    text.push_str("\n%install\n");
+    text.push_str("rm -rf %{buildroot}\n");
+    text.push_str("mkdir -p %{buildroot}\n");
+    // The path comes from the command line, so it is quoted here: a build folder may
+    // hold spaces.
+    text.push_str("cp -a \"%{arro_stage}/.\" %{buildroot}/\n");
+    text.push_str("\n%files\n");
+    let inside_opt = format!("{OPT_DIR}/");
+    for entry in package_entries(tree)? {
+        if entry.folder {
+            // Only the folders of the program belong to this package. `/opt`, `/usr`,
+            // `/usr/bin` and the folders of the icon theme are owned by the packages of
+            // the system, and naming them here fails the install with a file conflict;
+            // the files inside them are still below.
+            if entry.path == OPT_DIR || entry.path.starts_with(&inside_opt) {
+                text.push_str(&format!("%attr(0755,root,root) %dir {}\n", entry.path));
+            }
+        } else if let Some(mode) = entry.mode {
+            text.push_str(&format!("%attr({mode:04o},root,root) {}\n", entry.path));
+        } else {
+            // A link has no mode of its own; 0777 is what a package records for it.
+            text.push_str(&format!("%attr(0777,root,root) {}\n", entry.path));
+        }
+    }
+    Ok(text)
+}
+
+fn package_entries(tree: &Path) -> Result<Vec<PackageEntry>> {
+    let mut entries = Vec::new();
+    collect_entries(tree, tree, &mut entries)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn collect_entries(root: &Path, directory: &Path, entries: &mut Vec<PackageEntry>) -> Result {
+    let mut children = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            entries.push(PackageEntry {
+                path: format!("/{relative}"),
+                mode: None,
+                folder: false,
+            });
+        } else if metadata.is_dir() {
+            entries.push(PackageEntry {
+                path: format!("/{relative}"),
+                mode: None,
+                folder: true,
+            });
+            collect_entries(root, &path, entries)?;
+        } else {
+            let mode = if executable(&metadata) { 0o755 } else { 0o644 };
+            entries.push(PackageEntry {
+                path: format!("/{relative}"),
+                mode: Some(mode),
+                folder: false,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -460,6 +693,8 @@ fn remove_old(out: &Path) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::ffi::OsStr;
     use std::path::Path;
     use test_support::TempDir;
 
@@ -561,15 +796,220 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("Depends: "))
             .expect("a Depends line");
-        for library in DEPENDS {
+        for (library, _) in LIBRARIES {
             assert!(depends.contains(library), "{library} is not in {depends}");
         }
+        assert!(text.contains(&format!("License: {LICENSE}\n")), "{text}");
         assert!(text.contains("Description: "), "{text}");
     }
 
     #[test]
     fn the_package_name_holds_the_version_without_v() {
         assert_eq!(deb_name("0.1.16"), "arro_0.1.16_amd64.deb");
+    }
+
+    #[test]
+    fn the_rpm_name_holds_the_version_the_release_and_the_architecture() {
+        assert_eq!(rpm_name("0.1.16"), "arro-0.1.16-1.x86_64.rpm");
+    }
+
+    /// The release folder of the tests: the program, one helper jar, one tool jar, the
+    /// texts, the desktop entry and the two renders of the icon.
+    fn release_tree(root: &Path, out: &Path) {
+        let resources = root.join("crates/app/ide/resources");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(resources.join("arro-16.png"), b"png16").unwrap();
+        fs::write(resources.join("arro-256.png"), b"png256").unwrap();
+        fs::create_dir_all(out.join("helpers")).unwrap();
+        fs::create_dir_all(out.join("tools/engine")).unwrap();
+        fs::write(out.join("arro"), b"program").unwrap();
+        dist::make_executable(&out.join("arro")).unwrap();
+        fs::write(out.join("helpers/one.jar"), b"jar").unwrap();
+        fs::write(out.join("tools/engine/server.jar"), b"server").unwrap();
+        fs::write(out.join("README.txt"), b"readme").unwrap();
+        fs::write(out.join("NOTICE.txt"), b"notice").unwrap();
+        dist::write_unix_text(&out.join("install.sh"), INSTALL).unwrap();
+        dist::make_executable(&out.join("install.sh")).unwrap();
+        fs::write(out.join("arro.desktop"), DESKTOP).unwrap();
+        fs::write(out.join("arro-256.png"), b"png256").unwrap();
+    }
+
+    /// The spec builds no sources: `%install` copies the tree the `.deb` is assembled
+    /// from and `%files` names every path of it with the mode it has there.
+    #[test]
+    fn the_spec_names_the_package_the_version_and_the_fedora_libraries() {
+        let temp = TempDir::new("dist-rpm-spec");
+        let root = temp.path().join("repo");
+        let out = temp.path().join("dist");
+        let tree = temp.path().join("stage");
+        release_tree(&root, &out);
+        build_package_tree(&root, &out, &tree).unwrap();
+
+        let text = spec_text("0.1.16", &tree).unwrap();
+        assert!(text.contains("\nName: arro\n"), "{text}");
+        assert!(text.contains("\nVersion: 0.1.16\n"), "{text}");
+        assert!(text.contains("\nRelease: 1\n"), "{text}");
+        assert!(text.contains(&format!("BuildArch: {ARCH}\n")), "{text}");
+        assert!(text.contains(&format!("License: {LICENSE}\n")), "{text}");
+        assert!(text.contains("AutoReqProv: no\n"), "{text}");
+        for (_, rpm) in LIBRARIES {
+            assert!(text.contains(&format!("Requires: {rpm}\n")), "{text}");
+        }
+        assert!(
+            !text.contains("\n%build\n"),
+            "nothing is built here: {text}"
+        );
+        assert!(text.contains("\n%install\n"), "{text}");
+        assert!(
+            text.contains("cp -a \"%{arro_stage}/.\" %{buildroot}/\n"),
+            "{text}"
+        );
+        assert!(!text.contains("%{_builddir}"), "{text}");
+        // The `%files` list of the tree the `.deb` is built from too.
+        assert!(text.contains("%dir /opt/arro\n"), "{text}");
+        assert!(text.contains("%dir /opt/arro/helpers\n"), "{text}");
+        assert!(
+            text.contains("%attr(0644,root,root) /opt/arro/helpers/one.jar\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("%attr(0644,root,root) /opt/arro/tools/engine/server.jar\n"),
+            "{text}"
+        );
+        assert!(text.contains("/usr/bin/arro\n"), "{text}");
+        assert!(
+            text.contains("%attr(0644,root,root) /usr/share/applications/arro.desktop\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/usr/share/icons/hicolor/16x16/apps/arro.png\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/usr/share/icons/hicolor/256x256/apps/arro.png\n"),
+            "{text}"
+        );
+        assert!(!text.contains("@ARRO_DIR@"), "{text}");
+        // The package manager writes these itself.
+        assert!(!text.contains("/opt/arro/install.sh\n"), "{text}");
+        assert!(!text.contains("/opt/arro/arro.desktop\n"), "{text}");
+        // The link into `/usr/bin` is a link, not a file with a mode of its own.
+        #[cfg(unix)]
+        {
+            assert!(
+                text.contains("%attr(0777,root,root) /usr/bin/arro\n"),
+                "{text}"
+            );
+            assert!(
+                text.contains("%attr(0755,root,root) /opt/arro/arro\n"),
+                "{text}"
+            );
+        }
+    }
+
+    /// `/opt`, `/usr`, `/usr/bin` and the folders of the icon theme belong to the
+    /// packages of the system; a package that declares them conflicts with those. Only
+    /// the folders of the program are directories of this package.
+    #[test]
+    fn the_spec_declares_only_the_folders_of_the_program() {
+        let temp = TempDir::new("dist-rpm-dirs");
+        let root = temp.path().join("repo");
+        let out = temp.path().join("dist");
+        let tree = temp.path().join("stage");
+        release_tree(&root, &out);
+        build_package_tree(&root, &out, &tree).unwrap();
+
+        let text = spec_text("0.1.16", &tree).unwrap();
+        let dirs: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once("%dir ").map(|(_, dir)| dir))
+            .collect();
+        assert!(dirs.contains(&"/opt/arro"), "{dirs:?}");
+        assert!(dirs.contains(&"/opt/arro/helpers"), "{dirs:?}");
+        for dir in &dirs {
+            assert!(
+                *dir == OPT_DIR || dir.starts_with("/opt/arro/"),
+                "{dir} is not a folder of the program"
+            );
+        }
+        assert!(!dirs.contains(&"/opt"), "{dirs:?}");
+        assert!(!dirs.contains(&"/usr"), "{dirs:?}");
+        assert!(!dirs.contains(&"/usr/bin"), "{dirs:?}");
+        assert!(!dirs.contains(&"/usr/share"), "{dirs:?}");
+        assert!(!dirs.contains(&"/usr/share/applications"), "{dirs:?}");
+    }
+
+    /// `rpmbuild` would run its debug package and its post-install scripts even without
+    /// sources: the first fails on an empty list, the others strip and rewrite the JDK
+    /// and the language servers of the tree.
+    #[test]
+    fn the_spec_turns_the_post_processing_of_rpmbuild_off() {
+        let temp = TempDir::new("dist-rpm-post");
+        let root = temp.path().join("repo");
+        let out = temp.path().join("dist");
+        let tree = temp.path().join("stage");
+        release_tree(&root, &out);
+        build_package_tree(&root, &out, &tree).unwrap();
+
+        let text = spec_text("0.1.16", &tree).unwrap();
+        let head = text.lines().take(3).collect::<Vec<_>>();
+        assert_eq!(
+            head,
+            [
+                "%global debug_package %{nil}",
+                "%global __os_install_post %{nil}",
+                "%global __brp_mangle_shebangs %{nil}",
+            ],
+            "{text}"
+        );
+        // The definitions come before every section that reads them.
+        let name = text.find("\nName: arro\n").unwrap();
+        for macro_line in [
+            "%global debug_package %{nil}",
+            "%global __os_install_post %{nil}",
+            "%global __brp_mangle_shebangs %{nil}",
+        ] {
+            let at = text.find(macro_line).unwrap();
+            assert!(at < name, "{macro_line} comes after Name: {text}");
+        }
+    }
+
+    #[test]
+    fn rpmbuild_gets_the_top_folder_the_stage_and_the_spec() {
+        let top = Path::new("/tmp/rpmbuild");
+        let stage = Path::new("/tmp/rpmbuild/BUILD/stage");
+        let spec = Path::new("/tmp/rpmbuild/SPECS/arro.spec");
+        let command = rpmbuild_command(top, spec, stage);
+        assert_eq!(command.get_program(), "rpmbuild");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-bb",
+                "--define",
+                "_topdir /tmp/rpmbuild",
+                "--define",
+                "arro_stage /tmp/rpmbuild/BUILD/stage",
+                "/tmp/rpmbuild/SPECS/arro.spec"
+            ]
+        );
+    }
+
+    #[test]
+    fn rpmbuild_gets_a_stage_path_with_spaces() {
+        let top = Path::new("/tmp/rpmbuild");
+        let stage = Path::new("/tmp/arro build/stage");
+        let spec = Path::new("/tmp/rpmbuild/SPECS/arro.spec");
+        let command = rpmbuild_command(top, spec, stage);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        // The path stays one argument of `--define`, and `%install` quotes the macro.
+        assert_eq!(args[4], "arro_stage /tmp/arro build/stage", "{args:?}");
     }
 
     #[test]
@@ -754,5 +1194,200 @@ mod tests {
         ] {
             assert!(contents.contains(path), "{path} is not in {contents}");
         }
+    }
+
+    /// A real `.rpm` needs `rpmbuild` from the `rpm-build` package and `rpm` itself. The
+    /// test reports a skip where they are missing instead of failing.
+    #[test]
+    fn rpmbuild_builds_a_real_package() {
+        for tool in ["rpmbuild", "rpm"] {
+            let output = Command::new(tool).arg("--version").output();
+            let Ok(output) = output else {
+                eprintln!("{tool} is not installed; the test is skipped");
+                return;
+            };
+            if !output.status.success() {
+                eprintln!("{tool} does not run; the test is skipped");
+                return;
+            }
+        }
+
+        let temp = TempDir::new("dist-rpm-real");
+        let root = temp.path().join("repo");
+        let out = temp.path().join("dist");
+        release_tree(&root, &out);
+
+        let archive = rpm_package(&root, &out).unwrap();
+        assert_eq!(
+            archive.file_name().unwrap().to_string_lossy(),
+            rpm_name(env!("CARGO_PKG_VERSION"))
+        );
+
+        let contents = Command::new("rpm")
+            .args(["-qpl", archive.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(contents.status.success());
+        let contents = String::from_utf8_lossy(&contents.stdout);
+        for path in [
+            "/opt/arro/arro",
+            "/opt/arro/helpers/one.jar",
+            "/opt/arro/tools/engine/server.jar",
+            "/usr/bin/arro",
+            "/usr/share/applications/arro.desktop",
+            "/usr/share/icons/hicolor/16x16/apps/arro.png",
+        ] {
+            assert!(contents.contains(path), "{path} is not in {contents}");
+        }
+        // Only the folder of the program is a directory of the package; the folders of
+        // the system belong to the packages that already own them.
+        assert!(
+            contents.lines().any(|line| line == "/opt/arro"),
+            "{contents}"
+        );
+        for path in ["/opt", "/usr", "/usr/bin", "/usr/share"] {
+            assert!(
+                !contents.lines().any(|line| line == path),
+                "{path} is not a folder of this package: {contents}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_installer(script: &Path, home: &Path, args: &[&std::ffi::OsStr]) -> (String, String) {
+        let output = Command::new("sh")
+            .arg(script)
+            .args(args)
+            .env("HOME", home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// Without root the script copies the folder into the home directory, links the
+    /// program, writes the desktop entry and the icons, and `--uninstall` takes all of it
+    /// away. A second call copies into the folder it is given.
+    #[cfg(unix)]
+    #[test]
+    fn install_sh_installs_into_the_home_folder_and_uninstalls() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("dist-linux-install");
+        let archive = temp.path().join("arro-0.1.0-linux-x86_64");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        release_tree(&temp.path().join("repo"), &archive);
+        // The installer takes every render in the folder; the release of the test
+        // carries both of the resources.
+        fs::write(archive.join("arro-16.png"), b"png16").unwrap();
+        let installer = archive.join("install.sh");
+
+        let (stdout, stderr) = run_installer(&installer, &home, &[]);
+        assert!(stdout.contains("Installed Arro"), "{stdout}{stderr}");
+
+        let installed = home.join(".local/share/arro");
+        assert_eq!(fs::read(installed.join("arro")).unwrap(), b"program");
+        assert!(installed.join("helpers/one.jar").is_file());
+        assert!(installed.join("tools/engine/server.jar").is_file());
+        assert_eq!(
+            fs::metadata(installed.join("arro"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        let link = home.join(".local/bin/arro");
+        assert!(link_points_to(&link, &installed.join("arro")));
+
+        let entry =
+            fs::read_to_string(home.join(".local/share/applications/arro.desktop")).unwrap();
+        assert!(
+            entry.contains(&format!("Exec=\"{}/arro\" %F", installed.display())),
+            "{entry}"
+        );
+        assert!(entry.contains("MimeType=inode/directory;"), "{entry}");
+        assert!(!entry.contains("@ARRO_DIR@"), "{entry}");
+        assert!(
+            home.join(".local/share/icons/hicolor/16x16/apps/arro.png")
+                .is_file()
+        );
+        assert!(
+            home.join(".local/share/icons/hicolor/256x256/apps/arro.png")
+                .is_file()
+        );
+
+        let (stdout, stderr) = run_installer(&installer, &home, &[OsStr::new("--uninstall")]);
+        assert!(stdout.contains("Removed"), "{stdout}{stderr}");
+        assert!(fs::symlink_metadata(&installed).is_err());
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(fs::symlink_metadata(home.join(".local/share/applications/arro.desktop")).is_err());
+        assert!(
+            fs::symlink_metadata(home.join(".local/share/icons/hicolor/16x16/apps/arro.png"))
+                .is_err()
+        );
+
+        // The folder from the argument wins over the default, and the same argument is
+        // what `--uninstall` removes.
+        let custom = home.join("custom arro");
+        let (stdout, stderr) = run_installer(&installer, &home, &[custom.as_os_str()]);
+        assert!(stdout.contains("Installed Arro"), "{stdout}{stderr}");
+        assert!(custom.join("arro").is_file());
+        assert!(link_points_to(&link, &custom.join("arro")));
+        let entry =
+            fs::read_to_string(home.join(".local/share/applications/arro.desktop")).unwrap();
+        assert!(entry.contains(&*custom.to_string_lossy()), "{entry}");
+
+        let (stdout, stderr) = run_installer(
+            &installer,
+            &home,
+            &[OsStr::new("--uninstall"), custom.as_os_str()],
+        );
+        assert!(stdout.contains("Removed"), "{stdout}{stderr}");
+        assert!(fs::symlink_metadata(&custom).is_err());
+        assert!(fs::symlink_metadata(&link).is_err());
+    }
+
+    /// A folder inside the unpacked archive would copy the copy into itself.
+    #[cfg(unix)]
+    #[test]
+    fn install_sh_refuses_a_folder_inside_the_archive() {
+        let temp = TempDir::new("dist-linux-inside");
+        let archive = temp.path().join("arro-0.1.0-linux-x86_64");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        release_tree(&temp.path().join("repo"), &archive);
+
+        let inside = archive.join("installed");
+        let (stdout, stderr) =
+            run_installer(&archive.join("install.sh"), &home, &[inside.as_os_str()]);
+        assert!(stderr.contains("inside the archive"), "{stdout}{stderr}");
+        assert!(!inside.exists());
+    }
+
+    /// The script refuses a folder without the program instead of removing it.
+    #[cfg(unix)]
+    #[test]
+    fn install_sh_uninstall_leaves_a_foreign_folder_alone() {
+        let temp = TempDir::new("dist-linux-uninstall");
+        let archive = temp.path().join("arro-0.1.0-linux-x86_64");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        release_tree(&temp.path().join("repo"), &archive);
+        let foreign = home.join("documents");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("note.txt"), b"keep").unwrap();
+
+        let (stdout, stderr) = run_installer(
+            &archive.join("install.sh"),
+            &home,
+            &[OsStr::new("--uninstall"), foreign.as_os_str()],
+        );
+        assert!(stderr.contains("is not an Arro folder"), "{stdout}{stderr}");
+        assert_eq!(fs::read(foreign.join("note.txt")).unwrap(), b"keep");
     }
 }

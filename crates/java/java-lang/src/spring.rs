@@ -36,11 +36,21 @@ pub const LANGUAGE_ID: LanguageId = LanguageId("spring-config");
 const SOURCE: SourceId = SourceId::new("spring-config");
 const CONFIGURATION_METADATA: &str = "META-INF/spring-configuration-metadata.json";
 const ADDITIONAL_METADATA: &str = "META-INF/additional-spring-configuration-metadata.json";
+/// The extension descriptor of Quarkus, whose `config` list names keys and prefixes.
+const QUARKUS_EXTENSION: &str = "META-INF/quarkus-extension.yaml";
+/// The configuration metadata of a Quarkus extension, in the shape of the other
+/// frameworks when an extension ships one.
+const QUARKUS_METADATA: &str = "META-INF/quarkus-config-metadata.json";
+/// The configuration metadata of Micronaut: one file or a folder of them.
+const MICRONAUT_FOLDER: &str = "META-INF/micronaut/";
+const MICRONAUT_METADATA: &str = "META-INF/micronaut/configuration-metadata.json";
 /// The checks of this language, for the handle of the disabled ones.
 const SPRING_CHECKS: &[&str] = &[
     "spring.config.unknownProperty",
     "spring.config.deprecatedProperty",
     "spring.config.invalidValue",
+    "quarkus.config.unknownProperty",
+    "micronaut.config.unknownProperty",
 ];
 /// A wait of a query for the background thread that reads the metadata.
 const READY_STEP: Duration = Duration::from_millis(25);
@@ -319,7 +329,12 @@ fn read_snapshot(
     let mut next = HashMap::new();
     for path in &paths.classpath {
         if path.is_dir() {
-            for name in [CONFIGURATION_METADATA, ADDITIONAL_METADATA] {
+            for name in [
+                CONFIGURATION_METADATA,
+                ADDITIONAL_METADATA,
+                QUARKUS_METADATA,
+                MICRONAUT_METADATA,
+            ] {
                 let file = path.join(name.replace('/', std::path::MAIN_SEPARATOR_STR));
                 let Some(parsed) = cached_metadata(&file, cache, &mut next) else {
                     continue;
@@ -334,6 +349,9 @@ fn read_snapshot(
             metadata.add(parsed.as_ref().clone(), false);
         }
     }
+    // The configuration classes of the project declare their own keys.
+    let declared = config_properties_in_sources(&paths.sources);
+    metadata.add(declared, true);
     let placeholders = placeholders_in_sources(&paths.sources);
     (
         Snapshot {
@@ -405,16 +423,48 @@ fn read_jar(jar: &Path) -> Parsed {
         return Parsed::default();
     };
     let mut parsed = Parsed::default();
-    for name in [CONFIGURATION_METADATA, ADDITIONAL_METADATA] {
-        let Ok(mut entry) = archive.by_name(name) else {
+    for index in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(index) else {
+            continue;
+        };
+        let Ok(raw_name) = entry.name() else {
+            continue;
+        };
+        let name = raw_name.to_string();
+        let kind = if name == CONFIGURATION_METADATA
+            || name == ADDITIONAL_METADATA
+            || name == QUARKUS_METADATA
+            || name == MICRONAUT_METADATA
+            || name.ends_with("configuration-metadata.json")
+            || (name.starts_with(MICRONAUT_FOLDER) && name.ends_with(".json"))
+        {
+            Some(MetadataKind::Json)
+        } else if name == QUARKUS_EXTENSION {
+            Some(MetadataKind::QuarkusExtension)
+        } else {
+            None
+        };
+        let Some(kind) = kind else {
             continue;
         };
         let mut text = String::new();
-        if entry.read_to_string(&mut text).is_ok() {
-            parsed = parsed.merged(parse_metadata(&text));
+        if entry.read_to_string(&mut text).is_err() {
+            continue;
         }
+        let parsed_file = match kind {
+            MetadataKind::Json => parse_metadata(&text),
+            MetadataKind::QuarkusExtension => parse_quarkus_extension(&text),
+        };
+        parsed = parsed.merged(parsed_file);
     }
     parsed
+}
+
+/// The shape of one metadata file of a jar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataKind {
+    Json,
+    QuarkusExtension,
 }
 
 /// One property of the metadata, with the parts a list and a popup show.
@@ -484,11 +534,16 @@ struct Metadata {
     properties: HashMap<String, Property>,
     groups: HashMap<String, Group>,
     hints: HashMap<String, Vec<HintValue>>,
+    /// The roots of the keys the metadata knows, `spring`, `quarkus` or `micronaut`.
+    roots: HashSet<String>,
+    /// The full prefixes a framework descriptor names without listing their keys.
+    prefixes: HashSet<String>,
 }
 
 impl Metadata {
     fn add(&mut self, parsed: Parsed, replace: bool) {
         for property in parsed.properties {
+            note_prefix(&mut self.roots, &property.name);
             if replace {
                 self.properties.insert(property.name.clone(), property);
             } else {
@@ -498,6 +553,7 @@ impl Metadata {
             }
         }
         for group in parsed.groups {
+            note_prefix(&mut self.roots, &group.name);
             if replace {
                 self.groups.insert(group.name.clone(), group);
             } else {
@@ -511,10 +567,28 @@ impl Metadata {
                 self.hints.entry(name).or_insert(values);
             }
         }
+        for prefix in parsed.prefixes {
+            note_prefix(&mut self.roots, &prefix);
+            self.prefixes.insert(prefix);
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.properties.is_empty() && self.groups.is_empty()
+    }
+
+    /// Whether the metadata knows anything under the root of a key.
+    fn knows_root(&self, root: &str) -> bool {
+        self.roots.contains(root)
+    }
+
+    /// Whether a key lives under a prefix a descriptor named without listing its keys.
+    fn under_known_prefix(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|prefix| {
+            key.len() > prefix.len()
+                && key.starts_with(prefix.as_str())
+                && key.as_bytes()[prefix.len()] == b'.'
+        })
     }
 
     /// Whether `key` names a property, a group, or a level that holds them.
@@ -572,6 +646,9 @@ struct Parsed {
     properties: Vec<Property>,
     groups: Vec<Group>,
     hints: Vec<(String, Vec<HintValue>)>,
+    /// Keys and prefixes of a framework that ships no property list: a Quarkus
+    /// extension descriptor names what it reads, not the type of every key.
+    prefixes: Vec<String>,
 }
 
 impl Parsed {
@@ -579,14 +656,120 @@ impl Parsed {
         self.properties.extend(other.properties);
         self.groups.extend(other.groups);
         self.hints.extend(other.hints);
+        self.prefixes.extend(other.prefixes);
         self
     }
 }
 
+/// The root of a key, `quarkus` for `quarkus.http.port`.
+fn note_prefix(prefixes: &mut HashSet<String>, name: &str) {
+    if let Some(root) = name.split('.').next()
+        && !root.is_empty()
+    {
+        prefixes.insert(root.to_owned());
+    }
+}
+
+/// Reads the JSON metadata of the frameworks. The Spring shape names `properties` and
+/// `groups`; the Micronaut shape maps every key to its type, description and default
+/// value, so a top-level map without those lists is read as a property list.
 fn parse_metadata(text: &str) -> Parsed {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return Parsed::default();
     };
+    if value.get("properties").is_none()
+        && value.get("groups").is_none()
+        && value.get("hints").is_none()
+        && let Some(map) = value.as_object()
+    {
+        let mut parsed = Parsed::default();
+        for (name, entry) in map {
+            if !name.contains('.') || !entry.is_object() {
+                continue;
+            }
+            parsed.properties.push(Property {
+                name: name.clone(),
+                type_name: string(entry, "type"),
+                description: string(entry, "description"),
+                default_value: text_value(entry, "defaultValue"),
+                source_type: string(entry, "sourceType"),
+                source_method: string(entry, "sourceMethod"),
+                deprecation: parse_deprecation(entry.get("deprecation")),
+            });
+            if let Some(values) = entry.get("values").and_then(|value| value.as_array()) {
+                let hints: Vec<HintValue> = values
+                    .iter()
+                    .filter_map(|value| {
+                        Some(HintValue {
+                            value: string(value, "value")?,
+                            description: string(value, "description"),
+                        })
+                    })
+                    .collect();
+                if !hints.is_empty() {
+                    parsed.hints.push((name.clone(), hints));
+                }
+            }
+        }
+        return parsed;
+    }
+    parse_spring_metadata(&value)
+}
+
+/// Reads a Quarkus extension descriptor. Its `config` list names the keys and the
+/// prefixes the extension reads; an entry that ends with a dot is a prefix, the rest are
+/// keys. A version of the descriptor that carries no `config` list gives nothing.
+fn parse_quarkus_extension(text: &str) -> Parsed {
+    let mut parsed = Parsed::default();
+    let mut in_config = false;
+    let mut config_indent = 0;
+    for line in text.lines() {
+        let without_comment = line.split('#').next().unwrap_or("");
+        if without_comment.trim().is_empty() {
+            continue;
+        }
+        let indent = without_comment.len() - without_comment.trim_start().len();
+        let content = without_comment.trim();
+        if !in_config {
+            if content == "config:" {
+                in_config = true;
+                config_indent = indent;
+            }
+            continue;
+        }
+        if indent <= config_indent {
+            in_config = false;
+            continue;
+        }
+        let Some(entry) = content.strip_prefix('-') else {
+            continue;
+        };
+        let entry = entry.trim().trim_matches('"').trim_matches('\'');
+        let name = entry
+            .split_whitespace()
+            .next()
+            .unwrap_or(entry)
+            .trim_end_matches(':');
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(prefix) = name.strip_suffix('.') {
+            if !prefix.is_empty() {
+                parsed.prefixes.push(prefix.to_owned());
+            }
+            continue;
+        }
+        if !parsed.properties.iter().any(|found| found.name == name) {
+            parsed.properties.push(Property {
+                name: name.to_owned(),
+                ..Property::default()
+            });
+        }
+    }
+    parsed
+}
+
+fn parse_spring_metadata(value: &serde_json::Value) -> Parsed {
     let mut parsed = Parsed::default();
     if let Some(properties) = value.get("properties").and_then(|value| value.as_array()) {
         for entry in properties {
@@ -702,6 +885,254 @@ fn is_duration_type(type_name: Option<&str>) -> bool {
         type_name,
         Some("java.time.Duration" | "org.springframework.boot.convert.DurationStyle")
     )
+}
+
+/// The keys the configuration classes of the project declare: `@ConfigMapping` and
+/// `@ConfigProperties` of Quarkus, `@ConfigurationProperties` and `@EachProperty` of
+/// Micronaut. The types of a framework's own jars are not read.
+fn config_properties_in_sources(sources: &[PathBuf]) -> Parsed {
+    let mut files: Vec<(PathBuf, java_syntax::SpringFile)> = Vec::new();
+    let mut seen = 0;
+    for root in sources {
+        collect_java_sources(root, &mut files, &mut seen);
+        if seen >= MAX_PLACEHOLDER_FILES {
+            break;
+        }
+    }
+    let mut types: HashMap<&str, &java_syntax::Type> = HashMap::new();
+    for (_, file) in &files {
+        for kind in &file.types {
+            types.entry(kind.name.as_str()).or_insert(kind);
+        }
+    }
+    let mut parsed = Parsed::default();
+    for (_, file) in &files {
+        for kind in &file.types {
+            let Some((annotation, shape)) = config_annotation(&kind.annotations) else {
+                continue;
+            };
+            let Some(prefix) = config_prefix(annotation, shape) else {
+                continue;
+            };
+            expand_config_type(kind, &prefix, shape, &types, &mut parsed, 0);
+        }
+    }
+    parsed
+}
+
+/// What a configuration annotation declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigShape {
+    /// Methods of an interface or a class declare the keys.
+    Mapping,
+    /// Fields and getters of a class declare the keys.
+    Properties,
+    /// Every instance under the prefix has the keys of the type.
+    EachProperty,
+}
+
+fn config_annotation(
+    annotations: &[java_syntax::Annotation],
+) -> Option<(&java_syntax::Annotation, ConfigShape)> {
+    let find = |name: &str| annotations.iter().find(|found| found.name == name);
+    if let Some(annotation) = find("ConfigMapping") {
+        return Some((annotation, ConfigShape::Mapping));
+    }
+    if let Some(annotation) = find("ConfigProperties") {
+        return Some((annotation, ConfigShape::Mapping));
+    }
+    if let Some(annotation) = find("ConfigurationProperties") {
+        return Some((annotation, ConfigShape::Properties));
+    }
+    if let Some(annotation) = find("EachProperty") {
+        return Some((annotation, ConfigShape::EachProperty));
+    }
+    None
+}
+
+/// The prefix of a configuration type, with the dot that joins its members.
+fn config_prefix(annotation: &java_syntax::Annotation, shape: ConfigShape) -> Option<String> {
+    let prefix = annotation
+        .argument("prefix")
+        .or(annotation.value.as_deref())
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())?;
+    let mut prefix = prefix.to_owned();
+    if shape == ConfigShape::EachProperty {
+        prefix.push_str(".*");
+    }
+    if !prefix.ends_with('.') {
+        prefix.push('.');
+    }
+    Some(prefix)
+}
+
+fn expand_config_type(
+    kind: &java_syntax::Type,
+    prefix: &str,
+    shape: ConfigShape,
+    types: &HashMap<&str, &java_syntax::Type>,
+    parsed: &mut Parsed,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    parsed.groups.push(Group {
+        name: prefix.trim_end_matches('.').to_owned(),
+        type_name: Some(kind.name.clone()),
+        description: None,
+        source_type: Some(kind.qualified.clone()),
+    });
+    for (name, type_text) in config_members(kind, shape) {
+        let key = format!("{prefix}{}", kebab(&name));
+        let short = simple_config_type(&type_text);
+        if let Some(nested) = types.get(short)
+            && config_annotation(&nested.annotations).is_some()
+        {
+            expand_config_type(
+                nested,
+                &format!("{key}."),
+                config_annotation(&nested.annotations).map_or(shape, |(_, shape)| shape),
+                types,
+                parsed,
+                depth + 1,
+            );
+            continue;
+        }
+        parsed.properties.push(Property {
+            name: key,
+            type_name: Some(type_text),
+            description: None,
+            default_value: None,
+            source_type: Some(kind.qualified.clone()),
+            source_method: None,
+            deprecation: None,
+        });
+    }
+}
+
+/// The names and types of the members that declare keys.
+fn config_members(kind: &java_syntax::Type, shape: ConfigShape) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    match shape {
+        ConfigShape::Mapping => {
+            for method in &kind.methods {
+                if method.parameters.is_empty() && !method.return_type.is_empty() {
+                    found.push((method.name.clone(), method.return_type.clone()));
+                }
+            }
+        }
+        ConfigShape::Properties | ConfigShape::EachProperty => {
+            for field in &kind.fields {
+                if !field.is_static {
+                    found.push((field.name.clone(), field.type_text.clone()));
+                }
+            }
+            for method in &kind.methods {
+                if !method.parameters.is_empty() || method.return_type.is_empty() {
+                    continue;
+                }
+                let name = method
+                    .name
+                    .strip_prefix("get")
+                    .or_else(|| method.name.strip_prefix("is"));
+                if let Some(name) = name
+                    && !name.is_empty()
+                {
+                    found.push((name.to_owned(), method.return_type.clone()));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The type of a member without its type arguments and its package, as the map of the
+/// project knows it.
+fn simple_config_type(type_text: &str) -> &str {
+    let without_arguments = type_text.split('<').next().unwrap_or(type_text).trim();
+    without_arguments
+        .rsplit('.')
+        .next()
+        .unwrap_or(without_arguments)
+}
+
+/// A member name as the configuration spells it: `httpPort` gives `http-port`.
+fn kebab(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, character) in name.char_indices() {
+        if character.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('-');
+            }
+            out.push(character.to_ascii_lowercase());
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+fn collect_java_sources(
+    folder: &Path,
+    out: &mut Vec<(PathBuf, java_syntax::SpringFile)>,
+    seen: &mut usize,
+) {
+    if *seen >= MAX_PLACEHOLDER_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *seen >= MAX_PLACEHOLDER_FILES {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                "target" | "build" | "out" | ".git" | ".gradle"
+            ) {
+                continue;
+            }
+            collect_java_sources(&path, out, seen);
+            continue;
+        }
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
+        {
+            continue;
+        }
+        if entry.metadata().map(|meta| meta.len()).unwrap_or(0) > 2 * 1024 * 1024 {
+            continue;
+        }
+        *seen += 1;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        out.push((path, java_syntax::spring_file(&text)));
+    }
+}
+
+/// The key without the profile prefix of Quarkus, `%dev.quarkus.http.port` giving
+/// `quarkus.http.port`.
+fn without_profile(key: &str) -> &str {
+    let Some(rest) = key.strip_prefix('%') else {
+        return key;
+    };
+    rest.split_once('.').map_or(key, |(_, key)| key)
+}
+
+/// The profile prefix of a key, with the dot that joins it to the key.
+fn profile_of(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix('%')?;
+    let (profile, _) = rest.split_once('.')?;
+    Some(&key[..profile.len() + 2])
 }
 
 fn placeholders_in_sources(sources: &[PathBuf]) -> HashSet<String> {
@@ -1159,21 +1590,23 @@ fn completion_entries(
         return Vec::new();
     }
     let flat = context.flat_prefix.clone();
-    let filter_from = flat.rfind('.').map(|index| index + 1).unwrap_or(0);
+    let profile = profile_of(&flat).unwrap_or("");
+    let lookup = without_profile(&flat).to_owned();
+    let filter_from = lookup.rfind('.').map(|index| index + 1).unwrap_or(0);
     let span = Some(span_in(text, context.key_start, offset));
     let mut entries = Vec::new();
     for (name, property) in &metadata.properties {
-        if name.len() <= flat.len() || !name.starts_with(&flat) {
+        if name.len() <= lookup.len() || !name.starts_with(&lookup) {
             continue;
         }
         let label = name[filter_from..].to_owned();
         let insert = match kind {
-            ConfigKind::Properties => name.clone(),
+            ConfigKind::Properties => format!("{profile}{name}"),
             ConfigKind::Yaml => {
                 if context.has_separator {
-                    name.clone()
+                    format!("{profile}{name}")
                 } else {
-                    yaml_insertion(text, &context, name)
+                    yaml_insertion(text, &context, &format!("{profile}{name}"))
                 }
             }
         };
@@ -1210,8 +1643,139 @@ fn completion_entries(
             deprecated: property.deprecated(),
         });
     }
+    for prefix in &metadata.prefixes {
+        if prefix.len() <= lookup.len()
+            || !prefix.starts_with(&lookup)
+            || filter_from > prefix.len()
+        {
+            continue;
+        }
+        let label = format!("{}.", &prefix[filter_from..]);
+        entries.push(CompletionEntry {
+            label: label.clone(),
+            label_details: None,
+            detail: Some("prefix".to_owned()),
+            filter_text: Some(label),
+            sort_text: Some(format!("1{prefix}")),
+            insert_text: Some(format!("{profile}{prefix}.")),
+            span,
+            snippet: false,
+            additional_edits: Vec::new(),
+            command: None,
+            resolve: None,
+            kind: CompletionKind::Property,
+            deprecated: false,
+        });
+    }
     entries.sort_by(|left, right| left.sort_text.cmp(&right.sort_text));
     entries
+}
+
+/// The keys an annotation of a Java source offers at the caret of its key. The entry
+/// replaces the text before the caret and inserts the whole key.
+fn annotation_key_entries(
+    text: &str,
+    offset: usize,
+    snapshot: &Snapshot,
+) -> Option<Vec<CompletionEntry>> {
+    let found = java_syntax::config_key_at(text, offset)?;
+    let typed_end = offset.clamp(found.range.start, found.range.end);
+    let typed_len = (typed_end - found.range.start).min(found.key.len());
+    let typed = &found.key[..typed_len];
+    let metadata = &snapshot.metadata;
+    if metadata.is_empty() {
+        return None;
+    }
+    let filter_from = typed.rfind('.').map(|index| index + 1).unwrap_or(0);
+    let span = Some(span_in(text, found.range.start, typed_end));
+    let mut entries = Vec::new();
+    for (name, property) in &metadata.properties {
+        if !name.starts_with(typed) || name == typed {
+            continue;
+        }
+        let label = name[filter_from..].to_owned();
+        entries.push(CompletionEntry {
+            label: label.clone(),
+            label_details: Some(CompletionLabelDetails {
+                detail: None,
+                description: property.description.as_deref().map(short_description),
+            }),
+            detail: property.detail(),
+            filter_text: Some(label),
+            sort_text: Some(format!("0{name}")),
+            insert_text: Some(name.clone()),
+            span,
+            snippet: false,
+            additional_edits: Vec::new(),
+            command: None,
+            resolve: None,
+            kind: CompletionKind::Property,
+            deprecated: property.deprecated(),
+        });
+    }
+    for prefix in &metadata.prefixes {
+        if !prefix.starts_with(typed) || prefix == typed || filter_from > prefix.len() {
+            continue;
+        }
+        let label = format!("{}.", &prefix[filter_from..]);
+        entries.push(CompletionEntry {
+            label: label.clone(),
+            label_details: None,
+            detail: Some("prefix".to_owned()),
+            filter_text: Some(label),
+            sort_text: Some(format!("1{prefix}")),
+            insert_text: Some(format!("{prefix}.")),
+            span,
+            snippet: false,
+            additional_edits: Vec::new(),
+            command: None,
+            resolve: None,
+            kind: CompletionKind::Property,
+            deprecated: false,
+        });
+    }
+    entries.sort_by(|left, right| left.sort_text.cmp(&right.sort_text));
+    Some(entries)
+}
+
+/// The place a key is written in the configuration files of the resource roots, the key
+/// itself being the place a jump underlines.
+fn key_location(key: &str, resources: &[PathBuf]) -> Option<(PathBuf, Range<usize>)> {
+    let wanted = without_profile(key);
+    for root in resources {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| config_kind(path).is_some())
+            .collect();
+        files.sort();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            match config_kind(&path) {
+                Some(ConfigKind::Properties) => {
+                    for (found, range, _) in properties_entries(&text) {
+                        if without_profile(&found) == wanted {
+                            return Some((path, range));
+                        }
+                    }
+                }
+                Some(ConfigKind::Yaml) => {
+                    for pair in yaml_pairs(&text) {
+                        if without_profile(&pair.full_key) == wanted {
+                            return Some((path, pair.key));
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    None
 }
 
 fn value_entries(
@@ -1374,7 +1938,8 @@ fn diagnostics_for(
         if key.is_empty() {
             continue;
         }
-        let exact = metadata.properties.get(&key);
+        let lookup = without_profile(&key);
+        let exact = metadata.properties.get(lookup);
         if let Some(deprecation) = exact.and_then(|property| property.deprecation.as_ref()) {
             let mut message = format!("Deprecated Spring Boot property `{key}`");
             if let Some(replacement) = &deprecation.replacement {
@@ -1391,18 +1956,21 @@ fn diagnostics_for(
                 code: Some("spring.config.deprecatedProperty".to_owned()),
             });
         } else if exact.is_none()
-            && !metadata.knows(&key)
-            && !metadata.under_map(&key)
+            && !metadata.knows(lookup)
+            && !metadata.under_map(lookup)
+            && !metadata.under_known_prefix(lookup)
             && !local.contains(&key)
-            && !snapshot.placeholders.contains(&key)
-            && key.contains('.')
+            && !local.contains(lookup)
+            && !snapshot.placeholders.contains(lookup)
+            && lookup.contains('.')
+            && let Some((code, label)) = unknown_key(lookup, metadata)
         {
             found.push(DiagnosticEntry {
                 span: span_in(text, key_range.start, key_range.end),
                 severity: Severity::Warning,
-                message: format!("Unknown Spring Boot property `{key}`"),
+                message: format!("Unknown {label} property `{key}`"),
                 unnecessary: false,
-                code: Some("spring.config.unknownProperty".to_owned()),
+                code: Some(code.to_owned()),
             });
         }
         let (Some((raw, range)), Some(property)) = (value, exact) else {
@@ -1422,7 +1990,7 @@ fn diagnostics_for(
                     code: Some("spring.config.invalidValue".to_owned()),
                 });
             }
-        } else if let Some(allowed) = enum_values(metadata, &key, property)
+        } else if let Some(allowed) = enum_values(metadata, lookup, property)
             && let Some(cleaned) = single_value(raw)
             && !allowed
                 .iter()
@@ -1532,6 +2100,28 @@ fn single_value(value: &str) -> Option<String> {
     Some(value)
 }
 
+/// The check and the word of the framework an unknown key belongs to. A key of a
+/// framework the metadata knows nothing about is left alone: the project may use the
+/// framework without its jars being on the class path yet.
+fn unknown_key(key: &str, metadata: &Metadata) -> Option<(&'static str, &'static str)> {
+    let root = key.split('.').next().unwrap_or(key);
+    if root == "quarkus" && !metadata.knows_root("quarkus") {
+        return None;
+    }
+    if root == "micronaut" && !metadata.knows_root("micronaut") {
+        return None;
+    }
+    if metadata.knows_root("micronaut") {
+        Some(("micronaut.config.unknownProperty", "Micronaut"))
+    } else if metadata.knows_root("quarkus") {
+        Some(("quarkus.config.unknownProperty", "Quarkus"))
+    } else if metadata.is_empty() {
+        None
+    } else {
+        Some(("spring.config.unknownProperty", "Spring Boot"))
+    }
+}
+
 /// The values an enum-like property accepts, when the metadata names them and the type
 /// is not a scalar that takes any text.
 fn enum_values(metadata: &Metadata, key: &str, property: &Property) -> Option<Vec<String>> {
@@ -1564,6 +2154,7 @@ fn is_enum_type(type_name: Option<&str>) -> bool {
 }
 
 fn documentation(snapshot: &Snapshot, key: &str) -> Option<String> {
+    let key = without_profile(key);
     let metadata = &snapshot.metadata;
     let property = metadata.property(key);
     let group = metadata.groups.get(key);
@@ -1627,6 +2218,7 @@ fn documentation(snapshot: &Snapshot, key: &str) -> Option<String> {
 }
 
 fn source_span(snapshot: &Snapshot, key: &str, sources: &[PathBuf]) -> Option<SourceSpan> {
+    let key = without_profile(key);
     let metadata = &snapshot.metadata;
     let source_type = metadata
         .property(key)
@@ -1759,6 +2351,67 @@ impl SpringConfigSupport {
     fn kind_of(&self, uri: &str) -> Option<ConfigKind> {
         let path = file_path(&Uri::from_str(uri).ok()?)?;
         config_kind(&path)
+    }
+
+    /// The metadata of the project, waited for off the interface thread.
+    fn ready_snapshot(&self) -> Arc<Snapshot> {
+        let generation = self.generation();
+        let mut state = self.lock_state();
+        while state.loaded < generation {
+            let (next, _) = self
+                .inner
+                .ready
+                .wait_timeout(state, READY_STEP)
+                .unwrap_or_else(|poison| poison.into_inner());
+            state = next;
+        }
+        drop(state);
+        self.snapshot()
+    }
+
+    /// The keys a `@ConfigProperty`, `@Property` or `@Value` of a Java source offers at
+    /// the caret of its key.
+    pub(crate) fn annotation_completion(
+        &self,
+        text: &str,
+        offset: usize,
+    ) -> Option<CompletionList> {
+        let snapshot = self.ready_snapshot();
+        let entries = annotation_key_entries(text, offset, &snapshot)?;
+        Some(CompletionList {
+            entries,
+            complete: true,
+        })
+    }
+
+    /// The place of a key of an annotation: the key in a configuration file, or the
+    /// class that declares it.
+    pub(crate) fn annotation_navigation(
+        &self,
+        text: &str,
+        offset: usize,
+    ) -> Option<Vec<SourceSpan>> {
+        let found = java_syntax::config_key_at(text, offset)?;
+        let snapshot = self.ready_snapshot();
+        let sources = self.lock_state().paths.sources.clone();
+        let resources = self.lock_state().paths.resources.clone();
+        if let Some((path, range)) = key_location(&found.key, &resources) {
+            let canonical = CanonPath::new(&path).ok()?;
+            let uri = file_uri(&canonical)?;
+            let config = std::fs::read_to_string(&path).ok()?;
+            return Some(vec![SourceSpan {
+                uri: uri.as_str().to_owned(),
+                span: span_in(&config, range.start, range.end),
+            }]);
+        }
+        source_span(&snapshot, &found.key, &sources).map(|span| vec![span])
+    }
+
+    /// The documentation of the key an annotation names.
+    pub(crate) fn annotation_documentation(&self, text: &str, offset: usize) -> Option<String> {
+        let found = java_syntax::config_key_at(text, offset)?;
+        let snapshot = self.ready_snapshot();
+        documentation(&snapshot, &found.key)
     }
 }
 
@@ -2410,5 +3063,227 @@ mod tests {
         assert!(!support.matches(Path::new("C:/project/application.properties")));
         assert!(!support.matches(Path::new("C:/project/src/main/resources/other.properties")));
         assert!(!support.matches(Path::new("C:/project/src/main/java/App.java")));
+    }
+
+    #[test]
+    fn a_micronaut_profile_file_is_a_configuration_file() {
+        assert_eq!(
+            config_kind(Path::new("C:/p/src/main/resources/application-dev.yml")),
+            Some(ConfigKind::Yaml)
+        );
+        assert_eq!(
+            config_kind(Path::new(
+                "C:/p/src/main/resources/application-prod.properties"
+            )),
+            Some(ConfigKind::Properties)
+        );
+    }
+
+    const QUARKUS: &str = r#"{
+        "properties": [
+            {
+                "name": "quarkus.http.port",
+                "type": "java.lang.Integer",
+                "defaultValue": 8080,
+                "description": "The HTTP port."
+            },
+            {
+                "name": "quarkus.http.host",
+                "type": "java.lang.String",
+                "defaultValue": "0.0.0.0"
+            },
+            {
+                "name": "quarkus.http.ssl-port",
+                "type": "java.lang.Integer",
+                "defaultValue": 8443
+            }
+        ]
+    }"#;
+
+    const MICRONAUT: &str = r#"{
+        "micronaut.server.port": {
+            "type": "java.lang.Integer",
+            "description": "The port of the server.",
+            "defaultValue": 8080
+        },
+        "micronaut.server.host": {
+            "type": "java.lang.String"
+        }
+    }"#;
+
+    fn inserted(entries: &[CompletionEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .filter_map(|entry| entry.insert_text.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn a_quarkus_profile_key_is_completed_and_its_unknown_sibling_warns() {
+        let snapshot = snapshot(QUARKUS);
+        let text = "%dev.quarkus.http.";
+        let entries = completion_entries(text, text.len(), ConfigKind::Properties, &snapshot);
+        let keys = inserted(&entries);
+        assert!(keys.contains(&"%dev.quarkus.http.port"), "{keys:?}");
+        assert!(keys.contains(&"%dev.quarkus.http.host"), "{keys:?}");
+
+        let found = diagnostics_for(
+            "%dev.quarkus.http.port=8081\n%dev.quarkus.unknown=1\n",
+            ConfigKind::Properties,
+            &snapshot,
+            &lang_api::DisabledInspections::default(),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].code.as_deref(),
+            Some("quarkus.config.unknownProperty")
+        );
+        assert_eq!(
+            found[0].message,
+            "Unknown Quarkus property `%dev.quarkus.unknown`"
+        );
+    }
+
+    #[test]
+    fn a_quarkus_extension_descriptor_names_the_keys_it_reads() {
+        let parsed = parse_quarkus_extension(
+            "name: \"RESTEasy Reactive\"\nmetadata:\n  config:\n    - \"quarkus.resteasy-reactive.\"\n    - \"quarkus.http.port\"\n",
+        );
+        assert_eq!(parsed.prefixes, ["quarkus.resteasy-reactive"]);
+        assert_eq!(
+            parsed
+                .properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["quarkus.http.port"]
+        );
+        let mut metadata = Metadata::default();
+        metadata.add(parsed, true);
+        assert!(metadata.knows_root("quarkus"));
+        assert!(metadata.under_known_prefix("quarkus.resteasy-reactive.json"));
+        assert!(!metadata.under_known_prefix("quarkus.http"));
+    }
+
+    #[test]
+    fn the_flat_metadata_of_micronaut_is_read() {
+        let snapshot = snapshot(MICRONAUT);
+        let text = "micronaut.server.";
+        let entries = completion_entries(text, text.len(), ConfigKind::Properties, &snapshot);
+        let keys = inserted(&entries);
+        assert!(keys.contains(&"micronaut.server.port"), "{keys:?}");
+        let found = diagnostics_for(
+            "micronaut.server.port=8081\nmicronaut.server.unknown=1\n",
+            ConfigKind::Properties,
+            &snapshot,
+            &lang_api::DisabledInspections::default(),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].code.as_deref(),
+            Some("micronaut.config.unknownProperty")
+        );
+        assert_eq!(
+            found[0].message,
+            "Unknown Micronaut property `micronaut.server.unknown`"
+        );
+    }
+
+    #[test]
+    fn a_configuration_class_of_the_project_declares_its_keys() {
+        let root = test_support::TempDir::new("config-classes");
+        let source = root.path().join("src/demo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("ShopConfig.java"),
+            r#"package demo;
+
+import io.quarkus.runtime.annotations.ConfigMapping;
+
+@ConfigMapping(prefix = "shop")
+interface ShopConfig {
+    int httpPort();
+    String host();
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("ServerProperties.java"),
+            r#"package demo;
+
+import io.micronaut.context.annotation.ConfigurationProperties;
+
+@ConfigurationProperties("micronaut.server")
+class ServerProperties {
+    private int maxPort;
+}
+"#,
+        )
+        .unwrap();
+
+        let parsed = config_properties_in_sources(&[root.path().to_path_buf()]);
+        let mut names: Vec<&str> = parsed
+            .properties
+            .iter()
+            .map(|property| property.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["micronaut.server.max-port", "shop.host", "shop.http-port"],
+            "{names:?}"
+        );
+        let shop = parsed
+            .properties
+            .iter()
+            .find(|property| property.name == "shop.host")
+            .expect("the key of the mapping");
+        assert_eq!(shop.source_type.as_deref(), Some("demo.ShopConfig"));
+    }
+
+    #[test]
+    fn an_annotation_key_offers_the_keys_of_the_metadata() {
+        let snapshot = snapshot(QUARKUS);
+        let source =
+            "class Shop {\n    @ConfigProperty(name = \"quarkus.http.\")\n    int port;\n}\n";
+        let offset = source.find("quarkus.http.").unwrap() + "quarkus.http.".len();
+        let entries = annotation_key_entries(source, offset, &snapshot).expect("the keys");
+        let keys = inserted(&entries);
+        assert!(keys.contains(&"quarkus.http.port"), "{keys:?}");
+
+        let value = "class Shop {\n    @Value(\"${quarkus.http.}\")\n    int port;\n}\n";
+        let offset = value.find("quarkus.http.").unwrap() + "quarkus.http.".len();
+        let entries = annotation_key_entries(value, offset, &snapshot).expect("the keys");
+        assert!(
+            inserted(&entries).contains(&"quarkus.http.port"),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_of_an_annotation_is_found_in_its_configuration_file() {
+        let root = test_support::TempDir::new("config-key-place");
+        std::fs::write(
+            root.path().join("application.properties"),
+            "# the server\nquarkus.http.port=8081\n",
+        )
+        .unwrap();
+        let (path, range) = key_location("quarkus.http.port", &[root.path().to_path_buf()])
+            .expect("the place of the key");
+        assert_eq!(path, root.path().join("application.properties"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(&text[range], "quarkus.http.port");
+
+        std::fs::write(
+            root.path().join("application.yml"),
+            "quarkus:\n  http:\n    host: 0.0.0.0\n",
+        )
+        .unwrap();
+        let (path, range) = key_location("quarkus.http.host", &[root.path().to_path_buf()])
+            .expect("the place of the YAML key");
+        assert!(path.ends_with("application.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(&text[range], "host");
     }
 }

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use editor_view::{EditorEvent, EditorView, FolderMove, Semantic};
 use futures_util::StreamExt;
+use lang_api::MigrationModel;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -50,6 +51,10 @@ const ROOT_ICON: &str = "nodes/module";
 const ROW_MARGIN: f32 = SPACE_L;
 /// A pause this long starts a new speed search rather than adding to the old one.
 const SEARCH_TIMEOUT: Duration = Duration::from_millis(1000);
+/// The label of the migration node and of the entry of the New menu.
+pub(crate) const MIGRATIONS_LABEL: &str = "Migrations";
+/// The New menu row that writes the next versioned migration of the project.
+const FLYWAY_LABEL: &str = "Flyway Migration";
 /// Fully Expand reads this many folder levels from the root.
 pub(crate) const FULL_EXPAND_MAX_DEPTH: usize = 8;
 /// Fully Expand reads no more folders than this, so a folder with many children cannot
@@ -257,6 +262,8 @@ pub struct ProjectPanel {
     /// Bumped after a folder listing reaches the tree, so a test can wait for the walk
     /// of the project by its signal rather than by a clock.
     listings: u64,
+    /// The migrations of the project, which the tree shows under their own node.
+    migrations: MigrationModel,
 }
 
 impl ProjectPanel {
@@ -309,14 +316,177 @@ impl ProjectPanel {
                 search: String::new(),
                 search_at: None,
                 listings: 0,
+                migrations: MigrationModel::default(),
             };
             panel.read_pending(cx);
+            panel.load_migrations(cx);
             panel
         })
     }
 
     pub fn focus(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// The migrations the tree shows under their node.
+    #[allow(dead_code)]
+    pub fn migrations(&self) -> &MigrationModel {
+        &self.migrations
+    }
+
+    /// Reads the migrations of the project in the background and puts their node in the
+    /// tree, so the tree keeps walking as soon as the language answers.
+    fn load_migrations(&mut self, cx: &mut Context<Self>) {
+        let Some(support) = cx
+            .try_global::<crate::database_panel::ActiveMigrations>()
+            .and_then(|active| active.0.clone())
+        else {
+            return;
+        };
+        let job = cx
+            .background_executor()
+            .spawn(async move { support.model() });
+        cx.spawn(async move |this, cx| {
+            let model = job.await;
+            this.update(cx, |this, cx| this.apply_migrations(model, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn apply_migrations(&mut self, model: MigrationModel, cx: &mut Context<Self>) {
+        let root = self.root_path();
+        let folder = self.migrations_folder();
+        if model.is_empty() {
+            self.tree.remove_virtual_child(&root, MIGRATIONS_LABEL);
+            self.tree.clear_virtual_listing(&folder);
+            self.migrations = model;
+            cx.notify();
+            return;
+        }
+        self.tree.set_virtual_child(
+            &root,
+            Child {
+                path: folder.clone(),
+                name: MIGRATIONS_LABEL.to_owned(),
+                folder: true,
+            },
+        );
+        let children: Vec<Child> = model
+            .rows
+            .iter()
+            .filter(|row| row.depth == 0)
+            .map(|row| Child {
+                path: row.path.clone(),
+                name: row.label.clone(),
+                folder: false,
+            })
+            .collect();
+        self.tree.set_virtual_listing(folder, children);
+        self.migrations = model;
+        if let Some(path) = self.pending_select.clone()
+            && let Some(index) = self.tree.index_of(&path)
+        {
+            self.pending_select = None;
+            self.select(index, cx);
+        }
+        cx.notify();
+    }
+
+    /// The folder the migration node stands for. It holds no file: the node lists the
+    /// files of the tool wherever the configuration put them.
+    fn migrations_folder(&self) -> PathBuf {
+        self.root_path().join(".arro").join("migrations")
+    }
+
+    /// Asks for the description of the next versioned migration and writes it where the
+    /// tool reads it.
+    fn ask_flyway_migration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(next) = self.migrations.next.clone() else {
+            self.report(
+                "New Migration",
+                "the project has no Flyway folder".to_owned(),
+                cx,
+            );
+            return;
+        };
+        let panel = cx.weak_entity();
+        let handle = window.window_handle();
+        let folder = next.folder;
+        let submit = move |description: String, cx: &mut App| {
+            let (panel, folder) = (panel.clone(), folder.clone());
+            cx.defer(move |cx| {
+                let run = move |_: AnyView, window: &mut Window, cx: &mut App| {
+                    let (description, folder) = (description.clone(), folder.clone());
+                    let create = move |this: &mut Self, cx: &mut Context<Self>| {
+                        this.create_flyway_migration(&description, &folder, window, cx)
+                    };
+                    panel.update(cx, create).ok();
+                };
+                handle.update(cx, run).ok();
+            });
+        };
+        let ask = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
+            Prompt::show(
+                "New Flyway Migration",
+                "Description",
+                submit,
+                workspace,
+                window,
+                cx,
+            )
+        };
+        self.workspace.update(cx, ask).ok();
+    }
+
+    /// Writes `V<next>__<description>.sql` into `folder`, names the file as the language
+    /// names it and shows it in the tree.
+    pub(crate) fn create_flyway_migration(
+        &mut self,
+        description: &str,
+        folder: &Path,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(support) = cx
+            .try_global::<crate::database_panel::ActiveMigrations>()
+            .and_then(|active| active.0.clone())
+        else {
+            self.report(
+                "New Migration",
+                "the language of the project is not ready".to_owned(),
+                cx,
+            );
+            return;
+        };
+        let description = description.to_owned();
+        let folder = folder.to_path_buf();
+        let job = cx.background_executor().spawn(async move {
+            let name = support
+                .new_migration_name(&description)
+                .ok_or_else(|| "the project has no Flyway folder".to_owned())?;
+            std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+            let path = folder.join(&name);
+            if path.exists() {
+                return Err(format!("{} already exists", path.display()));
+            }
+            std::fs::write(&path, format!("-- {description}\n"))
+                .map_err(|error| error.to_string())?;
+            Ok::<PathBuf, String>(path)
+        });
+        cx.spawn(async move |this, cx| {
+            let path = job.await;
+            this.update(cx, |this, cx| match path {
+                Ok(path) => {
+                    this.load_migrations(cx);
+                    this.tree.set_expanded(&this.migrations_folder(), true);
+                    this.select_path(&path, cx);
+                }
+                Err(error) => this.report("New Migration", error, cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The path the tree acts on, if any.
@@ -470,6 +640,9 @@ impl ProjectPanel {
 
     fn read_pending(&mut self, cx: &mut Context<Self>) {
         for folder in self.tree.pending() {
+            if self.tree.is_virtual_folder(&folder) {
+                continue;
+            }
             // A row stays empty until its listing arrives; a failure leaves it empty.
             self.tree.set_listing(folder.clone(), Vec::new());
             let path = folder.clone();
@@ -487,7 +660,7 @@ impl ProjectPanel {
 
     /// The folder changed on disk: reads it again if the tree shows it.
     pub fn refresh_folder(&mut self, folder: &Path, cx: &mut Context<Self>) {
-        if !self.tree.has_listing(folder) {
+        if !self.tree.has_listing(folder) || self.tree.is_virtual_folder(folder) {
             return;
         }
         let folder = folder.to_path_buf();
@@ -506,7 +679,10 @@ impl ProjectPanel {
     /// Reads the open folders again: files came and went behind the back of the tree.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let rows = self.tree.rows().iter().filter(|row| row.open);
-        let open: Vec<PathBuf> = rows.map(|row| row.path.clone()).collect();
+        let open: Vec<PathBuf> = rows
+            .map(|row| row.path.clone())
+            .filter(|path| !self.tree.is_virtual_folder(path))
+            .collect();
         for folder in open {
             let path = folder.clone();
             let read = cx
@@ -1242,6 +1418,16 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if label == FLYWAY_LABEL {
+            let folder = self
+                .migrations
+                .next
+                .as_ref()
+                .map(|next| next.folder.clone())
+                .unwrap_or_else(|| self.root_path().join(folder));
+            self.create_flyway_migration(&name, &folder, window, cx);
+            return;
+        }
         let known = self
             .templates
             .iter()
@@ -1787,7 +1973,8 @@ impl ProjectPanel {
     fn new_entries(&self, folder: PathBuf, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let panel = cx.weak_entity();
         let templates = self.templates.iter().cloned();
-        templates
+        let has_migrations = self.migrations.next.is_some();
+        let mut entries: Vec<MenuEntry> = templates
             .map(|template| {
                 let (panel, folder) = (panel.clone(), folder.clone());
                 let (label, icon) = (format!("New {}", template.label), template.icon);
@@ -1800,7 +1987,20 @@ impl ProjectPanel {
                 })
                 .icon(icon)
             })
-            .collect()
+            .collect();
+        if has_migrations {
+            let panel = panel.clone();
+            entries.push(
+                MenuEntry::new(format!("New {FLYWAY_LABEL}"), move |window, cx| {
+                    let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                        this.ask_flyway_migration(window, cx)
+                    };
+                    Self::later(window, panel.clone(), cx, ask);
+                })
+                .icon("fileTypes/text"),
+            );
+        }
+        entries
     }
 
     /// The Menu key in the tree: the rows of the context menu of the selection.
@@ -2037,6 +2237,7 @@ impl ProjectPanel {
                 let tint = cx
                     .try_global::<crate::git::ActiveGit>()
                     .and_then(|git| git.0.read(cx).kind_of(&row.path));
+                let issue = self.migrations.issue_of(&row.path).is_some();
                 let path = row.path.clone();
                 let folder = row.folder;
                 let dragged = DraggedTree {
@@ -2048,6 +2249,9 @@ impl ProjectPanel {
                 let row = tree_row(style, &theme)
                     .debug_selector(move || format!("tree-row-{name}"))
                     .when_some(tint, |this, kind| this.text_color(kind.color(theme.dark)))
+                    .when(issue, |this| {
+                        this.text_color(theme.stripe_error).underline()
+                    })
                     .on_click(cx.listener(move |this, event, window, cx| {
                         this.click(index, event, window, cx)
                     }))

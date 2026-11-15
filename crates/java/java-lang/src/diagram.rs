@@ -614,7 +614,7 @@ fn visibility_of(visibility: java_syntax::DiagramVisibility) -> GraphVisibility 
     }
 }
 
-fn place_in(file: &Path, text: &str, start: usize, end: usize) -> SourceSpan {
+pub(crate) fn place_in(file: &Path, text: &str, start: usize, end: usize) -> SourceSpan {
     let uri = CanonPath::new(file)
         .map(|path| path.to_uri())
         .unwrap_or_default();
@@ -636,7 +636,7 @@ fn point_of(text: &str, offset: usize) -> TextPoint {
     TextPoint { line, character }
 }
 
-fn collect_sources(folder: &Path, out: &mut Vec<PathBuf>, cancel: &Cancel) {
+pub(crate) fn collect_sources(folder: &Path, out: &mut Vec<PathBuf>, cancel: &Cancel) {
     if out.len() >= MAX_FILES || cancel.is_cancelled() {
         return;
     }

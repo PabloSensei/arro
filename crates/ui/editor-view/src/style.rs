@@ -47,6 +47,8 @@ pub struct EditorStyle {
     pub fold_text: Hsla,
     pub error_mark: Hsla,
     pub warning_mark: Hsla,
+    /// The green wave under a misspelled word.
+    pub spell_mark: Hsla,
     pub panel: Hsla,
     pub panel_border: Hsla,
     pub accent: Hsla,
@@ -116,6 +118,7 @@ impl EditorStyle {
             // No theme token yet: the red of an IDEA error stripe.
             error_mark: rgb(0xe55757).into(),
             warning_mark: theme.warning_mark,
+            spell_mark: theme.spell_mark,
             panel: theme.popup_bg,
             panel_border: theme.popup_border,
             accent: theme.accent,

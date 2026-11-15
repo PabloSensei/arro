@@ -1,6 +1,7 @@
 //! The dependency-injection model of a project, read natively from its sources: the
 //! beans of the usual component annotations and factory methods, the repositories of
-//! Spring Data, the points that receive a bean and the checks of those points.
+//! Spring Data, the points that receive a bean and the checks of those points. The beans
+//! of CDI and Micronaut are read the same way, for the modules that name a framework.
 //!
 //! Reading runs in the background and the interface never waits on it: a reader thread
 //! keeps the model of the current sources, and a query answers with an immutable
@@ -16,6 +17,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use base::Cancel;
+use java_project::{Framework, FrameworkLookup, Frameworks};
 use lang_api::{
     Answer, Bean, BeanModel, BeanQuery, BeanWarning, Confidence, InjectionPlace, InjectionPoint,
     Provider, Reply, SourceId,
@@ -34,12 +36,35 @@ const STEREOTYPES: &[&str] = &[
     "RestController",
     "Configuration",
 ];
+/// The scopes of CDI that declare a bean. Quarkus implements them with ArC.
+const CDI_SCOPES: &[&str] = &[
+    "ApplicationScoped",
+    "RequestScoped",
+    "SessionScoped",
+    "ConversationScoped",
+    "Dependent",
+    "Singleton",
+];
+/// The scopes of Micronaut that declare a bean of a class.
+const MICRONAUT_SCOPES: &[&str] = &["Singleton", "Prototype"];
+/// The annotation of a CDI method or field that declares a bean.
+const PRODUCES: &str = "Produces";
+/// The annotation of a Micronaut class whose methods declare beans.
+const FACTORY_CLASS: &str = "Factory";
+/// The annotations of a Micronaut factory method that declare a bean.
+const MICRONAUT_BEANS: &[&str] = &["Bean", "Singleton", "Prototype"];
 /// The annotations that mark a field or a parameter as a point of an injection.
 const INJECTIONS: &[&str] = &["Autowired", "Inject", "Resource"];
 /// The annotation of a method that declares a bean in a configuration.
 const FACTORY: &str = "Bean";
 /// The annotation that narrows a point to the bean of a name.
 const QUALIFIER: &str = "Qualifier";
+/// The annotation that names a bean or a point.
+const NAMED: &str = "Named";
+/// The qualifier a point asks for when a bean has no other one.
+const DEFAULT_QUALIFIER: &str = "Default";
+/// The qualifier that accepts every candidate of the type.
+const ANY_QUALIFIER: &str = "Any";
 /// The annotation that wins among the candidates of a type.
 const PRIMARY: &str = "Primary";
 /// The interfaces of the data repositories of the framework.
@@ -83,18 +108,24 @@ pub fn bean_index(root: PathBuf) -> Arc<BeanIndex> {
 
 impl BeanIndex {
     /// The source roots of the project, from its model. A model that names the same
-    /// roots as the previous one starts no new read.
+    /// roots as the previous one starts no new read. The frameworks of the module of a
+    /// file decide which annotations declare a bean.
     pub fn set_model(&self, model: &ProjectModel) {
-        self.set_sources(sources_of(model));
+        self.set_sources_and(sources_of(model), FrameworkLookup::of(model));
     }
 
     /// The roots the sources are read from, for a caller that has no model.
     pub fn set_sources(&self, sources: Vec<PathBuf>) {
+        self.set_sources_and(sources, FrameworkLookup::default());
+    }
+
+    fn set_sources_and(&self, sources: Vec<PathBuf>, frameworks: FrameworkLookup) {
         let mut state = self.lock_state();
-        if state.sources == sources {
+        if state.sources == sources && state.frameworks == frameworks {
             return;
         }
         state.sources = sources;
+        state.frameworks = frameworks;
         drop(state);
         self.bump();
     }
@@ -219,6 +250,8 @@ impl Inner {
 #[derive(Default)]
 struct Load {
     sources: Vec<PathBuf>,
+    /// The frameworks of every source root of the model.
+    frameworks: FrameworkLookup,
     /// Grows with every change of the sources or of an open text; a snapshot is
     /// complete when the reader has caught up with it.
     generation: u64,
@@ -282,7 +315,7 @@ fn start_reader(inner: Arc<Inner>) {
             }
             // A burst of edits waits for quiet, so that the model is assembled once.
             thread::sleep(REBUILD_DELAY);
-            let (generation, sources, cache, open) = {
+            let (generation, sources, frameworks, cache, open) = {
                 let state = inner
                     .state
                     .lock()
@@ -290,6 +323,7 @@ fn start_reader(inner: Arc<Inner>) {
                 (
                     state.generation,
                     state.sources.clone(),
+                    state.frameworks.clone(),
                     state.cache.clone(),
                     state.open.clone(),
                 )
@@ -300,7 +334,7 @@ fn start_reader(inner: Arc<Inner>) {
             } else {
                 sources
             };
-            let (snapshot, cache) = read_model(&sources, &cache, &open);
+            let (snapshot, cache) = read_model(&sources, &frameworks, &cache, &open);
             *inner
                 .snapshot
                 .write()
@@ -319,6 +353,7 @@ fn start_reader(inner: Arc<Inner>) {
 
 fn read_model(
     sources: &[PathBuf],
+    frameworks: &FrameworkLookup,
     cache: &HashMap<PathBuf, Cached>,
     open: &HashMap<PathBuf, OpenDocument>,
 ) -> (BeanModel, HashMap<PathBuf, Cached>) {
@@ -374,7 +409,7 @@ fn read_model(
         .iter()
         .map(|(path, file)| (path.as_path(), file.as_ref()))
         .collect();
-    (build_model(&files), next)
+    (build_model_with(&files, frameworks), next)
 }
 
 fn collect_sources(folder: &Path, out: &mut Vec<PathBuf>) {
@@ -520,9 +555,19 @@ fn decapitalize(name: &str) -> String {
     out.push_str(characters.as_str());
     out
 }
-
-/// Assembles the model of a project from its parsed sources.
+/// Assembles the model of a project from its parsed sources, for the Spring annotations
+/// alone.
+#[cfg(test)]
 pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
+    build_model_with(files, &FrameworkLookup::default())
+}
+
+/// Assembles the model of a project from its parsed sources. The frameworks of the module
+/// of a file decide which annotations declare a bean and which qualifiers narrow a point.
+pub fn build_model_with(
+    files: &[(&Path, &java_syntax::SpringFile)],
+    frameworks: &FrameworkLookup,
+) -> BeanModel {
     let data: Vec<FileData<'_>> = files
         .iter()
         .map(|(path, file)| FileData::new(path, file))
@@ -572,69 +617,164 @@ pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
             }
         }
     }
+    // An annotation of the project that carries `@Qualifier` is a qualifier of its own.
+    let qualifier_annotations: HashSet<String> = data
+        .iter()
+        .flat_map(|file| file.file.types.iter())
+        .filter(|kind| kind.is_annotation && has(&kind.annotations, QUALIFIER))
+        .map(|kind| kind.name.clone())
+        .collect();
 
-    let mut model = BeanModel::default();
+    let mut beans: Vec<PendingBean> = Vec::new();
     for file in &data {
+        let module = frameworks.of_path(file.path);
+        let cdi = module.cdi();
+        let micronaut = module.contains(Framework::Micronaut);
         for kind in &file.file.types {
-            if let Some(annotation) = bean_annotation(&kind.annotations, &component_annotations)
-                && !kind.is_annotation
-            {
-                model.beans.push(Bean {
-                    name: bean_name(Some(annotation), &kind.name),
-                    type_name: kind.name.clone(),
-                    qualified_type: kind.qualified.clone(),
-                    stereotype: format!("@{}", annotation.name),
-                    primary: has(&kind.annotations, PRIMARY),
-                    file: file.path.to_path_buf(),
-                    line: kind.line,
-                    offset: kind.offset,
-                    usages: Vec::new(),
+            let scope = bean_scope(
+                &kind.annotations,
+                &component_annotations,
+                module,
+                kind.is_interface,
+                kind.is_annotation,
+            );
+            if let Some(annotation) = scope {
+                beans.push(PendingBean {
+                    bean: Bean {
+                        name: declaration_name(&kind.annotations, Some(annotation), &kind.name),
+                        type_name: kind.name.clone(),
+                        qualified_type: kind.qualified.clone(),
+                        stereotype: format!("@{}", annotation.name),
+                        primary: has(&kind.annotations, PRIMARY),
+                        file: file.path.to_path_buf(),
+                        line: kind.line,
+                        offset: kind.offset,
+                        usages: Vec::new(),
+                    },
+                    qualifiers: custom_qualifiers(&kind.annotations, &qualifier_annotations),
                 });
             } else if kind.is_interface && is_data_repository(kind, file, &names) {
-                model.beans.push(Bean {
-                    name: decapitalize(&kind.name),
-                    type_name: kind.name.clone(),
-                    qualified_type: kind.qualified.clone(),
-                    stereotype: "Spring Data".to_owned(),
-                    primary: false,
-                    file: file.path.to_path_buf(),
-                    line: kind.line,
-                    offset: kind.offset,
-                    usages: Vec::new(),
+                beans.push(PendingBean {
+                    bean: Bean {
+                        name: decapitalize(&kind.name),
+                        type_name: kind.name.clone(),
+                        qualified_type: kind.qualified.clone(),
+                        stereotype: "Spring Data".to_owned(),
+                        primary: false,
+                        file: file.path.to_path_buf(),
+                        line: kind.line,
+                        offset: kind.offset,
+                        usages: Vec::new(),
+                    },
+                    qualifiers: Vec::new(),
                 });
             }
-            let configuration =
+            let spring_configuration =
                 bean_annotation(&kind.annotations, &component_annotations).is_some();
-            if !configuration {
-                continue;
+            if spring_configuration {
+                for method in &kind.methods {
+                    let Some(annotation) = method
+                        .annotations
+                        .iter()
+                        .find(|annotation| annotation.name == FACTORY)
+                    else {
+                        continue;
+                    };
+                    beans.push(declared_bean(
+                        file,
+                        &names,
+                        Some(annotation),
+                        &method.name,
+                        &method.return_type,
+                        method.line,
+                        method.offset,
+                        &method.annotations,
+                        &qualifier_annotations,
+                    ));
+                }
             }
-            for method in &kind.methods {
-                let Some(annotation) = method
-                    .annotations
-                    .iter()
-                    .find(|annotation| annotation.name == FACTORY)
-                else {
-                    continue;
-                };
-                model.beans.push(Bean {
-                    name: bean_name(Some(annotation), &method.name),
-                    type_name: short_name(&method.return_type),
-                    qualified_type: file.resolve(&method.return_type, &names),
-                    stereotype: format!("@{FACTORY}"),
-                    primary: has(&method.annotations, PRIMARY),
-                    file: file.path.to_path_buf(),
-                    line: method.line,
-                    offset: method.offset,
-                    usages: Vec::new(),
-                });
+            // The methods of a Micronaut factory declare beans of their return type.
+            if micronaut && has(&kind.annotations, FACTORY_CLASS) {
+                for method in &kind.methods {
+                    let Some(annotation) = method
+                        .annotations
+                        .iter()
+                        .find(|annotation| MICRONAUT_BEANS.contains(&annotation.name.as_str()))
+                    else {
+                        continue;
+                    };
+                    beans.push(declared_bean(
+                        file,
+                        &names,
+                        Some(annotation),
+                        &method.name,
+                        &method.return_type,
+                        method.line,
+                        method.offset,
+                        &method.annotations,
+                        &qualifier_annotations,
+                    ));
+                }
+            }
+            // A producer method or field of a CDI bean declares a bean of its own type.
+            if cdi && scope.is_some() {
+                for method in &kind.methods {
+                    if !has(&method.annotations, PRODUCES) {
+                        continue;
+                    }
+                    beans.push(declared_bean(
+                        file,
+                        &names,
+                        None,
+                        &method.name,
+                        &method.return_type,
+                        method.line,
+                        method.offset,
+                        &method.annotations,
+                        &qualifier_annotations,
+                    ));
+                }
+                for field in &kind.fields {
+                    if !has(&field.annotations, PRODUCES) {
+                        continue;
+                    }
+                    beans.push(PendingBean {
+                        bean: Bean {
+                            name: value_of(&field.annotations, NAMED)
+                                .map_or_else(|| field.name.clone(), str::to_owned),
+                            type_name: short_name(&field.type_text),
+                            qualified_type: file.resolve(&field.type_text, &names),
+                            stereotype: format!("@{PRODUCES}"),
+                            primary: false,
+                            file: file.path.to_path_buf(),
+                            line: field.line,
+                            offset: field.offset,
+                            usages: Vec::new(),
+                        },
+                        qualifiers: custom_qualifiers(&field.annotations, &qualifier_annotations),
+                    });
+                }
             }
         }
     }
 
     // The points that receive a bean, with the place of the type a warning underlines.
-    let mut points: Vec<(InjectionPoint, Option<String>)> = Vec::new();
+    let mut points: Vec<PendingPoint> = Vec::new();
     for file in &data {
+        let module = frameworks.of_path(file.path);
+        let cdi = module.cdi();
+        let micronaut = module.contains(Framework::Micronaut);
         for kind in &file.file.types {
+            let scope = bean_scope(
+                &kind.annotations,
+                &component_annotations,
+                module,
+                kind.is_interface,
+                kind.is_annotation,
+            );
+            let spring_component = bean_annotation(&kind.annotations, &component_annotations)
+                .is_some()
+                && !kind.is_interface;
             for field in &kind.fields {
                 if !field
                     .annotations
@@ -643,72 +783,114 @@ pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
                 {
                     continue;
                 }
-                points.push((
-                    point(
-                        file,
-                        &names,
-                        &field.type_text,
-                        field.type_offset,
-                        field.line,
-                        field.offset,
-                    ),
-                    value_of(&field.annotations, QUALIFIER).map(str::to_owned),
+                points.push(point(
+                    file,
+                    &names,
+                    &field.annotations,
+                    &qualifier_annotations,
+                    &field.type_text,
+                    field.type_offset,
+                    field.line,
+                    field.offset,
+                    module,
                 ));
             }
-            let component = bean_annotation(&kind.annotations, &component_annotations).is_some()
-                && !kind.is_interface;
-            if component {
-                let constructors: Vec<&java_syntax::Constructor> = if kind.constructors.len() == 1 {
+            let constructors: Vec<&java_syntax::Constructor> = if spring_component {
+                if kind.constructors.len() == 1 {
                     kind.constructors.iter().collect()
                 } else {
                     kind.constructors
                         .iter()
                         .filter(|constructor| has(&constructor.annotations, "Autowired"))
                         .collect()
-                };
-                for constructor in constructors {
-                    for parameter in &constructor.parameters {
-                        points.push((
-                            point(
-                                file,
-                                &names,
-                                &parameter.type_text,
-                                parameter.type_offset,
-                                parameter.line,
-                                parameter.offset,
-                            ),
-                            value_of(&parameter.annotations, QUALIFIER).map(str::to_owned),
-                        ));
-                    }
+                }
+            } else if (cdi || micronaut) && scope.is_some() {
+                kind.constructors
+                    .iter()
+                    .filter(|constructor| has(&constructor.annotations, "Inject"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for constructor in constructors {
+                for parameter in &constructor.parameters {
+                    points.push(point(
+                        file,
+                        &names,
+                        &parameter.annotations,
+                        &qualifier_annotations,
+                        &parameter.type_text,
+                        parameter.type_offset,
+                        parameter.line,
+                        parameter.offset,
+                        module,
+                    ));
                 }
             }
-            if !component {
-                continue;
-            }
             for method in &kind.methods {
-                if !has(&method.annotations, FACTORY) {
+                // A setter with `@Inject` receives a bean too.
+                if has(&method.annotations, "Inject")
+                    && method.parameters.len() == 1
+                    && !has(&method.annotations, PRODUCES)
+                {
+                    let parameter = &method.parameters[0];
+                    points.push(point(
+                        file,
+                        &names,
+                        &method.annotations,
+                        &qualifier_annotations,
+                        &parameter.type_text,
+                        parameter.type_offset,
+                        parameter.line,
+                        parameter.offset,
+                        module,
+                    ));
+                }
+                let factory = (spring_component && has(&method.annotations, FACTORY))
+                    || (micronaut
+                        && has(&kind.annotations, FACTORY_CLASS)
+                        && method
+                            .annotations
+                            .iter()
+                            .any(|annotation| MICRONAUT_BEANS.contains(&annotation.name.as_str())))
+                    || (cdi && scope.is_some() && has(&method.annotations, PRODUCES));
+                if !factory {
                     continue;
                 }
                 for parameter in &method.parameters {
-                    points.push((
-                        point(
-                            file,
-                            &names,
-                            &parameter.type_text,
-                            parameter.type_offset,
-                            parameter.line,
-                            parameter.offset,
-                        ),
-                        value_of(&parameter.annotations, QUALIFIER).map(str::to_owned),
+                    points.push(point(
+                        file,
+                        &names,
+                        &parameter.annotations,
+                        &qualifier_annotations,
+                        &parameter.type_text,
+                        parameter.type_offset,
+                        parameter.line,
+                        parameter.offset,
+                        module,
                     ));
                 }
             }
         }
     }
 
+    let qualifiers: Vec<Vec<String>> = beans.iter().map(|bean| bean.qualifiers.clone()).collect();
+    let mut model = BeanModel {
+        beans: beans.into_iter().map(|pending| pending.bean).collect(),
+        injections: Vec::new(),
+        warnings: Vec::new(),
+    };
     // A candidate has the type of the point or inherits or implements it.
     let mut placements: HashMap<usize, Vec<InjectionPlace>> = HashMap::new();
-    for (mut injection, qualifier) in points {
+    for pending in points {
+        let PendingPoint {
+            point: mut injection,
+            frameworks: module,
+            named,
+            qualifiers: wanted,
+            default,
+            any,
+        } = pending;
         let mut candidates: Vec<usize> = model
             .beans
             .iter()
@@ -719,36 +901,70 @@ pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
             })
             .map(|(index, _)| index)
             .collect();
-        if let Some(qualifier) = &qualifier {
-            candidates.retain(|index| model.beans[*index].name == *qualifier);
-        } else if candidates.len() > 1 && candidates.iter().any(|index| model.beans[*index].primary)
+        if let Some(named) = &named {
+            candidates.retain(|index| model.beans[*index].name == *named);
+        }
+        if !wanted.is_empty() {
+            candidates.retain(|index| {
+                wanted
+                    .iter()
+                    .all(|qualifier| qualifiers[*index].contains(qualifier))
+            });
+        }
+        if module.cdi() && default && candidates.len() > 1 {
+            let unqualified: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|index| qualifiers[*index].is_empty())
+                .collect();
+            if !unqualified.is_empty() {
+                candidates = unqualified;
+            }
+        }
+        if !any
+            && candidates.len() > 1
+            && candidates.iter().any(|index| model.beans[*index].primary)
         {
             // The primary bean wins over its siblings of the same type.
             candidates.retain(|index| model.beans[*index].primary);
         }
         candidates.sort_by(|left, right| model.beans[*left].name.cmp(&model.beans[*right].name));
-        if candidates.len() > 1 {
+        let (no_bean, multiple) = warning_ids(module);
+        if candidates.len() > 1 && !any {
             let names: Vec<&str> = candidates
                 .iter()
                 .map(|index| model.beans[*index].name.as_str())
                 .collect();
             let short = simple_type(&injection.qualified_type).to_owned();
-            model.warnings.push(BeanWarning {
-                file: injection.file.clone(),
-                range: injection.range.clone(),
-                id: "beans.multipleCandidates".to_owned(),
-                message: format!(
+            let message = if module.cdi() || module.contains(Framework::Micronaut) {
+                format!(
+                    "There is more than one bean of '{short}' type: {}",
+                    names.join(", ")
+                )
+            } else {
+                format!(
                     "Could not autowire. There is more than one bean of '{short}' type: {}",
                     names.join(", ")
-                ),
-            });
-        } else if candidates.is_empty() && names.contains(&injection.qualified_type) {
-            let short = simple_type(&injection.qualified_type).to_owned();
+                )
+            };
             model.warnings.push(BeanWarning {
                 file: injection.file.clone(),
                 range: injection.range.clone(),
-                id: "beans.noCandidate".to_owned(),
-                message: format!("Could not autowire. No beans of '{short}' type found"),
+                id: multiple.to_owned(),
+                message,
+            });
+        } else if candidates.is_empty() && names.contains(&injection.qualified_type) && !any {
+            let short = simple_type(&injection.qualified_type).to_owned();
+            let message = if module.cdi() || module.contains(Framework::Micronaut) {
+                format!("No bean of '{short}' type found")
+            } else {
+                format!("Could not autowire. No beans of '{short}' type found")
+            };
+            model.warnings.push(BeanWarning {
+                file: injection.file.clone(),
+                range: injection.range.clone(),
+                id: no_bean.to_owned(),
+                message,
             });
         }
         for index in &candidates {
@@ -769,6 +985,8 @@ pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
     for (index, usages) in placements {
         model.beans[index].usages = usages;
     }
+    // The qualifiers followed the beans until the places were made; the sort below moves
+    // the beans alone.
     model.beans.sort_by(|left, right| {
         (&left.stereotype, &left.name, &left.file).cmp(&(
             &right.stereotype,
@@ -789,29 +1007,158 @@ pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
     model
 }
 
+/// A bean while the model is assembled, with the qualifiers that narrow a point to it.
+struct PendingBean {
+    bean: Bean,
+    /// The qualifier annotations of the project on the declaration.
+    qualifiers: Vec<String>,
+}
+
+/// A point that receives a bean, with what narrows its candidates.
+struct PendingPoint {
+    point: InjectionPoint,
+    /// The frameworks of the module of the point.
+    frameworks: Frameworks,
+    named: Option<String>,
+    qualifiers: Vec<String>,
+    default: bool,
+    any: bool,
+}
+
+/// The annotation that declares a bean of a class for the frameworks of its module.
+fn bean_scope<'a>(
+    annotations: &'a [java_syntax::Annotation],
+    component_annotations: &HashSet<String>,
+    frameworks: Frameworks,
+    is_interface: bool,
+    is_annotation: bool,
+) -> Option<&'a java_syntax::Annotation> {
+    if is_annotation {
+        return None;
+    }
+    if let Some(annotation) = bean_annotation(annotations, component_annotations) {
+        return Some(annotation);
+    }
+    if is_interface {
+        return None;
+    }
+    let mut scopes: Vec<&str> = Vec::new();
+    if frameworks.cdi() {
+        scopes.extend(CDI_SCOPES.iter().copied());
+    }
+    if frameworks.contains(Framework::Micronaut) {
+        scopes.extend(MICRONAUT_SCOPES.iter().copied());
+    }
+    annotations
+        .iter()
+        .find(|annotation| scopes.contains(&annotation.name.as_str()))
+}
+
+/// The name a declaration gives its bean: `@Named`, the value of the stereotype, or the
+/// name of the declaration with a lower first letter.
+fn declaration_name(
+    annotations: &[java_syntax::Annotation],
+    scope: Option<&java_syntax::Annotation>,
+    fallback: &str,
+) -> String {
+    value_of(annotations, NAMED)
+        .map(str::to_owned)
+        .or_else(|| scope.and_then(|annotation| annotation.value.clone()))
+        .unwrap_or_else(|| decapitalize(fallback))
+}
+
+/// The qualifier annotations of the project a declaration carries.
+fn custom_qualifiers(
+    annotations: &[java_syntax::Annotation],
+    known: &HashSet<String>,
+) -> Vec<String> {
+    annotations
+        .iter()
+        .filter(|annotation| known.contains(&annotation.name))
+        .map(|annotation| annotation.name.clone())
+        .collect()
+}
+
+/// A bean a factory or producer declaration gives, named by the annotation or by the
+/// declaration itself.
+#[allow(clippy::too_many_arguments)]
+fn declared_bean(
+    file: &FileData<'_>,
+    names: &HashSet<String>,
+    annotation: Option<&java_syntax::Annotation>,
+    fallback: &str,
+    return_type: &str,
+    line: u32,
+    offset: usize,
+    annotations: &[java_syntax::Annotation],
+    qualifier_annotations: &HashSet<String>,
+) -> PendingBean {
+    PendingBean {
+        bean: Bean {
+            name: value_of(annotations, NAMED)
+                .map_or_else(|| bean_name(annotation, fallback), str::to_owned),
+            type_name: short_name(return_type),
+            qualified_type: file.resolve(return_type, names),
+            stereotype: format!(
+                "@{}",
+                annotation.map_or(PRODUCES, |annotation| annotation.name.as_str())
+            ),
+            primary: has(annotations, PRIMARY),
+            file: file.path.to_path_buf(),
+            line,
+            offset,
+            usages: Vec::new(),
+        },
+        qualifiers: custom_qualifiers(annotations, qualifier_annotations),
+    }
+}
+
+/// The ids of the checks a point of a module reports.
+fn warning_ids(frameworks: Frameworks) -> (&'static str, &'static str) {
+    if frameworks.contains(Framework::Micronaut) {
+        ("micronaut.noBean", "micronaut.multipleBeans")
+    } else if frameworks.cdi() {
+        ("jakarta.noBean", "jakarta.multipleBeans")
+    } else {
+        ("beans.noCandidate", "beans.multipleCandidates")
+    }
+}
+
 struct ProjectType {
     supers: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn point(
     file: &FileData<'_>,
     names: &HashSet<String>,
+    annotations: &[java_syntax::Annotation],
+    qualifier_annotations: &HashSet<String>,
     type_text: &str,
     type_offset: usize,
     line: u32,
     offset: usize,
-) -> InjectionPoint {
-    InjectionPoint {
-        type_name: short_name(type_text),
-        qualified_type: file.resolve(type_text, names),
-        file: file.path.to_path_buf(),
-        line,
-        offset,
-        range: type_offset..type_offset + type_text.len(),
-        candidates: Vec::new(),
+    frameworks: Frameworks,
+) -> PendingPoint {
+    PendingPoint {
+        point: InjectionPoint {
+            type_name: short_name(type_text),
+            qualified_type: file.resolve(type_text, names),
+            file: file.path.to_path_buf(),
+            line,
+            offset,
+            range: type_offset..type_offset + type_text.len(),
+            candidates: Vec::new(),
+        },
+        frameworks,
+        named: value_of(annotations, QUALIFIER)
+            .or_else(|| value_of(annotations, NAMED))
+            .map(str::to_owned),
+        qualifiers: custom_qualifiers(annotations, qualifier_annotations),
+        default: has(annotations, DEFAULT_QUALIFIER),
+        any: has(annotations, ANY_QUALIFIER),
     }
 }
-
 fn is_data_repository(
     kind: &java_syntax::Type,
     file: &FileData<'_>,
@@ -894,6 +1241,24 @@ impl BeanIndex {
     pub fn model(&self) -> Arc<BeanModel> {
         self.snapshot()
     }
+}
+
+/// The model of the sources of a project as the model describes them, read once on the
+/// caller's thread. A test support uses it; the window reads [`BeanIndex`] instead.
+pub fn bean_model_for(model: &ProjectModel) -> BeanModel {
+    let sources = sources_of(model);
+    let sources = if sources.is_empty() {
+        vec![model.root.clone()]
+    } else {
+        sources
+    };
+    let (found, _) = read_model(
+        &sources,
+        &FrameworkLookup::of(model),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    found
 }
 
 #[cfg(test)]
@@ -1319,5 +1684,374 @@ class Controller {
         );
         println!("beans of PetClinic: {}", model.beans.len());
         assert!(model.beans.len() > 10);
+    }
+
+    /// A model of a project whose only source root uses the frameworks of the caller.
+    fn model_with(files: &[(&str, &str)], frameworks: Frameworks) -> BeanModel {
+        let parsed: Vec<(PathBuf, java_syntax::SpringFile)> = files
+            .iter()
+            .map(|(name, text)| {
+                (
+                    PathBuf::from(format!("C:/p/src/demo/{name}")),
+                    java_syntax::spring_file(text),
+                )
+            })
+            .collect();
+        let files: Vec<(&Path, &java_syntax::SpringFile)> = parsed
+            .iter()
+            .map(|(path, file)| (path.as_path(), file))
+            .collect();
+        let lookup = FrameworkLookup::of_roots(vec![(PathBuf::from("C:/p/src"), frameworks)]);
+        build_model_with(&files, &lookup)
+    }
+
+    fn cdi() -> Frameworks {
+        Frameworks::of(&[Framework::Jakarta])
+    }
+
+    fn micronaut() -> Frameworks {
+        Frameworks::of(&[Framework::Micronaut])
+    }
+
+    fn candidate_names(model: &BeanModel) -> Vec<Vec<&str>> {
+        model
+            .injections
+            .iter()
+            .map(|point| {
+                point
+                    .candidates
+                    .iter()
+                    .map(|place| place.label.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cdi_scopes_declare_beans_and_inject_fields_constructors_and_setters() {
+        let source = r#"package demo;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.context.RequestScoped;
+import jakarta.inject.Inject;
+
+interface Repository {}
+
+@ApplicationScoped
+class OwnerRepository implements Repository {}
+
+@RequestScoped
+class Shop {
+    @Inject
+    Repository repository;
+
+    @Inject
+    Shop(OwnerRepository owners) {}
+
+    @Inject
+    void setClock(Clock clock) {}
+}
+
+@ApplicationScoped
+class Clock {}
+"#;
+        let model = model_with(&[("Shop.java", source)], cdi());
+        assert_eq!(
+            names(&model),
+            ["clock", "ownerRepository", "shop"],
+            "{:?}",
+            names(&model)
+        );
+        let stereotypes: Vec<&str> = model
+            .beans
+            .iter()
+            .map(|bean| bean.stereotype.as_str())
+            .collect();
+        assert_eq!(
+            stereotypes,
+            ["@ApplicationScoped", "@ApplicationScoped", "@RequestScoped"]
+        );
+        assert_eq!(
+            candidate_names(&model),
+            [
+                vec!["ownerRepository"],
+                vec!["ownerRepository"],
+                vec!["clock"],
+            ],
+            "the field, the constructor and the setter receive their beans"
+        );
+        assert!(model.warnings.is_empty(), "{:?}", model.warnings);
+    }
+
+    #[test]
+    fn a_custom_qualifier_narrows_the_candidates_to_the_marked_bean() {
+        let source = r#"package demo;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.inject.Qualifier;
+import java.lang.annotation.Retention;
+
+@Qualifier
+@Retention(RetentionPolicy.RUNTIME)
+@interface Fast {}
+
+interface Repository {}
+
+@Fast
+@ApplicationScoped
+class FastRepository implements Repository {}
+
+@ApplicationScoped
+class SlowRepository implements Repository {}
+
+@ApplicationScoped
+class Service {
+    @Inject
+    @Fast
+    Repository repository;
+}
+"#;
+        let model = model_with(&[("Service.java", source)], cdi());
+        assert_eq!(candidate_names(&model), [vec!["fastRepository"]]);
+        assert!(model.warnings.is_empty(), "{:?}", model.warnings);
+    }
+
+    #[test]
+    fn a_named_point_and_a_named_bean_meet() {
+        let source = r#"package demo;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+
+interface Repository {}
+
+@Named("owners")
+@ApplicationScoped
+class OwnerRepository implements Repository {}
+
+@ApplicationScoped
+class OtherRepository implements Repository {}
+
+@ApplicationScoped
+class Service {
+    @Inject
+    @Named("owners")
+    Repository repository;
+}
+"#;
+        let model = model_with(&[("Service.java", source)], cdi());
+        assert_eq!(candidate_names(&model), [vec!["owners"]]);
+        assert_eq!(
+            names(&model),
+            ["otherRepository", "owners", "service"],
+            "{:?}",
+            names(&model)
+        );
+    }
+
+    #[test]
+    fn several_cdi_beans_without_a_qualifier_warn() {
+        let source = r#"package demo;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+interface Repository {}
+
+@ApplicationScoped
+class OneRepository implements Repository {}
+
+@ApplicationScoped
+class TwoRepository implements Repository {}
+
+@ApplicationScoped
+class Service {
+    @Inject
+    Repository repository;
+}
+"#;
+        let model = model_with(&[("Service.java", source)], cdi());
+        assert_eq!(
+            candidate_names(&model),
+            [vec!["oneRepository", "twoRepository"]]
+        );
+        assert_eq!(model.warnings.len(), 1);
+        assert_eq!(model.warnings[0].id, "jakarta.multipleBeans");
+        assert_eq!(
+            model.warnings[0].message,
+            "There is more than one bean of 'Repository' type: oneRepository, twoRepository"
+        );
+    }
+
+    #[test]
+    fn a_cdi_point_without_a_bean_warns() {
+        let source = r#"package demo;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+interface Repository {}
+
+@ApplicationScoped
+class Service {
+    @Inject
+    Repository repository;
+}
+"#;
+        let model = model_with(&[("Service.java", source)], cdi());
+        assert!(candidate_names(&model)[0].is_empty());
+        assert_eq!(model.warnings.len(), 1);
+        assert_eq!(model.warnings[0].id, "jakarta.noBean");
+        assert_eq!(
+            model.warnings[0].message,
+            "No bean of 'Repository' type found"
+        );
+    }
+
+    #[test]
+    fn a_quarkus_module_produces_beans_from_methods_and_fields() {
+        let source = r#"package demo;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Produces;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+
+@ApplicationScoped
+class Beans {
+    @Produces
+    @Named("clock")
+    Clock clock() { return null; }
+
+    @Produces
+    Store store = new Store();
+}
+
+@ApplicationScoped
+class Service {
+    @Inject
+    Clock clock;
+
+    @Inject
+    Store store;
+}
+
+class Clock {}
+class Store {}
+"#;
+        let model = model_with(
+            &[("Beans.java", source)],
+            Frameworks::of(&[Framework::Quarkus]),
+        );
+        assert_eq!(
+            names(&model),
+            ["beans", "service", "clock", "store"],
+            "{:?}",
+            names(&model)
+        );
+        let produced: Vec<&str> = model
+            .beans
+            .iter()
+            .filter(|bean| bean.stereotype == "@Produces")
+            .map(|bean| bean.name.as_str())
+            .collect();
+        assert_eq!(produced, ["clock", "store"]);
+        assert_eq!(candidate_names(&model), [vec!["clock"], vec!["store"]]);
+        assert!(model.warnings.is_empty(), "{:?}", model.warnings);
+    }
+
+    #[test]
+    fn a_micronaut_factory_declares_beans_and_its_method_parameters_receive_them() {
+        let source = r#"package demo;
+
+import io.micronaut.context.annotation.Bean;
+import io.micronaut.context.annotation.Factory;
+import io.micronaut.context.annotation.Prototype;
+import io.micronaut.context.annotation.Requires;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Singleton;
+
+@Factory
+class Beans {
+    @Bean
+    @Named("owners")
+    Repository repository(DataSource source) { return null; }
+
+    @Singleton
+    Clock clock() { return null; }
+}
+
+@Singleton
+class DataSource {}
+
+@Singleton
+class Service {
+    @Inject
+    @Named("owners")
+    Repository repository;
+}
+
+@Prototype
+class Task {}
+"#;
+        let model = model_with(&[("Beans.java", source)], micronaut());
+        assert_eq!(
+            names(&model),
+            ["owners", "task", "clock", "dataSource", "service"],
+            "{:?}",
+            names(&model)
+        );
+        let stereotypes: Vec<&str> = model
+            .beans
+            .iter()
+            .map(|bean| bean.stereotype.as_str())
+            .collect();
+        assert!(stereotypes.contains(&"@Bean"), "{stereotypes:?}");
+        assert!(stereotypes.contains(&"@Singleton"), "{stereotypes:?}");
+        assert!(stereotypes.contains(&"@Prototype"), "{stereotypes:?}");
+        assert_eq!(
+            candidate_names(&model),
+            [vec!["dataSource"], vec!["owners"]],
+            "the factory method parameter and the injected field receive their beans"
+        );
+        assert!(model.warnings.is_empty(), "{:?}", model.warnings);
+    }
+
+    #[test]
+    fn a_micronaut_point_without_a_bean_warns_with_its_own_check() {
+        let source = r#"package demo;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+
+interface Repository {}
+
+@Singleton
+class Service {
+    @Inject
+    Repository repository;
+}
+"#;
+        let model = model_with(&[("Service.java", source)], micronaut());
+        assert_eq!(model.warnings.len(), 1);
+        assert_eq!(model.warnings[0].id, "micronaut.noBean");
+    }
+
+    #[test]
+    fn the_frameworks_of_the_module_decide_which_annotations_make_a_bean() {
+        let source = r#"package demo;
+
+import jakarta.enterprise.context.ApplicationScoped;
+
+@ApplicationScoped
+class Shop {}
+"#;
+        let spring = model(&[("Shop.java", source)]);
+        assert!(spring.beans.is_empty(), "{:?}", spring.beans);
+        let cdi = model_with(&[("Shop.java", source)], cdi());
+        assert_eq!(names(&cdi), ["shop"]);
     }
 }

@@ -2,7 +2,7 @@
 //! flat list of visible rows. No UI and no I/O on the calling thread, except
 //! [`read_folder`], which the panel runs in the background.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Never shown: the object store of the version control.
@@ -49,6 +49,8 @@ pub struct FileTree {
     listings: HashMap<PathBuf, Vec<Child>>,
     /// Rows that come from outside the folder on disk, such as Scratches.
     virtuals: HashMap<PathBuf, Vec<Child>>,
+    /// Folders whose rows are set from outside the disk, such as the migrations.
+    virtual_folders: HashSet<PathBuf>,
     expanded: BTreeSet<PathBuf>,
     rows: Vec<Row>,
 }
@@ -61,6 +63,7 @@ impl FileTree {
             root,
             listings: HashMap::new(),
             virtuals: HashMap::new(),
+            virtual_folders: HashSet::new(),
             expanded,
             rows: Vec::new(),
         };
@@ -100,6 +103,47 @@ impl FileTree {
             .or_default()
             .push(child);
         self.rebuild();
+    }
+
+    /// Adds a row to `parent` that is not read from disk, or gives the row with the same
+    /// name new contents, such as the node of the migrations of a project.
+    pub fn set_virtual_child(&mut self, parent: &Path, child: Child) {
+        let children = self.virtuals.entry(parent.to_path_buf()).or_default();
+        children.retain(|known| known.name != child.name);
+        children.push(child);
+        self.rebuild();
+    }
+
+    /// Takes away the row of `parent` with that name, if the tree has it.
+    pub fn remove_virtual_child(&mut self, parent: &Path, name: &str) {
+        let Some(children) = self.virtuals.get_mut(parent) else {
+            return;
+        };
+        children.retain(|child| child.name != name);
+        if children.is_empty() {
+            self.virtuals.remove(parent);
+        }
+        self.rebuild();
+    }
+
+    /// Sets the rows of a folder whose files live elsewhere, such as the root of the
+    /// migrations: the tree must not read that folder from disk.
+    pub fn set_virtual_listing(&mut self, folder: PathBuf, children: Vec<Child>) {
+        self.virtual_folders.insert(folder.clone());
+        self.listings.insert(folder, children);
+        self.rebuild();
+    }
+
+    /// Forgets the rows of a folder of [`FileTree::set_virtual_listing`].
+    pub fn clear_virtual_listing(&mut self, folder: &Path) {
+        self.virtual_folders.remove(folder);
+        self.listings.remove(folder);
+        self.rebuild();
+    }
+
+    /// Whether the rows of a folder come from outside the disk.
+    pub fn is_virtual_folder(&self, path: &Path) -> bool {
+        self.virtual_folders.contains(path)
     }
 
     pub fn set_listing(&mut self, folder: PathBuf, children: Vec<Child>) {

@@ -10,6 +10,13 @@
 </p>
 
 <p align="center">
+  <a href="https://pablosensei.github.io/arro/"><b>Website</b></a> ·
+  <a href="https://pablosensei.github.io/arro/changelog/">Changelog</a> ·
+  <a href="https://pablosensei.github.io/arro/help/">Help</a> ·
+  <a href="https://pablosensei.github.io/arro/roadmap/">Roadmap</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/PabloSensei/arro/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/PabloSensei/arro?include_prereleases&label=release&color=EA580C"></a>
   <a href="https://github.com/PabloSensei/arro/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/PabloSensei/arro/total?color=EA580C"></a>
   <a href="LICENSE.md"><img alt="License: FSL-1.1-ALv2" src="https://img.shields.io/badge/license-FSL--1.1--ALv2-1F1F23"></a>
@@ -60,7 +67,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>Code intelligence</h3>
-      Completion with auto-import, quick fixes on Alt+Enter, semantic highlighting, parameter name hints, Find Usages, call and type hierarchy, class diagrams, rename, extract, inline, change signature, safe delete, Structural Search and Replace, live and postfix templates, reformat, optimize imports, Create Test, and per-project inspection levels with suppression on Alt+Enter.
+      Completion with auto-import, quick fixes on Alt+Enter, semantic highlighting, parameter name hints, Find Usages, call and type hierarchy, class and sequence diagrams, rename, extract, inline, change signature, safe delete, Structural Search and Replace, live and postfix templates, reformat, optimize imports, Create Test, spell checking of comments, strings and names with fixes through Rename, and per-project inspection levels with suppression on Alt+Enter.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/completion.png" alt="Completion popup in the editor">
@@ -77,12 +84,12 @@
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <h3>Spring</h3>
-      Completion, hover and checks for <code>application.properties</code> and <code>.yml</code> from the configuration metadata of your class path. A Beans window with injection gutter marks and navigation, an Endpoints window with every HTTP handler, Spring Data JPA query methods and JPQL in <code>@Query</code> completed and checked against your entities, message bundles linked to <code>getMessage</code>, validation messages and Thymeleaf <code>#{…}</code>. A running Spring Boot app gets an Actuator tab with live Health, Beans, Mappings and Environment.
+      <h3>Spring, Jakarta EE, Quarkus, Micronaut</h3>
+      Completion, hover and checks for <code>application.properties</code> and <code>.yml</code> from the configuration metadata of your class path. A Beans window with injection gutter marks and navigation, an Endpoints window with every HTTP handler, Spring Data JPA query methods and JPQL in <code>@Query</code> completed and checked against your entities, message bundles linked to <code>getMessage</code>, validation messages and Thymeleaf <code>#{…}</code>. A running Spring Boot app gets an Actuator tab with live Health, Beans, Mappings and Environment. CDI and Micronaut beans with <code>@Inject</code> checks, Quarkus and Micronaut configuration keys and endpoints, and Quarkus Dev Mode.
     </td>
     <td width="50%" valign="top">
       <h3>Tools in the window</h3>
-      A database console for JDBC sources with a schema tree, an HTTP client for <code>.http</code> files that turns pasted cURL into requests and back, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, newer dependency versions marked in <code>pom.xml</code> and Gradle files, a table editor for <code>.properties</code> bundles of all locales, library sources on demand, and a Markdown preview with images.
+      A database console for JDBC sources with a schema tree, an HTTP client for <code>.http</code> files that turns pasted cURL into requests and back, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), heap dumps with retained sizes, dominators and paths to GC roots, Flyway and Liquibase migrations with their state in the database, Kubernetes clusters next to Docker in the Services window, a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, newer dependency versions marked in <code>pom.xml</code> and Gradle files, a table editor for <code>.properties</code> bundles of all locales, library sources on demand, and a Markdown preview with images.
     </td>
   </tr>
   <tr>
@@ -121,13 +128,21 @@ On Debian and Ubuntu, install the package:
 sudo apt install ./arro_<version>_amd64.deb
 ```
 
-It puts Arro in `/opt/arro`, adds `arro` to the path and a shortcut to the application menu. A newer version installs the same way; Arro cannot update a package installation itself, so its update notice opens the release page.
+On Fedora and openSUSE, install the RPM package:
 
-On other distributions, use the archive:
+```shell
+sudo dnf install ./arro-<version>-1.x86_64.rpm
+```
 
-1. Unpack `arro-<version>-linux-x86_64.tar.gz`, for example into `~/opt`.
-2. Run `./arro` from that folder.
-3. If you want a shortcut in the application menu, run `./install.sh` and answer the question. It writes only to `~/.local/share` of your user; nothing is installed automatically.
+Both packages put Arro in `/opt/arro`, add `arro` to the path and a shortcut to the application menu. A newer version installs the same way; Arro cannot update a package installation itself, so its update notice opens the release page.
+
+On other distributions, or without root, use the archive:
+
+1. Unpack `arro-<version>-linux-x86_64.tar.gz` anywhere.
+2. Run `./install.sh` in that folder. It copies Arro to `~/.local/share/arro` (or to a folder you name), links `~/.local/bin/arro` and adds a shortcut and icons to the application menu, all inside your home folder. `./install.sh --uninstall` removes them again.
+3. Or skip the script and run `./arro` from the unpacked folder.
+
+An archive installation updates itself.
 
 The window needs `libfontconfig`, `libwayland`, `libx11`, `libxcb` and `libxkbcommon` at run time. The archive includes `README.txt` with the JDK search paths and the servers it ships.
 
@@ -148,7 +163,7 @@ Known limitations of this preview:
 - Linux and macOS are early previews: they build and pass the tests, but fewer people use them than the Windows build.
 - The macOS build is not notarized, so the first start needs the step above.
 - Linux is built for x86-64 only, and the macOS archive published by the release workflow is for Apple silicon. A build for another architecture has to be made on that architecture.
-- There is no `.rpm`, Flatpak or Homebrew package yet, and the macOS `.dmg` is not notarized.
+- There is no Flatpak or Homebrew package yet, and the macOS `.dmg` is not notarized.
 - On Linux the terminal uses the system pseudo terminal; the Windows ConPTY is not part of that archive.
 
 ## Build from source
@@ -173,6 +188,7 @@ The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `c
 | Git | ✅ Works |
 | Spring: configuration, beans, endpoints, message bundles, Actuator | 🚧 New, works on Spring PetClinic |
 | Database console, HTTP client, profiler, JShell | 🚧 New |
+| Jakarta EE, Quarkus, Micronaut, Kubernetes, heap dumps, Flyway and Liquibase | 🚧 New |
 | Windows 11 x86-64 | ✅ Supported |
 | Linux x86-64 | 🚧 Preview release |
 | macOS (Apple silicon; Intel where a runner builds it) | 🚧 Preview release |

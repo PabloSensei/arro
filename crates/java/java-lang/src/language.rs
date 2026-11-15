@@ -125,6 +125,7 @@ impl LanguageSupport for JavaProject {
             self.spring.clone(),
             self.messages.clone(),
             Arc::new(self.build_scripts.clone()),
+            self.migration_files.clone(),
         ]
     }
 
@@ -272,6 +273,10 @@ impl LanguageSupport for JavaProject {
         Some(self)
     }
 
+    fn sequence_diagram(&self) -> Option<&lang_api::SequenceDiagramProvider> {
+        Some(self)
+    }
+
     fn structural_search(&self) -> Option<&dyn StructuralSearchProvider> {
         Some(&STRUCTURAL_SEARCH)
     }
@@ -282,6 +287,10 @@ impl LanguageSupport for JavaProject {
 
     fn inspections(&self) -> Vec<lang_api::InspectionInfo> {
         crate::inspections::catalog()
+    }
+
+    fn spelling(&self) -> Option<&dyn lang_api::SpellingProvider> {
+        Some(self)
     }
 
     fn set_inspection_settings(&self, settings: lang_api::InspectionSettings) {

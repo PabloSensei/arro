@@ -18,6 +18,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::Workspace;
 
+use crate::diagram_canvas::{self, FIT_MARGIN, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP};
 use crate::diagram_layout::{self, Layout, Measure};
 use crate::diagram_svg::{self, SvgOptions};
 
@@ -31,13 +32,6 @@ const MEMBER_ROW: f32 = 20.;
 const NODE_PADDING: f32 = 8.;
 /// The space a separator between two sections takes.
 const SECTION_GAP: f32 = 5.;
-/// The smallest and the largest zoom of the diagram.
-const MIN_ZOOM: f32 = 0.25;
-const MAX_ZOOM: f32 = 2.5;
-/// One press of a zoom button or key.
-const ZOOM_STEP: f32 = 1.2;
-/// The space Fit leaves around the diagram.
-const FIT_MARGIN: f32 = 24.;
 const TAB_PATH_FOLDER: &str = ".diagram";
 const TAB_PATH_NAME: &str = "Diagram.diagram";
 
@@ -373,41 +367,20 @@ impl DiagramView {
     }
 
     fn to_graph(&self, position: Point<Pixels>) -> Point<f32> {
-        let origin = self
-            .bounds
-            .get()
-            .map(|bounds| bounds.origin)
-            .unwrap_or_default();
-        let local = point(
-            f32::from(position.x - origin.x) - self.pan.x,
-            f32::from(position.y - origin.y) - self.pan.y,
-        );
-        point(local.x, local.y)
+        diagram_canvas::to_diagram(self.pan, self.bounds.get(), position)
     }
 
     fn zoom_at(&mut self, factor: f32, around: Point<Pixels>) {
-        let bounds = self
-            .bounds
-            .get()
-            .map(|bounds| bounds.origin)
-            .unwrap_or_default();
-        let local = point(
-            f32::from(around.x - bounds.x),
-            f32::from(around.y - bounds.y),
+        diagram_canvas::zoom_at(
+            &mut self.zoom,
+            &mut self.pan,
+            factor,
+            around,
+            self.bounds.get(),
         );
-        let before = point(
-            (local.x - self.pan.x) / self.zoom,
-            (local.y - self.pan.y) / self.zoom,
-        );
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        let after = point(before.x * self.zoom, before.y * self.zoom);
-        self.pan = point(local.x - after.x, local.y - after.y);
     }
 
     fn fit(&mut self) {
-        let Some(bounds) = self.bounds.get() else {
-            return;
-        };
         if self.graph.nodes.is_empty() {
             self.zoom = 1.;
             self.pan = point(0., 0.);
@@ -425,36 +398,27 @@ impl DiagramView {
             right = right.max(place.x + width);
             bottom = bottom.max(place.y + height);
         }
-        if right <= left || bottom <= top {
-            return;
-        }
-        let width = f32::from(bounds.size.width).max(1.);
-        let height = f32::from(bounds.size.height).max(1.);
-        let fit_x = (width - FIT_MARGIN * 2.) / (right - left);
-        let fit_y = (height - FIT_MARGIN * 2.) / (bottom - top);
-        self.zoom = fit_x.min(fit_y).clamp(MIN_ZOOM, MAX_ZOOM);
-        self.pan = point(
-            (width - (right - left) * self.zoom) / 2. - left * self.zoom,
-            (height - (bottom - top) * self.zoom) / 2. - top * self.zoom,
+        diagram_canvas::fit(
+            &mut self.zoom,
+            &mut self.pan,
+            self.bounds.get(),
+            (left, top, right, bottom),
         );
     }
 
     fn is_visible(&self, index: usize) -> bool {
-        let Some(bounds) = self.bounds.get() else {
-            return true;
-        };
         let Some(place) = self.place_of(index) else {
             return false;
         };
         let (width, height) = self.size_of(index);
-        let left = place.x * self.zoom + self.pan.x;
-        let top = place.y * self.zoom + self.pan.y;
-        let right = left + width * self.zoom;
-        let bottom = top + height * self.zoom;
-        right > 0.
-            && bottom > 0.
-            && left < f32::from(bounds.size.width)
-            && top < f32::from(bounds.size.height)
+        let at = diagram_canvas::screen(place, self.zoom, self.pan);
+        diagram_canvas::visible(
+            at.x,
+            at.y,
+            width * self.zoom,
+            height * self.zoom,
+            self.bounds.get(),
+        )
     }
 
     /// Deletes the selected node and the edges that reach it.
@@ -1381,7 +1345,9 @@ fn paint_edges(
             .points
             .map(|at| point(bounds.left() + px(at.x), bounds.top() + px(at.y)));
         if edge.kind == GraphEdgeKind::Implementation {
-            paint_dashed(&points, edge.color, window);
+            for pair in points.windows(2) {
+                diagram_canvas::paint_dashed(pair[0], pair[1], edge.color, window);
+            }
         } else {
             let mut path = PathBuilder::stroke(px(1.2));
             path.move_to(points[0]);
@@ -1449,36 +1415,6 @@ fn paint_edges(
             if let Ok(path) = triangle.build() {
                 window.paint_path(path, edge.color);
             }
-        }
-    }
-}
-
-/// Paints the segments of an implementation edge with dashes.
-fn paint_dashed(points: &[Point<Pixels>; 4], color: Hsla, window: &mut Window) {
-    const DASH: f32 = 6.;
-    const GAP: f32 = 4.;
-    for pair in points.windows(2) {
-        let (from, to) = (pair[0], pair[1]);
-        let dx = f32::from(to.x - from.x);
-        let dy = f32::from(to.y - from.y);
-        let length = (dx * dx + dy * dy).sqrt();
-        if length < 0.5 {
-            continue;
-        }
-        let mut at = 0.;
-        while at < length {
-            let finish = (at + DASH).min(length);
-            let along = |distance: f32| {
-                let fraction = distance / length;
-                point(from.x + px(dx * fraction), from.y + px(dy * fraction))
-            };
-            let mut path = PathBuilder::stroke(px(1.2));
-            path.move_to(along(at));
-            path.line_to(along(finish));
-            if let Ok(path) = path.build() {
-                window.paint_path(path, color);
-            }
-            at += DASH + GAP;
         }
     }
 }

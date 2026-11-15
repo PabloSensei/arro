@@ -209,6 +209,13 @@ pub struct SettingsView {
     inspection_search: TextField,
     inspection_editing: bool,
     inspection_root: PathBuf,
+    /// The words of the spelling dictionary of the user.
+    spelling_words: Vec<String>,
+    /// The line about the dictionary the check reads.
+    spelling_source: String,
+    /// The word the user is typing into the dictionary.
+    spelling_word: TextField,
+    spelling_editing: bool,
     /// The search over the pages, drawn above the tree.
     search: TextField,
     /// Whether the caret of the search field is shown. The window opens with it in the
@@ -278,6 +285,7 @@ impl SettingsView {
         };
         let root = workspace.root().to_path_buf();
         let inspection_settings = workspace::load_inspections(&root);
+        let (spelling_words, spelling_source) = crate::spelling::words_and_source(cx);
         let inspections = cx
             .try_global::<Semantic>()
             .map(|semantic| semantic.0.inspections())
@@ -321,6 +329,10 @@ impl SettingsView {
             inspection_search: TextField::default(),
             inspection_editing: false,
             inspection_root: root,
+            spelling_words,
+            spelling_source,
+            spelling_word: TextField::default(),
+            spelling_editing: false,
             search: TextField::default(),
             search_editing: true,
             sdk: "not set".to_owned(),
@@ -749,6 +761,17 @@ impl SettingsView {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.spelling_editing {
+            if event.keystroke.key == "escape" {
+                self.spelling_editing = false;
+            } else if event.keystroke.key == "enter" {
+                self.add_spelling_word(cx);
+            } else if self.spelling_word.key_with_clipboard(event, false, cx) {
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.inspection_editing {
             if event.keystroke.key == "escape" {
                 if self.inspection_search.text.is_empty() {
@@ -932,6 +955,116 @@ impl SettingsView {
         content
     }
 
+    /// The words of the spelling dictionary of the user, which the check reads beside
+    /// the words of the system, and the line about where the words come from.
+    fn render_spelling(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
+        let mut content = Vec::new();
+        content.push(
+            div()
+                .text_size(px(TEXT_SMALL))
+                .text_color(theme.text_secondary)
+                .child(self.spelling_source.clone()),
+        );
+        if !crate::spelling::enabled(cx) {
+            content.push(note(
+                "Spell checking is off: this machine has no dictionary.",
+                theme,
+            ));
+        }
+        let add = dialog_button(
+            "settings-spelling-add",
+            "settings-spelling-add".to_owned(),
+            "Add",
+            true,
+            !self.spelling_word.text.trim().is_empty(),
+            theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.add_spelling_word(cx)));
+        content.push(
+            div()
+                .mt(px(DIALOG_GAP))
+                .flex()
+                .items_center()
+                .gap(px(SPACE_M))
+                .child(
+                    div().flex_1().child(
+                        field(
+                            "settings-spelling-word",
+                            &self.spelling_word,
+                            "Add a word",
+                            self.spelling_editing,
+                            theme,
+                        )
+                        .debug_selector(|| "settings-spelling-word".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.spelling_editing = true;
+                            this.search_editing = false;
+                            this.inspection_editing = false;
+                            this.editing = None;
+                            cx.notify();
+                        })),
+                    ),
+                )
+                .child(add),
+        );
+        if self.spelling_words.is_empty() {
+            content.push(
+                div()
+                    .mt(px(DIALOG_GAP))
+                    .text_color(theme.text_secondary)
+                    .child("No words of your own."),
+            );
+        }
+        for (index, word) in self.spelling_words.iter().enumerate() {
+            let chosen = word.clone();
+            let remove = dialog_button(
+                ("settings-spelling-remove", index),
+                format!("settings-spelling-remove-{index}"),
+                "Remove",
+                false,
+                true,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                crate::spelling::remove_user_word(cx, &chosen);
+                this.spelling_words.retain(|entry| entry != &chosen);
+                cx.notify();
+            }));
+            content.push(
+                div()
+                    .debug_selector(move || format!("settings-spelling-word-{index}"))
+                    .mt(px(SPACE_S))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(ROW_PADDING_X))
+                    .min_h(px(30.))
+                    .rounded(px(CONTROL_RADIUS))
+                    .child(word.clone())
+                    .child(remove),
+            );
+        }
+        content
+    }
+
+    fn add_spelling_word(&mut self, cx: &mut Context<Self>) {
+        let word = self.spelling_word.text.trim().to_owned();
+        if word.is_empty() {
+            return;
+        }
+        crate::spelling::add_user_word(cx, &word);
+        if !self
+            .spelling_words
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(&word))
+        {
+            self.spelling_words.push(word);
+        }
+        self.spelling_word = TextField::default();
+        self.spelling_editing = true;
+        cx.notify();
+    }
+
     fn toggle_inspection(&mut self, id: &str, cx: &mut Context<Self>) {
         let current = self.inspection_settings.setting(id);
         let enabled = current.is_some_and(|setting| !setting.enabled);
@@ -1099,6 +1232,8 @@ fn text_hint(field: SettingField) -> &'static str {
         SettingField::TerminalShell => "Detected automatically",
         SettingField::TerminalStartDirectory => "Project root",
         SettingField::TerminalEnvironment => "NAME=value per line",
+        SettingField::KubectlPath => "Found on PATH",
+        SettingField::KubeconfigPath => "~/.kube/config",
         _ => "",
     }
 }
@@ -1497,6 +1632,9 @@ impl Render for SettingsView {
             }
             SettingsPage::EditorInspections => {
                 content.extend(self.render_inspections(&theme, cx));
+            }
+            SettingsPage::EditorSpelling => {
+                content.extend(self.render_spelling(&theme, cx));
             }
             _ => {
                 if self.page == SettingsPage::Project {

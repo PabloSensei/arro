@@ -23,6 +23,7 @@ mod regions;
 mod rendered_doc;
 mod scrollbar;
 mod semantic;
+mod spelling;
 mod state;
 mod style;
 mod view;
@@ -47,6 +48,7 @@ pub use semantic::{
     InspectionProfile, LocalCompletions, Semantic, completion_order, completion_order_with,
     completion_parts, expand_snippet, show_location, uri_path,
 };
+pub use spelling::SpellingMark;
 pub use state::{
     ActionsOnSave, Conflict, EditorState, LoadError, SaveOptions, Saved, TrimTrailing,
 };
@@ -56,10 +58,10 @@ pub use style::{EditorStyle, SemanticLook};
 pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
-    BookmarkEntry, CodeStyleLanguages, CoverageMark, CoverageState, DebugValue, DetailedUsage,
-    DocumentationQuery, EditorEvent, EditorOptions, EditorView, EndpointMark, FileBar, GutterKind,
-    GutterMark, InlayPaint, InlineValue, InlineWatchRow, Languages, LineDeclaration, OutlineItem,
-    OutlineKind, PasteText, PlaceMark, PlaceTarget, PlainSyntax, ProblemSummary, RowPaint,
-    RunFiles, RunMark, RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate, bookmarks,
-    clipboard_history, highlight_text, install_keymap,
+    ActionMark, BookmarkEntry, CodeStyleLanguages, CoverageMark, CoverageState, DebugValue,
+    DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView, EndpointMark,
+    FileBar, GutterKind, GutterMark, InlayPaint, InlineValue, InlineWatchRow, Languages,
+    LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark, PlaceTarget, PlainSyntax,
+    ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot, TemplateSettings, Usage,
+    UsagesUpdate, bookmarks, clipboard_history, highlight_text, install_keymap,
 };

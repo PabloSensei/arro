@@ -61,11 +61,28 @@ impl DatabaseSupport {
         }
     }
 
+    /// The support of a project whose model the caller has already read: no model
+    /// session is started, so the answers stay those of that model.
+    pub fn with_model(root: PathBuf, model: Arc<ProjectModel>) -> Self {
+        Self {
+            root,
+            cache_root: PathBuf::new(),
+            model: Arc::new(Mutex::new(Some(model))),
+        }
+    }
+
     fn model(&self) -> Option<Arc<ProjectModel>> {
         self.model
             .lock()
             .ok()
             .and_then(|model| model.as_ref().cloned())
+    }
+
+    /// The migrations of the project, from the model the build tool reported and the
+    /// model-less scan while it is not ready.
+    pub(crate) fn scan_migrations(&self) -> java_project::Model {
+        let model = self.model();
+        java_project::scan(&self.root, model.as_deref())
     }
 }
 

@@ -15,6 +15,7 @@ pub enum SettingsPage {
     EditorCompletion,
     EditorInlayHints,
     EditorInspections,
+    EditorSpelling,
     Project,
     Plugins,
     Keymap,
@@ -31,6 +32,7 @@ pub enum SettingsPage {
     EditorPostfix,
     EditorFileTemplates,
     Debugger,
+    Kubernetes,
 }
 
 /// The names the language gives its two build tools. They are no part of this crate:
@@ -58,13 +60,14 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 22] = [
+    pub const ALL: [SettingsPage; 24] = [
         SettingsPage::Appearance,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
         SettingsPage::EditorCompletion,
         SettingsPage::EditorInlayHints,
         SettingsPage::EditorInspections,
+        SettingsPage::EditorSpelling,
         SettingsPage::EditorLiveTemplates,
         SettingsPage::EditorPostfix,
         SettingsPage::EditorFileTemplates,
@@ -78,6 +81,7 @@ impl SettingsPage {
         SettingsPage::Tools,
         SettingsPage::ActionsOnSave,
         SettingsPage::Terminal,
+        SettingsPage::Kubernetes,
         SettingsPage::HttpClient,
         SettingsPage::Plugins,
         SettingsPage::Keymap,
@@ -91,6 +95,7 @@ impl SettingsPage {
             SettingsPage::EditorCompletion => "Code Completion",
             SettingsPage::EditorInlayHints => "Inlay Hints",
             SettingsPage::EditorInspections => "Inspections",
+            SettingsPage::EditorSpelling => "Spelling",
             SettingsPage::Project => "Project",
             SettingsPage::Plugins => "Plugins",
             SettingsPage::Keymap => "Keymap",
@@ -107,6 +112,7 @@ impl SettingsPage {
             SettingsPage::EditorPostfix => "Postfix Completion",
             SettingsPage::EditorFileTemplates => "File and Code Templates",
             SettingsPage::Debugger => "Debugger",
+            SettingsPage::Kubernetes => "Kubernetes",
         }
     }
 
@@ -117,11 +123,13 @@ impl SettingsPage {
             | SettingsPage::EditorCompletion
             | SettingsPage::EditorInlayHints
             | SettingsPage::EditorInspections
+            | SettingsPage::EditorSpelling
             | SettingsPage::BuildToolsFirst
             | SettingsPage::BuildToolsSecond
             | SettingsPage::Git
             | SettingsPage::ActionsOnSave
             | SettingsPage::Terminal
+            | SettingsPage::Kubernetes
             | SettingsPage::EditorLiveTemplates
             | SettingsPage::EditorFileTemplates => 1,
             SettingsPage::EditorPostfix => 2,
@@ -146,6 +154,7 @@ impl SettingsPage {
             | SettingsPage::EditorCompletion
             | SettingsPage::EditorInlayHints
             | SettingsPage::EditorInspections
+            | SettingsPage::EditorSpelling
             | SettingsPage::EditorLiveTemplates
             | SettingsPage::EditorPostfix
             | SettingsPage::EditorFileTemplates => Some(SettingsPage::Editor),
@@ -153,7 +162,9 @@ impl SettingsPage {
                 Some(SettingsPage::BuildTools)
             }
             SettingsPage::Git => Some(SettingsPage::VersionControl),
-            SettingsPage::ActionsOnSave | SettingsPage::Terminal => Some(SettingsPage::Tools),
+            SettingsPage::ActionsOnSave | SettingsPage::Terminal | SettingsPage::Kubernetes => {
+                Some(SettingsPage::Tools)
+            }
             _ => None,
         }
     }
@@ -248,6 +259,9 @@ pub enum SettingField {
     ShowGutterIcons,
     ShowBreadcrumbs,
     ShowStickyLines,
+    HeapSnapshotFolder,
+    KubectlPath,
+    KubeconfigPath,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -880,6 +894,30 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::ShowStickyLines,
         keywords: "sticky lines header declarations editor general",
     },
+    Setting {
+        id: "kubectl_path",
+        title: "Path to kubectl",
+        page: SettingsPage::Kubernetes,
+        kind: SettingKind::Text,
+        field: SettingField::KubectlPath,
+        keywords: "kubectl kubernetes executable path cluster",
+    },
+    Setting {
+        id: "kubeconfig_path",
+        title: "Path to kubeconfig",
+        page: SettingsPage::Kubernetes,
+        kind: SettingKind::Text,
+        field: SettingField::KubeconfigPath,
+        keywords: "kubeconfig kubernetes configuration contexts cluster",
+    },
+    Setting {
+        id: "heap_snapshot_folder",
+        title: "Memory snapshot folder",
+        page: SettingsPage::Debugger,
+        kind: SettingKind::Text,
+        field: SettingField::HeapSnapshotFolder,
+        keywords: "heap dump memory snapshot hprof profiler capture folder directory",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -908,6 +946,7 @@ pub fn section_of(id: &str) -> Option<&'static str> {
         "right_margin" | "show_gutter_icons" | "show_breadcrumbs" | "show_sticky_lines" => {
             Some("Appearance")
         }
+        "heap_snapshot_folder" => Some("Data Views"),
         _ => None,
     }
 }
@@ -1036,7 +1075,10 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::HttpTimeout
         | SettingField::DebugTypeRenderers
         | SettingField::PresentationFontSize
-        | SettingField::RightMargin => None,
+        | SettingField::RightMargin
+        | SettingField::HeapSnapshotFolder
+        | SettingField::KubectlPath
+        | SettingField::KubeconfigPath => None,
     }
 }
 
@@ -1193,7 +1235,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::HttpTimeout
             | SettingField::DebugTypeRenderers
             | SettingField::PresentationFontSize
-            | SettingField::RightMargin,
+            | SettingField::RightMargin
+            | SettingField::HeapSnapshotFolder
+            | SettingField::KubectlPath
+            | SettingField::KubeconfigPath,
         )
         | None => {
             return false;
@@ -1325,6 +1370,9 @@ pub fn set_text(settings: &mut Settings, id: &str, text: &str) -> bool {
         SettingField::TerminalStartDirectory => settings.terminal_start_directory = text.to_owned(),
         SettingField::TerminalEnvironment => settings.terminal_environment = text.to_owned(),
         SettingField::DebugTypeRenderers => settings.debug_type_renderers = text.to_owned(),
+        SettingField::HeapSnapshotFolder => settings.heap_snapshot_folder = text.to_owned(),
+        SettingField::KubectlPath => settings.kubectl_path = text.to_owned(),
+        SettingField::KubeconfigPath => settings.kubeconfig_path = text.to_owned(),
         _ => return false,
     }
     true
@@ -1354,6 +1402,9 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
         SettingField::TerminalStartDirectory => settings.terminal_start_directory.clone(),
         SettingField::TerminalEnvironment => settings.terminal_environment.clone(),
         SettingField::DebugTypeRenderers => settings.debug_type_renderers.clone(),
+        SettingField::HeapSnapshotFolder => settings.heap_snapshot_folder.clone(),
+        SettingField::KubectlPath => settings.kubectl_path.clone(),
+        SettingField::KubeconfigPath => settings.kubeconfig_path.clone(),
         _ => return None,
     })
 }

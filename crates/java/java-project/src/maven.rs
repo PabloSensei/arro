@@ -202,6 +202,15 @@ impl BuildSystem for Maven {
                         }],
                     });
                 }
+                if has_quarkus(module) {
+                    groups.push(BuildGroup {
+                        name: "Quarkus".into(),
+                        tasks: vec![BuildTask {
+                            name: "quarkus:dev".into(),
+                            program: true,
+                        }],
+                    });
+                }
                 BuildModule {
                     id: module.id.clone(),
                     name: module.name.clone(),
@@ -226,17 +235,19 @@ impl BuildSystem for Maven {
             .command(root)?
             .args(run_args(root, module, task, options));
         // The application the plugin starts may read its input, as a console program does.
-        Ok(match task.ends_with("spring-boot:run") {
-            true => spec.input(),
-            false => spec,
-        })
+        Ok(
+            match task.ends_with("spring-boot:run") || task.ends_with("quarkus:dev") {
+                true => spec.input(),
+                false => spec,
+            },
+        )
     }
 
     fn goal(&self, root: &Path, line: &str, options: TaskOptions) -> Result<ProcessSpec> {
         let mut spec = self.command(root)?;
         let mut runs_program = false;
         for word in line.split_whitespace() {
-            runs_program |= word.ends_with("spring-boot:run");
+            runs_program |= word.ends_with("spring-boot:run") || word.ends_with("quarkus:dev");
             spec = spec.arg(word);
         }
         if options.skip_tests {
@@ -391,6 +402,14 @@ fn has_spring_boot(module: &Module) -> bool {
         return false;
     };
     text.contains("spring-boot-maven-plugin")
+}
+
+/// Whether the module applies a Quarkus plugin, so that its dev goal exists.
+fn has_quarkus(module: &Module) -> bool {
+    let Ok(text) = fs::read_to_string(module.dir.join("pom.xml")) else {
+        return false;
+    };
+    text.contains("io.quarkus")
 }
 
 #[derive(Deserialize)]
@@ -766,6 +785,30 @@ mod tests {
         assert!(plugins.tasks[0].program);
         let app = tree.iter().find(|module| module.name == "app").unwrap();
         assert!(!app.groups.iter().any(|group| group.name == "Plugins"));
+    }
+
+    #[test]
+    fn a_quarkus_module_gets_its_dev_goal() {
+        let plugin = "<build><plugins><plugin>\
+                      <groupId>io.quarkus</groupId>\
+                      <artifactId>quarkus-maven-plugin</artifactId>\
+                      </plugin></plugins></build>";
+        let root = multi_module("quarkus", plugin);
+        let model = scan_poms(&root).unwrap();
+
+        let tree = Maven::new(BuildEnv::default()).task_tree(&model);
+
+        let core = tree.iter().find(|module| module.name == "core").unwrap();
+        let quarkus = core
+            .groups
+            .iter()
+            .find(|group| group.name == "Quarkus")
+            .expect("the Quarkus group is there");
+        assert_eq!(quarkus.tasks.len(), 1);
+        assert_eq!(quarkus.tasks[0].name, "quarkus:dev");
+        assert!(quarkus.tasks[0].program);
+        let app = tree.iter().find(|module| module.name == "app").unwrap();
+        assert!(!app.groups.iter().any(|group| group.name == "Quarkus"));
     }
 
     #[test]

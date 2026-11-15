@@ -443,6 +443,7 @@ pub mod editor {
     pub const IMPLEMENT_METHODS: &str = "editor.implement_methods";
     pub const CALL_HIERARCHY: &str = "editor.call_hierarchy";
     pub const SHOW_DIAGRAM: &str = "editor.show_diagram";
+    pub const SHOW_SEQUENCE_DIAGRAM: &str = "editor.show_sequence_diagram";
     pub const GOTO_TYPE_DECLARATION: &str = "editor.goto_type_declaration";
     pub const QUICK_DEFINITION: &str = "editor.quick_definition";
     pub const COPY_REFERENCE: &str = "editor.copy_reference";

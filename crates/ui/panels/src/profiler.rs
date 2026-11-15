@@ -932,6 +932,24 @@ impl ProfilerPanel {
             .child(div().flex_1())
             .child(
                 icon_button(
+                    "profiler-heap",
+                    "general/logs",
+                    "Capture Memory Snapshot",
+                    None,
+                    theme,
+                )
+                .debug_selector(|| "profiler-heap".to_owned())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let workspace = this.workspace.clone();
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            crate::heap_dump::capture(workspace, window, cx)
+                        })
+                        .ok();
+                })),
+            )
+            .child(
+                icon_button(
                     "profiler-snapshots",
                     "general/logs",
                     "Snapshots",

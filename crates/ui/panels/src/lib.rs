@@ -23,6 +23,7 @@ mod create_test;
 pub mod database_panel;
 mod debug;
 mod diagram;
+mod diagram_canvas;
 mod diagram_layout;
 mod diagram_svg;
 mod diff_view;
@@ -37,6 +38,7 @@ mod folder_compare;
 mod git;
 mod git_history;
 mod git_log;
+pub mod heap_dump;
 mod history;
 mod history_view;
 mod http;
@@ -45,6 +47,7 @@ mod inspect;
 mod inspection;
 mod items;
 pub mod jshell_panel;
+mod kubernetes;
 mod library_sources;
 mod live_panel;
 mod marks;
@@ -68,12 +71,16 @@ mod reformat;
 mod run;
 mod run_configs;
 mod script;
+mod sequence_diagram;
+mod sequence_export;
+mod sequence_layout;
 mod settings;
 mod settings_archive;
 mod settings_catalog;
 mod settings_keymap;
 mod settings_templates;
 mod shelf;
+mod spelling;
 mod spring_data;
 mod stack_trace_dialog;
 mod stack_traces;
@@ -123,6 +130,8 @@ mod window_tests_first_open;
 mod window_tests_git;
 #[cfg(test)]
 mod window_tests_git_history_selection;
+#[cfg(test)]
+mod window_tests_heap_dump;
 #[cfg(test)]
 mod window_tests_hierarchy;
 #[cfg(test)]
@@ -218,6 +227,9 @@ mod window_tests_index_isolation;
 
 #[cfg(test)]
 mod window_tests_inspect;
+
+#[cfg(test)]
+mod window_tests_sequence_diagram;
 
 #[cfg(test)]
 mod window_tests_vcs_polish;
@@ -322,6 +334,9 @@ mod window_tests_exit_buffers;
 
 #[cfg(test)]
 mod window_tests_spring_config;
+
+#[cfg(test)]
+mod window_tests_kubernetes;
 
 #[cfg(test)]
 mod window_tests_settings_tools;
@@ -453,6 +468,8 @@ mod window_tests_profiler;
 #[cfg(test)]
 mod window_tests_profiler_allocations;
 #[cfg(test)]
+mod window_tests_spelling;
+#[cfg(test)]
 mod window_tests_spring_beans;
 #[cfg(test)]
 mod window_tests_spring_data;
@@ -470,6 +487,10 @@ mod window_tests_run_configurations;
 #[cfg(test)]
 mod window_tests_switcher_icons;
 
+#[cfg(test)]
+mod window_tests_jakarta;
+#[cfg(test)]
+mod window_tests_migrations;
 #[cfg(test)]
 mod window_tests_platform_menu;
 #[cfg(test)]
@@ -501,7 +522,10 @@ use crate::navigation::Navigator;
 
 pub use agents::{AgentLanguages, AgentOptions};
 pub use coverage::{ActiveCoverage, CoverageColumn};
-pub use database_panel::{ActiveDatabase, DatabasePanel, set_database_support};
+pub use database_panel::{
+    ActiveDatabase, ActiveMigrations, DatabasePanel, migration_support, set_database_support,
+    set_migration_support,
+};
 pub use debug::{ActiveDebug, BreakpointsChanged, DebugPanel};
 pub use index::SearchSetup;
 pub use inspect::{ActiveInspect, Finding, InspectHub};
@@ -854,6 +878,9 @@ fn install(
     templates.extend(project.templates.iter().cloned());
     cx.set_global(project::FileTemplates(templates));
 
+    // The spelling check reads its dictionaries once, when the window opens.
+    spelling::install(workspace, cx);
+
     cx.set_global(outline::SymbolsFor(search.symbols_for));
     let weak = cx.weak_entity();
     workspace.set_editor_factory(editor_tab::factory(
@@ -880,6 +907,16 @@ fn install(
     cx.set_global(project_structure::ProjectEnvironmentGlobal(
         project.environment.clone(),
     ));
+    // The migrations reach the project tree and the Database window when they are built,
+    // and a test that puts them in place before the window keeps them here.
+    if cx
+        .try_global::<database_panel::ActiveMigrations>()
+        .is_none()
+    {
+        cx.set_global(database_panel::ActiveMigrations(
+            database_panel::migration_support(),
+        ));
+    }
     let panel = project::ProjectPanel::create(workspace, weak.clone(), window, cx);
     let focus = panel.read(cx).focus();
     workspace.set_dock(
@@ -959,8 +996,14 @@ fn install(
     cx.set_global(terminal_panel::ActiveTerminal(terminal));
 
     let root = workspace.root().to_path_buf();
-    let services =
-        docker::DockerPanel::create(root, workspace, weak.clone(), window.window_handle(), cx);
+    let services = docker::DockerPanel::create(
+        root,
+        workspace.state_dir().to_path_buf(),
+        workspace,
+        weak.clone(),
+        window.window_handle(),
+        cx,
+    );
     let focus = services.read(cx).focus();
     workspace.set_dock(
         DockSide::Bottom,
@@ -1242,6 +1285,11 @@ fn install(
         "window.show_diagram",
         "Show Diagram",
         crate::diagram::show_current,
+    );
+    workspace.register_command(
+        "window.show_sequence_diagram",
+        "Generate Sequence Diagram",
+        crate::sequence_diagram::show_current,
     );
     window_features::register(workspace, window, cx);
     let inspect = inspect::InspectHub::create(

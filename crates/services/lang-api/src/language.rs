@@ -350,6 +350,12 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The messages of the method at a place, read natively from the sources in the
+    /// background, for a sequence diagram.
+    fn sequence_diagram(&self) -> Option<&crate::SequenceDiagramProvider> {
+        None
+    }
+
     /// Find and Replace Structurally: templates over the shape of the code, read by the
     /// language itself. The window walks the project and runs the search in the
     /// background.
@@ -372,6 +378,13 @@ pub trait LanguageSupport: Send + Sync {
     /// list is static data, so the window may ask for it while it draws.
     fn inspections(&self) -> Vec<crate::InspectionInfo> {
         Vec::new()
+    }
+
+    /// The pieces of a document the spelling check reads. A language that owns a file
+    /// answers with its comments, its strings and its declarations; `None` lets the
+    /// editor read the text by the file name.
+    fn spelling(&self) -> Option<&dyn crate::SpellingProvider> {
+        None
     }
 
     /// The choices of the user for the checks of the project. A language sends the ones
