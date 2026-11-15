@@ -342,25 +342,74 @@ pub fn enclosing_type_at(text: &str, offset: usize) -> Option<(String, Range<usi
 /// The names of the methods that a test class for this source can call, in source
 /// order. Constructors and private methods are left out.
 pub fn testable_methods(text: &str) -> Vec<String> {
+    testable_method_signatures(text)
+        .into_iter()
+        .map(|method| method.name)
+        .collect()
+}
+
+/// A method of a type that a test class can call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestableMethod {
+    pub name: String,
+    /// The name with its parameters, `find(int id)`, as a test window lists it.
+    pub signature: String,
+}
+
+/// The methods that a test class for this source can call, with their signatures, in
+/// source order. Constructors and private methods are left out.
+pub fn testable_method_signatures(text: &str) -> Vec<TestableMethod> {
     let Some(tree) = parse(text) else {
         return Vec::new();
     };
-    let mut names = Vec::new();
-    collect_methods(tree.root_node(), text, &mut names);
-    names
+    let mut methods = Vec::new();
+    collect_methods(tree.root_node(), text, &mut methods);
+    methods
 }
 
-fn collect_methods(node: Node<'_>, text: &str, names: &mut Vec<String>) {
+fn collect_methods(node: Node<'_>, text: &str, methods: &mut Vec<TestableMethod>) {
     if node.kind() == "method_declaration"
         && !is_private(node, text)
         && let Some(name) = name_node(node)
     {
-        names.push(text_of(text, name).to_owned());
+        let name_text = text_of(text, name);
+        let parameters = node
+            .child_by_field_name("parameters")
+            .map(|parameters| text_of(text, parameters))
+            .unwrap_or("()");
+        methods.push(TestableMethod {
+            name: name_text.to_owned(),
+            signature: format!("{name_text}{parameters}"),
+        });
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_methods(child, text, names);
+        collect_methods(child, text, methods);
     }
+}
+
+/// The name of the class a type extends, without its package or type arguments. `None`
+/// for a type that extends nothing or only `Object`.
+pub fn superclass_name(text: &str) -> Option<String> {
+    let tree = parse(text)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let declaration = root
+        .named_children(&mut cursor)
+        .find(|child| is_type(*child))?;
+    let mut cursor = declaration.walk();
+    let superclass = declaration
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "superclass")?;
+    let name = superclass
+        .named_children(&mut superclass.walk())
+        .next()
+        .map(|child| text_of(text, child))
+        .or_else(|| text_of(text, superclass).trim().strip_prefix("extends"))?;
+    let name = name.trim();
+    let name = name.split('<').next()?.trim();
+    let name = name.rsplit('.').next()?.trim();
+    (!name.is_empty() && name != "Object").then(|| name.to_owned())
 }
 
 fn has_modifier(node: Node<'_>, text: &str, wanted: &str) -> bool {
@@ -410,7 +459,10 @@ pub fn type_declares_method(text: &str, method: &str) -> (bool, bool) {
         found.kind(),
         "interface_declaration" | "annotation_type_declaration"
     ) || has_modifier(found, text, "abstract");
-    (names.iter().any(|found| found == method), abstract_type)
+    (
+        names.iter().any(|found| found.name == method),
+        abstract_type,
+    )
 }
 
 /// The offset of the name of the first top-level type, for Safe Delete on a file.
@@ -642,6 +694,127 @@ pub fn unwrap_edits(text: &str, offset: usize) -> Vec<UnwrapEdit> {
     found
 }
 
+/// Where a suppression of a check goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuppressTarget {
+    Statement,
+    Method,
+    Class,
+}
+
+/// One edit that suppresses a check with `@SuppressWarnings("token")`. Byte offsets
+/// are in the text that was asked about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuppressionEdit {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+/// The edit that puts `@SuppressWarnings("token")` on the declaration around `offset`,
+/// or on the declaration of the statement. An annotation that is already there takes
+/// the token into its list: `{"a"}` becomes `{"a", "token"}`.
+pub fn suppression_edit(
+    text: &str,
+    offset: usize,
+    target: SuppressTarget,
+    token: &str,
+) -> Option<SuppressionEdit> {
+    let tree = parse(text)?;
+    let mut node = node_at(&tree, offset);
+    let declaration = match target {
+        SuppressTarget::Statement => loop {
+            if node.kind().ends_with("_statement")
+                || matches!(
+                    node.kind(),
+                    "local_variable_declaration" | "variable_declarator"
+                )
+            {
+                break node;
+            }
+            node = node.parent()?;
+        },
+        SuppressTarget::Method => loop {
+            if is_method(node) {
+                break node;
+            }
+            node = node.parent()?;
+        },
+        SuppressTarget::Class => loop {
+            if is_type(node) {
+                break node;
+            }
+            node = node.parent()?;
+        },
+    };
+    let start = declaration.start_byte();
+    let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+    let indent = if text[line_start..start].trim().is_empty() {
+        text[line_start..start].to_owned()
+    } else {
+        text[line_start..]
+            .chars()
+            .take_while(|character| character.is_whitespace() && *character != '\n')
+            .collect()
+    };
+    let header_end = header_end(text, declaration);
+    if let Some(annotation) = suppress_annotation(&text[start..header_end]) {
+        let (open, close) = annotation;
+        let body = &text[start + open..start + close];
+        if body.contains(&format!("\"{token}\"")) {
+            return None;
+        }
+        let trimmed = body.trim();
+        let replacement = if trimmed.is_empty() {
+            format!("\"{token}\"")
+        } else if trimmed.starts_with('{') {
+            let inner = trimmed
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim_end();
+            let separator = if inner.is_empty() { "" } else { ", " };
+            format!("{{{inner}{separator}\"{token}\"}}")
+        } else {
+            format!("{{{trimmed}, \"{token}\"}}")
+        };
+        return Some(SuppressionEdit {
+            start: start + open,
+            end: start + close,
+            text: replacement,
+        });
+    }
+    Some(SuppressionEdit {
+        start: line_start,
+        end: line_start,
+        text: format!("{indent}@SuppressWarnings(\"{token}\")\n"),
+    })
+}
+
+/// The end of the header of a declaration: the first `{` of its body or the `;` that
+/// ends it.
+fn header_end(text: &str, declaration: Node<'_>) -> usize {
+    let start = declaration.start_byte();
+    let mut depth: usize = 0;
+    for (at, character) in text[start..declaration.end_byte()].char_indices() {
+        match character {
+            '(' | '<' => depth += 1,
+            ')' | '>' => depth = depth.saturating_sub(1),
+            '{' | ';' if depth == 0 => return start + at,
+            _ => {}
+        }
+    }
+    declaration.end_byte()
+}
+
+/// The span of the arguments of an `@SuppressWarnings` annotation in `header`, between
+/// the parentheses.
+fn suppress_annotation(header: &str) -> Option<(usize, usize)> {
+    let at = header.find("@SuppressWarnings")?;
+    let open = header[at..].find('(')? + at;
+    let close = header[open..].find(')')? + open;
+    Some((open + 1, close))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DeletionKind, deletion, first_type_offset, unwrap_edits};
@@ -744,6 +917,28 @@ mod tests {
     fn testable_methods_skip_constructors_and_private_ones() {
         let text = "class A {\n    A() {\n    }\n    public void one() {\n    }\n    private void secret() {\n    }\n}\n";
         assert_eq!(super::testable_methods(text), vec!["one"]);
+    }
+
+    #[test]
+    fn testable_signatures_keep_the_parameters_of_each_overload() {
+        let text = "class A {\n    public void find(int id) {\n    }\n    public void find(String name) {\n    }\n}\n";
+        let found: Vec<String> = super::testable_method_signatures(text)
+            .into_iter()
+            .map(|method| method.signature)
+            .collect();
+        assert_eq!(found, ["find(int id)", "find(String name)"]);
+    }
+
+    #[test]
+    fn the_superclass_is_read_without_arguments_or_a_package() {
+        let text = "package p;\n\nclass A extends p.B<C> {\n}\n";
+        assert_eq!(super::superclass_name(text), Some("B".to_owned()));
+        assert_eq!(super::superclass_name("class A {\n}\n"), None);
+        assert_eq!(
+            super::superclass_name("class A extends Object {\n}\n"),
+            None,
+            "Object is implicit everywhere"
+        );
     }
 
     #[test]

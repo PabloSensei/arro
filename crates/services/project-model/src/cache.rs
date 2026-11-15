@@ -6,7 +6,7 @@ use crate::ProjectModel;
 
 /// Where project caches live by default: outside the project, the tree stays clean.
 pub fn default_cache_root() -> PathBuf {
-    base::app::folder("LOCALAPPDATA").join("projects")
+    base::app::cache_folder().join("projects")
 }
 
 /// The cached model of one project. FNV-1a keeps a directory name stable and short.

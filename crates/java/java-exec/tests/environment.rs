@@ -99,6 +99,7 @@ fn the_build_and_the_run_use_the_chosen_sdk() {
             ..JavaTarget::default()
         })
         .unwrap(),
+        ..RunConfig::default()
     };
 
     let plan = provider.plan(&config, &model).unwrap();

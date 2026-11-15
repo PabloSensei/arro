@@ -53,6 +53,8 @@ impl RunConfigProvider for ReadingRun {
             provider: "fixture".into(),
             assemble_first: false,
             settings: Default::default(),
+
+            ..RunConfig::default()
         }])
     }
 

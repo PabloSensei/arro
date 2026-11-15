@@ -74,6 +74,11 @@ pub struct Semantic(pub Arc<dyn LanguageSupport>);
 
 impl Global for Semantic {}
 
+/// The choices of the user for the checks of the project, shared by the open editors.
+pub struct InspectionProfile(pub lang_api::InspectionSettings);
+
+impl Global for InspectionProfile {}
+
 /// Languages for files that no project server owns, such as the console of a tool. The
 /// application sets them; the editor asks them when the project language does not match.
 pub struct FileLanguages(pub Vec<Arc<dyn LanguageSupport>>);
@@ -236,6 +241,8 @@ pub(crate) struct Mark {
     pub message: String,
     /// The server marked the range as something that can go. The editor greys it out.
     pub unnecessary: bool,
+    /// The check that gave the mark, for its settings and its suppression comment.
+    pub code: Option<String>,
 }
 
 /// A semantic token of the document, in byte offsets. It follows the text the way the
@@ -914,9 +921,6 @@ pub(crate) struct Lsp {
     /// The marks of a native model, such as the checks of a framework, by the source of
     /// the model.
     pub(crate) native_marks: HashMap<&'static str, Vec<Mark>>,
-    /// The diagnostics both sets came from, for the Problems window.
-    pub(crate) server_entries: Vec<DiagnosticEntry>,
-    pub(crate) native_entries: HashMap<&'static str, Vec<DiagnosticEntry>>,
     /// The tokens the server sent, before the native ones join them.
     pub(crate) server_tokens: Vec<TokenSpan>,
     /// The tokens of a native model, by the source of the model.
@@ -1292,8 +1296,6 @@ impl EditorView {
             marks: Vec::new(),
             server_marks: Vec::new(),
             native_marks: HashMap::new(),
-            server_entries: Vec::new(),
-            native_entries: HashMap::new(),
             server_tokens: Vec::new(),
             native_tokens: HashMap::new(),
             received: !follows_diagnostics,
@@ -1508,10 +1510,10 @@ impl EditorView {
                     severity: entry.severity,
                     message: entry.message.clone(),
                     unnecessary: entry.unnecessary,
+                    code: entry.code.clone(),
                 }
             })
             .collect();
-        lsp.server_entries = entries;
         self.apply_marks(cx);
     }
 
@@ -1545,15 +1547,14 @@ impl EditorView {
                     severity: entry.severity,
                     message: entry.message.clone(),
                     unnecessary: entry.unnecessary,
+                    code: entry.code.clone(),
                 }
             })
             .collect();
-        if entries.is_empty() {
+        if marks.is_empty() {
             lsp.native_marks.remove(key);
-            lsp.native_entries.remove(key);
         } else {
             lsp.native_marks.insert(key, marks);
-            lsp.native_entries.insert(key, entries);
         }
         self.apply_marks(cx);
     }
@@ -1615,26 +1616,86 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Joins the marks of the server with the marks of a native model.
-    fn apply_marks(&mut self, cx: &mut Context<Self>) {
+    /// Joins the marks of the server with the marks of a native model, and leaves out
+    /// the checks the user turned off and the places a `//noinspection` comment covers.
+    pub(crate) fn apply_marks(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let store = state.store();
+        let settings = cx
+            .try_global::<InspectionProfile>()
+            .map(|profile| profile.0.clone())
+            .unwrap_or_default();
+        let suppressions = lang_api::Suppressions::from_text(&state.text());
         let Some(lsp) = &mut self.lsp else {
             return;
         };
-        lsp.marks = lsp
+        let mut marks = Vec::new();
+        let mut entries = Vec::new();
+        for mark in lsp
             .server_marks
             .iter()
             .chain(lsp.native_marks.values().flatten())
-            .cloned()
-            .collect();
+        {
+            let line = store.offset_to_line(mark.range.start) as u32;
+            let mut severity = mark.severity;
+            if let Some(code) = mark.code.as_deref() {
+                // The server names a compiler problem by its numeric `IProblem` id; the
+                // settings and the `@SuppressWarnings` tokens use the key of the option.
+                let inspection = lsp
+                    .support
+                    .inspection_of(Some(code), &mark.message)
+                    .map(|info| info.id);
+                let id = inspection.as_deref().unwrap_or(code);
+                if suppressions.covers(code, line) || suppressions.covers(id, line) {
+                    continue;
+                }
+                let level = settings
+                    .inspections
+                    .get(id)
+                    .map(|setting| {
+                        if setting.enabled {
+                            setting
+                                .level
+                                .unwrap_or(lang_api::InspectionLevel::from_severity(mark.severity))
+                        } else {
+                            lang_api::InspectionLevel::Off
+                        }
+                    })
+                    .unwrap_or_else(|| lang_api::InspectionLevel::from_severity(mark.severity));
+                let Some(shown) = level.severity() else {
+                    continue;
+                };
+                severity = shown;
+            }
+            marks.push(Mark {
+                range: mark.range.clone(),
+                severity,
+                message: mark.message.clone(),
+                unnecessary: mark.unnecessary,
+                code: mark.code.clone(),
+            });
+            entries.push(DiagnosticEntry {
+                span: lang_api::TextSpan {
+                    start: point_at(&store, mark.range.start),
+                    end: point_at(&store, mark.range.end),
+                },
+                severity,
+                message: mark.message.clone(),
+                unnecessary: mark.unnecessary,
+                code: mark.code.clone(),
+            });
+        }
+        lsp.marks = marks;
         lsp.received = true;
-        let entries: Vec<DiagnosticEntry> = lsp
-            .server_entries
-            .iter()
-            .chain(lsp.native_entries.values().flatten())
-            .cloned()
-            .collect();
         cx.emit(EditorEvent::Diagnostics(entries));
         cx.notify();
+    }
+
+    /// Applies a change of the inspection settings to the marks that are on screen.
+    pub fn reapply_inspections(&mut self, cx: &mut Context<Self>) {
+        self.apply_marks(cx);
     }
 
     /// Tells the server about a new text and keeps an open completion in step with the

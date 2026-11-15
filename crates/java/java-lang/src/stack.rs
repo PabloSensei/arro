@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base::Cancel;
+use futures_util::StreamExt;
 use lang_api::{
     Answer, Confidence, DumpAnswer, Frame, FrameOrigin, LineKind, Provider, Reply, Report,
     SourceId, SourceSpan, StackLine, TextPoint, TextSpan, ThreadStack, TraceQuery,
@@ -28,6 +29,9 @@ const JCMD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Classes one report looks up in the server. A large dump names hundreds of frames,
 /// and each lookup is a request to the server.
 const MAX_LOOKUPS: usize = 64;
+/// Lookups in flight at once: the second answer takes a few rounds instead of one request
+/// after another.
+const LOOKUP_CONCURRENCY: usize = 8;
 
 /// Reads a pasted stack trace or thread dump. Frames carry no place until the project
 /// resolves them.
@@ -386,27 +390,40 @@ fn unresolved(report: &Report) -> Vec<String> {
 }
 
 /// The place the server knows for each class: a `jdt:` URI for a class of a library or
-/// of the runtime, a file for a class of the project.
+/// of the runtime, a file for a class of the project. Runs the lookups side by side and
+/// keeps the answer of every class the server knew.
 async fn lookups(router: &Router, classes: &[String]) -> HashMap<String, SourceSpan> {
-    let mut found = HashMap::new();
-    for class in classes {
-        let (package, simple) = split_class(class);
-        let outer = simple.split('$').next().unwrap_or(simple);
-        let Ok(Some(response)) = router.workspace_symbol(outer).await else {
-            continue;
-        };
-        for (name, container, location) in symbol_places(response) {
-            if name != simple && name != outer {
-                continue;
-            }
-            if !container_matches(container.as_deref(), package, outer) {
-                continue;
-            }
-            found.insert(class.clone(), location);
-            break;
-        }
-    }
+    let found = futures_util::stream::iter(classes.iter().cloned())
+        .map(|class| async move {
+            let place = lookup_class(router, &class).await;
+            (class, place)
+        })
+        .buffer_unordered(LOOKUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     found
+        .into_iter()
+        .filter_map(|(class, place)| place.map(|place| (class, place)))
+        .collect()
+}
+
+/// The place of one class, `None` when the server does not answer with its symbol.
+async fn lookup_class(router: &Router, class: &str) -> Option<SourceSpan> {
+    let (package, simple) = split_class(class);
+    let outer = simple.split('$').next().unwrap_or(simple);
+    let Ok(Some(response)) = router.workspace_symbol(outer).await else {
+        return None;
+    };
+    for (name, container, location) in symbol_places(response) {
+        if name != simple && name != outer {
+            continue;
+        }
+        if !container_matches(container.as_deref(), package, outer) {
+            continue;
+        }
+        return Some(location);
+    }
+    None
 }
 
 fn split_class(class: &str) -> (&str, &str) {
@@ -469,8 +486,9 @@ fn location_span(location: &lsp_client::lsp_types::Location) -> Option<SourceSpa
     })
 }
 
-/// Fills the frames the server knows, with the line the frame named.
-fn apply_lookups(report: &mut Report, found: &HashMap<String, SourceSpan>, root: &Path) {
+/// Fills the frames the server knows, with the line the frame named. Answers whether a
+/// frame got a place.
+fn apply_lookups(report: &mut Report, found: &HashMap<String, SourceSpan>, root: &Path) -> bool {
     let origin = |uri: &str| {
         if file_under(uri, root) {
             FrameOrigin::Project
@@ -478,6 +496,7 @@ fn apply_lookups(report: &mut Report, found: &HashMap<String, SourceSpan>, root:
             FrameOrigin::Library
         }
     };
+    let mut applied = false;
     for_each_frame_mut(report, |frame| {
         let Some(span) = found.get(&frame.class) else {
             return;
@@ -496,7 +515,9 @@ fn apply_lookups(report: &mut Report, found: &HashMap<String, SourceSpan>, root:
                 },
             },
         });
+        applied = true;
     });
+    applied
 }
 
 fn file_under(uri: &str, root: &Path) -> bool {
@@ -631,15 +652,29 @@ impl StackService {
         roots
     }
 
-    async fn resolve(&self, text: &str) -> Report {
-        let mut report = parse(text);
-        resolve_project(&mut report, &self.source_roots());
-        let classes = unresolved(&report);
-        if !classes.is_empty() {
-            let found = lookups(&self.router, &classes).await;
-            apply_lookups(&mut report, &found, &self.root);
+    /// Reads the text and finds the files of the project's classes. The files of the
+    /// project are read off the runtime thread, so the first answer comes at once.
+    async fn project_report(&self, text: &str) -> Report {
+        let parsed = parse(text);
+        let roots = self.source_roots();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let mut report = parsed;
+            resolve_project(&mut report, &roots);
+            report
+        })
+        .await;
+        resolved.unwrap_or_else(|_| parse(text))
+    }
+
+    /// Fills the frames of the libraries and of the runtime. Answers whether a frame got
+    /// a place: the report is worth a second answer only then.
+    async fn refine(&self, report: &mut Report) -> bool {
+        let classes = unresolved(report);
+        if classes.is_empty() {
+            return false;
         }
-        report
+        let found = lookups(&self.router, &classes).await;
+        apply_lookups(report, &found, &self.root)
     }
 }
 
@@ -647,8 +682,19 @@ impl Provider<TraceQuery, Report> for StackService {
     fn start(&self, query: TraceQuery, _: Cancel, mut reply: Reply<Report>) {
         let service = self.clone();
         self.runtime.spawn(async move {
-            let report = service.resolve(&query.0).await;
-            let _ = reply.send(Answer::new(report, Confidence::Certain, SOURCE));
+            // The text and the frames of the project are ready first: the window shows
+            // them while the server looks up the classes of the libraries.
+            let mut report = service.project_report(&query.0).await;
+            let first = report.clone();
+            if reply
+                .send(Answer::new(first, Confidence::Partial, SOURCE))
+                .is_err()
+            {
+                return;
+            }
+            if service.refine(&mut report).await {
+                let _ = reply.send(Answer::new(report, Confidence::Certain, SOURCE));
+            }
         });
     }
 }
@@ -660,21 +706,44 @@ impl Provider<lang_api::DumpQuery, DumpAnswer> for StackService {
             let root = service.root.clone();
             let pid = query.0;
             let text = tokio::task::spawn_blocking(move || dump_text(&root, pid)).await;
-            let answer = match text {
-                Ok(Ok(text)) => DumpAnswer {
-                    report: Some(service.resolve(&text).await),
-                    error: None,
-                },
-                Ok(Err(error)) => DumpAnswer {
-                    report: None,
-                    error: Some(error),
-                },
-                Err(error) => DumpAnswer {
-                    report: None,
-                    error: Some(format!("The thread dump did not finish: {error}")),
-                },
+            let text = match text {
+                Ok(Ok(text)) => text,
+                Ok(Err(error)) => {
+                    let answer = DumpAnswer {
+                        report: None,
+                        error: Some(error),
+                    };
+                    let _ = reply.send(Answer::new(answer, Confidence::Certain, SOURCE));
+                    return;
+                }
+                Err(error) => {
+                    let answer = DumpAnswer {
+                        report: None,
+                        error: Some(format!("The thread dump did not finish: {error}")),
+                    };
+                    let _ = reply.send(Answer::new(answer, Confidence::Certain, SOURCE));
+                    return;
+                }
             };
-            let _ = reply.send(Answer::new(answer, Confidence::Certain, SOURCE));
+            // The threads and their project frames first, the library places after them.
+            let mut report = service.project_report(&text).await;
+            let first = DumpAnswer {
+                report: Some(report.clone()),
+                error: None,
+            };
+            if reply
+                .send(Answer::new(first, Confidence::Partial, SOURCE))
+                .is_err()
+            {
+                return;
+            }
+            if service.refine(&mut report).await {
+                let answer = DumpAnswer {
+                    report: Some(report),
+                    error: None,
+                };
+                let _ = reply.send(Answer::new(answer, Confidence::Certain, SOURCE));
+            }
         });
     }
 }

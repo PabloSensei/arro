@@ -58,6 +58,20 @@ pub fn path_key(path: &Path) -> PathBuf {
     PathBuf::from(normal_form(&path.to_string_lossy()).to_lowercase())
 }
 
+/// The path a `file://` URL names, as `open` of the Finder and an internet browser hand
+/// it over: `file:///C:/dir/a%20b.txt` and `file://server/share/a.txt`.
+pub fn file_url_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let text = String::from_utf8(crate::url::percent_decode(rest)?).ok()?;
+    let path = if let Some(local) = text.strip_prefix('/') {
+        local.replace('/', "\\")
+    } else {
+        format!(r"\\{}", text.replace('/', "\\"))
+    };
+    Some(PathBuf::from(path))
+}
+
 fn normal_form(path: &str) -> String {
     let plain = match path.strip_prefix(r"\\?\UNC\") {
         Some(share) => format!(r"\\{share}"),
@@ -135,5 +149,22 @@ mod tests {
             path_key(Path::new(r"\\?\c:\dir\a.txt")),
             path_key(Path::new(r"c:\dir\A.TXT"))
         );
+    }
+
+    #[test]
+    fn a_file_url_is_a_path() {
+        assert_eq!(
+            file_url_path("file:///C:/dir/a%20b.txt"),
+            Some(PathBuf::from(r"C:\dir\a b.txt"))
+        );
+        assert_eq!(
+            file_url_path("file://localhost/C:/%D0%BF%D1%80/A.txt"),
+            Some(PathBuf::from(r"C:\пр\A.txt"))
+        );
+        assert_eq!(
+            file_url_path("file://server/share/a.txt"),
+            Some(PathBuf::from(r"\\server\share\a.txt"))
+        );
+        assert_eq!(file_url_path("https://example.com/a"), None);
     }
 }

@@ -90,6 +90,15 @@ pub struct UsagesHub {
     serial: u64,
     /// The usage of each row of the list, in the order the rows are drawn.
     sources: Vec<usize>,
+    /// The places of a structural search, which replace the usages of the tabs until
+    /// the next search of a symbol.
+    structural: Option<StructuralView>,
+}
+
+struct StructuralView {
+    title: String,
+    items: Vec<Item>,
+    rows: Vec<PanelRow>,
 }
 
 /// The hub of the window, for the editor tab that receives the answer.
@@ -245,6 +254,7 @@ impl UsagesHub {
                 active: 0,
                 serial: 0,
                 sources: Vec::new(),
+                structural: None,
             }
         });
         let weak = hub.downgrade();
@@ -274,6 +284,7 @@ impl UsagesHub {
 
     /// Replaces the list with the uses of one symbol, grouped by file.
     pub fn set_usages(&mut self, usages: Vec<Usage>, cx: &mut Context<Self>) {
+        self.structural = None;
         let detailed = usages
             .into_iter()
             .map(|usage| DetailedUsage {
@@ -289,6 +300,7 @@ impl UsagesHub {
 
     /// Replaces the list with the uses of one symbol and the grouping the settings ask.
     pub fn set_detailed_usages(&mut self, mut usages: Vec<DetailedUsage>, cx: &mut Context<Self>) {
+        self.structural = None;
         let options = cx
             .try_global::<PendingFindUsages>()
             .and_then(|pending| pending.0.clone());
@@ -331,6 +343,19 @@ impl UsagesHub {
         if options.is_some() {
             self.load_extra(serial, cx);
         }
+    }
+
+    /// Shows the places of a structural search, grouped by file, in the window IDEA
+    /// uses for Find. The next search of a symbol replaces them.
+    pub fn show_structural(
+        &mut self,
+        title: String,
+        items: Vec<Item>,
+        rows: Vec<PanelRow>,
+        cx: &mut Context<Self>,
+    ) {
+        self.structural = Some(StructuralView { title, items, rows });
+        self.regroup(cx);
     }
 
     /// Asks the language for the member and hierarchy searches of the options, then
@@ -661,6 +686,18 @@ impl UsagesHub {
     /// Builds the rows from the usages, the filters and the grouping of the settings.
     pub fn regroup(&mut self, cx: &mut Context<Self>) {
         let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        if let Some(view) = &self.structural {
+            let items = view.items.clone();
+            let rows = view.rows.clone();
+            let title = view.title.clone();
+            self.sources = (0..items.len()).collect();
+            self.panel.update(cx, |panel, cx| {
+                panel.set_header_buttons(Vec::new(), cx);
+                panel.set_view(items, rows, cx);
+                panel.set_counted_title(&title, cx);
+            });
+            return;
+        }
         let Some(tab) = self.tabs.get(self.active) else {
             self.sources.clear();
             let buttons = header_buttons(&settings, &self.workspace, cx);

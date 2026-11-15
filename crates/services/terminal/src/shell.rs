@@ -1,7 +1,11 @@
-//! The shell of a new terminal when the user names none: the newest PowerShell this
-//! machine has, else the one of Windows, else the Git Bash, else the command prompt.
+//! The shell of a new terminal: the newest PowerShell this machine has, else the one of
+//! Windows, else the Git Bash, else the command prompt. The `+` menu lists every shell
+//! found, in the order the user is likely to want them.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+use crate::shells::{Shell, find_in, push_unique, quote};
 
 /// The command line of the shell found, quoted for the console of Windows.
 pub fn default_shell() -> Option<String> {
@@ -20,8 +24,47 @@ pub fn default_shell() -> Option<String> {
     found.map(|path| command_line(&path))
 }
 
+/// Every shell this machine has, in the order the menu shows them.
+pub fn available_shells() -> Vec<Shell> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut shells = shells_in(&path);
+    if let Some(bash) = git_bash() {
+        push_unique(&mut shells, Shell::new("Git Bash", &bash));
+    }
+    if let Some(wsl) = find_in(&path, "wsl.exe").or_else(|| system32("wsl.exe")) {
+        push_unique(&mut shells, Shell::new("WSL", &wsl));
+    }
+    // The prompt of Windows is there even when PATH does not name it.
+    if let Some(prompt) = std::env::var_os("ComSpec")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        push_unique(&mut shells, Shell::new("Command Prompt", &prompt));
+    }
+    shells
+}
+
+/// The shells `path` names alone, without the places outside PATH a shell of Windows
+/// lives in. A PATH of its own makes this testable.
+pub fn shells_in(path: &OsStr) -> Vec<Shell> {
+    let candidates = [
+        ("pwsh.exe", "PowerShell"),
+        ("powershell.exe", "Windows PowerShell"),
+        ("cmd.exe", "Command Prompt"),
+        ("bash.exe", "Git Bash"),
+        ("wsl.exe", "WSL"),
+    ];
+    let mut shells = Vec::new();
+    for (program, name) in candidates {
+        if let Some(found) = find_in(path, program) {
+            push_unique(&mut shells, Shell::new(name, &found));
+        }
+    }
+    shells
+}
+
 fn command_line(shell: &Path) -> String {
-    let quoted = format!("\"{}\"", shell.display());
+    let quoted = quote(shell);
     let name = shell
         .file_stem()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -34,10 +77,14 @@ fn command_line(shell: &Path) -> String {
 }
 
 fn find_in_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(program))
-        .find(|file| file.is_file())
+    find_in(std::env::var_os("PATH")?.as_os_str(), program)
+}
+
+/// A program of the system folder, which PATH does not have to name.
+fn system32(program: &str) -> Option<PathBuf> {
+    let folder = std::env::var_os("SystemRoot").map(PathBuf::from)?;
+    let file = folder.join("System32").join(program);
+    file.is_file().then_some(file)
 }
 
 /// The `bash.exe` of a Git for Windows installed in its usual places, which is often
@@ -56,7 +103,8 @@ fn git_bash() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::command_line;
+    use super::{command_line, shells_in};
+    use std::ffi::OsString;
     use std::path::Path;
 
     #[test]
@@ -68,5 +116,28 @@ mod tests {
         assert!(
             command_line(Path::new(r"C:\Program Files\Git\bin\bash.exe")).ends_with("--login -i")
         );
+    }
+
+    /// A PATH of its own, with the files `names` in the first folder.
+    fn path_with(name: &str, names: &[&str]) -> OsString {
+        let folder = test_support::scratch(name);
+        for name in names {
+            std::fs::write(folder.join(name), "").unwrap();
+        }
+        folder.as_os_str().to_os_string()
+    }
+
+    #[test]
+    fn the_shells_of_a_path_keep_the_order_of_the_menu() {
+        let path = path_with("shells-order", &["pwsh.exe", "cmd.exe", "wsl.exe"]);
+        let shells = shells_in(&path);
+        let names: Vec<&str> = shells.iter().map(|shell| shell.name.as_str()).collect();
+        assert_eq!(names, ["PowerShell", "Command Prompt", "WSL"]);
+    }
+
+    #[test]
+    fn a_folder_without_shells_names_none() {
+        let path = path_with("shells-empty", &["notes.txt"]);
+        assert!(shells_in(&path).is_empty());
     }
 }

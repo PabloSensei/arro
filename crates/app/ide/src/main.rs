@@ -1,9 +1,12 @@
 //! The Arro binary: `arro [--state-dir DIR] [--script STEPS] [--script-file PATH]
-//! [--mock-agents]
-//! [--after-update PID] [PATH]`. `PATH` is a project folder, or a file, which opens in
-//! the folder that holds it. `--mock-agents` runs harnesses in an empty home against a
-//! local model API, in builds with the `mock-agents` feature only. `--after-update` is
-//! set by a restart and waits for the old process before the project opens.
+//! [--mock-agents] [--new-instance] [--after-update PID] [PATH]`. `PATH` is a project
+//! folder, or a file, which opens in the folder that holds it. A start without
+//! `--new-instance` hands its path to the program that already runs in the same state
+//! folder and leaves. `--mock-agents` runs harnesses in an empty home against a local
+//! model API, in builds with the `mock-agents` feature only. `--after-update` is set by
+//! a restart and waits for the old process before the project opens. `--take-over` is
+//! set by the start screen, which closes after a project opens: the project listens for
+//! the next start once the start screen lets the state folder go.
 //! `--script-file` reads the steps of `--script` from a file, one step per line or
 //! separated by `;`.
 
@@ -14,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use editor_view::Languages;
 use java_lang::{BuildTools, JavaSession, Missing, Toolchain, Trust};
@@ -22,7 +25,7 @@ use lang_api::LanguageSupport;
 use panels::LanguageServer;
 use panels::{Creates, FileTemplate, ProjectSetup, ProjectTemplate, TemplatesSetup};
 use syntax::LanguageConfig;
-use workspace::{AppInfo, FileIcons, Launch, Settings};
+use workspace::{AppInfo, FileIcons, Launch, OpenRequests, Request, Settings};
 
 mod migration;
 mod panic_log;
@@ -54,6 +57,14 @@ fn language_for(path: &Path) -> Option<LanguageConfig> {
 fn language_by_name(name: &str) -> Option<LanguageConfig> {
     let name = name.split_whitespace().next()?;
     language_for(Path::new(&format!("fence.{name}")))
+}
+
+/// The name the code style files of a project give the language of this file, where the
+/// editor's own name is spelled differently there. Other languages use the editor name.
+fn code_style_language(path: &Path) -> Option<&'static str> {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
+        .then_some("JAVA")
 }
 
 fn class_text(folder: &Path, root: &Path, name: &str) -> String {
@@ -117,6 +128,11 @@ struct Args {
     script: Option<String>,
     script_file: Option<PathBuf>,
     mock_agents: bool,
+    /// This start is a window of its own: it does not hand its path to a running program.
+    new_instance: bool,
+    /// Waits for the state folder to be free and listens there: the start screen closes
+    /// after it opens a project, and the project becomes the program of the next start.
+    take_over: bool,
     /// The process this one replaces, set by a restart after an update.
     after_update: Option<u32>,
 }
@@ -138,6 +154,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 );
             }
             "--mock-agents" if cfg!(feature = "mock-agents") => parsed.mock_agents = true,
+            "--new-instance" => parsed.new_instance = true,
+            "--take-over" => parsed.take_over = true,
             flag if flag.starts_with("--") => return Err(format!("unknown argument {flag}")),
             path => parsed.path = Some(path.into()),
         }
@@ -147,7 +165,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
 
 /// Windows gives canonical paths the `\\?\` prefix, which must not reach the UI.
 fn canonical(path: &Path) -> PathBuf {
-    let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let full = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
     let text = full.to_string_lossy();
     text.strip_prefix(r"\\?\")
         .map_or(full.clone(), PathBuf::from)
@@ -416,14 +436,97 @@ fn project_templates() -> Vec<ProjectTemplate> {
     ]
 }
 
+/// The factories of the generators of New Project, from the language of the application.
+fn set_project_generators(state_dir: &Path) {
+    let directory = state_dir.to_path_buf();
+    panels::set_project_generators(Arc::new(move || {
+        java_lang::project_generators(&directory, &java_lang::NewProjectOptions::default())
+    }));
+}
+
 /// Without a project and without a script the window is the start screen.
-fn start_screen(args: &Args) {
+fn start_screen(args: &Args, requests: OpenRequests) {
     panels::set_build_tool_names("Maven", "Gradle");
     let state_dir = args.state_dir.clone().unwrap_or_else(state_folder);
     let settings_dir = args.state_dir.clone().unwrap_or_else(settings_folder);
+    set_project_generators(&state_dir);
+    let generators =
+        java_lang::project_generators(&state_dir, &java_lang::NewProjectOptions::default());
     let context = workspace::start_context(&state_dir, &settings_dir);
-    panels::run_start(context, state_dir, project_templates(), false);
+    panels::run_start(
+        context,
+        state_dir,
+        project_templates(),
+        generators,
+        false,
+        requests,
+    );
 }
+
+/// What the first start of a state folder found there.
+enum InstanceStart {
+    /// A running program took the request: this start leaves.
+    Forwarded,
+    /// No program runs in the state folder: this one listens for the next start.
+    Listening(platform::instance::Instance),
+    /// The endpoint belongs to nobody this start can reach: open without listening.
+    Alone,
+}
+
+/// Hands the path to the program that already runs in the state folder, or becomes the
+/// program that listens for the next start. A socket file of a program that died is
+/// replaced by the listener. A restart after an update waits for the old process and does
+/// not hand its path back to it: `forward` is false there. A start that takes the folder
+/// over waits `wait` for the program that leaves it.
+fn become_instance(
+    state_dir: &Path,
+    path: Option<&Path>,
+    forward: bool,
+    wait: Duration,
+    requests: &OpenRequests,
+) -> InstanceStart {
+    let request = match path {
+        Some(path) => Request::Open(canonical(path)),
+        None => Request::Focus,
+    };
+    if forward {
+        match platform::instance::send(state_dir, &request) {
+            Ok(true) => return InstanceStart::Forwarded,
+            Ok(false) => {}
+            Err(error) => eprintln!("the running program is not asked to open the path: {error}"),
+        }
+    }
+    let deadline = Instant::now() + wait;
+    loop {
+        let queue = requests.clone();
+        match platform::instance::Instance::listen(state_dir, move |request| queue.push(request)) {
+            Ok(instance) => return InstanceStart::Listening(instance),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && forward => {
+                // A program started at the same time took the endpoint: ask it again.
+                return match platform::instance::send(state_dir, &request) {
+                    Ok(true) => InstanceStart::Forwarded,
+                    _ => InstanceStart::Alone,
+                };
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
+                // The start screen closes after this start opened its project: wait for
+                // it to let go of the endpoint.
+                std::thread::sleep(TAKE_OVER_STEP);
+            }
+            Err(error) => {
+                eprintln!("this program does not listen for a second start: {error}");
+                return InstanceStart::Alone;
+            }
+        }
+    }
+}
+
+/// How long a start that takes the state folder over waits for the program that leaves
+/// it, and how often it asks.
+const TAKE_OVER_WAIT: Duration = Duration::from_secs(5);
+const TAKE_OVER_STEP: Duration = Duration::from_millis(50);
 
 /// How long the new process of a restart waits for the one it replaces.
 const AFTER_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -512,14 +615,39 @@ fn main() -> ExitCode {
     if !migration.is_empty() {
         log_migration(&logs, &migration);
     }
+    let requests = OpenRequests::default();
+    let mut instance = None;
+    if let Ok(args) = &parsed
+        && !args.new_instance
+        && args.script.is_none()
+        && args.script_file.is_none()
+    {
+        match become_instance(
+            &state_dir,
+            args.path.as_deref(),
+            args.after_update.is_none() && !args.take_over,
+            if args.take_over {
+                TAKE_OVER_WAIT
+            } else {
+                Duration::ZERO
+            },
+            &requests,
+        ) {
+            InstanceStart::Forwarded => return ExitCode::SUCCESS,
+            InstanceStart::Listening(server) => instance = Some(server),
+            InstanceStart::Alone => {}
+        }
+    }
     if let Ok(args) = &parsed
         && args.path.is_none()
         && args.script.is_none()
         && args.script_file.is_none()
     {
-        start_screen(args);
+        start_screen(args, requests);
         return ExitCode::SUCCESS;
     }
+    // The listener lives as long as the window: it is the program the next start talks to.
+    let _instance = instance;
     let toolchain = find_toolchain();
     let started = parsed.and_then(launch);
     match started {
@@ -530,6 +658,7 @@ fn main() -> ExitCode {
             let settings =
                 workspace::Settings::load(&launch.settings_dir.join(workspace::SETTINGS_FILE));
             panels::set_build_tool_names("Maven", "Gradle");
+            set_project_generators(&launch.state_dir);
             platform::MemoryPressure::configure(platform::MemoryThresholds::new(
                 settings.memory_low_percent,
                 settings.memory_low_megabytes,
@@ -581,6 +710,7 @@ fn main() -> ExitCode {
             )));
             panels::run_with_setup(
                 launch,
+                requests,
                 languages,
                 search,
                 project,
@@ -588,6 +718,7 @@ fn main() -> ExitCode {
                 setup,
                 cache,
                 templates,
+                code_style_language,
                 args.mock_agents,
                 args.script,
             );
@@ -614,6 +745,62 @@ mod tests {
         assert_eq!(args.path, Some(PathBuf::from("project")));
         assert_eq!(args.state_dir, Some(PathBuf::from("x")));
         assert_eq!(args.script.as_deref(), Some("quit"));
+        assert!(!args.new_instance);
+    }
+
+    #[test]
+    fn reads_the_flag_of_a_window_of_its_own() {
+        let args = parse(&["--new-instance", "project"]).unwrap();
+        assert!(args.new_instance);
+        assert!(!args.take_over);
+        assert_eq!(args.path, Some(PathBuf::from("project")));
+    }
+
+    #[test]
+    fn reads_the_flag_of_a_start_that_takes_the_folder_over() {
+        let args = parse(&["--take-over", "project"]).unwrap();
+        assert!(args.take_over);
+        assert!(!args.new_instance);
+        assert_eq!(args.path, Some(PathBuf::from("project")));
+    }
+
+    #[test]
+    fn a_second_start_hands_the_path_to_the_running_instance() {
+        let folder = test_support::TempDir::new("ide-second-start");
+        let file = folder.path().join("notes.txt");
+        std::fs::write(&file, "x").unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let listener = platform::instance::Instance::listen(folder.path(), move |request| {
+            sender.send(request).ok();
+        })
+        .unwrap();
+
+        let requests = OpenRequests::default();
+        let started = become_instance(folder.path(), Some(&file), true, Duration::ZERO, &requests);
+
+        assert!(matches!(started, InstanceStart::Forwarded));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Request::Open(canonical(&file))
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn the_first_start_listens_for_the_next_one() {
+        let folder = test_support::TempDir::new("ide-first-start");
+        let requests = OpenRequests::default();
+        let started = become_instance(folder.path(), None, true, Duration::ZERO, &requests);
+        let InstanceStart::Listening(listener) = started else {
+            panic!("the first start listens");
+        };
+
+        assert!(
+            platform::instance::send(folder.path(), &Request::Focus).unwrap(),
+            "the running instance takes the request"
+        );
+        assert_eq!(requests.take(), [Request::Focus]);
+        drop(listener);
     }
 
     #[test]

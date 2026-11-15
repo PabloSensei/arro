@@ -30,6 +30,7 @@ use crate::run::RunPanel;
 use crate::run_configs::RunConfigDialog;
 use crate::script::{ActiveCommitPanel, ActiveRunPanel};
 use crate::stack_trace_dialog::StackTraceDialog;
+use crate::structural::StructuralSearch;
 use crate::todo::ActiveTodo;
 use crate::usages::{self, ActiveUsages};
 
@@ -112,6 +113,25 @@ pub fn register(
         });
     }
 
+    for (id, title, replace) in [
+        (
+            "workspace.search_structurally",
+            "Search Structurally",
+            false,
+        ),
+        (
+            "workspace.replace_structurally",
+            "Replace Structurally",
+            true,
+        ),
+    ] {
+        let (project, files) = (project.clone(), files.clone());
+        workspace.register_command(id, title, move |workspace, window, cx| {
+            let root = project.root.clone();
+            StructuralSearch::show(replace, files.clone(), root, workspace, window, cx)
+        });
+    }
+
     workspace.register_command(keys::RUN_CLASS, "Run Test at Caret", marks::run_at_caret);
     for (id, title) in [
         (keys::CONSOLE_EXECUTE, "Execute Console Command"),
@@ -161,6 +181,16 @@ pub fn register(
         "workspace.compare_with_clipboard",
         "Compare with Clipboard",
         compare_with_clipboard,
+    );
+    workspace.register_command("http.copy_curl", "Copy as cURL", |workspace, window, cx| {
+        crate::http::copy_as_curl_active(::http_client::Shell::Bash, workspace, window, cx)
+    });
+    workspace.register_command(
+        "http.copy_curl_cmd",
+        "Copy as cURL (cmd)",
+        |workspace, window, cx| {
+            crate::http::copy_as_curl_active(::http_client::Shell::Cmd, workspace, window, cx)
+        },
     );
     workspace.register_command("workspace.compile", "Compile", |workspace, window, cx| {
         // Ctrl+Shift+F9 in a class with `main` debugs that program, as IDEA does; any
@@ -364,6 +394,13 @@ pub fn register(
         |workspace, _, cx| workspace.store_default_layout(cx),
     );
     workspace.register_command("file.open", "Open...", open_paths);
+    workspace.register_command(
+        "file.new_project",
+        "New Project...",
+        |workspace, _window, cx| {
+            crate::start::open_window(workspace.state_dir().to_path_buf(), cx);
+        },
+    );
     workspace.register_command(
         "file.reload_all",
         "Reload All from Disk",
@@ -819,11 +856,85 @@ fn goto_test(
         .collect();
     found.sort();
     found.dedup();
-    match found.len() {
-        0 => workspace.notify_user("Go to Test", "No test found", cx),
-        1 => workspace.open_file(found.remove(0), window, cx),
-        _ => show_related_menu(workspace, found, window, cx),
+    let spot = create_test_spot(workspace, &current, cx);
+    if found.is_empty() {
+        match spot {
+            Some(spot) => {
+                let entries = vec![create_test_entry(spot)];
+                workspace.show_menu(popup_anchor(workspace, window, cx), entries, cx);
+                workspace.highlight_first_menu_row(cx);
+            }
+            None => workspace.notify_user("Go to Test", "No test found", cx),
+        }
+        return;
     }
+    if found.len() == 1 && spot.is_none() {
+        workspace.open_file(found.remove(0), window, cx);
+        return;
+    }
+    let entries = test_menu(workspace, found, spot, cx.weak_entity());
+    workspace.show_menu(popup_anchor(workspace, window, cx), entries, cx);
+    workspace.highlight_first_menu_row(cx);
+}
+
+/// The place Create Test works from, when the language of `path` makes test classes for
+/// the class of the current editor.
+fn create_test_spot(
+    workspace: &Workspace,
+    path: &Path,
+    cx: &App,
+) -> Option<lang_api::DocumentSpot> {
+    let support = cx.try_global::<Semantic>()?;
+    if !support.0.matches(path) || support.0.test_form().is_none() {
+        return None;
+    }
+    let view = workspace.active_view()?.downcast::<EditorView>().ok()?;
+    view.read(cx).spot().map(|(spot, _)| spot)
+}
+
+/// The rows of Go to Test: the tests that exist, and Create New Test last.
+fn test_menu(
+    workspace: &Workspace,
+    found: Vec<PathBuf>,
+    spot: Option<lang_api::DocumentSpot>,
+    weak: WeakEntity<Workspace>,
+) -> Vec<MenuEntry> {
+    let mut entries: Vec<MenuEntry> = found
+        .into_iter()
+        .map(|path| {
+            let label = path
+                .strip_prefix(workspace.root())
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let weak = weak.clone();
+            MenuEntry::new(label, move |window, cx| {
+                weak.update(cx, |this, cx| this.open_file(path.clone(), window, cx))
+                    .ok();
+            })
+        })
+        .collect();
+    if let Some(spot) = spot {
+        entries.push(create_test_entry(spot));
+    }
+    entries
+}
+
+/// "Create New Test..." of Go to Test: the Create Test window of the language.
+fn create_test_entry(spot: lang_api::DocumentSpot) -> MenuEntry {
+    MenuEntry::new("Create New Test...", move |window, cx| {
+        let Some(handle) = window.window_handle().downcast::<Workspace>() else {
+            return;
+        };
+        let spot = spot.clone();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |workspace, window, cx| {
+                    crate::create_test::CreateTestDialog::show(spot.clone(), workspace, window, cx)
+                })
+                .ok();
+        });
+    })
 }
 
 /// Ctrl+Alt+Home: the files tied to the active one, from the language and from the test
@@ -1240,11 +1351,8 @@ fn reload_all_from_disk(
 
 /// File > Exit: every window closes, and unsaved text asks first.
 fn exit(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let dirty = open_views(workspace)
-        .into_iter()
-        .filter(|(_, view)| view.read(cx).is_dirty())
-        .count();
-    if dirty == 0 {
+    let dirty = workspace.unsaved_files(cx);
+    if dirty.is_empty() {
         ChoiceDialog::show(
             "Exit Arro",
             "Close every project window?",
@@ -1260,9 +1368,19 @@ fn exit(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         );
         return;
     }
+    let names = dirty
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let text = format!(
-        "{} file(s) have unsaved changes. Save them before Arro exits?",
-        dirty
+        "{} file(s) have unsaved changes. Save them before Arro exits? {names}",
+        dirty.len()
     );
     ChoiceDialog::show(
         "Exit Arro",
@@ -1270,7 +1388,7 @@ fn exit(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         vec![
             DialogChoice::new("Save All and Exit", true, |workspace, window, cx| {
                 let mut failure = None;
-                for (path, _) in workspace.open_editors() {
+                for path in workspace.unsaved_files(cx) {
                     if let Err(error) = workspace.save_editor_now(&path, cx) {
                         failure = Some(error);
                         break;
@@ -1411,6 +1529,16 @@ fn register_git_commands(workspace: &mut Workspace) {
                 .unwrap_or_else(|| workspace.root().to_path_buf());
             git_log::show_file(path, workspace, window, cx);
         },
+    );
+    workspace.register_command(
+        "git.show_selection_history",
+        "Show History for Selection",
+        crate::git_history::show_selection,
+    );
+    workspace.register_command(
+        "git.show_method_history",
+        "Show History for Method",
+        crate::git_history::show_method,
     );
     workspace.register_command("git.show_branches", "Branches", |workspace, window, cx| {
         let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {

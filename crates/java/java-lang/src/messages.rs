@@ -116,6 +116,23 @@ pub fn message_bundles(root: PathBuf) -> Arc<MessageBundles> {
 }
 
 impl MessageBundles {
+    /// The checks the user turned off, shared with the rest of the language.
+    pub fn set_inspection_checks(&self, checks: lang_api::DisabledInspections) {
+        *self
+            .inner
+            .inspection_checks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = checks;
+    }
+
+    fn check_enabled(&self, id: &str) -> bool {
+        self.inner
+            .inspection_checks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .enabled(id)
+    }
+
     /// The folders the bundles are read from: the resource folders of the modules. An
     /// empty list falls back to the standard resource folders of the project.
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
@@ -588,6 +605,37 @@ impl MessageBundles {
         Sources { usages, bases }
     }
 
+    /// The files of the localized set that holds `path`: the base file and its locales,
+    /// as the language found them. `None` when `path` is not in a set of two or more
+    /// files.
+    pub fn files_of(&self, path: &Path) -> Option<Vec<lang_api::BundleFile>> {
+        let index = self.keys();
+        let wanted = path_key(path);
+        for bundle in &index.bundles {
+            if !bundle
+                .files
+                .iter()
+                .any(|file| path_key(&file.path) == wanted)
+            {
+                continue;
+            }
+            if bundle.files.len() < 2 {
+                return None;
+            }
+            return Some(
+                bundle
+                    .files
+                    .iter()
+                    .map(|file| lang_api::BundleFile {
+                        path: file.path.clone(),
+                        locale: file.locale.clone(),
+                    })
+                    .collect(),
+            );
+        }
+        None
+    }
+
     /// The bundle and file that hold `path`.
     fn bundle_file(&self, path: &Path) -> Option<(Arc<KeyIndex>, usize, usize)> {
         let index = self.keys();
@@ -764,10 +812,20 @@ impl MessageBundles {
         let Some(kind) = file_kind(path) else {
             return Vec::new();
         };
-        let keys = self.keys();
         match kind {
-            FileKind::Java | FileKind::Template => unknown_keys(text, kind, &keys),
+            FileKind::Java | FileKind::Template => {
+                if !self.check_enabled("messages.unknownKey") {
+                    return Vec::new();
+                }
+                unknown_keys(text, kind, &self.keys())
+            }
             FileKind::Properties => {
+                let unused = self.check_enabled("messages.unusedProperty");
+                let missing = self.check_enabled("messages.missingTranslation");
+                if !unused && !missing {
+                    // The walk of the sources below is the costly part of this check.
+                    return Vec::new();
+                }
                 let Some((index, bundle_at, _file_at)) = self.bundle_file(path) else {
                     return Vec::new();
                 };
@@ -779,21 +837,26 @@ impl MessageBundles {
                     .any(|usage| bundle.has_key(&usage.key));
                 let mut entries = Vec::new();
                 for line in &properties_keys(text) {
-                    if used && !sources.usages.iter().any(|usage| usage.key == line.key) {
+                    if unused && used && !sources.usages.iter().any(|usage| usage.key == line.key) {
                         entries.push(DiagnosticEntry {
                             span: line.span,
                             severity: Severity::Hint,
                             message: "Unused property".to_owned(),
                             unnecessary: true,
+                            code: Some("messages.unusedProperty".to_owned()),
                         });
                     }
-                    let missing = bundle.missing_locales(&line.key);
-                    if !missing.is_empty() {
+                    let missing_locales = bundle.missing_locales(&line.key);
+                    if missing && !missing_locales.is_empty() {
                         entries.push(DiagnosticEntry {
                             span: line.span,
                             severity: Severity::Warning,
-                            message: format!("Missing translation for: {}", missing.join(", ")),
+                            message: format!(
+                                "Missing translation for: {}",
+                                missing_locales.join(", ")
+                            ),
                             unnecessary: false,
+                            code: Some("messages.missingTranslation".to_owned()),
                         });
                     }
                 }
@@ -969,6 +1032,8 @@ struct Inner {
     /// The files whose checks wait for a quiet moment.
     checks_queue: Arc<CheckQueue>,
     checks_started: AtomicBool,
+    /// The checks the user turned off: one that is off is not computed at all.
+    inspection_checks: Mutex<lang_api::DisabledInspections>,
 }
 
 type Job = Box<dyn FnOnce(&MessageBundles) + Send + 'static>;
@@ -1088,6 +1153,7 @@ impl Inner {
             checks: Mutex::new(HashMap::new()),
             checks_queue: Arc::new(CheckQueue::new()),
             checks_started: AtomicBool::new(false),
+            inspection_checks: Mutex::new(lang_api::DisabledInspections::default()),
         }
     }
 
@@ -1894,6 +1960,7 @@ fn unknown_keys(text: &str, kind: FileKind, keys: &KeyIndex) -> Vec<DiagnosticEn
             severity: Severity::Warning,
             message: "Cannot resolve property key".to_owned(),
             unnecessary: false,
+            code: Some("messages.unknownKey".to_owned()),
         });
     }
     found
@@ -2048,6 +2115,10 @@ impl LanguageSupport for MessageBundles {
 
     fn rename(&self) -> Option<&RenameProvider> {
         Some(self)
+    }
+
+    fn bundle_files(&self, path: &Path) -> Option<Vec<lang_api::BundleFile>> {
+        self.files_of(path)
     }
 }
 
@@ -2569,6 +2640,52 @@ mod tests {
     }
 
     #[test]
+    fn the_language_names_the_files_of_a_set() {
+        let dir = project(
+            "messages-set-files",
+            &[
+                (
+                    "src/main/resources/messages.properties",
+                    "welcome=Welcome
+",
+                ),
+                (
+                    "src/main/resources/messages_ru.properties",
+                    "welcome=Привет
+",
+                ),
+                (
+                    "src/main/resources/messages_de.properties",
+                    "welcome=Hallo
+",
+                ),
+                (
+                    "src/main/resources/other.properties",
+                    "key=value
+",
+                ),
+            ],
+        );
+        let known = support(&dir);
+        let base = dir.join("src/main/resources/messages.properties");
+        let files = known.files_of(&base).expect("the set is known");
+        let locales: Vec<Option<&str>> = files.iter().map(|file| file.locale.as_deref()).collect();
+        assert_eq!(locales, [None, Some("de"), Some("ru")]);
+
+        let alone = project(
+            "messages-set-alone",
+            &[(
+                "src/main/resources/other.properties",
+                "key=value
+",
+            )],
+        );
+        let lone = support(&alone);
+        let path = alone.join("src/main/resources/other.properties");
+        assert!(lone.files_of(&path).is_none(), "a set of one is no set");
+    }
+
+    #[test]
     fn a_bundle_is_its_base_file_and_its_locales() {
         let dir = project(
             "messages-bundle",
@@ -2772,6 +2889,53 @@ mod tests {
             apply_to_text(base, std::slice::from_ref(edit)),
             "welcome=Welcome\nmissing=\n"
         );
+    }
+
+    #[test]
+    fn a_check_that_is_off_reports_nothing_here() {
+        let base = "welcome=Welcome\nunused=Never\n";
+        let dir = project(
+            "messages-checks-off",
+            &[
+                (
+                    "src/main/java/App.java",
+                    "class App {\n  void run(MessageSource source) {\n    source.getMessage(\"missing\", null, null);\n  }\n}\n",
+                ),
+                ("src/main/resources/messages.properties", base),
+                (
+                    "src/main/resources/messages_ru.properties",
+                    "unused=Никогда\n",
+                ),
+            ],
+        );
+        let support = support(&dir);
+        let path = dir.join("src/main/resources/messages.properties");
+        assert!(
+            !support.diagnostics_for(&path, base).is_empty(),
+            "the checks are on before the settings arrive"
+        );
+
+        let mut settings = lang_api::InspectionSettings::default();
+        settings.set("messages.unusedProperty", false, None);
+        settings.set("messages.missingTranslation", false, None);
+        let checks = lang_api::DisabledInspections::default();
+        checks.replace(&settings);
+        support.set_inspection_checks(checks.clone());
+        assert!(
+            support.diagnostics_for(&path, base).is_empty(),
+            "the two checks of the properties file are off"
+        );
+
+        let java = dir.join("src/main/java/App.java");
+        let text = fs::read_to_string(&java).unwrap();
+        assert_eq!(
+            support.diagnostics_for(&java, &text).len(),
+            1,
+            "the unknown key keeps its own switch"
+        );
+        settings.set("messages.unknownKey", false, None);
+        checks.replace(&settings);
+        assert!(support.diagnostics_for(&java, &text).is_empty());
     }
 
     #[test]

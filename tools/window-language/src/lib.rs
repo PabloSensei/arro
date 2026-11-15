@@ -21,13 +21,142 @@ use runner::{RunConfig, RunConfigProvider, RunPlan, TestSite};
 use syntax::LanguageConfig;
 use templates::TemplateLanguage;
 
-pub use java_lang::BuildTools;
+pub use java_lang::{BuildTools, NewProjectOptions};
 pub use java_project::{BuildEnv, Gradle, Jdk, Maven};
 pub use jdtls_adapter::{self, settings_of};
+use project_model::scaffold::Generator;
 
 /// The names the language gives its two build tools, in the order of their pages.
 pub fn build_tool_names() -> (String, String) {
     ("Maven".to_owned(), "Gradle".to_owned())
+}
+
+/// The generators of New Project, as the application supplies them. `state_dir` keeps
+/// the metadata of the server between the windows of a test.
+pub fn project_generators(
+    state_dir: &Path,
+    options: &NewProjectOptions,
+) -> Vec<Arc<dyn Generator>> {
+    java_lang::project_generators(state_dir, options)
+}
+
+/// An archive of these files, as a project server hands one over. Stored, not deflated,
+/// because the test support has no compressor.
+pub fn project_archive(files: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut bytes = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        for (name, text) in files {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file(*name, options).expect("a zip entry");
+            writer
+                .write_all(text.as_bytes())
+                .expect("the text of an entry");
+        }
+        writer.finish().expect("the end of the archive");
+    }
+    bytes
+}
+
+/// The language level of a JDK folder, as the build files of a new project name it.
+pub fn jdk_feature(home: &Path) -> Option<u32> {
+    Jdk::at(home).map(|jdk| jdk.feature)
+}
+
+/// The language level a generated build file asks for: the release of a pom, or the
+/// toolchain of a script. `None` when the folder has no build file of a project.
+pub fn build_release(folder: &Path) -> Option<u32> {
+    let pom = fs::read_to_string(folder.join("pom.xml")).ok();
+    let script = fs::read_to_string(folder.join("build.gradle"))
+        .or_else(|_| fs::read_to_string(folder.join("build.gradle.kts")))
+        .ok();
+    let text = pom.or(script)?;
+    for marker in [
+        "<maven.compiler.release>",
+        "JavaLanguageVersion.of(",
+        "JavaVersion.VERSION_",
+    ] {
+        if let Some((_, rest)) = text.split_once(marker) {
+            let rest = rest.strip_prefix("1_").unwrap_or(rest);
+            let end = rest
+                .find(|character: char| !character.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if let Ok(level) = rest[..end].parse() {
+                return Some(level);
+            }
+        }
+    }
+    None
+}
+
+/// The sources of the sample code a generator wrote, under the sources of the project.
+pub fn sample_sources(folder: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![folder.join("src").join("main")];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = fs::read_dir(next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "java")
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The metadata a v2.2 Spring Initializr server answers with, cut down to what the New
+/// Project form shows.
+pub fn initializr_metadata_fixture() -> &'static str {
+    r#"{
+  "bootVersion": {"type": "single-select", "default": "4.0.0",
+    "values": [{"id": "4.0.0", "name": "4.0.0"}, {"id": "3.5.6", "name": "3.5.6"}]},
+  "javaVersion": {"type": "single-select", "default": "21",
+    "values": [{"id": "17", "name": "17"}, {"id": "21", "name": "21"}]},
+  "type": {"type": "single-select", "default": "maven-project",
+    "values": [{"id": "maven-project", "name": "Maven"},
+               {"id": "gradle-project", "name": "Gradle - Groovy"}]},
+  "packaging": {"type": "single-select", "default": "jar",
+    "values": [{"id": "jar", "name": "Jar"}, {"id": "war", "name": "War"}]},
+  "language": {"type": "single-select", "default": "java",
+    "values": [{"id": "java", "name": "Java"}]},
+  "dependencies": {"type": "hierarchical-multi-select", "values": [
+    {"name": "Web", "values": [
+      {"id": "web", "name": "Spring Web", "description": "RESTful applications"},
+      {"id": "webflux", "name": "Spring Reactive Web", "description": "Reactive"}
+    ]},
+    {"name": "Developer Tools", "values": [
+      {"id": "devtools", "name": "Spring Boot DevTools", "description": "Restarts"}
+    ]}
+  ]}
+}"#
+}
+
+/// The archive a Spring Initializr server hands over for a project: the root folder of
+/// the project and the files inside it.
+pub fn initializr_archive_fixture() -> Vec<u8> {
+    project_archive(&[
+        ("demo/pom.xml", "<project/>"),
+        ("demo/HELP.md", "help"),
+        (
+            "demo/src/main/java/com/example/demo/DemoApplication.java",
+            "package com.example.demo;
+
+class DemoApplication {
+}
+",
+        ),
+    ])
 }
 
 /// The support of the configuration files of a project whose class path is known: the
@@ -499,6 +628,23 @@ impl RealLanguage {
         Ok(Probe {
             path: source,
             line: FLOW_BREAK_LINE,
+            classes,
+        })
+    }
+
+    /// Compiles the probe of the mark: two objects of one type at a breakpoint, so a
+    /// marked object and another one of its type can be told apart after a step.
+    pub fn install_identity_probe(&self) -> Result<Probe, String> {
+        let source = self.root.join("src/main/java/probe/DebugProbe.java");
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(&source, IDENTITY_PROBE).map_err(|error| error.to_string())?;
+        let classes = self.state_dir.join("probe-classes-identity");
+        self.compile_probe(&source, &classes)?;
+        Ok(Probe {
+            path: source,
+            line: IDENTITY_BREAK_LINE,
             classes,
         })
     }
@@ -979,6 +1125,35 @@ pub fn write_vcs_format_sample(root: &Path) -> PathBuf {
     )
 }
 
+/// Writes the per-project code style of another IDE into the copy: the switch that turns
+/// it on and the options of the language. The `.editorconfig` of the copy goes, because
+/// it would win over these files and the test wants the project style alone.
+pub fn write_project_code_style(root: &Path, indent_size: u32, use_tabs: bool) {
+    let folder = root.join(".idea").join("codeStyles");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join("codeStyleConfig.xml"),
+        "<component name=\"ProjectCodeStyleConfiguration\">\n  <state>\n    \
+         <option name=\"USE_PER_PROJECT_SETTINGS\" value=\"true\" />\n  </state>\n</component>\n",
+    )
+    .unwrap();
+    fs::write(
+        folder.join("Project.xml"),
+        format!(
+            "<code_scheme name=\"Project\" version=\"173\">\n  \
+             <option name=\"RIGHT_MARGIN\" value=\"120\" />\n  \
+             <codeStyleSettings language=\"JAVA\">\n    \
+             <option name=\"INDENT_SIZE\" value=\"{indent_size}\" />\n    \
+             <option name=\"CONTINUATION_INDENT_SIZE\" value=\"{indent_size}\" />\n    \
+             <option name=\"TAB_SIZE\" value=\"{indent_size}\" />\n    \
+             <option name=\"USE_TAB_CHARACTER\" value=\"{use_tabs}\" />\n  \
+             </codeStyleSettings>\n</code_scheme>\n"
+        ),
+    )
+    .unwrap();
+    let _ = fs::remove_file(root.join(".editorconfig"));
+}
+
 /// A class to move to the `probe.dest` package, which exists before the test.
 pub fn write_move_samples(root: &Path) -> (PathBuf, PathBuf) {
     let movable = write_source(
@@ -1310,6 +1485,7 @@ impl RunConfigProvider for ProbeRun {
             provider: "probe".into(),
             assemble_first: false,
             settings: Default::default(),
+            ..RunConfig::default()
         }])
     }
 
@@ -1346,6 +1522,7 @@ impl RunConfigProvider for FlowRun {
             provider: "flow".into(),
             assemble_first: false,
             settings: Default::default(),
+            ..RunConfig::default()
         }])
     }
 
@@ -1400,6 +1577,28 @@ public class DebugProbe {
 
     static class Holder {
         int value;
+    }
+}
+"#;
+
+/// The line of `int stop = 1;` in [`IDENTITY_PROBE`], from one.
+const IDENTITY_BREAK_LINE: u32 = 12;
+
+/// The probe of two values of one type: a breakpoint before the line they are read on,
+/// so a step keeps both alive and only their identity tells them apart.
+const IDENTITY_PROBE: &str = r#"package probe;
+
+import java.util.ArrayList;
+
+public class DebugProbe {
+
+    public static void main(String[] args) {
+        ArrayList<String> first = new ArrayList<>();
+        first.add("alpha");
+        ArrayList<String> second = new ArrayList<>();
+        second.add("beta");
+        int stop = 1;
+        System.out.println("sizes=" + first.size() + second.size());
     }
 }
 "#;

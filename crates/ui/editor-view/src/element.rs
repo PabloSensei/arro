@@ -31,7 +31,6 @@ const ANNOTATE_INSET: f32 = 4.;
 pub(crate) const RUN_X: f32 = 6.;
 const NUMBER_RIGHT: f32 = 23.;
 const NUMBER_SIZE: f32 = 11.7;
-const RIGHT_MARGIN_COLUMN: f32 = 120.;
 
 /// Rounds the size so that the advance of a monospaced font is a whole device pixel.
 fn snapped_size(size: f32, scale_factor: f32) -> f32 {
@@ -77,6 +76,18 @@ pub(crate) struct LaidOutRow {
     pub(crate) doc_links: Vec<DocLinkLabel>,
     /// The values of the stopped debugger after the line.
     tail: Option<ShapedLine>,
+    /// The inline watch of the line, with its cross.
+    pub(crate) watch: Option<LaidOutWatch>,
+}
+
+/// One inline watch drawn after a line: its text and the cross that removes it.
+pub(crate) struct LaidOutWatch {
+    pub expression: String,
+    pub text: ShapedLine,
+    pub cross: ShapedLine,
+    /// The left edges of the text and of the cross, in window coordinates.
+    pub text_x: Pixels,
+    pub cross_x: Pixels,
 }
 
 /// One clickable link of a rendered documentation row.
@@ -256,6 +267,8 @@ pub(crate) struct EditorPrepaint {
     text_hitbox: Hitbox,
     char_width: Pixels,
     text_x: Pixels,
+    /// The width of the gutter that the frame leaves before the text.
+    gutter: f32,
     /// The rectangle the text may paint in: the bar and the horizontal bar stay out.
     text_mask: Bounds<Pixels>,
     scroll_top: f32,
@@ -676,14 +689,25 @@ impl Element for EditorElement {
         let line_height = style.line_height;
 
         let annotate = self.view.read(cx).annotation_width();
-        let text_x = bounds.left() + px(GUTTER_WIDTH + TEXT_INSET + annotate);
-        let text_width = (bounds.size.width
-            - px(GUTTER_WIDTH + TEXT_INSET + annotate + scrollbar::BAND))
-        .max(px(1.));
+        let gutter = if options.centered_text {
+            0.
+        } else {
+            GUTTER_WIDTH
+        };
+        let text_width =
+            (bounds.size.width - px(gutter + TEXT_INSET + annotate + scrollbar::BAND)).max(px(1.));
+        // Distraction Free Mode centres a column of the width of the right margin.
+        let center = if options.centered_text {
+            let margin = f32::from(char_width) * options.right_margin.max(1) as f32;
+            ((f32::from(text_width) - margin) / 2.).max(0.)
+        } else {
+            0.
+        };
+        let text_x = bounds.left() + px(gutter + TEXT_INSET + annotate + center);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let mut text_bounds = bounds;
-        text_bounds.origin.x += px(GUTTER_WIDTH + annotate);
-        text_bounds.size.width -= px(GUTTER_WIDTH + annotate + scrollbar::BAND);
+        text_bounds.origin.x += px(gutter + annotate + center);
+        text_bounds.size.width -= px(gutter + annotate + center + scrollbar::BAND);
         let text_hitbox = window.insert_hitbox(text_bounds, HitboxBehavior::Normal);
 
         let decor = self.decor.clone();
@@ -695,6 +719,7 @@ impl Element for EditorElement {
             .then(|| columns.saturating_sub(1).max(8));
         self.view.update(cx, |view, _| {
             view.viewport = bounds.size;
+            view.center_inset = center;
             if let Some(state) = &mut view.state
                 && state.wrap() != wrap
             {
@@ -1093,6 +1118,46 @@ impl Element for EditorElement {
                         text_system.shape_line(value.text.clone().into(), font_size, &runs, None)
                     })
                 };
+                let tail_width = tail.as_ref().map_or(px(0.), |tail| tail.width());
+                let watch = if block || continuation || doc_row.is_some() {
+                    None
+                } else {
+                    view.inline_watch_at(buffer_line).map(|watch| {
+                        let runs = [crate::element::run(
+                            watch.text.len(),
+                            &code_font,
+                            style.inlay,
+                            true,
+                        )];
+                        let text = text_system.shape_line(
+                            watch.text.clone().into(),
+                            font_size,
+                            &runs,
+                            None,
+                        );
+                        let cross_runs = [crate::element::run(
+                            "✕".len(),
+                            &code_font,
+                            style.line_number,
+                            false,
+                        )];
+                        let cross =
+                            text_system.shape_line("✕".into(), font_size, &cross_runs, None);
+                        let start = text_x + text.width() + px(8.);
+                        let start = if tail.is_some() {
+                            start + tail_width + px(8.)
+                        } else {
+                            start
+                        };
+                        LaidOutWatch {
+                            expression: watch.expression.clone(),
+                            cross_x: start + text.width() + px(6.),
+                            text_x: start,
+                            text,
+                            cross,
+                        }
+                    })
+                };
                 rows.push(LaidOutRow {
                     row,
                     buffer_line,
@@ -1117,6 +1182,7 @@ impl Element for EditorElement {
                     block_labels,
                     doc_links,
                     tail,
+                    watch,
                 });
             }
 
@@ -1126,7 +1192,7 @@ impl Element for EditorElement {
                 let head = state.selections().primary().head;
                 let x = f32::from(shown.text.x_for_index(shown.line.column_of(head)));
                 let width = f32::from(bounds.size.width)
-                    - GUTTER_WIDTH
+                    - gutter
                     - annotate
                     - TEXT_INSET
                     - scrollbar::BAND
@@ -1138,7 +1204,7 @@ impl Element for EditorElement {
                 }
             }
 
-            if !pinned.is_empty() {
+            if options.sticky_lines && !pinned.is_empty() {
                 for item in &pinned {
                     let line = line_of(item.name_range.start);
                     let text = store.line_text(line);
@@ -1580,7 +1646,7 @@ impl Element for EditorElement {
         });
 
         let text_mask = Bounds::from_corners(
-            point(bounds.left() + px(GUTTER_WIDTH + 1.), bounds.top()),
+            point(bounds.left() + px(gutter + 1.), bounds.top()),
             point(
                 bounds.right() - px(scrollbar::BAND),
                 bounds.bottom()
@@ -1609,6 +1675,7 @@ impl Element for EditorElement {
             text_hitbox,
             char_width,
             text_x: text_x - px(scroll_left),
+            gutter,
             text_mask,
             scroll_top,
             scroll_left,
@@ -1736,7 +1803,7 @@ impl Element for EditorElement {
             let height = line_height;
             let char_width = prepaint.char_width;
             let text_x = prepaint.text_x;
-            let gutter_right = bounds.left() + px(GUTTER_WIDTH);
+            let gutter_right = bounds.left() + px(prepaint.gutter);
             let vertical = |x: Pixels| {
                 fill(
                     Bounds::new(point(x, bounds.top()), size(px(1.), bounds.size.height)),
@@ -1781,7 +1848,7 @@ impl Element for EditorElement {
                     continue;
                 }
                 let line = shown.buffer_line as u32;
-                if !shown.is_doc && function_breakpoints.contains(&line) {
+                if options.gutter_icons && !shown.is_doc && function_breakpoints.contains(&line) {
                     // A method breakpoint is a diamond, not a filled dot.
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
@@ -1800,7 +1867,8 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
-                } else if !shown.is_doc && field_watchpoints.contains(&line) {
+                } else if options.gutter_icons && !shown.is_doc && field_watchpoints.contains(&line)
+                {
                     // A field watchpoint is an eye.
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
@@ -1819,7 +1887,7 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
-                } else if !shown.is_doc && breakpoints.contains(&line) {
+                } else if options.gutter_icons && !shown.is_doc && breakpoints.contains(&line) {
                     if muted_breakpoints.contains(&line) {
                         // A point that does not stop the program is a muted point.
                         let suffix = if style.dark { "_dark" } else { "" };
@@ -1856,7 +1924,9 @@ impl Element for EditorElement {
                     }
                 }
                 let number_x = bounds.left() + px(NUMBER_RIGHT) - shown.number.width();
-                if let Some((_, color)) = shown.run {
+                if options.gutter_icons
+                    && let Some((_, color)) = shown.run
+                {
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(RUN_X), shown.y + px(3.)),
@@ -1866,7 +1936,7 @@ impl Element for EditorElement {
                     window
                         .paint_svg(mark, path, None, TransformationMatrix::unit(), color, cx)
                         .ok();
-                } else if shown.bookmark {
+                } else if options.gutter_icons && shown.bookmark {
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(RUN_X), shown.y + px(3.)),
@@ -1897,7 +1967,9 @@ impl Element for EditorElement {
                         )
                         .ok();
                 }
-                if let Some((icon, color)) = &shown.place {
+                if options.gutter_icons
+                    && let Some((icon, color)) = &shown.place
+                {
                     let mark = Bounds::new(
                         point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
                         size(px(16.), px(16.)),
@@ -1912,7 +1984,9 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
-                } else if let Some(color) = shown.endpoint {
+                } else if options.gutter_icons
+                    && let Some(color) = shown.endpoint
+                {
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
@@ -1924,7 +1998,9 @@ impl Element for EditorElement {
                         .paint_svg(mark, path, None, TransformationMatrix::unit(), color, cx)
                         .ok();
                 }
-                if let Some(rendered) = shown.doc_icon {
+                if options.gutter_icons
+                    && let Some(rendered) = shown.doc_icon
+                {
                     let name = if rendered { "hide" } else { "show" };
                     let suffix = if style.dark { "_dark" } else { "" };
                     let icon = Bounds::new(
@@ -1943,7 +2019,9 @@ impl Element for EditorElement {
                         )
                         .ok();
                 }
-                if let Some(collapsed) = shown.fold {
+                if options.gutter_icons
+                    && let Some(collapsed) = shown.fold
+                {
                     let name = if collapsed {
                         "chevronRight"
                     } else {
@@ -1979,30 +2057,40 @@ impl Element for EditorElement {
                         .ok();
                 }
             }
-            for (mark, color) in &prepaint.gutter_marks {
-                window.paint_quad(fill(*mark, *color).corner_radii(px(1.)));
-            }
-            window.paint_quad(vertical(gutter_right));
-            for shown in &prepaint.layout.rows {
-                if shown.is_block {
-                    continue;
-                }
-                if let Some(mark) = coverage
-                    .iter()
-                    .find(|mark| mark.line as usize == shown.buffer_line)
-                {
-                    // The stripe sits left of the run marks, so a program that starts on
-                    // the line keeps its button.
-                    let stripe =
-                        Bounds::new(point(bounds.left() + px(2.), shown.y), size(px(3.), height));
-                    window.paint_quad(fill(stripe, mark.color));
+            if options.gutter_icons {
+                for (mark, color) in &prepaint.gutter_marks {
+                    window.paint_quad(fill(*mark, *color).corner_radii(px(1.)));
                 }
             }
-            paint_marks(&prepaint.layout.rows, &marks, gutter_right, height, window);
+            if prepaint.gutter > 0. {
+                window.paint_quad(vertical(gutter_right));
+            }
+            if prepaint.gutter > 0. && options.gutter_icons {
+                for shown in &prepaint.layout.rows {
+                    if shown.is_block {
+                        continue;
+                    }
+                    if let Some(mark) = coverage
+                        .iter()
+                        .find(|mark| mark.line as usize == shown.buffer_line)
+                    {
+                        // The stripe sits left of the run marks, so a program that starts on
+                        // the line keeps its button.
+                        let stripe = Bounds::new(
+                            point(bounds.left() + px(2.), shown.y),
+                            size(px(3.), height),
+                        );
+                        window.paint_quad(fill(stripe, mark.color));
+                    }
+                }
+                paint_marks(&prepaint.layout.rows, &marks, gutter_right, height, window);
+            }
 
             let text_mask = prepaint.text_mask;
             window.with_content_mask(Some(ContentMask { bounds: text_mask }), |window| {
-                window.paint_quad(vertical(text_x + char_width * RIGHT_MARGIN_COLUMN));
+                window.paint_quad(vertical(
+                    text_x + char_width * options.right_margin.max(1) as f32,
+                ));
 
                 for (area, color) in &prepaint.range_tints {
                     window.paint_quad(fill(*area, *color));
@@ -2116,6 +2204,30 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
+                    }
+                    if let Some(watch) = &shown.watch {
+                        watch
+                            .text
+                            .paint(
+                                point(watch.text_x, shown.y),
+                                height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                        watch
+                            .cross
+                            .paint(
+                                point(watch.cross_x, shown.y),
+                                height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
                     }
                     for inlay in &shown.inlays {
                         let Some(paint) = &inlay.paint else {

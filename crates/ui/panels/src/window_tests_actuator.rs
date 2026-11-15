@@ -346,6 +346,8 @@ impl RunConfigProvider for FakeProvider {
             provider: "fixture".to_owned(),
             assemble_first: false,
             settings: Default::default(),
+
+            ..RunConfig::default()
         }])
     }
 

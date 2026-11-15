@@ -270,6 +270,7 @@ impl Provider<DiagnosticsQuery, Vec<DiagnosticEntry>> for TestLanguage {
                         severity: note.severity,
                         message: note.message.clone(),
                         unnecessary: false,
+                        code: None,
                     })
                     .collect()
             })

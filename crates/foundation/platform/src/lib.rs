@@ -5,6 +5,9 @@ mod crash;
 #[cfg(unix)]
 #[path = "crash_unix.rs"]
 mod crash;
+/// One program per state folder: a second start hands its path to the first one.
+#[cfg(any(unix, windows))]
+pub mod instance;
 #[cfg(windows)]
 mod job;
 #[cfg(unix)]
@@ -48,6 +51,7 @@ mod shell;
 #[path = "shell_unix.rs"]
 mod shell;
 mod trash;
+mod url;
 #[cfg(windows)]
 mod waiter;
 #[cfg(unix)]
@@ -59,7 +63,7 @@ pub use job::Job;
 pub use memory::{MemoryPressure, MemoryState, MemoryThresholds, physical_memory};
 pub use mode::{make_executable, mode, set_mode};
 pub use os::version as os_version;
-pub use path::{CanonPath, path_key};
+pub use path::{CanonPath, file_url_path, path_key};
 pub use process::{
     ConsoleSignal, NO_WINDOW, SUSPENDED_NO_WINDOW, allow_ctrl_c_in_children, resume_process,
     signal_console_of,

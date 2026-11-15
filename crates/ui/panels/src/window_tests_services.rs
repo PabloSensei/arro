@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ui_kit::gpui;
 use ui_kit::gpui::{MouseButton, TestAppContext, VisualTestContext, WindowHandle, size};
@@ -29,7 +30,13 @@ const PS_LINES: [&str; 3] = [
 /// A `docker.cmd` that answers the calls of the panel from the constants above and writes
 /// every call to `calls.txt` next to itself. `logs` prints the first line at once and a
 /// tick every second until it is stopped.
-fn fake_docker(name: &str) -> (PathBuf, PathBuf) {
+///
+/// The panel runs the CLI calls of the watch, of the actions and of a live log at the same
+/// time, so several copies of this script write the file together. Windows lets one writer
+/// open it at a time, therefore a call that meets another writer waits a moment and tries
+/// again: a lost line would hide a `stop` from the test and a lost `ps` line would drop a
+/// container out of the tree.
+pub(crate) fn fake_docker(name: &str) -> (PathBuf, PathBuf) {
     let folder = scratch(name);
     let script = folder.join("docker.cmd");
     let calls = folder.join("calls.txt");
@@ -40,7 +47,16 @@ fn fake_docker(name: &str) -> (PathBuf, PathBuf) {
     let text = format!(
         r#"@echo off
 setlocal EnableExtensions
-echo %*>>"{calls}"
+set "calls={calls}"
+set "tries="
+:record
+echo %*>>"%calls%"
+if not errorlevel 1 goto recorded
+set /a tries+=1
+if %tries% geq 200 goto recorded
+ping -n 1 -w 5 127.0.0.1 >nul
+goto record
+:recorded
 if "%~1"=="--context" shift
 if "%~1"=="--context" shift
 if "%~1"=="version" goto version
@@ -126,10 +142,23 @@ fn open_services(
 }
 
 fn calls_of(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default()
+    // The stand-in writes the file between two reads of the test: a read that meets the
+    // writer waits for it, so the calls already made are not seen as lost.
+    for _ in 0..20 {
+        match fs::read_to_string(path) {
+            Ok(text) => return text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return String::new(),
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    String::new()
 }
 
-fn right_click(cx: &mut TestAppContext, window: WindowHandle<Workspace>, selector: &'static str) {
+pub(crate) fn right_click(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    selector: &'static str,
+) {
     let position = bounds_of(cx, window, selector).center();
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
@@ -138,7 +167,7 @@ fn right_click(cx: &mut TestAppContext, window: WindowHandle<Workspace>, selecto
     draw(cx, window);
 }
 
-fn menu_labels(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> Vec<String> {
+pub(crate) fn menu_labels(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> Vec<String> {
     window
         .read_with(cx, |workspace, _| {
             workspace

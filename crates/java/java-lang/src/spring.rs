@@ -36,6 +36,12 @@ pub const LANGUAGE_ID: LanguageId = LanguageId("spring-config");
 const SOURCE: SourceId = SourceId::new("spring-config");
 const CONFIGURATION_METADATA: &str = "META-INF/spring-configuration-metadata.json";
 const ADDITIONAL_METADATA: &str = "META-INF/additional-spring-configuration-metadata.json";
+/// The checks of this language, for the handle of the disabled ones.
+const SPRING_CHECKS: &[&str] = &[
+    "spring.config.unknownProperty",
+    "spring.config.deprecatedProperty",
+    "spring.config.invalidValue",
+];
 /// A wait of a query for the background thread that reads the metadata.
 const READY_STEP: Duration = Duration::from_millis(25);
 /// The pause before the checks of a file that just changed run again.
@@ -75,6 +81,23 @@ pub fn spring_config(root: PathBuf) -> Arc<SpringConfigSupport> {
 }
 
 impl SpringConfigSupport {
+    /// The checks the user turned off, shared with the rest of the language.
+    pub fn set_inspection_checks(&self, checks: lang_api::DisabledInspections) {
+        *self
+            .inner
+            .inspection_checks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = checks;
+    }
+
+    fn inspection_checks(&self) -> lang_api::DisabledInspections {
+        self.inner
+            .inspection_checks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
     /// The class path and the roots of the project, from its model. A model that names
     /// the same paths as the previous one starts no new read.
     pub fn set_model(&self, model: &ProjectModel) {
@@ -183,6 +206,8 @@ struct Inner {
     documents: Mutex<HashMap<String, Arc<str>>>,
     /// The answers of the open documents, which get a new one when the text changes.
     checks: Mutex<HashMap<String, Reply<Vec<DiagnosticEntry>>>>,
+    /// The checks the user turned off: one that is off is not computed at all.
+    inspection_checks: Mutex<lang_api::DisabledInspections>,
 }
 
 impl Inner {
@@ -194,6 +219,7 @@ impl Inner {
             snapshot: RwLock::new(Arc::new(Snapshot::default())),
             documents: Mutex::new(HashMap::new()),
             checks: Mutex::new(HashMap::new()),
+            inspection_checks: Mutex::new(lang_api::DisabledInspections::default()),
         }
     }
 }
@@ -1321,7 +1347,16 @@ fn short_description(description: &str) -> String {
     text
 }
 
-fn diagnostics_for(text: &str, kind: ConfigKind, snapshot: &Snapshot) -> Vec<DiagnosticEntry> {
+fn diagnostics_for(
+    text: &str,
+    kind: ConfigKind,
+    snapshot: &Snapshot,
+    checks: &lang_api::DisabledInspections,
+) -> Vec<DiagnosticEntry> {
+    // A check that is off costs nothing: the metadata is not read for it.
+    if !checks.any_enabled(SPRING_CHECKS) {
+        return Vec::new();
+    }
     let metadata = &snapshot.metadata;
     if metadata.is_empty() {
         return Vec::new();
@@ -1353,6 +1388,7 @@ fn diagnostics_for(text: &str, kind: ConfigKind, snapshot: &Snapshot) -> Vec<Dia
                 severity: Severity::Warning,
                 message,
                 unnecessary: false,
+                code: Some("spring.config.deprecatedProperty".to_owned()),
             });
         } else if exact.is_none()
             && !metadata.knows(&key)
@@ -1366,6 +1402,7 @@ fn diagnostics_for(text: &str, kind: ConfigKind, snapshot: &Snapshot) -> Vec<Dia
                 severity: Severity::Warning,
                 message: format!("Unknown Spring Boot property `{key}`"),
                 unnecessary: false,
+                code: Some("spring.config.unknownProperty".to_owned()),
             });
         }
         let (Some((raw, range)), Some(property)) = (value, exact) else {
@@ -1382,6 +1419,7 @@ fn diagnostics_for(text: &str, kind: ConfigKind, snapshot: &Snapshot) -> Vec<Dia
                     severity: Severity::Error,
                     message: format!("`{cleaned}` is not a boolean: use `true` or `false`"),
                     unnecessary: false,
+                    code: Some("spring.config.invalidValue".to_owned()),
                 });
             }
         } else if let Some(allowed) = enum_values(metadata, &key, property)
@@ -1398,9 +1436,16 @@ fn diagnostics_for(text: &str, kind: ConfigKind, snapshot: &Snapshot) -> Vec<Dia
                     allowed.join(", ")
                 ),
                 unnecessary: false,
+                code: Some("spring.config.invalidValue".to_owned()),
             });
         }
     }
+    found.retain(|entry| {
+        entry
+            .code
+            .as_deref()
+            .is_none_or(|code| checks.enabled(code))
+    });
     found
 }
 
@@ -1867,9 +1912,10 @@ fn schedule_checks(support: SpringConfigSupport, uri: String, delay: bool) {
         };
         let text = support.text_of(&uri);
         let snapshot = support.snapshot();
+        let checks = support.inspection_checks();
         let entries = text
             .as_deref()
-            .map(|text| diagnostics_for(text, kind, &snapshot))
+            .map(|text| diagnostics_for(text, kind, &snapshot, &checks))
             .unwrap_or_default();
         let mut checks = support
             .inner
@@ -2071,6 +2117,7 @@ mod tests {
             "spring.jpa.open-in-view=true\nspring.jpa.unknown=1\nlogging.level.com.shop=DEBUG\ndatabase=h2\n",
             ConfigKind::Properties,
             &snapshot,
+            &lang_api::DisabledInspections::default(),
         );
         let warnings: Vec<&str> = found
             .iter()
@@ -2082,12 +2129,38 @@ mod tests {
     }
 
     #[test]
+    fn a_check_that_is_off_reports_nothing_and_one_that_is_on_stays() {
+        let snapshot = snapshot(SAMPLE);
+        let text = "spring.jpa.open-in-view=true\nspring.jpa.unknown=1\n";
+        let enabled = lang_api::DisabledInspections::default();
+        let found = diagnostics_for(text, ConfigKind::Properties, &snapshot, &enabled);
+        assert_eq!(found.len(), 1, "{found:?}");
+
+        let mut settings = lang_api::InspectionSettings::default();
+        settings.set("spring.config.unknownProperty", false, None);
+        let checks = lang_api::DisabledInspections::default();
+        checks.replace(&settings);
+        let found = diagnostics_for(text, ConfigKind::Properties, &snapshot, &checks);
+        assert!(found.is_empty(), "{found:?}");
+
+        settings.set("spring.config.unknownProperty", true, None);
+        settings.set("spring.config.deprecatedProperty", false, None);
+        settings.set("spring.config.invalidValue", false, None);
+        checks.replace(&settings);
+        assert!(
+            checks.any_enabled(SPRING_CHECKS),
+            "a check that is on keeps the metadata read"
+        );
+    }
+
+    #[test]
     fn a_placeholder_of_the_same_file_hides_its_key() {
         let snapshot = snapshot(SAMPLE);
         let found = diagnostics_for(
             "database=h2\nspring.jpa.open-in-view=${database}\n",
             ConfigKind::Properties,
             &snapshot,
+            &lang_api::DisabledInspections::default(),
         );
         assert!(found.is_empty(), "{found:?}");
     }
@@ -2099,6 +2172,7 @@ mod tests {
             "spring.jpa.open-in-view=maybe\nspring.jpa.hibernate.ddl-auto=wrong\n",
             ConfigKind::Properties,
             &snapshot,
+            &lang_api::DisabledInspections::default(),
         );
         let errors = found
             .iter()

@@ -5,8 +5,9 @@ use std::ops::Range;
 use std::time::Duration;
 
 use lang_api::{
-    ActionEntry, ActionKind, ActionQuery, Confidence, DocumentEdit, GenerateKind, SourceSpan,
-    TextPoint, TextSpan, UnwrapEdit, WorkspaceChange, ask,
+    ActionEntry, ActionKind, ActionQuery, Confidence, DocumentEdit, DocumentSpot, GenerateKind,
+    SourceSpan, SuppressionQuery, SuppressionTarget, TextPoint, TextSpan, UnwrapEdit,
+    WorkspaceChange, ask,
 };
 use text_core::{Edit, RopeStore, TextStore};
 use ui_kit::*;
@@ -65,6 +66,31 @@ pub(crate) enum Pick {
         label: String,
         edit: UnwrapEdit,
     },
+    /// A suppression of a check, with the edit it writes.
+    Suppress {
+        label: String,
+        edit: DocumentEdit,
+    },
+    /// A row that turns a check off in the settings of the project.
+    DisableInspection {
+        label: String,
+        id: String,
+        title: String,
+    },
+    /// A row that opens the settings of a check.
+    EditInspection {
+        label: String,
+        id: String,
+    },
+    /// Create Test: the window shows its form for this place.
+    CreateTest {
+        spot: DocumentSpot,
+    },
+    /// Add Inline Watch: the expression of the caret and its line, from zero.
+    InlineWatch {
+        line: usize,
+        expression: String,
+    },
 }
 
 impl Pick {
@@ -76,7 +102,12 @@ impl Pick {
             | Self::Form { label, .. }
             | Self::Place { label, .. }
             | Self::Generate { label, .. }
-            | Self::Unwrap { label, .. } => label,
+            | Self::Unwrap { label, .. }
+            | Self::Suppress { label, .. }
+            | Self::DisableInspection { label, .. }
+            | Self::EditInspection { label, .. } => label,
+            Self::CreateTest { .. } => "Create Test",
+            Self::InlineWatch { .. } => "Add Inline Watch",
         }
     }
 
@@ -345,23 +376,189 @@ impl EditorView {
         })
     }
 
-    /// Alt+Enter: fixes of the problem under the caret first, then the other actions.
+    /// Alt+Enter: fixes of the problem under the caret first, then the suppressions of
+    /// its check and the other actions.
     pub(crate) fn show_actions(&mut self, cx: &mut Context<Self>) {
         let Some(span) = self.selection_span() else {
             return;
         };
-        self.ask_actions(span, None, cx, |this, _, caret, mut entries, cx| {
-            entries.sort_by_key(|entry| {
-                let fix = entry.kind == Some(ActionKind::QuickFix);
-                (!entry.preferred, !fix)
+        let caret = self
+            .state
+            .as_ref()
+            .map_or(0, |state| state.selections().primary().head);
+        let mut own = self.own_action_rows();
+        own.extend(self.inspection_picks(caret));
+        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.actions()) else {
+            if !own.is_empty() {
+                self.show_picks(caret, own, "No actions here", cx);
+            }
+            return;
+        };
+        let Some((uri, version, _)) = self.asked_version() else {
+            return;
+        };
+        let replies = ask(
+            provider,
+            ActionQuery {
+                uri,
+                version,
+                span,
+                only: None,
+            },
+        );
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let unknown = answer
+                    .as_ref()
+                    .is_none_or(|(_, confidence)| *confidence == Confidence::Unknown);
+                let mut entries: Vec<ActionEntry> = match answer {
+                    Some((mut entries, Confidence::Unknown)) => {
+                        entries.clear();
+                        entries
+                    }
+                    Some((entries, _)) => entries,
+                    None => Vec::new(),
+                };
+                entries.sort_by_key(|entry| {
+                    let fix = entry.kind == Some(ActionKind::QuickFix);
+                    (!entry.preferred, !fix)
+                });
+                let mut rows: Vec<Pick> = entries
+                    .into_iter()
+                    .filter(|entry| !entry.edits.is_empty() || !entry.renames.is_empty())
+                    .map(Pick::Action)
+                    .collect();
+                rows.extend(own);
+                if rows.is_empty() {
+                    let note = if unknown {
+                        NO_ANSWER
+                    } else {
+                        "No actions here"
+                    };
+                    this.show_note(caret, note, cx);
+                } else {
+                    this.show_picks(caret, rows, "No actions here", cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The rows of ALT+Enter that the window adds beside the language actions, such as
+    /// Create Test on the name of a type or an inline watch on a value.
+    fn own_action_rows(&self) -> Vec<Pick> {
+        let Some(state) = &self.state else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        if self.inline_watch_ready
+            && let Some((line, expression)) = self.inline_watch_at_caret()
+        {
+            rows.push(Pick::InlineWatch { line, expression });
+        }
+        let Some(lsp) = &self.lsp else {
+            return rows;
+        };
+        let caret = state.selections().primary().head;
+        if !lsp.support.can_create_test(&state.text(), caret) {
+            return rows;
+        }
+        if let Some(spot) = self.spot_at(caret) {
+            rows.push(Pick::CreateTest { spot });
+        }
+        rows
+    }
+
+    /// The rows that suppress or turn off the check of the problem under `caret`.
+    fn inspection_picks(&self, caret: usize) -> Vec<Pick> {
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return Vec::new();
+        };
+        let Some(mark) = lsp
+            .server_marks
+            .iter()
+            .chain(lsp.native_marks.values().flatten())
+            .find(|mark| mark.range.start <= caret && caret <= mark.range.end)
+        else {
+            return Vec::new();
+        };
+        let Some(code) = mark.code.clone() else {
+            return Vec::new();
+        };
+        let support = lsp.support.clone();
+        let catalog = support.inspections();
+        let info = support
+            .inspection_of(Some(&code), &mark.message)
+            .or_else(|| catalog.iter().find(|info| info.id == code).cloned());
+        let Some(info) = info else {
+            return Vec::new();
+        };
+        let text = state.text();
+        let text: std::sync::Arc<str> = text.into();
+        let mut rows = Vec::new();
+        let annotation = |target| {
+            support.suppression_edit(SuppressionQuery {
+                text: text.clone(),
+                offset: mark.range.start,
+                code: Some(code.clone()),
+                target,
+            })
+        };
+        if let Some(edit) = annotation(SuppressionTarget::Statement) {
+            rows.push(Pick::Suppress {
+                label: "Suppress for statement".to_owned(),
+                edit,
             });
-            let rows = entries
-                .into_iter()
-                .filter(|entry| !entry.edits.is_empty() || !entry.renames.is_empty())
-                .map(Pick::Action)
+            if let Some(edit) = annotation(SuppressionTarget::Method) {
+                rows.push(Pick::Suppress {
+                    label: "Suppress for method".to_owned(),
+                    edit,
+                });
+            }
+            if let Some(edit) = annotation(SuppressionTarget::Class) {
+                rows.push(Pick::Suppress {
+                    label: "Suppress for class".to_owned(),
+                    edit,
+                });
+            }
+        } else if info.configurable {
+            let line = state.store().offset_to_line(mark.range.start);
+            let line_start = state.store().line_to_offset(line);
+            let indent: String = text[line_start..]
+                .chars()
+                .take_while(|character| character.is_whitespace() && *character != '\n')
                 .collect();
-            this.show_picks(caret, rows, "No actions here", cx);
-        });
+            rows.push(Pick::Suppress {
+                label: "Suppress for statement".to_owned(),
+                edit: DocumentEdit {
+                    span: TextSpan {
+                        start: TextPoint {
+                            line: line as u32,
+                            character: 0,
+                        },
+                        end: TextPoint {
+                            line: line as u32,
+                            character: 0,
+                        },
+                    },
+                    text: format!("{indent}//noinspection {}\n", info.id),
+                },
+            });
+        }
+        if info.configurable {
+            rows.push(Pick::DisableInspection {
+                label: format!("Disable inspection '{}'", info.title),
+                id: info.id.clone(),
+                title: info.title.clone(),
+            });
+            rows.push(Pick::EditInspection {
+                label: "Edit inspection profile setting".to_owned(),
+                id: info.id,
+            });
+        }
+        rows
     }
 
     /// Keys of an open action list. Returns whether the key was taken.
@@ -402,6 +599,19 @@ impl EditorView {
                     (Some(Pick::Place { target, .. }), _) => self.go_to_location(&target, cx),
                     (Some(Pick::Generate { kind, .. }), _) => self.start_generation(kind, cx),
                     (Some(Pick::Unwrap { edit, .. }), _) => self.apply_unwrap(edit, cx),
+                    (Some(Pick::Suppress { edit, .. }), _) => {
+                        self.apply_document_edits(vec![edit], cx);
+                    }
+                    (Some(Pick::DisableInspection { id, title, .. }), _) => {
+                        cx.emit(EditorEvent::DisableInspection { id, title })
+                    }
+                    (Some(Pick::EditInspection { id, .. }), _) => {
+                        cx.emit(EditorEvent::EditInspection(id))
+                    }
+                    (Some(Pick::CreateTest { spot }), _) => cx.emit(EditorEvent::CreateTest(spot)),
+                    (Some(Pick::InlineWatch { line, expression }), _) => {
+                        cx.emit(EditorEvent::AddInlineWatch { line, expression })
+                    }
                     _ => {}
                 }
             }

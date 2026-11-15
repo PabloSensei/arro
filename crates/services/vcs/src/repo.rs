@@ -11,7 +11,7 @@ use crate::{
 
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
-const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1e";
+pub(crate) const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1e";
 const BRANCH_FORMAT: &str =
     "--format=%(HEAD)%1f%(refname)%1f%(objectname)%1f%(upstream:short)%1f%(upstream:track)%1e";
 const LABEL_FORMAT: &str = "--format=%(HEAD)%1f%(refname)%1f%(objectname)%1f%(*objectname)%1e";
@@ -198,10 +198,10 @@ pub enum ConflictSide {
 }
 
 pub struct Repository {
-    git: GitRunner,
-    root: PathBuf,
+    pub(crate) git: GitRunner,
+    pub(crate) root: PathBuf,
     /// Reads of the status, so a test tells the read of the window from the reads of an event.
-    status_reads: AtomicU64,
+    pub(crate) status_reads: AtomicU64,
 }
 
 impl Repository {
@@ -230,7 +230,7 @@ impl Repository {
         self.status_reads.load(Ordering::Relaxed)
     }
 
-    fn run<const N: usize>(&self, args: [&str; N]) -> io::Result<String> {
+    pub(crate) fn run<const N: usize>(&self, args: [&str; N]) -> io::Result<String> {
         let output = self.git.run(&self.root, args)?;
         Ok(String::from_utf8_lossy(&output).into_owned())
     }
@@ -1287,7 +1287,7 @@ fn git_failure(stderr: &[u8]) -> io::Error {
 const COMPARE_LIMIT: usize = 200;
 
 /// The commits of `git log` output in [`LOG_FORMAT`], newest first.
-fn commits_of(output: &str) -> Vec<Commit> {
+pub(crate) fn commits_of(output: &str) -> Vec<Commit> {
     output
         .split(RECORD)
         .filter_map(|record| {

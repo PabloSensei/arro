@@ -190,6 +190,11 @@ fn find_in_path() -> Option<PathBuf> {
         .find(|file| file.is_file())
 }
 
+/// The Gradle of this machine, `None` when only a wrapper can start it.
+pub fn find_gradle() -> Option<PathBuf> {
+    find_in_path()
+}
+
 impl BuildSystem for Gradle {
     fn detect(&self, root: &Path) -> bool {
         BUILD_FILES.iter().any(|name| root.join(name).is_file())

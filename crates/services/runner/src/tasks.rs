@@ -191,6 +191,7 @@ impl RunConfigProvider for BuildTaskProvider {
             provider: PROVIDER_ID.into(),
             assemble_first: false,
             settings: Self::store(&target).ok()?,
+            ..RunConfig::default()
         })
     }
 }

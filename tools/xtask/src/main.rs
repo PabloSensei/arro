@@ -47,14 +47,15 @@ commands:
   build-helpers --out DIR [--maven-lib DIR] [--jacoco-lib DIR]
                              the helper jars that run in project JVMs, needs a JDK;
                              the JaCoCo jars come from DIR or the local Maven repositories
-  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--target windows|linux|macos]
+  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--deb] [--dmg] [--target windows|linux|macos]
                              release Arro, helpers, jdtls, java-debug, README, run-arro.cmd
                              and THIRD-PARTY.txt; the jdtls and java-debug archives come
                              from --tools DIR, $IDE_CORPUS/tools by default; arro.pdb and
                              arro.exe go to DIR-symbols/<commit> by default. --target linux
                              writes arro, tools, arro.desktop, the icon and install.sh, and
-                             --target macos builds Arro.app with an ad-hoc signature; both
-                             are built on their own system
+                             with --deb the arro_<version>_amd64.deb package; --target macos
+                             builds Arro.app with an ad-hoc signature, and with --dmg the
+                             disk image; both are built on their own system
   symbolize LOG [--symbols DIR]
                              function and file:line for the arro.exe frames of a panic log;
                              DIR is target/symbols by default
@@ -157,17 +158,22 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// `--out DIR`, `--symbols DIR`, `--tools DIR`, `--zip` and `--target` in any order.
+/// `--out DIR`, `--symbols DIR`, `--tools DIR`, `--zip`, `--deb`, `--dmg` and `--target`
+/// in any order.
 fn dist_command(root: &Path, args: &[&str]) -> Result {
     let mut out = None;
     let mut symbols = None;
     let mut tools = None;
     let mut target = "windows";
     let mut zip = false;
+    let mut deb = false;
+    let mut dmg = false;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
             "--zip" => zip = true,
+            "--deb" => deb = true,
+            "--dmg" => dmg = true,
             "--target" => {
                 index += 1;
                 target = args
@@ -196,9 +202,24 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
     }
     let out = out.ok_or("dist needs --out DIR")?;
     match target {
-        "windows" => dist::run(root, out, symbols, tools, zip),
-        "linux" => dist_linux::run(root, out, tools, zip),
-        "macos" => dist_macos::run(root, out, tools, zip),
+        "windows" => {
+            if deb || dmg {
+                return Err("--deb and --dmg belong to the linux and macos targets".into());
+            }
+            dist::run(root, out, symbols, tools, zip)
+        }
+        "linux" => {
+            if dmg {
+                return Err("a disk image is built by --target macos".into());
+            }
+            dist_linux::run(root, out, tools, zip, deb)
+        }
+        "macos" => {
+            if deb {
+                return Err("a Debian package is built by --target linux".into());
+            }
+            dist_macos::run(root, out, tools, zip, dmg)
+        }
         other => Err(format!("unknown dist target: {other}; windows, linux or macos").into()),
     }
 }

@@ -1,16 +1,20 @@
-//! The Services tool window with Docker: the daemon, its containers grouped by compose
-//! project and its images, actions on them, live logs in a console beside the tree,
-//! compose and exec in the terminal. Docker is reached through its CLI, see
-//! `services/container`.
+//! The Services tool window: Docker with its daemon, its containers grouped by compose
+//! project and its images, and the run configurations the language shows as services.
+//! Actions on them, live logs in a console beside the tree, the console of a run
+//! configuration and its live sections, compose and exec in the terminal. Docker is
+//! reached through its CLI, see `services/container`; the runs belong to the Run window
+//! and nothing of this panel starts a process of its own.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use container::{
     ComposeAction, Container, ContainerState, DaemonState, DockerCli, DockerSnapshot, DockerWatch,
 };
-use runner::{Console, ConsoleEvent, RunPlan, Stream};
+use runner::{
+    Console, ConsoleEvent, LiveRequest, RunConfig, RunPlan, ServiceGroup, ServiceState, Stream,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -18,7 +22,7 @@ use workspace::{SERVICES_TOOL, TERMINAL_TOOL, Workspace};
 
 use crate::ansi::{Line, OutputBuffers, Style};
 use crate::prompt::Prompt;
-use crate::run::{error_style, info, line_element, wrapped_line_element};
+use crate::run::{RunPanel, error_style, info, line_element, wrapped_line_element};
 use crate::terminal_panel::ActiveTerminal;
 
 /// How often the panel asks Docker, and how often it reads the log and the answers.
@@ -64,13 +68,45 @@ enum Selected {
     Container(String),
     Compose(String),
     Image(String),
+    /// A configuration of the run groups, by name.
+    Run(String),
+    /// A group of configurations, by the id its provider gave it.
+    RunGroup(String),
 }
 
-/// The tabs of the right side: the logs of the selection and the answers of its actions.
+impl Selected {
+    /// The text the window keeps in the layout.
+    fn key(&self) -> String {
+        match self {
+            Self::Container(id) => format!("container:{id}"),
+            Self::Compose(project) => format!("compose:{project}"),
+            Self::Image(id) => format!("image:{id}"),
+            Self::Run(name) => format!("run:{name}"),
+            Self::RunGroup(group) => format!("run-group:{group}"),
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        let (kind, value) = key.split_once(':')?;
+        match kind {
+            "container" => Some(Self::Container(value.to_owned())),
+            "compose" => Some(Self::Compose(value.to_owned())),
+            "image" => Some(Self::Image(value.to_owned())),
+            "run" => Some(Self::Run(value.to_owned())),
+            "run-group" => Some(Self::RunGroup(value.to_owned())),
+            _ => None,
+        }
+    }
+}
+
+/// The tabs of the right side: the logs of the selection, the answers of its actions, the
+/// console of a run configuration and its live sections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RightTab {
     Dashboard,
     Console,
+    RunConsole,
+    Actuator,
 }
 
 /// One live `docker logs` and the name of the container it belongs to.
@@ -112,6 +148,12 @@ pub struct DockerPanel {
     collapsed: HashSet<String>,
     show_stopped: bool,
     wrap: bool,
+    /// The Run window: the run configurations in the tree and the console of the run.
+    runs: Option<Entity<RunPanel>>,
+    /// The last state of the run of each configuration, by name.
+    run_states: BTreeMap<String, ServiceState>,
+    /// The optional groups list their configurations.
+    show_all_runs: bool,
     /// The panel drains the watch and the logs while this runs.
     polling: bool,
 }
@@ -145,6 +187,17 @@ fn state_icon(state: ContainerState) -> &'static str {
     match state {
         ContainerState::Running => "run/run",
         _ => "run/stop",
+    }
+}
+
+/// The icon of a configuration of the run groups: a program that runs, one that is about
+/// to, one that never started and one that stopped.
+fn run_state_icon(state: &ServiceState) -> &'static str {
+    match state {
+        ServiceState::Starting => "run/restart",
+        ServiceState::Running { .. } => "run/run",
+        ServiceState::NotStarted => "run/run",
+        ServiceState::Stopped { .. } => "run/stop",
     }
 }
 
@@ -196,19 +249,27 @@ fn counter(containers: &[Container], members: &[usize]) -> String {
 impl DockerPanel {
     pub fn create(
         root: PathBuf,
-        workspace: WeakEntity<Workspace>,
+        workspace: &Workspace,
+        weak: WeakEntity<Workspace>,
         window: AnyWindowHandle,
         cx: &mut App,
     ) -> Entity<Self> {
+        let layout = workspace.layout();
+        let collapsed: HashSet<String> = layout.services_collapsed.iter().cloned().collect();
+        let selected = layout
+            .services_selected
+            .as_deref()
+            .and_then(Selected::from_key);
+        let show_all_runs = layout.services_show_all;
         cx.new(|cx| {
             let cli = find_cli();
-            let observer = workspace.clone();
+            let observer = weak.clone();
             let compose = COMPOSE_FILES
                 .iter()
                 .map(|name| root.join(name))
                 .find(|path| path.is_file());
             let panel = Self {
-                workspace,
+                workspace: weak,
                 window,
                 focus: cx.focus_handle(),
                 root,
@@ -220,7 +281,7 @@ impl DockerPanel {
                 // The watch starts when the tool window opens: a closed one asks nothing.
                 watch: None,
                 snapshot: no_cli(),
-                selected: None,
+                selected,
                 compose,
                 busy: Vec::new(),
                 logs: Vec::new(),
@@ -230,9 +291,12 @@ impl DockerPanel {
                 tab: RightTab::Dashboard,
                 tree_width: TREE_WIDTH,
                 resizing: None,
-                collapsed: HashSet::new(),
+                collapsed,
                 show_stopped: true,
                 wrap: false,
+                runs: None,
+                run_states: BTreeMap::new(),
+                show_all_runs,
                 polling: false,
             };
             if let Some(workspace) = observer.upgrade() {
@@ -243,6 +307,34 @@ impl DockerPanel {
             }
             panel
         })
+    }
+
+    /// The Run window of the same project: the configurations of the tree, their state
+    /// and the console of the run. The Services window starts nothing of its own.
+    pub fn set_runs(&mut self, runs: Entity<RunPanel>, cx: &mut Context<Self>) {
+        cx.observe(&runs, |this, runs, cx| {
+            let snapshots = runs.read(cx).service_snapshots();
+            this.apply_runs(snapshots, cx);
+        })
+        .detach();
+        let snapshots = runs.read(cx).service_snapshots();
+        self.apply_runs(snapshots, cx);
+        self.runs = Some(runs);
+    }
+
+    /// Keeps the last state of the run of every configuration the Run window shows. Its
+    /// console is the one source of the state, so both windows always agree.
+    fn apply_runs(&mut self, snapshots: Vec<(String, ServiceState)>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for (name, state) in snapshots {
+            if self.run_states.get(&name) != Some(&state) {
+                changed = true;
+            }
+            self.run_states.insert(name, state);
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     pub fn focus(&self) -> FocusHandle {
@@ -306,6 +398,50 @@ impl DockerPanel {
         (title.to_string(), hint.to_string())
     }
 
+    /// The groups of run configurations and the state of each configuration, for a test.
+    #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn service_entries(&self, cx: &App) -> Vec<(String, String, String)> {
+        let mut rows = Vec::new();
+        for (group, members) in self.run_groups(cx) {
+            rows.push((
+                group.title.to_owned(),
+                String::new(),
+                self.group_counter(&members, cx),
+            ));
+            if group.optional && !self.show_all_runs {
+                continue;
+            }
+            for config in members {
+                rows.push((
+                    group.title.to_owned(),
+                    config.name.clone(),
+                    self.run_state(&config.name, cx).text(),
+                ));
+            }
+        }
+        rows
+    }
+
+    /// The state of the run of one configuration, for a test.
+    #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn run_state_text(&self, name: &str, cx: &App) -> String {
+        self.run_state(name, cx).text()
+    }
+
+    /// The tabs of the right side, for a test.
+    #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn right_tab(&self) -> &'static str {
+        match self.tab {
+            RightTab::Dashboard => "dashboard",
+            RightTab::Console => "console",
+            RightTab::RunConsole => "run-console",
+            RightTab::Actuator => "actuator",
+        }
+    }
+
     /// Lines for the report of a script.
     pub fn report(&self) -> Vec<String> {
         let daemon = match &self.snapshot.daemon {
@@ -334,6 +470,9 @@ impl DockerPanel {
         }
         for busy in &self.busy {
             lines.push(format!("docker busy {busy}"));
+        }
+        for (name, state) in &self.run_states {
+            lines.push(format!("run {name} {}", state.text()));
         }
         lines.extend(
             self.lines
@@ -649,7 +788,10 @@ impl DockerPanel {
                     })
                     .unwrap_or_default()
             }
-            Some(Selected::Image(_)) | None => Vec::new(),
+            Some(Selected::Image(_))
+            | Some(Selected::Run(_))
+            | Some(Selected::RunGroup(_))
+            | None => Vec::new(),
         };
         for (index, (label, id, prefix)) in targets.into_iter().enumerate() {
             self.logs.push(LogSource {
@@ -714,16 +856,63 @@ impl DockerPanel {
     }
 
     fn select(&mut self, selected: Selected, cx: &mut Context<Self>) {
+        let run = matches!(selected, Selected::Run(_));
         self.selected = Some(selected);
-        self.tab = RightTab::Dashboard;
+        self.tab = if run {
+            RightTab::RunConsole
+        } else {
+            RightTab::Dashboard
+        };
         self.restart_logs(cx);
+        self.save_state(cx);
     }
 
     fn toggle_section(&mut self, key: &str, cx: &mut Context<Self>) {
         if !self.collapsed.remove(key) {
             self.collapsed.insert(key.to_owned());
         }
+        self.save_state(cx);
         cx.notify();
+    }
+
+    /// Keeps the collapsed groups, the selected node and the optional groups in the
+    /// layout of the window.
+    fn save_state(&mut self, cx: &mut Context<Self>) {
+        let mut collapsed: Vec<String> = self.collapsed.iter().cloned().collect();
+        collapsed.sort();
+        let selected = self.selected.as_ref().map(Selected::key);
+        let show_all = self.show_all_runs;
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.set_services_state(collapsed, selected, show_all, cx)
+            })
+            .ok();
+    }
+
+    fn selected_run(&self) -> Option<&str> {
+        match &self.selected {
+            Some(Selected::Run(name)) => Some(name),
+            _ => None,
+        }
+    }
+
+    fn selected_run_group(&self) -> Option<&str> {
+        match &self.selected {
+            Some(Selected::RunGroup(group)) => Some(group),
+            _ => None,
+        }
+    }
+
+    /// The state of the run of a configuration: the one the Run window reports, or the
+    /// last state it reported before another run took the console.
+    fn run_state(&self, name: &str, cx: &App) -> ServiceState {
+        let current = self.runs.as_ref().and_then(|runs| {
+            let snapshot = runs.read(cx).service_snapshot()?;
+            (snapshot.0 == name).then_some(snapshot.1)
+        });
+        current
+            .or_else(|| self.run_states.get(name).cloned())
+            .unwrap_or_default()
     }
 
     fn selected_container(&self) -> Option<&Container> {
@@ -753,6 +942,12 @@ impl DockerPanel {
 
     /// The name of the node on the right and its state.
     fn selection_title(&self) -> (SharedString, SharedString) {
+        if let Some(name) = self.selected_run() {
+            return (name.into(), String::new().into());
+        }
+        if let Some(group) = self.selected_run_group() {
+            return (group.into(), String::new().into());
+        }
         if let Some(container) = self.selected_container() {
             return (
                 container.name.clone().into(),
@@ -786,8 +981,113 @@ impl DockerPanel {
         }
     }
 
+    /// The groups of run configurations of the tree with their members, the order the
+    /// tree draws them in: a running configuration first, then by name. A group no
+    /// provider claims is not there; the optional ones come last.
+    fn run_groups(&self, cx: &App) -> Vec<(ServiceGroup, Vec<RunConfig>)> {
+        let Some(runs) = &self.runs else {
+            return Vec::new();
+        };
+        let (providers, configs) = {
+            let runs = runs.read(cx);
+            (runs.providers(), runs.configurations().to_vec())
+        };
+        let mut groups: Vec<(ServiceGroup, Vec<RunConfig>)> = Vec::new();
+        for config in configs {
+            let Some(provider) = providers
+                .iter()
+                .find(|provider| provider.id() == config.provider)
+            else {
+                continue;
+            };
+            let Some(group) = provider.service_group(&config) else {
+                continue;
+            };
+            match groups.iter_mut().find(|(known, _)| known.id == group.id) {
+                Some((_, members)) => members.push(config),
+                None => groups.push((group, vec![config])),
+            }
+        }
+        for (_, members) in &mut groups {
+            members.sort_by(|left, right| {
+                let left_state = self.run_state(&left.name, cx);
+                let right_state = self.run_state(&right.name, cx);
+                left_state
+                    .rank()
+                    .cmp(&right_state.rank())
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+        }
+        groups.sort_by(|left, right| {
+            left.0
+                .optional
+                .cmp(&right.0.optional)
+                .then_with(|| left.0.title.cmp(right.0.title))
+        });
+        groups
+    }
+
+    fn run_group(&self, id: &str, cx: &App) -> Option<(ServiceGroup, Vec<RunConfig>)> {
+        self.run_groups(cx)
+            .into_iter()
+            .find(|(group, _)| group.id == id)
+    }
+
+    /// The counter of a group of configurations, as the header of the group shows it.
+    fn group_counter(&self, members: &[RunConfig], cx: &App) -> String {
+        let running = members
+            .iter()
+            .filter(|config| self.run_state(&config.name, cx).active())
+            .count();
+        format!("Running: ({running}/{})", members.len())
+    }
+
     fn tree(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut rows = Vec::new();
+        for (group, members) in self.run_groups(cx) {
+            let key = format!("run:{}", group.id);
+            let open = !self.collapsed.contains(&key);
+            let selector = format!("services-run-group-{}", group.id);
+            let clicked = group.id.to_owned();
+            let target = group.id.to_owned();
+            let counter = self.group_counter(&members, cx);
+            rows.push(
+                tree_row(
+                    TreeRow {
+                        id: selector.clone().into(),
+                        depth: 0,
+                        label: group.title.into(),
+                        hint: Some(counter.into()),
+                        icon: "toolwindows/run",
+                        expandable: true,
+                        open,
+                        selected: self.selected_run_group() == Some(group.id),
+                    },
+                    theme,
+                )
+                .debug_selector(move || selector.clone())
+                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    this.select(Selected::RunGroup(clicked.clone()), cx);
+                    if event.click_count() >= 2 {
+                        this.toggle_section(&format!("run:{clicked}"), cx);
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.select(Selected::RunGroup(target.clone()), cx);
+                        this.show_run_group_menu(target.clone(), event.position, cx);
+                    }),
+                )
+                .into_any_element(),
+            );
+            if !open || (group.optional && !self.show_all_runs) {
+                continue;
+            }
+            for config in members {
+                rows.push(self.run_row(&config, 1, theme, cx));
+            }
+        }
         let up = matches!(self.snapshot.daemon, DaemonState::Up { .. });
         let reason = match &self.snapshot.daemon {
             DaemonState::Down { reason } => Some(reason.clone().into()),
@@ -1007,6 +1307,47 @@ impl DockerPanel {
         .into_any_element()
     }
 
+    /// One configuration of a run group, with the state of its last run.
+    fn run_row(
+        &self,
+        config: &RunConfig,
+        depth: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = config.name.clone();
+        let state = self.run_state(&name, cx);
+        let selector = format!("services-run-{}", config.name);
+        let selected = self.selected_run() == Some(name.as_str());
+        let clicked = name.clone();
+        let target = name.clone();
+        tree_row(
+            TreeRow {
+                id: selector.clone().into(),
+                depth,
+                label: config.name.clone().into(),
+                hint: Some(state.text().into()),
+                icon: run_state_icon(&state),
+                expandable: false,
+                open: false,
+                selected,
+            },
+            theme,
+        )
+        .debug_selector(move || selector.clone())
+        .on_click(
+            cx.listener(move |this, _, _, cx| this.select(Selected::Run(clicked.clone()), cx)),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.select(Selected::Run(target.clone()), cx);
+                this.show_run_menu(target.clone(), event.position, cx);
+            }),
+        )
+        .into_any_element()
+    }
+
     fn tree_toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let (stopped_icon, stopped_label) = if self.show_stopped {
             ("general/hide", "Hide Stopped Containers")
@@ -1046,6 +1387,7 @@ impl DockerPanel {
                 .debug_selector(|| "docker-toolbar-expand".to_owned())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.collapsed.clear();
+                    this.save_state(cx);
                     cx.notify();
                 })),
             )
@@ -1065,6 +1407,15 @@ impl DockerPanel {
                     for (project, _) in group_containers(&this.snapshot.containers).0 {
                         this.collapsed.insert(format!("compose:{project}"));
                     }
+                    let groups: Vec<String> = this
+                        .run_groups(cx)
+                        .into_iter()
+                        .map(|(group, _)| format!("run:{}", group.id))
+                        .collect();
+                    for key in groups {
+                        this.collapsed.insert(key);
+                    }
+                    this.save_state(cx);
                     cx.notify();
                 })),
             )
@@ -1072,7 +1423,29 @@ impl DockerPanel {
 
     /// The actions of the selected node, each with its icon and its name. The name goes
     /// away when the window is narrow, so the buttons keep their place and never overlap.
-    fn header_actions(&self) -> Vec<(&'static str, &'static str, &'static str, bool)> {
+    fn header_actions(&self, cx: &App) -> Vec<(&'static str, &'static str, &'static str, bool)> {
+        if let Some(name) = self.selected_run() {
+            let state = self.run_state(name, cx);
+            let running = state.active();
+            let port = state.port().is_some();
+            return vec![
+                ("run", "run/run", "Run", !running),
+                ("debug", "run/debug", "Debug", !running),
+                ("stop-run", "run/stop", "Stop", running),
+                ("rerun", "run/restart", "Rerun", true),
+                (
+                    "browser",
+                    "general/openInToolWindow",
+                    "Open in Browser",
+                    port,
+                ),
+                ("http", "toolwindows/http", "Open in HTTP Client", port),
+                ("edit", "general/settings", "Edit Configuration", true),
+            ];
+        }
+        if self.selected_run_group().is_some() {
+            return Vec::new();
+        }
         if let Some(container) = self.selected_container() {
             let running = container.state == ContainerState::Running;
             return vec![
@@ -1102,8 +1475,15 @@ impl DockerPanel {
         show_labels: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let (title, hint) = self.selection_title();
-        let actions = self.header_actions();
+        let (title, hint) = match (self.selected_run(), self.selected_run_group()) {
+            (Some(name), _) => (name.into(), self.run_state(name, cx).text().into()),
+            (None, Some(group)) => self.run_group(group, cx).map_or_else(
+                || (group.into(), SharedString::default()),
+                |(known, members)| (known.title.into(), self.group_counter(&members, cx).into()),
+            ),
+            (None, None) => self.selection_title(),
+        };
+        let actions = self.header_actions(cx);
         div()
             .flex()
             .items_center()
@@ -1145,18 +1525,23 @@ impl DockerPanel {
                         action_button(action, icon, label, enabled, show_labels, theme).when(
                             enabled,
                             |this| {
-                                this.on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.header_action(action, cx)
-                                    }),
-                                )
+                                this.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.header_action(action, window, cx)
+                                }))
                             },
                         )
                     })),
             )
     }
 
-    fn header_action(&mut self, action: &str, cx: &mut Context<Self>) {
+    fn header_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = self.selected_run().map(str::to_owned) {
+            self.run_action(action, &name, window, cx);
+            return;
+        }
+        if self.selected_run_group().is_some() {
+            return;
+        }
         if let Some(container) = self.selected_container().cloned() {
             self.container_action(action, &container, cx);
             return;
@@ -1177,41 +1562,339 @@ impl DockerPanel {
         }
     }
 
-    fn tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(SPACE_XS))
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .px(px(SPACE_M))
-            .child(tab_button(
-                "docker-tab-dashboard",
-                "Dashboard",
-                self.tab == RightTab::Dashboard,
-                theme,
-                cx.listener(|this, _, _, cx| {
-                    this.tab = RightTab::Dashboard;
+    /// One action of a configuration. Every action goes through the Run window: the
+    /// Services window has no console and no process of its own.
+    fn run_action(
+        &mut self,
+        action: &str,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runs) = self.runs.clone() else {
+            return;
+        };
+        match action {
+            "run" | "rerun" => {
+                runs.update(cx, |runs, cx| {
+                    if runs.select_named(name, cx) {
+                        runs.run(cx);
+                    }
+                });
+            }
+            "debug" => {
+                runs.update(cx, |runs, cx| {
+                    if runs.select_named(name, cx) {
+                        runs.debug(window, cx);
+                    }
+                });
+            }
+            "stop-run" => {
+                runs.update(cx, |runs, cx| {
+                    let active = runs
+                        .service_snapshot()
+                        .is_some_and(|(_, state)| state.active());
+                    if runs.run_config_name() == Some(name) && active {
+                        runs.stop(cx);
+                    }
+                });
+            }
+            "browser" => self.open_browser(name, cx),
+            "http" => self.open_in_http_client(name, window, cx),
+            "edit" => {
+                let Some(config) = runs
+                    .read(cx)
+                    .configurations()
+                    .iter()
+                    .find(|config| config.name == name)
+                    .cloned()
+                else {
+                    return;
+                };
+                let workspace = self.workspace.clone();
+                window.defer(cx, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            crate::run_configs::RunConfigDialog::show_config(
+                                runs, config, workspace, window, cx,
+                            )
+                        })
+                        .ok();
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// The browser link of a running configuration, on the port its console named.
+    fn open_browser(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(port) = self.run_state(name, cx).port() else {
+            return;
+        };
+        let url = format!("http://localhost:{port}/");
+        let opener = cx
+            .try_global::<editor_view::ExternalLinks>()
+            .and_then(|links| links.0.clone());
+        match opener {
+            Some(open) => open(&url),
+            None => {
+                ::platform::open_url(&url);
+            }
+        }
+    }
+
+    /// A scratch request of the HTTP client for the port of a running configuration.
+    fn open_in_http_client(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(port) = self.run_state(name, cx).port() else {
+            return;
+        };
+        let url = format!("http://localhost:{port}/");
+        let request = LiveRequest {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+        };
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    crate::endpoints::generate_url(&request, &url, workspace, window, cx)
+                })
+                .ok();
+        });
+    }
+
+    /// The menu of a configuration of a run group: the same actions as its header.
+    fn show_run_menu(&mut self, name: String, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let state = self.run_state(&name, cx);
+        let running = state.active();
+        let port = state.port().is_some();
+        let panel = cx.weak_entity();
+        let mut entries = Vec::new();
+        for (action, label, icon, enabled) in [
+            ("run", "Run", "run/run", !running),
+            ("debug", "Debug", "run/debug", !running),
+            ("stop-run", "Stop", "run/stop", running),
+            ("rerun", "Rerun", "run/restart", true),
+            (
+                "browser",
+                "Open in Browser",
+                "general/openInToolWindow",
+                port,
+            ),
+            ("http", "Open in HTTP Client", "toolwindows/http", port),
+            ("edit", "Edit Configuration...", "general/settings", true),
+        ] {
+            if !enabled {
+                entries.push(MenuEntry::disabled(label).icon(icon));
+                continue;
+            }
+            let panel = panel.clone();
+            let target = name.clone();
+            entries.push(
+                MenuEntry::new(label, move |window, cx| {
+                    panel
+                        .update(cx, |this, cx| this.run_action(action, &target, window, cx))
+                        .ok();
+                })
+                .icon(icon),
+            );
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
+    }
+
+    /// The menu of a group of configurations: an optional group lists its configurations
+    /// only after Show all run configurations.
+    fn show_run_group_menu(&mut self, id: String, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((group, _)) = self.run_group(&id, cx) else {
+            return;
+        };
+        if !group.optional {
+            return;
+        }
+        let show = !self.show_all_runs;
+        let label = if show {
+            "Show all run configurations"
+        } else {
+            "Hide all run configurations"
+        };
+        let icon = if show { "general/show" } else { "general/hide" };
+        let panel = cx.weak_entity();
+        let entry = MenuEntry::new(label, move |_, cx| {
+            panel
+                .update(cx, |this, cx| {
+                    this.show_all_runs = show;
+                    this.save_state(cx);
                     cx.notify();
-                }),
-            ))
-            .child(tab_button(
-                "docker-tab-console",
-                "Console",
-                self.tab == RightTab::Console,
-                theme,
-                cx.listener(|this, _, _, cx| {
-                    this.tab = RightTab::Console;
-                    cx.notify();
-                }),
-            ))
+                })
+                .ok();
+        })
+        .icon(icon);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![entry], cx)
+            })
+            .ok();
+    }
+
+    fn tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+        if self.selected_run().is_some() {
+            let live = self.selected_live(cx).is_some();
+            return Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .flex_none()
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_M))
+                    .child(tab_button(
+                        "services-run-tab-console",
+                        "Console",
+                        self.tab != RightTab::Actuator,
+                        theme,
+                        cx.listener(|this, _, _, cx| {
+                            this.tab = RightTab::RunConsole;
+                            cx.notify();
+                        }),
+                    ))
+                    .children(live.then(|| {
+                        tab_button(
+                            "services-run-tab-actuator",
+                            "Actuator",
+                            self.tab == RightTab::Actuator,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.tab = RightTab::Actuator;
+                                cx.notify();
+                            }),
+                        )
+                    })),
+            );
+        }
+        if self.selected_run_group().is_some() {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .flex_none()
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_M))
+                .child(tab_button(
+                    "docker-tab-dashboard",
+                    "Dashboard",
+                    self.tab == RightTab::Dashboard,
+                    theme,
+                    cx.listener(|this, _, _, cx| {
+                        this.tab = RightTab::Dashboard;
+                        cx.notify();
+                    }),
+                ))
+                .child(tab_button(
+                    "docker-tab-console",
+                    "Console",
+                    self.tab == RightTab::Console,
+                    theme,
+                    cx.listener(|this, _, _, cx| {
+                        this.tab = RightTab::Console;
+                        cx.notify();
+                    }),
+                )),
+        )
     }
 
     fn body(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        if self.selected_run().is_some() {
+            if self.tab == RightTab::Actuator && self.selected_live(cx).is_some() {
+                return self.run_live(theme, cx);
+            }
+            return self.run_console(theme, window, cx);
+        }
+        if self.selected_run_group().is_some() {
+            return empty_state("Select a configuration of the group", theme);
+        }
         match self.tab {
-            RightTab::Dashboard => self.dashboard(theme, window, cx),
+            RightTab::Dashboard | RightTab::Actuator | RightTab::RunConsole => {
+                self.dashboard(theme, window, cx)
+            }
             RightTab::Console => self.console(theme, window, cx),
         }
+    }
+
+    /// The live tab of the run of the selected configuration, when its language has one.
+    fn selected_live(&self, cx: &App) -> Option<Entity<crate::live_panel::LivePanel>> {
+        let name = self.selected_run()?;
+        let runs = self.runs.as_ref();
+        let runs = runs?.read(cx);
+        (runs.run_config_name() == Some(name))
+            .then(|| runs.live_panel())
+            .flatten()
+    }
+
+    /// The live sections of the same run the Run window shows.
+    fn run_live(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        match self.selected_live(cx) {
+            Some(live) => div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .child(live.into_any_element()),
+            None => empty_state("No live data for this run", theme),
+        }
+    }
+
+    /// The console of the same run the Run window shows: the same lines, the same
+    /// unfinished line and the same process. Nothing runs for the Services window.
+    fn run_console(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let Some(name) = self.selected_run() else {
+            return empty_state("Select a configuration", theme);
+        };
+        let Some(runs) = self.runs.clone() else {
+            return empty_state("No run configurations in this window", theme);
+        };
+        if !runs.read(cx).shows_console(name) {
+            return empty_state("This configuration has not run in this window", theme);
+        }
+        let (count, scroll) = {
+            let runs = runs.read(cx);
+            (runs.console_rows(), runs.console_scroll())
+        };
+        let theme = *theme;
+        div().flex().flex_1().min_h_0().child(
+            scrollable(
+                "services-run-console",
+                &scroll,
+                div().size_full().child(
+                    uniform_list(
+                        "services-run-console",
+                        count,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            let Some(runs) = this.runs.clone() else {
+                                return Vec::new();
+                            };
+                            let runs = runs.read(cx);
+                            range
+                                .map(|index| runs.console_row(index, &theme))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&scroll)
+                    .size_full(),
+                ),
+                &theme,
+                window,
+                cx,
+            )
+            .debug_selector(|| "services-run-console".to_owned())
+            .flex_1()
+            .min_h_0(),
+        )
     }
 
     fn dashboard(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -1759,7 +2442,7 @@ impl Render for DockerPanel {
             .min_w_0()
             .h_full()
             .child(header)
-            .child(tabs)
+            .children(tabs)
             .child(body);
         island(&theme)
             .id("docker-panel")
@@ -1801,7 +2484,7 @@ impl Render for DockerPanel {
 mod tests {
     use container::{Container, ContainerState};
 
-    use super::{counter, group_containers, prefix_line};
+    use super::{Selected, counter, group_containers, prefix_line};
     use crate::ansi::{Line, Style};
 
     fn container(name: &str, state: ContainerState, project: Option<&str>) -> Container {
@@ -1849,5 +2532,26 @@ mod tests {
         assert_eq!(line.spans[0].0, 0..17);
         assert_eq!(line.spans[0].1.color, Some(2));
         assert_eq!(line.spans[1].0, 17..22);
+    }
+
+    #[test]
+    fn the_selected_node_of_the_tree_survives_the_layout_as_a_key() {
+        let nodes = [
+            Selected::Container("web0001".to_owned()),
+            Selected::Compose("petclinic".to_owned()),
+            Selected::Image("sha256:aa".to_owned()),
+            Selected::Run("App".to_owned()),
+            Selected::RunGroup("boot".to_owned()),
+        ];
+
+        for node in nodes {
+            assert_eq!(
+                Selected::from_key(&node.key()),
+                Some(node.clone()),
+                "{node:?}"
+            );
+        }
+        assert_eq!(Selected::from_key("unknown:node"), None);
+        assert_eq!(Selected::from_key("run"), None);
     }
 }

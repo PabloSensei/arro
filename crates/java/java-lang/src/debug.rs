@@ -670,6 +670,31 @@ impl DebugService for JavaDebugger {
         Some(Box::new(self.extension.begin_session()))
     }
 
+    /// The values the plugin already gives a shape of its own keep it; the map entries
+    /// are the one type the plugin lists by key and value rather than by the fields of
+    /// its runtime class, so their text names the pair.
+    fn type_renderers(&self) -> Vec<dap_client::TypeRenderer> {
+        ["java.util.Map$Entry", "java.util.Map.Entry"]
+            .into_iter()
+            .map(|type_name| dap_client::TypeRenderer {
+                type_name: type_name.to_owned(),
+                display: "getKey() + \" = \" + getValue()".to_owned(),
+                children: None,
+                subtype_probe: self.subtype_probe(type_name),
+            })
+            .collect()
+    }
+
+    fn subtype_probe(&self, type_name: &str) -> Option<String> {
+        Some(format!("({{name}} instanceof {type_name})"))
+    }
+
+    /// The identity hash of the object, the one number of a Java program that stays with
+    /// the object while the handles of the adapter may go to other values.
+    fn object_identity_expression(&self, evaluate_name: &str) -> Option<String> {
+        Some(format!("System.identityHashCode({evaluate_name})"))
+    }
+
     fn reload_classes(
         &self,
         debugger: Debugger,

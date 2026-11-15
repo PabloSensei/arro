@@ -180,6 +180,12 @@ pub struct DatabasePanel {
     status: Option<String>,
     dialog: Option<Dialog>,
     scripted: Option<Scripted>,
+    /// Set while the task that reads the answers of the helpers runs: it runs only while
+    /// at least one connection is alive.
+    polling: bool,
+    /// How many times the task read the answers, for the window tests.
+    #[cfg(test)]
+    poll_ticks: usize,
     /// Set when the window goes away, so the helpers do not outlive it.
     window_closed: Arc<AtomicBool>,
     /// The flag of a scripted connection, raised when the window goes away.
@@ -224,6 +230,9 @@ impl DatabasePanel {
                 status: None,
                 dialog: None,
                 scripted: None,
+                polling: false,
+                #[cfg(test)]
+                poll_ticks: 0,
                 window_closed: Arc::new(AtomicBool::new(false)),
                 scripted_closed: Arc::new(Mutex::new(None)),
                 tree_scroll: ScrollHandle::new(),
@@ -231,7 +240,6 @@ impl DatabasePanel {
             };
             panel.load_sources(cx);
             panel.refresh_catalog();
-            panel.start_poll(cx);
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -404,16 +412,40 @@ impl DatabasePanel {
         .detach();
     }
 
-    fn start_poll(&mut self, cx: &mut Context<Self>) {
+    /// Starts the task that reads the answers of the helpers, when a connection needs it.
+    fn ensure_poll(&mut self, cx: &mut Context<Self>) {
+        if self.polling {
+            return;
+        }
+        self.polling = true;
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(POLL).await;
-                if this.update(cx, |this, cx| this.poll(cx)).is_err() {
+                let more = this.update(cx, |this, cx| {
+                    #[cfg(test)]
+                    {
+                        this.poll_ticks += 1;
+                    }
+                    this.poll(cx);
+                    // Nothing to read: the task ends and the next connection starts it.
+                    let more = !this.sessions.is_empty();
+                    if !more {
+                        this.polling = false;
+                    }
+                    more
+                });
+                if !matches!(more, Ok(true)) {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    /// How many times the task that reads the answers has run, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn poll_ticks_for_test(&self) -> usize {
+        self.poll_ticks
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
@@ -706,6 +738,7 @@ impl DatabasePanel {
                     Ok(session) => {
                         this.sessions.insert(source.id.clone(), session);
                         this.errors.remove(&source.id);
+                        this.ensure_poll(cx);
                     }
                     Err(error) => {
                         this.errors.insert(source.id.clone(), error);

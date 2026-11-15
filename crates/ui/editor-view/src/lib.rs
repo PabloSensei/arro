@@ -5,6 +5,7 @@ mod actions;
 mod annotate;
 mod bar;
 mod blocks;
+mod bundle;
 mod code_lens;
 mod decor;
 mod delete;
@@ -27,6 +28,7 @@ mod style;
 mod view;
 
 pub use annotate::BlameNote;
+pub use bundle::{BundleChanged, BundleHost, BundleMode, BundleModes};
 pub use decor::PaneDecor;
 pub use element::StripeKind;
 #[cfg(any(test, feature = "test-support"))]
@@ -42,8 +44,8 @@ pub use quick_doc::{
 pub use refactor::FolderMove;
 pub use semantic::{
     CompletionCase, CompletionSources, ExternalLinks, ExternalOpener, FileLanguages,
-    LocalCompletions, Semantic, completion_order, completion_order_with, completion_parts,
-    expand_snippet, show_location, uri_path,
+    InspectionProfile, LocalCompletions, Semantic, completion_order, completion_order_with,
+    completion_parts, expand_snippet, show_location, uri_path,
 };
 pub use state::{
     ActionsOnSave, Conflict, EditorState, LoadError, SaveOptions, Saved, TrimTrailing,
@@ -54,10 +56,10 @@ pub use style::{EditorStyle, SemanticLook};
 pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
-    BookmarkEntry, CoverageMark, CoverageState, DebugValue, DetailedUsage, DocumentationQuery,
-    EditorEvent, EditorOptions, EditorView, EndpointMark, FileBar, GutterKind, GutterMark,
-    InlayPaint, InlineValue, Languages, LineDeclaration, OutlineItem, OutlineKind, PlaceMark,
-    PlaceTarget, PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot,
-    TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
-    install_keymap,
+    BookmarkEntry, CodeStyleLanguages, CoverageMark, CoverageState, DebugValue, DetailedUsage,
+    DocumentationQuery, EditorEvent, EditorOptions, EditorView, EndpointMark, FileBar, GutterKind,
+    GutterMark, InlayPaint, InlineValue, InlineWatchRow, Languages, LineDeclaration, OutlineItem,
+    OutlineKind, PasteText, PlaceMark, PlaceTarget, PlainSyntax, ProblemSummary, RowPaint,
+    RunFiles, RunMark, RunMarkState, Spot, TemplateSettings, Usage, UsagesUpdate, bookmarks,
+    clipboard_history, highlight_text, install_keymap,
 };

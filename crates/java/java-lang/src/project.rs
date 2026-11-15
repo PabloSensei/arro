@@ -9,13 +9,14 @@ use base::Cancel;
 use futures_util::StreamExt;
 use jdtls_adapter::{ImportFailure, Jdtls, JdtlsConfig};
 use lang_api::{
-    Answer, CompletionList, Confidence, DefinitionPreview, DefinitionPreviewQuery, DocumentSpot,
-    ExternalDoc, FileSymbol, FileSymbolsQuery, GenerateApplyRequest, GenerateChoice, GenerateKind,
-    GenerateQuery, GeneratedFile, Generation, HierarchyDirection, HierarchyQuery, HoverProvider,
-    MethodHierarchyEntry, MethodHierarchyQuery, MethodRelation, NavigationQuery,
-    PrepareDiagnosticsQuery, ProjectProblem, ProjectProblemsQuery, Provider, ReferenceQuery, Reply,
-    Severity, SourceId, SourceSpan, SourceTextQuery, SymbolEntry, SymbolKind, TextSpan, ask,
-    offset_in,
+    Answer, CompletionList, Confidence, DefinitionPreview, DefinitionPreviewQuery,
+    DisabledInspections, DocumentSpot, ExternalDoc, FileSymbol, FileSymbolsQuery,
+    GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateQuery, GeneratedFile, Generation,
+    HierarchyDirection, HierarchyQuery, HoverProvider, MethodHierarchyEntry, MethodHierarchyQuery,
+    MethodRelation, NavigationQuery, PrepareDiagnosticsQuery, ProjectProblem, ProjectProblemsQuery,
+    Provider, ReferenceQuery, Reply, Severity, SourceId, SourceSpan, SourceTextQuery, SymbolEntry,
+    SymbolKind, TestCreateOutcome, TestCreateRequest, TestFixOutcome, TestFixRequest, TestForm,
+    TestFormQuery, TextSpan, ask, offset_in,
 };
 use lsp_client::ServerEvents;
 use lsp_client::lsp_types::{
@@ -125,6 +126,9 @@ pub struct JavaProject {
     pub(crate) spring: Arc<SpringConfigSupport>,
     /// The message bundles of the project and the places of the sources that use a key.
     pub(crate) messages: Arc<MessageBundles>,
+    /// The versions of the dependencies in the build files: the hints on an old one, the
+    /// fixes and the entries of a version being typed.
+    pub(crate) build_scripts: crate::build_scripts::BuildScriptSupport,
     /// The answers of the message bundles in front of the answers of the server.
     pub(crate) java_messages: JavaMessages,
     /// The beans and the points of an injection of the project, read in the background
@@ -133,6 +137,9 @@ pub struct JavaProject {
     /// The entities of the project and the queries of its data repositories, read in the
     /// background from its sources.
     pub(crate) data: Arc<SpringDataIndex>,
+    /// The checks the user turned off, shared with the native providers: a check that is
+    /// off is not computed at all.
+    checks: DisabledInspections,
 }
 
 /// The language server as the window sees it. A build file that appears or disappears can
@@ -405,6 +412,7 @@ impl JavaProject {
         }
         let root = config.project_root.clone();
         let cache = config.state_dir.clone();
+        let offline = config.offline;
         let repositories = crate::lombok::repositories(
             config.maven_settings.as_deref(),
             config.gradle_user_home.as_deref(),
@@ -417,7 +425,30 @@ impl JavaProject {
             root,
             repositories,
             cache,
+            offline,
         )
+    }
+
+    /// Applies the choices of the user for the checks. A check that is off reaches the
+    /// native providers, which then skip it before their work; the compiler problems go
+    /// to a `.prefs` file whose path changes with the choices, and the server reads it
+    /// when `workspace/didChangeConfiguration` brings the new path, without a restart.
+    /// False when no server setting changed.
+    pub(crate) fn apply_inspection_settings(
+        &self,
+        settings: &lang_api::InspectionSettings,
+    ) -> bool {
+        self.checks.replace(settings);
+        let prefs = crate::inspections::jdt_prefs(settings);
+        if !self.spec.set_inspection_prefs(prefs) {
+            return false;
+        }
+        let settings = self.spec.settings();
+        self.router.notify(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({"settings": settings}),
+        );
+        true
     }
 
     /// Applies the Inlay Hints settings of the window. jdtls reads them on its next
@@ -461,6 +492,7 @@ impl JavaProject {
         root: PathBuf,
         repositories: java_project::LocalRepositories,
         cache: PathBuf,
+        offline: bool,
     ) -> Result<Self, OpenError> {
         let problems = ProjectProblems {
             failures: spec.watch_import_failure(),
@@ -490,6 +522,11 @@ impl JavaProject {
         ));
         let model: Arc<std::sync::Mutex<Option<Arc<project_model::ProjectModel>>>> = Arc::default();
         let router = Router::new(sidecar.status());
+        let build_scripts = crate::build_scripts::BuildScriptSupport::new(
+            root.clone(),
+            cache.join(java_project::updates::CACHE_FOLDER),
+            offline,
+        );
         let library_sources = crate::sources::LibrarySources::new(
             router.clone(),
             Handle::current(),
@@ -560,6 +597,11 @@ impl JavaProject {
         let messages = crate::message_bundles(root.clone());
         let beans = crate::bean_index(root.clone());
         let data = crate::spring_data_index(root.clone());
+        let checks = DisabledInspections::default();
+        spring.set_inspection_checks(checks.clone());
+        messages.set_inspection_checks(checks.clone());
+        data.set_inspection_checks(checks.clone());
+        build_scripts.set_inspection_checks(checks.clone());
         let completion_fallback: Arc<dyn Provider<DocumentSpot, CompletionList>> =
             providers.clone();
         let navigation_fallback: Arc<dyn Provider<NavigationQuery, Vec<SourceSpan>>> =
@@ -622,9 +664,11 @@ impl JavaProject {
             stack,
             spring,
             messages,
+            build_scripts,
             java_messages,
             beans,
             data,
+            checks,
         })
     }
 
@@ -932,6 +976,72 @@ impl Provider<GenerateApplyRequest, Generation> for JavaProject {
             },
         };
         let _ = reply.send(Answer::new(outcome, Confidence::Certain, SOURCE));
+    }
+}
+
+/// The text of the document of a place, from an open editor or from the disk.
+fn spot_text(router: &Router, spot: &DocumentSpot) -> Option<(PathBuf, String)> {
+    let uri = Uri::from_str(&spot.uri).ok()?;
+    let path = file_path(&uri)?;
+    let text = router
+        .text(&uri)
+        .map(|text| text.to_string())
+        .or_else(|| std::fs::read_to_string(&path).ok())?;
+    Some((path, text))
+}
+
+impl Provider<TestFormQuery, TestForm> for JavaProject {
+    fn start(&self, query: TestFormQuery, cancel: Cancel, mut reply: Reply<TestForm>) {
+        let root = self.root.clone();
+        let model = self.model.lock().ok().and_then(|model| model.clone());
+        let router = self.router.clone();
+        self.runtime.spawn(async move {
+            let form = if cancel.is_cancelled() {
+                return;
+            } else if let Some((path, text)) = spot_text(&router, &query.0) {
+                crate::test_creation::form_for(&root, model.as_deref(), &path, &text)
+            } else {
+                TestForm {
+                    error: Some("The file is not open".to_owned()),
+                    ..TestForm::default()
+                }
+            };
+            let _ = reply.send(Answer::new(form, Confidence::Certain, SOURCE));
+        });
+    }
+}
+
+impl Provider<TestCreateRequest, TestCreateOutcome> for JavaProject {
+    fn start(&self, query: TestCreateRequest, cancel: Cancel, mut reply: Reply<TestCreateOutcome>) {
+        self.runtime.spawn(async move {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let outcome = crate::test_creation::create(&query);
+            let _ = reply.send(Answer::new(outcome, Confidence::Certain, SOURCE));
+        });
+    }
+}
+
+impl Provider<TestFixRequest, TestFixOutcome> for JavaProject {
+    fn start(&self, query: TestFixRequest, cancel: Cancel, mut reply: Reply<TestFixOutcome>) {
+        let root = self.root.clone();
+        let model = self.model.lock().ok().and_then(|model| model.clone());
+        self.runtime.spawn(async move {
+            let outcome = if cancel.is_cancelled() {
+                return;
+            } else if let Ok(uri) = Uri::from_str(&query.spot.uri)
+                && let Some(path) = file_path(&uri)
+            {
+                crate::test_creation::fix(&root, model.as_deref(), &path, &query.framework)
+            } else {
+                TestFixOutcome {
+                    error: Some("The file has no path".to_owned()),
+                    ..TestFixOutcome::default()
+                }
+            };
+            let _ = reply.send(Answer::new(outcome, Confidence::Certain, SOURCE));
+        });
     }
 }
 

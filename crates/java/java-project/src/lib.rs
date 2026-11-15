@@ -8,6 +8,7 @@ mod env;
 mod environment;
 mod fingerprint;
 mod gradle;
+pub mod initializr;
 mod jdk;
 mod lombok;
 mod maven;
@@ -15,6 +16,8 @@ mod pom;
 pub mod profile;
 mod sources;
 mod test_runs;
+pub mod updates;
+mod wrapper;
 
 pub use coverage::CoverageTools;
 pub use database::{drivers, kind_of_jar};
@@ -36,3 +39,5 @@ pub use sources::{
     source_location,
 };
 pub use test_runs::{TEST_LISTENER, TestHook, TestSelection};
+pub use updates::{BuildFile, Metadata, Slot, Updates, Version, VersionSource, kind_of, slot_at};
+pub use wrapper::{Wrapper, generate as generate_wrapper};

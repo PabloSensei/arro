@@ -184,6 +184,7 @@ mod tests {
                     provider: "plain".into(),
                     assemble_first: false,
                     settings: Default::default(),
+                    ..crate::RunConfig::default()
                 },
                 &ProjectModel::default(),
             )

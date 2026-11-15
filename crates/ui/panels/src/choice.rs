@@ -66,6 +66,12 @@ impl ChoiceDialog {
         workspace.show_overlay(view.into(), focus, window, cx);
     }
 
+    /// The question of the dialog, for a test that checks what the user is told.
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
     fn choose(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(choice) = self.choices.get(index) else {
             return;

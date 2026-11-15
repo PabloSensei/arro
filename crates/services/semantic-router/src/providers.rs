@@ -1042,11 +1042,16 @@ fn unnecessary(diagnostic: &lsp::Diagnostic) -> bool {
 
 fn diagnostic(diagnostic: lsp::Diagnostic) -> DiagnosticEntry {
     let unnecessary = unnecessary(&diagnostic);
+    let code = diagnostic.code.map(|code| match code {
+        NumberOrString::Number(code) => code.to_string(),
+        NumberOrString::String(code) => code,
+    });
     DiagnosticEntry {
         span: span(diagnostic.range),
         severity: severity(diagnostic.severity),
         message: diagnostic.message,
         unnecessary,
+        code,
     }
 }
 

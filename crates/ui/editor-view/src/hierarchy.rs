@@ -478,4 +478,20 @@ impl EditorView {
         }
         cx.emit(EditorEvent::CallHierarchy(spot));
     }
+
+    /// Ctrl+Alt+Shift+U: the window shows the diagram of the type at the caret.
+    pub(crate) fn show_diagram(&mut self, cx: &mut Context<Self>) {
+        let Some((spot, _)) = self.spot() else {
+            return;
+        };
+        if self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.support.type_graph())
+            .is_none()
+        {
+            return;
+        }
+        cx.emit(EditorEvent::ShowDiagram(spot));
+    }
 }

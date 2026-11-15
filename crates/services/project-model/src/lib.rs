@@ -6,6 +6,7 @@ mod cache;
 mod environment;
 mod model;
 mod open;
+pub mod scaffold;
 
 pub use build_tools::{BuildToolSettings, BuildTools};
 pub use cache::{cache_file, default_cache_root};

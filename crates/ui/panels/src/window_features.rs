@@ -3,7 +3,12 @@
 
 use keymap::workspace as keys;
 use ui_kit::*;
-use workspace::{TASKS_TOOL, UI_SCALE_STEP, Workspace};
+use workspace::{
+    TASKS_TOOL, TOGGLE_BREADCRUMBS, TOGGLE_DISTRACTION_FREE, TOGGLE_FULL_SCREEN,
+    TOGGLE_GUTTER_ICONS, TOGGLE_INDENT_GUIDES, TOGGLE_LINE_NUMBERS, TOGGLE_NAVIGATION_BAR,
+    TOGGLE_PRESENTATION_MODE, TOGGLE_STATUS_BAR, TOGGLE_STICKY_LINES, TOGGLE_TOOL_WINDOW_BARS,
+    TOGGLE_TOOLBAR, TOGGLE_ZEN_MODE, UI_SCALE_STEP, Workspace,
+};
 
 use crate::call_hierarchy::ActiveCallHierarchy;
 use crate::method_hierarchy::ActiveMethodHierarchy;
@@ -70,17 +75,71 @@ pub fn register(workspace: &mut Workspace, _window: &mut Window, cx: &mut Contex
         "Focus Editor",
         |workspace, window, cx| workspace.focus_editor(window, cx),
     );
-    workspace.register_command(keys::ZOOM_IN_IDE, "Zoom In Arro", |workspace, _, cx| {
+    workspace.register_command(keys::ZOOM_IN_IDE, "Zoom In", |workspace, _, cx| {
         workspace.zoom_ide(UI_SCALE_STEP, cx)
     });
-    workspace.register_command(keys::ZOOM_OUT_IDE, "Zoom Out Arro", |workspace, _, cx| {
+    workspace.register_command(keys::ZOOM_OUT_IDE, "Zoom Out", |workspace, _, cx| {
         workspace.zoom_ide(-UI_SCALE_STEP, cx)
     });
+    workspace.register_command(keys::RESET_IDE_SCALE, "Reset Zoom", |workspace, _, cx| {
+        workspace.reset_ide_scale(cx)
+    });
+    // View | Appearance: the modes of the window and the parts it shows.
     workspace.register_command(
-        keys::RESET_IDE_SCALE,
-        "Reset Arro Scale",
-        |workspace, _, cx| workspace.reset_ide_scale(cx),
+        TOGGLE_FULL_SCREEN,
+        "Enter Full Screen",
+        |workspace, window, cx| workspace.toggle_full_screen(window, cx),
     );
+    workspace.register_command(
+        TOGGLE_DISTRACTION_FREE,
+        "Enter Distraction Free Mode",
+        |workspace, window, cx| workspace.toggle_distraction_free(window, cx),
+    );
+    workspace.register_command(
+        TOGGLE_ZEN_MODE,
+        "Enter Zen Mode",
+        |workspace, window, cx| workspace.toggle_zen_mode(window, cx),
+    );
+    workspace.register_command(
+        TOGGLE_PRESENTATION_MODE,
+        "Enter Presentation Mode",
+        |workspace, window, cx| workspace.toggle_presentation_mode(window, cx),
+    );
+    type Switch = fn(&mut workspace::Settings);
+    let switches: [(&'static str, &'static str, Switch); 9] = [
+        (TOGGLE_TOOLBAR, "Toolbar", |settings| {
+            settings.toolbar_visible = !settings.toolbar_visible
+        }),
+        (TOGGLE_TOOL_WINDOW_BARS, "Tool Window Bars", |settings| {
+            settings.tool_window_bars_visible = !settings.tool_window_bars_visible
+        }),
+        (TOGGLE_STATUS_BAR, "Status Bar", |settings| {
+            settings.status_bar_visible = !settings.status_bar_visible
+        }),
+        (TOGGLE_NAVIGATION_BAR, "Navigation Bar", |settings| {
+            settings.navigation_bar_visible = !settings.navigation_bar_visible
+        }),
+        (TOGGLE_LINE_NUMBERS, "Line Numbers", |settings| {
+            settings.show_line_numbers = !settings.show_line_numbers
+        }),
+        (TOGGLE_GUTTER_ICONS, "Gutter Icons", |settings| {
+            settings.show_gutter_icons = !settings.show_gutter_icons
+        }),
+        (TOGGLE_INDENT_GUIDES, "Indent Guides", |settings| {
+            settings.show_indent_guides = !settings.show_indent_guides
+        }),
+        (TOGGLE_BREADCRUMBS, "Breadcrumbs", |settings| {
+            settings.show_breadcrumbs = !settings.show_breadcrumbs
+        }),
+        (TOGGLE_STICKY_LINES, "Sticky Lines", |settings| {
+            settings.show_sticky_lines = !settings.show_sticky_lines
+        }),
+    ];
+    for (id, title, flip) in switches {
+        workspace.register_command(id, title, move |workspace, _, cx| {
+            workspace.update_settings(flip, cx);
+        });
+    }
     workspace.register_command(
         keys::EDITOR_FONT_INCREASE,
         "Increase Editor Font Size",

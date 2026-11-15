@@ -5,12 +5,14 @@
 
 use std::path::Path;
 
+mod curl;
 mod env;
 mod execute;
 mod highlight;
 mod history;
 mod json;
 mod parse;
+mod script;
 mod variables;
 
 #[cfg(test)]
@@ -20,12 +22,14 @@ mod execute_tests;
 #[cfg(test)]
 mod test_server;
 
+pub use curl::{Imported, Shell, from_curl, is_curl, quote, to_curl};
 pub use env::{Environments, environment_files, load_environments};
 pub use execute::{Cancel, DEFAULT_TIMEOUT, Error, Response, execute};
 pub use highlight::{Span, TokenKind, highlight, highlight_json};
 pub use history::{HistoryEntry, history_dir, load_history, read_body, save_response};
 pub use json::pretty_json;
-pub use parse::{Body, Method, ParsedFile, Problem, Request, parse};
+pub use parse::{Body, Handler, Method, ParsedFile, Problem, Request, parse};
+pub use script::{ScriptError, ScriptOutput, TestResult, run as run_script};
 pub use variables::{PreparedRequest, Variables, prepare, substitute};
 
 /// Whether `path` is a request file the HTTP client shows.

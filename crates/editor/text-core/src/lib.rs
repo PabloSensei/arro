@@ -10,7 +10,9 @@ mod encoding;
 mod file;
 pub mod find;
 mod history;
+pub mod idea_style;
 pub mod indent;
+pub mod properties;
 mod selection;
 mod store;
 
@@ -24,6 +26,7 @@ pub use encoding::{
 };
 pub use file::{FileUpdate, MAX_EDITABLE_BYTES, read_file, write_file, write_files};
 pub use history::History;
+pub use idea_style::{StyleSource, properties_for, style_source};
 pub use indent::{IndentSettings, IndentSource};
 pub use selection::{Selection, SelectionSet, transform_offset};
 pub use store::{RopeStore, TextStore};

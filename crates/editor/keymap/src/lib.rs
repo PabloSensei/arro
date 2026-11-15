@@ -442,6 +442,7 @@ pub mod editor {
     pub const OVERRIDE_METHODS: &str = "editor.override_methods";
     pub const IMPLEMENT_METHODS: &str = "editor.implement_methods";
     pub const CALL_HIERARCHY: &str = "editor.call_hierarchy";
+    pub const SHOW_DIAGRAM: &str = "editor.show_diagram";
     pub const GOTO_TYPE_DECLARATION: &str = "editor.goto_type_declaration";
     pub const QUICK_DEFINITION: &str = "editor.quick_definition";
     pub const COPY_REFERENCE: &str = "editor.copy_reference";
@@ -641,6 +642,7 @@ pub mod editor {
         ("OverrideMethods", OVERRIDE_METHODS),
         ("ImplementMethods", IMPLEMENT_METHODS),
         ("CallHierarchy", CALL_HIERARCHY),
+        ("ShowUmlDiagram", SHOW_DIAGRAM),
         ("GotoTypeDeclaration", GOTO_TYPE_DECLARATION),
         ("QuickImplementations", QUICK_DEFINITION),
         ("CopyReference", COPY_REFERENCE),
@@ -821,6 +823,7 @@ pub mod workspace {
         ("GotoSymbol", GOTO_SYMBOL),
         ("SearchEverywhere", SEARCH_EVERYWHERE),
         ("GotoAction", FIND_ACTION),
+        ("ShowUmlDiagram", "window.show_diagram"),
         ("RunAnything", RUN_ANYTHING),
         ("RecentFiles", RECENT_FILES),
         ("Switcher", SWITCHER),
@@ -1082,6 +1085,7 @@ mod tests {
         ("ctrl-shift-p", editor::EXPRESSION_TYPE),
         ("ctrl-u", editor::GOTO_SUPER),
         ("ctrl-h", editor::TYPE_HIERARCHY),
+        ("ctrl-alt-shift-u", editor::SHOW_DIAGRAM),
     ];
 
     #[test]

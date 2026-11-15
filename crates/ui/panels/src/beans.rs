@@ -586,6 +586,7 @@ fn apply(view: &mut EditorView, model: &BeanModel, cx: &mut Context<EditorView>)
             severity: Severity::Warning,
             message: warning.message.clone(),
             unnecessary: false,
+            code: Some(warning.id.clone()),
         })
         .collect();
     view.set_native_marks(warnings, cx);

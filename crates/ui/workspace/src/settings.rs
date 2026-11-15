@@ -30,6 +30,12 @@ const DEFAULT_LINE_SPACING: f32 = 1.;
 pub const MAX_INDENT_SIZE: f32 = 16.;
 /// The longest wait before the completion list opens on its own, in milliseconds.
 pub const MAX_COMPLETION_DELAY_MS: u32 = 5000;
+/// The column of the right margin: the width of the centred text of Distraction Free
+/// Mode, in characters.
+pub const DEFAULT_RIGHT_MARGIN: u32 = 120;
+pub const MIN_RIGHT_MARGIN: u32 = 20;
+pub const MAX_RIGHT_MARGIN: u32 = 500;
+pub const RIGHT_MARGIN_STEP: u32 = 10;
 /// How long an HTTP request may take before it is stopped.
 pub const DEFAULT_HTTP_TIMEOUT_SECONDS: u32 = 60;
 /// The longest timeout the Settings window allows.
@@ -195,6 +201,8 @@ impl GitUpdateMethod {
 pub struct Settings {
     /// Size of the text in the editor, in points.
     pub font_size: f32,
+    /// Size of the text of the editors in Presentation Mode, in points.
+    pub presentation_font_size: f32,
     /// Scale of the whole interface, 1 for the regular size.
     pub ui_scale: f32,
     /// Family of the editor text; `JetBrains Mono` by default.
@@ -207,12 +215,23 @@ pub struct Settings {
     pub show_whitespace: bool,
     /// The line numbers in the gutter of the editor.
     pub show_line_numbers: bool,
+    /// The icons of the gutter: breakpoints, run marks, bookmarks and the fold arrows.
+    pub show_gutter_icons: bool,
     /// The background of the line with the caret.
     pub highlight_current_line: bool,
     /// The values of the variables of the stopped frame after the lines that name them.
     pub debug_show_values_inline: bool,
+    /// The frames of libraries are folded into one row of the stack.
+    pub debug_hide_library_frames: bool,
+    /// How values of some types are shown, one `type = display | children` rule per
+    /// semicolon.
+    pub debug_type_renderers: String,
     /// The thin vertical lines at the steps of the indentation.
     pub show_indent_guides: bool,
+    /// The declarations around the caret above the editor text.
+    pub show_breadcrumbs: bool,
+    /// The declarations that the top of the editor holds while the caret is in their body.
+    pub show_sticky_lines: bool,
     /// The caret blinks while the editor has the focus.
     pub caret_blink: bool,
     /// What a save does with the spaces at the end of a line.
@@ -294,6 +313,14 @@ pub struct Settings {
     /// The tool window layout Restore Default Layout goes back to; `None` is the layout
     /// of a new window.
     pub default_layout: Option<DefaultLayout>,
+    /// The column of the right margin, which also limits the width of the text of
+    /// Distraction Free Mode.
+    pub right_margin: u32,
+    /// The parts of the window that View | Appearance shows.
+    pub toolbar_visible: bool,
+    pub tool_window_bars_visible: bool,
+    pub status_bar_visible: bool,
+    pub navigation_bar_visible: bool,
     /// The language server's semantic tokens colour the names over the syntax colours.
     pub semantic_highlighting: bool,
     /// The documentation popup opens under the pointer after a delay.
@@ -302,12 +329,17 @@ pub struct Settings {
     pub build_tools: BuildTools,
     /// The sources of a class of a library are fetched as soon as the class opens.
     pub download_sources_automatically: bool,
+    /// A build file shows the newer versions of its dependencies, and offers to update
+    /// them, when the repositories of the project can be asked.
+    pub check_dependency_updates: bool,
     /// The program that runs Git; empty means the one on `PATH`.
     pub git_path: String,
     /// How Update Project brings the upstream in.
     pub git_update_method: GitUpdateMethod,
     /// A push the remote rejected fetches, updates and pushes again.
     pub git_auto_update_on_reject: bool,
+    /// Update Project initializes and updates the submodules of the project.
+    pub git_update_submodules: bool,
     /// A commit whose files carry CRLF line separators warns first.
     pub git_warn_crlf: bool,
     /// The commit window starts with code analysis.
@@ -318,6 +350,8 @@ pub struct Settings {
     pub terminal_start_directory: String,
     /// Variables of a new terminal, one `NAME=value` per line.
     pub terminal_environment: String,
+    /// A paste of more than one line asks before it reaches the shell.
+    pub terminal_confirm_multiline_paste: bool,
     /// The diff shows the two versions side by side rather than as one list.
     pub diff_side_by_side: bool,
     /// The branch popup groups local and remote branches by the folders of their names.
@@ -330,15 +364,21 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: DEFAULT_FONT_SIZE,
+            presentation_font_size: crate::appearance::DEFAULT_PRESENTATION_FONT_SIZE,
             ui_scale: DEFAULT_UI_SCALE,
             editor_font_family: "JetBrains Mono".to_owned(),
             line_spacing: DEFAULT_LINE_SPACING,
             soft_wrap: false,
             show_whitespace: false,
             show_line_numbers: true,
+            show_gutter_icons: true,
             highlight_current_line: true,
             debug_show_values_inline: true,
+            debug_hide_library_frames: true,
+            debug_type_renderers: String::new(),
             show_indent_guides: true,
+            show_breadcrumbs: true,
+            show_sticky_lines: true,
             caret_blink: true,
             trim_trailing_whitespace: TrimTrailingWhitespace::None,
             ensure_final_newline: false,
@@ -382,18 +422,26 @@ impl Default for Settings {
             todo_flatten_packages: false,
             updates_check_automatically: true,
             default_layout: None,
+            right_margin: DEFAULT_RIGHT_MARGIN,
+            toolbar_visible: true,
+            tool_window_bars_visible: true,
+            status_bar_visible: true,
+            navigation_bar_visible: true,
             semantic_highlighting: true,
             quick_doc_on_hover: true,
             build_tools: BuildTools::default(),
             download_sources_automatically: false,
+            check_dependency_updates: true,
             git_path: String::new(),
             git_update_method: GitUpdateMethod::Merge,
             git_auto_update_on_reject: false,
+            git_update_submodules: true,
             git_warn_crlf: true,
             git_analyze_before_commit: false,
             terminal_shell: String::new(),
             terminal_start_directory: String::new(),
             terminal_environment: String::new(),
+            terminal_confirm_multiline_paste: true,
             diff_side_by_side: true,
             git_group_by_directory: true,
             http_timeout_seconds: DEFAULT_HTTP_TIMEOUT_SECONDS,
@@ -450,6 +498,13 @@ impl Settings {
             self.font_size = DEFAULT_FONT_SIZE;
         }
         self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if !self.presentation_font_size.is_finite() {
+            self.presentation_font_size = crate::appearance::DEFAULT_PRESENTATION_FONT_SIZE;
+        }
+        self.presentation_font_size = self.presentation_font_size.clamp(
+            crate::appearance::MIN_PRESENTATION_FONT_SIZE,
+            crate::appearance::MAX_PRESENTATION_FONT_SIZE,
+        );
         if !self.memory_low_percent.is_finite() {
             self.memory_low_percent = DEFAULT_MEMORY_LOW_PERCENT;
         }
@@ -468,6 +523,7 @@ impl Settings {
         self.line_spacing = self.line_spacing.clamp(MIN_LINE_SPACING, MAX_LINE_SPACING);
         self.tab_size = self.tab_size.clamp(1, MAX_INDENT_SIZE as u32);
         self.indent_size = self.indent_size.clamp(1, MAX_INDENT_SIZE as u32);
+        self.right_margin = self.right_margin.clamp(MIN_RIGHT_MARGIN, MAX_RIGHT_MARGIN);
         self.completion_delay_ms = self.completion_delay_ms.min(MAX_COMPLETION_DELAY_MS);
         self.http_timeout_seconds = self.http_timeout_seconds.clamp(1, MAX_HTTP_TIMEOUT_SECONDS);
         self
@@ -477,6 +533,15 @@ impl Settings {
     pub fn with_font_step(&self, step: f32) -> Self {
         Self {
             font_size: self.font_size + step,
+            ..self.clone()
+        }
+        .clamped()
+    }
+
+    /// One step of the font of Presentation Mode, inside the limits.
+    pub fn with_presentation_font_step(&self, step: f32) -> Self {
+        Self {
+            presentation_font_size: self.presentation_font_size + step,
             ..self.clone()
         }
         .clamped()

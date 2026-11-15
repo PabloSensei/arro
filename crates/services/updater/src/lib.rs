@@ -3,7 +3,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -346,6 +346,58 @@ fn bundle_root(executable: &Path) -> PathBuf {
         }
     }
     executable.parent().unwrap_or(executable).to_owned()
+}
+
+/// Whether the program was installed from a package. Such an installation keeps its
+/// files under `/opt` or `/usr` on Linux, or in `Program Files` on Windows, and the
+/// user cannot write to them: the package manager owns the folder and replaces it,
+/// while the updater can only point at the release page. A folder of the user that lost
+/// its write rights counts too, because the updater would fail halfway through it.
+pub fn installed_from_package(install_dir: &Path) -> bool {
+    system_folder(install_dir) || (install_dir.is_dir() && !writable(install_dir))
+}
+
+/// The folders of the administrator and the package manager, whatever system the path
+/// is read on: `/opt` and `/usr`, and `Program Files` of Windows.
+fn system_folder(path: &Path) -> bool {
+    // `has_root` rather than `is_absolute`: `/opt/arro` is the root of the current
+    // drive when a Windows build reads such a path, and it means the same folder.
+    if !path.has_root() {
+        return false;
+    }
+    let mut parts = path.components().filter_map(|component| match component {
+        Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
+        _ => None,
+    });
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    matches!(
+        first.as_str(),
+        "opt" | "usr" | "program files" | "program files (x86)"
+    )
+}
+
+/// Whether a file can be created in `folder`. A folder without any write bit is refused
+/// before the attempt, so a user who could bypass the bits still gets the package
+/// message; the rest is a real attempt, because an ACL or a read-only mount is only
+/// visible that way.
+fn writable(folder: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        if platform::mode(folder).is_ok_and(|mode| mode & 0o222 == 0) {
+            return false;
+        }
+    }
+    let probe = folder.join(format!(".arro-write-{}-{}", std::process::id(), next_id()));
+    match File::create(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// The program of an installed release, next to [`install_dir`] or inside the macOS
@@ -1519,6 +1571,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod package_tests;
 #[cfg(test)]
 mod platform_tests;
 #[cfg(test)]

@@ -125,7 +125,7 @@ fn save(state: &mut EditorState, path: &Path) {
 fn open_edit_undo_save_keeps_the_file_right() {
     let source = b"class A {\r\n    int a;\r\n}\r\n";
     let path = temp_file("A.java", source);
-    let mut state = EditorState::load(&path, None).unwrap();
+    let mut state = EditorState::load(&path, None, None).unwrap();
     assert_eq!(state.eol_name(), "CRLF");
     assert_eq!(state.encoding_name(), "UTF-8");
 
@@ -145,7 +145,7 @@ fn open_edit_undo_save_keeps_the_file_right() {
 #[test]
 fn a_save_of_an_old_version_leaves_the_document_dirty() {
     let path = temp_file("A.java", b"class A {}\n");
-    let mut state = EditorState::load(&path, None).unwrap();
+    let mut state = EditorState::load(&path, None, None).unwrap();
     state.type_text("a");
     let saved = EditorState::save_snapshot(&path, state.snapshot_for_save());
     state.type_text("b");

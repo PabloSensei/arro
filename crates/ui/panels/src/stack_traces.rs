@@ -2,6 +2,8 @@
 //! dump. A frame of the project opens its file; the frames of libraries and of the
 //! runtime open what the language has for them and stay grey.
 
+use std::collections::HashMap;
+
 use editor_view::{Semantic, Spot};
 use futures_util::StreamExt;
 use lang_api::{FrameOrigin, LineKind, Report, StackLine, ThreadStack, TraceQuery, ask};
@@ -33,6 +35,8 @@ pub struct StackTracePanel {
     trace_scroll: ScrollHandle,
     thread_scroll: ScrollHandle,
     line_scroll: ScrollHandle,
+    /// Grows with every request, so the answer of an older one is dropped.
+    generation: u64,
 }
 
 /// The panel of the window, for the commands that fill it.
@@ -53,6 +57,7 @@ impl StackTracePanel {
             trace_scroll: ScrollHandle::new(),
             thread_scroll: ScrollHandle::new(),
             line_scroll: ScrollHandle::new(),
+            generation: 0,
         })
     }
 
@@ -60,7 +65,9 @@ impl StackTracePanel {
         self.focus.clone()
     }
 
-    /// Reads the text through the language, which finds the place of every frame.
+    /// Reads the text through the language, which finds the place of every frame. The
+    /// language answers twice: the text and the project frames first, the places of the
+    /// libraries after them.
     pub fn analyze(&mut self, text: String, cx: &mut Context<Self>) {
         let support = cx
             .try_global::<Semantic>()
@@ -74,12 +81,30 @@ impl StackTracePanel {
             );
             return;
         };
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         let mut replies = ask(provider, TraceQuery(text));
         cx.spawn(async move |this, cx| {
-            let Some(answer) = replies.next().await else {
-                return;
-            };
-            this.update(cx, |this, cx| this.show(answer.value, cx)).ok();
+            let mut first = true;
+            while let Some(answer) = replies.next().await {
+                let current = this
+                    .update(cx, |this, cx| {
+                        if this.generation != generation {
+                            return false;
+                        }
+                        if first {
+                            first = false;
+                            this.show(answer.value, cx);
+                        } else {
+                            this.refine(answer.value, cx);
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !current {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -105,6 +130,48 @@ impl StackTracePanel {
         self.thread_scroll.scroll_to_item(0);
         self.line_scroll.scroll_to_item(0);
         self.refresh(cx);
+        cx.notify();
+    }
+
+    /// A later answer of the same request: the places of more frames fill in. The report
+    /// the window shows keeps its shape, the chosen thread and the scroll position.
+    pub fn refine(&mut self, report: Report, cx: &mut Context<Self>) {
+        let same_shape = match (&self.report, &report) {
+            (Some(Report::Trace { lines }), Report::Trace { lines: next }) => {
+                lines.len() == next.len()
+            }
+            (Some(Report::Dump { threads, .. }), Report::Dump { threads: next, .. }) => {
+                threads.len() == next.len()
+            }
+            _ => false,
+        };
+        if !same_shape {
+            self.show(report, cx);
+            return;
+        }
+        match (&mut self.report, report) {
+            (Some(Report::Trace { lines }), Report::Trace { lines: next }) => *lines = next,
+            (
+                Some(Report::Dump { threads, deadlock }),
+                Report::Dump {
+                    threads: next,
+                    deadlock: next_deadlock,
+                },
+            ) => {
+                *deadlock = next_deadlock;
+                let mut found: HashMap<String, ThreadStack> = next
+                    .into_iter()
+                    .map(|thread| (thread.name.clone(), thread))
+                    .collect();
+                for thread in self.threads.iter_mut() {
+                    if let Some(found) = found.remove(&thread.name) {
+                        *thread = found;
+                    }
+                }
+                *threads = self.threads.clone();
+            }
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -515,6 +582,13 @@ impl StackTracePanel {
             .iter()
             .map(|index| (*index, self.threads[*index].name.clone()))
             .collect()
+    }
+
+    /// The name of the thread whose stack is on the right.
+    pub(crate) fn selected_thread(&self) -> Option<String> {
+        self.selected
+            .and_then(|index| self.threads.get(index))
+            .map(|thread| thread.name.clone())
     }
 
     /// The lines of the trace, or of the selected thread.

@@ -19,6 +19,41 @@ fn request(method: Method, url: String) -> PreparedRequest {
 }
 
 #[test]
+fn a_multipart_body_sends_the_file_of_a_part() {
+    let server = TestServer::start();
+    let root = test_support::scratch("http-client-multipart-send");
+    std::fs::write(root.join("a.bin"), b"\x00binary\x01").unwrap();
+    let file = crate::parse::parse(
+        "POST http://localhost/upload\n\
+         Content-Type: multipart/form-data; boundary=B\n\n\
+         --B\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\n\n\
+         < ./a.bin\n\
+         --B--\n",
+    );
+    let mut prepared =
+        crate::variables::prepare(&file.requests[0], &root, &crate::Variables::default())
+            .expect("the body");
+    prepared.url = server.url("/post");
+
+    let response = execute(&prepared, Duration::from_secs(5), &Cancel::new()).expect("the answer");
+
+    assert_eq!(response.status, 201);
+    let received = server.received();
+    assert_eq!(
+        received[0].header("content-type"),
+        Some("multipart/form-data; boundary=B")
+    );
+    let body = &received[0].body;
+    assert!(body.windows(8).any(|window| window == b"\x00binary\x01"));
+    assert!(
+        String::from_utf8_lossy(body).contains("name=\"file\"; filename=\"a.bin\""),
+        "{}",
+        String::from_utf8_lossy(body)
+    );
+}
+
+#[test]
 fn a_get_sends_its_headers_and_reads_the_answer() {
     let server = TestServer::start();
     let mut get = request(Method::Get, server.url("/get?lastName=Davis"));

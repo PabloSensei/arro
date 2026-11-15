@@ -58,6 +58,15 @@ pub enum Body {
     File(String),
 }
 
+/// What runs after the answer: a script between `{%` and `%}`, or a file next to the
+/// request file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Handler {
+    Inline(String),
+    /// The path as written after `>`, relative to the request file unless absolute.
+    File(String),
+}
+
 /// One request of a file with the lines it covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -67,6 +76,8 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Body>,
+    /// The script of `> {% ... %}` or `> path.js` after the request.
+    pub handler: Option<Handler>,
     /// The line of the request line, from zero.
     pub line: usize,
     /// The last non-empty line of the request, from zero.
@@ -268,6 +279,16 @@ pub fn parse(text: &str) -> ParsedFile {
         {
             body_lines.remove(0);
         }
+        let handler_at = body_lines
+            .iter()
+            .position(|line| line.trim_start().starts_with('>'));
+        let handler = handler_at.and_then(|at| handler_of(&body_lines[at..]));
+        if let (Some(at), Some(_)) = (handler_at, &handler) {
+            body_lines.truncate(at);
+            while body_lines.last().is_some_and(|line| line.trim().is_empty()) {
+                body_lines.pop();
+            }
+        }
         let body = body_of(&body_lines);
         let end_line = (start..at)
             .rev()
@@ -279,6 +300,7 @@ pub fn parse(text: &str) -> ParsedFile {
             url: url.trim().to_owned(),
             headers,
             body,
+            handler,
             line: start,
             end_line,
         });
@@ -306,9 +328,27 @@ fn body_of(lines: &[&str]) -> Option<Body> {
     Some(Body::Inline(text))
 }
 
+/// The script of the lines that start with `>`: the text between `{%` and `%}`, or the
+/// path of a script file. The lines before the first `>` are the body of the request.
+fn handler_of(lines: &[&str]) -> Option<Handler> {
+    let first = lines.first()?.trim_start().strip_prefix('>')?.trim();
+    if let Some(rest) = first.strip_prefix("{%") {
+        let mut text = String::from(rest);
+        for line in &lines[1..] {
+            text.push('\n');
+            text.push_str(line);
+        }
+        let end = text.find("%}")?;
+        return Some(Handler::Inline(text[..end].trim().to_owned()));
+    }
+    let path = first.trim_matches('"').trim();
+    (!path.is_empty() && !path.contains(char::is_whitespace))
+        .then(|| Handler::File(path.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Body, Method, parse};
+    use super::{Body, Handler, Method, parse};
 
     const FILE: &str = "\
 ### Get owners
@@ -433,5 +473,40 @@ Content-Type: application/json
         }
         let file = parse("get http://localhost/\n");
         assert_eq!(file.requests[0].method, Method::Get);
+    }
+
+    #[test]
+    fn a_script_after_the_request_is_not_its_body() {
+        let file = parse(
+            "POST http://localhost/api\nContent-Type: application/json\n\n{\"a\":1}\n\n\
+             > {%\n client.global.set(\"id\", response.body.id);\n %}\n",
+        );
+        let request = &file.requests[0];
+        assert_eq!(request.body, Some(Body::Inline("{\"a\":1}".to_owned())));
+        assert_eq!(
+            request.handler,
+            Some(Handler::Inline(
+                "client.global.set(\"id\", response.body.id);".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_script_can_be_a_file_of_its_own() {
+        let file = parse("GET http://localhost/\n\n> ./scripts/token.js\n");
+        assert_eq!(
+            file.requests[0].handler,
+            Some(Handler::File("./scripts/token.js".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_handler_without_a_close_is_ignored() {
+        let file = parse("GET http://localhost/\n\n> {%\n client.log(1);\n");
+        assert_eq!(file.requests[0].handler, None);
+        assert_eq!(
+            file.requests[0].body,
+            Some(Body::Inline("> {%\n client.log(1);".to_owned()))
+        );
     }
 }

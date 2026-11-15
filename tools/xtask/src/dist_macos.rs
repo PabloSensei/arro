@@ -18,9 +18,12 @@ const BINARY: &str = "arro";
 const DISPLAY_NAME: &str = "Arro";
 /// A name of ours, from the domain the project is published under.
 const BUNDLE_ID: &str = "life.pablosensei.arro";
+/// The disk image carries a shortcut so the bundle can be dragged into Applications.
+#[cfg(unix)]
+const APPLICATIONS: &str = "/Applications";
 const README: &str = include_str!("../../../dist/README-macos.txt");
 
-pub fn run(root: &Path, out: &Path, tools: Option<&Path>, zip: bool) -> Result {
+pub fn run(root: &Path, out: &Path, tools: Option<&Path>, zip: bool, dmg: bool) -> Result {
     let out = dist::absolute(out)?;
     let root = dist::absolute(root)?;
     if out == root {
@@ -87,7 +90,119 @@ pub fn run(root: &Path, out: &Path, tools: Option<&Path>, zip: bool) -> Result {
         let archive = zip_bundle(&app)?;
         println!("{}", archive.display());
     }
+    if dmg {
+        let image = dmg_image(&app)?;
+        println!("{}", image.display());
+    }
     Ok(())
+}
+
+/// The disk image: the bundle and a link to `/Applications` in a folder `hdiutil`
+/// compresses, so the Finder shows what to drag where. Someone who downloads the zip
+/// keeps using it: the updater reads the zip.
+fn dmg_image(app: &Path) -> Result<PathBuf> {
+    let parent = app.parent().ok_or("the bundle has no parent folder")?;
+    let archive = parent.join(dmg_name(env!("CARGO_PKG_VERSION"), env::consts::ARCH)?);
+    if archive.exists() {
+        fs::remove_file(&archive)?;
+    }
+    let stage = parent.join(format!(".arro-dmg-{}", std::process::id()));
+    let result = stage_for_dmg(app, &stage).and_then(|()| run_hdiutil(&stage, &archive));
+    let _ = fs::remove_dir_all(&stage);
+    if result.is_err() {
+        // A failed run must not leave an image that a later step may attach.
+        let _ = fs::remove_file(&archive);
+    }
+    result?;
+    Ok(archive)
+}
+
+/// `arro-0.1.16-macos-aarch64.dmg`, the same platform suffix as the zip.
+fn dmg_name(version: &str, arch: &str) -> Result<String> {
+    let platform = match arch {
+        "aarch64" => "macos-aarch64",
+        "x86_64" => "macos-x86_64",
+        other => return Err(format!("no macOS release for the {other} architecture").into()),
+    };
+    Ok(format!("arro-{version}-{platform}.dmg"))
+}
+
+/// The folder `hdiutil` reads: a copy of the bundle and the shortcut. The copy keeps
+/// the modes and the links of the bundle, so the signature survives, and needs no tool
+/// that the check of `hdiutil` would not name anyway.
+fn stage_for_dmg(app: &Path, stage: &Path) -> Result {
+    if stage.exists() {
+        fs::remove_dir_all(stage)?;
+    }
+    fs::create_dir_all(stage)?;
+    copy_tree(app, &stage.join(APP))?;
+    create_applications_link(&stage.join("Applications"))?;
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result {
+    let metadata = fs::symlink_metadata(from)?;
+    if metadata.file_type().is_symlink() {
+        copy_link(from, to)?;
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    fs::copy(from, to)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_link(from: &Path, to: &Path) -> Result {
+    std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_link(from: &Path, to: &Path) -> Result {
+    fs::copy(from, to)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_applications_link(link: &Path) -> Result {
+    std::os::unix::fs::symlink(APPLICATIONS, link)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_applications_link(_link: &Path) -> Result {
+    // A disk image is built on macOS; elsewhere only the command is checked.
+    Ok(())
+}
+
+/// `hdiutil create -volname Arro -srcfolder FOLDER -ov -format UDZO ARCHIVE`.
+fn dmg_command(folder: &Path, archive: &Path) -> Command {
+    let mut command = Command::new("hdiutil");
+    command
+        .args(["create", "-volname", DISPLAY_NAME, "-srcfolder"])
+        .arg(folder)
+        .args(["-ov", "-format", "UDZO"])
+        .arg(archive);
+    command
+}
+
+fn run_hdiutil(folder: &Path, archive: &Path) -> Result {
+    let mut command = dmg_command(folder, archive);
+    match command.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("hdiutil create failed: {status}").into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err("hdiutil is not available: the disk image is built on macOS".into())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The plist the Finder, `open` and Gatekeeper read. `CFBundleVersion` is the commit and
@@ -130,7 +245,75 @@ fn info_plist(version: &str, commit: &str, date: &str) -> String {
         "\t<key>ArroBuild</key>\n\t<string>{}</string>\n",
         escape(&format!("{commit} {date}"))
     ));
+    // No `LSMultipleInstancesProhibited`: Apple documents it for one program in several
+    // user sessions of the same Mac (fast user switching), not for a second process of
+    // the same user. A program of a project per window is what Arro is; the second start
+    // of one state folder hands its path to the running process through the socket.
+    text.push_str(&document_types());
     text.push_str("</dict>\n</plist>\n");
+    text
+}
+
+/// The documents the Finder offers Arro for, and the folders. Every type is an editor
+/// and an alternate handler: the default program of the type stays the default, and Arro
+/// appears in its "Open With" list.
+///
+/// macOS has no standard type for a Maven POM or a Gradle script, so those two carry the
+/// names this bundle declares for them; `pom.xml` is XML to the system and comes with the
+/// XML type too.
+fn document_types() -> String {
+    const TYPES: &[(&str, &[&str], &[&str])] = &[
+        ("Folder", &["public.folder"], &[]),
+        ("Java Source", &["com.sun.java-source"], &["java"]),
+        (
+            "Kotlin Source",
+            &["org.jetbrains.kotlin-source"],
+            &["kt", "kts"],
+        ),
+        (
+            "Gradle Build Script",
+            &["org.gradle.gradle-script"],
+            &["gradle"],
+        ),
+        ("Maven Project", &["org.apache.maven.pom"], &["pom"]),
+        (
+            "Markdown",
+            &["net.daringfireball.markdown"],
+            &["md", "markdown"],
+        ),
+        ("Properties", &["public.plain-text"], &["properties"]),
+        ("YAML", &["public.yaml"], &["yml", "yaml"]),
+        ("JSON", &["public.json"], &["json"]),
+        ("XML", &["public.xml"], &["xml"]),
+        ("Text", &["public.plain-text"], &["txt", "text"]),
+    ];
+    let mut text = String::from("\t<key>CFBundleDocumentTypes</key>\n\t<array>\n");
+    for (name, content_types, extensions) in TYPES {
+        text.push_str("\t\t<dict>\n");
+        text.push_str(&format!(
+            "\t\t\t<key>CFBundleTypeName</key>\n\t\t\t<string>{}</string>\n",
+            escape(name)
+        ));
+        text.push_str("\t\t\t<key>CFBundleTypeRole</key>\n\t\t\t<string>Editor</string>\n");
+        text.push_str("\t\t\t<key>LSHandlerRank</key>\n\t\t\t<string>Alternate</string>\n");
+        text.push_str("\t\t\t<key>LSItemContentTypes</key>\n\t\t\t<array>\n");
+        for content_type in *content_types {
+            text.push_str(&format!(
+                "\t\t\t\t<string>{}</string>\n",
+                escape(content_type)
+            ));
+        }
+        text.push_str("\t\t\t</array>\n");
+        if !extensions.is_empty() {
+            text.push_str("\t\t\t<key>CFBundleTypeExtensions</key>\n\t\t\t<array>\n");
+            for extension in *extensions {
+                text.push_str(&format!("\t\t\t\t<string>{}</string>\n", escape(extension)));
+            }
+            text.push_str("\t\t\t</array>\n");
+        }
+        text.push_str("\t\t</dict>\n");
+    }
+    text.push_str("\t</array>\n");
     text
 }
 
@@ -232,7 +415,10 @@ fn remove_old(out: &Path) -> Result {
     for entry in fs::read_dir(out)?.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if path.is_file() && name.starts_with("arro-") && name.ends_with(".zip") {
+        if path.is_file()
+            && name.starts_with("arro-")
+            && (name.ends_with(".zip") || name.ends_with(".dmg"))
+        {
             fs::remove_file(path)?;
         }
     }
@@ -263,6 +449,7 @@ fn check(command: &mut Command) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn the_plist_names_the_program_and_the_build() {
@@ -282,6 +469,65 @@ mod tests {
     #[test]
     fn a_plist_value_is_escaped() {
         assert_eq!(escape("a & b <c>"), "a &amp; b &lt;c&gt;");
+    }
+
+    /// The Finder offers Arro for the folders and the sources of a project, and leaves
+    /// the default program of each type in place: Arro is an alternate handler.
+    #[test]
+    fn the_plist_opens_the_documents_and_the_folders_of_a_project() {
+        let text = info_plist("0.1.4", "abc1234", "2026-11-12");
+
+        assert!(text.contains("<key>CFBundleDocumentTypes</key>"));
+        for content_type in [
+            "public.folder",
+            "com.sun.java-source",
+            "org.jetbrains.kotlin-source",
+            "org.gradle.gradle-script",
+            "org.apache.maven.pom",
+            "net.daringfireball.markdown",
+            "public.plain-text",
+            "public.yaml",
+            "public.json",
+            "public.xml",
+        ] {
+            assert!(
+                text.contains(&format!("<string>{content_type}</string>")),
+                "{content_type} is missing"
+            );
+        }
+        for extension in [
+            "java",
+            "kt",
+            "gradle",
+            "md",
+            "properties",
+            "yml",
+            "json",
+            "xml",
+        ] {
+            assert!(
+                text.contains(&format!("<string>{extension}</string>")),
+                "the .{extension} files are missing"
+            );
+        }
+        let roles = text
+            .matches("<key>CFBundleTypeRole</key>\n\t\t\t<string>Editor</string>")
+            .count();
+        let ranks = text
+            .matches("<key>LSHandlerRank</key>\n\t\t\t<string>Alternate</string>")
+            .count();
+        assert_eq!(
+            roles, 11,
+            "a type for every kind of document and the folder"
+        );
+        assert_eq!(ranks, roles, "every type is an alternate handler");
+        // The key is for several user sessions of one Mac, not for the windows of one
+        // user: Arro runs a process per project.
+        assert!(!text.contains("LSMultipleInstancesProhibited"));
+        assert_eq!(
+            text.matches("<array>").count(),
+            text.matches("</array>").count()
+        );
     }
 
     #[test]
@@ -306,6 +552,46 @@ mod tests {
         assert_eq!(
             macos_paths(text, "aarch64-apple-darwin"),
             "in tools/jdtls-1.63.0 and arro for aarch64-apple-darwin"
+        );
+    }
+
+    #[test]
+    fn the_disk_image_is_named_after_the_platform_as_the_zip() {
+        assert_eq!(
+            dmg_name("0.1.16", "aarch64").unwrap(),
+            "arro-0.1.16-macos-aarch64.dmg"
+        );
+        assert_eq!(
+            dmg_name("0.1.16", "x86_64").unwrap(),
+            "arro-0.1.16-macos-x86_64.dmg"
+        );
+        assert!(dmg_name("0.1.16", "riscv64").is_err());
+    }
+
+    #[test]
+    fn hdiutil_gets_the_volume_the_folder_and_the_format() {
+        let command = dmg_command(
+            Path::new("/tmp/stage"),
+            Path::new("/tmp/arro-0.1.16-macos-aarch64.dmg"),
+        );
+        assert_eq!(command.get_program(), "hdiutil");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "create",
+                "-volname",
+                "Arro",
+                "-srcfolder",
+                "/tmp/stage",
+                "-ov",
+                "-format",
+                "UDZO",
+                "/tmp/arro-0.1.16-macos-aarch64.dmg"
+            ]
         );
     }
 }

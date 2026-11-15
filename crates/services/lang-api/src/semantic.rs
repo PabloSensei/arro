@@ -175,11 +175,61 @@ pub struct DiagnosticEntry {
     /// The server marked the span as something that can go, an unused declaration for
     /// one. The editor greys it out the way an IDE does.
     pub unnecessary: bool,
+    /// The stable name of the check that gave the entry, when it has one. The editor
+    /// looks the settings of the project up by it, and a native check names itself here.
+    pub code: Option<String>,
+}
+
+/// Where a suppression of a check goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuppressionTarget {
+    Statement,
+    Method,
+    Class,
+}
+
+/// A check to suppress at a place of a document. The text comes with the query, so a
+/// language answers without reading the disk again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuppressionQuery {
+    pub text: Arc<str>,
+    /// The byte offset of the problem in `text`.
+    pub offset: usize,
+    /// The code the language gave the diagnostic, or the id of the check.
+    pub code: Option<String>,
+    pub target: SuppressionTarget,
+}
+
+/// What a language suppresses a check with: a comment or an annotation of the language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuppressionStyle {
+    /// `//noinspection <id>` on the line before, which the language itself respects.
+    Comment,
+    /// `@SuppressWarnings("...")` on the declaration, which the language server understands.
+    Annotation,
 }
 
 /// The document whose diagnostics are wanted, by URI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiagnosticsQuery(pub String);
+
+/// One dependency the project declares and the version it asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyVersion {
+    /// The name of the dependency, `group:artifact` for a repository coordinate.
+    pub name: String,
+    /// The version the project asks for.
+    pub current: String,
+    /// The newest stable version that is newer than `current`.
+    pub latest: Option<String>,
+}
+
+/// The dependencies whose updates a window asks about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyVersionQuery {
+    /// The name of each dependency and its version.
+    pub dependencies: Vec<(String, String)>,
+}
 
 /// The kind of a semantic token, as far as the editor draws it. A language maps the
 /// names of its server onto these, so the editor needs no vocabulary of its own.
@@ -800,6 +850,10 @@ pub type UsageProvider = dyn Provider<DocumentSpot, Vec<UsageEntry>>;
 
 /// The stream stays open and sends the full list whenever it changes.
 pub type DiagnosticsProvider = dyn Provider<DiagnosticsQuery, Vec<DiagnosticEntry>>;
+
+/// The versions of the dependencies the project declares. An answer comes from the cache
+/// first, and again when a repository has answered, so the window never waits.
+pub type DependencyUpdatesProvider = dyn Provider<DependencyVersionQuery, Vec<DependencyVersion>>;
 
 /// Every diagnostic the server has published, for Inspect Code over a scope.
 pub type WorkspaceDiagnosticsProvider =

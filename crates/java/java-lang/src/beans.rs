@@ -736,6 +736,7 @@ pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
             model.warnings.push(BeanWarning {
                 file: injection.file.clone(),
                 range: injection.range.clone(),
+                id: "beans.multipleCandidates".to_owned(),
                 message: format!(
                     "Could not autowire. There is more than one bean of '{short}' type: {}",
                     names.join(", ")
@@ -746,6 +747,7 @@ pub fn build_model(files: &[(&Path, &java_syntax::SpringFile)]) -> BeanModel {
             model.warnings.push(BeanWarning {
                 file: injection.file.clone(),
                 range: injection.range.clone(),
+                id: "beans.noCandidate".to_owned(),
                 message: format!("Could not autowire. No beans of '{short}' type found"),
             });
         }

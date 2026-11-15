@@ -92,7 +92,7 @@ jobs:
               curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
               . "$HOME/.cargo/env"
               cargo run -q -p xtask -- dist --target linux \
-                --out "/work/dist/$NAME" --tools /work/tools --zip
+                --out "/work/dist/$NAME" --tools /work/tools --zip --deb
               # The newest glibc the program asks for; anything past 2.35 would shut
               # out the systems this build is for.
               newest=$(objdump -T "/work/dist/$NAME/arro" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1)
@@ -103,6 +103,10 @@ jobs:
           cd "$RUNNER_TEMP/dist"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           cat "$name.tar.gz.sha256"
+          for package in arro_*_amd64.deb; do
+            sha256sum "$package" > "$package.sha256"
+            cat "$package.sha256"
+          done
 
       - name: Attach to the release
         if: inputs.tag != ''
@@ -112,6 +116,8 @@ jobs:
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/dist/"arro-*.tar.gz \
             "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256 \
+            "$RUNNER_TEMP/dist/"arro_*.deb \
+            "$RUNNER_TEMP/dist/"arro_*.deb.sha256 \
             --clobber
 
       - name: Keep the trial archive
@@ -122,6 +128,8 @@ jobs:
           path: |
             ${{ runner.temp }}/dist/arro-*.tar.gz
             ${{ runner.temp }}/dist/arro-*.tar.gz.sha256
+            ${{ runner.temp }}/dist/arro_*.deb
+            ${{ runner.temp }}/dist/arro_*.deb.sha256
           retention-days: 7
 
   macos:
@@ -175,10 +183,13 @@ jobs:
           out="$RUNNER_TEMP/dist"
           mkdir -p "$out"
           cargo run -q -p xtask -- dist --target macos --out "$out" \
-            --tools "$RUNNER_TEMP/tools" --zip
+            --tools "$RUNNER_TEMP/tools" --zip --dmg
           cd "$out"
-          shasum -a 256 "arro-$version-$platform.zip" > "arro-$version-$platform.zip.sha256"
-          cat "arro-$version-$platform.zip.sha256"
+          for archive in "arro-$version-$platform.zip" "arro-$version-$platform.dmg"; do
+            shasum -a 256 "$archive" > "$archive.sha256"
+            cat "$archive.sha256"
+          done
+          hdiutil verify "arro-$version-$platform.dmg"
 
       - name: Attach to the release
         env:
@@ -187,6 +198,8 @@ jobs:
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/dist/"arro-*.zip \
             "$RUNNER_TEMP/dist/"arro-*.zip.sha256 \
+            "$RUNNER_TEMP/dist/"arro-*.dmg \
+            "$RUNNER_TEMP/dist/"arro-*.dmg.sha256 \
             --clobber
 
   # The draft becomes public only when every archive is there and matches its checksum,
@@ -207,7 +220,9 @@ jobs:
           for archive in \
             "arro-$version-windows-x86_64.zip" \
             "arro-$version-linux-x86_64.tar.gz" \
-            "arro-$version-macos-aarch64.zip"; do
+            "arro-$version-macos-aarch64.zip" \
+            "arro-$version-macos-aarch64.dmg" \
+            "arro_${version}_amd64.deb"; do
             [ -f "$archive" ] || { echo "missing $archive"; exit 1; }
             [ -f "$archive.sha256" ] || { echo "missing $archive.sha256"; exit 1; }
             expected=$(cut -d' ' -f1 "$archive.sha256")
@@ -225,6 +240,13 @@ jobs:
             || { echo "the macOS archive has no Arro.app"; exit 1; }
           unzip -l "arro-$version-windows-x86_64.zip" | grep -q "arro.exe" \
             || { echo "the Windows archive has no arro.exe"; exit 1; }
+          deb="arro_${version}_amd64.deb"
+          dpkg-deb --info "$deb" | grep -q "Version: $version" \
+            || { echo "the package has another version"; exit 1; }
+          contents=$(dpkg-deb --contents "$deb")
+          for path in ./opt/arro/arro ./usr/bin/arro ./usr/share/applications/arro.desktop; do
+            echo "$contents" | grep -q " $path" || { echo "the package has no $path"; exit 1; }
+          done
 
       - name: Publish
         env:

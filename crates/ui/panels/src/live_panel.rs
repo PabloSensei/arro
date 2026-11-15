@@ -98,6 +98,11 @@ impl LivePanel {
         self.stopped
     }
 
+    /// The port the application listens on, when the language knows it.
+    pub fn app_port(&self) -> Option<u16> {
+        self.app.app_port()
+    }
+
     pub fn missing(&self) -> Option<&LiveNote> {
         self.missing.as_ref()
     }

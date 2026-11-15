@@ -7,7 +7,7 @@ use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
 use editor_view::Spot;
-use runner::{TestRequest, TestRun, TestState, TestTree, TreeNode};
+use runner::{TestEvent, TestRequest, TestRun, TestState, TestTree, TreeNode};
 
 use super::*;
 use crate::navigation;
@@ -17,6 +17,8 @@ use crate::navigation;
 const EVENT_DRAIN: Duration = Duration::from_secs(5);
 const TREE_WIDTH: f32 = 360.;
 const CHIP_HEIGHT: f32 = 22.;
+/// The pause after the last save of a burst before the tests run again.
+const AUTO_TEST_DELAY: Duration = Duration::from_secs(1);
 
 /// Everything about the last test run that the window shows.
 pub(super) struct TestView {
@@ -29,6 +31,13 @@ pub(super) struct TestView {
     pub tree: TestTree,
     pub selected: Option<String>,
     pub only_failed: bool,
+    /// The events the tree was built from, kept so the run can be shown again from the
+    /// history.
+    pub events: Vec<TestEvent>,
+    /// The tree is a run from the history: it does not change and runs nothing.
+    pub history: bool,
+    /// The finished run is already in the history.
+    pub recorded: bool,
     collapsed: HashSet<String>,
     scroll: UniformListScrollHandle,
     detail: Vec<Frame>,
@@ -60,6 +69,9 @@ impl TestView {
             tree: TestTree::default(),
             selected: None,
             only_failed: false,
+            events: Vec::new(),
+            history: false,
+            recorded: false,
             collapsed: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
             detail: Vec::new(),
@@ -92,6 +104,9 @@ impl TestView {
 
     /// Applies what the tests reported. True when the tree changed.
     pub fn poll(&mut self, files: &[PathBuf]) -> bool {
+        if self.history {
+            return false;
+        }
         let Some(run) = &self.run else {
             return false;
         };
@@ -101,6 +116,7 @@ impl TestView {
             match run.events().try_recv() {
                 Ok(event) => {
                     self.tree.apply(&event);
+                    self.events.push(event);
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -496,11 +512,151 @@ impl RunPanel {
     }
 
     /// The Rerun button: the tests when they ran last, else the selected configuration.
+    /// A program that runs is stopped at once, as Ctrl+F5 reruns it; only Run asks.
     pub fn rerun_last(&mut self, cx: &mut Context<Self>) {
         match self.tests.request.clone() {
             Some(request) => self.run_tests(request, cx),
-            None => self.run(cx),
+            None if self.starting => {}
+            None if self.busy() => {
+                self.confirm_rerun = None;
+                self.rerun = true;
+                self.stop_running();
+                self.changed(cx);
+            }
+            None => self.start(cx),
         }
+    }
+
+    /// The Auto chip of the test window: the last tests run again after a save.
+    pub fn auto_test(&self) -> bool {
+        self.auto_test
+    }
+
+    pub fn toggle_auto_test(&mut self, cx: &mut Context<Self>) {
+        self.auto_test = !self.auto_test;
+        if !self.auto_test {
+            self.auto_pending = false;
+        }
+        self.changed(cx);
+    }
+
+    /// A file of the project was saved. The last tests run again after the saves of a
+    /// burst settle, as the Auto toggle of the test window asks.
+    pub fn project_file_saved(&mut self, path: &StdPath, cx: &mut Context<Self>) {
+        if !self.auto_test
+            || self.tests.history
+            || self.tests.request.is_none()
+            || !path.starts_with(&self.root)
+        {
+            return;
+        }
+        self.auto_saves = self.auto_saves.wrapping_add(1);
+        let mine = self.auto_saves;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AUTO_TEST_DELAY).await;
+            this.update(cx, |this, cx| {
+                if this.auto_saves != mine {
+                    return;
+                }
+                this.auto_pending = true;
+                this.run_auto_tests(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs the tests a save asked for once nothing runs: a run that is going is never
+    /// stopped for it.
+    fn run_auto_tests(&mut self, cx: &mut Context<Self>) {
+        if !self.auto_pending {
+            return;
+        }
+        if self.starting
+            || self.busy()
+            || self.queued_tests.is_some()
+            || self.waiting_tests.is_some()
+        {
+            return;
+        }
+        let Some(request) = self.tests.request.clone() else {
+            self.auto_pending = false;
+            return;
+        };
+        self.auto_pending = false;
+        self.run_tests(request, cx);
+    }
+
+    /// The runs of the history, the newest first.
+    pub fn test_history(&self) -> &[runner::TestHistoryRun] {
+        &self.test_history
+    }
+
+    pub fn history_open(&self) -> bool {
+        self.history_open
+    }
+
+    pub fn toggle_history(&mut self, cx: &mut Context<Self>) {
+        self.history_open = !self.history_open;
+        cx.notify();
+    }
+
+    /// Shows the tree of an earlier run, read only. The tree of the run that is going
+    /// stays in the history and is not touched.
+    pub fn show_history_run(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let Some(run) = self.test_history.get(index).cloned() else {
+            return false;
+        };
+        let mut view = TestView::new();
+        view.request = Some(run.request);
+        view.finished = true;
+        view.history = true;
+        view.events = run.events.clone();
+        for event in &run.events {
+            view.tree.apply(event);
+        }
+        let files = self.file_list(cx);
+        if let Some(id) = view.failed_ids().into_iter().next() {
+            view.select(&id, &files);
+        }
+        self.tests = view;
+        self.history_open = false;
+        self.title = format!("History: {}", run.name).into();
+        self.lines.clear();
+        cx.emit(TestsChanged);
+        self.changed(cx);
+        true
+    }
+
+    /// Writes the finished run into the history of the state folder.
+    fn record_history(&mut self, cx: &mut Context<Self>) {
+        self.tests.recorded = true;
+        let Some(request) = self.tests.request.clone() else {
+            return;
+        };
+        let counts = self.tests.tree.counts();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |age| age.as_secs());
+        let run = runner::TestHistoryRun {
+            at,
+            name: title_of(&request),
+            passed: counts.passed,
+            failed: counts.failed,
+            aborted: counts.aborted,
+            skipped: counts.skipped,
+            request,
+            events: self.tests.events.clone(),
+        };
+        self.test_history.insert(0, run);
+        self.test_history.truncate(runner::HISTORY_LIMIT);
+        let file = runner::test_history_file(&self.cache_root);
+        let runs = self.test_history.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = runner::save_test_history(&file, &runs);
+            })
+            .detach();
     }
 
     /// Called every poll with the console already read.
@@ -509,6 +665,12 @@ impl RunPanel {
         let changed = self.tests.poll(&files);
         if changed {
             cx.emit(TestsChanged);
+        }
+        if self.tests.finished && !self.tests.recorded && !self.tests.history {
+            self.record_history(cx);
+        }
+        if self.auto_pending {
+            self.run_auto_tests(cx);
         }
         changed
     }
@@ -685,36 +847,88 @@ impl RunPanel {
         );
         let header = div()
             .flex()
+            .flex_col()
             .flex_none()
-            .items_center()
-            .gap(px(4.))
-            .h(px(ROW_HEIGHT + 6.))
+            .gap(px(2.))
+            .py(px(2.))
             .px(px(8.))
-            .child(div().flex_1().min_w_0().truncate().child(summary))
-            .child(chip(
-                "tests-only-failed",
-                "Failed",
-                self.tests.only_failed,
-                &theme,
-                cx.listener(|this, _, _, cx| {
-                    this.tests.only_failed = !this.tests.only_failed;
-                    cx.notify();
-                }),
-            ))
-            .child(chip(
-                "tests-rerun-failed",
-                "Rerun failed",
-                false,
-                &theme,
-                cx.listener(|this, _, _, cx| this.rerun_failed(cx)),
-            ))
-            .child(chip(
-                "tests-debug-selected",
-                "Debug",
-                false,
-                &theme,
-                cx.listener(|this, _, window, cx| this.debug_selected_test(window, cx)),
-            ));
+            .child(div().h(px(ROW_HEIGHT)).min_w_0().truncate().child(summary))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(chip(
+                        "tests-only-failed",
+                        "Failed",
+                        self.tests.only_failed,
+                        &theme,
+                        cx.listener(|this, _, _, cx| {
+                            this.tests.only_failed = !this.tests.only_failed;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(chip(
+                        "tests-rerun-failed",
+                        "Rerun failed",
+                        false,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.rerun_failed(cx)),
+                    ))
+                    .child(chip(
+                        "tests-auto",
+                        "Auto",
+                        self.auto_test,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_auto_test(cx)),
+                    ))
+                    .child(chip(
+                        "tests-history",
+                        "History",
+                        self.history_open,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_history(cx)),
+                    ))
+                    .child(chip(
+                        "tests-debug-selected",
+                        "Debug",
+                        false,
+                        &theme,
+                        cx.listener(|this, _, window, cx| this.debug_selected_test(window, cx)),
+                    )),
+            );
+        let history = self.history_open.then(|| {
+            let rows = self.test_history.iter().enumerate().map(|(index, run)| {
+                let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(run.at);
+                let label: SharedString =
+                    format!("{}: {} passed, {} failed", run.name, run.passed, run.failed).into();
+                let age: SharedString = crate::history_view::age(at).into();
+                let hover = theme.hover;
+                div()
+                    .id(("test-history-row", index))
+                    .debug_selector(move || format!("tests-history-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(ROW_HEIGHT))
+                    .px(px(SPACE_M))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(div().flex_none().text_color(theme.text_muted).child(age))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.show_history_run(index, cx);
+                    }))
+            });
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .children(rows)
+                .into_any_element()
+        });
         let rows = self.tests.rows();
         let empty = rows.is_empty();
         let hint = if !empty {
@@ -733,6 +947,7 @@ impl RunPanel {
             .border_r_1()
             .border_color(theme.border)
             .child(header)
+            .children(history)
             .children(hint.map(|hint| {
                 div()
                     .px(px(12.))

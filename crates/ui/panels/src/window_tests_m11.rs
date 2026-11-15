@@ -575,6 +575,7 @@ fn diagnostic(line: u32, character: u32, message: &str) -> DiagnosticEntry {
         severity: Severity::Error,
         message: message.to_owned(),
         unnecessary: false,
+        code: None,
     }
 }
 
@@ -747,6 +748,8 @@ impl RunConfigProvider for LateRun {
             provider: "fixture".into(),
             assemble_first: false,
             settings: Default::default(),
+
+            ..RunConfig::default()
         }])
     }
 

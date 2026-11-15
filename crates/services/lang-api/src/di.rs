@@ -66,6 +66,8 @@ pub struct BeanWarning {
     pub file: PathBuf,
     /// The byte range of the type to underline.
     pub range: Range<usize>,
+    /// The stable name of the check that found the warning.
+    pub id: String,
     pub message: String,
 }
 

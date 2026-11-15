@@ -15,7 +15,32 @@ pub fn take_over_old_folders() -> Vec<String> {
     if !had_state && state.exists() {
         failed.extend(drop_jdtls_caches(&state));
     }
+    #[cfg(unix)]
+    failed.extend(take_over_cache());
     failed
+}
+
+/// The cache of the project model moved from the state folder to the cache folder of the
+/// system. A cache builds again, so a failed move is only reported: the next opening of a
+/// project writes a new one.
+#[cfg(unix)]
+fn take_over_cache() -> Vec<String> {
+    let old = base::app::folder("LOCALAPPDATA").join("projects");
+    let new = base::app::cache_folder().join("projects");
+    if new.exists() || !old.exists() {
+        return Vec::new();
+    }
+    if let Some(parent) = new.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::rename(&old, &new) {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![format!(
+            "could not move {} to {}: {error}",
+            old.display(),
+            new.display()
+        )],
+    }
 }
 
 /// jdtls keeps absolute paths of its own folder in its OSGi and Gradle caches, so after a

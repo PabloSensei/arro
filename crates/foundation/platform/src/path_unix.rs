@@ -59,6 +59,17 @@ pub fn path_key(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The path a `file://` URL names, as `open` of the Finder hands it over:
+/// `file:///home/user/a%20b.txt`.
+pub fn file_url_path(url: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = crate::url::percent_decode(rest)?;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +125,18 @@ mod tests {
             path_key(Path::new("/home/user/README.md")),
             path_key(Path::new("/home/user/readme.md"))
         );
+    }
+
+    #[test]
+    fn a_file_url_is_a_path() {
+        assert_eq!(
+            file_url_path("file:///home/user/a%20b.txt"),
+            Some(PathBuf::from("/home/user/a b.txt"))
+        );
+        assert_eq!(
+            file_url_path("file://localhost/home/user/%D0%BF%D1%80/A.txt"),
+            Some(PathBuf::from("/home/user/пр/A.txt"))
+        );
+        assert_eq!(file_url_path("https://example.com/a"), None);
     }
 }

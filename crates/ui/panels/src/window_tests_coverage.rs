@@ -140,6 +140,8 @@ impl RunConfigProvider for FixtureCoverage {
             provider: self.id().into(),
             assemble_first: false,
             settings: Default::default(),
+
+            ..RunConfig::default()
         }])
     }
 

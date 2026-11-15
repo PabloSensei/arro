@@ -22,36 +22,48 @@ pub struct MockDap {
 impl MockDap {
     /// Binds a free port and starts serving. The first connection gets the scenario.
     pub fn start() -> std::io::Result<Self> {
-        Self::start_with_threads(0, None, false, false)
+        Self::start_with_threads(0, None, false, false, false, false)
     }
 
     /// The same scenario with `virtual_threads` extra threads, named the way the JDK
     /// names a virtual thread. A test reads a large thread list without a real JVM.
     pub fn start_with_virtual_threads(virtual_threads: usize) -> std::io::Result<Self> {
-        Self::start_with_threads(virtual_threads, None, false, false)
+        Self::start_with_threads(virtual_threads, None, false, false, false, false)
     }
 
     /// The scenario with the stack frame of a real file, for the window actions that open
     /// the place of a frame.
     pub fn start_with_stack_source(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), false, false)
+        Self::start_with_threads(0, Some(source.into()), false, false, false, false)
     }
 
     /// The scenario of an adapter that lists the requests for method breakpoints, field
     /// watchpoints and frame restarts among its capabilities.
     pub fn start_with_breakpoint_kinds() -> std::io::Result<Self> {
-        Self::start_with_threads(0, None, true, false)
+        Self::start_with_threads(0, None, true, false, false, false)
     }
 
     /// The same, on a real file, for the window tests of the gutter.
     pub fn start_with_breakpoint_kinds_for(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), true, false)
+        Self::start_with_threads(0, Some(source.into()), true, false, false, false)
     }
 
     /// The scenario of an adapter that supports logpoints: a breakpoint with a message
     /// prints the message and does not stop the program.
     pub fn start_with_log_points(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), false, true)
+        Self::start_with_threads(0, Some(source.into()), false, true, false, false)
+    }
+
+    /// The scenario with frames of libraries between two frames of the project, for the
+    /// filter of the stack.
+    pub fn start_with_library_frames(source: impl Into<String>) -> std::io::Result<Self> {
+        Self::start_with_threads(0, Some(source.into()), false, false, true, false)
+    }
+
+    /// The scenario of two stops with values of one type: at the second stop the handle
+    /// of a value is given to another value, and the marked value has a new handle.
+    pub fn start_with_identity_objects(source: impl Into<String>) -> std::io::Result<Self> {
+        Self::start_with_threads(0, Some(source.into()), false, false, false, true)
     }
 
     fn start_with_threads(
@@ -59,21 +71,23 @@ impl MockDap {
         source: Option<String>,
         breakpoint_kinds: bool,
         log_points: bool,
+        library_frames: bool,
+        identity_objects: bool,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?.to_string();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = seen.clone();
+        let scenario = Scenario {
+            source,
+            breakpoint_kinds,
+            log_points,
+            library_frames,
+            identity_objects,
+        };
         let thread = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
-                let _ = serve(
-                    stream,
-                    &recorded,
-                    virtual_threads,
-                    source.as_deref(),
-                    breakpoint_kinds,
-                    log_points,
-                );
+                let _ = serve(stream, &recorded, virtual_threads, &scenario);
             }
         });
         Ok(Self {
@@ -105,6 +119,15 @@ impl MockDap {
     }
 }
 
+/// The answers one mock adapter gives: which stack, which requests and which values.
+struct Scenario {
+    source: Option<String>,
+    breakpoint_kinds: bool,
+    log_points: bool,
+    library_frames: bool,
+    identity_objects: bool,
+}
+
 impl Drop for MockDap {
     fn drop(&mut self) {
         // A dropped adapter leaves its thread waiting for the next request. Joining here
@@ -117,11 +140,12 @@ fn serve(
     stream: TcpStream,
     seen: &Mutex<Vec<Value>>,
     virtual_threads: usize,
-    source: Option<&str>,
-    breakpoint_kinds: bool,
-    log_points: bool,
+    scenario: &Scenario,
 ) -> std::io::Result<()> {
-    let source = source.unwrap_or("C:/fixture/demo.sample");
+    let source = scenario
+        .source
+        .as_deref()
+        .unwrap_or("C:/fixture/demo.sample");
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     let mut seq = 0;
@@ -130,6 +154,7 @@ fn serve(
     let mut exception_stopped = false;
     let mut has_log_points = false;
     let mut text_value = "\"hello\"".to_owned();
+    let mut identity_stop = 1;
     while let Some(message) = read_message(&mut reader)? {
         if message.get("type").and_then(Value::as_str) != Some("request") {
             continue;
@@ -156,12 +181,12 @@ fn serve(
                         {"filter": "uncaught", "label": "Uncaught Exceptions", "default": true}
                     ]
                 });
-                if breakpoint_kinds {
+                if scenario.breakpoint_kinds {
                     body["supportsFunctionBreakpoints"] = json!(true);
                     body["supportsDataBreakpoints"] = json!(true);
                     body["supportsRestartFrame"] = json!(true);
                 }
-                if log_points {
+                if scenario.log_points {
                     body["supportsLogPoints"] = json!(true);
                 }
                 respond(&mut writer, seq, request_seq, command, body)?;
@@ -228,7 +253,7 @@ fn serve(
                     json!({"breakpoints": entries}),
                 )?;
                 // A logpoint prints its message on a hit and leaves the program running.
-                if log_points {
+                if scenario.log_points {
                     has_log_points = !messages.is_empty();
                     for message in messages {
                         seq += 1;
@@ -398,17 +423,29 @@ fn serve(
                     json!({"threads": threads}),
                 )?
             }
-            "stackTrace" => respond(
-                &mut writer,
-                seq,
-                request_seq,
-                command,
-                json!({"stackFrames": [
-                    // No source and line zero on purpose.
-                    {"id": 11, "name": "run", "source": {}, "line": 0, "column": 0},
-                    {"id": 12, "name": "start", "source": {"path": source}, "line": 42, "column": 1},
-                ]}),
-            )?,
+            "stackTrace" => {
+                let stack_frames = if scenario.library_frames {
+                    json!([
+                        {"id": 21, "name": "demo.Main.main", "source": {"path": source}, "line": 42, "column": 1},
+                        {"id": 22, "name": "org.example.Lib.run", "source": {"path": "C:/libs/spring-core-6.1.0.jar"}, "line": 10, "column": 1},
+                        {"id": 23, "name": "java.util.ArrayList.add", "source": {"path": "jrt:/java.base/java/util/ArrayList.java"}, "line": 500, "column": 1},
+                        {"id": 24, "name": "demo.Main.work", "source": {"path": source}, "line": 7, "column": 1}
+                    ])
+                } else {
+                    json!([
+                        // No source and line zero on purpose.
+                        {"id": 11, "name": "run", "source": {}, "line": 0, "column": 0},
+                        {"id": 12, "name": "start", "source": {"path": source}, "line": 42, "column": 1},
+                    ])
+                };
+                respond(
+                    &mut writer,
+                    seq,
+                    request_seq,
+                    command,
+                    json!({"stackFrames": stack_frames}),
+                )?
+            }
             "scopes" => respond(
                 &mut writer,
                 seq,
@@ -424,14 +461,37 @@ fn serve(
                     .get("variablesReference")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                if scenario.identity_objects && reference == 100 {
+                    let variables = if identity_stop == 1 {
+                        json!([
+                            {"name": "a", "value": "Thing@1", "type": "Thing", "variablesReference": 101, "evaluateName": "a"},
+                            {"name": "b", "value": "Thing@2", "type": "Thing", "variablesReference": 102, "evaluateName": "b"},
+                        ])
+                    } else {
+                        // The old handle of `a` now names `other`, a different object of
+                        // the same type; `a` lives on under a new handle.
+                        json!([
+                            {"name": "other", "value": "Thing@3", "type": "Thing", "variablesReference": 101, "evaluateName": "other"},
+                            {"name": "same", "value": "Thing@1", "type": "Thing", "variablesReference": 103, "evaluateName": "same"},
+                        ])
+                    };
+                    respond(
+                        &mut writer,
+                        seq,
+                        request_seq,
+                        command,
+                        json!({"variables": variables}),
+                    )?;
+                    continue;
+                }
                 let body = match reference {
                     100 => json!({"variables": [
-                        {"name": "text", "value": text_value, "type": "String", "variablesReference": 0},
-                        {"name": "items", "value": "ArrayList (2)", "type": "ArrayList", "variablesReference": 101},
+                        {"name": "text", "value": text_value, "type": "String", "variablesReference": 0, "evaluateName": "text"},
+                        {"name": "items", "value": "ArrayList (2)", "type": "ArrayList", "variablesReference": 101, "evaluateName": "items"},
                     ]}),
                     101 => json!({"variables": [
-                        {"name": "0", "value": "\"a\"", "type": "String", "variablesReference": 0},
-                        {"name": "1", "value": "\"b\"", "type": "String", "variablesReference": 0},
+                        {"name": "0", "value": "\"a\"", "type": "String", "variablesReference": 0, "evaluateName": "items.get(0)"},
+                        {"name": "1", "value": "\"b\"", "type": "String", "variablesReference": 0, "evaluateName": "items.get(1)"},
                     ]}),
                     _ => json!({"variables": []}),
                 };
@@ -443,7 +503,15 @@ fn serve(
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 // A field of an object costs one more request, so a test can expand it.
-                let body = if expression.contains("items") {
+                let body = if let Some(identity) = identity_of(expression) {
+                    json!({"result": identity.to_string(), "type": "int", "variablesReference": 0})
+                } else if expression.contains("instanceof") {
+                    json!({"result": "true", "type": "boolean", "variablesReference": 0})
+                } else if expression.contains(".getName()") {
+                    json!({"result": "rendered", "type": "String", "variablesReference": 0})
+                } else if expression.contains(".size()") {
+                    json!({"result": "2", "type": "int", "variablesReference": 0})
+                } else if expression.contains("items") {
                     json!({"result": "ArrayList (2)", "type": "ArrayList", "variablesReference": 101})
                 } else if expression.contains("text") {
                     json!({"result": text_value, "type": "String", "variablesReference": 0})
@@ -503,6 +571,9 @@ fn serve(
             "continue" | "next" | "stepIn" | "stepOut" => {
                 respond(&mut writer, seq, request_seq, command, json!({}))?;
                 seq += 1;
+                if scenario.identity_objects && command == "next" {
+                    identity_stop = 2;
+                }
                 let exception = command == "continue"
                     && !exception_stopped
                     && exception_filters.iter().any(|filter| filter == "uncaught");
@@ -536,6 +607,21 @@ fn serve(
         }
     }
     Ok(())
+}
+
+/// The number the fixture keeps for the object a name denotes, when the expression is an
+/// identity question of the scenario of reused handles.
+fn identity_of(expression: &str) -> Option<i64> {
+    let name = expression
+        .strip_prefix("identityHashCode(")?
+        .strip_suffix(')')?
+        .trim();
+    match name {
+        "a" | "same" => Some(1001),
+        "b" => Some(1002),
+        "other" => Some(1003),
+        _ => Some(42),
+    }
 }
 
 /// The console text of a log message: an expression in braces becomes the value of the

@@ -2,17 +2,21 @@
 //! editor, and `lang-api` traits over one open project backed by jdtls.
 
 mod beans;
+mod build_scripts;
 mod database;
 mod debug;
+mod diagram;
 mod doc;
 mod endpoints;
 mod environment;
 mod file_templates;
+mod inspections;
 mod jshell;
 mod language;
 mod live_templates;
 mod lombok;
 mod messages;
+pub mod newproject;
 mod problems;
 mod project;
 mod refactor;
@@ -22,6 +26,7 @@ mod sources;
 mod spring;
 mod spring_data;
 mod stack;
+mod test_creation;
 
 pub use beans::{BeanIndex, bean_index};
 pub use database::DatabaseSupport;
@@ -30,6 +35,7 @@ pub use doc::documentation_comments;
 pub use environment::{JavaEnvironment, project_environment};
 pub use file_templates::file_templates;
 pub use jshell::JShellSupport;
+pub use newproject::{NewProjectOptions, project_generators};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +62,10 @@ pub use sidecar::{State, Status, Trust};
 pub use spring::{SpringConfigSupport, spring_config};
 pub use spring_data::{SpringDataIndex, SpringDataSupport, spring_data_index, spring_data_support};
 pub use stack::{jcmd_thread_dump, parse as parse_stack};
+pub use test_creation::{
+    GeneratedTest, TestLibrary, build_file_edit, form_for, libraries, libraries_in_script,
+    test_path, test_source, unique_names,
+};
 
 fn is_source(path: &Path) -> bool {
     path.extension()

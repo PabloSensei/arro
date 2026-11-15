@@ -122,6 +122,7 @@ fn config(name: &str) -> RunConfig {
         provider: "fixture".into(),
         assemble_first: false,
         settings: Default::default(),
+        ..RunConfig::default()
     }
 }
 
@@ -173,11 +174,14 @@ impl RunConfigProvider for LongRun {
 }
 
 /// A copy of a program under a name of its own: only this image tells the process apart
-/// from the other copies of the same program. The folder of the test removes it.
+/// from the other copies of the same program. The name carries the id of the test process
+/// too: another run of these tests on this machine may hold a copy of the same name, and a
+/// search of the process list must not find that one. The folder of the test removes it.
 pub(crate) fn long_image(name: &str) -> PathBuf {
     let system_root = std::env::var_os("SystemRoot").expect("a Windows machine");
     let source = PathBuf::from(system_root).join("System32").join("ping.exe");
-    let image = test_support::scratch("window-run").join(format!("{name}.exe"));
+    let image =
+        test_support::scratch("window-run").join(format!("{name}-{}.exe", std::process::id()));
     std::fs::copy(&source, &image).expect("the program is copied");
     image
 }

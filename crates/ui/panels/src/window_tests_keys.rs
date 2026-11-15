@@ -504,6 +504,7 @@ fn error_description_shows_the_message_of_the_mark(cx: &mut TestAppContext) {
         severity: lang_api::Severity::Error,
         message: "first error".to_owned(),
         unnecessary: false,
+        code: None,
     }]);
     let window = open_window_with(cx, root.clone(), language);
     cx.run_until_parked();

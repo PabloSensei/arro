@@ -9,6 +9,7 @@ syntax = { path = "../../editor/syntax" }
 tree-sitter.workspace = true
 tree-sitter-java-orchard.workspace = true
 lang-api.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 text-core = { path = "../../editor/text-core" }

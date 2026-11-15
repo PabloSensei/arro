@@ -8,6 +8,8 @@ use crate::editorconfig::Properties;
 pub enum IndentSource {
     /// A `.editorconfig` file names it.
     EditorConfig,
+    /// The code style files of the project name it.
+    Project,
     /// The indentation of the lines in the file itself.
     Content,
     /// The unit of the language, when neither of the two says anything.
@@ -32,8 +34,25 @@ impl IndentSettings {
     /// The rule from `.editorconfig`, else from the indentation already in the text, else
     /// from the language.
     pub fn resolve(properties: &Properties, text: &str, language_unit: &str) -> Self {
+        Self::resolve_with_project(properties, false, text, language_unit)
+    }
+
+    /// The rule from `.editorconfig` or the project code style, else from the indentation
+    /// already in the text, else from the language. `from_project` says that the
+    /// indentation of `properties` comes from the project style alone.
+    pub fn resolve_with_project(
+        properties: &Properties,
+        from_project: bool,
+        text: &str,
+        language_unit: &str,
+    ) -> Self {
         if let Some((tabs, size, tab_width)) = properties.indentation() {
-            return Self::new(tabs, size, tab_width, IndentSource::EditorConfig);
+            let source = if from_project {
+                IndentSource::Project
+            } else {
+                IndentSource::EditorConfig
+            };
+            return Self::new(tabs, size, tab_width, source);
         }
         if let Some((tabs, size)) = detect(text) {
             let tab_width = properties.tab_width.map_or(4, |width| width as usize);

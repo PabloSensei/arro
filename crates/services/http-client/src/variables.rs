@@ -140,6 +140,60 @@ impl PreparedRequest {
     }
 }
 
+/// The body of a multipart request with the files of its parts read: a line of a part
+/// that starts with `<` and a path is the content of that file, relative to the request
+/// file. Other lines stay as they are.
+fn multipart_body(text: &str, base_dir: &Path) -> Result<Vec<u8>, Error> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = Vec::with_capacity(text.len());
+    for (index, line) in lines.iter().enumerate() {
+        match part_file(line) {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    base_dir.join(path)
+                };
+                let bytes = std::fs::read(&path).map_err(|error| Error::BodyFile {
+                    path: path.display().to_string(),
+                    message: error.to_string(),
+                })?;
+                out.extend_from_slice(&bytes);
+                if !out.ends_with(b"\n") {
+                    out.push(b'\n');
+                }
+            }
+            None => out.extend_from_slice(line.as_bytes()),
+        }
+        if index + 1 < lines.len() {
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
+}
+
+/// The path of a line of a multipart part that holds a file: `< ./a.png`.
+fn part_file(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix('<')?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let path = rest.trim().trim_matches('"').trim();
+    (!path.is_empty()).then_some(path)
+}
+
+/// Whether the headers name a multipart body, whose parts may hold files.
+fn is_multipart(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type")
+            && value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+    })
+}
+
 /// Makes the request ready to send: substitutes the variables and reads `< file`.
 /// Blocks on the file of the body, so the caller runs it away from the window.
 pub fn prepare(
@@ -151,7 +205,7 @@ pub fn prepare(
     if url.trim().is_empty() {
         return Err(Error::InvalidUrl("the request has no URL".to_owned()));
     }
-    let headers = request
+    let headers: Vec<(String, String)> = request
         .headers
         .iter()
         .map(|(name, value)| {
@@ -161,9 +215,17 @@ pub fn prepare(
             )
         })
         .collect();
+    let multipart = is_multipart(&headers);
     let body = match &request.body {
         None => None,
-        Some(Body::Inline(text)) => Some(substitute(text, variables).into_bytes()),
+        Some(Body::Inline(text)) => {
+            let text = substitute(text, variables);
+            if multipart {
+                Some(multipart_body(&text, base_dir)?)
+            } else {
+                Some(text.into_bytes())
+            }
+        }
         Some(Body::File(path)) => {
             let path = substitute(path, variables);
             let path = PathBuf::from(path);
@@ -269,6 +331,51 @@ mod tests {
         )
         .expect_err("the file is missing");
         assert!(error.to_string().contains("missing.json"), "{error}");
+    }
+
+    #[test]
+    fn a_multipart_body_reads_the_file_of_a_part() {
+        let root = test_support::scratch("http-client-multipart");
+        std::fs::write(root.join("a.png"), b"\x89PNG\r\n\x1a\nbinary").unwrap();
+        let file = parse(
+            "POST http://localhost/upload\n\
+             Content-Type: multipart/form-data; boundary=WebAppBoundary\n\n\
+             --WebAppBoundary\n\
+             Content-Disposition: form-data; name=\"note\"\n\n\
+             hello\n\
+             --WebAppBoundary\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"a.png\"\n\n\
+             < ./a.png\n\
+             --WebAppBoundary--\n",
+        );
+        let prepared = prepare(&file.requests[0], &root, &Variables::default()).expect("the body");
+        let body = prepared.body.expect("a body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"note\""), "{text}");
+        assert!(text.contains("\nhello\n"), "{text}");
+        assert!(text.contains("name=\"file\"; filename=\"a.png\""), "{text}");
+        assert!(body.windows(6).any(|window| window == b"\x89PNG\r\n"));
+        assert!(text.ends_with("--WebAppBoundary--"), "{text}");
+    }
+
+    #[test]
+    fn a_multipart_part_without_a_file_stays_text() {
+        let file = parse(
+            "POST http://localhost/upload\n\
+             Content-Type: multipart/form-data; boundary=B\n\n\
+             --B\n\
+             Content-Disposition: form-data; name=\"note\"\n\n\
+             <html>\n\
+             --B--\n",
+        );
+        let prepared = prepare(
+            &file.requests[0],
+            std::path::Path::new("."),
+            &Variables::default(),
+        )
+        .expect("the body");
+        let text = String::from_utf8_lossy(&prepared.body.expect("a body")).into_owned();
+        assert!(text.contains("\n<html>\n"), "{text}");
     }
 
     #[test]

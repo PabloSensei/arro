@@ -188,6 +188,8 @@ enum Source {
     File(PathBuf),
     /// A shelf, the left side of its diff is `HEAD`.
     Shelf(String),
+    /// Two texts with no file behind them, such as the bodies of two responses.
+    Text,
 }
 
 /// What the file is now and what the last commit has, with `\n` line ends, and the hunks
@@ -782,6 +784,21 @@ impl DiffView {
         );
     }
 
+    /// Two texts of the window, with no file behind them: the bodies of two responses.
+    pub fn compare_texts(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        left: String,
+        right: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_text(git, workspace, path, Source::Text, window, cx, move |_| {
+            (left, right)
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_source(
         git: Entity<GitState>,
@@ -793,15 +810,19 @@ impl DiffView {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(repo) = git.read(cx).repo() else {
+        let Some(top) = git.read(cx).repo() else {
             return;
         };
+        let relative = relative_of(top.root(), &path);
+        let repo = git.read(cx).repo_of(&relative).unwrap_or(top);
         let (current, format) = match source {
             Source::WorkingTree | Source::Branch(_) => {
                 current_document(&path, editor_of(&workspace, &path, cx).as_ref(), cx)
             }
             Source::Commit(_) | Source::Shelf(_) => (String::new(), FileFormat::default()),
-            Source::Clipboard | Source::File(_) => (String::new(), FileFormat::default()),
+            Source::Clipboard | Source::File(_) | Source::Text => {
+                (String::new(), FileFormat::default())
+            }
         };
         let (job_path, job_text) = (path.clone(), current.clone());
         let job_source = source.clone();
@@ -814,7 +835,7 @@ impl DiffView {
                     .file_diff_with(&mut blobs, branch, &relative, &job_text)
                     .ok(),
                 Source::Commit(commit) => repo.commit_file_diff(&mut blobs, commit, &relative).ok(),
-                Source::Clipboard | Source::File(_) | Source::Shelf(_) => None,
+                Source::Clipboard | Source::File(_) | Source::Shelf(_) | Source::Text => None,
             }
         });
         window
@@ -1466,7 +1487,7 @@ impl DiffView {
                 Source::Commit(commit) => {
                     repo.commit_file_diff(&mut blobs, &commit, &relative).ok()
                 }
-                Source::Clipboard | Source::File(_) | Source::Shelf(_) => None,
+                Source::Clipboard | Source::File(_) | Source::Shelf(_) | Source::Text => None,
             }
         });
         self.serial += 1;
@@ -2058,6 +2079,7 @@ impl DiffView {
                 |name| name.to_string_lossy().into_owned(),
             ),
             (Source::Shelf(_), true) => "HEAD".to_owned(),
+            (Source::Text, true) => "First response".to_owned(),
             (_, false) => self.path.file_name().map_or_else(
                 || self.path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -2174,6 +2196,7 @@ impl Render for DiffView {
                 format!("Difference between {other} and {title}")
             }
             Source::Shelf(shelf) => format!("HEAD and {title} in shelf {shelf}"),
+            Source::Text => "Difference between two responses".to_owned(),
         };
         let pane: AnyElement = if self.side_by_side {
             let side_rows = self.rows();

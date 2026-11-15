@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use editor_view::Semantic;
 use plugin_host::{Manifest, PluginSettings, default_plugins_dir};
 use project_model::RuntimeInfo;
 use ui_kit::metrics::*;
@@ -197,6 +198,17 @@ pub struct SettingsView {
     page: SettingsPage,
     /// The row the window came for, drawn as chosen while the window is open.
     highlight: Option<&'static str>,
+    /// The checks of the language, read when the window opens.
+    inspections: Vec<lang_api::InspectionInfo>,
+    /// The choices of the user for the checks, as the draft of this window.
+    inspection_settings: lang_api::InspectionSettings,
+    saved_inspections: lang_api::InspectionSettings,
+    /// The check the window came for, drawn as chosen.
+    inspection_highlight: Option<String>,
+    /// The search over the checks of the inspecting page.
+    inspection_search: TextField,
+    inspection_editing: bool,
+    inspection_root: PathBuf,
     /// The search over the pages, drawn above the tree.
     search: TextField,
     /// Whether the caret of the search field is shown. The window opens with it in the
@@ -204,6 +216,10 @@ pub struct SettingsView {
     search_editing: bool,
     /// The name of the SDK of the project, empty until the environment is read.
     sdk: String,
+    /// The code style file the project uses rather than the window settings.
+    project_style: Option<text_core::StyleSource>,
+    /// The user turned the project style off for this project.
+    project_style_off: bool,
     /// The SDKs the pages offer where a choice among them is needed.
     runtimes: Vec<RuntimeInfo>,
     /// The local repository the settings file names, read in the background.
@@ -229,13 +245,43 @@ impl SettingsView {
         cx: &mut Context<Workspace>,
         target: Option<&'static str>,
     ) {
+        Self::open(workspace, window, cx, target, None);
+    }
+
+    /// Shows the Inspections page with the row of `id` marked, for Alt+Enter.
+    pub fn show_inspection(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        id: &str,
+    ) {
+        Self::open(workspace, window, cx, None, Some(id.to_owned()));
+    }
+
+    fn open(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        target: Option<&'static str>,
+        inspection: Option<String>,
+    ) {
         let weak = cx.weak_entity();
         let settings_dir = workspace.settings_dir().to_path_buf();
         let settings = cx.global::<Settings>().clone();
         let font_family = settings.editor_font_family.clone();
-        let page = target
-            .and_then(settings_catalog::find)
-            .map_or(SettingsPage::Appearance, |setting| setting.page);
+        let page = if inspection.is_some() {
+            SettingsPage::EditorInspections
+        } else {
+            target
+                .and_then(settings_catalog::find)
+                .map_or(SettingsPage::Appearance, |setting| setting.page)
+        };
+        let root = workspace.root().to_path_buf();
+        let inspection_settings = workspace::load_inspections(&root);
+        let inspections = cx
+            .try_global::<Semantic>()
+            .map(|semantic| semantic.0.inspections())
+            .unwrap_or_default();
         // The same folder and switch file the plugin host loads from.
         let folder = default_plugins_dir().unwrap_or_else(|| settings_dir.join("plugins"));
         let plugin_file = folder
@@ -252,6 +298,8 @@ impl SettingsView {
             .settings_path()
             .map_or_else(default_settings_file, PathBuf::from);
         let templates_page = crate::settings_templates::page(weak.clone());
+        let project_style = text_core::style_source(&root);
+        let project_style_off = root.join(text_core::idea_style::DISABLED_FILE).is_file();
         let view = cx.new(|cx| Self {
             workspace: weak,
             focus: cx.focus_handle(),
@@ -266,9 +314,18 @@ impl SettingsView {
             templates_page,
             page,
             highlight: target,
+            inspections,
+            inspection_settings: inspection_settings.clone(),
+            saved_inspections: inspection_settings,
+            inspection_highlight: inspection,
+            inspection_search: TextField::default(),
+            inspection_editing: false,
+            inspection_root: root,
             search: TextField::default(),
             search_editing: true,
             sdk: "not set".to_owned(),
+            project_style,
+            project_style_off,
             runtimes: Vec::new(),
             repository: String::new(),
             git_version: None,
@@ -349,7 +406,95 @@ impl SettingsView {
 
     /// Whether the window holds something Apply would write.
     fn changed(&self) -> bool {
-        self.draft != self.saved || self.plugins != self.saved_plugins
+        self.draft != self.saved
+            || self.plugins != self.saved_plugins
+            || self.inspection_settings != self.saved_inspections
+    }
+
+    /// The line the Code Style page shows above the window settings: which file of the
+    /// project names the style, or that the window settings apply.
+    #[cfg(test)]
+    pub(crate) fn project_style_note(&self) -> Option<String> {
+        if let Some(source) = self.project_style {
+            return Some(format!("Using code style from {}", source.label()));
+        }
+        self.project_style_off
+            .then(|| "Using Arro settings".to_owned())
+    }
+
+    /// The line and the button of the Code Style page. The button turns the project
+    /// style off for this project and records the choice in `.arro` of the project.
+    fn project_style_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let Some(source) = self.project_style else {
+            return div()
+                .debug_selector(|| {
+                    if self.project_style_off {
+                        "settings-project-style-arro".to_owned()
+                    } else {
+                        "settings-project-style-none".to_owned()
+                    }
+                })
+                .when(self.project_style_off, |this| {
+                    this.text_color(theme.text_secondary)
+                        .child("Using Arro settings")
+                });
+        };
+        let weak = self.workspace.clone();
+        let root = self.inspection_root.clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(DIALOG_GAP))
+            .min_h(px(30.))
+            .child(
+                div()
+                    .debug_selector(|| "settings-project-style".to_owned())
+                    .child(format!("Using code style from {}", source.label())),
+            )
+            .child(
+                pill("settings-use-arro-style", "Use Arro settings", true, theme)
+                    .debug_selector(|| "settings-use-arro-style".to_owned())
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        let file = root.join(text_core::idea_style::DISABLED_FILE);
+                        let write = cx.background_executor().spawn(async move {
+                            if let Some(directory) = file.parent()
+                                && let Err(error) = std::fs::create_dir_all(directory)
+                            {
+                                return Err(error.to_string());
+                            }
+                            std::fs::write(&file, b"").map_err(|error| error.to_string())
+                        });
+                        let workspace = weak.clone();
+                        cx.spawn(async move |this, cx| {
+                            let written = write.await;
+                            this.update(cx, |this, cx| {
+                                if written.is_ok() {
+                                    this.project_style = None;
+                                    this.project_style_off = true;
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                            if written.is_ok() {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        for (_, view) in workspace.open_editors() {
+                                            if let Ok(view) =
+                                                view.downcast::<editor_view::EditorView>()
+                                            {
+                                                view.update(cx, |view, cx| {
+                                                    view.use_arro_code_style(cx)
+                                                });
+                                            }
+                                        }
+                                    })
+                                    .ok();
+                            }
+                        })
+                        .detach();
+                    })),
+            )
     }
 
     /// Apply or OK: the changed leaves of the draft reach the window, the plugin switches
@@ -370,13 +515,43 @@ impl SettingsView {
             })
             .ok();
         let current = cx.global::<Settings>().clone();
+        if let Some(semantic) = cx.try_global::<editor_view::Semantic>() {
+            semantic
+                .0
+                .set_dependency_updates(current.check_dependency_updates);
+        }
         self.saved = current.clone();
         self.draft = current;
         self.save_plugins(cx);
+        self.save_inspections(cx);
         if close {
             self.close(window, cx);
         }
         cx.notify();
+    }
+
+    /// Writes the checks of the project and tells the language and the open editors.
+    fn save_inspections(&mut self, cx: &mut Context<Self>) {
+        if self.inspection_settings == self.saved_inspections {
+            return;
+        }
+        let settings = self.inspection_settings.clone();
+        self.saved_inspections = settings.clone();
+        let root = self.inspection_root.clone();
+        let write = cx
+            .background_executor()
+            .spawn(async move { workspace::save_inspections(&root, &settings) });
+        cx.spawn(async move |_, _| {
+            if let Err(error) = write.await {
+                eprintln!("the inspections of the project are not saved: {error}");
+            }
+        })
+        .detach();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::inspection::apply(workspace, &self.inspection_settings, cx);
+            })
+            .ok();
     }
 
     /// Writes the plugin switches only when one moved since the last Apply or OK.
@@ -574,6 +749,20 @@ impl SettingsView {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inspection_editing {
+            if event.keystroke.key == "escape" {
+                if self.inspection_search.text.is_empty() {
+                    self.close(window, cx);
+                } else {
+                    self.inspection_search = TextField::default();
+                    cx.notify();
+                }
+            } else if self.inspection_search.key_with_clipboard(event, false, cx) {
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.search_editing {
             self.search_key(event, window, cx);
             return;
@@ -605,6 +794,167 @@ impl SettingsView {
             self.close(window, cx);
             cx.stop_propagation();
         }
+    }
+
+    /// The picks of the Inspections page: a search over the checks, the tree by group,
+    /// a switch and a level for each check, and the reset of every choice.
+    fn render_inspections(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
+        let mut content = Vec::new();
+        content.push(note(
+            "Compiler problems of the language server apply after it restarts.",
+            theme,
+        ));
+        content.push(
+            div().child(
+                field(
+                    "settings-inspection-search",
+                    &self.inspection_search,
+                    "Search inspections",
+                    self.inspection_editing,
+                    theme,
+                )
+                .debug_selector(|| "settings-inspection-search".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.inspection_editing = true;
+                    this.search_editing = false;
+                    this.editing = None;
+                    cx.notify();
+                })),
+            ),
+        );
+        let reset = dialog_button(
+            "settings-inspection-reset",
+            "settings-inspection-reset".to_owned(),
+            "Reset to default",
+            false,
+            !self.inspection_settings.inspections.is_empty(),
+            theme,
+        )
+        .debug_selector(|| "settings-inspection-reset".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.inspection_settings.reset();
+            this.inspection_editing = false;
+            cx.notify();
+        }));
+        content.push(div().flex().justify_end().child(reset));
+        let query = self.inspection_search.text.trim().to_lowercase();
+        let shown: Vec<&lang_api::InspectionInfo> = self
+            .inspections
+            .iter()
+            .filter(|info| {
+                let text = format!("{} {} {}", info.title, info.id, info.group).to_lowercase();
+                query.split_whitespace().all(|word| text.contains(word))
+            })
+            .collect();
+        if shown.is_empty() {
+            content.push(
+                div()
+                    .py(px(SPACE_S))
+                    .text_color(theme.text_secondary)
+                    .child("No inspections found."),
+            );
+            return content;
+        }
+        let mut group = String::new();
+        for (index, info) in shown.into_iter().enumerate() {
+            if info.group != group {
+                group = info.group.clone();
+                content.push(
+                    div()
+                        .debug_selector(|| "settings-inspection-group".to_owned())
+                        .mt(px(DIALOG_GAP))
+                        .pb(px(SPACE_S))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(group.clone()),
+                );
+            }
+            let id = info.id.clone();
+            let enabled = self
+                .inspection_settings
+                .setting(&id)
+                .is_none_or(|setting| setting.enabled);
+            let level = self
+                .inspection_settings
+                .level_of(&id, info.default_severity);
+            let toggle = pill(
+                ("inspection-toggle", index),
+                if enabled { "On" } else { "Off" },
+                enabled,
+                theme,
+            )
+            .debug_selector(move || format!("settings-inspection-toggle-{index}"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_inspection(&id, cx);
+            }));
+            let level_id = info.id.clone();
+            let severity =
+                toolbar_dropdown(("inspection-level", index), None, level.label(), theme)
+                    .debug_selector(move || format!("settings-inspection-level-{index}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cycle_inspection(&level_id, cx);
+                    }));
+            let chosen = self.inspection_highlight.as_deref() == Some(info.id.as_str());
+            let row = div()
+                .id(("inspection-row", index))
+                .debug_selector(|| "settings-inspection-row".to_owned())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(DIALOG_GAP))
+                .min_h(px(30.))
+                .px(px(ROW_PADDING_X))
+                .rounded(px(CONTROL_RADIUS))
+                .when(chosen, |this| this.bg(theme.selection))
+                .child(
+                    div().flex().flex_col().child(info.title.clone()).child(
+                        div()
+                            .text_size(px(TEXT_SMALL))
+                            .text_color(theme.text_secondary)
+                            .child(info.id.clone()),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .child(toggle)
+                        .child(severity),
+                );
+            content.push(
+                div()
+                    .debug_selector(move || format!("settings-inspection-{index}"))
+                    .child(row),
+            );
+        }
+        content
+    }
+
+    fn toggle_inspection(&mut self, id: &str, cx: &mut Context<Self>) {
+        let current = self.inspection_settings.setting(id);
+        let enabled = current.is_some_and(|setting| !setting.enabled);
+        let level = current.and_then(|setting| setting.level);
+        self.inspection_settings.set(id, enabled, level);
+        self.inspection_editing = false;
+        cx.notify();
+    }
+
+    fn cycle_inspection(&mut self, id: &str, cx: &mut Context<Self>) {
+        let default = self
+            .inspections
+            .iter()
+            .find(|info| info.id == id)
+            .map_or(lang_api::InspectionLevel::Warning, |info| {
+                info.default_severity
+            });
+        let next = self.inspection_settings.level_of(id, default).next();
+        let level = (next != lang_api::InspectionLevel::Off).then_some(next);
+        self.inspection_settings
+            .set(id, next != lang_api::InspectionLevel::Off, level);
+        self.inspection_editing = false;
+        cx.notify();
     }
 
     /// Reads the local repository of the settings file again, off the UI thread.
@@ -1145,6 +1495,9 @@ impl Render for SettingsView {
                         .render(TemplateSection::Files, window, cx),
                 );
             }
+            SettingsPage::EditorInspections => {
+                content.extend(self.render_inspections(&theme, cx));
+            }
             _ => {
                 if self.page == SettingsPage::Project {
                     content.push(div().child(project_sdk_row(&self.sdk, &theme, cx)));
@@ -1152,6 +1505,15 @@ impl Render for SettingsView {
                 }
                 if self.page == SettingsPage::Appearance {
                     content.push(note("The theme applies at once.", &theme));
+                }
+                if self.page == SettingsPage::Debugger {
+                    content.push(note(
+                        "Type renderers: type = display | children, one rule per semicolon.",
+                        &theme,
+                    ));
+                }
+                if self.page == SettingsPage::EditorCodeStyle {
+                    content.push(self.project_style_row(&theme, cx));
                 }
                 let mut last_section: Option<&'static str> = None;
                 for entry in settings_catalog::all()
@@ -1203,6 +1565,7 @@ impl Render for SettingsView {
                                 SettingField::CompletionDelay => {
                                     workspace::COMPLETION_DELAY_STEP_MS as f32
                                 }
+                                SettingField::RightMargin => workspace::RIGHT_MARGIN_STEP as f32,
                                 _ => 1.,
                             };
                             let text = settings_catalog::number_label(&settings, entry.id)

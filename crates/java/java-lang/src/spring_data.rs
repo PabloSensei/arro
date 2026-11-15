@@ -735,6 +735,7 @@ fn method_diagnostics(
                 method.name
             ),
             unnecessary: false,
+            code: Some("spring.data.methodQuery".to_owned()),
         });
     }
     let Some(entity) = entity else {
@@ -753,6 +754,7 @@ fn method_diagnostics(
                 severity: Severity::Error,
                 message: format!("Cannot resolve property '{failed}'"),
                 unnecessary: false,
+                code: Some("spring.data.query".to_owned()),
             });
         }
     }
@@ -790,6 +792,7 @@ fn query_diagnostics(
                 severity: Severity::Error,
                 message: format!("Cannot resolve entity '{}'", entity.text),
                 unnecessary: false,
+                code: Some("spring.data.query".to_owned()),
             });
         }
     }
@@ -805,6 +808,7 @@ fn query_diagnostics(
                 severity: Severity::Error,
                 message: format!("Cannot resolve property '{failed}'"),
                 unnecessary: false,
+                code: Some("spring.data.query".to_owned()),
             });
         }
     }
@@ -819,6 +823,7 @@ fn query_diagnostics(
                 severity: Severity::Error,
                 message: format!("Cannot resolve parameter '{}'", parameter.text),
                 unnecessary: false,
+                code: Some("spring.data.query".to_owned()),
             });
         }
     }
@@ -1271,6 +1276,23 @@ pub fn spring_data_index(root: PathBuf) -> Arc<SpringDataIndex> {
 }
 
 impl SpringDataIndex {
+    /// The checks the user turned off, shared with the rest of the language.
+    pub fn set_inspection_checks(&self, checks: lang_api::DisabledInspections) {
+        *self
+            .inner
+            .inspection_checks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = checks;
+    }
+
+    fn check_enabled(&self, id: &str) -> bool {
+        self.inner
+            .inspection_checks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .enabled(id)
+    }
+
     /// The source roots of the project, from its model. A model that names the same
     /// roots as the previous one starts no new read.
     pub fn set_model(&self, model: &ProjectModel) {
@@ -1415,6 +1437,8 @@ struct Inner {
     state: Mutex<Load>,
     ready: Condvar,
     snapshot: RwLock<Arc<SpringDataModel>>,
+    /// The checks the user turned off: one that is off is not computed at all.
+    inspection_checks: Mutex<lang_api::DisabledInspections>,
 }
 
 impl Inner {
@@ -1424,6 +1448,7 @@ impl Inner {
             state: Mutex::new(Load::default()),
             ready: Condvar::new(),
             snapshot: RwLock::new(Arc::new(SpringDataModel::default())),
+            inspection_checks: Mutex::new(lang_api::DisabledInspections::default()),
         }
     }
 }
@@ -1629,8 +1654,20 @@ impl EmbeddedTextProvider for SpringDataIndex {
     }
 
     fn diagnostics(&self, _path: &Path, text: &str) -> Vec<DiagnosticEntry> {
+        if !self.check_enabled("spring.data.methodQuery")
+            && !self.check_enabled("spring.data.query")
+        {
+            return Vec::new();
+        }
         let file = java_syntax::spring_file(text);
-        diagnostics_for(&file, text, &self.snapshot())
+        let mut found = diagnostics_for(&file, text, &self.snapshot());
+        found.retain(|entry| {
+            entry
+                .code
+                .as_deref()
+                .is_none_or(|code| self.check_enabled(code))
+        });
+        found
     }
 
     fn definitions(&self, _path: &Path, text: &str, offset: usize) -> Vec<SourceSpan> {

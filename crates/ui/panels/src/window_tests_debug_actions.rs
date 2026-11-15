@@ -137,6 +137,8 @@ impl RunConfigProvider for Configs {
                 provider: "fixture".into(),
                 assemble_first: false,
                 settings: Default::default(),
+
+                ..RunConfig::default()
             })
             .collect())
     }
@@ -313,6 +315,12 @@ impl DebugService for MockService {
         exception_filters: Vec<String>,
     ) -> Result<Debugger, String> {
         self.session(name, breakpoints, watch, exception_filters)
+    }
+
+    /// The mock adapter answers any identity expression with the same number, so a mark
+    /// works on it; the scenario of the reused handles has its own adapter.
+    fn object_identity_expression(&self, evaluate_name: &str) -> Option<String> {
+        Some(format!("identityHashCode({evaluate_name})"))
     }
 }
 

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use store::Store;
 use ui_kit::metrics::*;
 
+use crate::editor::BundleLayout;
 use crate::editor::PreviewLayout;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,6 +55,14 @@ pub struct Layout {
     pub recent_edited: Vec<PathBuf>,
     /// What each file with a rendered document showed: the text, the document, or both.
     pub preview_modes: Vec<(PathBuf, PreviewLayout)>,
+    /// What each file of a localized set showed: its text or the table of the set.
+    pub bundle_modes: Vec<(PathBuf, BundleLayout)>,
+    /// The groups of the Services tree that are collapsed, by their key.
+    pub services_collapsed: Vec<String>,
+    /// The node selected in the Services tree, by its key.
+    pub services_selected: Option<String>,
+    /// The optional groups of the Services tree list their configurations.
+    pub services_show_all: bool,
 }
 
 impl Default for Layout {
@@ -80,6 +89,10 @@ impl Default for Layout {
             bottom_tool: None,
             recent_edited: Vec::new(),
             preview_modes: Vec::new(),
+            bundle_modes: Vec::new(),
+            services_collapsed: Vec::new(),
+            services_selected: None,
+            services_show_all: false,
         }
     }
 }
@@ -170,6 +183,21 @@ mod tests {
         layout.tree_expanded = vec![PathBuf::from("C:/project/src")];
         let json = serde_json::to_string(&layout).unwrap();
         save_layout(&store, root, &json).unwrap();
+        assert_eq!(load_layout(&store, root), layout);
+    }
+
+    #[test]
+    fn the_services_tree_remembers_its_groups_and_its_node() {
+        let store = Store::in_memory().unwrap();
+        let root = Path::new("C:/project");
+        let mut layout = load_layout(&store, root);
+        layout.services_collapsed = vec!["run:boot".to_owned()];
+        layout.services_selected = Some("run:App".to_owned());
+        layout.services_show_all = true;
+
+        let json = serde_json::to_string(&layout).unwrap();
+        save_layout(&store, root, &json).unwrap();
+
         assert_eq!(load_layout(&store, root), layout);
     }
 

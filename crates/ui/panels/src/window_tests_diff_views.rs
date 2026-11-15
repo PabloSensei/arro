@@ -342,6 +342,7 @@ fn error(line: u32, start: u32, end: u32, message: &str) -> DiagnosticEntry {
         severity: Severity::Error,
         message: message.to_owned(),
         unnecessary: false,
+        code: None,
     }
 }
 

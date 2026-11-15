@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -217,4 +218,136 @@ fn a_change_on_disk_reaches_the_open_document() {
     assert!(matches!(reloaded, Some(Reload::Changed { .. })));
     let text = store.state(document).unwrap().text.text();
     assert!(text.contains("class Pet /* edited */ "));
+}
+
+fn copy_project(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let lower = name.to_string_lossy().to_lowercase();
+        if matches!(
+            lower.as_str(),
+            ".git" | "build" | ".gradle" | "node_modules"
+        ) {
+            continue;
+        }
+        if entry.file_type().unwrap().is_dir() {
+            copy_project(&entry.path(), &to.join(&name));
+        } else {
+            fs::copy(entry.path(), to.join(&name)).unwrap();
+        }
+    }
+}
+
+/// The newest jar of the local repository that `folder` holds.
+fn newest_jar(repository: &Path, folder: &str, prefix: &str) -> Option<PathBuf> {
+    let versions = fs::read_dir(repository.join(folder)).ok()?;
+    let mut found: Vec<PathBuf> = Vec::new();
+    for version in versions.flatten() {
+        if !version.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let jars = fs::read_dir(version.path()).ok()?;
+        for jar in jars.flatten() {
+            let name = jar.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix) && name.ends_with(".jar") && !name.contains("sources") {
+                found.push(jar.path());
+            }
+        }
+    }
+    found.sort();
+    found.pop()
+}
+
+#[test]
+#[ignore = "needs the PetClinic corpus and MAVEN_USER_HOME: run with --ignored"]
+fn create_test_for_owner_controller_compiles() {
+    let source = petclinic();
+    let folder = test_support::TempDir::new("petclinic-create-test");
+    let root = folder.path().join("petclinic");
+    copy_project(&source, &root);
+    let path =
+        root.join("src/main/java/org/springframework/samples/petclinic/owner/OwnerController.java");
+    let text = fs::read_to_string(&path).unwrap();
+
+    let form = java_lang::form_for(&root, None, &path, &text);
+    assert_eq!(form.class_name, "OwnerControllerTest");
+    assert_eq!(form.package, "org.springframework.samples.petclinic.owner");
+    assert!(
+        form.methods.iter().any(|method| method.name == "findOwner"),
+        "the public methods of the class are offered"
+    );
+    let library = java_lang::TestLibrary::from_handle(&form.frameworks[form.framework].handle)
+        .expect("the form names one of the libraries");
+    assert_eq!(
+        library,
+        java_lang::TestLibrary::JUnit5,
+        "the module brings JUnit 5 through its test dependencies"
+    );
+
+    let selected: Vec<String> = form
+        .methods
+        .iter()
+        .filter(|method| method.checked)
+        .map(|method| method.handle.clone())
+        .collect();
+    let generated = java_lang::test_source(
+        library,
+        &form.package,
+        &form.class_name,
+        "",
+        form.setup,
+        form.teardown,
+        &selected,
+    );
+    let file = java_lang::test_path(&form.folders[0].path, &form.package, &form.class_name);
+    assert_eq!(
+        file,
+        root.join(
+            "src/test/java/org/springframework/samples/petclinic/owner/OwnerControllerTest.java"
+        )
+    );
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, &generated.text).unwrap();
+    assert!(generated.text.contains("class OwnerControllerTest {"));
+    assert!(
+        generated
+            .text
+            .contains("import org.junit.jupiter.api.Test;")
+    );
+
+    let corpus = PathBuf::from(std::env::var("IDE_CORPUS").expect("set IDE_CORPUS"));
+    let javac = corpus.join("jdk").join("17").join("bin").join("javac.exe");
+    assert!(javac.is_file(), "javac of JDK 17 in the corpus: {javac:?}");
+    let repository = PathBuf::from(std::env::var("MAVEN_USER_HOME").expect("set MAVEN_USER_HOME"))
+        .join("repository");
+    let junit = newest_jar(
+        &repository,
+        "org/junit/jupiter/junit-jupiter-api",
+        "junit-jupiter-api-",
+    )
+    .expect("junit-jupiter-api in the local repository");
+    let output = root.join("target").join("test-classes-of-create-test");
+    fs::create_dir_all(&output).unwrap();
+    let classpath = format!(
+        "{};{}",
+        root.join("target").join("classes").display(),
+        junit.display()
+    );
+    let result = Command::new(&javac)
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-d")
+        .arg(&output)
+        .arg("-cp")
+        .arg(&classpath)
+        .arg(&file)
+        .output()
+        .expect("javac runs");
+    assert!(
+        result.status.success(),
+        "javac failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

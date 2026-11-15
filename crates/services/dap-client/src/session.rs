@@ -15,9 +15,13 @@ use crate::client::{Client, Event};
 use crate::model::{
     Breakpoint, BreakpointKind, BreakpointSpec, Capabilities, Command, ConsoleLine,
     DataBreakpointSpec, DebugState, Evaluation, ExceptionFilter, Frame, FunctionBreakpointSpec,
-    OutputLine, Scope, Snapshot, StepTarget, Thread, Variable, VariableError, WatchValue, line_of,
-    source_path,
+    IdentityAnswer, OutputLine, Scope, Snapshot, StepTarget, Thread, TypeRenderer, Variable,
+    VariableError, WatchValue, children_expression, line_of, object_expression, source_path,
 };
+
+/// How many answers to identity questions a snapshot keeps. The window asks for the
+/// objects it shows at a stop, so the list only has to outlive a few polls.
+const MAX_IDENTITIES: usize = 512;
 
 /// What starts a session. `attach_port` is the port the debuggee listens on.
 #[derive(Clone, Debug, Default)]
@@ -80,6 +84,10 @@ pub async fn run_with_output(
         breakpoints: BTreeMap::new(),
         function_breakpoints: launch.function_breakpoints.clone(),
         data_breakpoints: launch.data_breakpoints.clone(),
+        inline_watch: Vec::new(),
+        renderers: Vec::new(),
+        rendered_children: HashMap::new(),
+        subtype_cache: HashMap::new(),
         exception_filters: launch.exception_filters.iter().cloned().collect(),
         project: launch.project.clone(),
         attach_host: launch.attach_host.clone(),
@@ -153,6 +161,15 @@ struct Session {
     function_breakpoints: Vec<FunctionBreakpointSpec>,
     /// Field watchpoints, as the window set them.
     data_breakpoints: Vec<DataBreakpointSpec>,
+    /// Inline watch expressions, as the window set them.
+    inline_watch: Vec<String>,
+    /// How values of some types are shown.
+    renderers: Vec<TypeRenderer>,
+    /// The expression that gives the children of a value whose children the renderer
+    /// replaces, by the handle of the value.
+    rendered_children: HashMap<i64, String>,
+    /// Whether a type is of a renderer type or of a subtype, by the pair of the two.
+    subtype_cache: HashMap<(String, String), bool>,
     exception_filters: BTreeSet<String>,
     project: Option<String>,
     attach_host: Option<String>,
@@ -487,6 +504,7 @@ impl Session {
                 self.state.stops += 1;
                 self.state.step_targets = None;
                 self.state.evaluation = None;
+                self.rendered_children.clear();
                 self.console(format!("Stopped: {reason}"), false);
                 self.refresh_threads().await;
                 let thread = thread_id.or(self.state.current_thread);
@@ -495,6 +513,7 @@ impl Session {
                     self.stack(thread).await;
                 }
                 self.evaluate_watch().await;
+                self.evaluate_inline_watch().await;
             }
             Event::Continued { .. } => {
                 self.state.state = DebugState::Running;
@@ -600,7 +619,12 @@ impl Session {
         self.state.variables.clear();
         self.state.step_targets = None;
         self.state.evaluation = None;
+        self.rendered_children.clear();
         for watch in &mut self.state.watch {
+            watch.value.clear();
+            watch.error = None;
+        }
+        for watch in &mut self.state.inline_watch {
             watch.value.clear();
             watch.error = None;
         }
@@ -664,6 +688,20 @@ impl Session {
                 self.scopes(frame).await;
             }
             Command::Expand(reference) => {
+                if let Some(expression) = self.rendered_children.get(&reference).cloned()
+                    && let Ok(body) = self.evaluate_body(&expression, "watch").await
+                {
+                    let child = body
+                        .get("variablesReference")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    if child != 0 {
+                        let variables = self.variables(child).await;
+                        self.state.variables.insert(reference, variables);
+                        self.publish();
+                        return Ok(false);
+                    }
+                }
                 let variables = self.variables(reference).await;
                 self.state.variables.insert(reference, variables);
             }
@@ -720,6 +758,23 @@ impl Session {
                     .watch
                     .retain(|item| item.expression != expression);
             }
+            Command::SetInlineWatches(expressions) => {
+                self.inline_watch = expressions;
+                self.state.inline_watch = self
+                    .inline_watch
+                    .iter()
+                    .map(|expression| WatchValue {
+                        expression: expression.clone(),
+                        ..WatchValue::default()
+                    })
+                    .collect();
+                if matches!(self.state.state, DebugState::Stopped { .. }) {
+                    self.evaluate_inline_watch().await;
+                }
+            }
+            Command::SetTypeRenderers(renderers) => {
+                self.renderers = renderers;
+            }
             Command::Evaluate(expression) => {
                 let answer = self.evaluate(&expression, "repl").await;
                 match answer {
@@ -736,6 +791,33 @@ impl Session {
             }
             Command::EvaluateQuick(expression) => {
                 self.state.evaluation = Some(self.evaluate_quick(&expression).await);
+            }
+            Command::EvaluateIdentity {
+                request,
+                expression,
+            } => {
+                let answer = match self.evaluate_body(&expression, "watch").await {
+                    Ok(body) => IdentityAnswer {
+                        request,
+                        identity: body
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .and_then(|result| result.trim().parse::<i64>().ok()),
+                        error: None,
+                    },
+                    Err(error) => IdentityAnswer {
+                        request,
+                        identity: None,
+                        error: Some(error),
+                    },
+                };
+                self.state.identities.insert(request, answer);
+                while self.state.identities.len() > MAX_IDENTITIES {
+                    let Some(oldest) = self.state.identities.keys().min().copied() else {
+                        break;
+                    };
+                    self.state.identities.remove(&oldest);
+                }
             }
             Command::SetVariable {
                 reference,
@@ -848,28 +930,105 @@ impl Session {
         }
     }
 
-    async fn variables(&self, reference: i64) -> Vec<Variable> {
+    async fn variables(&mut self, reference: i64) -> Vec<Variable> {
         let arguments = json!({"variablesReference": reference, "start": 0, "count": 0});
         let Ok(body) = self.client.request("variables", arguments).await else {
             return Vec::new();
         };
-        variables_of(&body)
+        let mut variables = variables_of(&body);
+        self.render_variables(&mut variables).await;
+        variables
     }
 
-    async fn evaluate(&self, expression: &str, context: &str) -> Result<String, String> {
+    /// Replaces the value of each variable a renderer is for with the value its display
+    /// expression gives, and remembers the expression of its children.
+    async fn render_variables(&mut self, variables: &mut [Variable]) {
+        for variable in variables.iter_mut() {
+            let Some(name) = variable.evaluate_name.clone() else {
+                continue;
+            };
+            let Some(renderer) = self.renderer_for(&variable.type_name, &name).await else {
+                continue;
+            };
+            let expression = object_expression(&renderer.display, &name);
+            if let Ok(body) = self.evaluate_body(&expression, "watch").await
+                && let Some(value) = body.get("result").and_then(Value::as_str)
+            {
+                variable.value = value.to_owned();
+            }
+            if variable.reference != 0
+                && let Some(children) = children_expression(&renderer, &name)
+            {
+                self.rendered_children.insert(variable.reference, children);
+            }
+        }
+    }
+
+    /// The renderer of a value: its exact type first, then the renderer types it is a
+    /// subtype of. The answer for a pair of types is kept, so a scope full of values of
+    /// one type costs one question.
+    async fn renderer_for(&mut self, type_name: &str, evaluate_name: &str) -> Option<TypeRenderer> {
+        if let Some(renderer) = self
+            .renderers
+            .iter()
+            .find(|renderer| renderer.matches(type_name))
+        {
+            return Some(renderer.clone());
+        }
+        let candidates: Vec<TypeRenderer> = self
+            .renderers
+            .iter()
+            .filter(|renderer| renderer.subtype_probe.is_some())
+            .cloned()
+            .collect();
+        for renderer in candidates {
+            let key = (type_name.to_owned(), renderer.type_name.clone());
+            let applies = match self.subtype_cache.get(&key) {
+                Some(applies) => *applies,
+                None => {
+                    let applies = match renderer.subtype_expression(evaluate_name) {
+                        Some(expression) => self
+                            .evaluate_body(&expression, "watch")
+                            .await
+                            .ok()
+                            .and_then(|body| {
+                                body.get("result")
+                                    .and_then(Value::as_str)
+                                    .map(|result| result.trim() == "true")
+                            })
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    self.subtype_cache.insert(key, applies);
+                    applies
+                }
+            };
+            if applies {
+                return Some(renderer);
+            }
+        }
+        None
+    }
+
+    async fn evaluate_body(&self, expression: &str, context: &str) -> Result<Value, String> {
         let arguments = json!({
             "expression": expression,
             "frameId": self.state.selected_frame.unwrap_or(0),
             "context": context,
         });
-        match self.client.request("evaluate", arguments).await {
-            Ok(body) => Ok(body
-                .get("result")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()),
-            Err(error) => Err(error.to_string()),
-        }
+        self.client
+            .request("evaluate", arguments)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evaluate(&self, expression: &str, context: &str) -> Result<String, String> {
+        let body = self.evaluate_body(expression, context).await?;
+        Ok(body
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
     }
 
     /// Evaluates for the popup at the caret, keeping what it takes to show the fields of
@@ -915,24 +1074,52 @@ impl Session {
             .map(|w| w.expression.clone())
             .collect();
         for expression in expressions {
-            let result = self.evaluate(&expression, "watch").await;
+            let value = self.watch_value(&expression).await;
             if let Some(watch) = self
                 .state
                 .watch
                 .iter_mut()
                 .find(|watch| watch.expression == expression)
             {
-                match result {
-                    Ok(value) => {
-                        watch.value = value;
-                        watch.error = None;
-                    }
-                    Err(error) => {
-                        watch.value.clear();
-                        watch.error = Some(error);
-                    }
-                }
+                *watch = value;
             }
+        }
+    }
+
+    async fn evaluate_inline_watch(&mut self) {
+        let expressions: Vec<String> = self.inline_watch.clone();
+        let mut values = Vec::with_capacity(expressions.len());
+        for expression in expressions {
+            values.push(self.watch_value(&expression).await);
+        }
+        self.state.inline_watch = values;
+    }
+
+    async fn watch_value(&self, expression: &str) -> WatchValue {
+        match self.evaluate_body(expression, "watch").await {
+            Ok(body) => WatchValue {
+                expression: expression.to_owned(),
+                value: body
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                type_name: body
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                reference: body
+                    .get("variablesReference")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                error: None,
+            },
+            Err(error) => WatchValue {
+                expression: expression.to_owned(),
+                error: Some(error),
+                ..WatchValue::default()
+            },
         }
     }
 }
@@ -1052,6 +1239,11 @@ fn variables_of(body: &Value) -> Vec<Variable> {
                         .get("variablesReference")
                         .and_then(Value::as_i64)
                         .unwrap_or(0),
+                    evaluate_name: item
+                        .get("evaluateName")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned),
                 })
                 .collect()
         })
@@ -1248,6 +1440,66 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the session did not stop");
+    }
+
+    /// The three requests of this kind reach the adapter, with the fields it reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_watches_and_renderers_reach_the_adapter() {
+        let server = lang_fixture::MockDap::start().unwrap();
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (snapshots, incoming) = std::sync::mpsc::channel();
+        let launch = launch_at(server.address().to_owned());
+        let running = tokio::spawn(run(launch, receiver, snapshots));
+        let debugger = crate::model::Debugger::new(commands, incoming);
+
+        wait_stopped(&debugger).await;
+        debugger.send(Command::SetInlineWatches(vec!["text".into()]));
+        let watched = loop {
+            if let Some(snapshot) = debugger.poll()
+                && snapshot
+                    .inline_watch
+                    .iter()
+                    .any(|watch| watch.expression == "text" && watch.value == "\"hello\"")
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(watched.inline_watch[0].reference, 0);
+
+        debugger.send(Command::SetTypeRenderers(vec![
+            crate::model::TypeRenderer {
+                type_name: "pkg.Collection".into(),
+                display: "size()".into(),
+                children: None,
+                subtype_probe: Some("({name} instanceof pkg.Collection)".into()),
+            },
+        ]));
+        debugger.send(Command::Expand(100));
+        let rendered = loop {
+            if let Some(snapshot) = debugger.poll()
+                && snapshot.variables.get(&100).is_some_and(|variables| {
+                    variables
+                        .iter()
+                        .any(|variable| variable.name == "items" && variable.value == "2")
+                })
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert!(
+            rendered
+                .variables
+                .get(&100)
+                .expect("the locals")
+                .iter()
+                .any(|variable| variable.name == "items" && variable.value == "2")
+        );
+
+        debugger.send(Command::Disconnect);
+        running.await.unwrap().unwrap();
+        server.join();
     }
 
     /// The three requests of this kind reach the adapter, with the fields it reads.

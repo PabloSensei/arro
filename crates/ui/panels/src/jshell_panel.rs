@@ -105,7 +105,6 @@ enum LineKind {
 /// The helper of one module's console and its unfinished output.
 struct OpenConsole {
     session: Box<dyn ConsoleSession>,
-    path: PathBuf,
     uri: Option<String>,
     /// The request that runs now, or the one Reset is answering.
     busy: Option<u64>,
@@ -113,8 +112,6 @@ struct OpenConsole {
     stopping: Option<Instant>,
     /// The output of the running fragment that has no line break yet.
     output: String,
-    /// The tab has been seen open, so a missing tab means it was closed.
-    was_open: bool,
 }
 
 pub struct JShellPanel {
@@ -127,8 +124,14 @@ pub struct JShellPanel {
     lines: HashMap<String, Vec<Line>>,
     status: Option<String>,
     scroll: ScrollHandle,
+    /// Set while the task that reads the answers of the helpers runs: it runs only while
+    /// at least one console is open.
+    polling: bool,
     /// Set when the window goes away, so the helpers do not outlive it.
     window_closed: Arc<AtomicBool>,
+    /// How many times the task read the answers, for the window tests.
+    #[cfg(test)]
+    poll_ticks: usize,
 }
 
 impl JShellPanel {
@@ -137,33 +140,37 @@ impl JShellPanel {
         state_dir: PathBuf,
         cx: &mut App,
     ) -> Entity<Self> {
-        let panel = cx.new(|cx| {
-            let panel = Self {
-                workspace,
-                focus: cx.focus_handle(),
-                state_dir,
-                modules: support()
-                    .map(|support| support.modules())
-                    .unwrap_or_default(),
-                selected: None,
-                consoles: HashMap::new(),
-                lines: HashMap::new(),
-                status: None,
-                scroll: ScrollHandle::new(),
-                window_closed: Arc::new(AtomicBool::new(false)),
-            };
-            panel.start_poll(cx);
-            panel
+        let panel = cx.new(|cx| Self {
+            workspace,
+            focus: cx.focus_handle(),
+            state_dir,
+            modules: support()
+                .map(|support| support.modules())
+                .unwrap_or_default(),
+            selected: None,
+            consoles: HashMap::new(),
+            lines: HashMap::new(),
+            status: None,
+            scroll: ScrollHandle::new(),
+            polling: false,
+            window_closed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            poll_ticks: 0,
         });
         panel.update(cx, |panel, cx| {
             let workspace = panel.workspace.clone();
             let closed = panel.window_closed.clone();
-            // The panel is built while the window is being updated; the hook is added
+            let this = cx.weak_entity();
+            // The panel is built while the window is being updated; the hooks are added
             // after that update is over.
             cx.defer(move |cx| {
                 if let Some(workspace) = workspace.upgrade() {
-                    workspace.update(cx, |workspace, _| {
-                        workspace.on_close(move || closed.store(true, Ordering::Relaxed))
+                    let tabs = this.clone();
+                    workspace.update(cx, |workspace, _cx| {
+                        workspace.on_close(move || closed.store(true, Ordering::Relaxed));
+                        workspace.on_tab_closed(move |path, cx| {
+                            tabs.update(cx, |panel, cx| panel.tab_closed(path, cx)).ok();
+                        });
                     });
                 }
             });
@@ -203,14 +210,29 @@ impl JShellPanel {
         console_module(&self.state_dir, path)
     }
 
-    fn start_poll(&self, cx: &mut Context<Self>) {
+    /// Starts the task that reads the answers of the helpers, when a console needs it.
+    fn ensure_poll(&mut self, cx: &mut Context<Self>) {
+        if self.polling {
+            return;
+        }
+        self.polling = true;
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(POLL).await;
-                if this
-                    .update(cx, |this: &mut Self, cx| this.poll(cx))
-                    .is_err()
-                {
+                let more = this.update(cx, |this, cx| {
+                    #[cfg(test)]
+                    {
+                        this.poll_ticks += 1;
+                    }
+                    this.poll(cx);
+                    // Nothing to read: the task ends and the next console starts it again.
+                    let more = !this.consoles.is_empty();
+                    if !more {
+                        this.polling = false;
+                    }
+                    more
+                });
+                if !matches!(more, Ok(true)) {
                     break;
                 }
             }
@@ -218,7 +240,8 @@ impl JShellPanel {
         .detach();
     }
 
-    /// Runs the answers of every helper, and ends the consoles whose tab is gone.
+    /// Runs the answers of every helper. The task that calls it runs only while a console
+    /// is open.
     fn poll(&mut self, cx: &mut Context<Self>) {
         if self.window_closed.load(Ordering::Relaxed) && !self.consoles.is_empty() {
             let modules: Vec<String> = self.consoles.keys().cloned().collect();
@@ -229,32 +252,12 @@ impl JShellPanel {
             cx.notify();
             return;
         }
-        let open: Vec<PathBuf> = self
-            .workspace
-            .upgrade()
-            .map(|workspace| {
-                workspace.read_with(cx, |workspace, _| {
-                    workspace
-                        .open_editors()
-                        .into_iter()
-                        .map(|(path, _)| ::platform::path_key(&path))
-                        .collect()
-                })
-            })
-            .unwrap_or_default();
         let modules: Vec<String> = self.consoles.keys().cloned().collect();
         let mut changed = false;
-        let mut closed = Vec::new();
         for module in modules {
             let Some(console) = self.consoles.get_mut(&module) else {
                 continue;
             };
-            if open.contains(&::platform::path_key(&console.path)) {
-                console.was_open = true;
-            } else if console.was_open {
-                closed.push(module.clone());
-                continue;
-            }
             let events = console.session.poll();
             if events.is_empty() {
                 continue;
@@ -264,14 +267,23 @@ impl JShellPanel {
                 changed = true;
             }
         }
-        for module in closed {
-            self.push_line(&module, Line::muted("The console was closed with its tab"));
-            self.remove(&module);
-            changed = true;
-        }
         if changed {
             cx.notify();
         }
+    }
+
+    /// The tab of a console file closed: its helper ends. The workspace runs this as the
+    /// tab goes, so there is no list of the open tabs to compare on every answer.
+    fn tab_closed(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(module) = self.module_of(path) else {
+            return;
+        };
+        if !self.consoles.contains_key(&module) {
+            return;
+        }
+        self.push_line(&module, Line::muted("The console was closed with its tab"));
+        self.remove(&module);
+        cx.notify();
     }
 
     fn handle(&mut self, module: &str, event: Event) {
@@ -571,15 +583,20 @@ impl JShellPanel {
             module.to_owned(),
             OpenConsole {
                 session,
-                path,
                 uri,
                 busy: None,
                 stopping: None,
                 output: String::new(),
-                was_open: false,
             },
         );
+        self.ensure_poll(cx);
         cx.notify();
+    }
+
+    /// How many times the task that reads the answers has run, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn poll_ticks_for_test(&self) -> usize {
+        self.poll_ticks
     }
 
     /// The session of a module, for a window test that answers without a process.

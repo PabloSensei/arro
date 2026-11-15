@@ -13,12 +13,14 @@ use lang_api::{
     ActionEntry, ActionKind, ActionProvider, ActionQuery, Answer, CodeLensCommand, CodeLensEntry,
     CodeLensProvider, CodeLensQuery, CodeLensResolveProvider, CodeLensResolveQuery,
     CompletionEntry, CompletionList, CompletionProvider, Confidence, DiagnosticEntry,
-    DiagnosticsProvider, DiagnosticsQuery, DocumentEdit, DocumentSpot, FormatProvider, FormatQuery,
-    InlayHintEntry, InlayHintKind, InlayHintProvider, InlayHintQuery, LanguageFn, LanguageId,
-    LanguageSupport, MoveDestination, MoveDestinationProvider, MoveOutcome, MoveProvider,
-    MoveQuery, MoveRequest, NavigationProvider, NavigationQuery, Provider, Queries,
-    ReferencesProvider, RenameProvider, RenameQuery, SemanticServer, Severity, SourceEdit,
-    SourceId, SourceSpan, SyntaxProvider, TextPoint, TextSpan, WorkspaceChange, offset_in,
+    DiagnosticNote, DiagnosticsProvider, DiagnosticsQuery, DocumentEdit, DocumentSpot,
+    FileDiagnostics, FormatProvider, FormatQuery, InlayHintEntry, InlayHintKind, InlayHintProvider,
+    InlayHintQuery, InspectionInfo, InspectionSettings, LanguageFn, LanguageId, LanguageSupport,
+    MoveDestination, MoveDestinationProvider, MoveOutcome, MoveProvider, MoveQuery, MoveRequest,
+    NavigationProvider, NavigationQuery, Provider, Queries, ReferencesProvider, RenameProvider,
+    RenameQuery, SemanticServer, Severity, SourceEdit, SourceId, SourceSpan, SyntaxProvider,
+    TextPoint, TextSpan, WorkspaceChange, WorkspaceDiagnosticsProvider, WorkspaceDiagnosticsQuery,
+    offset_in,
 };
 use platform::CanonPath;
 use ui_kit::gpui;
@@ -190,6 +192,8 @@ pub(crate) struct FakeLanguage {
     documents: Mutex<HashMap<String, Arc<str>>>,
     definition: Mutex<Option<SourceSpan>>,
     diagnostics: Mutex<Vec<DiagnosticEntry>>,
+    inspections: Mutex<Vec<InspectionInfo>>,
+    inspection_settings: Mutex<InspectionSettings>,
     actions: Mutex<Vec<ActionEntry>>,
     references: Mutex<Vec<SourceSpan>>,
     /// Hints by the offset of their place in the text.
@@ -209,6 +213,8 @@ impl FakeLanguage {
             documents: Mutex::new(HashMap::new()),
             definition: Mutex::new(None),
             diagnostics: Mutex::new(Vec::new()),
+            inspections: Mutex::new(Vec::new()),
+            inspection_settings: Mutex::new(InspectionSettings::default()),
             actions: Mutex::new(Vec::new()),
             references: Mutex::new(Vec::new()),
             inlays: Mutex::new(Vec::new()),
@@ -232,6 +238,14 @@ impl FakeLanguage {
 
     pub(crate) fn set_diagnostics(&self, entries: Vec<DiagnosticEntry>) {
         *self.diagnostics.lock().unwrap() = entries;
+    }
+
+    pub(crate) fn set_inspections(&self, entries: Vec<InspectionInfo>) {
+        *self.inspections.lock().unwrap() = entries;
+    }
+
+    pub(crate) fn inspection_settings(&self) -> InspectionSettings {
+        self.inspection_settings.lock().unwrap().clone()
     }
 
     pub(crate) fn set_actions(&self, entries: Vec<ActionEntry>) {
@@ -355,6 +369,34 @@ impl Provider<DiagnosticsQuery, Vec<DiagnosticEntry>> for FakeLanguage {
     ) {
         let entries = self.diagnostics.lock().unwrap().clone();
         let _ = reply.send(self.answer(entries));
+    }
+}
+
+impl Provider<WorkspaceDiagnosticsQuery, Vec<FileDiagnostics>> for FakeLanguage {
+    fn start(
+        &self,
+        _: WorkspaceDiagnosticsQuery,
+        _: base::Cancel,
+        mut reply: lang_api::Reply<Vec<FileDiagnostics>>,
+    ) {
+        let entries = self.diagnostics.lock().unwrap().clone();
+        let notes: Vec<DiagnosticNote> = entries
+            .iter()
+            .map(|entry| DiagnosticNote {
+                span: entry.span,
+                severity: entry.severity,
+                message: entry.message.clone(),
+                code: entry.code.clone(),
+            })
+            .collect();
+        let mut files = Vec::new();
+        for uri in self.documents.lock().unwrap().keys() {
+            files.push(FileDiagnostics {
+                uri: uri.clone(),
+                diagnostics: notes.clone(),
+            });
+        }
+        let _ = reply.send(self.answer(files));
     }
 }
 
@@ -590,6 +632,28 @@ impl LanguageSupport for FakeLanguage {
         Some(self)
     }
 
+    fn workspace_diagnostics(&self) -> Option<&WorkspaceDiagnosticsProvider> {
+        Some(self)
+    }
+
+    fn inspections(&self) -> Vec<InspectionInfo> {
+        self.inspections.lock().unwrap().clone()
+    }
+
+    fn set_inspection_settings(&self, settings: InspectionSettings) {
+        *self.inspection_settings.lock().unwrap() = settings;
+    }
+
+    fn inspection_of(&self, code: Option<&str>, _: &str) -> Option<InspectionInfo> {
+        let code = code?;
+        self.inspections
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|info| info.id == code)
+            .cloned()
+    }
+
     fn inlay_hints(&self) -> Option<&InlayHintProvider> {
         Some(self)
     }
@@ -735,6 +799,7 @@ fn error(line: u32, start: u32, end: u32, message: &str) -> DiagnosticEntry {
         severity: Severity::Error,
         message: message.to_owned(),
         unnecessary: false,
+        code: None,
     }
 }
 

@@ -7,9 +7,12 @@
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use ui_kit::{Menu, MenuEntry, MenuItem};
+use ui_kit::{Menu, MenuEntry, MenuItem, SystemMenuType};
 
-use crate::window::{MenuRow, QuitApp};
+use crate::window::{
+    AboutApp, BringAllToFront, CheckForUpdatesApp, HideApp, HideOtherApps, MenuRow, MinimizeWindow,
+    QuitApp, ShowAllApps, ShowSettings, ZoomWindow,
+};
 
 /// The menus of the screen and the rows of them that have a key of their own.
 pub struct ScreenMenus {
@@ -21,31 +24,84 @@ pub struct ScreenMenus {
 }
 
 /// The menus of the screen: the menu of the application in front of the sections of the
-/// window menu, in IDEA's order.
+/// window menu, in IDEA's order. The rows the application menu has in the native place of
+/// macOS do not appear a second time in File and Help.
 pub fn menus(application: &str, sections: &[MenuEntry]) -> ScreenMenus {
     let mut hints = Vec::new();
     let mut menus = Vec::with_capacity(sections.len() + 1);
-    menus.push(Menu::new(application).items(vec![MenuItem::action(
-        format!("Quit {application}"),
-        QuitApp,
-    )]));
+    menus.push(application_menu(application));
     for (index, section) in sections.iter().enumerate() {
-        let rows = items(&section.submenu, &[index], &mut hints);
+        let keep = |entry: &MenuEntry| !duplicate(&section.label, &entry.label);
+        let mut rows = items(&section.submenu, &[index], &mut hints, &keep);
+        // The window list itself is added by the system to the menu it is given as the
+        // windows menu of the application.
+        if section.label == "Window" {
+            rows.extend(window_rows());
+        }
         menus.push(Menu::new(section.label.clone()).items(rows));
     }
     ScreenMenus { menus, hints }
 }
 
-/// The rows of one menu, with the path of each through the menu of the window.
-fn items(entries: &[MenuEntry], prefix: &[usize], hints: &mut Vec<MenuRow>) -> Vec<MenuItem> {
+/// The menu of the application: what macOS puts in front of every other menu, in the
+/// order of a native program.
+fn application_menu(application: &str) -> Menu {
+    Menu::new(application.to_string()).items(vec![
+        MenuItem::action(format!("About {application}"), AboutApp),
+        MenuItem::action("Settings…", ShowSettings),
+        MenuItem::action("Check for Updates…", CheckForUpdatesApp),
+        MenuItem::separator(),
+        MenuItem::os_submenu("Services", SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action(format!("Hide {application}"), HideApp),
+        MenuItem::action("Hide Others", HideOtherApps),
+        MenuItem::action("Show All", ShowAllApps),
+        MenuItem::separator(),
+        MenuItem::action(format!("Quit {application}"), QuitApp),
+    ])
+}
+
+/// The end of the menu of the screen that the system fills with the windows of the
+/// application.
+fn window_rows() -> Vec<MenuItem> {
+    vec![
+        MenuItem::separator(),
+        MenuItem::action("Minimize", MinimizeWindow),
+        MenuItem::action("Zoom", ZoomWindow),
+        MenuItem::action("Bring All to Front", BringAllToFront),
+    ]
+}
+
+/// A row of a section that has its own place in the menu of the application.
+fn duplicate(section: &str, label: &str) -> bool {
+    matches!(
+        (section, label),
+        ("File", "Settings...")
+            | ("File", "Exit")
+            | ("Help", "About Arro")
+            | ("Help", "Check for Updates…")
+    )
+}
+
+/// The rows of one menu, with the path of each through the menu of the window. `keep`
+/// drops the rows that have another place; the paths stay the paths of the window menu.
+fn items(
+    entries: &[MenuEntry],
+    prefix: &[usize],
+    hints: &mut Vec<MenuRow>,
+    keep: &dyn Fn(&MenuEntry) -> bool,
+) -> Vec<MenuItem> {
     let mut rows = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let mut path = prefix.to_vec();
         path.push(index);
+        if !keep(entry) {
+            continue;
+        }
         if entry.label.is_empty() {
             rows.push(MenuItem::separator());
         } else if entry.has_submenu() {
-            let rows_of_submenu = items(&entry.submenu, &path, hints);
+            let rows_of_submenu = items(&entry.submenu, &path, hints, &|_| true);
             let menu = Menu::new(entry.label.clone()).items(rows_of_submenu);
             rows.push(MenuItem::submenu(menu));
         } else {
@@ -240,5 +296,92 @@ mod tests {
         assert_eq!(row.path, [0, 0]);
         assert_eq!(row.key.as_deref(), Some("ctrl-c"));
         assert_eq!(&screen.hints[0], row);
+    }
+
+    fn labels(items: &[MenuItem]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The menu of the application holds what a native macOS program has there.
+    #[test]
+    fn the_application_menu_has_the_rows_of_a_native_program() {
+        let screen = menus("Arro", &[]);
+
+        let application = &screen.menus[0];
+        assert_eq!(application.name.as_ref(), "Arro");
+        let names = labels(&application.items);
+        for label in [
+            "About Arro",
+            "Settings…",
+            "Check for Updates…",
+            "Hide Arro",
+            "Hide Others",
+            "Show All",
+            "Quit Arro",
+        ] {
+            assert!(names.iter().any(|name| name == label), "{label} is missing");
+        }
+        assert!(
+            application
+                .items
+                .iter()
+                .any(|item| matches!(item, MenuItem::SystemMenu(menu)
+                    if menu.menu_type == SystemMenuType::Services)),
+            "the Services menu is the one of the system"
+        );
+    }
+
+    /// About, Settings, Check for Updates and Exit have their own place in the menu of the
+    /// application, so File and Help do not repeat them.
+    #[test]
+    fn the_rows_of_the_application_menu_do_not_repeat_in_the_sections() {
+        let sections = vec![
+            MenuEntry::submenu(
+                "File",
+                vec![
+                    leaf("Open..."),
+                    MenuEntry::separator(),
+                    leaf("Settings..."),
+                    leaf("Exit"),
+                ],
+            ),
+            MenuEntry::submenu(
+                "Help",
+                vec![
+                    leaf("About Arro"),
+                    leaf("Check for Updates…"),
+                    leaf("Support Arro…"),
+                ],
+            ),
+        ];
+
+        let screen = menus("Arro", &sections);
+
+        assert_eq!(labels(&screen.menus[1].items), ["Open..."]);
+        assert_eq!(labels(&screen.menus[2].items), ["Support Arro…"]);
+    }
+
+    /// The system fills the menu it is given as the windows menu with the window list;
+    /// the rows that open the list are ours.
+    #[test]
+    fn the_window_menu_ends_with_the_rows_of_the_system() {
+        let sections = vec![MenuEntry::submenu(
+            "Window",
+            vec![leaf("Reopen Closed Tab")],
+        )];
+
+        let screen = menus("Arro", &sections);
+
+        let names = labels(&screen.menus[1].items);
+        assert_eq!(
+            &names[names.len() - 3..],
+            ["Minimize", "Zoom", "Bring All to Front"]
+        );
     }
 }

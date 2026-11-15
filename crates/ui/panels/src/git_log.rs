@@ -1,13 +1,13 @@
 //! The Git Log tool window: the commits of the branch or of one file, the files a commit
 //! changed, the diff of one of them and the actions a right click on a commit opens.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::graph;
-use vcs::{Commit, RebaseAction, RebasePlan, RefKind, RefLabel, ResetMode};
+use vcs::{Commit, RebaseAction, RebasePlan, RefKind, RefLabel, Repository, ResetMode};
 use workspace::{LOG_TOOL, Workspace};
 
 use crate::diff_view::DiffView;
@@ -101,7 +101,13 @@ pub struct GitLogPanel {
     focus: FocusHandle,
     /// `None` for the branch, `Some` for Show History of one file.
     path: Option<PathBuf>,
+    /// The root chosen in the filter, `None` for every root of the project.
+    root: Option<String>,
+    /// The roots the project has: their prefixes inside it and their names.
+    roots: Vec<(String, String)>,
     commits: Vec<Commit>,
+    /// The prefix of the root of each commit of `commits`.
+    commit_roots: Vec<String>,
     /// The graph rows of `commits`, laid out once when the log is loaded.
     graph: Vec<graph::Row>,
     /// The branches and tags of the repository, in the order `for-each-ref` gives them.
@@ -156,7 +162,10 @@ impl GitLogPanel {
                 workspace,
                 focus: cx.focus_handle(),
                 path: None,
+                root: None,
+                roots: Vec::new(),
                 commits: Vec::new(),
+                commit_roots: Vec::new(),
                 graph: Vec::new(),
                 labels: Vec::new(),
                 lanes: 0,
@@ -185,6 +194,7 @@ impl GitLogPanel {
         self.path = None;
         self.filter.text.clear();
         self.commits.clear();
+        self.commit_roots.clear();
         self.graph.clear();
         self.labels.clear();
         self.lanes = 0;
@@ -201,6 +211,7 @@ impl GitLogPanel {
         self.path = Some(path);
         self.filter.text.clear();
         self.commits.clear();
+        self.commit_roots.clear();
         self.graph.clear();
         self.labels.clear();
         self.lanes = 0;
@@ -210,6 +221,47 @@ impl GitLogPanel {
         self.want = None;
         self.reload(cx);
         cx.notify();
+    }
+
+    /// The Paths > Roots filter of IDEA: one root of the project, or all of them.
+    pub fn set_root(&mut self, root: Option<String>, cx: &mut Context<Self>) {
+        self.root = root;
+        self.selected = None;
+        self.files.clear();
+        self.want = None;
+        self.reload(cx);
+        cx.notify();
+    }
+
+    /// The menu of the root filter: every root and the project as a whole.
+    fn root_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let me = cx.weak_entity();
+        let mut entries = Vec::new();
+        {
+            let me = me.clone();
+            entries.push(
+                MenuEntry::new("All Roots", move |_, cx| {
+                    me.update(cx, |this, cx| this.set_root(None, cx)).ok();
+                })
+                .icon("general/vcs"),
+            );
+        }
+        for (prefix, label) in self.roots.clone() {
+            let me = me.clone();
+            entries.push(
+                MenuEntry::new(label, move |_, cx| {
+                    let prefix = prefix.clone();
+                    me.update(cx, |this, cx| this.set_root(Some(prefix), cx))
+                        .ok();
+                })
+                .icon("general/vcs"),
+            );
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -222,34 +274,72 @@ impl GitLogPanel {
         }
         self.loading = true;
         let path = self.path.clone();
+        let chosen = self.root.clone();
         let job = cx.background_executor().spawn(async move {
-            let result = match path {
+            let (commits, commit_roots, roots) = match path {
                 Some(path) => {
-                    let relative = relative_of(repo.root(), &path);
-                    repo.file_log(&relative, LIMIT, 0)
+                    let (prefix, repository) = repository_for_path(&repo, &path);
+                    let relative = relative_of(repository.root(), &path);
+                    let commits = repository.file_log(&relative, LIMIT, 0)?;
+                    let count = commits.len();
+                    (commits, vec![prefix; count], roots_of(&repo))
                 }
-                None => repo.log(LIMIT, 0),
+                None => match chosen {
+                    Some(prefix) => {
+                        let repository = roots_of(&repo)
+                            .into_iter()
+                            .find(|(root, _)| *root == prefix)
+                            .map_or_else(|| repo.fork(), |(_, repository)| repository);
+                        let commits = repository.log(LIMIT, 0)?;
+                        let count = commits.len();
+                        (commits, vec![prefix; count], roots_of(&repo))
+                    }
+                    None => {
+                        let roots = roots_of(&repo);
+                        let mut merged: Vec<(String, Commit)> = Vec::new();
+                        for (prefix, repository) in &roots {
+                            for commit in repository.log(LIMIT, 0).unwrap_or_default() {
+                                merged.push((prefix.clone(), commit));
+                            }
+                        }
+                        // One root keeps the order of git: a cherry-pick has an author
+                        // time older than the commits below it.
+                        if roots.len() > 1 {
+                            merged.sort_by_key(|(_, commit)| std::cmp::Reverse(commit.time));
+                        }
+                        let (commit_roots, commits): (Vec<String>, Vec<Commit>) =
+                            merged.into_iter().unzip();
+                        (commits, commit_roots, roots)
+                    }
+                },
             };
             // The layout of a long log and the labels are the slow part of a load, so
             // they are read here and never while the window draws. A log without labels
             // is still a log.
-            result
-                .map(|commits| {
-                    let graph = graph::layout(&commits);
-                    let labels = repo.labels().unwrap_or_default();
-                    (commits, graph, labels)
-                })
-                .map_err(|error| error.to_string())
+            let graph = graph::layout(&commits);
+            let mut labels = Vec::new();
+            for (_, repository) in roots_of(&repo) {
+                labels.extend(repository.labels().unwrap_or_default());
+            }
+            Ok::<_, std::io::Error>((commits, commit_roots, graph, labels, roots))
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| {
                 this.loading = false;
-                match result {
-                    Ok((commits, graph, labels)) => {
+                match result.map_err(|error| error.to_string()) {
+                    Ok((commits, commit_roots, graph, labels, roots)) => {
                         this.commits = commits;
+                        this.commit_roots = commit_roots;
                         this.graph = graph;
                         this.labels = labels;
+                        this.roots = roots
+                            .into_iter()
+                            .map(|(prefix, repository)| {
+                                let label = root_label(repository.root(), &prefix);
+                                (prefix, label)
+                            })
+                            .collect();
                         this.selected = None;
                         this.files.clear();
                         this.apply_filter();
@@ -323,15 +413,25 @@ impl GitLogPanel {
             return;
         };
         let id = commit.id.clone();
+        let source = self.shown.get(index).copied().unwrap_or(index);
+        let prefix = self.commit_roots.get(source).cloned().unwrap_or_default();
         self.selected = Some(index);
         self.files.clear();
         self.files_loading = true;
         let Some(repo) = self.git.read(cx).repo() else {
             return;
         };
-        let job = cx
-            .background_executor()
-            .spawn(async move { repo.commit_files(&id).map_err(|error| error.to_string()) });
+        let job = cx.background_executor().spawn(async move {
+            let repository = repo
+                .roots()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(root, _)| *root == prefix)
+                .map_or_else(|| repo.fork(), |(_, repository)| repository);
+            repository
+                .commit_files(&id)
+                .map_err(|error| error.to_string())
+        });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| {
@@ -362,12 +462,23 @@ impl GitLogPanel {
         let Some(path) = self.files.get(index) else {
             return;
         };
-        let Some(root) = self
-            .git
-            .read(cx)
-            .repo()
-            .map(|repo| repo.root().to_path_buf())
-        else {
+        let prefix = self
+            .selected
+            .and_then(|selected| self.shown.get(selected))
+            .and_then(|index| self.commit_roots.get(*index))
+            .cloned()
+            .unwrap_or_default();
+        let Some(root) = self.git.read(cx).repo().and_then(|repo| {
+            repo.roots()
+                .ok()
+                .and_then(|roots| {
+                    roots
+                        .into_iter()
+                        .find(|(root, _)| *root == prefix)
+                        .map(|(_, repository)| repository.root().to_path_buf())
+                })
+                .or_else(|| Some(repo.root().to_path_buf()))
+        }) else {
             return;
         };
         DiffView::open_commit(
@@ -722,6 +833,21 @@ impl GitLogPanel {
         self.path.as_ref()
     }
 
+    /// The roots the filter offers, for a test.
+    #[cfg(test)]
+    pub fn roots(&self) -> Vec<(String, String)> {
+        self.roots.clone()
+    }
+
+    /// The root of each shown commit, for a test.
+    #[cfg(test)]
+    pub fn shown_roots(&self) -> Vec<String> {
+        self.shown
+            .iter()
+            .filter_map(|index| self.commit_roots.get(*index).cloned())
+            .collect()
+    }
+
     /// The commits the filter leaves, newest first.
     #[cfg(test)]
     pub fn commits(&self) -> Vec<&Commit> {
@@ -770,9 +896,19 @@ impl GitLogPanel {
         labels
     }
 
+    /// The name of the root a commit belongs to, when the project has more than one.
+    fn root_of_commit(&self, index: usize) -> Option<String> {
+        let prefix = self.commit_roots.get(index)?;
+        self.roots
+            .iter()
+            .find(|(root, _)| root == prefix)
+            .map(|(_, label)| label.clone())
+    }
+
     fn commit_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
         let colors = graph_colors(theme);
         let lanes = self.lanes;
+        let show_roots = self.roots.len() > 1;
         self.shown
             .iter()
             .enumerate()
@@ -786,6 +922,7 @@ impl GitLogPanel {
                 let date = date_of(commit.time);
                 let row = self.graph.get(*source).cloned().unwrap_or_default();
                 let labels = self.commit_labels(commit);
+                let root = show_roots.then(|| self.root_of_commit(*source)).flatten();
                 div()
                     .id(("log-commit", index))
                     .debug_selector(move || format!("log-commit-{index}"))
@@ -819,6 +956,20 @@ impl GitLogPanel {
                             .text_color(theme.link)
                             .child(short.to_string()),
                     )
+                    .children(root.map(|root| {
+                        div()
+                            .flex_none()
+                            .max_w(px(LABEL_WIDTH))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .px(px(SPACE_S))
+                            .rounded(px(CONTROL_RADIUS))
+                            .bg(theme.selection_muted)
+                            .text_color(theme.text_secondary)
+                            .text_size(px(TEXT_SMALL))
+                            .debug_selector(move || format!("log-root-{index}"))
+                            .child(root)
+                    }))
                     .child(
                         div()
                             .flex()
@@ -890,8 +1041,35 @@ impl GitLogPanel {
     }
 }
 
+/// The roots of the project, or the project alone when git cannot list them.
+fn roots_of(repo: &Repository) -> Vec<(String, Repository)> {
+    repo.roots()
+        .unwrap_or_else(|_| vec![(String::new(), repo.fork())])
+}
+
+/// The root a file belongs to and the repository of that root.
+fn repository_for_path(repo: &Repository, path: &Path) -> (String, Repository) {
+    let mut chosen = (String::new(), repo.fork());
+    for (prefix, repository) in roots_of(repo) {
+        if path.starts_with(repository.root()) {
+            chosen = (prefix, repository);
+        }
+    }
+    chosen
+}
+
+/// The name of a root: the folder of the project, or the path of the submodule.
+fn root_label(root: &Path, prefix: &str) -> String {
+    if !prefix.is_empty() {
+        return prefix.to_owned();
+    }
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Project".to_owned())
+}
+
 /// `YYYY-MM-DD` in UTC.
-fn date_of(seconds: i64) -> String {
+pub(crate) fn date_of(seconds: i64) -> String {
     let days = seconds.div_euclid(86_400);
     // The civil date from days since 1970-01-01, as the calendar repeats every 400 years.
     let z = days + 719_468;
@@ -1758,6 +1936,12 @@ impl Render for GitLogPanel {
         let commits = self.commit_rows(&theme, cx);
         let files = self.file_rows(&theme, cx);
         let branch = self.git.read(cx).status().branch.clone();
+        let root_title = self.root.as_ref().and_then(|prefix| {
+            self.roots
+                .iter()
+                .find(|(root, _)| root == prefix)
+                .map(|(_, label)| label.clone())
+        });
         let title: SharedString = match &self.path {
             Some(path) => {
                 let root = self
@@ -1768,10 +1952,16 @@ impl Render for GitLogPanel {
                     .unwrap_or_default();
                 format!("Git Log: {}", relative_of(&root, path)).into()
             }
-            None => match branch {
-                Some(branch) => format!("Git Log: {branch}").into(),
-                None => "Git Log".into(),
+            None => match (branch, root_title.clone()) {
+                (Some(branch), Some(root)) => format!("Git Log: {branch} ({root})").into(),
+                (Some(branch), None) => format!("Git Log: {branch}").into(),
+                (None, Some(root)) => format!("Git Log: {root}").into(),
+                (None, None) => "Git Log".into(),
             },
+        };
+        let roots_label: SharedString = match &root_title {
+            Some(root) => format!("Roots: {root}").into(),
+            None => "Roots: All".into(),
         };
         let filter_empty = self.filter.text.is_empty();
         let filter_focused = self.focus.is_focused(window);
@@ -1819,24 +2009,46 @@ impl Render for GitLogPanel {
                             .debug_selector(|| "log-title".to_owned())
                             .child(title),
                     )
-                    .child(if busy {
+                    .child(
                         div()
-                            .text_color(theme.text_secondary)
-                            .child("Loading...")
-                            .into_any_element()
-                    } else {
-                        div()
-                            .id("log-refresh")
-                            .px(px(SPACE_M))
-                            .rounded(px(CONTROL_RADIUS))
-                            .hover({
-                                let hover = theme.hover;
-                                move |style| style.bg(hover)
-                            })
-                            .child("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
-                            .into_any_element()
-                    }),
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .child(
+                                div()
+                                    .id("log-roots")
+                                    .px(px(SPACE_M))
+                                    .rounded(px(CONTROL_RADIUS))
+                                    .cursor_pointer()
+                                    .hover({
+                                        let hover = theme.hover;
+                                        move |style| style.bg(hover)
+                                    })
+                                    .child(roots_label)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.root_menu(window.mouse_position(), cx)
+                                    })),
+                            )
+                            .child(if busy {
+                                div()
+                                    .text_color(theme.text_secondary)
+                                    .child("Loading...")
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .id("log-refresh")
+                                    .px(px(SPACE_M))
+                                    .rounded(px(CONTROL_RADIUS))
+                                    .cursor_pointer()
+                                    .hover({
+                                        let hover = theme.hover;
+                                        move |style| style.bg(hover)
+                                    })
+                                    .child("Refresh")
+                                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+                                    .into_any_element()
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1964,6 +2176,7 @@ pub fn show_commit(
     let id = id.to_owned();
     panel.update(cx, |panel, cx| {
         panel.path = None;
+        panel.root = None;
         panel.filter.text.clear();
         panel.want = Some(id);
         panel.reload(cx);

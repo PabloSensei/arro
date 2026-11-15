@@ -2,14 +2,34 @@
 //! Get from VCS. A project opens in a window of its own, a program of its own.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
+use ::base::Cancel;
+
+use project_model::scaffold::{self, Generator};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{StartContext, spawn_project};
+use workspace::{OpenRequests, Request, StartContext, spawn_path_taking_over};
 
+use crate::new_project::{NewProject, Plan, Step};
 use crate::prompt::TextField;
 use crate::tree_ops::check_name;
+
+/// The generators of the wizard, made when the form opens: the application supplies
+/// them, because a neutral crate knows no language and no build tool.
+pub type Generators = Arc<dyn Fn() -> Vec<Arc<dyn Generator>> + Send + Sync>;
+
+static GENERATORS: OnceLock<Generators> = OnceLock::new();
+
+/// Registers the generators the application offers in New Project.
+pub fn set_generators(generators: Generators) {
+    let _ = GENERATORS.set(generators);
+}
+
+fn registered_generators() -> Vec<Arc<dyn Generator>> {
+    GENERATORS.get().map(|make| make()).unwrap_or_default()
+}
 
 /// A kind of new project. The application gives the list: neutral crates know no build tool.
 #[derive(Clone)]
@@ -63,6 +83,8 @@ pub struct StartScreen {
     recent: Vec<PathBuf>,
     state_dir: PathBuf,
     templates: Vec<ProjectTemplate>,
+    generators: Vec<Arc<dyn Generator>>,
+    pub(crate) wizard: NewProject,
     mode: Mode,
     template: usize,
     active: Active,
@@ -71,38 +93,75 @@ pub struct StartScreen {
     url: TextField,
     message: Option<SharedString>,
     busy: bool,
+    /// A window opened only for the wizard closes instead of showing the start screen.
+    standalone: bool,
     focus: FocusHandle,
     /// Tests create projects without starting a program of their own.
     #[cfg(test)]
     no_spawn: bool,
 }
 
-/// Opens the start window and runs until it closes.
+/// Opens the start window and runs until it closes. `requests` brings the paths the
+/// system opens and the requests of a second start: a path becomes a project of its own.
 pub fn run(
     context: StartContext,
     state_dir: PathBuf,
     templates: Vec<ProjectTemplate>,
+    generators: Vec<Arc<dyn Generator>>,
     background: bool,
+    requests: OpenRequests,
 ) {
-    ui_kit::app().run(move |cx| {
+    let opened = requests.clone();
+    let application = ui_kit::app();
+    application.on_open_urls(move |urls| {
+        for url in urls {
+            if let Some(path) = ::platform::file_url_path(&url) {
+                opened.push(Request::Open(path));
+            }
+        }
+    });
+    application.run(move |cx| {
         ui_kit::init(context.dark, cx);
         cx.set_global(context.settings);
         let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             focus: !background,
+            app_id: Some("arro".into()),
             ..Default::default()
         };
         let recent = context.recent;
-        cx.open_window(options, move |window, cx| {
-            window.set_window_title("Welcome to Arro");
-            cx.new(|cx| {
-                let focus = cx.focus_handle();
-                window.focus(&focus, cx);
-                StartScreen::new(recent, state_dir, templates, focus)
+        let window = cx
+            .open_window(options, move |window, cx| {
+                window.set_window_title("Welcome to Arro");
+                cx.new(|cx| {
+                    let focus = cx.focus_handle();
+                    window.focus(&focus, cx);
+                    StartScreen::new(recent, state_dir, templates, generators, focus, Mode::Home)
+                })
             })
+            .expect("open window");
+        // The listener of the platform cannot touch the window, so the queue wakes the
+        // screen and it hands the paths over until the first one closes it.
+        cx.spawn(async move |cx| {
+            while requests.wait_for_push().await {
+                for request in requests.take() {
+                    let opened = match request {
+                        Request::Focus => {
+                            cx.update(|cx| cx.activate(true));
+                            Ok(())
+                        }
+                        Request::Open(path) => {
+                            window.update(cx, |screen, window, cx| screen.open(path, window, cx))
+                        }
+                    };
+                    if opened.is_err() {
+                        return;
+                    }
+                }
+            }
         })
-        .expect("open window");
+        .detach();
     });
 }
 
@@ -111,21 +170,27 @@ impl StartScreen {
         recent: Vec<PathBuf>,
         state_dir: PathBuf,
         templates: Vec<ProjectTemplate>,
+        generators: Vec<Arc<dyn Generator>>,
         focus: FocusHandle,
+        mode: Mode,
     ) -> Self {
         let home = ::base::program::home_dir().unwrap_or_else(std::env::temp_dir);
+        let projects = home.join("ArroProjects");
         Self {
             recent,
             state_dir,
             templates,
-            mode: Mode::Home,
+            wizard: NewProject::new(generators.clone(), projects.clone()),
+            generators,
+            mode,
             template: 0,
             active: Active::Name,
             name: TextField::default(),
-            location: TextField::from_text(home.join("ArroProjects").display().to_string()),
+            location: TextField::from_text(projects.display().to_string()),
             url: TextField::default(),
             message: None,
             busy: false,
+            standalone: false,
             focus,
             #[cfg(test)]
             no_spawn: false,
@@ -143,7 +208,33 @@ impl StartScreen {
     ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        Self::new(recent, state_dir, templates, focus)
+        Self::new(recent, state_dir, templates, Vec::new(), focus, Mode::Home)
+    }
+
+    /// Hands the wizard the generators of the application, for a test of the form.
+    #[cfg(test)]
+    pub fn set_generators_for_test(&mut self, generators: Vec<Arc<dyn Generator>>) {
+        self.generators = generators.clone();
+        let location = PathBuf::from(self.location.text.trim());
+        self.wizard = NewProject::new(generators, location);
+    }
+
+    /// Fills the fields of the wizard, for tests without a keyboard.
+    #[cfg(test)]
+    pub fn set_new_project_fields_for_test(&mut self, name: &str, location: &str) {
+        self.wizard.set_fields_for_test(name, location);
+    }
+
+    /// The wizard of the form, for a test.
+    #[cfg(test)]
+    pub fn wizard_for_test(&self) -> &NewProject {
+        &self.wizard
+    }
+
+    /// The line under the form, for a test without pixels.
+    #[cfg(test)]
+    pub fn message_for_test(&self) -> Option<String> {
+        self.message.as_ref().map(|text| text.to_string())
     }
 
     /// The mode the screen shows, for tests.
@@ -208,7 +299,7 @@ impl StartScreen {
         let state_dir = self.state_dir.clone();
         let start = cx
             .background_executor()
-            .spawn(async move { spawn_project(&state_dir, &folder) });
+            .spawn(async move { spawn_path_taking_over(&state_dir, &folder) });
         cx.spawn_in(window, async move |this, cx| match start.await {
             Ok(()) => {
                 this.update_in(cx, |_, window, _| window.remove_window())
@@ -309,6 +400,25 @@ impl StartScreen {
             return;
         }
         let key = event.keystroke.key.as_str();
+        if self.mode == Mode::New && !self.generators.is_empty() {
+            if key == "escape" {
+                if self.standalone {
+                    window.remove_window();
+                } else {
+                    self.show(Mode::Home, window, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+            match self.wizard.key(event, cx) {
+                Step::None => return,
+                step => {
+                    cx.stop_propagation();
+                    self.run_wizard_step(step, window, cx);
+                }
+            }
+            return;
+        }
         if key == "tab" {
             self.active = match (self.mode, self.active) {
                 (Mode::New, Active::Name) | (Mode::Clone, Active::Url) => Active::Location,
@@ -328,6 +438,127 @@ impl StartScreen {
         cx.stop_propagation();
         cx.notify();
     }
+
+    /// Runs what the wizard asked for: a frame, the metadata of a server, or the project.
+    pub(crate) fn run_wizard_step(
+        &mut self,
+        step: Step,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match step {
+            Step::None => {}
+            Step::Changed => {
+                self.message = None;
+                cx.notify();
+            }
+            Step::Load => self.load_generator(window, cx),
+            Step::Create(plan) => self.create_planned(plan, window, cx),
+        }
+    }
+
+    /// Asks the generator for the choices that come from outside, away from this thread.
+    fn load_generator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.wizard.begin_load();
+        let values = self.wizard.values_for_load();
+        let Some(generator) = self.generators.get(self.wizard.generator_index()) else {
+            return;
+        };
+        let generator = Arc::clone(generator);
+        let answer = cx
+            .background_executor()
+            .spawn(async move { generator.load(&values, &Cancel::new()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await;
+            this.update(cx, |this, cx| {
+                this.wizard.loaded(generation, answer);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Writes the project away from this thread and opens it in a window of its own.
+    fn create_planned(&mut self, plan: Plan, window: &mut Window, cx: &mut Context<Self>) {
+        let Plan { generator, request } = plan;
+        let folder = request.folder.clone();
+        let opened = folder.clone();
+        let git = request.git;
+        self.busy = true;
+        self.message = Some("Creating...".into());
+        let write = cx.background_executor().spawn(async move {
+            let cancel = Cancel::new();
+            scaffold::prepare(&folder)?;
+            let created = generator.create(&request, &cancel)?;
+            scaffold::apply_created(&folder, &created)?;
+            let mut note = match generator.finish(&request, &folder, &cancel) {
+                Ok(note) => note.or(created.note.clone()),
+                Err(error) => Some(error),
+            };
+            if git {
+                let started = vcs::GitRunner::from_env()
+                    .is_some_and(|git| git.run(&folder, ["init"]).is_ok());
+                if !started {
+                    note = Some(match note {
+                        Some(note) => format!("{note} Git did not start in the folder."),
+                        None => "The project is created, but Git did not start in the folder."
+                            .to_owned(),
+                    });
+                }
+            }
+            Ok::<_, String>(note.unwrap_or_default())
+        });
+        cx.spawn_in(window, async move |this, cx| match write.await {
+            Ok(note) => {
+                this.update(cx, |this, _cx| {
+                    if !note.is_empty() {
+                        this.message = Some(note.into());
+                    }
+                })
+                .ok();
+                this.update_in(cx, |this, window, cx| this.open(opened, window, cx))
+                    .ok();
+            }
+            Err(error) => {
+                this.update(cx, |this, cx| {
+                    this.fail(format!("The project is not created: {error}"), cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+}
+
+/// Opens the New Project wizard in a window of its own, as File > New > Project does.
+pub fn open_window(state_dir: PathBuf, cx: &mut App) {
+    let generators = registered_generators();
+    let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        ..Default::default()
+    };
+    cx.open_window(options, move |window, cx| {
+        window.set_window_title("New Project");
+        cx.new(|cx| {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            let mut screen = StartScreen::new(
+                Vec::new(),
+                state_dir,
+                Vec::new(),
+                generators.clone(),
+                focus,
+                Mode::New,
+            );
+            screen.standalone = true;
+            screen
+        })
+    })
+    .ok();
 }
 
 fn button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
@@ -374,7 +605,7 @@ fn text_field(label: &'static str, field: &TextField, active: bool, theme: &Them
 }
 
 impl Render for StartScreen {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let actions = div()
             .flex()
@@ -395,7 +626,7 @@ impl Render for StartScreen {
                 ),
             );
 
-        let side = match self.mode {
+        let side: AnyElement = match self.mode {
             Mode::Home => {
                 let rows = self.recent.iter().enumerate().map(|(index, project)| {
                     let name = project.file_name().unwrap_or_default().to_string_lossy();
@@ -436,7 +667,9 @@ impl Render for StartScreen {
                     )
                     .children(rows)
                     .children(empty)
+                    .into_any_element()
             }
+            Mode::New if !self.generators.is_empty() => self.wizard.render(window, cx),
             Mode::New => {
                 let templates = self.templates.iter().enumerate().map(|(index, template)| {
                     let on = index == self.template;
@@ -480,28 +713,32 @@ impl Render for StartScreen {
                         button("start-create", "Create", &theme)
                             .on_click(cx.listener(|this, _, window, cx| this.create(window, cx))),
                     )
+                    .into_any_element()
             }
-            Mode::Clone => div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .gap(px(DIALOG_GAP))
-                .child(div().font_weight(FontWeight::MEDIUM).child("Get from VCS"))
-                .child(text_field(
-                    "URL",
-                    &self.url,
-                    self.active == Active::Url,
-                    &theme,
-                ))
-                .child(text_field(
-                    "Directory",
-                    &self.location,
-                    self.active == Active::Location,
-                    &theme,
-                ))
-                .child(button("start-do-clone", "Clone", &theme).on_click(
-                    cx.listener(|this, _, window, cx| this.clone_repository(window, cx)),
-                )),
+            Mode::Clone => {
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .gap(px(DIALOG_GAP))
+                    .child(div().font_weight(FontWeight::MEDIUM).child("Get from VCS"))
+                    .child(text_field(
+                        "URL",
+                        &self.url,
+                        self.active == Active::Url,
+                        &theme,
+                    ))
+                    .child(text_field(
+                        "Directory",
+                        &self.location,
+                        self.active == Active::Location,
+                        &theme,
+                    ))
+                    .child(button("start-do-clone", "Clone", &theme).on_click(
+                        cx.listener(|this, _, window, cx| this.clone_repository(window, cx)),
+                    ))
+                    .into_any_element()
+            }
         };
         let message = self
             .message
@@ -540,7 +777,15 @@ impl Render for StartScreen {
                             .child("Welcome to Arro"),
                     ),
             )
-            .child(div().flex().gap(px(SPACE_XL)).child(actions).child(side))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(px(SPACE_XL))
+                    .child(actions)
+                    .child(side),
+            )
             .children(message)
     }
 }

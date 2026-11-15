@@ -141,6 +141,12 @@ pub trait LiveApplication: Send + Sync {
     /// The HTTP path of a section on the endpoint.
     fn section_path(&self, section: LiveSection) -> Option<String>;
 
+    /// The port the application itself listens on, for the browser link of the Services
+    /// window. `None` while the language cannot name it.
+    fn app_port(&self) -> Option<u16> {
+        None
+    }
+
     /// The URL of a path of the application itself, for a request of the HTTP client.
     /// The management endpoint may listen on another port.
     fn app_url(&self, path: &str) -> Option<String>;

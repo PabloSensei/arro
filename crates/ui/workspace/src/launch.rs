@@ -7,6 +7,7 @@ use store::Store;
 use ui_kit::*;
 
 use crate::editor::FileIcons;
+use crate::external::{OpenRequests, Request};
 use crate::layout::{
     Layout, WindowPlacement, load_dark_theme, load_layout, load_recent, remember_project,
 };
@@ -120,12 +121,50 @@ pub fn spawn_project_from(
     folder: &std::path::Path,
     replaced: Option<u32>,
 ) -> std::io::Result<()> {
+    let mut command = spawn_command(program, state_dir);
+    command.args(project_arguments(folder, replaced));
+    command.spawn().map(|_| ())
+}
+
+/// The arguments of a start that opens a project in a window of its own. Such a start
+/// does not hand the folder to the program that already listens: that one would start a
+/// second process for the folder and leave, a whole start too late. A start after an
+/// update is the program that listens next: the old one is on its way out.
+fn project_arguments(folder: &std::path::Path, replaced: Option<u32>) -> Vec<std::ffi::OsString> {
+    let mut arguments = Vec::with_capacity(3);
+    match replaced {
+        Some(process_id) => {
+            arguments.push("--after-update".into());
+            arguments.push(process_id.to_string().into());
+        }
+        None => arguments.push("--new-instance".into()),
+    }
+    arguments.push(folder.into());
+    arguments
+}
+
+/// Starts a program of its own for a path: a project folder, or a file, which opens in
+/// the folder that holds it. The path is not handed to a running program: this start is
+/// the window of its own.
+pub fn spawn_path(state_dir: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    let mut command = spawn_command(std::env::current_exe()?, state_dir);
+    command.arg("--new-instance").arg(path).spawn().map(|_| ())
+}
+
+/// [`spawn_path`] for the start screen, which closes after it: this program listens for
+/// the next start as soon as the start screen lets the state folder go.
+pub fn spawn_path_taking_over(
+    state_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut command = spawn_command(std::env::current_exe()?, state_dir);
+    command.arg("--take-over").arg(path).spawn().map(|_| ())
+}
+
+fn spawn_command(program: PathBuf, state_dir: &std::path::Path) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     command.arg("--state-dir").arg(state_dir);
-    if let Some(process_id) = replaced {
-        command.arg("--after-update").arg(process_id.to_string());
-    }
-    command.arg(folder).spawn().map(|_| ())
+    command
 }
 
 fn open_store(launch: &Launch) -> Option<Arc<Store>> {
@@ -169,9 +208,11 @@ pub fn choose_platform_keymap() {
 }
 
 /// Runs the application until the window closes. `setup` adds the panels and must
-/// give the workspace its editor factory.
+/// give the workspace its editor factory. `requests` brings the paths the system opens
+/// and the paths of a second start to the window.
 pub fn run(
     launch: Launch,
+    requests: OpenRequests,
     setup: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) {
     let store = open_store(&launch);
@@ -188,7 +229,19 @@ pub fn run(
     let focus = !launch.background;
     let settings = Settings::load(&launch.settings_dir.join(SETTINGS_FILE));
 
-    ui_kit::app().run(move |cx| {
+    // The Finder hands a document to the delegate of the running application, and the
+    // window takes it from the same queue as the paths of a second start.
+    let opened = requests.clone();
+    let application = ui_kit::app();
+    application.on_open_urls(move |urls| {
+        for url in urls {
+            if let Some(path) = ::platform::file_url_path(&url) {
+                opened.push(Request::Open(path));
+            }
+        }
+    });
+    let watched = requests;
+    application.run(move |cx| {
         ui_kit::init(dark, cx);
         cx.set_global(settings);
         bind_keys(cx);
@@ -218,8 +271,10 @@ pub fn run(
                 traffic_light_position: None,
             }),
             // Wayland and X11 have no titlebar of their own here: the window keeps the
-            // toolbar of the application as its titlebar.
+            // toolbar of the application as its titlebar. The identifier groups the
+            // windows under the icon of the desktop entry in the panel and the switcher.
             window_decorations: decorations,
+            app_id: Some("arro".into()),
             #[cfg(unix)]
             app_owns_titlebar_drag: true,
             ..Default::default()
@@ -229,9 +284,49 @@ pub fn run(
                 let mut workspace = Workspace::new(launch, layout, store, recent, window, cx);
                 setup(&mut workspace, window, cx);
                 workspace.restore_tabs(window, cx);
+                workspace.watch_open_requests(watched, window, cx);
                 workspace
             })
         })
         .expect("open window");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_arguments;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    /// A project that opens from a window is a window of its own at once: it must not
+    /// hand the folder to the program that listens, which would start it again.
+    #[test]
+    fn a_project_opening_is_a_window_of_its_own() {
+        let folder = Path::new("shop");
+        let arguments = project_arguments(folder, None);
+        assert_eq!(
+            arguments,
+            [
+                OsString::from("--new-instance"),
+                folder.as_os_str().to_owned()
+            ]
+        );
+    }
+
+    /// The start after an update waits for the old process and becomes the listener of
+    /// the state folder: it must not hand the folder to the process that leaves.
+    #[test]
+    fn a_start_after_an_update_waits_and_listens() {
+        let folder = Path::new("shop");
+        let arguments = project_arguments(folder, Some(4242));
+        assert_eq!(
+            arguments,
+            [
+                OsString::from("--after-update"),
+                OsString::from("4242"),
+                folder.as_os_str().to_owned(),
+            ]
+        );
+        assert!(!arguments.contains(&OsString::from("--new-instance")));
+    }
 }

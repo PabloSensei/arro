@@ -43,6 +43,26 @@ pub fn folder(variable: &str) -> PathBuf {
     }
 }
 
+/// `FOLDER` under the cache folder of the user: `%LOCALAPPDATA%` on Windows,
+/// `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS. Everything
+/// there can be built again, so a missing or lost folder only costs time.
+pub fn cache_folder() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        folder_under(&library("Caches"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        folder_under(&xdg("XDG_CACHE_HOME", ".cache"))
+    }
+    #[cfg(windows)]
+    {
+        folder_under(
+            &std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from),
+        )
+    }
+}
+
 /// `~/Library/<name>`, or the temporary folder when there is no home folder.
 #[cfg(target_os = "macos")]
 fn library(name: &str) -> PathBuf {
@@ -96,4 +116,94 @@ pub fn take_over_old_folders(legacy: &[(&str, &[&str])]) -> Vec<String> {
         }
     }
     failed
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    /// The tests of the folders write the variables of the whole process: one at a time.
+    static VARIABLES: Mutex<()> = Mutex::new(());
+
+    /// Puts the variables of the profile back when the test ends, even on a panic.
+    struct Environment(Vec<(&'static str, Option<OsString>)>);
+
+    impl Environment {
+        fn set(values: &[(&'static str, &str)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in values {
+                // SAFETY: the tests of this module hold `VARIABLES` while the variables
+                // are changed, and no other test of the crate reads them.
+                unsafe { std::env::set_var(name, value) };
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for Environment {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                // SAFETY: see `Environment::set`.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_config_folder_follows_the_xdg_variable() {
+        let _guard = VARIABLES.lock().unwrap_or_else(|error| error.into_inner());
+        let _environment = Environment::set(&[
+            ("XDG_CONFIG_HOME", "/home/user/settings"),
+            ("XDG_DATA_HOME", "/home/user/data"),
+            ("XDG_CACHE_HOME", "/home/user/cache"),
+            ("HOME", "/home/user"),
+        ]);
+
+        assert_eq!(
+            folder("APPDATA"),
+            PathBuf::from("/home/user/settings").join(FOLDER)
+        );
+        assert_eq!(
+            folder("LOCALAPPDATA"),
+            PathBuf::from("/home/user/data").join(FOLDER)
+        );
+        assert_eq!(
+            cache_folder(),
+            PathBuf::from("/home/user/cache").join(FOLDER)
+        );
+    }
+
+    #[test]
+    fn a_relative_xdg_variable_falls_back_to_the_home_folder() {
+        let _guard = VARIABLES.lock().unwrap_or_else(|error| error.into_inner());
+        let _environment = Environment::set(&[
+            ("XDG_CONFIG_HOME", "relative/settings"),
+            ("XDG_DATA_HOME", ""),
+            ("XDG_CACHE_HOME", "cache"),
+            ("HOME", "/home/user"),
+        ]);
+
+        assert_eq!(
+            folder("APPDATA"),
+            PathBuf::from("/home/user/.config").join(FOLDER)
+        );
+        assert_eq!(
+            folder("LOCALAPPDATA"),
+            PathBuf::from("/home/user/.local/share").join(FOLDER)
+        );
+        assert_eq!(
+            cache_folder(),
+            PathBuf::from("/home/user/.cache").join(FOLDER)
+        );
+    }
 }

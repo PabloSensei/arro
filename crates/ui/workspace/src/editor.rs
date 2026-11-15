@@ -43,6 +43,29 @@ pub enum PreviewLayout {
     PreviewOnly,
 }
 
+/// What a tab of a file of a localized set shows: its text or the table of the set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleLayout {
+    #[default]
+    Text,
+    Bundle,
+}
+
+/// Reads what a tab of a file of a localized set shows.
+pub type BundleReader = Rc<dyn Fn(&App) -> BundleLayout>;
+
+/// Changes what a tab of a file of a localized set shows.
+pub type BundleSetter = Rc<dyn Fn(BundleLayout, &mut App)>;
+
+/// Reads and changes what a tab of a file of a localized set shows: the tab itself and
+/// the mode the layout of the project keeps for the file.
+#[derive(Clone)]
+pub struct BundleTab {
+    pub layout: BundleReader,
+    pub set_layout: BundleSetter,
+}
+
 /// Reads what a tab with a rendered document shows.
 pub type PreviewReader = Rc<dyn Fn(&App) -> PreviewLayout>;
 
@@ -100,6 +123,8 @@ pub struct EditorTab {
     pub reload_from_disk: Rc<dyn Fn(&mut App)>,
     /// What the tab with a rendered document shows; `None` for a file without a preview.
     pub preview: Option<PreviewTab>,
+    /// What the tab of a file of a localized set shows; `None` for other files.
+    pub bundle: Option<BundleTab>,
 }
 
 /// Line ends and encodings the status bar offers, by the names `EditorTab::set_format` takes.

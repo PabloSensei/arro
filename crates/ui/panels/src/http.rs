@@ -2,17 +2,20 @@
 //! file, the environment selector above its text, the request at the caret and the
 //! answer of the last one. The request itself runs away from the window.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use ::http_client::{
-    Cancel, Environments, Error, HistoryEntry, PreparedRequest, Response, Span, TokenKind,
-    Variables, execute, highlight, highlight_json, is_request_file, limits, load_environments,
-    load_history, parse, prepare, pretty_json, read_body, save_response,
+    Cancel, Environments, Error, Handler, HistoryEntry, PreparedRequest, Response, ScriptError,
+    ScriptOutput, Shell, Span, TestResult, TokenKind, Variables, execute, from_curl, highlight,
+    highlight_json, is_request_file, limits, load_environments, load_history, parse, prepare,
+    pretty_json, read_body, run_script, save_response, to_curl,
 };
-use editor_view::{EditorStyle, EditorView, FileBar, HighlightKind, HighlightSpan, PlainSyntax};
+use editor_view::{
+    EditorStyle, EditorView, FileBar, HighlightKind, HighlightSpan, PasteText, PlainSyntax,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -44,6 +47,12 @@ struct Shown {
     pretty: bool,
     /// The file of the body in the history, for Open in Editor.
     body_file: Option<PathBuf>,
+    /// The results of the script of the answer.
+    tests: Vec<TestResult>,
+    /// The lines of `client.log` of the script.
+    logs: Vec<String>,
+    /// The place of the script that stopped it.
+    script_error: Option<ScriptError>,
 }
 
 impl Shown {
@@ -93,7 +102,18 @@ impl Shown {
             truncated,
             pretty: pretty.is_some(),
             body_file: entry.map(|entry| history_body_file(&entry)),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            script_error: None,
         }
+    }
+
+    /// The tests and the logs the script of this answer wrote.
+    fn with_script(mut self, output: ScriptOutput) -> Self {
+        self.tests = output.tests;
+        self.logs = output.logs;
+        self.script_error = output.error;
+        self
     }
 
     fn status_line(&self) -> String {
@@ -111,6 +131,41 @@ fn history_body_file(entry: &HistoryEntry) -> PathBuf {
     PathBuf::from(format!("{}.body", entry.id))
 }
 
+/// The tabs of the answer: the body and its headers, or the tests of its script.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpTab {
+    Response,
+    Tests,
+}
+
+/// What one press of Run brings back from the requests and their scripts.
+struct RunOutcome {
+    last: Option<(PreparedRequest, Response)>,
+    entries: Vec<HistoryEntry>,
+    failure: Option<Error>,
+    /// The variables the scripts set and the next requests use.
+    globals: BTreeMap<String, String>,
+    script: ScriptOutput,
+}
+
+/// The source of the handler of a request: the text between `{%` and `%}`, or the file
+/// named after `>` relative to the request file.
+fn handler_source(handler: &Handler, base: &Path) -> Result<String, String> {
+    match handler {
+        Handler::Inline(source) => Ok(source.clone()),
+        Handler::File(path) => {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            };
+            std::fs::read_to_string(&path)
+                .map_err(|error| format!("Cannot read the script {}: {error}", path.display()))
+        }
+    }
+}
+
 pub struct HttpPanel {
     workspace: WeakEntity<Workspace>,
     state_dir: PathBuf,
@@ -119,7 +174,10 @@ pub struct HttpPanel {
     file: Option<PathBuf>,
     environments: HashMap<PathBuf, Environments>,
     selected: HashMap<PathBuf, String>,
+    /// The variables a script of an answer set; they live until the window closes.
+    globals: BTreeMap<String, String>,
     shown: Option<Shown>,
+    tab: HttpTab,
     error: Option<String>,
     history: Vec<HistoryEntry>,
     headers_open: bool,
@@ -149,7 +207,9 @@ impl HttpPanel {
             file: None,
             environments: HashMap::new(),
             selected: HashMap::new(),
+            globals: BTreeMap::new(),
             shown: None,
+            tab: HttpTab::Response,
             error: None,
             history: Vec::new(),
             headers_open: false,
@@ -238,6 +298,103 @@ impl HttpPanel {
         cx.notify();
     }
 
+    /// The values a request of `path` substitutes: the environment in force over the
+    /// variables the scripts set.
+    pub(crate) fn variables_for(&self, path: &Path) -> BTreeMap<String, String> {
+        let environments = self
+            .environments
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| load_environments(path));
+        let picked = self.selected.get(path).cloned();
+        let name = if picked.as_deref() == Some("") {
+            None
+        } else {
+            environments.resolved_name(picked.as_deref())
+        };
+        let mut values = name
+            .as_deref()
+            .map(|name| environments.values(name))
+            .unwrap_or_default();
+        values.extend(self.globals.clone());
+        values
+    }
+
+    /// Opens the picker of two answers of the history to compare.
+    pub(crate) fn show_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries: Vec<HistoryEntry> =
+            self.history.iter().take(limits::HISTORY).cloned().collect();
+        if entries.len() < 2 {
+            return;
+        }
+        let panel = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        let view = cx.new(|cx| CompareResponses {
+            workspace,
+            panel,
+            focus: cx.focus_handle(),
+            entries,
+            selected: Vec::new(),
+        });
+        let focus = view.read(cx).focus.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_overlay(view.into(), focus, window, cx)
+            })
+            .ok();
+    }
+
+    /// Opens the bodies of two answers in the diff window, the JSON ones indented.
+    pub(crate) fn compare_entries(
+        &mut self,
+        left: HistoryEntry,
+        right: HistoryEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(git) = cx
+            .try_global::<crate::git::ActiveGit>()
+            .map(|git| git.0.clone())
+        else {
+            return;
+        };
+        let dir = self.state_dir.clone();
+        let path = self
+            .file
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("http-history").join("responses.http"));
+        let workspace = self.workspace.clone();
+        let job = cx
+            .background_executor()
+            .spawn(async move { (read_body(&dir, &left), read_body(&dir, &right)) });
+        window
+            .spawn(cx, async move |cx| {
+                let (left, right) = job.await;
+                let left = left.unwrap_or_default();
+                let right = right.unwrap_or_default();
+                let left = pretty_json(&left).unwrap_or(left);
+                let right = pretty_json(&right).unwrap_or(right);
+                let weak = workspace.clone();
+                cx.update(|window, cx| {
+                    workspace
+                        .update(cx, |_, cx| {
+                            crate::diff_view::DiffView::compare_texts(
+                                git,
+                                weak,
+                                path.clone(),
+                                left,
+                                right,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
     /// The names of every environment of the file on screen.
     #[cfg(test)]
     pub fn environment_names(&self) -> Vec<String> {
@@ -284,6 +441,43 @@ impl HttpPanel {
         self.shown.as_ref().map(|shown| shown.url.as_str())
     }
 
+    /// The tests the script of the answer on screen ran.
+    #[cfg(test)]
+    pub fn tests(&self) -> &[TestResult] {
+        self.shown
+            .as_ref()
+            .map_or(&[], |shown| shown.tests.as_slice())
+    }
+
+    /// The lines of `client.log` of the answer on screen.
+    #[cfg(test)]
+    pub fn test_logs(&self) -> &[String] {
+        self.shown
+            .as_ref()
+            .map_or(&[], |shown| shown.logs.as_slice())
+    }
+
+    /// The place of the script of the answer on screen that stopped it.
+    #[cfg(test)]
+    pub fn script_error(&self) -> Option<&ScriptError> {
+        self.shown
+            .as_ref()
+            .and_then(|shown| shown.script_error.as_ref())
+    }
+
+    /// The variables the scripts set, which the next requests use.
+    #[cfg(test)]
+    pub fn globals(&self) -> &BTreeMap<String, String> {
+        &self.globals
+    }
+
+    /// Shows the tests of the answer, as a click on the tab does.
+    #[cfg(test)]
+    pub fn choose_tests(&mut self, cx: &mut Context<Self>) {
+        self.tab = HttpTab::Tests;
+        cx.notify();
+    }
+
     /// Sends the request at `line`, or every request of the file when `line` is `None`.
     pub fn run(
         &mut self,
@@ -310,6 +504,7 @@ impl HttpPanel {
         }
         let selected = self.selected.get(&path).cloned();
         let known = self.environments.get(&path).cloned();
+        let globals = self.globals.clone();
         let timeout = timeout_of(cx);
         let cancel = Cancel::new();
         self.cancel = Some(cancel.clone());
@@ -332,15 +527,21 @@ impl HttpPanel {
                 .as_deref()
                 .map(|name| environments.values(name))
                 .unwrap_or_default();
+            let mut globals = globals;
             let mut last = None;
             let mut entries = Vec::new();
             let mut failure = None;
+            let mut tests = Vec::new();
+            let mut logs = Vec::new();
+            let mut script_error = None;
             for request in requests {
                 if cancel.is_cancelled() {
                     failure = Some(Error::Cancelled);
                     break;
                 }
-                let variables = Variables::for_request(values.clone());
+                let mut known = values.clone();
+                known.extend(globals.clone());
+                let variables = Variables::for_request(known);
                 let outcome = prepare(&request, &base, &variables).and_then(|prepared| {
                     execute(&prepared, timeout, &cancel).map(|response| (prepared, response))
                 });
@@ -348,6 +549,21 @@ impl HttpPanel {
                     Ok((prepared, response)) => {
                         if let Ok(entry) = save_response(&state_dir, &prepared, &response) {
                             entries.push(entry);
+                        }
+                        if let Some(handler) = &request.handler {
+                            match handler_source(handler, &base) {
+                                Ok(source) => {
+                                    let output = run_script(&source, &response, &mut globals);
+                                    tests.extend(output.tests);
+                                    logs.extend(output.logs);
+                                    if output.error.is_some() {
+                                        script_error = output.error;
+                                    }
+                                }
+                                Err(message) => {
+                                    script_error = Some(ScriptError { line: 1, message });
+                                }
+                            }
                         }
                         last = Some((prepared, response));
                     }
@@ -357,34 +573,43 @@ impl HttpPanel {
                     }
                 }
             }
-            (last, entries, failure)
+            RunOutcome {
+                last,
+                entries,
+                failure,
+                globals,
+                script: ScriptOutput {
+                    tests,
+                    logs,
+                    error: script_error,
+                },
+            }
         });
         cx.spawn(async move |this, cx| {
-            let (last, entries, failure) = job.await;
-            this.update(cx, |this, cx| {
-                this.finish(serial, last, entries, failure, cx)
-            })
-            .ok();
+            let outcome = job.await;
+            this.update(cx, |this, cx| this.finish(serial, outcome, cx))
+                .ok();
         })
         .detach();
         cx.notify();
     }
 
     /// Takes the answer of a run, unless a newer run started meanwhile.
-    fn finish(
-        &mut self,
-        serial: u64,
-        last: Option<(PreparedRequest, Response)>,
-        entries: Vec<HistoryEntry>,
-        failure: Option<Error>,
-        cx: &mut Context<Self>,
-    ) {
+    fn finish(&mut self, serial: u64, outcome: RunOutcome, cx: &mut Context<Self>) {
         if serial != self.serial {
             return;
         }
+        let RunOutcome {
+            last,
+            entries,
+            failure,
+            globals,
+            script,
+        } = outcome;
         self.running = false;
         self.cancel = None;
         self.show_all = false;
+        self.globals = globals;
         for entry in entries.into_iter().rev() {
             self.history.insert(0, entry);
         }
@@ -395,7 +620,8 @@ impl HttpPanel {
         match last {
             Some((request, response)) => {
                 let entry = self.history.first().cloned();
-                self.shown = Some(Shown::new(&request, &response, entry, false));
+                self.shown =
+                    Some(Shown::new(&request, &response, entry, false).with_script(script));
                 self.error = failure.map(|error| error.to_string());
             }
             None => {
@@ -436,8 +662,14 @@ impl HttpPanel {
             elapsed: Duration::from_millis(shown.elapsed_ms),
         };
         let body_file = shown.body_file.clone();
+        let tests = shown.tests.clone();
+        let logs = shown.logs.clone();
+        let script_error = shown.script_error.clone();
         let mut all = Shown::new(&request, &response, None, true);
         all.body_file = body_file;
+        all.tests = tests;
+        all.logs = logs;
+        all.script_error = script_error;
         self.shown = Some(all);
         self.show_all = true;
         cx.notify();
@@ -557,6 +789,16 @@ impl HttpPanel {
         if entries.is_empty() {
             return;
         }
+        let mut entries = entries;
+        if self.history.len() >= 2 {
+            entries.push(MenuEntry::separator());
+            let panel = cx.weak_entity();
+            entries.push(MenuEntry::new("Compare Responses...", move |window, cx| {
+                panel
+                    .update(cx, |panel, cx| panel.show_compare(window, cx))
+                    .ok();
+            }));
+        }
         let position = window.mouse_position();
         let workspace = self.workspace.clone();
         workspace
@@ -602,6 +844,19 @@ impl HttpPanel {
                 .on_click(cx.listener(|this, _, window, cx| this.show_history_menu(window, cx)));
             toolbar = toolbar.child(history);
         }
+        if self.history.len() >= 2 {
+            toolbar = toolbar.child(
+                icon_button(
+                    "http-compare",
+                    "general/editorAndPreview",
+                    "Compare Responses",
+                    None,
+                    theme,
+                )
+                .debug_selector(|| "http-compare".to_owned())
+                .on_click(cx.listener(|this, _, window, cx| this.show_compare(window, cx))),
+            );
+        }
         if self
             .shown
             .as_ref()
@@ -627,6 +882,109 @@ impl HttpPanel {
         }
         let _ = window;
         toolbar
+    }
+
+    fn tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(px(SPACE_XS))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .child(tab_button(
+                "http-tab-response",
+                "Response",
+                self.tab == HttpTab::Response,
+                theme,
+                cx.listener(|this, _, _, cx| {
+                    this.tab = HttpTab::Response;
+                    cx.notify();
+                }),
+            ))
+            .child(tab_button(
+                "http-tab-tests",
+                "Tests",
+                self.tab == HttpTab::Tests,
+                theme,
+                cx.listener(|this, _, _, cx| {
+                    this.tab = HttpTab::Tests;
+                    cx.notify();
+                }),
+            ))
+    }
+
+    /// The tests and the logs of the script under the answer.
+    fn tests_body(&self, theme: &Theme) -> Stateful<Div> {
+        let mut list = div()
+            .id("http-tests")
+            .debug_selector(|| "http-tests".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(SPACE_XS))
+            .p(px(SPACE_M));
+        let Some(shown) = &self.shown else {
+            return list.child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .child("Run a request with a response handler to see its tests."),
+            );
+        };
+        if let Some(error) = &shown.script_error {
+            list = list.child(
+                div()
+                    .debug_selector(|| "http-test-script-error".to_owned())
+                    .text_color(theme.stripe_error)
+                    .child(error.to_string()),
+            );
+        }
+        for (index, test) in shown.tests.iter().enumerate() {
+            let colour = if test.passed {
+                theme.console_input
+            } else {
+                theme.stripe_error
+            };
+            list = list.child(
+                div()
+                    .debug_selector(move || format!("http-test-row-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .text_color(colour)
+                    .child(icon_sized(
+                        if test.passed {
+                            "general/check"
+                        } else {
+                            "general/close"
+                        },
+                        TEXT_SMALL,
+                        theme,
+                    ))
+                    .child(test.name.clone())
+                    .children(test.message.clone().map(|message| {
+                        div()
+                            .text_color(theme.text_secondary)
+                            .child(format!("— {message}"))
+                    })),
+            );
+        }
+        for log in &shown.logs {
+            list = list.child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .child(format!("log: {log}")),
+            );
+        }
+        if shown.tests.is_empty() && shown.script_error.is_none() && shown.logs.is_empty() {
+            list = list.child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .child("The request has no response handler."),
+            );
+        }
+        list
     }
 
     fn headers_block(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -685,6 +1043,189 @@ impl HttpPanel {
                 .into_any_element(),
         )
     }
+}
+
+/// The picker of two answers of the history: their bodies go to the diff window.
+struct CompareResponses {
+    workspace: WeakEntity<Workspace>,
+    panel: WeakEntity<HttpPanel>,
+    focus: FocusHandle,
+    entries: Vec<HistoryEntry>,
+    /// The rows picked, at most two and in the order they were picked.
+    selected: Vec<usize>,
+}
+
+impl CompareResponses {
+    fn toggle(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(at) = self.selected.iter().position(|picked| *picked == index) {
+            self.selected.remove(at);
+        } else {
+            if self.selected.len() == 2 {
+                self.selected.remove(0);
+            }
+            self.selected.push(index);
+        }
+        cx.notify();
+    }
+
+    fn compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.len() != 2 {
+            return;
+        }
+        let entries: Vec<HistoryEntry> = self
+            .selected
+            .iter()
+            .filter_map(|index| self.entries.get(*index).cloned())
+            .collect();
+        if entries.len() != 2 {
+            return;
+        }
+        let workspace = self.workspace.clone();
+        workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+        self.panel
+            .update(cx, |panel, cx| {
+                panel.compare_entries(entries[0].clone(), entries[1].clone(), window, cx)
+            })
+            .ok();
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+}
+
+impl Render for CompareResponses {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let viewport = window.viewport_size();
+        let width = px(520.).min(viewport.width - px(40.));
+        let height =
+            (px(120.) + px(24.) * self.entries.len() as f32).min(viewport.height - px(40.));
+        let rows: Vec<AnyElement> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let picked = self.selected.contains(&index);
+                div()
+                    .id(("http-compare-row", index))
+                    .debug_selector(move || format!("http-compare-row-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(24.))
+                    .px(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
+                    .when(picked, |this| this.bg(theme.selection))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(index, cx)))
+                    .child(icon_sized(
+                        if picked {
+                            "general/check"
+                        } else {
+                            "general/chevronRight"
+                        },
+                        TEXT_SMALL,
+                        &theme,
+                    ))
+                    .child(format!("{}  {}", entry.status_line(), entry.label()))
+                    .into_any_element()
+            })
+            .collect();
+        let enabled = self.selected.len() == 2;
+        surface(&theme)
+            .id("http-compare-dialog")
+            .debug_selector(|| "http-compare-dialog".to_owned())
+            .key_context("HttpCompare")
+            .track_focus(&self.focus)
+            .occlude()
+            .w(width)
+            .h(height)
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text)
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text)
+                    .child("Compare two responses"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(px(SPACE_XS))
+                    .overflow_hidden()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .justify_end()
+                    .gap(px(SPACE_S))
+                    .child(
+                        crate::project_structure::dialog_button(
+                            "http-compare-cancel",
+                            "http-compare-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .child(
+                        crate::project_structure::dialog_button(
+                            "http-compare-run",
+                            "http-compare-run".to_owned(),
+                            "Compare",
+                            true,
+                            enabled,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.compare(window, cx))),
+                    ),
+            )
+    }
+}
+
+fn tab_button(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    theme: &Theme,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex()
+        .items_center()
+        .flex_none()
+        .h(px(24.))
+        .px(px(SPACE_S))
+        .rounded(px(CONTROL_RADIUS))
+        .text_color(if active {
+            theme.text
+        } else {
+            theme.text_secondary
+        })
+        .when(active, |this| this.bg(theme.selection_inactive))
+        .when(!active, |this| {
+            let hover = theme.hover;
+            this.hover(move |style| style.bg(hover))
+        })
+        .on_click(on_click)
+        .child(label)
 }
 
 fn timeout_of(cx: &App) -> Duration {
@@ -753,8 +1294,12 @@ impl Render for HttpPanel {
                 .ok();
         };
         let toolbar = self.toolbar(window, &theme, cx);
-        let headers = self.headers_block(&theme, cx);
-        let hint = self.shown.is_none().then(|| {
+        let tabs = self.tabs(&theme, cx);
+        let response_tab = self.tab == HttpTab::Response;
+        let headers = response_tab
+            .then(|| self.headers_block(&theme, cx))
+            .flatten();
+        let hint = (response_tab && self.shown.is_none()).then(|| {
             div()
                 .p(px(SPACE_M))
                 .text_color(theme.text_secondary)
@@ -766,7 +1311,8 @@ impl Render for HttpPanel {
                 }
             })
         });
-        let body = self.shown.as_ref().map(|shown| {
+        let body = (response_tab && self.shown.is_some()).then(|| {
+            let shown = self.shown.as_ref()?;
             let style = EditorStyle::from_theme(&theme);
             let lines = shown.lines.clone();
             let starts = shown.line_starts.clone();
@@ -834,8 +1380,10 @@ impl Render for HttpPanel {
                     .child(more)
                     .into_any_element();
             }
-            area
+            Some(area)
         });
+        let body = body.flatten();
+        let tests = (self.tab == HttpTab::Tests).then(|| self.tests_body(&theme));
 
         island(&theme)
             .id("http-panel")
@@ -846,6 +1394,7 @@ impl Render for HttpPanel {
             .h_full()
             .child(panel_header("HTTP Response", GROUP, hide, &theme))
             .child(toolbar)
+            .child(tabs)
             .child(
                 div()
                     .flex()
@@ -854,7 +1403,8 @@ impl Render for HttpPanel {
                     .min_h_0()
                     .children(headers)
                     .children(hint)
-                    .children(body),
+                    .children(body)
+                    .children(tests),
             )
     }
 }
@@ -912,6 +1462,66 @@ pub(crate) fn run_all(
     };
     workspace.show_tool(HTTP_TOOL, window, cx);
     panel.update(cx, |panel, cx| panel.run(path, text, None, cx));
+}
+
+/// Copy as cURL: the request at the caret of the editor, with the variables of the
+/// environment and of the scripts in place.
+pub(crate) fn copy_as_curl(
+    view: &Entity<EditorView>,
+    shell: Shell,
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) {
+    let path = view.read(cx).path().to_path_buf();
+    if !is_request_file(&path) {
+        workspace.notify_user("Copy as cURL", "The file is not a request file", cx);
+        return;
+    }
+    let Some(text) = view.read(cx).text() else {
+        return;
+    };
+    let line = view.read(cx).caret().0;
+    let parsed = parse(&text);
+    let Some(request) = parsed
+        .at_line(line)
+        .or_else(|| parsed.requests.first())
+        .cloned()
+    else {
+        workspace.notify_user("Copy as cURL", "The file has no request", cx);
+        return;
+    };
+    let values = cx
+        .try_global::<ActiveHttp>()
+        .map(|panel| panel.0.read(cx).variables_for(&path))
+        .unwrap_or_default();
+    let variables = Variables::for_request(values);
+    let base = path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    match prepare(&request, &base, &variables) {
+        Ok(prepared) => {
+            cx.write_to_clipboard(ClipboardItem::new_string(to_curl(&prepared, shell)));
+        }
+        Err(error) => workspace.notify_user("Copy as cURL", error.to_string(), cx),
+    }
+}
+
+/// Copy as cURL of Find Action and the editor menu: the active editor, if it is a
+/// request file.
+pub(crate) fn copy_as_curl_active(
+    shell: Shell,
+    workspace: &mut Workspace,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(view) = workspace
+        .active_view()
+        .and_then(|view| view.downcast::<EditorView>().ok())
+    else {
+        workspace.notify_user("Copy as cURL", "No file is open", cx);
+        return;
+    };
+    copy_as_curl(&view, shell, workspace, cx);
 }
 
 /// The request file of the active editor changed its environment list.
@@ -992,4 +1602,14 @@ pub(crate) fn install(cx: &mut App) {
     cx.set_global(FileBar(Rc::new(
         file_bar as fn(&Path, &mut Window, &mut Context<EditorView>) -> Option<AnyElement>,
     )));
+    // A pasted command line becomes the request it describes.
+    cx.set_global(PasteText(Rc::new(|path, text| {
+        if !is_request_file(path) {
+            return None;
+        }
+        match from_curl(text) {
+            Some(Ok(imported)) => Some(imported.text),
+            Some(Err(_)) | None => None,
+        }
+    })));
 }

@@ -32,6 +32,11 @@ impl Artifact {
         self.usages.iter().any(Usage::conflict)
     }
 
+    /// The artifact is declared by a module itself, not only pulled in by another one.
+    pub fn direct(&self) -> bool {
+        self.usages.iter().any(|usage| usage.chain.len() == 1)
+    }
+
     /// The versions the resolution did not choose.
     pub fn losing(&self) -> impl Iterator<Item = &String> {
         self.versions

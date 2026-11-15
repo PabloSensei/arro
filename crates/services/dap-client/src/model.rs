@@ -52,13 +52,15 @@ pub struct Scope {
 }
 
 /// One variable or watch result. `reference` is the handle its children are asked with,
-/// zero when it has none.
+/// zero when it has none. `evaluate_name` is the expression that names the value in the
+/// frame, when the adapter sends one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Variable {
     pub name: String,
     pub value: String,
     pub type_name: String,
     pub reference: i64,
+    pub evaluate_name: Option<String>,
 }
 
 /// One watch expression and its last value.
@@ -67,7 +69,43 @@ pub struct WatchValue {
     pub expression: String,
     pub value: String,
     pub type_name: String,
+    /// Handle of the fields of the value, zero when it has none.
+    pub reference: i64,
     pub error: Option<String>,
+}
+
+/// How the window shows a value of a type: `display` is an expression evaluated with the
+/// value as the receiver, `children` an expression that gives the children instead of
+/// the ones of the adapter.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypeRenderer {
+    /// The full name of the type, with `.` or `$` before a nested type.
+    pub type_name: String,
+    pub display: String,
+    pub children: Option<String>,
+    /// An expression of the language that says whether a value is of this type or of a
+    /// subtype, `{name}` standing for the value. When it is absent, the renderer is for
+    /// the exact type only.
+    pub subtype_probe: Option<String>,
+}
+
+impl TypeRenderer {
+    /// Whether this renderer is for `type_name`. A nested type is written with `.` in
+    /// one place and `$` in another; both name the same type.
+    pub fn matches(&self, type_name: &str) -> bool {
+        let wanted = self.type_name.trim().replace('$', ".");
+        !wanted.is_empty() && type_name.trim().replace('$', ".") == wanted
+    }
+
+    /// The expression that asks the program whether `evaluate_name` is of this type or
+    /// of a subtype, when the language gave one.
+    pub fn subtype_expression(&self, evaluate_name: &str) -> Option<String> {
+        Some(
+            self.subtype_probe
+                .as_deref()?
+                .replace("{name}", evaluate_name),
+        )
+    }
 }
 
 /// One place a step into may go, as the adapter lists it on a line with several calls.
@@ -85,6 +123,19 @@ pub struct Evaluation {
     pub type_name: String,
     /// Handle of the fields of an object, zero when it has none.
     pub reference: i64,
+    pub error: Option<String>,
+}
+
+/// What the program answered when the window asked for the identity of an object: a
+/// number the language keeps for the object itself, unlike a handle the adapter may give
+/// to another value at the next stop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdentityAnswer {
+    /// The request the answer belongs to, from [`Command::EvaluateIdentity`].
+    pub request: u64,
+    /// The number the expression gave, none when the answer was not a number.
+    pub identity: Option<i64>,
+    /// Why the question failed, when the adapter refused it.
     pub error: Option<String>,
 }
 
@@ -250,6 +301,13 @@ pub struct Snapshot {
     /// Children of each scope or variable, by reference, filled on demand.
     pub variables: HashMap<i64, Vec<Variable>>,
     pub watch: Vec<WatchValue>,
+    /// The inline watches of the window and their last values, in the order they were
+    /// set.
+    pub inline_watch: Vec<WatchValue>,
+    /// Answers to [`Command::EvaluateIdentity`], by the number the caller gave. The
+    /// answers are kept for a while, so a caller that polls the newest snapshot does not
+    /// lose one that came with an earlier one.
+    pub identities: HashMap<u64, IdentityAnswer>,
     /// Output events and notes of the adapter, in arrival order.
     pub console: Vec<ConsoleLine>,
     pub breakpoints: Vec<Breakpoint>,
@@ -310,6 +368,12 @@ pub enum Command {
     RestartFrame(i64),
     AddWatch(String),
     RemoveWatch(String),
+    /// Replaces the inline watches of the window. Every expression is evaluated at each
+    /// stop, and the values arrive in the snapshot in the same order.
+    SetInlineWatches(Vec<String>),
+    /// Replaces how values of some types are shown; a later stop and its variables use
+    /// the new rules.
+    SetTypeRenderers(Vec<TypeRenderer>),
     /// Evaluate an expression in the console of the selected frame.
     Evaluate(String),
     /// Evaluate an expression at a breakpoint that suspends the program and print its
@@ -317,6 +381,13 @@ pub enum Command {
     EvaluateLog(String),
     /// Evaluate an expression in the selected frame for the popup at the caret.
     EvaluateQuick(String),
+    /// Evaluates an expression of the caller that names the identity of an object, such
+    /// as the number the language keeps for it. The answer arrives in the snapshot's
+    /// `identities` under `request`.
+    EvaluateIdentity {
+        request: u64,
+        expression: String,
+    },
     /// Gives a variable a new value; `reference` is the group or object that holds it.
     SetVariable {
         reference: i64,
@@ -464,6 +535,100 @@ pub fn line_of(body: &Value) -> u32 {
         .unwrap_or(0)
 }
 
+/// The frames of one thread as a stack trace text, one `at name(File:line)` line per
+/// frame. A frame without a place names no file, as a trace of an unsourced class does.
+pub fn stack_trace_text(frames: &[Frame]) -> String {
+    let mut text = String::new();
+    for frame in frames {
+        let name = frame.name.trim();
+        let name = if name.is_empty() { "<unknown>" } else { name };
+        let place = match (&frame.source, frame.line) {
+            (Some(path), line) if line > 0 => {
+                let file = path
+                    .file_name()
+                    .map(|file| file.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                format!("{file}:{line}")
+            }
+            _ => "Unknown Source".to_owned(),
+        };
+        text.push_str("at ");
+        text.push_str(name);
+        text.push('(');
+        text.push_str(&place);
+        text.push_str(")\n");
+    }
+    text
+}
+
+/// An expression of a renderer with the value as its receiver: a call without a receiver
+/// is a call of the value. `getName() + " (" + getId() + ")"` becomes
+/// `(item).getName() + " (" + (item).getId() + ")"` for a value named `item`.
+pub fn object_expression(expression: &str, evaluate_name: &str) -> String {
+    let receiver = format!("({})", evaluate_name.trim());
+    let mut out = String::with_capacity(expression.len() + 8);
+    let chars: Vec<char> = expression.chars().collect();
+    let mut at = 0;
+    while at < chars.len() {
+        let ch = chars[at];
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            out.push(ch);
+            at += 1;
+            while at < chars.len() {
+                let current = chars[at];
+                out.push(current);
+                at += 1;
+                if current == '\\' && at < chars.len() {
+                    out.push(chars[at]);
+                    at += 1;
+                } else if current == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            let start = at;
+            while at < chars.len()
+                && (chars[at].is_alphanumeric() || chars[at] == '_' || chars[at] == '$')
+            {
+                at += 1;
+            }
+            let word: String = chars[start..at].iter().collect();
+            let previous = chars[..start]
+                .iter()
+                .rev()
+                .find(|ch| !ch.is_whitespace())
+                .copied();
+            let next = chars[at..].iter().find(|ch| !ch.is_whitespace()).copied();
+            let plain = !word.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+                && word != "this"
+                && word != "new"
+                && previous != Some('.');
+            if plain && next == Some('(') {
+                out.push_str(&receiver);
+                out.push('.');
+            }
+            out.push_str(&word);
+            continue;
+        }
+        out.push(ch);
+        at += 1;
+    }
+    out
+}
+
+/// The expression that lists the children of a value with a renderer, with the value as
+/// its receiver. None when the renderer leaves the children of the adapter in place.
+pub fn children_expression(renderer: &TypeRenderer, evaluate_name: &str) -> Option<String> {
+    let children = renderer
+        .children
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())?;
+    Some(object_expression(children, evaluate_name))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -488,5 +653,87 @@ mod tests {
     #[test]
     fn a_breakpoint_is_enabled_unless_it_says_otherwise() {
         assert!(BreakpointSpec::default().enabled);
+    }
+
+    #[test]
+    fn a_stack_text_names_each_frame_with_its_file_and_line() {
+        let frames = vec![
+            Frame {
+                id: 1,
+                name: "demo.Probe.work".into(),
+                source: Some(PathBuf::from("C:/src/demo/Probe.txt")),
+                line: 42,
+                column: 1,
+            },
+            Frame {
+                id: 2,
+                name: "demo.Probe.main".into(),
+                source: None,
+                line: 0,
+                column: 0,
+            },
+        ];
+        assert_eq!(
+            stack_trace_text(&frames),
+            "at demo.Probe.work(Probe.txt:42)\nat demo.Probe.main(Unknown Source)\n"
+        );
+        assert_eq!(stack_trace_text(&[]), "");
+    }
+
+    #[test]
+    fn a_renderer_names_a_nested_type_with_a_dot_or_a_dollar() {
+        let renderer = TypeRenderer {
+            type_name: "pkg.Map$Entry".into(),
+            display: "getKey()".into(),
+            children: None,
+            subtype_probe: None,
+        };
+        assert!(renderer.matches("pkg.Map$Entry"));
+        assert!(renderer.matches("pkg.Map.Entry"));
+        assert!(!renderer.matches("pkg.HashMap$Node"));
+        assert!(!TypeRenderer::default().matches(""));
+        let probe = TypeRenderer {
+            type_name: "pkg.List".into(),
+            subtype_probe: Some("({name} instanceof pkg.List)".into()),
+            ..TypeRenderer::default()
+        };
+        assert_eq!(
+            probe.subtype_expression("items").as_deref(),
+            Some("(items instanceof pkg.List)")
+        );
+        assert_eq!(renderer.subtype_expression("items"), None);
+    }
+
+    #[test]
+    fn a_renderer_expression_receives_the_value_as_its_receiver() {
+        assert_eq!(
+            object_expression("getName() + \" (\" + getId() + \")\"", "item"),
+            "(item).getName() + \" (\" + (item).getId() + \")\""
+        );
+        // A call of another object and the text of a string stay as they are.
+        assert_eq!(
+            object_expression("map.getKey() + \"getName()\"", "item"),
+            "map.getKey() + \"getName()\""
+        );
+    }
+
+    #[test]
+    fn the_children_of_a_renderer_receive_the_value_as_their_receiver() {
+        let renderer = |children: Option<&str>| TypeRenderer {
+            type_name: "pkg.Items".into(),
+            display: "size()".into(),
+            children: children.map(str::to_owned),
+            subtype_probe: None,
+        };
+        assert_eq!(
+            children_expression(&renderer(Some("getItems()")), "items").as_deref(),
+            Some("(items).getItems()")
+        );
+        assert_eq!(
+            children_expression(&renderer(Some("getMap().values()")), "items").as_deref(),
+            Some("(items).getMap().values()")
+        );
+        assert_eq!(children_expression(&renderer(None), "items"), None);
+        assert_eq!(children_expression(&renderer(Some("  ")), "items"), None);
     }
 }

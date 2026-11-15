@@ -889,7 +889,8 @@
       "alt-shift-r"
     ],
     "ResetIdeScaleAction": [
-      "alt-shift-0"
+      "alt-shift-0",
+      "alt-shift-cmd-0"
     ],
     "ResizeToolWindowDown": [
       "alt-shift-cmd-down"
@@ -1026,6 +1027,9 @@
     ],
     "ShowTypeBookmarks": [
       "shift-cmd-f3"
+    ],
+    "ShowUmlDiagram": [
+      "alt-shift-cmd-u"
     ],
     "ShowUsages": [
       "alt-cmd-f7"
@@ -1212,10 +1216,12 @@
       "f2"
     ],
     "ZoomInIdeAction": [
-      "alt-shift-="
+      "alt-shift-=",
+      "alt-shift-cmd-="
     ],
     "ZoomOutIdeAction": [
-      "alt-shift--"
+      "alt-shift--",
+      "alt-shift-cmd--"
     ]
   }
 }

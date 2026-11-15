@@ -372,6 +372,7 @@ fn cyrillic_output_is_right_on_every_jdk() {
             provider: PROVIDER_ID.into(),
             assemble_first: false,
             settings: toml::Table::try_from(target).unwrap(),
+            ..RunConfig::default()
         };
         let model = hello_model(&root, &output);
         let console = Console::start(provider.plan(&config, &model).unwrap());

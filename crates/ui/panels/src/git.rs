@@ -11,8 +11,9 @@ use std::time::Duration;
 use editor_view::{EditorView, GutterKind, GutterMark};
 use ui_kit::*;
 use vcs::{
-    BlameLine, Change, ConflictSide, FileStatus, GitRunner, Hunk, LineChangeKind, Operation,
-    RebasePlan, RebaseReport, Repository, ResetMode, Stash, Status, UpdateMode, UpdateReport,
+    BlameLine, Change, CommitOptions, CommitRequest, ConflictSide, FileStatus, GitRunner, Hunk,
+    LineChangeKind, Operation, RebasePlan, RebaseReport, Repository, ResetMode, RootsUpdate, Stash,
+    Status, UpdateMode, UpdateReport,
 };
 use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
@@ -102,13 +103,26 @@ impl Kind {
     }
 }
 
+/// One root of the project: the repository itself, or a submodule with its own.
+#[derive(Clone)]
+struct GitRoot {
+    /// The path of the root inside the project, empty for the project itself.
+    prefix: String,
+    repo: Arc<Repository>,
+    status: Status,
+}
+
 /// The repository of the project and what is known about it. `None` repository: not a
 /// Git project, and everything here stays quiet.
 pub struct GitState {
     repo: Option<Arc<Repository>>,
+    /// The project and its checked-out submodules, the project first.
+    roots: Vec<GitRoot>,
     status: Status,
     kinds: HashMap<PathBuf, Kind>,
     folders: HashSet<PathBuf>,
+    /// The commit the parent records for a submodule and the one its working tree has.
+    pointers: HashMap<String, (Option<String>, Option<String>)>,
     workspace: WeakEntity<Workspace>,
     refreshing: bool,
     /// What is going on that the user waits for, shown by the commit window.
@@ -149,6 +163,8 @@ impl Global for ActiveGit {}
 /// What one background read of the repository brought back.
 struct Refreshed {
     status: Result<Status, String>,
+    roots: Vec<GitRoot>,
+    pointers: HashMap<String, (Option<String>, Option<String>)>,
     hunks: HashMap<PathBuf, Vec<Hunk>>,
     /// The blame of every editor that shows the column, with the messages of its commits.
     blames: HashMap<PathBuf, (Vec<BlameLine>, HashMap<String, String>)>,
@@ -156,15 +172,19 @@ struct Refreshed {
     autostash: bool,
     merge_message: String,
     binary_conflicts: HashSet<String>,
+    /// The path of the file the active editor shows, for the branch of its root.
+    active: Option<PathBuf>,
 }
 
 impl GitState {
     pub fn create(root: PathBuf, workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<Self> {
         let git = cx.new(|_| Self {
             repo: None,
+            roots: Vec::new(),
             status: Status::default(),
             kinds: HashMap::new(),
             folders: HashSet::new(),
+            pointers: HashMap::new(),
             workspace,
             refreshing: false,
             busy: None,
@@ -190,6 +210,16 @@ impl GitState {
         cx.spawn(async move |cx| {
             let repo = found.await;
             weak.update(cx, |this, cx| {
+                this.roots = repo
+                    .as_ref()
+                    .map(|repo| {
+                        vec![GitRoot {
+                            prefix: String::new(),
+                            repo: repo.clone(),
+                            status: Status::default(),
+                        }]
+                    })
+                    .unwrap_or_default();
                 this.repo = repo;
                 this.refresh(cx);
             })
@@ -201,6 +231,56 @@ impl GitState {
 
     pub fn repo(&self) -> Option<Arc<Repository>> {
         self.repo.clone()
+    }
+
+    /// The roots of the project: the prefix inside the project and the name of the root.
+    /// The project itself is empty-prefixed and first.
+    pub fn roots(&self) -> Vec<(String, String)> {
+        self.roots
+            .iter()
+            .map(|root| (root.prefix.clone(), self.root_label(&root.prefix)))
+            .collect()
+    }
+
+    /// The name of a root: the folder of the project, or the path of the submodule.
+    pub fn root_label(&self, prefix: &str) -> String {
+        if !prefix.is_empty() {
+            return prefix.to_owned();
+        }
+        self.repo
+            .as_ref()
+            .and_then(|repo| repo.root().file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Project".to_owned())
+    }
+
+    /// The prefix of the root a relative path belongs to, empty for the project itself.
+    pub fn root_of(&self, relative: &str) -> String {
+        self.roots
+            .iter()
+            .filter(|root| {
+                root.prefix.is_empty()
+                    || relative == root.prefix
+                    || relative.starts_with(&format!("{}/", root.prefix))
+            })
+            .max_by_key(|root| root.prefix.len())
+            .map(|root| root.prefix.clone())
+            .unwrap_or_default()
+    }
+
+    /// The repository of the root a relative path belongs to.
+    pub fn repo_of(&self, relative: &str) -> Option<Arc<Repository>> {
+        let prefix = self.root_of(relative);
+        self.roots
+            .iter()
+            .find(|root| root.prefix == prefix)
+            .map(|root| root.repo.clone())
+            .or_else(|| self.repo.clone())
+    }
+
+    /// The recorded and working commits of a changed submodule pointer.
+    pub fn pointer(&self, path: &str) -> Option<&(Option<String>, Option<String>)> {
+        self.pointers.get(path)
     }
 
     pub fn status(&self) -> &Status {
@@ -254,6 +334,30 @@ impl GitState {
         !self.status.files.is_empty()
     }
 
+    /// The status bar line of the root the active file belongs to.
+    fn branch_label(
+        &self,
+        active: Option<&Path>,
+        operation: Operation,
+        autostash: bool,
+    ) -> Option<String> {
+        let relative = active
+            .and_then(|path| {
+                self.repo
+                    .as_ref()
+                    .map(|repo| relative_of(repo.root(), path))
+            })
+            .unwrap_or_default();
+        let prefix = self.root_of(&relative);
+        let status = self
+            .roots
+            .iter()
+            .find(|root| root.prefix == prefix)
+            .map(|root| &root.status)
+            .unwrap_or(&self.status);
+        branch_label(status, operation, autostash)
+    }
+
     /// Git holds local changes it puts back when the operation ends.
     pub fn autostash(&self) -> bool {
         self.autostash
@@ -304,6 +408,23 @@ impl GitState {
         self.schedule(cx);
     }
 
+    /// The tab of another file became active: the status bar shows the branch of the
+    /// root that file belongs to.
+    pub fn active_editor_changed(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.roots.len() < 2 {
+            return;
+        }
+        let branch = self.branch_label(Some(path), self.operation, self.autostash);
+        let workspace = self.workspace.clone();
+        // A tab becomes active while the window is being updated: the status bar waits
+        // for the end of that update.
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| workspace.set_branch(branch, cx))
+                .ok();
+        });
+    }
+
     /// The window came to the front or went behind another one.
     pub fn window_activation(&mut self, active: bool, cx: &mut Context<Self>) {
         self.active = active;
@@ -347,17 +468,72 @@ impl GitState {
         }
         self.refreshing = true;
         let editors = self.editors(cx);
+        let active = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_editor())
+            .ok()
+            .flatten()
+            .map(|(path, _)| path);
         let inputs: Vec<(PathBuf, String)> = editors
             .iter()
             .filter_map(|(path, view)| Some((path.clone(), view.read(cx).text()?)))
             .collect();
-        let annotated: Vec<(PathBuf, String)> = editors
+        let annotated: Vec<PathBuf> = editors
             .iter()
             .filter(|(_, view)| view.read(cx).has_annotations())
-            .map(|(path, _)| (path.clone(), relative_of(repo.root(), path)))
+            .map(|(path, _)| path.clone())
             .collect();
         let job = cx.background_executor().spawn(async move {
-            let status = repo.status().map_err(|error| error.to_string());
+            let mut roots = vec![(String::new(), repo.clone())];
+            if let Ok(submodules) = repo.submodules() {
+                for submodule in submodules {
+                    if submodule.state == vcs::SubmoduleState::Uninitialized {
+                        continue;
+                    }
+                    if let Ok(repository) =
+                        Repository::open(repo.git().clone(), &repo.root().join(&submodule.path))
+                    {
+                        roots.push((submodule.path, Arc::new(repository)));
+                    }
+                }
+            }
+            let mut read = Vec::new();
+            let mut combined: Option<Status> = None;
+            let mut failure = None;
+            for (prefix, repository) in roots {
+                match repository.status() {
+                    Ok(status) => {
+                        match &mut combined {
+                            Some(all) => combine_status(all, &prefix, &status),
+                            None => combined = Some(status.clone()),
+                        }
+                        read.push(GitRoot {
+                            prefix,
+                            repo: repository,
+                            status,
+                        });
+                    }
+                    Err(error) if prefix.is_empty() => failure = Some(error.to_string()),
+                    Err(_) => {}
+                }
+            }
+            let status = match failure {
+                Some(message) => Err(message),
+                None => combined.ok_or_else(|| "no repository".to_string()),
+            };
+            let mut pointers = HashMap::new();
+            if let Ok(all) = &status {
+                for root in &read {
+                    if root.prefix.is_empty() {
+                        continue;
+                    }
+                    if all.files.iter().any(|file| file.path == root.prefix)
+                        && let Ok(Some(pointer)) = repo.submodule_pointer(&root.prefix)
+                    {
+                        pointers.insert(root.prefix.clone(), pointer);
+                    }
+                }
+            }
             let operation = repo.operation().unwrap_or_default();
             let autostash = operation != Operation::None && repo.autostash().unwrap_or(false);
             let merge_message = match operation {
@@ -365,12 +541,51 @@ impl GitState {
                 _ => String::new(),
             };
             let mut hunks = HashMap::new();
-            if let Ok(mut blobs) = repo.blobs() {
-                for (path, text) in inputs {
-                    let relative = relative_of(repo.root(), &path);
-                    if let Ok(diff) = repo.file_diff(&mut blobs, &relative, &text) {
-                        hunks.insert(path, diff.hunks);
-                    }
+            let mut blames = HashMap::new();
+            let mut readers: HashMap<String, vcs::BlobReader> = HashMap::new();
+            for (path, text) in inputs {
+                let relative = relative_of(repo.root(), &path);
+                let root = read
+                    .iter()
+                    .filter(|root| {
+                        root.prefix.is_empty()
+                            || relative == root.prefix
+                            || relative.starts_with(&format!("{}/", root.prefix))
+                    })
+                    .max_by_key(|root| root.prefix.len());
+                let Some(root) = root else {
+                    continue;
+                };
+                let relative = relative_of(root.repo.root(), &path);
+                if !readers.contains_key(&root.prefix)
+                    && let Ok(reader) = root.repo.blobs()
+                {
+                    readers.insert(root.prefix.clone(), reader);
+                }
+                let Some(reader) = readers.get_mut(&root.prefix) else {
+                    continue;
+                };
+                if let Ok(diff) = root.repo.file_diff(reader, &relative, &text) {
+                    hunks.insert(path, diff.hunks);
+                }
+            }
+            for path in annotated {
+                let relative = relative_of(repo.root(), &path);
+                let root = read
+                    .iter()
+                    .filter(|root| {
+                        root.prefix.is_empty()
+                            || relative == root.prefix
+                            || relative.starts_with(&format!("{}/", root.prefix))
+                    })
+                    .max_by_key(|root| root.prefix.len());
+                let Some(root) = root else {
+                    continue;
+                };
+                let relative = relative_of(root.repo.root(), &path);
+                if let Ok(lines) = root.repo.blame(&relative) {
+                    let messages = messages_of(&root.repo, &lines);
+                    blames.insert(path, (lines, messages));
                 }
             }
             // A binary file has no three texts to merge: the row keeps only the two sides.
@@ -389,21 +604,17 @@ impl GitState {
                     .collect(),
                 Err(_) => HashSet::new(),
             };
-            let mut blames = HashMap::new();
-            for (path, relative) in annotated {
-                if let Ok(lines) = repo.blame(&relative) {
-                    let messages = messages_of(&repo, &lines);
-                    blames.insert(path, (lines, messages));
-                }
-            }
             Refreshed {
                 status,
+                roots: read,
+                pointers,
                 hunks,
                 blames,
                 operation,
                 autostash,
                 merge_message,
                 binary_conflicts,
+                active,
             }
         });
         cx.spawn(async move |this, cx| {
@@ -439,22 +650,27 @@ impl GitState {
     ) {
         let Refreshed {
             status,
+            roots,
+            pointers,
             hunks,
             blames,
             operation,
             autostash,
             merge_message,
             binary_conflicts,
+            active,
         } = refreshed;
         let dark = cx.global::<Theme>().dark;
         self.binary_conflicts = binary_conflicts;
+        self.roots = roots;
+        self.pointers = pointers;
         match status {
             Ok(status) => {
                 if status != self.status
                     || operation != self.operation
                     || autostash != self.autostash
                 {
-                    let branch = branch_label(&status, operation, autostash);
+                    let branch = self.branch_label(active.as_deref(), operation, autostash);
                     self.set_status(status);
                     self.operation = operation;
                     self.autostash = autostash;
@@ -542,6 +758,110 @@ impl GitState {
                 match result {
                     Ok(value) => done(this, value, cx),
                     Err(message) => this.report(what, message, cx),
+                }
+                this.revision = this.revision.wrapping_add(1);
+                this.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Commits the chosen files of every root, one commit per root with the same message,
+    /// as the Commit window does for a project with submodules.
+    pub fn commit_roots(
+        &mut self,
+        request: CommitRequest,
+        options: CommitOptions,
+        push: bool,
+        done: impl FnOnce(&mut Self, Vec<String>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.repo.is_none() {
+            return;
+        }
+        if self.busy.is_some() {
+            self.report(
+                "Commit",
+                format!("Still busy: {}", self.busy.unwrap_or("")),
+                cx,
+            );
+            return;
+        }
+        let mut groups = Vec::new();
+        let mut order: Vec<&GitRoot> = self.roots.iter().collect();
+        // Submodules go first, the deepest before its parent: the commit of the parent
+        // records their new commits.
+        order.sort_by_key(|root| std::cmp::Reverse(root.prefix.len()));
+        for root in order {
+            let mut paths = Vec::new();
+            for path in &request.paths {
+                if root.prefix.is_empty() {
+                    // The project takes its own files and the pointers of its submodules.
+                    if self.root_of(path).is_empty()
+                        || self.roots.iter().any(|other| other.prefix == *path)
+                    {
+                        paths.push(path.clone());
+                    }
+                } else if path != &root.prefix
+                    && path.strip_prefix(&format!("{}/", root.prefix)).is_some()
+                {
+                    paths.push(
+                        path.strip_prefix(&format!("{}/", root.prefix))
+                            .unwrap_or(path)
+                            .to_owned(),
+                    );
+                }
+            }
+            if !paths.is_empty() {
+                groups.push((root.repo.clone(), paths));
+            }
+        }
+        if groups.is_empty() {
+            self.report("Commit", "Tick at least one file".to_string(), cx);
+            return;
+        }
+        let message = request.message.clone();
+        let amend = request.amend;
+        self.busy = Some("Commit");
+        self.last_error = None;
+        cx.notify();
+        let job = cx.background_executor().spawn(async move {
+            let mut ids = Vec::new();
+            for (repo, paths) in groups {
+                let request = CommitRequest {
+                    message: message.clone(),
+                    paths,
+                    amend,
+                };
+                let id = repo.commit_with(&request, &options)?;
+                if push {
+                    repo.push()?;
+                }
+                ids.push(id);
+            }
+            Ok::<_, std::io::Error>(ids)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                this.busy = None;
+                match result {
+                    Ok(ids) => {
+                        let done_ids = ids.clone();
+                        done(this, ids, cx);
+                        let short: Vec<String> =
+                            done_ids.iter().map(|id| short_commit(id)).collect();
+                        if short.len() > 1 {
+                            this.tell(
+                                "Commit",
+                                format!("Committed each root: {}", short.join(", ")),
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => this.report("Commit", error.to_string(), cx),
                 }
                 this.revision = this.revision.wrapping_add(1);
                 this.refresh(cx);
@@ -793,10 +1113,13 @@ impl GitState {
             self.report("Update", message, cx);
             return;
         }
+        let submodules = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.git_update_submodules);
         self.run(
             "Update",
-            move |repo| repo.update_with(mode),
-            move |this, report, cx| this.finish_update(report, cx),
+            move |repo| repo.update_all(mode, submodules),
+            move |this, update, cx| this.finish_update(update, cx),
             cx,
         );
     }
@@ -820,12 +1143,15 @@ impl GitState {
             .ok();
     }
 
-    fn finish_update(&mut self, report: UpdateReport, cx: &mut Context<Self>) {
+    fn finish_update(&mut self, update: RootsUpdate, cx: &mut Context<Self>) {
+        let report = update.report;
         self.operation = report.operation;
         self.autostash = report.autostash;
         self.merge_message = report.merge_message;
         self.reload_everything_from_disk(cx);
-        if let Some(stash) = &report.stash {
+        if !update.errors.is_empty() {
+            self.report("Update", update.errors.join("\n"), cx);
+        } else if let Some(stash) = &report.stash {
             self.report("Update", stash_left_message(stash), cx);
         } else if !report.conflicts.is_empty() {
             self.tell(
@@ -2062,6 +2388,18 @@ pub fn hunk_at(hunks: &[Hunk], line: u32) -> Option<&Hunk> {
             hunk.after.contains(&line)
         }
     })
+}
+
+/// The files of a submodule root under the prefix of that root in the project status.
+fn combine_status(all: &mut Status, prefix: &str, root: &Status) {
+    for file in &root.files {
+        let mut file = file.clone();
+        file.path = format!("{prefix}/{}", file.path);
+        if let Some(original) = file.original.as_mut() {
+            *original = format!("{prefix}/{original}");
+        }
+        all.files.push(file);
+    }
 }
 
 /// `path` relative to the repository, with `/`, as git names it.

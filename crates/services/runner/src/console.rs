@@ -189,7 +189,14 @@ impl OutputWatch {
 
 /// What the keeper of a console runs.
 enum Work {
-    Plan(RunPlan),
+    Plan {
+        plan: RunPlan,
+        /// The before launch steps of the configuration, in order. Each must end with
+        /// success before the next one starts.
+        steps: Vec<ProcessSpec>,
+        /// A Stop that came before the console was made keeps every step from starting.
+        stop_before_start: bool,
+    },
     /// One step only, for a caller that starts the program itself after it succeeds.
     Single {
         spec: ProcessSpec,
@@ -203,7 +210,7 @@ impl Work {
     /// never does.
     fn reads_input(&self) -> bool {
         match self {
-            Self::Plan(plan) => plan.program.reads_input(),
+            Self::Plan { plan, .. } => plan.program.reads_input(),
             Self::Single { .. } => false,
         }
     }
@@ -211,7 +218,25 @@ impl Work {
 
 impl Console {
     pub fn start(plan: RunPlan) -> Self {
-        Self::spawn(Work::Plan(plan))
+        Self::spawn(Work::Plan {
+            plan,
+            steps: Vec::new(),
+            stop_before_start: false,
+        })
+    }
+
+    /// The same plan after the before launch steps of the configuration. The console stops
+    /// when `stop` is already cancelled, so a Stop before the first process keeps the
+    /// program from starting at all.
+    pub fn start_with_steps(plan: RunPlan, steps: Vec<ProcessSpec>, stop: Cancel) -> Self {
+        Self::spawn_with(
+            Work::Plan {
+                plan,
+                steps,
+                stop_before_start: true,
+            },
+            stop,
+        )
     }
 
     /// Runs one build step and stops there. `ConsoleEvent::Exited` with [`Step::Program`]
@@ -221,8 +246,11 @@ impl Console {
     }
 
     fn spawn(work: Work) -> Self {
+        Self::spawn_with(work, Cancel::new())
+    }
+
+    fn spawn_with(work: Work, stop: Cancel) -> Self {
         let (sender, events) = sync_channel(QUEUE);
-        let stop = Cancel::new();
         let cancel = stop.clone();
         let watch = Arc::new(OutputWatch::default());
         let keeper_watch = watch.clone();
@@ -347,7 +375,11 @@ fn keep(
     input: Option<InputWriter>,
 ) {
     match work {
-        Work::Plan(plan) => keep_plan(plan, stop, events, watch, input),
+        Work::Plan {
+            plan,
+            steps,
+            stop_before_start,
+        } => keep_plan(plan, steps, stop_before_start, stop, events, watch, input),
         Work::Single { spec, step, grace } => {
             let end = run_step(&spec, step, grace, stop, events, watch, None);
             let _ = events.send(ConsoleEvent::Exited {
@@ -362,27 +394,39 @@ fn keep(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn keep_plan(
     plan: RunPlan,
+    steps: Vec<ProcessSpec>,
+    stop_before_start: bool,
     stop: &Cancel,
     events: &SyncSender<ConsoleEvent>,
     watch: &Arc<OutputWatch>,
     input: Option<InputWriter>,
 ) {
-    if let Some(before) = &plan.before {
-        let end = run_step(before, Step::Before, plan.grace, stop, events, watch, None);
+    // Stop asked before the plan began: no step starts, not even for a moment.
+    if stop_before_start && stop.is_cancelled() {
+        let _ = events.send(ConsoleEvent::Closed);
+        return;
+    }
+    let mut before = steps.into_iter().chain(plan.before).collect::<Vec<_>>();
+    let had_steps = !before.is_empty();
+    for step in before.drain(..) {
+        let end = run_step(&step, Step::Before, plan.grace, stop, events, watch, None);
         if end.code != Some(0) || stop.is_cancelled() {
+            let code = end.code;
             let step = Step::Before;
-            let _ = events.send(ConsoleEvent::Exited {
-                code: end.code,
-                step,
-            });
+            let _ = events.send(ConsoleEvent::Exited { code, step });
             end.drain(stop, Some(DRAIN));
             let _ = events.send(ConsoleEvent::Closed);
             return;
         }
         // A build that left a daemon behind must not hold the program back.
         end.drain(stop, Some(DRAIN));
+    }
+    if had_steps && stop.is_cancelled() {
+        let _ = events.send(ConsoleEvent::Closed);
+        return;
     }
     let end = run_step(
         &plan.program,
@@ -653,6 +697,55 @@ mod tests {
     #[test]
     fn a_step_that_failed_keeps_the_program_from_starting() {
         let console = Console::start(plan(Some(shell("exit /b 7")), shell("echo second")));
+
+        let (text, code, step) = to_end(&console);
+
+        assert_eq!(text, "");
+        assert_eq!((code, step), (Some(7), Step::Before));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cancelled_plan_starts_nothing() {
+        let stop = Cancel::new();
+        stop.cancel();
+        let console = Console::start_with_steps(
+            plan(None, shell("echo second")),
+            vec![shell("echo first")],
+            stop,
+        );
+
+        let first = console.events().recv_timeout(PATIENCE).unwrap();
+
+        assert_eq!(first, ConsoleEvent::Closed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_steps_run_in_order_before_the_program() {
+        let console = Console::start_with_steps(
+            plan(None, shell("echo program")),
+            vec![shell("echo one"), shell("echo two")],
+            Cancel::new(),
+        );
+
+        let (text, code, _) = to_end(&console);
+
+        assert_eq!(
+            text.split_whitespace().collect::<Vec<_>>(),
+            ["one", "two", "program"]
+        );
+        assert_eq!(code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_step_keeps_the_next_ones_and_the_program_from_starting() {
+        let console = Console::start_with_steps(
+            plan(None, shell("echo program")),
+            vec![shell("exit /b 7"), shell("echo second")],
+            Cancel::new(),
+        );
 
         let (text, code, step) = to_end(&console);
 

@@ -618,6 +618,7 @@ fn error_at_start() -> DiagnosticEntry {
         severity: Severity::Error,
         message: "the value is never used".to_owned(),
         unnecessary: false,
+        code: None,
     }
 }
 

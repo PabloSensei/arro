@@ -718,7 +718,7 @@ impl EditorView {
             .iter()
             .find(|laid_out| laid_out.row == row.row)?;
         let x = layout.bounds.left()
-            + px(self.gutter_room() + TEXT_INSET)
+            + px(self.gutter_room() + TEXT_INSET + self.center_inset)
             + shown.text.x_for_index(row.column)
             - px(self.scroll_left);
         Some(point(x, shown.y + px(self.style.line_height)))

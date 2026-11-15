@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use sidecar::{Plan, ServerSpec, State};
 use tokio::sync::watch;
 
+mod code_style;
 mod import;
 mod startup;
 
@@ -187,6 +188,15 @@ impl Default for CodeVision {
     }
 }
 
+/// The `.prefs` file of the checks the user changed, under the state folder of the
+/// server. The server reads the path from `java.settings.url`, and its preference
+/// listener (`StandardProjectsManager$3.preferencesChange`) reloads the file only when
+/// the path itself changes. The name therefore carries the content: the same choices
+/// give the same path, new choices give a new one, and `workspace/didChangeConfiguration`
+/// applies them to the running server.
+const INSPECTION_PREFS_PREFIX: &str = "inspections-";
+const INSPECTION_PREFS_SUFFIX: &str = ".prefs";
+
 /// The Lombok agent of the project: the jar copied next to the server state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lombok {
@@ -254,6 +264,12 @@ pub struct Jdtls {
     inlay: Mutex<InlayHints>,
     /// The Code Vision settings of the window, read on every settings question.
     code_vision: Mutex<CodeVision>,
+    /// `org.eclipse.jdt.core.prefs` entries of the checks the user changed. The server
+    /// reads the file named by `java.settings.url` when it initializes.
+    inspection_prefs: Mutex<Vec<(String, String)>>,
+    /// The formatter profile and import choices of the project code style, prepared
+    /// when the server starts.
+    code_style: Option<code_style::Prepared>,
     /// The Lombok agent of the running server, if the project uses Lombok.
     lombok: Mutex<Option<Lombok>>,
     /// When the last start began, so that a stale log is not read as its cause.
@@ -272,6 +288,20 @@ impl Jdtls {
         let root = CanonPath::new(&config.project_root)?;
         let launcher_jar = equinox_launcher(&config.jdtls_home)?;
         fs::create_dir_all(&config.state_dir)?;
+        let code_style = code_style::read_project_style(&config.project_root)
+            .map(|style| code_style::prepare(&config.state_dir, &style));
+        // The default choices name a file too, so the server always reads one at its
+        // start and never misses the path it is given.
+        let prefs = code_style
+            .as_ref()
+            .map(|style| style.prefs.clone())
+            .unwrap_or_default();
+        if let Err(error) = fs::write(
+            inspection_prefs_path(&config.state_dir, &prefs),
+            code_style::prefs_text(&prefs),
+        ) {
+            eprintln!("the inspections of the project are not saved: {error}");
+        }
         let lock = fs::File::create(config.state_dir.join(LOCK_FILE))?;
         if lock.try_lock().is_err() {
             let message = "jdtls already runs for this project in another window";
@@ -282,6 +312,8 @@ impl Jdtls {
             runtimes: Mutex::new(config.runtimes.clone()),
             inlay: Mutex::new(InlayHints::default()),
             code_vision: Mutex::new(CodeVision::default()),
+            inspection_prefs: Mutex::new(Vec::new()),
+            code_style,
             lombok: Mutex::new(None),
             config,
             root,
@@ -377,12 +409,35 @@ impl Jdtls {
             .code_vision
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let prefs = self
+            .inspection_prefs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let mut combined = self
+            .code_style
+            .as_ref()
+            .map(|style| style.prefs.clone())
+            .unwrap_or_default();
+        combined.extend(prefs);
+        let formatter = self
+            .code_style
+            .as_ref()
+            .and_then(|style| style.formatter.clone());
+        let import_order = self
+            .code_style
+            .as_ref()
+            .map(|style| style.import_order.clone())
+            .unwrap_or_default();
         settings(
             &self.config,
             &runtimes,
             self.autobuild.enabled(),
             inlay,
             code_vision,
+            &combined,
+            formatter.as_deref(),
+            &import_order,
         )
     }
 
@@ -402,6 +457,47 @@ impl Jdtls {
 
     /// The labels above declarations. The caller sends the new settings to a running
     /// server, which applies them without a restart. `false` when nothing changed.
+    /// The compiler problems of the checks the user changed, as `.prefs` lines. A new
+    /// choice goes to a file of its own, which the running server reads at once when
+    /// the caller sends the new settings; `true` means that the path changed.
+    pub fn set_inspection_prefs(&self, prefs: Vec<(String, String)>) -> bool {
+        let mut current = self
+            .inspection_prefs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *current == prefs {
+            return false;
+        }
+        *current = prefs;
+        let mut combined = self
+            .code_style
+            .as_ref()
+            .map(|style| style.prefs.clone())
+            .unwrap_or_default();
+        combined.extend(current.iter().cloned());
+        let file = inspection_prefs_path(&self.config.state_dir, &combined);
+        let text = code_style::prefs_text(&combined);
+        if let Err(error) = fs::write(&file, text) {
+            eprintln!("the inspections of the project are not saved: {error}");
+        }
+        // The earlier choice names a file the settings no longer point at.
+        for entry in fs::read_dir(&self.config.state_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(INSPECTION_PREFS_PREFIX)
+                && name.ends_with(INSPECTION_PREFS_SUFFIX)
+                && entry.path() != file
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        true
+    }
+
     pub fn set_code_vision(&self, usages: bool, implementations: bool) -> bool {
         let mut code_vision = self
             .code_vision
@@ -498,15 +594,39 @@ pub fn settings_of(config: &JdtlsConfig) -> Value {
         parameters: InlayParameterNames::default(),
         types: false,
     };
-    settings(config, &config.runtimes, true, inlay, CodeVision::default())
+    let style = code_style::read_project_style(&config.project_root)
+        .map(|style| code_style::prepare(&config.state_dir, &style));
+    let prefs = style
+        .as_ref()
+        .map(|style| style.prefs.clone())
+        .unwrap_or_default();
+    let formatter = style.as_ref().and_then(|style| style.formatter.clone());
+    let import_order = style
+        .as_ref()
+        .map(|style| style.import_order.clone())
+        .unwrap_or_default();
+    settings(
+        config,
+        &config.runtimes,
+        true,
+        inlay,
+        CodeVision::default(),
+        &prefs,
+        formatter.as_deref(),
+        &import_order,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settings(
     config: &JdtlsConfig,
     runtimes: &[Runtime],
     autobuild: bool,
     inlay: InlayHints,
     code_vision: CodeVision,
+    inspection_prefs: &[(String, String)],
+    formatter: Option<&Path>,
+    import_order: &[String],
 ) -> Value {
     let runtimes: Vec<Value> = runtimes
         .iter()
@@ -545,29 +665,40 @@ fn settings(
     if let Some(path) = &config.maven_settings {
         maven_configuration["userSettings"] = json!(slashes(path));
     }
-    json!({
+    let mut format = json!({"enabled": true});
+    if let Some(path) = formatter {
+        format["settings"] = json!({
+            "url": formatter_url(path),
+            "profile": code_style::PROFILE_NAME,
+        });
+    }
+    let mut completion = json!({
+        "enabled": true,
+        "maxResults": 100,
+        // `args.for`, `name.var` and the other postfix keys of the server.
+        "postfix": {"enabled": true},
+        // No argument names or guesses: `name()` with the caret inside, as in IDEA.
+        "guessMethodArguments": "off",
+        // The default list of vscode-java: service types do not crowd the popup.
+        "filteredTypes": [
+            "java.awt.*",
+            "com.sun.*",
+            "sun.*",
+            "jdk.*",
+            "org.graalvm.*",
+            "io.micrometer.shaded.*",
+        ],
+    });
+    if !import_order.is_empty() {
+        completion["importOrder"] = json!(import_order);
+    }
+    let settings = json!({
         "java": {
             "autobuild": {"enabled": autobuild},
-            "completion": {
-                "enabled": true,
-                "maxResults": 100,
-                // `args.for`, `name.var` and the other postfix keys of the server.
-                "postfix": {"enabled": true},
-                // No argument names or guesses: `name()` with the caret inside, as in IDEA.
-                "guessMethodArguments": "off",
-                // The default list of vscode-java: service types do not crowd the popup.
-                "filteredTypes": [
-                    "java.awt.*",
-                    "com.sun.*",
-                    "sun.*",
-                    "jdk.*",
-                    "org.graalvm.*",
-                    "io.micrometer.shaded.*",
-                ],
-            },
+            "completion": completion,
             "signatureHelp": {"enabled": true},
             "semanticHighlighting": {"enabled": true},
-            "format": {"enabled": true},
+            "format": format,
             "referencesCodeLens": {"enabled": code_vision.usages},
             // jdtls 1.63 names the setting in the singular and takes a scope rather
             // than a switch: `all`, `types`, `methods` or `none`.
@@ -586,6 +717,7 @@ fn settings(
                 "parameterTypes": {"enabled": inlay.types},
             },
             "maven": {"downloadSources": false},
+            "settings": {"url": inspection_prefs_url(config, inspection_prefs)},
             "import": {
                 "maven": {"enabled": true, "offline": {"enabled": config.offline}},
                 "gradle": gradle,
@@ -596,7 +728,38 @@ fn settings(
                 "runtimes": runtimes,
             },
         }
-    })
+    });
+    settings
+}
+
+/// The file the server reads the compiler choices from. The name is a hash of the
+/// lines, so a new choice is a new path and the server reloads it without a restart.
+fn inspection_prefs_path(state_dir: &Path, prefs: &[(String, String)]) -> PathBuf {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for (key, value) in prefs {
+        for byte in key.bytes().chain(*b"=").chain(value.bytes()).chain(*b"\n") {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    state_dir.join(format!(
+        "{INSPECTION_PREFS_PREFIX}{hash:016x}{INSPECTION_PREFS_SUFFIX}"
+    ))
+}
+
+fn inspection_prefs_url(config: &JdtlsConfig, prefs: &[(String, String)]) -> String {
+    let path = inspection_prefs_path(&config.state_dir, prefs);
+    CanonPath::new(&path).map_or_else(
+        |_| format!("file:///{}", slashes(&path).trim_start_matches('/')),
+        |path| path.to_uri(),
+    )
+}
+
+fn formatter_url(formatter: &Path) -> String {
+    CanonPath::new(formatter).map_or_else(
+        |_| format!("file:///{}", slashes(formatter).trim_start_matches('/')),
+        |path| path.to_uri(),
+    )
 }
 
 fn is_gradle_project(config: &JdtlsConfig) -> bool {
@@ -1003,6 +1166,38 @@ mod tests {
     }
 
     #[test]
+    fn a_project_code_style_sets_the_formatter_profile_and_the_import_order() {
+        let project = test_support::scratch("jdtls-adapter-code-style");
+        std::fs::create_dir_all(project.join(".idea").join("codeStyles")).unwrap();
+        std::fs::write(
+            project.join(".idea/codeStyles/Project.xml"),
+            r#"<code_scheme name="Project">
+  <codeStyleSettings language="JAVA">
+    <option name="INDENT_SIZE" value="2" />
+    <option name="TAB_SIZE" value="2" />
+    <option name="USE_TAB_CHARACTER" value="false" />
+  </codeStyleSettings>
+</code_scheme>"#,
+        )
+        .unwrap();
+        let (jdtls, _root) = jdtls_on(project);
+        let settings = jdtls.settings();
+        let url = settings["java"]["format"]["settings"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(
+            url.starts_with("file:///") && url.ends_with(".xml"),
+            "{url}"
+        );
+        assert_eq!(
+            settings["java"]["format"]["settings"]["profile"],
+            json!(code_style::PROFILE_NAME)
+        );
+        let prefs = settings["java"]["settings"]["url"].as_str().unwrap();
+        assert!(prefs.ends_with(".prefs"), "{prefs}");
+    }
+
+    #[test]
     fn the_import_shortens_the_gradle_daemon_idle_timeout_unless_the_project_sets_one() {
         let project = test_support::scratch("jdtls-adapter-gradle-props");
         fs::create_dir_all(&project).unwrap();
@@ -1324,6 +1519,69 @@ mod tests {
         assert_eq!(reply, json!(["--no-scan", null]));
         let home = jdtls.section("java.import.gradle.user.home");
         assert_eq!(home, "E:/gradle");
+    }
+
+    #[test]
+    fn the_checks_of_the_user_reach_the_running_server_through_a_new_file() {
+        use lsp_client::uri::file_path;
+
+        let (jdtls, _) = jdtls();
+        let url = || {
+            jdtls.settings()["java"]["settings"]["url"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let empty = url();
+        assert!(
+            empty.starts_with("file:///") && empty.ends_with(".prefs"),
+            "the server always reads a file: {empty}"
+        );
+        let empty_path = file_path(&empty.parse().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(&empty_path).unwrap(), "");
+
+        assert!(jdtls.set_inspection_prefs(vec![(
+            "org.eclipse.jdt.core.compiler.problem.unusedImport".to_owned(),
+            "ignore".to_owned(),
+        )]));
+        let changed = url();
+        assert_ne!(changed, empty, "a new choice is a new path for the server");
+        let changed_path = file_path(&changed.parse().unwrap()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&changed_path).unwrap(),
+            "org.eclipse.jdt.core.compiler.problem.unusedImport=ignore\n"
+        );
+        assert!(!empty_path.exists(), "the file of the old choice is gone");
+
+        assert!(
+            !jdtls.set_inspection_prefs(vec![(
+                "org.eclipse.jdt.core.compiler.problem.unusedImport".to_owned(),
+                "ignore".to_owned(),
+            )]),
+            "the same choices are not sent again"
+        );
+        assert_eq!(url(), changed);
+    }
+
+    #[test]
+    fn the_settings_of_a_check_are_sent_when_it_is_turned_off_and_after_a_reset() {
+        let (jdtls, _) = jdtls();
+        let url = || {
+            jdtls.settings()["java"]["settings"]["url"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let empty = url();
+        jdtls.set_inspection_prefs(vec![("a".to_owned(), "error".to_owned())]);
+        let set = url();
+        jdtls.set_inspection_prefs(Vec::new());
+        let reset = url();
+        assert_ne!(set, empty);
+        assert_eq!(
+            reset, empty,
+            "the default choices name the same empty file again"
+        );
     }
 
     #[test]

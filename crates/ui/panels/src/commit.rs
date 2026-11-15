@@ -15,7 +15,7 @@ use workspace::{COMMIT_TOOL, Settings, Workspace};
 
 use crate::changelists::{Changelists, Grouping};
 use crate::diff_view::DiffView;
-use crate::git::{GitState, Kind, relative_of};
+use crate::git::{GitState, Kind, relative_of, short_commit};
 use crate::inspect::ActiveInspect;
 use crate::project_state::project_key;
 use crate::prompt::{Prompt, TextField};
@@ -440,6 +440,17 @@ impl CommitPanel {
     #[cfg(test)]
     pub fn analysis_enabled(&self) -> bool {
         self.analysis
+    }
+
+    /// The headings of the roots the file list groups by, for tests.
+    #[cfg(test)]
+    pub fn root_headings(&self, cx: &App) -> Vec<String> {
+        self.git
+            .read(cx)
+            .roots()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
     }
 
     /// Whether the file belongs to a list other than the active one.
@@ -1381,25 +1392,19 @@ impl CommitPanel {
         let me = cx.weak_entity();
         let amend = request.amend;
         self.git.update(cx, |git, cx| {
-            git.run(
-                "Commit",
-                move |repo| {
-                    let id = repo.commit_with(&request, &options)?;
-                    if push {
-                        repo.push()?;
-                    }
-                    Ok(id)
-                },
-                move |git, id, cx| {
-                    let short = &id[..id.len().min(7)];
+            git.commit_roots(
+                request,
+                options,
+                push,
+                move |git: &mut GitState, _ids, cx| {
                     let text = if amend && push {
-                        format!("Amended {short} and pushed")
+                        "Amended the commit and pushed".to_string()
                     } else if amend {
-                        format!("Amended {short}")
+                        "Amended the commit".to_string()
                     } else if push {
-                        format!("Committed {short} and pushed")
+                        "Committed and pushed".to_string()
                     } else {
-                        format!("Committed {short}")
+                        "Committed".to_string()
                     };
                     git.tell("Commit", text, cx);
                     me.update(cx, |this, cx| {
@@ -1519,6 +1524,39 @@ impl CommitPanel {
         let Some(file) = git.status().files.get(index) else {
             return;
         };
+        if let Some((old, new)) = git.pointer(&file.path).cloned() {
+            let Some(repo) = git.repo_of(&file.path) else {
+                return;
+            };
+            let path = file.path.clone();
+            let title = file.path.clone();
+            let window = window.window_handle();
+            let job = cx.background_executor().spawn(async move {
+                repo.submodule_commits(&path, old.as_deref(), new.as_deref())
+                    .map_err(|error| error.to_string())
+            });
+            let workspace = self.workspace.clone();
+            cx.spawn(async move |this, cx| {
+                let result = job.await;
+                this.update(cx, |this, cx| match result {
+                    Ok(commits) => {
+                        let _ = window.update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    PointerView::open(title, commits, workspace, window, cx)
+                                })
+                                .ok();
+                        });
+                    }
+                    Err(message) => this.git.update(cx, |git, cx| {
+                        git.report("Submodule", message, cx);
+                    }),
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let Some(path) = git.absolute(&file.path) else {
             return;
         };
@@ -1673,6 +1711,12 @@ impl CommitPanel {
             None => (String::new(), path.clone()),
         };
         let checked = !self.unchecked.contains(&path);
+        let pointer = self.git.read(cx).pointer(&path).cloned();
+        let pointer_text = pointer.map(|(old, new)| {
+            let old = old.map_or_else(|| "0000000".to_owned(), |id| short_commit(&id));
+            let new = new.map_or_else(|| "0000000".to_owned(), |id| short_commit(&id));
+            format!("commit {old} → {new}")
+        });
         let toggle_path = path.clone();
         let boxed = div()
             .id(("commit-check", index))
@@ -1743,7 +1787,15 @@ impl CommitPanel {
                     .whitespace_nowrap()
                     .text_color(theme.text_secondary)
                     .child(folder),
-            );
+            )
+            .children(pointer_text.map(|text| {
+                div()
+                    .ml(px(8.))
+                    .flex_none()
+                    .text_color(theme.text_secondary)
+                    .debug_selector(|| "commit-pointer".to_owned())
+                    .child(text)
+            }));
         let row_bounds = self.row_bounds.clone();
         div()
             .w_full()
@@ -1825,9 +1877,28 @@ impl CommitPanel {
             .child(group.to_string())
     }
 
+    /// The heading of a root when the project has submodules: the same files below it
+    /// belong to that repository.
+    fn root_row(&self, root: &str, index: usize, theme: &Theme) -> Stateful<Div> {
+        div()
+            .id(("commit-root", index))
+            .debug_selector(move || format!("commit-root-{index}"))
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .mx(px(ROW_MARGIN))
+            .px(px(ROW_PADDING_X))
+            .text_color(theme.link)
+            .font_weight(FontWeight::MEDIUM)
+            .child(root.to_string())
+    }
+
     fn grouped_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut rows = Vec::new();
         let mut last: Option<String> = None;
+        let mut last_root: Option<String> = None;
+        let show_roots = self.git.read(cx).roots().len() > 1;
         for index in self.visible_files(cx) {
             let Some(path) = self
                 .git
@@ -1839,6 +1910,16 @@ impl CommitPanel {
             else {
                 continue;
             };
+            if show_roots {
+                let git = self.git.read(cx);
+                let prefix = git.root_of(&path);
+                let root = git.root_label(&prefix);
+                if last_root.as_deref() != Some(root.as_str()) {
+                    rows.push(self.root_row(&root, rows.len(), theme).into_any_element());
+                    last_root = Some(root);
+                    last = None;
+                }
+            }
             let group = self.group_of(&path, cx);
             if last.as_deref() != Some(group.as_str()) {
                 rows.push(self.group_row(&group, rows.len(), theme).into_any_element());
@@ -2496,6 +2577,140 @@ impl Render for CommitPanel {
             )
             .child(self.tab_row(&theme, cx))
             .child(body)
+    }
+}
+
+/// The diff of a changed submodule pointer: the commits of the submodule between the
+/// commit the parent records and the one its working tree has.
+struct PointerView {
+    workspace: WeakEntity<Workspace>,
+    focus: FocusHandle,
+    title: String,
+    commits: Vec<vcs::Commit>,
+    scroll: ScrollHandle,
+}
+
+impl PointerView {
+    fn open(
+        title: String,
+        commits: Vec<vcs::Commit>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let weak = cx.weak_entity();
+        let view = cx.new(|cx| Self {
+            workspace: weak,
+            focus: cx.focus_handle(),
+            title,
+            commits,
+            scroll: ScrollHandle::new(),
+        });
+        let focus = view.read(cx).focus.clone();
+        workspace.show_overlay(view.into(), focus, window, cx);
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+}
+
+impl Render for PointerView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let viewport = window.viewport_size();
+        let width = px(620.).min(viewport.width - px(40.));
+        let left = (viewport.width - width) / 2.;
+        let top = viewport.height * 0.2;
+        let rows: Vec<AnyElement> = self
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(index, commit)| {
+                div()
+                    .id(("pointer-commit", index))
+                    .debug_selector(move || format!("pointer-commit-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .flex_none()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .flex_none()
+                            .font_family(MONO_FONT)
+                            .text_color(theme.link)
+                            .child(short_commit(&commit.id)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(commit.subject.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .flex_none()
+                            .text_color(theme.text_secondary)
+                            .child(commit.author.clone()),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let empty = rows.is_empty();
+        let body = surface(&theme)
+            .id("submodule-pointer")
+            .debug_selector(|| "submodule-pointer".to_owned())
+            .key_context("SubmodulePointer")
+            .track_focus(&self.focus)
+            .occlude()
+            .w(width)
+            .p(px(POPUP_PADDING))
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .text_size(px(TEXT_TITLE))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(self.title.clone()),
+            )
+            .child(
+                scrollable(
+                    "pointer-commits",
+                    &self.scroll,
+                    div()
+                        .id("pointer-commits")
+                        .flex()
+                        .flex_col()
+                        .max_h(px(420.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .children(rows)
+                        .when(empty, |this| {
+                            this.text_color(theme.text_secondary).child("No commits")
+                        }),
+                    &theme,
+                    window,
+                    cx,
+                )
+                .max_h(px(420.)),
+            );
+        div().absolute().left(left).top(top).child(body)
     }
 }
 

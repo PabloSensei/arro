@@ -175,6 +175,14 @@ impl LiveApplication for SpringLive {
         Some(format!("{}/{name}", self.settings.normalized_base()))
     }
 
+    fn app_port(&self) -> Option<u16> {
+        let observed = self.observed();
+        observed
+            .app_port
+            .or(self.settings.server_port)
+            .or_else(|| observed.started.then_some(DEFAULT_PORT))
+    }
+
     fn app_url(&self, path: &str) -> Option<String> {
         let path = if path.starts_with('/') {
             path.to_owned()
@@ -885,6 +893,7 @@ mod tests {
         let root = test_support::scratch("java-exec-live-console");
         let live = SpringLive::of(&target(true), &model(&root, false)).unwrap();
         assert!(!live.started());
+        assert_eq!(live.app_port(), None, "nothing ran yet");
         assert_eq!(
             live.endpoint(),
             Some(LiveEndpoint {
@@ -893,10 +902,26 @@ mod tests {
             })
         );
         assert!(live.observe("Tomcat started on port 8085 (http)"));
+        assert_eq!(
+            live.app_port(),
+            Some(8085),
+            "the line of the server names it"
+        );
         assert_eq!(live.endpoint().map(|endpoint| endpoint.port), Some(8085));
         assert!(!live.started());
         assert!(live.observe("Started App in 1.2 seconds"));
         assert!(live.started());
+        assert_eq!(live.app_port(), Some(8085));
+    }
+
+    #[test]
+    fn a_started_application_without_a_named_port_listens_on_the_usual_one() {
+        let root = test_support::scratch("java-exec-live-default-port");
+        let live = SpringLive::of(&target(true), &model(&root, false)).unwrap();
+
+        live.observe("Started App in 1.2 seconds");
+
+        assert_eq!(live.app_port(), Some(8080));
     }
 
     #[test]

@@ -4,14 +4,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use editor_view::{
-    ActionsOnSave, CompletionCase, EditorEvent, EditorOptions, EditorStyle, EditorView,
+    ActionsOnSave, BundleMode, CompletionCase, EditorEvent, EditorOptions, EditorStyle, EditorView,
     PreviewMode, SaveOptions, Spot, TrimTrailing,
 };
 use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{
-    DOCUMENTATION_TOOL, EditorFactory, EditorStatus, EditorTab, IndentChoice, PreviewLayout,
-    PreviewTab, Settings, USAGES_TOOL, Workspace,
+    BundleLayout, BundleTab, DOCUMENTATION_TOOL, EditorFactory, EditorStatus, EditorTab,
+    IndentChoice, PreviewLayout, PreviewTab, Settings, USAGES_TOOL, Workspace,
 };
 
 use crate::documentation::ActiveDocumentation;
@@ -28,12 +28,17 @@ pub struct PendingSafeDelete(pub Option<(PathBuf, usize)>);
 
 impl Global for PendingSafeDelete {}
 
-/// The theme's colours with the font size of Settings; the line follows the size.
+/// The theme's colours with the font size of Settings; the line follows the size. In
+/// Presentation Mode the editor font grows without a change of the settings.
 pub(crate) fn style_of(cx: &App) -> EditorStyle {
     let mut style = EditorStyle::from_theme(cx.global::<Theme>());
     if let Some(settings) = cx.try_global::<Settings>() {
         let ratio = style.line_height / style.font_size;
-        let font_size = (settings.font_size * settings.ui_scale).round().max(6.);
+        let points = cx
+            .try_global::<workspace::EditorAppearance>()
+            .and_then(|appearance| appearance.presentation_font)
+            .unwrap_or(settings.font_size);
+        let font_size = (points * settings.ui_scale).round().max(6.);
         if !settings.editor_font_family.trim().is_empty() {
             style.font_family = settings.editor_font_family.clone().into();
         }
@@ -51,10 +56,21 @@ pub(crate) fn options_of(cx: &App) -> EditorOptions {
     let Some(settings) = cx.try_global::<Settings>() else {
         return EditorOptions::default();
     };
+    let appearance = cx
+        .try_global::<workspace::EditorAppearance>()
+        .copied()
+        .unwrap_or_default();
     EditorOptions {
-        line_numbers: settings.show_line_numbers,
+        line_numbers: settings.show_line_numbers && !appearance.distraction_free,
+        gutter_icons: settings.show_gutter_icons && !appearance.distraction_free,
         highlight_current_line: settings.highlight_current_line,
         indent_guides: settings.show_indent_guides,
+        breadcrumbs: settings.show_breadcrumbs
+            && settings.navigation_bar_visible
+            && !appearance.distraction_free,
+        sticky_lines: settings.show_sticky_lines,
+        centered_text: appearance.distraction_free,
+        right_margin: settings.right_margin as usize,
         caret_blink: settings.caret_blink,
         wheel_zoom: settings.zoom_with_wheel,
         save: SaveOptions {
@@ -110,8 +126,10 @@ fn status_of(view: &EditorView) -> EditorStatus {
     let (line, column) = view.caret();
     let (indent_tabs, indent_size, from_editorconfig) = view.indent_status();
     let mut indent = view.indent_label();
-    if from_editorconfig {
-        indent.push_str(" (EditorConfig)");
+    if let Some(source) = view.indent_source_name() {
+        indent.push_str(" (");
+        indent.push_str(source);
+        indent.push(')');
     }
     EditorStatus {
         caret: caret_text(line, column, view.selected_chars()),
@@ -154,6 +172,12 @@ fn open(
             marks::refresh(view, cx);
             crate::coverage::refresh(view, cx);
             debug::refresh_inline_values(view, cx);
+        })
+        .detach();
+        cx.observe_global::<workspace::EditorAppearance>(|view: &mut EditorView, cx| {
+            let style = style_of(cx);
+            view.set_style(style, cx);
+            view.set_options(options_of(cx), cx);
         })
         .detach();
         if let Some(panel) = cx
@@ -209,6 +233,23 @@ fn open(
 
     OpenEditors::add(cx, view.read(cx).path().to_path_buf(), view.downgrade());
     outline::refresh(&view, false, cx);
+    let bundle = crate::bundle_editor::register(&opened, cx).then(|| {
+        let read_view = view.clone();
+        let write_view = view.clone();
+        BundleTab {
+            layout: Rc::new(move |cx: &App| match read_view.read(cx).bundle_mode(cx) {
+                Some(BundleMode::Bundle) => BundleLayout::Bundle,
+                _ => BundleLayout::Text,
+            }),
+            set_layout: Rc::new(move |layout, cx: &mut App| {
+                let mode = match layout {
+                    BundleLayout::Text => BundleMode::Text,
+                    BundleLayout::Bundle => BundleMode::Bundle,
+                };
+                write_view.update(cx, |view, cx| view.set_bundle_mode(mode, cx));
+            }),
+        }
+    });
     let runner = workspace.clone();
     window
         .subscribe(
@@ -216,6 +257,14 @@ fn open(
             cx,
             move |view, event: &EditorEvent, window, cx| match event {
                 EditorEvent::Loaded | EditorEvent::Changed => {
+                    let properties = view
+                        .read(cx)
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("properties"));
+                    if properties {
+                        crate::bundle_editor::files_changed(cx);
+                    }
                     if matches!(event, EditorEvent::Loaded) {
                         let path = view.read(cx).path().to_path_buf();
                         let pending = cx.default_global::<PendingSafeDelete>().0.take();
@@ -330,6 +379,33 @@ fn open(
                             .ok();
                     });
                 }
+                EditorEvent::DisableInspection { id, title } => {
+                    let (id, title) = (id.clone(), title.clone());
+                    let workspace = runner.clone();
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            crate::inspection::disable(workspace, &id, &title, cx);
+                        })
+                        .ok();
+                }
+                EditorEvent::EditInspection(id) => {
+                    let id = id.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::settings::SettingsView::show_inspection(
+                                            workspace, window, cx, &id,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
                 EditorEvent::CopyElement => {
                     let workspace = runner.clone();
                     let handle = window.window_handle();
@@ -360,6 +436,27 @@ fn open(
                                     .update(cx, |workspace, cx| {
                                         workspace.show_tool(
                                             workspace::CALL_HIERARCHY_TOOL,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::ShowDiagram(spot) => {
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    let spot = spot.clone();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::diagram::show(
+                                            workspace,
+                                            crate::diagram::DiagramSource::Spot(spot),
                                             window,
                                             cx,
                                         )
@@ -431,6 +528,28 @@ fn open(
                             }
                         })
                         .detach();
+                }
+                EditorEvent::CreateTest(spot) => {
+                    let spot = spot.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    // The key of the window is being handled: the overlay opens after it.
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::create_test::CreateTestDialog::show(
+                                            spot.clone(),
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
                 }
                 EditorEvent::CreateFiles(files) => {
                     let files = files.clone();
@@ -628,6 +747,28 @@ fn open(
                         );
                     }
                 }
+                EditorEvent::AddInlineWatch { line, expression } => {
+                    let path = view.read(cx).path().to_path_buf();
+                    let panel = cx
+                        .try_global::<debug::ActiveDebug>()
+                        .map(|panel| panel.0.clone());
+                    if let Some(panel) = panel {
+                        panel.update(cx, |panel, cx| {
+                            panel.add_inline_watch(path, *line as u32 + 1, expression.clone(), cx)
+                        });
+                    }
+                }
+                EditorEvent::InlineWatchRemoved { line, expression } => {
+                    let path = view.read(cx).path().to_path_buf();
+                    let panel = cx
+                        .try_global::<debug::ActiveDebug>()
+                        .map(|panel| panel.0.clone());
+                    if let Some(panel) = panel {
+                        panel.update(cx, |panel, cx| {
+                            panel.remove_inline_watch_at(&path, *line as u32 + 1, expression, cx)
+                        });
+                    }
+                }
                 _ => {}
             },
         )
@@ -684,6 +825,12 @@ fn open(
             let path = view.read(cx).path().to_path_buf();
             crate::history::snapshot_file(&path, local_history::Cause::Saved, cx);
             crate::endpoints::editor_changed(&view, cx);
+            if let Some(panel) = cx
+                .try_global::<ActiveRunPanel>()
+                .map(|panel| panel.0.clone())
+            {
+                panel.update(cx, |panel, cx| panel.project_file_saved(&path, cx));
+            }
         }
         EditorEvent::ExternalChange(bytes) => {
             let path = view.read(cx).path().to_path_buf();
@@ -856,6 +1003,7 @@ fn open(
             indent.update(cx, |view, cx| view.set_indent(tabs, size, cx));
         }),
         preview,
+        bundle,
     }
 }
 /// The factory the workspace opens files with.

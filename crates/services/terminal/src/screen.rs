@@ -61,6 +61,26 @@ pub struct Link {
     pub uri: String,
 }
 
+/// One run a search found. The line counts from the live screen, as `Screen` rows do
+/// with [`Screen::display_offset`]: a line above the screen is negative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub line: i32,
+    pub start_col: u16,
+    /// One past the last column of the run.
+    pub end_col: u16,
+}
+
+/// What the program in the terminal found for a search, over the whole scrollback. The
+/// generation of a later search tells the older answer apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchResults {
+    pub generation: u64,
+    pub matches: Vec<SearchMatch>,
+    /// Why the query is not a search, such as a pattern that does not parse.
+    pub error: Option<String>,
+}
+
 /// Modes a host acts on. Copied into every snapshot, and kept fresher than snapshots in the
 /// session itself, because input has to be encoded for the mode in force right now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,6 +135,8 @@ pub struct Screen {
     pub modes: Modes,
     pub links: Vec<Link>,
     pub bells: u64,
+    /// The working directory the program reported with OSC 7 or OSC 9;9, unchanged.
+    pub cwd: Option<String>,
     /// Grows with every published change.
     pub version: u64,
     pub exit_code: Option<u32>,

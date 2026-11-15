@@ -18,8 +18,12 @@ use ui_kit::*;
 use workspace_core::CommandRegistry;
 
 use crate::about::AboutView;
+use crate::appearance::{EditorAppearance, WindowMode};
 use crate::chrome::{ChromeView, EditorChromeSignal, StatusBarView, TabBarView};
-use crate::editor::{EditorFactory, EditorStatus, FileIcons, PreviewLayout};
+use crate::editor::{
+    BundleLayout, EditorFactory, EditorStatus, EditorTab, FileIcons, PreviewLayout,
+};
+use crate::external::{OpenRequests, OpenTarget, Request, open_target};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{
     DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_dark_theme, save_layout,
@@ -119,7 +123,15 @@ actions!(
         GotoRelated,
         NextProjectWindow,
         PreviousProjectWindow,
-        // The window only declares it, the menu of the screen of macOS runs it.
+        // The window only declares these, the menu of the screen of macOS runs them.
+        AboutApp,
+        CheckForUpdatesApp,
+        HideApp,
+        HideOtherApps,
+        ShowAllApps,
+        MinimizeWindow,
+        ZoomWindow,
+        BringAllToFront,
         QuitApp,
         RerunInspection,
         // Project Structure, Ctrl+Alt+Shift+S: the dialog is in `panels`.
@@ -134,6 +146,8 @@ actions!(
         ToggleHttp,
         // The Endpoints window: the HTTP handlers of the project.
         ToggleEndpoints,
+        // Ctrl+Cmd+F on macOS fills the screen; Windows and Linux have no key of default.
+        ToggleFullScreen,
     ]
 );
 
@@ -167,9 +181,21 @@ macro_rules! window_keys {
                     cx.bind_keys([KeyBinding::new(key, $action, $context)]);
                 }
             )*
-            // Every application of macOS quits with Command+Q, from its own menu.
+            // The keys of the application menu of macOS. The menu shows a key when the
+            // keymap binds it; the menu itself runs the row by its key equivalent.
             #[cfg(target_os = "macos")]
-            cx.bind_keys([KeyBinding::new("cmd-q", QuitApp, None)]);
+            {
+                cx.bind_keys([KeyBinding::new("cmd-q", QuitApp, None)]);
+                cx.bind_keys([KeyBinding::new("cmd-h", HideApp, None)]);
+                cx.bind_keys([KeyBinding::new("alt-cmd-h", HideOtherApps, None)]);
+                cx.bind_keys([KeyBinding::new("cmd-m", MinimizeWindow, None)]);
+                cx.bind_keys([KeyBinding::new("cmd-,", ShowSettings, None)]);
+            }
+            // Ctrl+Cmd+F fills the screen of macOS, as IDEA does. The other systems have
+            // no key of default: the row is of the View | Appearance menu only.
+            if platform.uses_command() {
+                cx.bind_keys([KeyBinding::new("cmd-ctrl-f", ToggleFullScreen, None)]);
+            }
         }
 
         /// The same bindings as [`bind_keys`], for the keymap check.
@@ -386,6 +412,7 @@ pub const SERVICES_TOOL: &str = "services";
 pub const PERFORMANCE_TOOL: &str = "performance";
 pub const DOCUMENTATION_TOOL: &str = "documentation";
 pub const LOG_TOOL: &str = "log";
+pub const SELECTION_HISTORY_TOOL: &str = "selection-history";
 pub const CALL_HIERARCHY_TOOL: &str = "call-hierarchy";
 pub const STACK_TRACE_TOOL: &str = "stack-trace";
 pub const METHOD_HIERARCHY_TOOL: &str = "method-hierarchy";
@@ -571,6 +598,9 @@ pub struct Workspace {
     /// The last change of the window that a draw has shown, for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) counted_revision: usize,
+    /// The batches of paths the window took from the queue of the system, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) open_request_wakes: usize,
     pub(crate) left: Dock,
     pub(crate) right: Dock,
     pub(crate) bottom: Dock,
@@ -620,6 +650,16 @@ pub struct Workspace {
     hidden_docks: Option<Vec<DockSide>>,
     /// The dock that fills the window while a tool window is maximized.
     maximized: Option<DockSide>,
+    /// The mode of View | Appearance: the parts of the window a mode hides.
+    mode: WindowMode,
+    /// Whether the window fills the screen, as the last toggle of the window left it.
+    full_screen: bool,
+    /// Whether Zen Mode turned the full screen on, so that leaving it turns it off.
+    zen_full_screen: bool,
+    /// The notice of the status bar after a zoom, such as `Zoom: 110%`.
+    zoom_notice: Option<SharedString>,
+    /// A number that drops a late end of a notice.
+    zoom_notice_serial: usize,
     pub(crate) balloon_visible: bool,
     pub(crate) balloon_serial: usize,
     icons: FileIcons,
@@ -662,6 +702,11 @@ pub struct Workspace {
     commands: CommandRegistry,
     handlers: HashMap<&'static str, CommandFn>,
     tab_listener: Option<TabListener>,
+    /// The callbacks of the views that follow the files whose tabs close.
+    tab_closed_hooks: Vec<TabListener>,
+    /// The buffers of files that no tab shows, by path: a view edits them through their
+    /// text and Save All writes them.
+    buffers: HashMap<PathBuf, EditorTab>,
     layout: Layout,
     placement: Option<WindowPlacement>,
     store: Option<Arc<Store>>,
@@ -909,6 +954,8 @@ impl Workspace {
             state_revision: 0,
             #[cfg(any(test, feature = "test-support"))]
             counted_revision: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            open_request_wakes: 0,
             left: Dock::new(layout.left),
             right: Dock::new(layout.right),
             bottom: Dock::new(bottom),
@@ -941,6 +988,11 @@ impl Workspace {
             last_tool: None,
             hidden_docks: None,
             maximized: None,
+            mode: WindowMode::Normal,
+            full_screen: window.is_fullscreen(),
+            zen_full_screen: false,
+            zoom_notice: None,
+            zoom_notice_serial: 0,
             balloon_visible: false,
             balloon_serial: 0,
             icons,
@@ -970,6 +1022,8 @@ impl Workspace {
             commands: CommandRegistry::new(),
             handlers: HashMap::new(),
             tab_listener: None,
+            tab_closed_hooks: Vec::new(),
+            buffers: HashMap::new(),
             placement: layout.window.or_else(|| placement_of(window)),
             layout,
             store,
@@ -994,6 +1048,7 @@ impl Workspace {
         });
         workspace.start_update_tasks(cx);
         workspace.reload_keymap(cx);
+        workspace.publish_editor_appearance(cx);
         workspace.refresh_platform_menus(cx);
         workspace
     }
@@ -1127,13 +1182,22 @@ impl Workspace {
             return;
         };
         let source = updater::UpdateSource::new();
-        let check = cx
-            .background_executor()
-            .spawn(async move { source.check(&current) });
+        let install = updater::install_dir().ok();
+        let check = cx.background_executor().spawn(async move {
+            // A package install cannot replace its own files, so the notification points
+            // at the release page instead. The check of the folder stays off the
+            // interface thread.
+            let package = install
+                .as_deref()
+                .is_none_or(updater::installed_from_package);
+            (source.check(&current), package)
+        });
         cx.spawn(async move |this, cx| {
-            let result = check.await;
-            this.update(cx, |this, cx| this.update_checked(result, automatic, cx))
-                .ok();
+            let (result, package) = check.await;
+            this.update(cx, |this, cx| {
+                this.update_checked(result, package, automatic, cx)
+            })
+            .ok();
         })
         .detach();
     }
@@ -1141,6 +1205,7 @@ impl Workspace {
     fn update_checked(
         &mut self,
         result: Result<Option<updater::Release>, updater::Error>,
+        package: bool,
         automatic: bool,
         cx: &mut Context<Self>,
     ) {
@@ -1151,7 +1216,7 @@ impl Workspace {
                     return;
                 }
                 self.update_release = Some(release.clone());
-                self.show_update(release, cx);
+                self.show_update(release, package, cx);
             }
             Ok(None) if !automatic => {
                 self.notify_user("No updates", "You're up to date", cx);
@@ -1166,7 +1231,7 @@ impl Workspace {
         }
     }
 
-    fn show_update(&mut self, release: updater::Release, cx: &mut Context<Self>) {
+    fn show_update(&mut self, release: updater::Release, package: bool, cx: &mut Context<Self>) {
         let version = release.version_text();
         let line = release
             .notes
@@ -1175,11 +1240,21 @@ impl Workspace {
             .unwrap_or("A newer version of Arro is ready to install.")
             .trim()
             .to_owned();
-        let mut buttons = vec![BalloonButton {
-            id: "update",
-            label: "Update and Restart".into(),
-            action: BalloonAction::InstallUpdate,
-        }];
+        // A package install owns its folder: the package manager replaces it, and the
+        // button opens the page where the new `.deb` or `.dmg` is.
+        let mut buttons = if package {
+            vec![BalloonButton {
+                id: "download-package",
+                label: "Download the new package".into(),
+                action: BalloonAction::Url(release.page_url.clone()),
+            }]
+        } else {
+            vec![BalloonButton {
+                id: "update",
+                label: "Update and Restart".into(),
+                action: BalloonAction::InstallUpdate,
+            }]
+        };
         buttons.push(BalloonButton {
             id: "release-notes",
             label: "Release Notes".into(),
@@ -1316,6 +1391,12 @@ impl Workspace {
             .iter()
             .map(|(path, mode)| (::platform::path_key(path), *mode))
             .collect();
+        let bundle_modes: HashMap<PathBuf, BundleLayout> = self
+            .layout
+            .bundle_modes
+            .iter()
+            .map(|(path, mode)| (::platform::path_key(path), *mode))
+            .collect();
         let mut panes = Vec::with_capacity(states.len());
         let mut seen = HashSet::new();
         for state in &states {
@@ -1334,6 +1415,11 @@ impl Workspace {
                     && let Some(preview) = &tab.editor.preview
                 {
                     (preview.set_layout)(*mode, cx);
+                }
+                if let Some(mode) = bundle_modes.get(&::platform::path_key(path))
+                    && let Some(bundle) = &tab.editor.bundle
+                {
+                    (bundle.set_layout)(*mode, cx);
                 }
                 if index == state.active {
                     active = tabs.len();
@@ -1485,6 +1571,18 @@ impl Workspace {
         self.close_hooks.push(Box::new(hook));
     }
 
+    /// Adds a callback that runs with the path of a file when its tab closes, so a view
+    /// that keeps a buffer of the file hears about it instead of comparing the tabs.
+    pub fn on_tab_closed(&mut self, hook: impl Fn(&Path, &mut Context<Self>) + 'static) {
+        self.tab_closed_hooks.push(Rc::new(hook));
+    }
+
+    fn note_tab_closed(&self, path: &Path, cx: &mut Context<Self>) {
+        for hook in &self.tab_closed_hooks {
+            hook(path, cx);
+        }
+    }
+
     /// Puts a tool window into a dock, in place of one with the same id. The window keeps
     /// the last frame of the tool window until the tool window itself changes, the theme
     /// or the scale changes, or the window changes what it shows.
@@ -1530,10 +1628,63 @@ impl Workspace {
             .collect()
     }
 
+    /// The buffer of a file that no tab shows: a view edits the file through its text,
+    /// the undo of the file works as in a tab, Save All writes it, and opening the file
+    /// later puts this same buffer into a tab.
+    pub fn open_buffer(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyView {
+        if let Some(view) = self.view_of(&path) {
+            return view;
+        }
+        let path = on_disk_path(path);
+        let tab = self.tab_for(path.clone(), window, cx);
+        let view = tab.editor.view.clone();
+        self.buffers.insert(path, tab.editor);
+        cx.notify();
+        view
+    }
+
+    /// Forgets the buffer of a file no tab shows, writing its unsaved text first. A file
+    /// whose tab is open keeps its buffer there.
+    pub fn release_buffer(&mut self, path: &Path, cx: &mut App) {
+        let key = ::platform::path_key(path);
+        let found = self
+            .buffers
+            .keys()
+            .find(|known| ::platform::path_key(known) == key)
+            .cloned();
+        if let Some(found) = found
+            && let Some(tab) = self.buffers.remove(&found)
+        {
+            (tab.save)(cx);
+        }
+    }
+
     /// The editor of the active tab with its path.
     pub fn active_editor(&self) -> Option<(PathBuf, AnyView)> {
         let tab = self.active_tab()?;
         Some((tab.path.clone(), tab.editor.view.clone()))
+    }
+
+    /// The files with unsaved text: the tabs and the buffers of files that no tab shows.
+    /// A question about leaving the window names every file whose text it would drop.
+    pub fn unsaved_files(&self, cx: &App) -> Vec<PathBuf> {
+        let tabs = self
+            .panes
+            .iter()
+            .flat_map(|pane| pane.tabs.iter())
+            .filter(|tab| (tab.editor.status)(cx).dirty)
+            .map(|tab| tab.path.clone());
+        let buffers = self
+            .buffers
+            .iter()
+            .filter(|(_, editor)| (editor.status)(cx).dirty)
+            .map(|(path, _)| path.clone());
+        tabs.chain(buffers).collect()
     }
 
     /// Writes the open editor of `path` if it has unsaved text.
@@ -1542,6 +1693,14 @@ impl Workspace {
         let tabs = self.panes.iter().flat_map(|pane| pane.tabs.iter());
         for tab in tabs.filter(|tab| ::platform::path_key(&tab.path) == key) {
             (tab.editor.save)(cx);
+        }
+        for editor in self
+            .buffers
+            .iter()
+            .filter(|(buffer, _)| ::platform::path_key(buffer) == key)
+            .map(|(_, editor)| editor)
+        {
+            (editor.save)(cx);
         }
     }
 
@@ -1558,6 +1717,22 @@ impl Workspace {
                 return Err(format!("{}: {error}", path.display()));
             }
             if (tab.editor.status)(cx).dirty {
+                return Err(format!("{}: the text is still not on disk", path.display()));
+            }
+        }
+        for editor in self
+            .buffers
+            .iter()
+            .filter(|(buffer, _)| ::platform::path_key(buffer) == key)
+            .map(|(_, editor)| editor)
+        {
+            if !(editor.status)(cx).dirty {
+                continue;
+            }
+            if let Some(error) = (editor.save_now)(cx) {
+                return Err(format!("{}: {error}", path.display()));
+            }
+            if (editor.status)(cx).dirty {
                 return Err(format!("{}: the text is still not on disk", path.display()));
             }
         }
@@ -2085,6 +2260,7 @@ impl Workspace {
             |settings| *settings = settings.with_ui_scale_step(amount),
             cx,
         );
+        self.show_zoom_notice(cx);
     }
 
     /// The scale of the interface in Settings, for scripts and tests.
@@ -2095,6 +2271,136 @@ impl Workspace {
 
     pub fn reset_ide_scale(&mut self, cx: &mut Context<Self>) {
         self.update_settings(|settings| *settings = settings.with_ui_scale(1.), cx);
+        self.show_zoom_notice(cx);
+    }
+
+    /// The `Zoom: 110%` line of the status bar, which goes away after a second.
+    fn show_zoom_notice(&mut self, cx: &mut Context<Self>) {
+        let percent = (self.ui_scale(cx) * 100.).round() as i32;
+        self.zoom_notice = Some(format!("Zoom: {percent}%").into());
+        self.zoom_notice_serial += 1;
+        let serial = self.zoom_notice_serial;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            this.update(cx, |this, cx| {
+                if this.zoom_notice_serial == serial {
+                    this.zoom_notice = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The zoom notice of the status bar, while it is shown.
+    pub fn zoom_notice(&self) -> Option<&SharedString> {
+        self.zoom_notice.as_ref()
+    }
+
+    /// The mode of View | Appearance, for the menu, the chrome and the tests.
+    pub fn window_mode(&self) -> WindowMode {
+        self.mode
+    }
+
+    /// Whether a mode of View | Appearance hides the parts of the window.
+    pub fn distraction_free(&self) -> bool {
+        self.mode.hides_tools()
+    }
+
+    /// Whether the window fills the screen, as the last toggle left it.
+    pub fn full_screen(&self) -> bool {
+        self.full_screen
+    }
+
+    /// Ctrl+Cmd+F on macOS: the window fills the screen or comes back.
+    pub fn toggle_full_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_full_screen(!self.full_screen, window);
+        self.refresh_platform_menus(cx);
+        cx.notify();
+    }
+
+    fn set_full_screen(&mut self, on: bool, window: &mut Window) {
+        if self.full_screen == on {
+            return;
+        }
+        window.toggle_fullscreen();
+        self.full_screen = on;
+    }
+
+    /// View | Appearance: the text alone, and the same command brings the window back.
+    pub fn toggle_distraction_free(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = if self.mode == WindowMode::DistractionFree {
+            WindowMode::Normal
+        } else {
+            WindowMode::DistractionFree
+        };
+        self.set_window_mode(mode, window, cx);
+    }
+
+    /// Zen Mode is Distraction Free in a window that fills the screen.
+    pub fn toggle_zen_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = if self.mode == WindowMode::Zen {
+            WindowMode::Normal
+        } else {
+            WindowMode::Zen
+        };
+        self.set_window_mode(mode, window, cx);
+    }
+
+    /// Presentation Mode is Distraction Free with the font of `Presentation Mode font size`.
+    pub fn toggle_presentation_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = if self.mode == WindowMode::Presentation {
+            WindowMode::Normal
+        } else {
+            WindowMode::Presentation
+        };
+        self.set_window_mode(mode, window, cx);
+    }
+
+    /// Puts the window in `mode`. The tool windows keep their state: the mode only hides
+    /// them, so leaving it brings back what was open and how wide it was.
+    pub fn set_window_mode(
+        &mut self,
+        mode: WindowMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.mode;
+        if before == mode {
+            return;
+        }
+        if before == WindowMode::Zen && self.zen_full_screen {
+            self.zen_full_screen = false;
+            self.set_full_screen(false, window);
+        }
+        if mode == WindowMode::Zen && !self.full_screen {
+            self.zen_full_screen = true;
+            self.set_full_screen(true, window);
+        }
+        self.mode = mode;
+        if mode.hides_tools() {
+            // A hidden tool window may hold the focus: the keys go to the editor.
+            self.focus_active(window, cx);
+        }
+        self.publish_editor_appearance(cx);
+        self.refresh_platform_menus(cx);
+        cx.notify();
+    }
+
+    /// Puts the mode of the window and the editor font into the global the open editors
+    /// read. It is not a setting: an edit of the settings file keeps the sizes of the
+    /// regular mode.
+    fn publish_editor_appearance(&mut self, cx: &mut Context<Self>) {
+        let font = cx.try_global::<Settings>().map_or(
+            crate::appearance::DEFAULT_PRESENTATION_FONT_SIZE,
+            |settings| settings.presentation_font_size,
+        );
+        let appearance = EditorAppearance::of(self.mode, font);
+        if cx.try_global::<EditorAppearance>() != Some(&appearance) {
+            cx.set_global(appearance);
+        }
     }
 
     /// Alt+Shift+. and Alt+Shift+,: the font of every open editor.
@@ -2194,6 +2500,21 @@ impl Workspace {
     ) {
         self.layout.tree_expanded = expanded;
         self.layout.tree_selected = selected;
+        self.layout_changed(cx);
+    }
+
+    /// What the Services tree wants to be restored next time: the collapsed groups, the
+    /// selected node and whether the optional groups list their configurations.
+    pub fn set_services_state(
+        &mut self,
+        collapsed: Vec<String>,
+        selected: Option<String>,
+        show_all: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.layout.services_collapsed = collapsed;
+        self.layout.services_selected = selected;
+        self.layout.services_show_all = show_all;
         self.layout_changed(cx);
     }
 
@@ -2363,6 +2684,75 @@ impl Workspace {
         }
     }
 
+    /// The tab of a file that is about to be shown. A buffer of the file that no tab
+    /// showed becomes the tab, so one file never has two buffers to write.
+    fn tab_or_buffer(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Tab {
+        let key = ::platform::path_key(&path);
+        let found = self
+            .buffers
+            .keys()
+            .find(|known| ::platform::path_key(known) == key)
+            .cloned();
+        if let Some(found) = found
+            && let Some(editor) = self.buffers.remove(&found)
+        {
+            let title = path.file_name().unwrap_or_default().to_string_lossy();
+            return Tab {
+                title: title.into_owned().into(),
+                icon: self.icons.icon_for(&path),
+                editor,
+                path,
+                pinned: false,
+            };
+        }
+        self.tab_for(path, window, cx)
+    }
+
+    /// Opens a tab that is not a file editor: the view is the whole content of the tab.
+    /// Such a tab carries a path of its own for the lookup of the tab and is left out of
+    /// the saved layout, as the program behind it may be gone on the next start.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_view_tab(
+        &mut self,
+        path: PathBuf,
+        title: impl Into<SharedString>,
+        icon: &'static str,
+        view: AnyView,
+        focus: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((pane, index)) = self.open_tab(&path) {
+            self.select_tab(pane, index, window, cx);
+            return;
+        }
+        let editor = EditorTab {
+            view,
+            focus,
+            status: Rc::new(|_| EditorStatus::default()),
+            save: Rc::new(|_| {}),
+            save_now: Rc::new(|_| None),
+            caret: Rc::new(|_| (0, 0)),
+            restore_caret: Rc::new(|_, _| {}),
+            set_format: Rc::new(|_, _| {}),
+            set_indent: Rc::new(|_, _| {}),
+            reload_from_disk: Rc::new(|_| {}),
+            preview: None,
+            bundle: None,
+        };
+        let tab = Tab {
+            path,
+            title: title.into(),
+            icon,
+            editor,
+            pinned: false,
+        };
+        self.save_active(cx);
+        let pane = &mut self.panes[self.active_pane];
+        let index = pane.insert(pane.tabs.len(), tab);
+        self.select_tab(self.active_pane, index, window, cx);
+    }
+
     /// A file has one view: two buffers of it would overwrite each other on save.
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((pane, index)) = self.open_tab(&path) {
@@ -2370,11 +2760,34 @@ impl Workspace {
             return;
         }
         let path = on_disk_path(path);
-        let tab = self.tab_for(path, window, cx);
+        let tab = self.tab_or_buffer(path, window, cx);
         self.save_active(cx);
         let pane = &mut self.panes[self.active_pane];
         let index = pane.insert(pane.tabs.len(), tab);
         self.select_tab(self.active_pane, index, window, cx);
+    }
+
+    /// Opens a tab of `path` without showing it, for a view that edits another file
+    /// through its buffer. Returns the view of its tab.
+    pub fn open_file_in_background(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyView {
+        if let Some((pane, index)) = self.open_tab(&path) {
+            return self.panes[pane].tabs[index].editor.view.clone();
+        }
+        let tab = self.tab_or_buffer(on_disk_path(path), window, cx);
+        let view = tab.editor.view.clone();
+        let pane = &mut self.panes[self.active_pane];
+        let active = pane.active;
+        pane.insert(pane.tabs.len(), tab);
+        pane.active = active;
+        self.renumber_bars(cx);
+        self.layout_changed(cx);
+        cx.notify();
+        view
     }
 
     /// Opens a file without writing the unsaved text of the active tab, for Save As: the
@@ -2389,7 +2802,7 @@ impl Workspace {
             self.select_tab_keeping_edits(pane, index, window, cx);
             return;
         }
-        let tab = self.tab_for(on_disk_path(path), window, cx);
+        let tab = self.tab_or_buffer(on_disk_path(path), window, cx);
         let pane = self.active_pane;
         let index = {
             let pane = &mut self.panes[pane];
@@ -2429,7 +2842,7 @@ impl Workspace {
             self.select_tab(pane, index, window, cx);
             return;
         }
-        let tab = self.tab_for(on_disk_path(path), window, cx);
+        let tab = self.tab_or_buffer(on_disk_path(path), window, cx);
         self.save_active(cx);
         if self.panes.len() == 1 {
             self.split_down = down;
@@ -2468,6 +2881,9 @@ impl Workspace {
         for tab in self.panes.iter().flat_map(|pane| &pane.tabs) {
             (tab.editor.save_now)(cx);
         }
+        for editor in self.buffers.values() {
+            (editor.save_now)(cx);
+        }
     }
 
     /// Writes every open file that has unsaved text. Ctrl+S, and the window losing the
@@ -2475,6 +2891,9 @@ impl Workspace {
     pub fn save_all(&self, cx: &mut App) {
         for tab in self.panes.iter().flat_map(|pane| &pane.tabs) {
             (tab.editor.save)(cx);
+        }
+        for editor in self.buffers.values() {
+            (editor.save)(cx);
         }
     }
 
@@ -2543,6 +2962,10 @@ impl Workspace {
     /// Puts the settings in force and writes the file in the background.
     fn store_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         cx.set_global(settings.clone());
+        // The font of Presentation Mode follows the settings while the mode is on.
+        self.publish_editor_appearance(cx);
+        // The checks of View | Appearance and its labels follow the switch that ran.
+        self.refresh_platform_menus(cx);
         let path = self.settings_dir.join(SETTINGS_FILE);
         let write = cx
             .background_executor()
@@ -2859,7 +3282,9 @@ impl Workspace {
     ) {
         (self.panes[pane].tabs[index].editor.save)(cx);
         let tab = self.drop_tab(pane, index, cx);
-        remember_closed(&mut self.closed, tab.path);
+        let path = tab.path.clone();
+        remember_closed(&mut self.closed, path.clone());
+        self.note_tab_closed(&path, cx);
         self.tab_removed(window, cx);
     }
 
@@ -2966,7 +3391,8 @@ impl Workspace {
         for index in indexes.into_iter().rev() {
             (self.panes[pane].tabs[index].editor.save)(cx);
             let tab = self.drop_tab(pane, index, cx);
-            remember_closed(&mut self.closed, tab.path);
+            remember_closed(&mut self.closed, tab.path.clone());
+            self.note_tab_closed(&tab.path, cx);
         }
         self.tab_removed(window, cx);
     }
@@ -3150,7 +3576,8 @@ impl Workspace {
             let Some((pane, index)) = found else {
                 break;
             };
-            self.drop_tab(pane, index, cx);
+            let tab = self.drop_tab(pane, index, cx);
+            self.note_tab_closed(&tab.path, cx);
         }
         self.tab_removed(window, cx);
     }
@@ -3204,14 +3631,26 @@ impl Workspace {
 
     /// Opens a project in a new window: a program of its own, as the IDE does it.
     pub fn open_project(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        self.open_project_path(folder, None, cx);
+    }
+
+    /// Opens a project in a program of its own and, when the system handed a file over,
+    /// that file on top of it.
+    fn open_project_path(
+        &mut self,
+        folder: PathBuf,
+        file: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(opener) = self.project_opener.clone() {
             opener(&folder, cx);
             return;
         }
         let state_dir = self.state_dir.clone();
+        let path = file.unwrap_or(folder);
         let start = cx
             .background_executor()
-            .spawn(async move { crate::launch::spawn_project(&state_dir, &folder) });
+            .spawn(async move { crate::launch::spawn_path(&state_dir, &path) });
         cx.spawn(async move |this, cx| {
             if let Err(error) = start.await {
                 let text = error.to_string();
@@ -3222,6 +3661,88 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Opens a path the system handed over: a file of this project becomes a tab of its
+    /// window, a path outside it a project of its own. The window comes to the front.
+    pub fn accept_request(
+        &mut self,
+        request: Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = match request {
+            Request::Focus => {
+                self.bring_to_front(window, cx);
+                return;
+            }
+            Request::Open(path) => path,
+        };
+        if !path.exists() {
+            self.notify_user(
+                "Cannot open",
+                format!("{} does not exist", path.display()),
+                cx,
+            );
+            return;
+        }
+        match open_target(&self.root, &path) {
+            OpenTarget::Window => self.bring_to_front(window, cx),
+            OpenTarget::File(path) => {
+                self.open_file(path, window, cx);
+                self.bring_to_front(window, cx);
+            }
+            OpenTarget::Project { folder, file } => {
+                cx.activate(true);
+                self.open_project_path(folder, file, cx);
+            }
+        }
+    }
+
+    /// Takes the paths the system opens and the requests of a second start. The listener
+    /// belongs to the platform and cannot touch the window, so it wakes the window
+    /// through the queue; an empty queue costs no timer.
+    pub fn watch_open_requests(
+        &mut self,
+        requests: OpenRequests,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            while requests.wait_for_push().await {
+                let pending = requests.take();
+                if pending.is_empty() {
+                    continue;
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                if this
+                    .update(cx, |this, _| this.open_request_wakes += 1)
+                    .is_err()
+                {
+                    return;
+                }
+                for request in pending {
+                    let opened = this.update_in(cx, |this, window, cx| {
+                        this.accept_request(request, window, cx)
+                    });
+                    if opened.is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// How many batches of paths the window took from the queue, for the window tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_request_wakes_for_test(&self) -> usize {
+        self.open_request_wakes
+    }
+
+    fn bring_to_front(&self, window: &mut Window, cx: &mut App) {
+        window.activate_window();
+        cx.activate(true);
     }
 
     /// Replaces where a project opens; the scripts and tests of the window use it.
@@ -3779,6 +4300,17 @@ impl Workspace {
         true
     }
 
+    /// Highlights the first row of the open menu, so that Enter runs it without a Down
+    /// first. A menu that a key opens starts on its first row, as the lists of IDEA do.
+    pub fn highlight_first_menu_row(&mut self, cx: &mut Context<Self>) {
+        if let Some(Overlay::Menu { entries, state, .. }) = self.overlay.as_mut()
+            && state.highlighted_at(0).is_none()
+        {
+            state.move_down(entries);
+            cx.notify();
+        }
+    }
+
     /// The pointer entered or left a row of the open menu. Opening a submenu waits a
     /// little, so a diagonal move into it does not close it again on the way.
     pub fn menu_hover(&mut self, path: &[usize], entered: bool, cx: &mut Context<Self>) {
@@ -4148,12 +4680,21 @@ impl Workspace {
         self.active_tab().map(|tab| tab.path.clone())
     }
 
-    /// The view of the tab that holds `path`, if one is open.
+    /// The view of the tab that holds `path`, if one is open, or the buffer of a file
+    /// that no tab shows.
     pub fn view_of(&self, path: &Path) -> Option<AnyView> {
         let key = ::platform::path_key(path);
         let mut tabs = self.panes.iter().flat_map(|pane| &pane.tabs);
-        tabs.find(|tab| ::platform::path_key(&tab.path) == key)
+        if let Some(view) = tabs
+            .find(|tab| ::platform::path_key(&tab.path) == key)
             .map(|tab| tab.editor.view.clone())
+        {
+            return Some(view);
+        }
+        self.buffers
+            .iter()
+            .find(|(buffer, _)| ::platform::path_key(buffer) == key)
+            .map(|(_, editor)| editor.view.clone())
     }
 
     fn capture(&self, cx: &App) -> Layout {
@@ -4183,6 +4724,15 @@ impl Workspace {
                 Some((tab.path.clone(), (preview.layout)(cx)))
             })
             .collect();
+        let bundle_modes = self
+            .panes
+            .iter()
+            .flat_map(|pane| &pane.tabs)
+            .filter_map(|tab| {
+                let bundle = tab.editor.bundle.as_ref()?;
+                Some((tab.path.clone(), (bundle.layout)(cx)))
+            })
+            .collect();
         Layout {
             window: self.placement,
             left: self.left.state(),
@@ -4196,6 +4746,10 @@ impl Workspace {
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
             recent_edited: self.recent_edited.clone(),
             preview_modes,
+            bundle_modes,
+            services_collapsed: self.layout.services_collapsed.clone(),
+            services_selected: self.layout.services_selected.clone(),
+            services_show_all: self.layout.services_show_all,
         }
     }
 
@@ -4279,6 +4833,9 @@ impl Workspace {
     fn save_now(&mut self, window: &Window, cx: &mut App) {
         for tab in self.panes.iter().flat_map(|pane| &pane.tabs) {
             (tab.editor.save_now)(cx);
+        }
+        for editor in self.buffers.values() {
+            (editor.save_now)(cx);
         }
         self.placement = placement_of(window).or(self.placement);
         if let (Some(store), Some(json)) = (self.store.clone(), self.fresh_json(cx))

@@ -73,6 +73,8 @@ impl RunConfigProvider for MainRun {
             provider: "fixture".into(),
             assemble_first: false,
             settings: Default::default(),
+
+            ..RunConfig::default()
         };
         let mut points = Vec::new();
         for (index, line) in lines.iter().enumerate() {
@@ -117,6 +119,7 @@ fn config(name: &str) -> RunConfig {
         provider: "fixture".into(),
         assemble_first: false,
         settings: Default::default(),
+        ..RunConfig::default()
     }
 }
 

@@ -425,6 +425,7 @@ fn a_problem_under_the_pointer_comes_before_the_documentation(cx: &mut TestAppCo
         severity: Severity::Error,
         message: "alpha is broken".to_owned(),
         unnecessary: false,
+        code: None,
     }]);
     let window = open_window_with(cx, root, language, Settings::default());
     cx.run_until_parked();

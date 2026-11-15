@@ -376,17 +376,26 @@ impl EditorState {
             .to_vec()
     }
 
-    /// Reads and decodes the file, and reads the `.editorconfig` files around it. Blocks:
-    /// not for the UI thread.
-    pub fn load(path: &Path, language: Option<LanguageConfig>) -> Result<Self, LoadError> {
+    /// Reads and decodes the file, and reads the `.editorconfig` files and the project
+    /// code style around it. Blocks: not for the UI thread.
+    pub fn load(
+        path: &Path,
+        language: Option<LanguageConfig>,
+        style_language: Option<&'static str>,
+    ) -> Result<Self, LoadError> {
         let decoded = read_file(path).map_err(|error| LoadError(error.to_string()))?;
-        let properties = text_core::for_file(path);
+        let (properties, from_project) = text_core::properties_for(path, style_language);
         let mut state = Self::new(&decoded.text, decoded.format, language, !decoded.lossless);
         let unit = state
             .language
             .as_ref()
             .map_or("    ", |language| language.indent_unit);
-        state.indent = text_core::IndentSettings::resolve(&properties, &decoded.text, unit);
+        state.indent = text_core::IndentSettings::resolve_with_project(
+            &properties,
+            from_project,
+            &decoded.text,
+            unit,
+        );
         state.map.tab_size = state.indent.tab_width;
         state.properties = properties;
         state.new_file = decoded.text.is_empty();
@@ -1176,7 +1185,10 @@ impl EditorState {
     /// `.editorconfig` does not own; the step changes only a file without an indentation
     /// of its own.
     pub fn apply_indent_defaults(&mut self, tabs: bool, size: usize, tab_size: usize) {
-        if self.indent.source == text_core::IndentSource::EditorConfig {
+        if matches!(
+            self.indent.source,
+            text_core::IndentSource::EditorConfig | text_core::IndentSource::Project
+        ) {
             return;
         }
         if self.indent.source == text_core::IndentSource::Language {
@@ -1189,6 +1201,20 @@ impl EditorState {
         } else {
             self.indent.tab_width = tab_size.max(1);
         }
+        self.map.tab_size = self.indent.tab_width;
+    }
+
+    /// Gives up the project code style of this file: the window settings name the
+    /// indentation again until the file opens once more without the switch.
+    pub fn drop_project_indent(&mut self, tabs: bool, size: usize, tab_size: usize) {
+        if !matches!(
+            self.indent.source,
+            text_core::IndentSource::EditorConfig | text_core::IndentSource::Project
+        ) {
+            return;
+        }
+        self.indent =
+            text_core::IndentSettings::new(tabs, size, tab_size, text_core::IndentSource::Language);
         self.map.tab_size = self.indent.tab_width;
     }
 

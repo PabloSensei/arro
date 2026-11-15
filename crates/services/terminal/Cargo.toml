@@ -9,6 +9,7 @@ alacritty_terminal = "=0.26.0"
 base.workspace = true
 crossbeam-channel = "0.5"
 platform.workspace = true
+regex.workspace = true
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

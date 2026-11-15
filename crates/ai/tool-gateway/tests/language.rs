@@ -101,12 +101,14 @@ impl Provider<DiagnosticsQuery, Vec<DiagnosticEntry>> for FakeLanguage {
                 severity: Severity::Information,
                 message: "just so you know".to_string(),
                 unnecessary: false,
+                code: None,
             },
             DiagnosticEntry {
                 span: at(1, 4),
                 severity: Severity::Error,
                 message: "greet expects a name".to_string(),
                 unnecessary: false,
+                code: None,
             },
         ];
         // A live stream: the reply stays open, as with a real server.

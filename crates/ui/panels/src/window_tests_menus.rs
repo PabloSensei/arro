@@ -141,6 +141,30 @@ pub(crate) fn show_project(cx: &mut TestAppContext, window: WindowHandle<Workspa
     draw(cx, window);
 }
 
+/// Clicks the row of the open menu with `label`: the separators move the index of every
+/// row below them, so the tests name the row instead of counting.
+fn click_menu_row(cx: &mut TestAppContext, window: WindowHandle<Workspace>, label: &str) {
+    let index = window
+        .read_with(cx, |workspace, _| {
+            workspace
+                .menu_entries()
+                .and_then(|entries| entries.iter().position(|entry| entry.label == label))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| panic!("the menu has no row {label}"));
+    // The test platform looks its selectors up by a static name.
+    let selector: &'static str = Box::leak(format!("menu-{index}").into_boxed_str());
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let bounds = visual
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("no element {selector} on screen"))
+        .center();
+    visual.simulate_click(bounds, Modifiers::default());
+    drop(visual);
+    cx.run_until_parked();
+}
+
 /// Opens a bottom tool window and lets its slide finish: the pointer can only reach a
 /// row that is not clipped by a half-open dock.
 fn show_problems(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
@@ -182,19 +206,19 @@ fn the_editor_menu_cuts_copies_pastes_and_puts_the_caret_at_the_click(cx: &mut T
 
     // Cut the line at the caret: the menu runs the same action as Ctrl+X.
     right_click_text(cx, window, 0, 0);
-    click(cx, window, "menu-0");
+    click_menu_row(cx, window, "Cut");
     assert_eq!(buffer_of(cx, &view), "beta\n");
     assert_eq!(clipboard(cx).as_deref(), Some("alpha\n"));
 
     // Paste it back from the menu.
     right_click_text(cx, window, 0, 0);
-    click(cx, window, "menu-2");
+    click_menu_row(cx, window, "Paste");
     assert_eq!(buffer_of(cx, &view), "alpha\nbeta\n");
 
     // A right click inside a selection keeps it; Copy takes the selection.
     press(cx, window, "ctrl-a");
     right_click_text(cx, window, 0, 1);
-    click(cx, window, "menu-1");
+    click_menu_row(cx, window, "Copy");
     assert_eq!(clipboard(cx).as_deref(), Some("alpha\nbeta\n"));
     assert_eq!(buffer_of(cx, &view), "alpha\nbeta\n");
 
@@ -239,14 +263,14 @@ fn the_editor_menu_finds_usages_and_renames_with_the_language(cx: &mut TestAppCo
     let view = editor_of(cx, window, &open);
 
     right_click_text(cx, window, 0, 0);
-    click(cx, window, "menu-10");
+    click_menu_row(cx, window, "Find Usages");
     wait_for(cx, "the usages of the symbol", |cx| {
         let usages = cx.update(|cx| cx.global::<ActiveUsages>().0.clone());
         usages.read_with(cx, |hub, cx| hub.panel().read(cx).items().len() == 2)
     });
 
     right_click_text(cx, window, 0, 0);
-    click(cx, window, "menu-12");
+    click_menu_row(cx, window, "Rename...");
     draw(cx, window);
     assert!(
         bounds_of(cx, window, "rename-popup").size.height > px(0.),
@@ -296,6 +320,7 @@ fn the_problems_menu_jumps_shows_fixes_copies_and_survives_an_empty_window(
         severity: Severity::Error,
         message: "first error".into(),
         unnecessary: false,
+        code: None,
     }]);
     language.set_actions(vec![ActionEntry {
         title: "Fix the problem".into(),

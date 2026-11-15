@@ -28,6 +28,7 @@ impl MenuModel {
             actions::GOTO_DECLARATION,
             actions::GOTO_IMPLEMENTATION,
             actions::GOTO_SUPER,
+            actions::SHOW_DIAGRAM,
             actions::FIND_USAGES,
             actions::RENAME,
             actions::CHANGE_SIGNATURE,
@@ -158,6 +159,7 @@ fn build(
     let references = matches && support.as_ref().is_some_and(|s| s.references().is_some());
     let rename = matches && support.as_ref().is_some_and(|s| s.rename().is_some());
     let format = matches && support.as_ref().is_some_and(|s| s.format().is_some());
+    let diagram = matches && support.as_ref().is_some_and(|s| s.type_graph().is_some());
     let moves = matches
         && support
             .as_ref()
@@ -179,6 +181,22 @@ fn build(
         entry("Paste", actions::PASTE, paste),
         entry("Paste from History...", actions::PASTE_HISTORY, history),
     ];
+    entries.push(MenuEntry::separator());
+
+    if let Some(panel) = cx
+        .try_global::<crate::debug::ActiveDebug>()
+        .map(|panel| panel.0.clone())
+        && panel.read(cx).state().1
+        && let Some((line, expression)) = view.read(cx).inline_watch_at_caret()
+    {
+        let path = view.read(cx).path().to_path_buf();
+        entries.push(MenuEntry::new("Add Inline Watch", move |_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.add_inline_watch(path.clone(), line as u32 + 1, expression.clone(), cx)
+            });
+        }));
+        entries.push(MenuEntry::separator());
+    }
 
     let text = path.display().to_string();
     entries.push(MenuEntry::new("Copy Path", move |_, cx| {
@@ -196,6 +214,21 @@ fn build(
     } else {
         MenuEntry::disabled("Compare with Clipboard")
     });
+    if ::http_client::is_request_file(&path) {
+        for (label, command) in [
+            ("Copy as cURL", "http.copy_curl"),
+            ("Copy as cURL (cmd)", "http.copy_curl_cmd"),
+        ] {
+            let runner = workspace.clone();
+            entries.push(MenuEntry::new(label, move |window, cx| {
+                runner
+                    .update(cx, |workspace, cx| {
+                        workspace.run_command(command, window, cx)
+                    })
+                    .ok();
+            }));
+        }
+    }
     entries.push(MenuEntry::separator());
 
     entries.push(entry(
@@ -257,6 +290,7 @@ fn build(
     ));
     entries.push(MenuEntry::separator());
     entries.push(entry("Comment Line", actions::TOGGLE_COMMENT, true));
+    entries.push(entry("Show Diagram", actions::SHOW_DIAGRAM, diagram));
 
     let (can_run, can_debug) = (model.can_run, model.can_debug);
     if can_run || can_debug {
@@ -318,6 +352,22 @@ fn build(
             key("workspace::ShowBranches"),
             || Box::new(workspace::ShowBranches),
         ));
+        for (label, command) in [
+            ("Show History for Selection", "git.show_selection_history"),
+            ("Show History for Method", "git.show_method_history"),
+        ] {
+            let runner = workspace.clone();
+            entries.push(
+                MenuEntry::new(label, move |window, cx| {
+                    runner
+                        .update(cx, |workspace, cx| {
+                            workspace.run_command(command, window, cx)
+                        })
+                        .ok();
+                })
+                .icon("general/vcs"),
+            );
+        }
         if model.gutter {
             // The row toggles, as the gutter menu of IDEA does: the column of the open
             // editor is either annotated already or gets its blame now.

@@ -16,7 +16,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounde
 use crate::conpty::{Backend, Pty};
 use crate::engine::Engine;
 use crate::keys::{KeyEvent, ShiftEnter, encode, encode_text};
-use crate::screen::{Modes, Screen};
+use crate::screen::{Modes, Screen, SearchResults};
 
 const READ_BUFFER: usize = 64 * 1024;
 /// Ceilings of the queues. Output backpressure reaches the child through the pipe.
@@ -55,6 +55,15 @@ pub enum TerminalEvent {
     Exited(Option<u32>),
 }
 
+/// What the user looks for in the text of the terminal, scrollback included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchQuery {
+    pub text: String,
+    pub case_sensitive: bool,
+    /// The text is a regular expression.
+    pub regex: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputError {
     /// The program is not reading fast enough, and the queue is full.
@@ -77,11 +86,21 @@ pub(crate) enum Control {
     Resize,
     Scroll(i32),
     ScrollToBottom,
+    /// The match of the latest answer of the search the view should show.
+    RevealMatch(usize),
+    Search {
+        query: SearchQuery,
+        generation: u64,
+    },
+    ClearSearch,
+    /// Clears the screen and the scrollback, as the clear command of a shell does.
+    Clear,
 }
 
 /// What the threads of a session have in common. All of it is lock-free for readers.
 pub(crate) struct Shared {
     pub(crate) screen: Snapshot<Screen>,
+    pub(crate) search: Snapshot<SearchResults>,
     pub(crate) modes: AtomicU32,
     pub(crate) bytes: AtomicU64,
     pub(crate) exit: OnceLock<u32>,
@@ -125,6 +144,7 @@ impl TerminalSession {
         let pty = Arc::new(pty);
         let shared = Arc::new(Shared {
             screen: Snapshot::new(Screen::default()),
+            search: Snapshot::new(SearchResults::default()),
             modes: AtomicU32::new(0),
             bytes: AtomicU64::new(0),
             exit: OnceLock::new(),
@@ -296,6 +316,33 @@ impl TerminalSession {
 
     pub fn scroll_to_bottom(&self) {
         drop(self.control.try_send(Control::ScrollToBottom));
+    }
+
+    /// Scrolls the view to the match `index` of the latest answer of the search. The
+    /// lines of an answer move when the program prints more, so the engine finds the
+    /// line of the match again when the view asks for it.
+    pub fn reveal_match(&self, index: usize) {
+        drop(self.control.try_send(Control::RevealMatch(index)));
+    }
+
+    /// Asks for the runs `query` finds over the whole scrollback. A later search has a
+    /// larger `generation`, so an answer that arrives late is dropped.
+    pub fn search(&self, query: SearchQuery, generation: u64) {
+        drop(self.control.try_send(Control::Search { query, generation }));
+    }
+
+    pub fn clear_search(&self) {
+        drop(self.control.try_send(Control::ClearSearch));
+    }
+
+    /// What the last search found. Taking it never waits.
+    pub fn search_results(&self) -> Arc<SearchResults> {
+        self.shared.search.get()
+    }
+
+    /// Clears the screen and the scrollback.
+    pub fn clear(&self) {
+        drop(self.control.try_send(Control::Clear));
     }
 
     /// Kills the program and everything it started.

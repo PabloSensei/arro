@@ -60,7 +60,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>Code intelligence</h3>
-      Completion with auto-import, quick fixes on Alt+Enter, semantic highlighting, parameter name hints, Find Usages, call and type hierarchy, rename, extract, inline, change signature, safe delete, live and postfix templates, reformat, optimize imports.
+      Completion with auto-import, quick fixes on Alt+Enter, semantic highlighting, parameter name hints, Find Usages, call and type hierarchy, class diagrams, rename, extract, inline, change signature, safe delete, Structural Search and Replace, live and postfix templates, reformat, optimize imports, Create Test, and per-project inspection levels with suppression on Alt+Enter.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/completion.png" alt="Completion popup in the editor">
@@ -72,7 +72,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>Run, test, debug</h3>
-      Maven and Gradle projects, run configurations, gutter run marks for <code>main</code> and tests, a test tree with rerun of failures, a debugger with breakpoints, stepping, evaluation, hot swap, variable values inline in the editor, remote JVM attach and thousands of virtual threads. Analyze Stack Trace turns a pasted trace or thread dump into clickable frames, and Dump Threads reads a running JVM.
+      Maven and Gradle projects, run configurations with Before launch steps, compound runs and <code>.env</code> files, gutter run marks for <code>main</code> and tests, a test tree with rerun of failures, auto-test on save and a history of runs, a debugger with breakpoints, stepping, evaluation, hot swap, variable values inline in the editor, remote JVM attach, marked objects, folded library frames, inline watches and thousands of virtual threads. Analyze Stack Trace turns a pasted trace or thread dump into clickable frames, and Dump Threads reads a running JVM. A Services window shows every Spring Boot app and main class with its state and port.
     </td>
   </tr>
   <tr>
@@ -82,13 +82,13 @@
     </td>
     <td width="50%" valign="top">
       <h3>Tools in the window</h3>
-      A database console for JDBC sources with a schema tree, an HTTP client for <code>.http</code> files, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, library sources on demand, and a Markdown preview with images.
+      A database console for JDBC sources with a schema tree, an HTTP client for <code>.http</code> files that turns pasted cURL into requests and back, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, newer dependency versions marked in <code>pom.xml</code> and Gradle files, a table editor for <code>.properties</code> bundles of all locales, library sources on demand, and a Markdown preview with images.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <h3>Git built in</h3>
-      Commit, diff, log, branches with merge, rebase and compare, shelf and stash, conflict resolution, local history.
+      Commit, diff, log, branches with merge, rebase and compare, shelf and stash, conflict resolution, history of a selection or a method, submodules, local history.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/light.png" alt="Arro in the light theme">
@@ -96,11 +96,11 @@
   </tr>
 </table>
 
-And the rest you expect from an IDE: Search Everywhere, Find in Files, a project tree, a terminal, file structure, bookmarks, split editors, Compare with Clipboard, actions on save (reformat, optimize imports), dark and light themes, a configurable keymap, Docker services, Lombok support, and automatic updates.
+And the rest you expect from an IDE: a New Project wizard for Maven, Gradle and Spring Boot (Spring Initializr), Search Everywhere, Find in Files, a project tree, a terminal with tabs, splits, search and clickable paths, file structure, bookmarks, split editors, Compare with Clipboard, actions on save (reformat, optimize imports), dark and light themes, Distraction Free, Zen and Presentation modes, a configurable keymap, the code style of a project's <code>.idea</code> folder, settings export and import, Docker services, Lombok support, and automatic updates.
 
 ## Install
 
-Download the archive for your system from [Releases](https://github.com/PabloSensei/arro/releases/latest) and unpack it anywhere. There is no installer. Every archive has a `.sha256` file next to it.
+Download the package or archive for your system from [Releases](https://github.com/PabloSensei/arro/releases/latest). Every file has a `.sha256` file next to it.
 
 Whichever system you use, install a JDK 25 or newer for the language server, for example [Eclipse Temurin 25](https://adoptium.net/temurin/releases/?version=25&package=jdk). Your projects can still build on their own JDK, from 8 to 25. The Java language server and the debugger are already in the archive.
 
@@ -115,6 +115,16 @@ Whichever system you use, install a JDK 25 or newer for the language server, for
 
 The build needs glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36 or a later release.
 
+On Debian and Ubuntu, install the package:
+
+```shell
+sudo apt install ./arro_<version>_amd64.deb
+```
+
+It puts Arro in `/opt/arro`, adds `arro` to the path and a shortcut to the application menu. A newer version installs the same way; Arro cannot update a package installation itself, so its update notice opens the release page.
+
+On other distributions, use the archive:
+
 1. Unpack `arro-<version>-linux-x86_64.tar.gz`, for example into `~/opt`.
 2. Run `./arro` from that folder.
 3. If you want a shortcut in the application menu, run `./install.sh` and answer the question. It writes only to `~/.local/share` of your user; nothing is installed automatically.
@@ -123,7 +133,7 @@ The window needs `libfontconfig`, `libwayland`, `libx11`, `libxcb` and `libxkbco
 
 ### macOS (Apple silicon)
 
-1. Unpack `arro-<version>-macos-aarch64.zip` and drag `Arro.app` into Applications, or run it from where it is unpacked.
+1. Open `arro-<version>-macos-aarch64.dmg` and drag `Arro` into Applications. The `.zip` of the same bundle works too and is what the built-in updater uses.
 2. The build is signed ad hoc, not notarized: the first start is stopped by Gatekeeper. Control-click `Arro.app`, choose Open and confirm, or run `xattr -dr com.apple.quarantine /Applications/Arro.app`.
 3. Open `Arro.app`, or run `open Arro.app --args /work/shop` for a project folder.
 
@@ -138,7 +148,7 @@ Known limitations of this preview:
 - Linux and macOS are early previews: they build and pass the tests, but fewer people use them than the Windows build.
 - The macOS build is not notarized, so the first start needs the step above.
 - Linux is built for x86-64 only, and the macOS archive published by the release workflow is for Apple silicon. A build for another architecture has to be made on that architecture.
-- There is no `.deb`, `.rpm`, Flatpak or Homebrew package yet, and the macOS bundle is not a signed `.dmg`.
+- There is no `.rpm`, Flatpak or Homebrew package yet, and the macOS `.dmg` is not notarized.
 - On Linux the terminal uses the system pseudo terminal; the Windows ConPTY is not part of that archive.
 
 ## Build from source

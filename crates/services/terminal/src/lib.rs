@@ -15,17 +15,20 @@ mod engine;
 mod env;
 mod keys;
 mod screen;
+mod search;
 mod session;
 #[cfg(windows)]
 mod shell;
 #[cfg(unix)]
 #[path = "shell_unix.rs"]
 mod shell;
+mod shells;
 
 pub use conpty::{Backend, command_line};
 pub use console::{attach_console, console_size};
 pub use env::{TERM_VARS, allowlisted, inherited};
 pub use keys::{Key, KeyEvent, Mods, ShiftEnter, encode};
-pub use screen::{Cell, CellColor, CellFlags, Link, Modes, Screen};
-pub use session::{InputError, SpawnSpec, TerminalEvent, TerminalSession};
-pub use shell::default_shell;
+pub use screen::{Cell, CellColor, CellFlags, Link, Modes, Screen, SearchMatch, SearchResults};
+pub use session::{InputError, SearchQuery, SpawnSpec, TerminalEvent, TerminalSession};
+pub use shell::{available_shells, default_shell};
+pub use shells::Shell;

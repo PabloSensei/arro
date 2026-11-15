@@ -913,7 +913,8 @@
       "alt-shift-r"
     ],
     "ResetIdeScaleAction": [
-      "alt-shift-0"
+      "alt-shift-0",
+      "ctrl-alt-shift-0"
     ],
     "ResizeToolWindowDown": [
       "ctrl-alt-shift-down"
@@ -1052,6 +1053,9 @@
     ],
     "ShowTypeBookmarks": [
       "ctrl-shift-f11"
+    ],
+    "ShowUmlDiagram": [
+      "ctrl-alt-shift-u"
     ],
     "ShowUsages": [
       "ctrl-alt-f7"
@@ -1244,10 +1248,12 @@
       "f2"
     ],
     "ZoomInIdeAction": [
-      "alt-shift-="
+      "alt-shift-=",
+      "ctrl-alt-shift-="
     ],
     "ZoomOutIdeAction": [
-      "alt-shift--"
+      "alt-shift--",
+      "ctrl-alt-shift--"
     ]
   },
   "license": "Apache-2.0",

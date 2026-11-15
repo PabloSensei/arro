@@ -1,0 +1,80 @@
+{
+  "_links": {
+    "maven-project": {"href": "https://start.spring.io/starter.zip", "templated": true},
+    "gradle-project": {"href": "https://start.spring.io/starter.zip", "templated": true}
+  },
+  "dependencies": {
+    "type": "hierarchical-multi-select",
+    "values": [
+      {
+        "name": "Web",
+        "values": [
+          {
+            "id": "web",
+            "name": "Spring Web",
+            "description": "Build web, including RESTful, applications using Spring MVC."
+          },
+          {
+            "id": "webflux",
+            "name": "Spring Reactive Web",
+            "description": "Build reactive web applications with Spring WebFlux and Netty."
+          }
+        ]
+      },
+      {
+        "name": "Developer Tools",
+        "values": [
+          {
+            "id": "devtools",
+            "name": "Spring Boot DevTools",
+            "description": "Provides fast application restarts and LiveReload."
+          }
+        ]
+      }
+    ]
+  },
+  "type": {
+    "type": "single-select",
+    "default": "maven-project",
+    "values": [
+      {"id": "maven-project", "name": "Maven"},
+      {"id": "gradle-project", "name": "Gradle - Groovy"},
+      {"id": "gradle-project-kotlin", "name": "Gradle - Kotlin"}
+    ]
+  },
+  "packaging": {
+    "type": "single-select",
+    "default": "jar",
+    "values": [
+      {"id": "jar", "name": "Jar"},
+      {"id": "war", "name": "War"}
+    ]
+  },
+  "javaVersion": {
+    "type": "single-select",
+    "default": "21",
+    "values": [
+      {"id": "17", "name": "17"},
+      {"id": "21", "name": "21"},
+      {"id": "25", "name": "25"}
+    ]
+  },
+  "language": {
+    "type": "single-select",
+    "default": "java",
+    "values": [
+      {"id": "java", "name": "Java"},
+      {"id": "kotlin", "name": "Kotlin"},
+      {"id": "groovy", "name": "Groovy"}
+    ]
+  },
+  "bootVersion": {
+    "type": "single-select",
+    "default": "4.0.0",
+    "values": [
+      {"id": "4.0.0", "name": "4.0.0"},
+      {"id": "3.5.6", "name": "3.5.6"},
+      {"id": "3.4.11", "name": "3.4.11"}
+    ]
+  }
+}

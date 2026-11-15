@@ -16,7 +16,7 @@ use std::time::Duration;
 use base::{Cancel, Result};
 use lang_api::CoverageReport;
 use project_model::ProjectModel;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::coverage::{CoveragePlan, CoverageStart, ProfileStart, StartKind, StartedExtra};
 use crate::{Console, RunPlan};
@@ -29,7 +29,7 @@ const DEBUG_READY: Duration = Duration::from_secs(300);
 pub const STOPPED_BY_USER: &str = "stopped by the user";
 
 /// What to run. Nothing set runs every test of the project, a module alone all of its tests.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestRequest {
     pub module: Option<String>,
     /// A class or file of tests, in the terms of the provider.
@@ -154,14 +154,14 @@ pub trait TestProvider: Send + Sync {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TestKind {
     Suite,
     Case,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TestOutcome {
     Passed,
@@ -170,7 +170,7 @@ pub enum TestOutcome {
     Aborted,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TestNode {
     pub id: String,
     #[serde(default)]
@@ -184,7 +184,7 @@ pub struct TestNode {
     pub case: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub enum TestEvent {
     /// A test process began its run. A build may start several.
@@ -741,11 +741,14 @@ mod tests {
 
     /// A copy of a program that runs far longer than the test, under a name of its own:
     /// other tests start the same program, and only this image tells the process apart.
+    /// The name carries the id of the test process, so a run of another window of the
+    /// project on this machine is not mistaken for this one.
     #[cfg(windows)]
     fn silent_program(name: &str) -> (ProcessSpec, PathBuf) {
         let system_root = std::env::var_os("SystemRoot").expect("a Windows machine");
         let source = PathBuf::from(system_root).join("System32").join("ping.exe");
-        let image = test_support::scratch(&format!("runner-{name}")).join("program.exe");
+        let image = test_support::scratch(&format!("runner-{name}"))
+            .join(format!("{name}-{}.exe", std::process::id()));
         fs::copy(&source, &image).expect("the program is copied");
         let spec = ProcessSpec::new(&image)
             .args(["-n", "120", "127.0.0.1"])

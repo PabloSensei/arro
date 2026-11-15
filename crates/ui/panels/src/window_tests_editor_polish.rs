@@ -188,6 +188,7 @@ fn diagnostic(line: u32) -> DiagnosticEntry {
         severity: Severity::Error,
         message: "the error".to_owned(),
         unnecessary: false,
+        code: None,
     }
 }
 

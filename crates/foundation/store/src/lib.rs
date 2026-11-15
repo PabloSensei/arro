@@ -8,6 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub use rusqlite::Error;
 pub use trust::TrustList;
 
+pub mod settings_archive;
+
 mod trust;
 
 /// Applied in order, `PRAGMA user_version` remembers how many.

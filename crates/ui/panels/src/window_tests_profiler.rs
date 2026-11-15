@@ -248,6 +248,8 @@ impl RunConfigProvider for FixtureProfiler {
             provider: self.id().into(),
             assemble_first: false,
             settings: Default::default(),
+
+            ..RunConfig::default()
         }])
     }
 

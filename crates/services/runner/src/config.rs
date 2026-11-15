@@ -16,20 +16,80 @@ const METADATA_FOLDER: &str = ".arro";
 /// The stored run configurations, in the project and under git.
 const CONFIG_FILE: &str = "run.toml";
 
+/// The provider of a configuration that starts several other configurations at once.
+pub const COMPOUND_PROVIDER: &str = "compound";
+
 /// One entry of the run list. `settings` is what the provider asked to keep.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
     pub name: String,
     pub provider: String,
     /// Build the project first. Only the tool knows about code generators and processors.
+    /// A configuration with an explicit [`RunConfig::before_launch`] list keeps the build
+    /// in that list instead.
     #[serde(default = "assemble_by_default")]
     pub assemble_first: bool,
+    /// The steps before the program, in order. `None` is a configuration written before
+    /// the list existed: it builds when `assemble_first` is set. An empty list runs no
+    /// step at all, so a removed build stays removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_launch: Option<Vec<BeforeLaunchStep>>,
+    /// A second Run of this configuration opens another tab instead of asking to stop
+    /// the one that runs.
+    #[serde(default)]
+    pub allow_multiple_instances: bool,
+    /// Variables read from a file before the program starts. Values set by the
+    /// configuration itself win over the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_file: Option<PathBuf>,
+    /// The other configurations this one starts, for [`COMPOUND_PROVIDER`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compound: Vec<String>,
     #[serde(default)]
     pub settings: Table,
 }
 
 fn assemble_by_default() -> bool {
     true
+}
+
+impl RunConfig {
+    /// The before launch steps, with the old `assemble_first` flag as a build step.
+    pub fn before_launch_steps(&self) -> Vec<BeforeLaunchStep> {
+        match &self.before_launch {
+            Some(steps) => steps.clone(),
+            None if self.assemble_first => vec![BeforeLaunchStep::Build],
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether this configuration starts other configurations instead of a program.
+    pub fn is_compound(&self) -> bool {
+        self.provider == COMPOUND_PROVIDER
+    }
+}
+
+/// A step that runs before the program of a configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BeforeLaunchStep {
+    /// Build the project with its build tool.
+    Build,
+    /// A goal or task line of the build tool.
+    Task { target: String },
+    /// Another stored configuration, run to its end first.
+    Configuration { name: String },
+}
+
+impl BeforeLaunchStep {
+    /// A short name for the console and the list of the dialog.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Build => "Build".to_owned(),
+            Self::Task { target } => format!("Task {target}"),
+            Self::Configuration { name } => format!("Run {name}"),
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -333,6 +393,12 @@ pub trait RunConfigProvider: Send + Sync {
         None
     }
 
+    /// The group of the Services window this configuration is listed under. `None` keeps
+    /// the configuration out of the window: not every program is a service.
+    fn service_group(&self, _config: &RunConfig) -> Option<crate::ServiceGroup> {
+        None
+    }
+
     /// Whether [`RunConfigProvider::coverage_plan`] makes a plan. The menus offer Run
     /// with Coverage only for a provider that has it.
     fn supports_coverage(&self) -> bool {
@@ -475,6 +541,7 @@ mod tests {
             provider: "any".into(),
             assemble_first: false,
             settings,
+            ..RunConfig::default()
         }];
 
         save_configs(&file, &configs).unwrap();
@@ -520,6 +587,7 @@ mod tests {
             provider: "any".into(),
             assemble_first: false,
             settings,
+            ..RunConfig::default()
         }];
 
         save_configs(&file, &configs).unwrap();
@@ -533,12 +601,98 @@ mod tests {
     }
 
     #[test]
+    fn configurations_with_before_launch_and_compound_survive_a_round_trip() {
+        let file = temp_file("before-launch.toml");
+        let mut settings = Table::new();
+        settings.insert("entry".into(), "demo.Main".into());
+        let configs = vec![
+            RunConfig {
+                name: "App".into(),
+                provider: "any".into(),
+                assemble_first: false,
+                before_launch: Some(vec![
+                    BeforeLaunchStep::Build,
+                    BeforeLaunchStep::Task {
+                        target: "package".into(),
+                    },
+                    BeforeLaunchStep::Configuration {
+                        name: "Other".into(),
+                    },
+                ]),
+                allow_multiple_instances: true,
+                environment_file: Some(".env.local".into()),
+                compound: Vec::new(),
+                settings,
+            },
+            RunConfig {
+                name: "All".into(),
+                provider: COMPOUND_PROVIDER.into(),
+                assemble_first: false,
+                before_launch: Some(Vec::new()),
+                allow_multiple_instances: false,
+                environment_file: None,
+                compound: vec!["App".into(), "Other".into()],
+                settings: Table::new(),
+            },
+        ];
+
+        save_configs(&file, &configs).unwrap();
+        let loaded = load_configs(&file).unwrap();
+
+        assert_eq!(loaded, configs);
+        assert_eq!(loaded[0].before_launch_steps().len(), 3);
+        assert!(loaded[1].is_compound());
+        assert!(loaded[1].before_launch_steps().is_empty());
+    }
+
+    #[test]
+    fn an_old_configuration_builds_through_its_flag() {
+        let text = "[[run]]\nname = \"App\"\nprovider = \"any\"\n";
+        let config = toml::from_str::<ConfigFile>(text).unwrap().configs[0].clone();
+
+        assert_eq!(config.before_launch_steps(), [BeforeLaunchStep::Build]);
+        assert!(!config.allow_multiple_instances);
+        assert!(config.environment_file.is_none());
+    }
+
+    #[test]
+    fn an_empty_list_removes_the_build() {
+        let config = RunConfig {
+            assemble_first: true,
+            before_launch: Some(Vec::new()),
+            ..RunConfig::default()
+        };
+
+        assert!(config.before_launch_steps().is_empty());
+    }
+
+    #[test]
+    fn steps_are_named_for_the_console() {
+        assert_eq!(BeforeLaunchStep::Build.label(), "Build");
+        assert_eq!(
+            BeforeLaunchStep::Task {
+                target: "package".into()
+            }
+            .label(),
+            "Task package"
+        );
+        assert_eq!(
+            BeforeLaunchStep::Configuration {
+                name: "Other".into()
+            }
+            .label(),
+            "Run Other"
+        );
+    }
+
+    #[test]
     fn stored_configurations_come_first_and_discovered_ones_fill_the_rest() {
         let stored = vec![RunConfig {
             name: "App".into(),
             provider: "any".into(),
             assemble_first: false,
             settings: Table::new(),
+            ..RunConfig::default()
         }];
         let discovered = vec![
             RunConfig {
@@ -546,12 +700,14 @@ mod tests {
                 provider: "any".into(),
                 assemble_first: true,
                 settings: Table::new(),
+                ..RunConfig::default()
             },
             RunConfig {
                 name: "Other".into(),
                 provider: "any".into(),
                 assemble_first: true,
                 settings: Table::new(),
+                ..RunConfig::default()
             },
         ];
 

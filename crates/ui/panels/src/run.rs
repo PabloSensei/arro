@@ -14,13 +14,15 @@ use dap_client::ReloadOutcome;
 use editor_view::Semantic;
 use futures_util::StreamExt;
 use lang_api::{DumpQuery, ask};
+use proc_sup::ProcessSpec;
 use project_model::{
     BuildModule, BuildSystem, EnvironmentProvider, ProjectModel, ProjectSession, SyncEvent,
     TaskOptions, open_project,
 };
 use runner::{
-    Console, ConsoleEvent, CoverageOwner, FindTests, LiveApplication, ProfileOwner, RunConfig,
-    RunConfigProvider, RunPlan, STOPPED_BY_USER, Step, Stream, TestProvider, TestRequest, TestRun,
+    BeforeLaunchStep, Console, ConsoleEvent, CoverageOwner, FindTests, LiveApplication,
+    ProfileOwner, RunConfig, RunConfigProvider, RunPlan, STOPPED_BY_USER, ServiceRun, ServiceState,
+    Step, Stream, TestProvider, TestRequest, TestRun,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -244,6 +246,29 @@ pub struct RunPanel {
     live: Option<Entity<crate::live_panel::LivePanel>>,
     /// The live tab is in front instead of the console.
     live_open: bool,
+    /// The configuration whose console is in the window, for the Services window. It
+    /// stays after the program ends, so the window shows the last state of that run.
+    run_config: Option<String>,
+    /// The state of the run of that configuration, fed by the events of its console.
+    run_service: ServiceRun,
+    /// A Run that stops the one that runs only after the user confirms it.
+    confirm_rerun: Option<String>,
+    /// Cancels a launch that is still planning in the background, as Stop does before
+    /// the program of a configuration starts.
+    launch: Cancel,
+    /// Stop was pressed while the launch was still planning: the plan, when it comes,
+    /// starts nothing and says why.
+    launch_cancelled: bool,
+    /// Tests run again by themselves after a project file is saved.
+    auto_test: bool,
+    /// The saves since the last automatic run: a burst of saves runs the tests once.
+    auto_saves: u64,
+    /// A save asked for a run while tests were going: it starts after they end.
+    auto_pending: bool,
+    /// The last test runs of the project, newest first, from the state folder.
+    test_history: Vec<runner::TestHistoryRun>,
+    /// The list of earlier runs is open in the test window.
+    history_open: bool,
 }
 
 /// The name of a recording file, for the list of several.
@@ -283,6 +308,13 @@ struct DrainingConsole {
     /// The last process of that console, for its unfinished line.
     process: Option<u32>,
     output: OutputBuffers,
+    /// The configuration this run belongs to, for the Services window.
+    config: Option<String>,
+    /// The state of the run of that configuration.
+    service: ServiceRun,
+    /// Its main process is still going, as a child of a compound configuration or a
+    /// second instance of one that allows them.
+    running: bool,
 }
 
 impl RunPanel {
@@ -307,6 +339,9 @@ impl RunPanel {
             if let Some(tool) = &setup.tool {
                 providers.push(Arc::new(runner::BuildTaskProvider::new(tool.clone())));
             }
+            // A compound configuration belongs to the window itself: its children are the
+            // configurations of this list, whatever the language.
+            providers.push(Arc::new(runner::CompoundProvider));
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(POLL).await;
@@ -317,6 +352,21 @@ impl RunPanel {
                         break;
                     }
                 }
+            })
+            .detach();
+            let history_file = runner::test_history_file(&setup.cache_root);
+            let read = cx
+                .background_executor()
+                .spawn(async move { runner::load_test_history(&history_file) });
+            cx.spawn(async move |this, cx| {
+                let loaded = read.await;
+                this.update(cx, |this, cx| {
+                    if let Ok(runs) = loaded {
+                        this.test_history = runs;
+                        cx.notify();
+                    }
+                })
+                .ok();
             })
             .detach();
             Self {
@@ -386,6 +436,16 @@ impl RunPanel {
                 profile_revision: 0,
                 live: None,
                 live_open: false,
+                run_config: None,
+                run_service: ServiceRun::default(),
+                confirm_rerun: None,
+                launch: Cancel::new(),
+                launch_cancelled: false,
+                auto_test: false,
+                auto_saves: 0,
+                auto_pending: false,
+                test_history: Vec::new(),
+                history_open: false,
             }
         })
     }
@@ -630,6 +690,58 @@ impl RunPanel {
     /// The live tab of the current run, when its language has one.
     pub fn live_panel(&self) -> Option<Entity<crate::live_panel::LivePanel>> {
         self.live.clone()
+    }
+
+    /// Every configuration the window lists, stored or discovered.
+    pub(crate) fn configurations(&self) -> &[RunConfig] {
+        &self.configs
+    }
+
+    /// The configuration whose console is in the window, and the state of its run, for
+    /// the Services window. `None` while a task or tests run: they are no configuration.
+    pub(crate) fn service_snapshot(&self) -> Option<(String, ServiceState)> {
+        Some((self.run_config.clone()?, self.run_service.state().clone()))
+    }
+
+    /// The state of every run the window shows, including the children of a compound
+    /// configuration and the instances beside the one that has the console.
+    pub(crate) fn service_snapshots(&self) -> Vec<(String, ServiceState)> {
+        let mut states = Vec::new();
+        if let Some(name) = &self.run_config {
+            states.push((name.clone(), self.run_service.state().clone()));
+        }
+        for drain in &self.draining {
+            if let Some(name) = &drain.config {
+                states.push((name.clone(), drain.service.state().clone()));
+            }
+        }
+        states
+    }
+
+    /// The configuration of the run in the window, if the run is one.
+    pub(crate) fn run_config_name(&self) -> Option<&str> {
+        self.run_config.as_deref()
+    }
+
+    /// Whether the console in the window belongs to the run of `name`.
+    pub(crate) fn shows_console(&self, name: &str) -> bool {
+        self.run_config.as_deref() == Some(name)
+    }
+
+    /// The rows of the console of the current run, for the Services window: the same
+    /// lines and the same unfinished line the Run window draws.
+    pub(crate) fn console_rows(&self) -> usize {
+        self.lines.len() + 1
+    }
+
+    pub(crate) fn console_row(&self, index: usize, theme: &Theme) -> AnyElement {
+        let current = self.output.current().cloned().unwrap_or_default();
+        line_element(self.lines.get(index).unwrap_or(&current), theme)
+    }
+
+    /// The scroll position of the console, shared with the Services window.
+    pub(crate) fn console_scroll(&self) -> UniformListScrollHandle {
+        self.scroll.clone()
     }
 
     /// Shows the live tab, as a click on its tab does.
@@ -1002,6 +1114,7 @@ impl RunPanel {
         self.console_running
             || self.tests.running()
             || (self.build_console.is_some() && self.build_running)
+            || self.draining.iter().any(|drain| drain.running)
     }
 
     fn stop_running(&self) {
@@ -1032,6 +1145,9 @@ impl RunPanel {
         let title = std::mem::take(&mut self.title);
         let output = std::mem::take(&mut self.output);
         let process = self.console_process.take();
+        let config = self.run_config.take();
+        let service = std::mem::take(&mut self.run_service);
+        let running = self.console_running;
         self.program_pid = None;
         let lines = self.lines.drain(..).collect();
         // Old runs whose output has ended are kept as tabs, the latest few of them.
@@ -1039,7 +1155,7 @@ impl RunPanel {
             let Some(oldest) = self
                 .draining
                 .iter()
-                .position(|drain| drain.console.is_none())
+                .position(|drain| drain.console.is_none() && !drain.running)
             else {
                 break;
             };
@@ -1051,6 +1167,9 @@ impl RunPanel {
             lines,
             process,
             output,
+            config,
+            service,
+            running,
         });
         self.viewing = None;
         self.console_running = false;
@@ -1064,11 +1183,43 @@ impl RunPanel {
             return;
         }
         if self.busy() {
-            self.rerun = true;
-            self.stop_running();
+            let config = self
+                .selected
+                .and_then(|index| self.configs.get(index))
+                .cloned();
+            let programs_run =
+                self.console_running || self.draining.iter().any(|drain| drain.running);
+            // A configuration that allows several instances opens another tab instead of
+            // asking what to do with the one that runs.
+            if programs_run
+                && !self.tests.running()
+                && config
+                    .as_ref()
+                    .is_some_and(|config| config.allow_multiple_instances)
+            {
+                self.start(cx);
+                return;
+            }
+            let name = config.map_or_else(|| self.title.to_string(), |config| config.name);
+            self.confirm_rerun = Some(name);
+            self.changed(cx);
             return;
         }
         self.start(cx);
+    }
+
+    /// Stop and Rerun of the question a second Run asks: the program that runs is
+    /// stopped and the selected configuration starts again.
+    pub fn rerun_confirmed(&mut self, cx: &mut Context<Self>) {
+        self.confirm_rerun = None;
+        self.stop(cx);
+        self.start(cx);
+    }
+
+    /// Cancel of that question: the program that runs keeps running.
+    pub fn cancel_rerun(&mut self, cx: &mut Context<Self>) {
+        self.confirm_rerun = None;
+        self.changed(cx);
     }
 
     /// Plans the selected configuration in the background and starts its console.
@@ -1083,6 +1234,9 @@ impl RunPanel {
         let model = self.session.as_ref().and_then(ProjectSession::model);
         let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
             self.waiting = true;
+            self.run_config = Some(config.name.clone());
+            self.run_service = ServiceRun::default();
+            self.run_service.starting();
             self.title = config.name.clone().into();
             self.lines.clear();
             self.note("Waiting for the project to load", false);
@@ -1095,15 +1249,258 @@ impl RunPanel {
             self.tell("Cannot run", text, cx);
             return;
         };
+        if config.is_compound() {
+            self.start_compound(config, model, cx);
+            return;
+        }
+        self.launch_config(config, provider, model, cx);
+    }
+
+    /// Plans one configuration in the background and starts its console with the before
+    /// launch steps of the configuration.
+    fn launch_config(
+        &mut self,
+        config: RunConfig,
+        provider: Arc<dyn RunConfigProvider>,
+        model: Arc<ProjectModel>,
+        cx: &mut Context<Self>,
+    ) {
         let title = config.name.clone();
-        let live_provider = provider.clone();
-        let live_config = config.clone();
-        let live_model = model.clone();
-        self.launch(title, cx, move || {
-            let live = live_provider.live_application(&live_config, &live_model);
-            let plan = plan(&*live_provider, &live_config, &live_model)?;
-            Ok((plan, live))
+        let cancel = Cancel::new();
+        self.launch = cancel.clone();
+        self.launch_cancelled = false;
+        self.starting = true;
+        self.archive_console();
+        self.confirm_rerun = None;
+        self.live = None;
+        self.live_open = false;
+        self.run_config = Some(title.clone());
+        self.run_service = ServiceRun::default();
+        self.run_service.starting();
+        crate::history::put_label(&self.root, format!("Before running {title}"), cx);
+        self.title = title.into();
+        self.lines.clear();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
+        self.program_pid = None;
+        self.console_input.restart();
+        self.program_started = false;
+        self.tests.clear();
+        cx.emit(TestsChanged);
+        let tool = self.tool.clone();
+        let providers = self.providers.clone();
+        let configs = self.configs.clone();
+        let root = self.root.clone();
+        let planned = cx.background_executor().spawn(async move {
+            let mut plan = provider
+                .plan(&config, &model)
+                .map_err(|error| error.to_string())?;
+            let live = provider.live_application(&config, &model);
+            let steps = before_launch_specs(
+                &config,
+                tool.as_deref(),
+                &model,
+                &configs,
+                &providers,
+                &root,
+            )?;
+            let steps = apply_environment_file(&config, &root, &mut plan, steps)?;
+            Ok((plan, live, steps))
         });
+        cx.spawn(async move |this, cx| {
+            let planned: Result<_, String> = planned.await;
+            this.update(cx, |this, cx| {
+                this.starting = false;
+                if this.launch_cancelled || cancel.is_cancelled() {
+                    this.launch_cancelled = false;
+                    this.changed(cx);
+                    return;
+                }
+                match planned {
+                    Ok((plan, live, steps)) => {
+                        this.set_live(live, cx);
+                        this.console = Some(Console::start_with_steps(plan, steps, cancel));
+                        this.console_running = true;
+                    }
+                    Err(message) => {
+                        this.run_service.stopped();
+                        this.note(&message, true);
+                        this.tell("Cannot run", message, cx);
+                    }
+                }
+                this.changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.changed(cx);
+    }
+
+    /// Starts every configuration of a compound one, each in a tab of its own.
+    fn start_compound(
+        &mut self,
+        config: RunConfig,
+        model: Arc<ProjectModel>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut children = Vec::new();
+        for name in &config.compound {
+            let Some(child) = self
+                .configs
+                .iter()
+                .find(|known| known.name == *name)
+                .cloned()
+            else {
+                let message = format!("Compound names a configuration that is not there: {name}");
+                self.note(&message, true);
+                self.tell("Cannot run", message, cx);
+                return;
+            };
+            let Some(provider) = self
+                .providers
+                .iter()
+                .find(|provider| provider.id() == child.provider)
+                .cloned()
+            else {
+                let message = format!("Nothing runs configurations of kind {}", child.provider);
+                self.note(&message, true);
+                self.tell("Cannot run", message, cx);
+                return;
+            };
+            if child.is_compound() {
+                let message = format!("A compound configuration cannot start {name}");
+                self.note(&message, true);
+                self.tell("Cannot run", message, cx);
+                return;
+            }
+            children.push((child, provider));
+        }
+        if children.is_empty() {
+            let message = "This compound configuration lists nothing to run".to_owned();
+            self.note(&message, true);
+            self.tell("Cannot run", message, cx);
+            return;
+        }
+        let cancel = Cancel::new();
+        self.launch = cancel.clone();
+        self.launch_cancelled = false;
+        self.starting = true;
+        self.archive_console();
+        self.confirm_rerun = None;
+        self.live = None;
+        self.live_open = false;
+        self.run_config = None;
+        self.run_service = ServiceRun::default();
+        self.title = config.name.clone().into();
+        self.lines.clear();
+        self.output = OutputBuffers::default();
+        self.console_process = None;
+        self.program_pid = None;
+        self.console_input.restart();
+        self.program_started = false;
+        self.tests.clear();
+        cx.emit(TestsChanged);
+        let tool = self.tool.clone();
+        let providers = self.providers.clone();
+        let configs = self.configs.clone();
+        let root = self.root.clone();
+        let compound = config.clone();
+        let planned = cx.background_executor().spawn(async move {
+            // The steps of the compound configuration itself go before the first child,
+            // in the console of that child.
+            let own_steps = before_launch_specs(
+                &compound,
+                tool.as_deref(),
+                &model,
+                &configs,
+                &providers,
+                &root,
+            )?;
+            let own_variables = environment_variables(&compound, &root)?;
+            let mut own_steps: Vec<ProcessSpec> = own_steps
+                .into_iter()
+                .map(|spec| runner::with_environment(spec, &own_variables))
+                .collect();
+            let mut starts = Vec::new();
+            let mut first = true;
+            for (child, provider) in children {
+                let mut plan = provider
+                    .plan(&child, &model)
+                    .map_err(|error| format!("{}: {error}", child.name))?;
+                let live = provider.live_application(&child, &model);
+                let steps = before_launch_specs(
+                    &child,
+                    tool.as_deref(),
+                    &model,
+                    &configs,
+                    &providers,
+                    &root,
+                )
+                .map_err(|error| format!("{}: {error}", child.name))?;
+                let mut steps = apply_environment_file(&child, &root, &mut plan, steps)
+                    .map_err(|error| format!("{}: {error}", child.name))?;
+                if first {
+                    own_steps.append(&mut steps);
+                    steps = std::mem::take(&mut own_steps);
+                    first = false;
+                }
+                starts.push((child.name.clone(), plan, live, steps));
+            }
+            Ok(starts)
+        });
+        cx.spawn(async move |this, cx| {
+            let planned: Result<_, String> = planned.await;
+            this.update(cx, |this, cx| {
+                this.starting = false;
+                if this.launch_cancelled || cancel.is_cancelled() {
+                    this.launch_cancelled = false;
+                    this.changed(cx);
+                    return;
+                }
+                match planned {
+                    Ok(starts) => {
+                        let mut starts = starts.into_iter();
+                        if let Some((name, plan, live, steps)) = starts.next() {
+                            this.set_live(live, cx);
+                            this.title = name.clone().into();
+                            this.run_config = Some(name);
+                            this.run_service = ServiceRun::default();
+                            this.run_service.starting();
+                            this.console =
+                                Some(Console::start_with_steps(plan, steps, cancel.clone()));
+                            this.console_running = true;
+                        }
+                        for (name, plan, _live, steps) in starts {
+                            let mut service = ServiceRun::default();
+                            service.starting();
+                            this.draining.push(DrainingConsole {
+                                title: name.clone().into(),
+                                console: Some(Console::start_with_steps(
+                                    plan,
+                                    steps,
+                                    cancel.clone(),
+                                )),
+                                lines: Vec::new(),
+                                process: None,
+                                output: OutputBuffers::default(),
+                                config: Some(name),
+                                service,
+                                running: true,
+                            });
+                        }
+                    }
+                    Err(message) => {
+                        this.run_service.stopped();
+                        this.note(&message, true);
+                        this.tell("Cannot run", message, cx);
+                    }
+                }
+                this.changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.changed(cx);
     }
 
     /// Runs the selected configuration with the coverage agent. The old data goes at
@@ -1145,6 +1542,9 @@ impl RunPanel {
         self.queued_tests = None;
         self.rerun = false;
         self.archive_console();
+        self.run_config = Some(config.name.clone());
+        self.run_service = ServiceRun::default();
+        self.run_service.starting();
         self.title = config.name.clone().into();
         self.lines.clear();
         self.output = OutputBuffers::default();
@@ -1178,6 +1578,7 @@ impl RunPanel {
                     }
                     Err(error) => {
                         let message = error.to_string();
+                        this.run_service.stopped();
                         this.note(&message, true);
                         this.tell("Cannot run with coverage", message, cx);
                     }
@@ -1223,6 +1624,8 @@ impl RunPanel {
         self.queued_tests = None;
         self.rerun = false;
         self.archive_console();
+        self.run_config = None;
+        self.run_service = ServiceRun::default();
         self.title = title_of(&request).into();
         self.lines.clear();
         self.output = OutputBuffers::default();
@@ -1301,6 +1704,8 @@ impl RunPanel {
         self.queued_tests = None;
         self.rerun = false;
         self.archive_console();
+        self.run_config = None;
+        self.run_service = ServiceRun::default();
         self.title = title_of(&request).into();
         self.lines.clear();
         self.output = OutputBuffers::default();
@@ -1489,6 +1894,9 @@ impl RunPanel {
         self.queued_tests = None;
         self.rerun = false;
         self.archive_console();
+        self.run_config = Some(config.name.clone());
+        self.run_service = ServiceRun::default();
+        self.run_service.starting();
         self.title = config.name.clone().into();
         self.lines.clear();
         self.output = OutputBuffers::default();
@@ -1524,6 +1932,7 @@ impl RunPanel {
                     }
                     Err(error) => {
                         let message = error.to_string();
+                        this.run_service.stopped();
                         this.note(&message, true);
                         this.profile_error = Some(message.clone());
                         this.tell("Cannot run with profiler", message, cx);
@@ -1809,7 +2218,7 @@ impl RunPanel {
         let (root, name) = (self.root.clone(), task.to_string());
         let options = TaskOptions { skip_tests };
         let title = format!("{} {task}", self.tool_title());
-        self.launch(title, cx, move || {
+        self.launch(title, None, cx, move || {
             let program = tool
                 .task_in(&root, module.as_ref(), &name, options)
                 .map_err(|error| error.to_string())?;
@@ -1835,7 +2244,7 @@ impl RunPanel {
         };
         let (root, line) = (self.root.clone(), line.to_string());
         let title = format!("{} {line}", self.tool_title());
-        self.launch(title, cx, move || {
+        self.launch(title, None, cx, move || {
             let program = tool
                 .goal(&root, &line, TaskOptions::default())
                 .map_err(|error| error.to_string())?;
@@ -1956,7 +2365,7 @@ impl RunPanel {
             self.launch_build(title, cx, make);
         } else {
             self.building_project = true;
-            self.launch(title, cx, move || make().map(|plan| (plan, None)));
+            self.launch(title, None, cx, move || make().map(|plan| (plan, None)));
         }
     }
 
@@ -1994,7 +2403,7 @@ impl RunPanel {
             ))
         };
         self.building_project = true;
-        self.launch(title, cx, make);
+        self.launch(title, None, cx, make);
     }
 
     /// Alt+Shift+R: the tests of the last run again.
@@ -2236,6 +2645,7 @@ impl RunPanel {
     fn launch(
         &mut self,
         title: String,
+        config: Option<String>,
         cx: &mut Context<Self>,
         make: impl FnOnce() -> Result<(RunPlan, Option<Arc<dyn LiveApplication>>), String>
         + Send
@@ -2245,6 +2655,11 @@ impl RunPanel {
         self.archive_console();
         self.live = None;
         self.live_open = false;
+        self.run_config = config;
+        self.run_service = ServiceRun::default();
+        if self.run_config.is_some() {
+            self.run_service.starting();
+        }
         crate::history::put_label(&self.root, format!("Before running {title}"), cx);
         self.title = title.into();
         self.lines.clear();
@@ -2268,6 +2683,7 @@ impl RunPanel {
                     }
                     Err(message) => {
                         this.building_project = false;
+                        this.run_service.stopped();
                         this.note(&message, true);
                         this.tell("Cannot run", message, cx);
                     }
@@ -2282,16 +2698,41 @@ impl RunPanel {
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.rerun = false;
+        self.confirm_rerun = None;
+        self.auto_pending = false;
         self.waiting = false;
         self.waiting_tests = None;
         self.queued_tests = None;
         self.debugging_tests = false;
+        // A launch that still plans in the background starts nothing when it comes.
+        if self.starting {
+            self.launch.cancel();
+            self.launch_cancelled = true;
+            if !self.building_project {
+                self.note("Launch cancelled", false);
+            }
+        } else if self.console.is_some() && !self.program_started {
+            // The before launch steps still run, so the program itself never starts.
+            self.note("Launch cancelled", false);
+        }
+        self.starting = false;
         self.building_project = false;
         self.build_console = None;
         self.build_running = false;
         self.console_running = false;
         self.program_pid = None;
         self.reload = None;
+        if self.run_service.state().active() {
+            self.run_service.stopped();
+        }
+        for drain in &mut self.draining {
+            if drain.running {
+                if drain.service.state().active() {
+                    drain.service.stopped();
+                }
+                drain.running = false;
+            }
+        }
         if let Some(starting) = &self.starting_tests {
             starting.cancel();
         }
@@ -2325,41 +2766,49 @@ impl RunPanel {
         self.note("Dumping the threads of the program", false);
         self.changed(cx);
         cx.spawn(async move |this, cx| {
-            let Some(answer) = replies.next().await else {
-                return;
-            };
-            let dump = answer.value;
-            if let Some(error) = dump.error {
-                this.update(cx, |this, cx| {
-                    this.note(&error, true);
-                    this.changed(cx);
-                })
-                .ok();
-                return;
-            }
-            let Some(report) = dump.report else {
-                return;
-            };
-            this.update(cx, |_, cx| {
-                cx.defer(move |cx| {
-                    handle
-                        .update(cx, |_, window, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.show_tool(STACK_TRACE_TOOL, window, cx)
+            let mut shown = false;
+            while let Some(answer) = replies.next().await {
+                let dump = answer.value;
+                if let Some(error) = dump.error {
+                    this.update(cx, |this, cx| {
+                        this.note(&error, true);
+                        this.changed(cx);
+                    })
+                    .ok();
+                    return;
+                }
+                let Some(report) = dump.report else {
+                    return;
+                };
+                let first = !shown;
+                shown = true;
+                let workspace = workspace.clone();
+                this.update(cx, |_, cx| {
+                    cx.defer(move |cx| {
+                        if first {
+                            handle
+                                .update(cx, |_, window, cx| {
+                                    workspace
+                                        .update(cx, |workspace, cx| {
+                                            workspace.show_tool(STACK_TRACE_TOOL, window, cx)
+                                        })
+                                        .ok();
                                 })
                                 .ok();
-                        })
-                        .ok();
-                    if let Some(panel) = cx.try_global::<ActiveStackTrace>() {
-                        panel
-                            .0
-                            .clone()
-                            .update(cx, |panel, cx| panel.show(report, cx));
-                    }
-                });
-            })
-            .ok();
+                        }
+                        if let Some(panel) = cx.try_global::<ActiveStackTrace>() {
+                            panel.0.clone().update(cx, |panel, cx| {
+                                if first {
+                                    panel.show(report, cx);
+                                } else {
+                                    panel.refine(report, cx);
+                                }
+                            });
+                        }
+                    });
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -2488,6 +2937,8 @@ impl RunPanel {
         self.queued_tests = None;
         self.rerun = false;
         self.archive_console();
+        self.run_config = None;
+        self.run_service = ServiceRun::default();
         self.title = title_of(&request).into();
         self.lines.clear();
         self.output = OutputBuffers::default();
@@ -2612,6 +3063,7 @@ impl RunPanel {
                         }
                         if step == Step::Program && main_console {
                             self.program_started = true;
+                            self.run_service.running(None);
                         }
                     }
                     ConsoleEvent::Failed { message } => {
@@ -2621,12 +3073,21 @@ impl RunPanel {
                         if step == Step::Program {
                             self.program_pid = None;
                         }
+                        if step == Step::Program && main_console {
+                            self.run_service.exited(code);
+                        }
                         match self.console_process.take() {
                             Some(process) => self.output.finish(process, &mut done),
                             None => self.output.finish_all(&mut done),
                         }
                         done.push(Line::default());
                         done.push(info(exit_text(code, step)));
+                        if step == Step::Before && code != Some(0) {
+                            done.push(Line::plain(
+                                "The before launch step failed, so the program did not start",
+                                error_style(),
+                            ));
+                        }
                         self.console_running = false;
                         if step == Step::Before && code == Some(0) {
                             built = true;
@@ -2746,17 +3207,31 @@ impl RunPanel {
                             &mut drain.lines,
                         );
                     }
-                    ConsoleEvent::Started { pid, .. } => drain.process = Some(pid),
-                    ConsoleEvent::Exited { .. } => match drain.process.take() {
-                        Some(process) => drain.output.finish(process, &mut drain.lines),
-                        None => drain.output.finish_all(&mut drain.lines),
-                    },
+                    ConsoleEvent::Started { pid, step } => {
+                        drain.process = Some(pid);
+                        if step == Step::Program {
+                            drain.service.running(None);
+                        }
+                    }
+                    ConsoleEvent::Exited { code, step } => {
+                        match drain.process.take() {
+                            Some(process) => drain.output.finish(process, &mut drain.lines),
+                            None => drain.output.finish_all(&mut drain.lines),
+                        }
+                        drain.lines.push(Line::default());
+                        drain.lines.push(info(exit_text(code, step)));
+                        drain.running = false;
+                        if step == Step::Program {
+                            drain.service.exited(code);
+                        }
+                    }
                     ConsoleEvent::Failed { message } => {
                         drain.lines.push(Line::plain(message, error_style()));
                     }
                     ConsoleEvent::Closed => {
                         drain.output.finish_all(&mut drain.lines);
                         drain.process = None;
+                        drain.running = false;
                         closed = true;
                         break;
                     }
@@ -2829,6 +3304,13 @@ impl RunPanel {
             self.finished += 1;
         }
         changed |= self.poll_reload(cx);
+        // The port a line of the program named reaches the Services window as the line
+        // itself reaches the live tab.
+        if let Some(port) = self.live.as_ref().and_then(|live| live.read(cx).app_port())
+            && self.run_service.port(port)
+        {
+            changed = true;
+        }
         if self.debugging_tests && !self.starting {
             let ended = cx
                 .try_global::<crate::debug::ActiveDebug>()
@@ -3129,14 +3611,101 @@ impl RunPanel {
     }
 }
 
-fn plan(
-    provider: &dyn RunConfigProvider,
+/// The commands of the before launch list of a configuration, in order. A build step
+/// asks the build tool whether its outputs are already current; a task and a
+/// configuration are planned here, because their processes belong to the same console.
+fn before_launch_specs(
     config: &RunConfig,
+    tool: Option<&dyn BuildSystem>,
     model: &ProjectModel,
-) -> Result<RunPlan, String> {
-    provider
-        .plan(config, model)
-        .map_err(|error| error.to_string())
+    configs: &[RunConfig],
+    providers: &[Arc<dyn RunConfigProvider>],
+    root: &StdPath,
+) -> Result<Vec<ProcessSpec>, String> {
+    let mut specs = Vec::new();
+    for step in config.before_launch.clone().unwrap_or_default() {
+        match step {
+            BeforeLaunchStep::Build => {
+                let tool = tool.ok_or("The project has no build tool to build it")?;
+                let spec = tool
+                    .assemble_if_needed(root)
+                    .map_err(|error| error.to_string())?;
+                specs.extend(spec);
+            }
+            BeforeLaunchStep::Task { target } => {
+                let tool = tool.ok_or("The project has no build tool to run a task")?;
+                let spec = tool
+                    .goal(root, &target, TaskOptions::default())
+                    .map_err(|error| error.to_string())?;
+                specs.push(spec);
+            }
+            BeforeLaunchStep::Configuration { name } => {
+                let other = configs
+                    .iter()
+                    .find(|known| known.name == name)
+                    .ok_or_else(|| {
+                        format!("Before launch names a configuration that is not there: {name}")
+                    })?;
+                if other.is_compound() {
+                    return Err(format!(
+                        "Before launch cannot start the compound configuration {name}"
+                    ));
+                }
+                let provider = providers
+                    .iter()
+                    .find(|provider| provider.id() == other.provider)
+                    .ok_or_else(|| {
+                        format!("Nothing runs configurations of kind {}", other.provider)
+                    })?;
+                let plan = provider
+                    .plan(other, model)
+                    .map_err(|error| format!("{name}: {error}"))?;
+                specs.extend(plan.before);
+                specs.push(plan.program);
+            }
+        }
+    }
+    Ok(specs)
+}
+
+/// Reads the variables of the environment file of a configuration. Variables the
+/// configuration set itself win over the file.
+fn environment_variables(
+    config: &RunConfig,
+    root: &StdPath,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Some(file) = &config.environment_file else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let path = if file.is_absolute() {
+        file.clone()
+    } else {
+        root.join(file)
+    };
+    runner::read_environment_file(&path)
+}
+
+/// Adds the variables of the environment file of a configuration to the program and to
+/// every before launch step.
+fn apply_environment_file(
+    config: &RunConfig,
+    root: &StdPath,
+    plan: &mut RunPlan,
+    steps: Vec<ProcessSpec>,
+) -> Result<Vec<ProcessSpec>, String> {
+    let variables = environment_variables(config, root)?;
+    if variables.is_empty() {
+        return Ok(steps);
+    }
+    let program = std::mem::replace(&mut plan.program, ProcessSpec::new(""));
+    plan.program = runner::with_environment(program, &variables);
+    if let Some(before) = plan.before.take() {
+        plan.before = Some(runner::with_environment(before, &variables));
+    }
+    Ok(steps
+        .into_iter()
+        .map(|spec| runner::with_environment(spec, &variables))
+        .collect())
 }
 
 fn discover(
@@ -3536,7 +4105,7 @@ impl Render for RunPanel {
             )
             .child(panel_tools(GROUP, hide, &theme))
             .debug_selector(|| "run-header".to_owned());
-        island(&theme)
+        let panel = island(&theme)
             .id("run-panel")
             .key_context("RunPanel ToolWindow")
             .track_focus(&self.focus)
@@ -3551,6 +4120,70 @@ impl Render for RunPanel {
                     .min_h_0()
                     .child(side)
                     .child(div().flex_1().min_w_0().h_full().child(body)),
-            )
+            );
+        let Some(name) = self.confirm_rerun.clone() else {
+            return panel.into_any_element();
+        };
+        // The question of a second Run stays inside the tool window, so the toolbar and
+        // the keys need no window of their own to ask it.
+        let question = format!("{name} is already running. Stop and rerun?");
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .flex()
+                .items_center()
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_L))
+                .rounded(px(CONTROL_RADIUS))
+                .when(primary, |this| {
+                    this.bg(theme.accent).text_color(theme.over_accent)
+                })
+                .when(!primary, |this| {
+                    this.border_1()
+                        .border_color(theme.control_border)
+                        .hover(move |style| style.bg(theme.hover))
+                })
+                .child(label)
+        };
+        let dialog = div()
+            .id("run-confirm")
+            .debug_selector(|| "run-confirm".to_owned())
+            .absolute()
+            .left(px(SPACE_L))
+            .top(px(CONTROL_HEIGHT + SPACE_L))
+            .w(px(380.))
+            .p(px(DIALOG_PADDING))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.island_bg)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(DIALOG_GAP))
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text)
+            .child(question)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(SPACE_M))
+                    .child(
+                        button("run-confirm-cancel", "Cancel", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_rerun(cx))),
+                    )
+                    .child(
+                        button("run-confirm-rerun", "Stop and Rerun", true)
+                            .on_click(cx.listener(|this, _, _, cx| this.rerun_confirmed(cx))),
+                    ),
+            );
+        div()
+            .relative()
+            .size_full()
+            .child(panel)
+            .child(dialog)
+            .into_any_element()
     }
 }

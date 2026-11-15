@@ -33,6 +33,11 @@ const FIELD_AGENT: &str = "agent";
 const TEMPLATE_APPLICATION: &str = "application";
 /// The template that attaches to a JVM another process started.
 const TEMPLATE_REMOTE: &str = "remote";
+/// The groups of the Services window: an application that starts a web server goes to
+/// the first one, a plain program is listed only when the user asks for every
+/// configuration.
+const SPRING_BOOT_GROUP: &str = "spring-boot";
+const APPLICATION_GROUP: &str = "application";
 /// What the new configuration is called before the user renames it.
 const NEW_CONFIG_NAME: &str = "Unnamed";
 /// The host and the port of a remote JVM before the user changes them.
@@ -64,6 +69,12 @@ pub struct JavaTarget {
     pub remote: bool,
     pub host: String,
     pub port: u16,
+}
+
+/// A configuration written before the before launch list existed builds through its flag;
+/// one with a list has the build as a step of that list instead.
+fn needs_build(config: &RunConfig) -> bool {
+    config.assemble_first && config.before_launch.is_none()
 }
 
 /// Starts `java` directly with an explicit classpath. Only a direct start gets Ctrl+C
@@ -127,6 +138,7 @@ impl JavaProvider {
             provider: PROVIDER_ID.into(),
             assemble_first: true,
             settings: Self::store(&target)?,
+            ..RunConfig::default()
         })
     }
 
@@ -238,8 +250,7 @@ impl RunConfigProvider for JavaProvider {
             );
         }
         let jdk = self.jdk(model)?;
-        let before = config
-            .assemble_first
+        let before = needs_build(config)
             .then(|| self.tool.assemble_if_needed(&model.root))
             .transpose()?
             .flatten();
@@ -261,8 +272,7 @@ impl RunConfigProvider for JavaProvider {
             );
         }
         let jdk = self.jdk(model)?;
-        let before = config
-            .assemble_first
+        let before = needs_build(config)
             .then(|| self.tool.assemble_if_needed(&model.root))
             .transpose()?
             .flatten();
@@ -308,8 +318,7 @@ impl RunConfigProvider for JavaProvider {
             return Err(format!("no coverage agent at {}", tools.agent.display()).into());
         }
         let exec = crate::coverage::exec_file(&self.env.cache_root(), &config.name)?;
-        let before = config
-            .assemble_first
+        let before = needs_build(config)
             .then(|| self.tool.assemble_if_needed(&model.root))
             .transpose()?
             .flatten();
@@ -353,8 +362,7 @@ impl RunConfigProvider for JavaProvider {
             .into());
         }
         let recording = crate::profile::recording_file(&self.env.cache_root(), &config.name)?;
-        let before = config
-            .assemble_first
+        let before = needs_build(config)
             .then(|| self.tool.assemble_if_needed(&model.root))
             .transpose()?
             .flatten();
@@ -422,6 +430,27 @@ impl RunConfigProvider for JavaProvider {
         }
         points.sort_by_key(|point| point.line);
         points
+    }
+
+    /// An application with a web server is the one the Services window opens for; a plain
+    /// program is there only when the user asks the group to show every configuration.
+    fn service_group(&self, config: &RunConfig) -> Option<runner::ServiceGroup> {
+        let target = Self::target(config);
+        if target.remote {
+            return None;
+        }
+        if target.spring_boot {
+            return Some(runner::ServiceGroup {
+                id: SPRING_BOOT_GROUP,
+                title: "Spring Boot",
+                optional: false,
+            });
+        }
+        (!target.main_class.trim().is_empty()).then_some(runner::ServiceGroup {
+            id: APPLICATION_GROUP,
+            title: "Application",
+            optional: true,
+        })
     }
 
     fn fields(&self, config: &RunConfig) -> Vec<ConfigField> {
@@ -547,6 +576,7 @@ impl RunConfigProvider for JavaProvider {
                 provider: PROVIDER_ID.into(),
                 assemble_first: false,
                 settings: Self::store(&target)?,
+                ..RunConfig::default()
             });
         }
         if template != TEMPLATE_APPLICATION {
@@ -565,6 +595,7 @@ impl RunConfigProvider for JavaProvider {
             provider: PROVIDER_ID.into(),
             assemble_first: true,
             settings: Self::store(&target)?,
+            ..RunConfig::default()
         })
     }
 }
@@ -778,6 +809,67 @@ mod tests {
     }
 
     #[test]
+    fn the_services_window_lists_an_application_apart_from_a_plain_program() {
+        let root = temp_dir("groups");
+        let provider = provider(&root.join("cache"));
+        let model = model(&root);
+        let boot = provider.discover(&model).unwrap().remove(0);
+
+        let group = provider
+            .service_group(&boot)
+            .expect("a group of the window");
+        assert_eq!(group.id, SPRING_BOOT_GROUP);
+        assert_eq!(group.title, "Spring Boot");
+        assert!(!group.optional, "an application is what the window is for");
+
+        let plain = RunConfig {
+            name: "Plain".into(),
+            provider: PROVIDER_ID.into(),
+            assemble_first: false,
+            settings: Table::try_from(JavaTarget {
+                module: "app".into(),
+                main_class: "demo.Plain".into(),
+                ..JavaTarget::default()
+            })
+            .unwrap(),
+            ..RunConfig::default()
+        };
+        let group = provider
+            .service_group(&plain)
+            .expect("a group of the window");
+        assert_eq!(group.id, APPLICATION_GROUP);
+        assert_eq!(group.title, "Application");
+        assert!(group.optional, "a plain program waits for Show all");
+    }
+
+    #[test]
+    fn a_configuration_without_a_program_is_not_a_service() {
+        let root = temp_dir("groups-none");
+        let provider = provider(&root.join("cache"));
+        let remote = RunConfig {
+            name: "Remote".into(),
+            provider: PROVIDER_ID.into(),
+            assemble_first: false,
+            settings: Table::try_from(JavaTarget {
+                remote: true,
+                ..JavaTarget::default()
+            })
+            .unwrap(),
+            ..RunConfig::default()
+        };
+        let empty = RunConfig {
+            name: "Empty".into(),
+            provider: PROVIDER_ID.into(),
+            assemble_first: false,
+            settings: Table::try_from(JavaTarget::default()).unwrap(),
+            ..RunConfig::default()
+        };
+
+        assert!(provider.service_group(&remote).is_none());
+        assert!(provider.service_group(&empty).is_none());
+    }
+
+    #[test]
     fn the_dialog_fields_read_and_write_the_settings() {
         let root = temp_dir("fields");
         let provider = provider(&root.join("cache"));
@@ -835,6 +927,7 @@ mod tests {
             provider: PROVIDER_ID.into(),
             assemble_first: false,
             settings: Table::try_from(JavaTarget::default()).unwrap(),
+            ..RunConfig::default()
         };
         let provider = provider(&temp_dir("plain-program"));
 

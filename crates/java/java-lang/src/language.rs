@@ -11,7 +11,8 @@ use lang_api::{
     MoveDestinationProvider, MoveProvider, NavigationProvider, OverridableMethodsProvider,
     PrepareDiagnosticsProvider, ProjectProblemsProvider, Queries, RangeFormatProvider,
     ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer,
-    SemanticTokensProvider, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
+    SemanticTokensProvider, SignatureProvider, SourceTextProvider, StructuralEdit, StructuralMatch,
+    StructuralQuery, StructuralSearchProvider, StructuralTemplate, SymbolProvider, SyntaxProvider,
     UnwrapEdit, WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use lang_api::{ExpectedTypeProvider, ExternalDocProvider, SignatureInfoProvider};
@@ -120,7 +121,11 @@ impl LanguageSupport for JavaProject {
     }
 
     fn embedded_languages(&self) -> Vec<Arc<dyn LanguageSupport>> {
-        vec![self.spring.clone(), self.messages.clone()]
+        vec![
+            self.spring.clone(),
+            self.messages.clone(),
+            Arc::new(self.build_scripts.clone()),
+        ]
     }
 
     fn related_files(&self, path: &Path) -> Vec<PathBuf> {
@@ -227,6 +232,14 @@ impl LanguageSupport for JavaProject {
         Some(&self.java_messages)
     }
 
+    fn dependency_updates(&self) -> Option<&lang_api::DependencyUpdatesProvider> {
+        Some(&self.build_scripts)
+    }
+
+    fn set_dependency_updates(&self, enabled: bool) {
+        self.build_scripts.set_enabled(enabled);
+    }
+
     fn semantic_tokens(&self) -> Option<&SemanticTokensProvider> {
         Some(self.providers.as_ref())
     }
@@ -255,8 +268,40 @@ impl LanguageSupport for JavaProject {
         Some(self.beans.as_ref())
     }
 
+    fn type_graph(&self) -> Option<&lang_api::TypeGraphProvider> {
+        Some(self)
+    }
+
+    fn structural_search(&self) -> Option<&dyn StructuralSearchProvider> {
+        Some(&STRUCTURAL_SEARCH)
+    }
+
     fn set_code_vision_settings(&self, settings: lang_api::CodeVisionSettings) {
         self.apply_code_vision_settings(settings);
+    }
+
+    fn inspections(&self) -> Vec<lang_api::InspectionInfo> {
+        crate::inspections::catalog()
+    }
+
+    fn set_inspection_settings(&self, settings: lang_api::InspectionSettings) {
+        self.apply_inspection_settings(&settings);
+    }
+
+    fn inspection_of(&self, code: Option<&str>, message: &str) -> Option<lang_api::InspectionInfo> {
+        crate::inspections::inspection_of(code, message)
+    }
+
+    fn suppression_edit(
+        &self,
+        query: lang_api::SuppressionQuery,
+    ) -> Option<lang_api::DocumentEdit> {
+        crate::inspections::suppression_edit(
+            &query.text,
+            query.offset,
+            query.code.as_deref(),
+            query.target,
+        )
     }
 
     fn inlay_hints(&self) -> Option<&InlayHintProvider> {
@@ -400,6 +445,24 @@ impl LanguageSupport for JavaProject {
         Some(self)
     }
 
+    fn test_form(&self) -> Option<&lang_api::TestFormProvider> {
+        Some(self)
+    }
+
+    fn create_test(&self) -> Option<&lang_api::TestCreateProvider> {
+        Some(self)
+    }
+
+    fn test_framework_fix(&self) -> Option<&lang_api::TestFixProvider> {
+        Some(self)
+    }
+
+    /// Alt+Enter on the name of a type offers Create Test for it.
+    fn can_create_test(&self, text: &str, offset: usize) -> bool {
+        java_syntax::enclosing_type_at(text, offset)
+            .is_some_and(|(_, name)| name.start <= offset && offset <= name.end)
+    }
+
     fn method_hierarchy(&self) -> Option<&MethodHierarchyProvider> {
         Some(self)
     }
@@ -491,6 +554,29 @@ fn repackage(text: &str, package: &str) -> String {
         None => {}
     }
     lines.join(newline)
+}
+
+/// Structural search of the language: the templates and the matcher of `java-syntax`.
+struct JavaStructuralSearch;
+
+static STRUCTURAL_SEARCH: JavaStructuralSearch = JavaStructuralSearch;
+
+impl StructuralSearchProvider for JavaStructuralSearch {
+    fn templates(&self) -> Vec<StructuralTemplate> {
+        java_syntax::ready_templates()
+    }
+
+    fn variables(&self, pattern: &str) -> Result<Vec<String>, String> {
+        java_syntax::structural_variables(pattern)
+    }
+
+    fn find(&self, text: &str, query: &StructuralQuery) -> Result<Vec<StructuralMatch>, String> {
+        java_syntax::structural_find(query, text)
+    }
+
+    fn replace(&self, text: &str, query: &StructuralQuery) -> Result<Vec<StructuralEdit>, String> {
+        java_syntax::structural_replace(query, text)
+    }
 }
 
 #[cfg(test)]

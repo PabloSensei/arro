@@ -10,26 +10,33 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
+use crate::appearance::{
+    TOGGLE_BREADCRUMBS, TOGGLE_DISTRACTION_FREE, TOGGLE_FULL_SCREEN, TOGGLE_GUTTER_ICONS,
+    TOGGLE_INDENT_GUIDES, TOGGLE_LINE_NUMBERS, TOGGLE_NAVIGATION_BAR, TOGGLE_PRESENTATION_MODE,
+    TOGGLE_STATUS_BAR, TOGGLE_STICKY_LINES, TOGGLE_TOOL_WINDOW_BARS, TOGGLE_TOOLBAR,
+    TOGGLE_ZEN_MODE, WindowMode, checked_label,
+};
 use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
 use crate::window::{
-    AI_TOOL, BOOKMARKS_POPUP, BalloonAction, BuildProject, COMMIT_TOOL, ChooseDebugConfiguration,
-    ChooseRunConfiguration, CloseTab, Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug,
-    Dismiss, DockSide, EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup,
-    ForceRunToCursor, ForceStepInto, ForceStepOver, FullyExpandTreeNode, GotoRelated, HTTP_TOOL,
-    HideCoverage, HideToolWindow, LOG_TOOL, MenuRow, MoveToOtherGroup, NewElementSamePlace,
+    AI_TOOL, AboutApp, BOOKMARKS_POPUP, BalloonAction, BringAllToFront, BuildProject, COMMIT_TOOL,
+    CheckForUpdatesApp, ChooseDebugConfiguration, ChooseRunConfiguration, CloseTab, Compile,
+    CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug, Dismiss, DockSide, EditBreakpoint, Evaluate,
+    FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto, ForceStepOver,
+    FullyExpandTreeNode, GotoRelated, HTTP_TOOL, HideApp, HideCoverage, HideOtherApps,
+    HideToolWindow, LOG_TOOL, MenuRow, MinimizeWindow, MoveToOtherGroup, NewElementSamePlace,
     NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL,
     PinTab, PreviousProblem, PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate,
     QuitApp, RUN_TOOL, ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown,
     ResizeToolWindowLeft, ResizeToolWindowRight, ResizeToolWindowUp, Resume, Run,
     RunTestsWithCoverage, RunTestsWithProfiler, RunToCursor, RunWithCoverage, SERVICES_TOOL,
-    STRUCTURE_TOOL, SaveAll, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
+    STRUCTURE_TOOL, SaveAll, ShowAllApps, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
     ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop,
     StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi,
-    ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug, ToggleLog,
-    ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTemporaryLineBreakpoint,
-    ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList,
-    ViewBreakpoints, Workspace,
+    ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug, ToggleFullScreen,
+    ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
+    ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
+    UpdateProject, VcsQuickList, ViewBreakpoints, Workspace, ZoomWindow,
 };
 use crate::window::{
     ENDPOINTS_TOOL, RunWithProfiler, TODO_TOOL, ToggleEndpoints, ToggleHttp, ToggleProblems,
@@ -238,7 +245,11 @@ fn workspace_entry(
 }
 
 /// A row that runs the command the keymap and Find Action know by `id`.
-fn command_entry(weak: &WeakEntity<Workspace>, id: &'static str, label: &'static str) -> MenuEntry {
+fn command_entry(
+    weak: &WeakEntity<Workspace>,
+    id: &'static str,
+    label: impl Into<SharedString>,
+) -> MenuEntry {
     let weak = weak.clone();
     MenuEntry::new(label, move |window, cx| {
         weak.update(cx, |this, cx| {
@@ -708,19 +719,22 @@ impl Workspace {
             .gap(px(SPACE_XS))
             .child(search)
             .child(settings);
+        let controls = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.toolbar_visible);
         let right = div()
             .relative()
             .flex()
             .items_center()
-            .child(self.run_widget(theme, cx))
-            .child(
+            .children(controls.then(|| self.run_widget(theme, cx)))
+            .children(controls.then(|| {
                 div()
                     .w(px(DIVIDER_WIDTH))
                     .h(px(DIVIDER))
                     .mx(px((SPACE_L - DIVIDER_WIDTH) / 2.))
-                    .bg(theme.border),
-            )
-            .child(tools)
+                    .bg(theme.border)
+            }))
+            .children(controls.then_some(tools))
             .children(own_chrome().then_some(window_buttons));
 
         #[cfg(unix)]
@@ -759,9 +773,13 @@ impl Workspace {
                         TRAFFIC_LIGHTS_ROOM + SPACE_M
                     }))
                     .children(own_chrome().then(|| self.menu_bar(window, theme, cx)))
-                    .child(project.ml(px(SPACE_L)))
-                    .child(channel.ml(px(SPACE_XS)))
-                    .children(branch.map(|branch| branch.ml(px(SPACE_L)))),
+                    .children(controls.then(|| project.ml(px(SPACE_L))))
+                    .children(controls.then(|| channel.ml(px(SPACE_XS))))
+                    .children(
+                        controls
+                            .then(|| branch.map(|branch| branch.ml(px(SPACE_L))))
+                            .flatten(),
+                    ),
             )
             .children(titlebar_drag)
             .child(right)
@@ -1005,6 +1023,16 @@ impl Workspace {
         id: &'static str,
         label: &'static str,
     ) -> MenuEntry {
+        self.command_row_named(weak, id, label)
+    }
+
+    /// The same row with a label the window builds, such as a switch with its check.
+    fn command_row_named(
+        &self,
+        weak: &WeakEntity<Workspace>,
+        id: &'static str,
+        label: impl Into<SharedString>,
+    ) -> MenuEntry {
         let mut entry = if self.commands().get(id).is_some() {
             command_entry(weak, id, label)
         } else {
@@ -1126,8 +1154,7 @@ impl Workspace {
     pub(crate) fn refresh_platform_menus(&self, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         {
-            let sections = self.main_menu(cx);
-            let screen = crate::native_menu::menus(self.info().name, &sections);
+            let screen = self.screen_menus(cx);
             // The hints come before the menus: the platform reads the keymap when it
             // builds them and makes the key it finds the key equivalent of the row.
             crate::native_menu::add_hints(cx, &screen.hints);
@@ -1137,6 +1164,13 @@ impl Workspace {
         let _ = cx;
     }
 
+    /// The menus the platform shows on macOS: the menu of the application and the sections
+    /// of the menu of the window. The window list is added to Window by the system.
+    pub fn screen_menus(&self, cx: &mut Context<Self>) -> crate::native_menu::ScreenMenus {
+        let sections = self.main_menu(cx);
+        crate::native_menu::menus(self.info().name, &sections)
+    }
+
     /// The sections of the main menu, in IDEA's order, with the rows the window can run.
     pub fn main_menu(&self, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let weak = cx.weak_entity();
@@ -1144,10 +1178,93 @@ impl Workspace {
 
         let recent = self.recent_project_entries(&weak);
 
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let mode = self.window_mode();
+        let full_screen = if self.full_screen() {
+            "Exit Full Screen"
+        } else {
+            "Enter Full Screen"
+        };
+        let presentation = if mode == WindowMode::Presentation {
+            "Exit Presentation Mode"
+        } else {
+            "Enter Presentation Mode"
+        };
+        let distraction_free = if mode == WindowMode::DistractionFree {
+            "Exit Distraction Free Mode"
+        } else {
+            "Enter Distraction Free Mode"
+        };
+        let zen = if mode == WindowMode::Zen {
+            "Exit Zen Mode"
+        } else {
+            "Enter Zen Mode"
+        };
+        let appearance = MenuEntry::submenu(
+            "Appearance",
+            vec![
+                self.command_row_named(&weak, TOGGLE_PRESENTATION_MODE, presentation),
+                self.command_row_named(&weak, TOGGLE_DISTRACTION_FREE, distraction_free),
+                self.command_row_named(&weak, TOGGLE_FULL_SCREEN, full_screen),
+                self.command_row_named(&weak, TOGGLE_ZEN_MODE, zen),
+                MenuEntry::separator(),
+                self.command_row(&weak, editor_keys::TOGGLE_WHITESPACE, "Show Whitespaces"),
+                self.command_row(&weak, editor_keys::TOGGLE_SOFT_WRAP, "Soft-Wrap"),
+                MenuEntry::separator(),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_TOOLBAR,
+                    checked_label("Toolbar", settings.toolbar_visible),
+                ),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_TOOL_WINDOW_BARS,
+                    checked_label("Tool Window Bars", settings.tool_window_bars_visible),
+                ),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_STATUS_BAR,
+                    checked_label("Status Bar", settings.status_bar_visible),
+                ),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_NAVIGATION_BAR,
+                    checked_label("Navigation Bar", settings.navigation_bar_visible),
+                ),
+                MenuEntry::separator(),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_LINE_NUMBERS,
+                    checked_label("Line Numbers", settings.show_line_numbers),
+                ),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_GUTTER_ICONS,
+                    checked_label("Gutter Icons", settings.show_gutter_icons),
+                ),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_INDENT_GUIDES,
+                    checked_label("Indent Guides", settings.show_indent_guides),
+                ),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_BREADCRUMBS,
+                    checked_label("Breadcrumbs", settings.show_breadcrumbs),
+                ),
+                self.command_row_named(
+                    &weak,
+                    TOGGLE_STICKY_LINES,
+                    checked_label("Sticky Lines", settings.show_sticky_lines),
+                ),
+            ],
+        );
+
         let file = MenuEntry::submenu(
             "File",
             vec![
                 self.action_row("Open Folder...", OpenFolder),
+                MenuEntry::submenu("New", vec![command("file.new_project", "Project...")]),
                 command("file.open", "Open..."),
                 self.action_row("Save All", SaveAll),
                 command(workspace_keys::SAVE_AS, "Save As..."),
@@ -1176,6 +1293,14 @@ impl Workspace {
                     })
                 },
                 command("app.exit", "Exit"),
+                MenuEntry::separator(),
+                MenuEntry::submenu(
+                    "Manage IDE Settings",
+                    vec![
+                        command("settings.export", "Export Settings..."),
+                        command("settings.import", "Import Settings..."),
+                    ],
+                ),
             ],
         );
 
@@ -1197,6 +1322,8 @@ impl Workspace {
                 command(editor_keys::REPLACE, "Replace..."),
                 command(workspace_keys::FIND_IN_FILES, "Find in Files..."),
                 command(workspace_keys::REPLACE_IN_FILES, "Replace in Files..."),
+                command("workspace.search_structurally", "Search Structurally..."),
+                command("workspace.replace_structurally", "Replace Structurally..."),
                 MenuEntry::separator(),
                 command(editor_keys::SELECT_ALL, "Select All"),
                 command(editor_keys::EXTEND_SELECTION, "Extend Selection"),
@@ -1268,13 +1395,7 @@ impl Workspace {
             "View",
             vec![
                 tool_windows,
-                MenuEntry::submenu(
-                    "Appearance",
-                    vec![
-                        command(editor_keys::TOGGLE_WHITESPACE, "Show Whitespaces"),
-                        command(editor_keys::TOGGLE_SOFT_WRAP, "Soft-Wrap"),
-                    ],
-                ),
+                appearance,
                 MenuEntry::separator(),
                 command(workspace_keys::RECENT_FILES, "Recent Files"),
                 command(workspace_keys::RECENT_LOCATIONS, "Recent Locations"),
@@ -1468,6 +1589,8 @@ impl Workspace {
                 command("git.abort", "Abort Merge or Rebase"),
                 MenuEntry::separator(),
                 command("git.show_file_history", "Show History"),
+                command("git.show_selection_history", "Show History for Selection"),
+                command("git.show_method_history", "Show History for Method"),
                 command("git.show_log", "Git Log"),
                 command(workspace_keys::ROLLBACK_CHANGED_LINES, "Revert Change"),
             ],
@@ -2124,18 +2247,22 @@ impl Workspace {
             None => body.child(self.welcome(theme)).into_any_element(),
         };
         let down = self.split_down;
-        let bar = self.panes[pane].bar.clone().map_or_else(
-            || div().into_any_element(),
-            |bar| {
-                bar.cached(
-                    StyleRefinement::default()
-                        .w_full()
-                        .h(px(HEADER_HEIGHT))
-                        .flex_none(),
-                )
-                .into_any_element()
-            },
-        );
+        let bar = if self.distraction_free() {
+            div().into_any_element()
+        } else {
+            self.panes[pane].bar.clone().map_or_else(
+                || div().into_any_element(),
+                |bar| {
+                    bar.cached(
+                        StyleRefinement::default()
+                            .w_full()
+                            .h(px(HEADER_HEIGHT))
+                            .flex_none(),
+                    )
+                    .into_any_element()
+                },
+            )
+        };
         island(theme)
             .flex_1()
             .min_w_0()
@@ -2403,6 +2530,15 @@ impl Render for Workspace {
             .map_or(1., |settings| settings.ui_scale);
         window.set_rem_size(px(16. * scale));
         let viewport = window.viewport_size();
+        let (shows_stripes, shows_status) = {
+            let settings = cx.try_global::<Settings>();
+            let distraction = self.distraction_free();
+            (
+                !distraction && settings.is_none_or(|settings| settings.tool_window_bars_visible),
+                !distraction && settings.is_none_or(|settings| settings.status_bar_visible),
+            )
+        };
+        let distraction = self.distraction_free();
         let (left_panel, right_panel, bottom_panel) = match self.maximized_tool_window() {
             Some(DockSide::Left) => (
                 f32::from(viewport.width) - STRIPE_WIDTH - RIGHT_STRIPE_WIDTH,
@@ -2420,6 +2556,11 @@ impl Render for Workspace {
                 f32::from(viewport.height) - TOOLBAR_HEIGHT - STATUS_HEIGHT,
             ),
             None => (self.left.size, self.right.size, self.bottom.size),
+        };
+        let (left_panel, right_panel, bottom_panel) = if distraction {
+            (0., 0., 0.)
+        } else {
+            (left_panel, right_panel, bottom_panel)
         };
         let upper = div()
             .flex()
@@ -2648,6 +2789,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &Synchronize, window, cx| {
                 this.run_command("file.reload_all", window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
+                this.toggle_full_screen(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &Stop, window, cx| this.stop_run(window, cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_tool(AI_TOOL, window, cx)),
@@ -2658,6 +2802,17 @@ impl Render for Workspace {
                 cx.listener(|this, row: &MenuRow, window, cx| this.run_menu_row(row, window, cx)),
             )
             .on_action(cx.listener(|_, _: &QuitApp, _, cx| cx.quit()))
+            .on_action(cx.listener(|this, _: &AboutApp, window, cx| this.show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &CheckForUpdatesApp, _, cx| this.check_updates(cx)))
+            .on_action(cx.listener(|_, _: &HideApp, _, cx| cx.hide()))
+            .on_action(cx.listener(|_, _: &HideOtherApps, _, cx| cx.hide_other_apps()))
+            .on_action(cx.listener(|_, _: &ShowAllApps, _, cx| cx.unhide_other_apps()))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| window.minimize_window()))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _| window.zoom_window()))
+            .on_action(cx.listener(|_, _: &BringAllToFront, window, cx| {
+                cx.activate(true);
+                window.activate_window();
+            }))
             .on_action(
                 cx.listener(|this, _: &HideToolWindow, window, cx| {
                     this.hide_active_tool(window, cx)
@@ -2766,7 +2921,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(
+                    .children(shows_stripes.then(|| {
                         self.left_stripe_view
                             .clone()
                             .cached(
@@ -2775,8 +2930,8 @@ impl Render for Workspace {
                                     .h_full()
                                     .flex_none(),
                             )
-                            .into_any_element(),
-                    )
+                            .into_any_element()
+                    }))
                     .child(
                         div()
                             .flex()
@@ -2786,7 +2941,7 @@ impl Render for Workspace {
                             .child(upper)
                             .child(lower),
                     )
-                    .child(
+                    .children((shows_stripes).then(|| {
                         self.right_stripe_view
                             .clone()
                             .cached(
@@ -2795,10 +2950,10 @@ impl Render for Workspace {
                                     .h_full()
                                     .flex_none(),
                             )
-                            .into_any_element(),
-                    ),
+                            .into_any_element()
+                    })),
             )
-            .child(
+            .children(shows_status.then(|| {
                 self.status_view
                     .clone()
                     .cached(
@@ -2807,8 +2962,8 @@ impl Render for Workspace {
                             .h(px(STATUS_HEIGHT))
                             .flex_none(),
                     )
-                    .into_any_element(),
-            )
+                    .into_any_element()
+            }))
             .children(self.overlay_element(&theme, window, cx))
             .children(self.balloon_element(&theme, cx))
     }
@@ -3170,6 +3325,7 @@ impl Render for StatusBarView {
             eol_anchor,
             enc_anchor,
             indent_anchor,
+            zoom_notice,
         ) = {
             let workspace = workspace.read(cx);
             (
@@ -3186,6 +3342,7 @@ impl Render for StatusBarView {
                 workspace.st_eol_anchor.clone(),
                 workspace.st_enc_anchor.clone(),
                 workspace.st_indent_anchor.clone(),
+                workspace.zoom_notice().cloned(),
             )
         };
         #[cfg(any(test, feature = "test-support"))]
@@ -3213,6 +3370,9 @@ impl Render for StatusBarView {
                 ));
             }
         }
+        let zoom = zoom_notice.map(|text| {
+            status_widget("st-zoom", text, &theme).debug_selector(|| "st-zoom".to_owned())
+        });
         let language = language_status.map(|text| {
             let widget = status_widget("st-language", text, &theme)
                 .debug_selector(|| "st-language".to_owned());
@@ -3356,6 +3516,7 @@ impl Render for StatusBarView {
             .flex()
             .items_center()
             .gap(px(SPACE_L))
+            .children(zoom)
             .children(language)
             .children(editor);
         div()

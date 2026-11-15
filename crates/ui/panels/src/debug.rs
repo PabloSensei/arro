@@ -12,7 +12,7 @@ use std::time::Duration;
 use dap_client::{
     Breakpoint, BreakpointSpec, Command, ConsoleLine, DataAccessType, DataBreakpointSpec,
     DebugService, DebugSessionToken, DebugState, Debugger, Frame, FunctionBreakpointSpec, Scope,
-    Snapshot, StepTarget, Thread, Variable,
+    Snapshot, StepTarget, Thread, TypeRenderer, Variable,
 };
 use runner::{Console, ConsoleEvent, RunPlan, Step, Stream};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,10 @@ use crate::prompt::Prompt;
 
 const CONTEXT: &str = "DebugPanel";
 
-actions!(debug_panel, [NewWatch, DeleteWatch, SetValue, CancelInput]);
+actions!(
+    debug_panel,
+    [NewWatch, DeleteWatch, SetValue, MarkObject, CancelInput]
+);
 
 macro_rules! debug_keys {
     ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
@@ -72,6 +75,7 @@ macro_rules! debug_keys {
 debug_keys![
     ("insert", NewWatch, Some("XDebugger.NewWatch"), None),
     ("f2", SetValue, Some("XDebugger.SetValue"), None),
+    ("f11", MarkObject, None, Some("f11")),
     ("delete", DeleteWatch, None, Some("delete")),
     ("escape", CancelInput, None, Some("escape")),
 ];
@@ -178,6 +182,47 @@ fn enabled() -> bool {
 fn is_main_frame(frame: &Frame) -> bool {
     let name = frame.name.trim();
     name == "main" || name.starts_with("main(") || name.contains(".main(")
+}
+
+/// An inline watch the user set in this project: an expression and the line it names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct InlineWatchSetting {
+    file: PathBuf,
+    /// The line, from one.
+    line: u32,
+    expression: String,
+}
+
+/// The name the user gave an object, kept by what the program says the object is rather
+/// than by a handle of the adapter: a handle may name another value at the next stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObjectLabel {
+    name: String,
+    type_name: String,
+    /// The number the language expression gave for the object.
+    identity: i64,
+}
+
+/// A question about the identity of a value the tree or a watch shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IdentityQuestion {
+    reference: i64,
+}
+
+/// A value the window shows, whose identity it may need: the handle and the expression
+/// that names the value in its frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShownObject {
+    reference: i64,
+    name: String,
+}
+
+/// Whether two type names are the same type. A nested type is written with `.` in one
+/// place and `$` in another; both name the same type.
+fn same_type(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    !left.is_empty() && left.replace('$', ".") == right.replace('$', ".")
 }
 
 impl BreakpointSetting {
@@ -381,6 +426,8 @@ struct SavedState {
     function_breakpoints: Vec<FunctionBreakpointSetting>,
     data_breakpoints: Vec<DataBreakpointSetting>,
     exception_filters: Vec<String>,
+    #[serde(default)]
+    inline_watches: Vec<InlineWatchSetting>,
 }
 
 fn state_key(root: &Path) -> String {
@@ -430,6 +477,11 @@ struct VariableTarget {
     reference: i64,
     name: String,
     value: String,
+    /// The handle of the value itself, zero for a primitive.
+    object: i64,
+    type_name: String,
+    /// The expression that names the value in its frame, when the adapter sent one.
+    evaluate_name: Option<String>,
 }
 
 /// A value being typed in place of its row.
@@ -480,6 +532,36 @@ pub struct DebugPanel {
     /// Filters of the adapter the user turned on.
     enabled_filters: BTreeSet<String>,
     watch: Vec<String>,
+    /// Inline watches of this project, kept until the user removes them.
+    inline_watches: Vec<InlineWatchSetting>,
+    /// Labels the user gave objects of this session, by the identity the program keeps
+    /// for each object.
+    labels: Vec<ObjectLabel>,
+    /// The identity of the objects the adapter shows at the current stop, by handle. A
+    /// handle may name another object at the next stop, so the map is emptied then.
+    identities: BTreeMap<i64, Option<i64>>,
+    /// The identity questions the panel waits for, by the number the session got.
+    identity_questions: BTreeMap<u64, IdentityQuestion>,
+    /// Marks whose identity was asked but has not arrived yet: the request, the name the
+    /// user gave and the type of the object.
+    pending_marks: Vec<(u64, String, String)>,
+    /// The stop the identity map belongs to.
+    identity_stop: u64,
+    /// The number of the next identity question.
+    next_identity: u64,
+    /// The hide setting of this session when the button changed it; `None` follows the
+    /// window setting.
+    hide_library_frames: Option<bool>,
+    /// The first frame of each library group the user opened.
+    expanded_library_groups: BTreeSet<i64>,
+    /// The renderers the language offers, sent to the session beside the user rules.
+    language_renderers: Vec<TypeRenderer>,
+    /// The service of the current session, for the probes the language answers.
+    service: Option<Arc<dyn DebugService>>,
+    /// The renderers the last stop was asked for, so an unchanged list is not sent again.
+    sent_renderers: Vec<TypeRenderer>,
+    /// The inline watch expressions the session already has.
+    sent_inline_watches: Vec<String>,
     expanded: BTreeSet<i64>,
     /// The breakpoints of the last snapshot, to notice the adapter's answers.
     shown_breakpoints: Vec<Breakpoint>,
@@ -520,7 +602,7 @@ pub struct DebugPanel {
     scroll_variables: ScrollHandle,
     scroll_watch: ScrollHandle,
     /// The values of the frame at the last stop, by name, for the colour of changed ones.
-    stop_values: BTreeMap<String, String>,
+    stop_values: BTreeMap<String, (i64, String, String)>,
     /// The names whose value differs from the previous stop.
     changed_values: BTreeSet<String>,
     /// The stop whose values are in `stop_values`; zero before the first stop.
@@ -564,6 +646,19 @@ impl DebugPanel {
             data_breakpoints: saved.data_breakpoints,
             enabled_filters: saved.exception_filters.into_iter().collect(),
             watch: Vec::new(),
+            inline_watches: saved.inline_watches,
+            labels: Vec::new(),
+            identities: BTreeMap::new(),
+            identity_questions: BTreeMap::new(),
+            pending_marks: Vec::new(),
+            identity_stop: 0,
+            next_identity: 1,
+            hide_library_frames: None,
+            expanded_library_groups: BTreeSet::new(),
+            language_renderers: Vec::new(),
+            service: None,
+            sent_renderers: Vec::new(),
+            sent_inline_watches: Vec::new(),
             expanded: BTreeSet::new(),
             shown_breakpoints: Vec::new(),
             shown_function_breakpoints: Vec::new(),
@@ -623,11 +718,13 @@ impl DebugPanel {
         let changed = &self.changed_values;
         self.frame_values()
             .into_iter()
-            .map(|(name, value)| editor_view::DebugValue {
-                changed: changed.contains(&name),
-                name,
-                value,
-            })
+            .map(
+                |(name, (reference, type_name, value))| editor_view::DebugValue {
+                    changed: changed.contains(&name),
+                    name,
+                    value: self.display_value(reference, &type_name, &value),
+                },
+            )
             .collect()
     }
 
@@ -652,7 +749,7 @@ impl DebugPanel {
 
     /// The values of the scopes of the selected frame, by name. A name of the locals
     /// wins over a field of the same name, as the debugger names the one in force.
-    fn frame_values(&self) -> BTreeMap<String, String> {
+    fn frame_values(&self) -> BTreeMap<String, (i64, String, String)> {
         let mut values = BTreeMap::new();
         for scope in &self.snapshot.scopes {
             let Some(variables) = self.snapshot.variables.get(&scope.reference) else {
@@ -662,12 +759,36 @@ impl DebugPanel {
                 if variable.name.is_empty() || variable.name == "this" {
                     continue;
                 }
-                values
-                    .entry(variable.name.clone())
-                    .or_insert_with(|| variable.value.clone());
+                values.entry(variable.name.clone()).or_insert_with(|| {
+                    (
+                        variable.reference,
+                        variable.type_name.clone(),
+                        variable.value.clone(),
+                    )
+                });
             }
         }
         values
+    }
+
+    /// The value as the tree shows it: with the label of the object, if the user marked
+    /// the object this handle names at this stop.
+    fn display_value(&self, reference: i64, type_name: &str, value: &str) -> String {
+        match self.label(reference, type_name) {
+            Some(label) => format!("{value} ({label}_DebugLabel)"),
+            None => value.to_owned(),
+        }
+    }
+
+    /// The label of the object a handle names at this stop, when that object was marked.
+    /// The identity the program gave for the handle is the key; the type guards against
+    /// two objects of different types with the same number.
+    fn label(&self, reference: i64, type_name: &str) -> Option<&str> {
+        let identity = self.identities.get(&reference).copied().flatten()?;
+        self.labels
+            .iter()
+            .find(|label| label.identity == identity && same_type(&label.type_name, type_name))
+            .map(|label| label.name.as_str())
     }
 
     /// Whether a scope or a variable of the tree is open, for tests.
@@ -678,6 +799,275 @@ impl DebugPanel {
     /// The watch expressions the window keeps, for tests.
     pub fn watch_expressions(&self) -> Vec<String> {
         self.watch.clone()
+    }
+
+    /// The inline watch expressions of this project, for tests.
+    pub fn inline_watches(&self) -> Vec<String> {
+        self.inline_watches
+            .iter()
+            .map(|watch| watch.expression.clone())
+            .collect()
+    }
+
+    /// The value of a variable as the tree shows it, for tests.
+    #[cfg(test)]
+    pub(crate) fn variable_value_for_test(&self, reference: i64, name: &str) -> Option<String> {
+        let variable = self
+            .snapshot
+            .variables
+            .get(&reference)?
+            .iter()
+            .find(|variable| variable.name == name)?;
+        Some(self.display_value(variable.reference, &variable.type_name, &variable.value))
+    }
+
+    /// The label of an object, for tests.
+    #[cfg(test)]
+    pub(crate) fn label_for_test(&self, reference: i64) -> Option<String> {
+        let identity = self.identities.get(&reference).copied().flatten()?;
+        self.labels
+            .iter()
+            .find(|label| label.identity == identity)
+            .map(|label| label.name.clone())
+    }
+
+    /// The identity the program gave for a handle at this stop, for tests.
+    #[cfg(test)]
+    pub(crate) fn identity_for_test(&self, reference: i64) -> Option<i64> {
+        self.identities.get(&reference).copied().flatten()
+    }
+
+    /// The objects the window shows whose type has a mark: the variables of every scope
+    /// and of the open objects, the watch list, the inline watches and the popup. A value
+    /// the adapter gave no expression for cannot be asked for its identity.
+    fn shown_objects(&self) -> Vec<ShownObject> {
+        if self.labels.is_empty() {
+            return Vec::new();
+        }
+        let marked = |type_name: &str| {
+            self.labels
+                .iter()
+                .any(|label| same_type(&label.type_name, type_name))
+        };
+        let mut shown = Vec::new();
+        let mut push = |variable: &Variable| {
+            let Some(name) = variable
+                .evaluate_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            else {
+                return;
+            };
+            if variable.reference != 0 && marked(&variable.type_name) {
+                shown.push(ShownObject {
+                    reference: variable.reference,
+                    name: name.to_owned(),
+                });
+            }
+        };
+        // The variables of a scope stand in the inline values of the editor even when
+        // the scope is folded, so every scope is read rather than only the open ones.
+        for scope in &self.snapshot.scopes {
+            if let Some(variables) = self.snapshot.variables.get(&scope.reference) {
+                let mut open = vec![variables];
+                while let Some(variables) = open.pop() {
+                    for variable in variables {
+                        push(variable);
+                        if variable.reference != 0
+                            && self.expanded.contains(&variable.reference)
+                            && let Some(children) = self.snapshot.variables.get(&variable.reference)
+                        {
+                            open.push(children);
+                        }
+                    }
+                }
+            }
+        }
+        for watch in self
+            .snapshot
+            .watch
+            .iter()
+            .chain(&self.snapshot.inline_watch)
+        {
+            if watch.reference != 0 && marked(&watch.type_name) {
+                shown.push(ShownObject {
+                    reference: watch.reference,
+                    name: watch.expression.clone(),
+                });
+            }
+        }
+        if let Some(evaluation) = &self.snapshot.evaluation
+            && evaluation.reference != 0
+            && marked(&evaluation.type_name)
+        {
+            shown.push(ShownObject {
+                reference: evaluation.reference,
+                name: evaluation.expression.clone(),
+            });
+        }
+        shown
+    }
+
+    /// Asks the program for the identity of the objects it shows, so a mark appears on
+    /// the object it was put on rather than on a handle the adapter reused. The answers
+    /// of a stop are kept in `identities`; a new stop forgets them.
+    fn sync_identities(&mut self, cx: &mut Context<Self>) {
+        if self.identity_stop != self.snapshot.stops {
+            self.identity_stop = self.snapshot.stops;
+            self.identities.clear();
+            self.identity_questions.clear();
+        }
+        let answers = self.snapshot.identities.clone();
+        let mut changed = false;
+        let mut waiting = Vec::new();
+        for (request, name, type_name) in std::mem::take(&mut self.pending_marks) {
+            let Some(answer) = answers.get(&request) else {
+                waiting.push((request, name, type_name));
+                continue;
+            };
+            changed = true;
+            match answer.identity {
+                Some(identity) => self.labels.push(ObjectLabel {
+                    name,
+                    type_name,
+                    identity,
+                }),
+                None => {
+                    let reason = answer
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "the program gave no number for the object".to_owned());
+                    self.local_console
+                        .push(ConsoleLine::new(format!("Mark Object: {reason}"), true));
+                    self.trim_console();
+                }
+            }
+        }
+        self.pending_marks = waiting;
+        let answered: Vec<u64> = self
+            .identity_questions
+            .iter()
+            .filter(|(request, _)| answers.contains_key(request))
+            .map(|(request, _)| *request)
+            .collect();
+        for request in answered {
+            if let Some(question) = self.identity_questions.remove(&request)
+                && let Some(answer) = answers.get(&request)
+            {
+                self.identities.insert(question.reference, answer.identity);
+                changed = true;
+            }
+        }
+        if matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            let mut asked = false;
+            for object in self.shown_objects() {
+                if self.identities.contains_key(&object.reference)
+                    || self
+                        .identity_questions
+                        .values()
+                        .any(|question| question.reference == object.reference)
+                {
+                    continue;
+                }
+                let expression = self
+                    .service
+                    .as_ref()
+                    .and_then(|service| service.object_identity_expression(&object.name));
+                let Some(expression) = expression else {
+                    continue;
+                };
+                let request = self.next_identity;
+                self.next_identity += 1;
+                self.identity_questions.insert(
+                    request,
+                    IdentityQuestion {
+                        reference: object.reference,
+                    },
+                );
+                self.send(
+                    Command::EvaluateIdentity {
+                        request,
+                        expression,
+                    },
+                    cx,
+                );
+                asked = true;
+            }
+            if asked {
+                // The identity of a value may arrive after the values of the stop: the
+                // tree draws the mark when it does.
+                cx.notify();
+            }
+        }
+        if changed {
+            cx.emit(ValuesChanged);
+            cx.notify();
+        }
+    }
+
+    /// The renderers of the window: the rules of the language first, then the rules of
+    /// the settings, which win for the same type.
+    fn type_renderers(&self, cx: &App) -> Vec<TypeRenderer> {
+        let text = cx
+            .try_global::<workspace::Settings>()
+            .map(|settings| settings.debug_type_renderers.clone())
+            .unwrap_or_default();
+        let mut renderers = self.language_renderers.clone();
+        for mut renderer in parse_renderers(&text) {
+            renderer.subtype_probe = self
+                .service
+                .as_ref()
+                .and_then(|service| service.subtype_probe(&renderer.type_name));
+            if let Some(index) = renderers
+                .iter()
+                .position(|existing| existing.matches(&renderer.type_name))
+            {
+                renderers[index] = renderer;
+            } else {
+                renderers.push(renderer);
+            }
+        }
+        renderers
+    }
+
+    /// Sends the language and settings renderers to the session when they changed.
+    fn sync_renderers(&mut self, cx: &mut Context<Self>) {
+        let renderers = self.type_renderers(cx);
+        if renderers == self.sent_renderers {
+            return;
+        }
+        self.sent_renderers = renderers.clone();
+        self.send(Command::SetTypeRenderers(renderers), cx);
+        if matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            let mut references: Vec<i64> = self
+                .snapshot
+                .scopes
+                .iter()
+                .map(|scope| scope.reference)
+                .collect();
+            references.extend(self.expanded.iter().copied().filter(|key| *key > 0));
+            references.sort_unstable();
+            references.dedup();
+            for reference in references {
+                self.send(Command::Expand(reference), cx);
+            }
+        }
+    }
+
+    /// Sends the inline watch expressions of the project to the session when a session
+    /// starts or the list changes.
+    fn sync_inline_watches(&mut self, cx: &mut Context<Self>) {
+        let expressions: Vec<String> = self
+            .inline_watches
+            .iter()
+            .map(|watch| watch.expression.clone())
+            .collect();
+        if expressions == self.sent_inline_watches {
+            return;
+        }
+        self.sent_inline_watches = expressions.clone();
+        self.send(Command::SetInlineWatches(expressions), cx);
     }
 
     /// The lines of the debug console, for tests.
@@ -701,17 +1091,26 @@ impl DebugPanel {
     /// scrolled out of the window.
     #[cfg(test)]
     pub fn select_variable_for_test(&mut self, reference: i64, name: &str) {
-        let value = self
+        let variable = self
             .snapshot
             .variables
             .get(&reference)
-            .and_then(|variables| variables.iter().find(|variable| variable.name == name))
+            .and_then(|variables| variables.iter().find(|variable| variable.name == name));
+        let value = variable
             .map(|variable| variable.value.clone())
             .unwrap_or_default();
+        let object = variable.map(|variable| variable.reference).unwrap_or(0);
+        let type_name = variable
+            .map(|variable| variable.type_name.clone())
+            .unwrap_or_default();
+        let evaluate_name = variable.and_then(|variable| variable.evaluate_name.clone());
         self.selected_variable = Some(VariableTarget {
             reference,
             name: name.to_owned(),
             value,
+            object,
+            type_name,
+            evaluate_name,
         });
     }
 
@@ -807,6 +1206,8 @@ impl DebugPanel {
         project: Option<String>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        self.language_renderers = service.type_renderers();
+        self.service = Some(service.clone());
         let debugger = service.attach_with_breakpoints(
             host,
             port,
@@ -834,6 +1235,8 @@ impl DebugPanel {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let session = service.begin_session();
+        self.language_renderers = service.type_renderers();
+        self.service = Some(service.clone());
         let debugger = service.attach_ready_with_breakpoints(
             host,
             port,
@@ -871,6 +1274,15 @@ impl DebugPanel {
         self.variable_edit = None;
         self.watch_input = None;
         self.selected_watch = None;
+        self.labels.clear();
+        self.identities.clear();
+        self.identity_questions.clear();
+        self.pending_marks.clear();
+        self.identity_stop = 0;
+        self.next_identity = 1;
+        self.expanded_library_groups.clear();
+        self.sent_renderers.clear();
+        self.sent_inline_watches.clear();
         self.temporary = None;
         self.forced_step = None;
         self.seen_stops = 0;
@@ -894,6 +1306,8 @@ impl DebugPanel {
         let Some(pending) = self.pending.take() else {
             return;
         };
+        self.language_renderers = pending.service.type_renderers();
+        self.service = Some(pending.service.clone());
         match pending.service.start_with_breakpoints(
             pending.program,
             pending.name,
@@ -1588,6 +2002,7 @@ impl DebugPanel {
             function_breakpoints: self.function_breakpoints.clone(),
             data_breakpoints: self.data_breakpoints.clone(),
             exception_filters: self.filter_list(),
+            inline_watches: self.inline_watches.clone(),
         };
         let Ok(json) = serde_json::to_string(&saved) else {
             return;
@@ -1602,6 +2017,10 @@ impl DebugPanel {
         if let Some(reason) = self.debugger.as_ref().and_then(Debugger::take_input_error) {
             self.input_error_line(&reason);
             build_changed = true;
+        }
+        if self.debugger.is_some() {
+            self.sync_renderers(cx);
+            self.sync_inline_watches(cx);
         }
         let Some(debugger) = &self.debugger else {
             if matches!(self.snapshot.state, DebugState::Terminated) {
@@ -1634,6 +2053,7 @@ impl DebugPanel {
         // thousand threads here would be the work the grouping avoids.
         self.snapshot = (*snapshot).clone();
         self.merge_console();
+        self.sync_identities(cx);
         // A program that reads its input needs the line of the console at hand.
         if self.takes_input() && self.front != Front::Console {
             self.front = Front::Console;
@@ -1678,11 +2098,15 @@ impl DebugPanel {
                 .filter(|(name, value)| {
                     self.stop_values
                         .get(*name)
-                        .is_some_and(|previous| previous != *value)
+                        .is_some_and(|previous| previous.2 != value.2)
                 })
                 .map(|(name, _)| name.clone())
                 .collect();
             self.stop_values = current;
+            true
+        } else if stopped && !self.snapshot.frames.is_empty() {
+            // A later snapshot of the same stop may carry the values of a new inline
+            // watch or of a renderer.
             true
         } else if !stopped && self.values_stop != 0 {
             self.values_stop = 0;
@@ -1896,10 +2320,16 @@ impl DebugPanel {
             .ok();
     }
 
-    /// The context menu of a frame: Drop Frame, when the adapter allows it.
+    /// The context menu of a frame: Copy Stack and Drop Frame, when the adapter allows
+    /// the restart. The adapter offers no request that returns from a method early, so
+    /// there is no row for it: a row that silently did nothing else would lie.
     fn frame_menu(&mut self, frame: Frame, position: Point<Pixels>, cx: &mut Context<Self>) {
         let panel = cx.weak_entity();
         let frame_id = frame.id;
+        let copy_panel = panel.clone();
+        let copy = MenuEntry::new("Copy Stack", move |_, cx| {
+            copy_panel.update(cx, |panel, cx| panel.copy_stack(cx)).ok();
+        });
         let entry = if self.restart_frame_enabled_for(&frame) {
             MenuEntry::new("Drop Frame", move |_, cx| {
                 panel
@@ -1911,12 +2341,12 @@ impl DebugPanel {
         };
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_menu(position, vec![entry], cx)
+                workspace.show_menu(position, vec![copy, entry], cx)
             })
             .ok();
     }
 
-    /// The context menu of a variable: Set Value and Add Field Watchpoint.
+    /// The context menu of a variable: Mark Object, Set Value and Add Field Watchpoint.
     fn variable_menu(
         &mut self,
         target: VariableTarget,
@@ -1934,6 +2364,21 @@ impl DebugPanel {
                 })
                 .ok();
         });
+        let mark_panel = panel.clone();
+        let mark_target = target.clone();
+        let mark = if self.can_mark(&target) {
+            MenuEntry::new("Mark Object", move |window, cx| {
+                mark_panel
+                    .update(cx, |panel, cx| {
+                        panel.mark_object(mark_target.clone(), window, cx)
+                    })
+                    .ok();
+            })
+        } else {
+            // A value without an expression of its own cannot be asked for its identity,
+            // and a mark that would follow a reused handle would lie.
+            MenuEntry::disabled("Mark Object (the adapter gives no expression for this value)")
+        };
         let set_panel = panel;
         let set = MenuEntry::new("Set Value", move |_, cx| {
             set_panel
@@ -1945,7 +2390,7 @@ impl DebugPanel {
         });
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_menu(position, vec![watch, set], cx)
+                workspace.show_menu(position, vec![mark, watch, set], cx)
             })
             .ok();
     }
@@ -1957,6 +2402,192 @@ impl DebugPanel {
 
     pub fn pause(&mut self, cx: &mut Context<Self>) {
         self.send(Command::Pause, cx);
+    }
+
+    /// F11: gives the selected object a name that every value with the same identity shows.
+    pub(crate) fn mark_selected_object(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(target) = self.selected_variable.clone()
+            && self.can_mark(&target)
+        {
+            self.mark_object(target, window, cx);
+        }
+    }
+
+    /// Whether the value can be marked: it is an object, the adapter named it in its
+    /// frame, and the language can ask the program for the identity of what it names.
+    fn can_mark(&self, target: &VariableTarget) -> bool {
+        matches!(self.snapshot.state, DebugState::Stopped { .. })
+            && target.object != 0
+            && !target.type_name.trim().is_empty()
+            && self.identity_expression(target).is_some()
+    }
+
+    /// The expression that gives the identity of the value of `target`.
+    fn identity_expression(&self, target: &VariableTarget) -> Option<String> {
+        let name = target
+            .evaluate_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())?;
+        self.service
+            .as_ref()
+            .and_then(|service| service.object_identity_expression(name))
+    }
+
+    /// The Mark Object dialog: the name the user gives the object. The identity of the
+    /// object is asked in the frame first, because the handle alone may name another
+    /// value at the next stop.
+    fn mark_object(&mut self, target: VariableTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(expression) = self.identity_expression(&target) else {
+            return;
+        };
+        let reference = target.object;
+        let type_name = target.type_name.clone();
+        let panel = cx.weak_entity();
+        let submit = move |text: String, cx: &mut App| {
+            let name = text.trim().to_owned();
+            if name.is_empty() {
+                return;
+            }
+            panel
+                .update(cx, |panel, cx| {
+                    let request = panel.next_identity;
+                    panel.next_identity += 1;
+                    panel.pending_marks.push((request, name, type_name.clone()));
+                    panel
+                        .identity_questions
+                        .insert(request, IdentityQuestion { reference });
+                    panel.send(
+                        Command::EvaluateIdentity {
+                            request,
+                            expression: expression.clone(),
+                        },
+                        cx,
+                    );
+                })
+                .ok();
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show("Mark Object", "Label", submit, workspace, window, cx)
+            })
+            .ok();
+    }
+
+    /// Copies the stack of the current thread as a text that Analyze Stack Trace reads.
+    fn copy_stack(&mut self, cx: &mut Context<Self>) {
+        let text = dap_client::stack_trace_text(&self.snapshot.frames);
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Adds an inline watch on a line of `file`, the line from one.
+    pub(crate) fn add_inline_watch(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        expression: String,
+        cx: &mut Context<Self>,
+    ) {
+        let expression = expression.trim().to_owned();
+        if expression.is_empty() || line == 0 {
+            return;
+        }
+        if self
+            .inline_watches
+            .iter()
+            .any(|watch| watch.file == file && watch.line == line && watch.expression == expression)
+        {
+            return;
+        }
+        self.inline_watches.push(InlineWatchSetting {
+            file,
+            line,
+            expression,
+        });
+        self.save_state();
+        self.sync_inline_watches(cx);
+        cx.emit(ValuesChanged);
+        cx.notify();
+    }
+
+    /// Takes the inline watch of a line away, the line from one.
+    pub(crate) fn remove_inline_watch_at(
+        &mut self,
+        file: &Path,
+        line: u32,
+        expression: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.inline_watches.len();
+        self.inline_watches.retain(|watch| {
+            !(watch.file == file && watch.line == line && watch.expression == expression)
+        });
+        if self.inline_watches.len() == before {
+            return;
+        }
+        self.save_state();
+        self.sync_inline_watches(cx);
+        cx.emit(ValuesChanged);
+        cx.notify();
+    }
+
+    /// The inline watches that stand after the lines of `file`, with their last values.
+    fn inline_watch_rows(&self, file: &Path) -> Vec<editor_view::InlineWatchRow> {
+        if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            return Vec::new();
+        }
+        self.inline_watches
+            .iter()
+            .filter(|watch| same_file(&watch.file, file))
+            .map(|watch| {
+                let value = self
+                    .snapshot
+                    .inline_watch
+                    .iter()
+                    .find(|value| value.expression == watch.expression);
+                let text = match value {
+                    Some(value) => match &value.error {
+                        Some(error) => format!("{} = <{}>", watch.expression, error),
+                        None => format!(
+                            "{} = {}",
+                            watch.expression,
+                            self.display_value(value.reference, &value.type_name, &value.value)
+                        ),
+                    },
+                    None => format!("{} = …", watch.expression),
+                };
+                editor_view::InlineWatchRow {
+                    line: watch.line.saturating_sub(1) as usize,
+                    expression: watch.expression.clone(),
+                    text,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the library group with this first frame is open, for tests.
+    #[cfg(test)]
+    pub(crate) fn library_group_open_for_test(&self, first: i64) -> bool {
+        self.expanded_library_groups.contains(&first)
+    }
+
+    /// The hide setting of the frames of libraries: the button of this session, or the
+    /// window setting until the button changed it.
+    fn hides_library_frames(&self, cx: &App) -> bool {
+        self.hide_library_frames.unwrap_or_else(|| {
+            cx.try_global::<workspace::Settings>()
+                .is_none_or(|settings| settings.debug_hide_library_frames)
+        })
+    }
+
+    /// The button of the frames header: folds or opens the frames of libraries.
+    fn toggle_library_frames(&mut self, cx: &mut Context<Self>) {
+        let hidden = self.hides_library_frames(cx);
+        self.hide_library_frames = Some(!hidden);
+        self.expanded_library_groups.clear();
+        cx.notify();
     }
 
     /// Ctrl+F5: the last launch starts again, in place of the running session.
@@ -2799,50 +3430,38 @@ impl DebugPanel {
     ) -> AnyElement {
         let frames = self.snapshot.frames.clone();
         let selected_frame = self.snapshot.selected_frame;
+        let hide = self.hides_library_frames(cx);
         let body = if frames.is_empty() {
             empty_pane("debug-empty-frames", "No frames", theme)
         } else {
-            let rows = frames
-                .iter()
-                .map(|frame| {
-                    let selected = selected_frame == Some(frame.id);
-                    let frame = frame.clone();
-                    let frame_id = frame.id;
-                    let menu_frame = frame.clone();
-                    let where_ = frame
-                        .source
-                        .as_ref()
-                        .and_then(|path| path.file_name())
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let text = if frame.line == 0 {
-                        format!("{}  {}", frame.name, where_)
-                    } else {
-                        format!("{}  {}:{}", frame.name, where_, frame.line)
-                    };
-                    row(format!("frame-{}", frame.id), &text, selected, theme)
-                        .debug_selector(move || format!("frame-{frame_id}"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.send(Command::SelectFrame(frame.id), cx);
-                            this.open_frame(&frame, window, cx);
-                            cx.notify();
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                this.frame_menu(menu_frame.clone(), event.position, cx);
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .into_any_element()
-                })
-                .collect::<Vec<AnyElement>>();
+            let mut rows: Vec<AnyElement> = Vec::new();
+            let mut index = 0;
+            while index < frames.len() {
+                if hide && is_library_frame(&frames[index], &self.root) {
+                    let start = index;
+                    while index < frames.len() && is_library_frame(&frames[index], &self.root) {
+                        index += 1;
+                    }
+                    rows.push(self.library_group_row(&frames[start..index], theme, cx));
+                    if self.expanded_library_groups.contains(&frames[start].id) {
+                        for frame in &frames[start..index] {
+                            let selected = selected_frame == Some(frame.id);
+                            rows.push(self.frame_row(frame.clone(), selected, theme, cx));
+                        }
+                    }
+                    continue;
+                }
+                let frame = frames[index].clone();
+                let selected = selected_frame == Some(frame.id);
+                rows.push(self.frame_row(frame, selected, theme, cx));
+                index += 1;
+            }
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .child(section("Frames", theme))
+                .child(self.frames_header(theme, hide, cx))
                 .child(
                     scrollable(
                         "debug-tree",
@@ -2874,6 +3493,127 @@ impl DebugPanel {
             .child(self.thread_picker(theme, cx))
             .child(body)
             .into_any_element()
+    }
+
+    /// The title of the frames and the button that folds the frames of libraries.
+    fn frames_header(&self, theme: &Theme, hide: bool, cx: &mut Context<Self>) -> AnyElement {
+        let label = if hide {
+            "Show Frames from Libraries"
+        } else {
+            "Hide Frames from Libraries"
+        };
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .pl(px(SPACE_M))
+            .pr(px(SPACE_S))
+            .child(
+                div()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.line_number)
+                    .child("Frames"),
+            )
+            .child(
+                icon_button("debug-hide-libraries", "general/hide", label, None, theme)
+                    .debug_selector(|| "debug-hide-libraries".to_owned())
+                    .size(px(20.))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_library_frames(cx))),
+            )
+            .into_any_element()
+    }
+
+    /// One frame of the stack, with its menu.
+    fn frame_row(
+        &mut self,
+        frame: Frame,
+        selected: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let frame_id = frame.id;
+        let menu_frame = frame.clone();
+        let where_ = frame
+            .source
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = if frame.line == 0 {
+            format!("{}  {}", frame.name, where_)
+        } else {
+            format!("{}  {}:{}", frame.name, where_, frame.line)
+        };
+        row(format!("frame-{}", frame.id), &text, selected, theme)
+            .debug_selector(move || format!("frame-{frame_id}"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.send(Command::SelectFrame(frame.id), cx);
+                this.open_frame(&frame, window, cx);
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.frame_menu(menu_frame.clone(), event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// A collapsed run of library frames: a click opens it, a second click folds it.
+    fn library_group_row(
+        &mut self,
+        frames: &[Frame],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(first) = frames.first() else {
+            return div().into_any_element();
+        };
+        let key = first.id;
+        let open = self.expanded_library_groups.contains(&key);
+        let mut names: Vec<String> = Vec::new();
+        for frame in frames {
+            let name = library_group_name(frame);
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        let count = frames.len();
+        let text = if open {
+            if names.is_empty() {
+                format!("-{count} frames from libraries")
+            } else {
+                format!("-{count} frames from {}", names.join(", "))
+            }
+        } else if names.is_empty() {
+            format!("+{count} frames from libraries")
+        } else {
+            format!("+{count} frames from {}", names.join(", "))
+        };
+        let selector = format!("frames-group-{key}");
+        let group = div()
+            .id(("frames-group", key as u64))
+            .debug_selector(move || selector)
+            .flex()
+            .items_center()
+            .h(px(ROW_HEIGHT))
+            .px(px(ROW_PADDING_X))
+            .cursor_pointer()
+            .text_size(px(CODE_SIZE))
+            .text_color(theme.text_secondary)
+            .hover(move |style| style.bg(theme.caret_row))
+            .child(text)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_library_groups.remove(&key) {
+                    this.expanded_library_groups.insert(key);
+                }
+                cx.notify();
+            }));
+        group.into_any_element()
     }
 
     /// The right column of the Debugger tab: the scopes and the watch list.
@@ -2941,7 +3681,11 @@ impl DebugPanel {
         for watch in &self.snapshot.watch {
             let text = match &watch.error {
                 Some(error) => format!("{} = <{error}>", watch.expression),
-                None => format!("{} = {}", watch.expression, watch.value),
+                None => format!(
+                    "{} = {}",
+                    watch.expression,
+                    self.display_value(watch.reference, &watch.type_name, &watch.value)
+                ),
             };
             let expression = watch.expression.clone();
             let selected = self.selected_watch.as_deref() == Some(expression.as_str());
@@ -3222,13 +3966,16 @@ impl DebugPanel {
             arrow,
             variable.name,
             type_name,
-            variable.value
+            self.display_value(reference, &variable.type_name, &variable.value)
         );
         let name = variable.name.clone();
         let target = VariableTarget {
             reference: parent,
             name: name.clone(),
             value: variable.value.clone(),
+            object: reference,
+            type_name: variable.type_name.clone(),
+            evaluate_name: variable.evaluate_name.clone(),
         };
         let selected = self.selected_variable.as_ref() == Some(&target);
         let editing = self
@@ -3698,10 +4445,14 @@ impl Render for QuickEvaluateView {
                         .py(px(SPACE_XS))
                         .cursor_pointer()
                         .text_color(theme.text)
-                        .child(format!(
-                            "{arrow}{}{type_name} = {}",
-                            evaluation.expression, evaluation.value
-                        ))
+                        .child({
+                            let shown = self.panel.read(cx).display_value(
+                                reference,
+                                &evaluation.type_name,
+                                &evaluation.value,
+                            );
+                            format!("{arrow}{}{type_name} = {shown}", evaluation.expression)
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if target != 0 {
                                 this.toggle(target, cx);
@@ -3874,6 +4625,123 @@ impl Render for StepTargetsView {
             .left(left)
             .top(top)
             .child(enter("step-targets-enter", body))
+    }
+}
+
+/// The rules of the settings: `type = display` or `type = display | children`, one rule
+/// per semicolon. A rule without a type or a display is skipped.
+fn parse_renderers(text: &str) -> Vec<TypeRenderer> {
+    text.split(';')
+        .filter_map(|rule| {
+            let (type_name, rest) = rule.split_once('=')?;
+            let type_name = type_name.trim();
+            if type_name.is_empty() {
+                return None;
+            }
+            let (display, children) = match rest.split_once('|') {
+                Some((display, children)) => (display, Some(children.trim())),
+                None => (rest, None),
+            };
+            let display = display.trim();
+            if display.is_empty() {
+                return None;
+            }
+            Some(TypeRenderer {
+                type_name: type_name.to_owned(),
+                display: display.to_owned(),
+                children: children
+                    .filter(|children| !children.is_empty())
+                    .map(str::to_owned),
+                subtype_probe: None,
+            })
+        })
+        .collect()
+}
+
+/// Whether a frame belongs to a library rather than to the project: its source is known,
+/// lies outside the project and comes from an archive of dependencies or from a runtime
+/// image. A frame without a source, or one whose source is a directory beside the
+/// project, stays: the adapter did not say it is a library, and hiding it would hide the
+/// debuggee itself.
+fn is_library_frame(frame: &Frame, root: &Path) -> bool {
+    let Some(source) = &frame.source else {
+        return false;
+    };
+    if path_under(source, root) {
+        return false;
+    }
+    let path = source.to_string_lossy();
+    path.starts_with("jrt:/")
+        || path.contains(".jar!")
+        || path.ends_with(".jar")
+        || path.ends_with(".zip")
+}
+
+/// Whether `path` is in the directory of `root`, ignoring the case on Windows.
+fn path_under(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let mut root = root.to_string_lossy().replace('/', "\\").to_lowercase();
+        if !root.ends_with('\\') {
+            root.push('\\');
+        }
+        path.starts_with(&root) || path == root.trim_end_matches('\\')
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(root)
+    }
+}
+
+/// The name of the group of a library frame: the module of a runtime image, the artifact
+/// of an archive, or the first packages of a class that no source names.
+fn library_group_name(frame: &Frame) -> String {
+    let Some(source) = &frame.source else {
+        return String::new();
+    };
+    let path = source.to_string_lossy();
+    if let Some(rest) = path.strip_prefix("jrt:/") {
+        return rest.split('/').next().unwrap_or_default().to_owned();
+    }
+    let archive = if let Some(at) = path.find(".jar!") {
+        &path[..at + 4]
+    } else if path.ends_with(".jar") || path.ends_with(".zip") {
+        &path[..]
+    } else {
+        return package_prefix(&frame.name);
+    };
+    let name = Path::new(archive)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = name
+        .trim_end_matches(".jar")
+        .trim_end_matches(".zip")
+        .to_owned();
+    artifact_name(&name)
+}
+
+/// An artifact without the version that follows the last dash before a number:
+/// `spring-core-6.1.0` is `spring-core`.
+fn artifact_name(name: &str) -> String {
+    let Some((head, tail)) = name.rsplit_once('-') else {
+        return name.to_owned();
+    };
+    if tail.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        head.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// The first two packages of a class name, `pkg.util` for `pkg.util.Items.add`.
+fn package_prefix(name: &str) -> String {
+    let mut parts = name.split('.');
+    let first = parts.next().unwrap_or_default();
+    match parts.next() {
+        Some(second) => format!("{first}.{second}"),
+        None => first.to_owned(),
     }
 }
 
@@ -4240,6 +5108,11 @@ impl Render for DebugPanel {
             .on_action(cx.listener(|this, _: &NewWatch, _, cx| this.start_watch(cx)))
             .on_action(cx.listener(|this, _: &DeleteWatch, _, cx| this.delete_watch(cx)))
             .on_action(cx.listener(|this, _: &SetValue, _, cx| this.start_value_edit(cx)))
+            .on_action(
+                cx.listener(|this, _: &MarkObject, window, cx| {
+                    this.mark_selected_object(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &CancelInput, window, cx| {
                 this.key(
                     &KeyDownEvent {
@@ -5182,21 +6055,32 @@ pub(crate) fn refresh_inline_values(
         .is_none_or(|settings| settings.debug_show_values_inline);
     let Some(panel) = cx.try_global::<ActiveDebug>() else {
         view.set_debug_values(None, &[], cx);
+        view.set_inline_watches(&[], cx);
+        view.set_inline_watch_ready(false, cx);
         return;
     };
     let panel = panel.0.clone();
     let path = view.path().to_path_buf();
-    let shown = if enabled {
-        panel.read_with(cx, |panel, _| {
-            let (file, line) = panel.stop_location()?;
-            same_file(&file, &path).then(|| (line, panel.stopped_values()))
-        })
-    } else {
-        None
-    };
+    let shown = panel.read_with(cx, |panel, _| {
+        let (file, line) = panel.stop_location()?;
+        let values = enabled.then(|| panel.stopped_values());
+        let watches = panel.inline_watch_rows(&path);
+        Some((file, line, values, watches))
+    });
     match shown {
-        Some((line, values)) => view.set_debug_values(Some(line), &values, cx),
-        None => view.set_debug_values(None, &[], cx),
+        Some((file, line, values, watches)) if same_file(&file, &path) => {
+            match values {
+                Some(values) => view.set_debug_values(Some(line), &values, cx),
+                None => view.set_debug_values(None, &[], cx),
+            }
+            view.set_inline_watches(&watches, cx);
+            view.set_inline_watch_ready(true, cx);
+        }
+        _ => {
+            view.set_debug_values(None, &[], cx);
+            view.set_inline_watches(&[], cx);
+            view.set_inline_watch_ready(false, cx);
+        }
     }
 }
 
@@ -5363,6 +6247,19 @@ mod tests {
                 data_breakpoints: Vec::new(),
                 enabled_filters: BTreeSet::new(),
                 watch: Vec::new(),
+                inline_watches: Vec::new(),
+                labels: Vec::new(),
+                identities: BTreeMap::new(),
+                identity_questions: BTreeMap::new(),
+                pending_marks: Vec::new(),
+                identity_stop: 0,
+                next_identity: 1,
+                hide_library_frames: None,
+                expanded_library_groups: BTreeSet::new(),
+                language_renderers: Vec::new(),
+                service: None,
+                sent_renderers: Vec::new(),
+                sent_inline_watches: Vec::new(),
                 expanded: BTreeSet::new(),
                 shown_breakpoints: Vec::new(),
                 shown_function_breakpoints: Vec::new(),
@@ -5410,6 +6307,7 @@ mod tests {
                 "value".into(),
             )],
             exception_filters: vec!["uncaught".into()],
+            inline_watches: Vec::new(),
         };
         let json = serde_json::to_string(&saved).unwrap();
         let back: SavedState = serde_json::from_str(&json).unwrap();
@@ -5489,3 +6387,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "debug_depth_tests.rs"]
+mod depth_tests;

@@ -7,11 +7,13 @@ mod blame;
 mod blob;
 mod diff;
 mod git;
+mod history;
 mod merge;
 mod rebase;
 mod repo;
 mod shelve;
 mod status;
+mod submodule;
 
 pub mod graph;
 
@@ -23,6 +25,7 @@ pub use diff::{
     word_changes,
 };
 pub use git::GitRunner;
+pub use history::LineHistory;
 pub use merge::{Segment, SegmentKind, ThreeWay, merge};
 pub use rebase::{RebaseAction, RebasePlan, RebaseReport, RebaseStep};
 pub use repo::{
@@ -31,3 +34,4 @@ pub use repo::{
 };
 pub use shelve::{ShelfDiff, patch_files, patched_text};
 pub use status::{Change, FileStatus, Status, parse_status};
+pub use submodule::{RootsUpdate, Submodule, SubmoduleState, parse_submodule_status};

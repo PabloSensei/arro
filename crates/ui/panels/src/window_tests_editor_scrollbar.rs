@@ -23,6 +23,7 @@ fn diagnostic(severity: Severity, line: u32, message: &str) -> DiagnosticEntry {
         severity,
         message: message.to_owned(),
         unnecessary: false,
+        code: None,
     }
 }
 

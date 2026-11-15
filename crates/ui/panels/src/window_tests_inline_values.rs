@@ -276,6 +276,8 @@ impl RunConfigProvider for RemoteProbe {
             provider: "remote-probe".into(),
             assemble_first: false,
             settings: Default::default(),
+
+            ..RunConfig::default()
         }])
     }
 

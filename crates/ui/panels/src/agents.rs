@@ -650,8 +650,20 @@ impl Render for AgentsPanel {
         let body = match self.active_terminal() {
             Some(terminal) => {
                 let scrolled = terminal.clone();
+                let view = crate::term_grid::GridView {
+                    session: terminal.clone(),
+                    focused,
+                    theme,
+                    selection: None,
+                    matches: Vec::new(),
+                    current: None,
+                    hover: None,
+                    host: None,
+                    pane: 0,
+                    metrics: std::rc::Rc::new(std::cell::Cell::new(None)),
+                };
                 body.on_scroll(move |event, _, _| scrolled.scroll(scroll_lines(event)))
-                    .child(grid(terminal.clone(), focused, theme))
+                    .child(grid(view))
             }
             None if self.entries.is_empty() => body.child(message("No sessions yet", &theme)),
             None => body.child(message("This session has no terminal", &theme)),

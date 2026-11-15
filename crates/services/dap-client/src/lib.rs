@@ -15,8 +15,9 @@ pub use client::{
 pub use model::{
     Breakpoint, BreakpointKind, BreakpointSpec, Capabilities, Command, ConsoleLine, DataAccessType,
     DataBreakpointSpec, DebugState, Debugger, Evaluation, ExceptionFilter, Frame,
-    FunctionBreakpointSpec, OutputLine, ReloadOutcome, Scope, Snapshot, StepTarget, Thread,
-    Variable, VariableError, WatchValue, line_of, source_path,
+    FunctionBreakpointSpec, IdentityAnswer, OutputLine, ReloadOutcome, Scope, Snapshot, StepTarget,
+    Thread, TypeRenderer, Variable, VariableError, WatchValue, children_expression, line_of,
+    object_expression, source_path, stack_trace_text,
 };
 pub use session::{Launch, normalise, output_sender, run, run_with_output};
 pub use threads::{ThreadList, VIRTUAL_PAGE, VirtualThreads, is_virtual_thread, thread_list};
@@ -164,6 +165,26 @@ pub trait DebugService: Send + Sync + 'static {
     /// when it is dropped, and the language may keep compilation off for as long as one
     /// is alive. `None` when the language has nothing to suspend.
     fn begin_session(&self) -> Option<Box<dyn DebugSessionToken>> {
+        None
+    }
+
+    /// How the language shows values of some of its types, beside the rules the user
+    /// sets. Empty when the language has no shapes of its own.
+    fn type_renderers(&self) -> Vec<crate::model::TypeRenderer> {
+        Vec::new()
+    }
+
+    /// An expression that says whether a value of `type_name` is a subtype of the type
+    /// of a renderer, `{name}` standing for the value. `None` when the language cannot
+    /// answer for a type.
+    fn subtype_probe(&self, _type_name: &str) -> Option<String> {
+        None
+    }
+
+    /// An expression that gives a number the program keeps for the object `evaluate_name`
+    /// denotes, so a mark stays on that object while a handle of the adapter may go to
+    /// another value. `None` when the language has no such number.
+    fn object_identity_expression(&self, _evaluate_name: &str) -> Option<String> {
         None
     }
 

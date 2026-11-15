@@ -14,6 +14,7 @@ pub enum SettingsPage {
     EditorCodeStyle,
     EditorCompletion,
     EditorInlayHints,
+    EditorInspections,
     Project,
     Plugins,
     Keymap,
@@ -57,12 +58,13 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 21] = [
+    pub const ALL: [SettingsPage; 22] = [
         SettingsPage::Appearance,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
         SettingsPage::EditorCompletion,
         SettingsPage::EditorInlayHints,
+        SettingsPage::EditorInspections,
         SettingsPage::EditorLiveTemplates,
         SettingsPage::EditorPostfix,
         SettingsPage::EditorFileTemplates,
@@ -88,6 +90,7 @@ impl SettingsPage {
             SettingsPage::EditorCodeStyle => "Code Style",
             SettingsPage::EditorCompletion => "Code Completion",
             SettingsPage::EditorInlayHints => "Inlay Hints",
+            SettingsPage::EditorInspections => "Inspections",
             SettingsPage::Project => "Project",
             SettingsPage::Plugins => "Plugins",
             SettingsPage::Keymap => "Keymap",
@@ -113,6 +116,7 @@ impl SettingsPage {
             SettingsPage::EditorCodeStyle
             | SettingsPage::EditorCompletion
             | SettingsPage::EditorInlayHints
+            | SettingsPage::EditorInspections
             | SettingsPage::BuildToolsFirst
             | SettingsPage::BuildToolsSecond
             | SettingsPage::Git
@@ -141,6 +145,7 @@ impl SettingsPage {
             SettingsPage::EditorCodeStyle
             | SettingsPage::EditorCompletion
             | SettingsPage::EditorInlayHints
+            | SettingsPage::EditorInspections
             | SettingsPage::EditorLiveTemplates
             | SettingsPage::EditorPostfix
             | SettingsPage::EditorFileTemplates => Some(SettingsPage::Editor),
@@ -211,6 +216,7 @@ pub enum SettingField {
     BuildToolFirstVmOptions,
     BuildToolFirstUpdateSnapshots,
     DownloadSourcesAutomatically,
+    CheckDependencyUpdates,
     BuildToolSecondHome,
     BuildToolSecondOffline,
     BuildToolSecondUserHome,
@@ -218,17 +224,30 @@ pub enum SettingField {
     GitPath,
     GitUpdateMethod,
     GitAutoUpdateOnReject,
+    GitUpdateSubmodules,
     GitWarnCrlf,
     GitAnalyzeBeforeCommit,
     TerminalShell,
     TerminalStartDirectory,
     TerminalEnvironment,
+    TerminalConfirmMultilinePaste,
     RenderDocComments,
     MarkdownImagesFromInternet,
     DiffSideBySide,
     GitGroupByDirectory,
     HttpTimeout,
     DebugShowValuesInline,
+    DebugHideLibraryFrames,
+    DebugTypeRenderers,
+    PresentationFontSize,
+    RightMargin,
+    ToolbarVisible,
+    ToolWindowBarsVisible,
+    StatusBarVisible,
+    NavigationBarVisible,
+    ShowGutterIcons,
+    ShowBreadcrumbs,
+    ShowStickyLines,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -606,6 +625,14 @@ pub const SETTINGS: &[Setting] = &[
         keywords: "sources download library decompiled class build tools",
     },
     Setting {
+        id: "check_dependency_updates",
+        title: "Check for dependency updates",
+        page: SettingsPage::BuildToolsFirst,
+        kind: SettingKind::Toggle,
+        field: SettingField::CheckDependencyUpdates,
+        keywords: "dependency updates versions build files repositories build tools",
+    },
+    Setting {
         id: "build_tool_second_home",
         title: "Distribution",
         page: SettingsPage::BuildToolsSecond,
@@ -662,6 +689,14 @@ pub const SETTINGS: &[Setting] = &[
         keywords: "push rejected auto update merge rebase version control",
     },
     Setting {
+        id: "git_update_submodules",
+        title: "Update submodules on project update",
+        page: SettingsPage::Git,
+        kind: SettingKind::Toggle,
+        field: SettingField::GitUpdateSubmodules,
+        keywords: "submodule update project git version control",
+    },
+    Setting {
         id: "git_warn_crlf",
         title: "Warn if CRLF line separators are about to be committed",
         page: SettingsPage::Git,
@@ -700,6 +735,14 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Text,
         field: SettingField::TerminalEnvironment,
         keywords: "environment variables terminal",
+    },
+    Setting {
+        id: "terminal_confirm_multiline_paste",
+        title: "Confirm pasting multi-line text",
+        page: SettingsPage::Terminal,
+        kind: SettingKind::Toggle,
+        field: SettingField::TerminalConfirmMultilinePaste,
+        keywords: "paste multiline confirmation terminal",
     },
     Setting {
         id: "render_doc_comments",
@@ -749,6 +792,94 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::DebugShowValuesInline,
         keywords: "debugger values variables inline editor",
     },
+    Setting {
+        id: "debug_hide_library_frames",
+        title: "Hide Frames from Libraries",
+        page: SettingsPage::Debugger,
+        kind: SettingKind::Toggle,
+        field: SettingField::DebugHideLibraryFrames,
+        keywords: "debugger stack frames library filter hide fold",
+    },
+    Setting {
+        id: "debug_type_renderers",
+        title: "Type Renderers",
+        page: SettingsPage::Debugger,
+        kind: SettingKind::Text,
+        field: SettingField::DebugTypeRenderers,
+        keywords: "debugger data views type renderer display expression values",
+    },
+    Setting {
+        id: "presentation_font_size",
+        title: "Presentation Mode font size",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Number,
+        field: SettingField::PresentationFontSize,
+        keywords: "presentation mode font size text appearance",
+    },
+    Setting {
+        id: "toolbar_visible",
+        title: "Toolbar",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Toggle,
+        field: SettingField::ToolbarVisible,
+        keywords: "toolbar main window part appearance",
+    },
+    Setting {
+        id: "tool_window_bars_visible",
+        title: "Tool Window Bars",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Toggle,
+        field: SettingField::ToolWindowBarsVisible,
+        keywords: "tool window bars stripes buttons appearance",
+    },
+    Setting {
+        id: "status_bar_visible",
+        title: "Status Bar",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Toggle,
+        field: SettingField::StatusBarVisible,
+        keywords: "status bar window part appearance",
+    },
+    Setting {
+        id: "navigation_bar_visible",
+        title: "Navigation Bar",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Toggle,
+        field: SettingField::NavigationBarVisible,
+        keywords: "navigation bar breadcrumbs window part appearance",
+    },
+    Setting {
+        id: "right_margin",
+        title: "Right margin",
+        page: SettingsPage::Editor,
+        kind: SettingKind::Number,
+        field: SettingField::RightMargin,
+        keywords: "right margin column wrap distract editor",
+    },
+    Setting {
+        id: "show_gutter_icons",
+        title: "Gutter Icons",
+        page: SettingsPage::Editor,
+        kind: SettingKind::Toggle,
+        field: SettingField::ShowGutterIcons,
+        keywords: "gutter icons breakpoints bookmarks folds editor general",
+    },
+    Setting {
+        id: "show_breadcrumbs",
+        title: "Breadcrumbs",
+        page: SettingsPage::Editor,
+        kind: SettingKind::Toggle,
+        field: SettingField::ShowBreadcrumbs,
+        keywords: "breadcrumbs navigation declarations editor general",
+    },
+    Setting {
+        id: "show_sticky_lines",
+        title: "Sticky Lines",
+        page: SettingsPage::Editor,
+        kind: SettingKind::Toggle,
+        field: SettingField::ShowStickyLines,
+        keywords: "sticky lines header declarations editor general",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -768,6 +899,15 @@ pub fn section_of(id: &str) -> Option<&'static str> {
         "render_doc_comments" => Some("Appearance"),
         "markdown_images_from_internet" => Some("Markdown"),
         "code_vision_usages" | "code_vision_implementations" => Some("Code Vision"),
+        "debug_hide_library_frames" | "debug_type_renderers" => Some("Data Views"),
+        "presentation_font_size"
+        | "toolbar_visible"
+        | "tool_window_bars_visible"
+        | "status_bar_visible"
+        | "navigation_bar_visible" => Some("Window"),
+        "right_margin" | "show_gutter_icons" | "show_breadcrumbs" | "show_sticky_lines" => {
+            Some("Appearance")
+        }
         _ => None,
     }
 }
@@ -850,10 +990,23 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         }
         SettingField::BuildToolSecondOffline => Some(settings.build_tools.second.offline),
         SettingField::DownloadSourcesAutomatically => Some(settings.download_sources_automatically),
+        SettingField::CheckDependencyUpdates => Some(settings.check_dependency_updates),
         SettingField::GitAutoUpdateOnReject => Some(settings.git_auto_update_on_reject),
+        SettingField::GitUpdateSubmodules => Some(settings.git_update_submodules),
         SettingField::GitWarnCrlf => Some(settings.git_warn_crlf),
         SettingField::GitAnalyzeBeforeCommit => Some(settings.git_analyze_before_commit),
         SettingField::DebugShowValuesInline => Some(settings.debug_show_values_inline),
+        SettingField::TerminalConfirmMultilinePaste => {
+            Some(settings.terminal_confirm_multiline_paste)
+        }
+        SettingField::DebugHideLibraryFrames => Some(settings.debug_hide_library_frames),
+        SettingField::ToolbarVisible => Some(settings.toolbar_visible),
+        SettingField::ToolWindowBarsVisible => Some(settings.tool_window_bars_visible),
+        SettingField::StatusBarVisible => Some(settings.status_bar_visible),
+        SettingField::NavigationBarVisible => Some(settings.navigation_bar_visible),
+        SettingField::ShowGutterIcons => Some(settings.show_gutter_icons),
+        SettingField::ShowBreadcrumbs => Some(settings.show_breadcrumbs),
+        SettingField::ShowStickyLines => Some(settings.show_sticky_lines),
         SettingField::Theme
         | SettingField::FontSize
         | SettingField::UiScale
@@ -880,7 +1033,10 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::TerminalShell
         | SettingField::TerminalStartDirectory
         | SettingField::TerminalEnvironment
-        | SettingField::HttpTimeout => None,
+        | SettingField::HttpTimeout
+        | SettingField::DebugTypeRenderers
+        | SettingField::PresentationFontSize
+        | SettingField::RightMargin => None,
     }
 }
 
@@ -964,8 +1120,14 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         Some(SettingField::DownloadSourcesAutomatically) => {
             settings.download_sources_automatically = !settings.download_sources_automatically;
         }
+        Some(SettingField::CheckDependencyUpdates) => {
+            settings.check_dependency_updates = !settings.check_dependency_updates;
+        }
         Some(SettingField::GitAutoUpdateOnReject) => {
             settings.git_auto_update_on_reject = !settings.git_auto_update_on_reject;
+        }
+        Some(SettingField::GitUpdateSubmodules) => {
+            settings.git_update_submodules = !settings.git_update_submodules;
         }
         Some(SettingField::GitWarnCrlf) => settings.git_warn_crlf = !settings.git_warn_crlf,
         Some(SettingField::GitAnalyzeBeforeCommit) => {
@@ -973,6 +1135,33 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::DebugShowValuesInline) => {
             settings.debug_show_values_inline = !settings.debug_show_values_inline;
+        }
+        Some(SettingField::TerminalConfirmMultilinePaste) => {
+            settings.terminal_confirm_multiline_paste = !settings.terminal_confirm_multiline_paste;
+        }
+        Some(SettingField::DebugHideLibraryFrames) => {
+            settings.debug_hide_library_frames = !settings.debug_hide_library_frames;
+        }
+        Some(SettingField::ToolbarVisible) => {
+            settings.toolbar_visible = !settings.toolbar_visible;
+        }
+        Some(SettingField::ToolWindowBarsVisible) => {
+            settings.tool_window_bars_visible = !settings.tool_window_bars_visible;
+        }
+        Some(SettingField::StatusBarVisible) => {
+            settings.status_bar_visible = !settings.status_bar_visible;
+        }
+        Some(SettingField::NavigationBarVisible) => {
+            settings.navigation_bar_visible = !settings.navigation_bar_visible;
+        }
+        Some(SettingField::ShowGutterIcons) => {
+            settings.show_gutter_icons = !settings.show_gutter_icons;
+        }
+        Some(SettingField::ShowBreadcrumbs) => {
+            settings.show_breadcrumbs = !settings.show_breadcrumbs;
+        }
+        Some(SettingField::ShowStickyLines) => {
+            settings.show_sticky_lines = !settings.show_sticky_lines;
         }
         Some(
             SettingField::Theme
@@ -1001,7 +1190,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::TerminalShell
             | SettingField::TerminalStartDirectory
             | SettingField::TerminalEnvironment
-            | SettingField::HttpTimeout,
+            | SettingField::HttpTimeout
+            | SettingField::DebugTypeRenderers
+            | SettingField::PresentationFontSize
+            | SettingField::RightMargin,
         )
         | None => {
             return false;
@@ -1014,8 +1206,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
 pub fn number(settings: &Settings, id: &str) -> Option<f32> {
     match find(id)?.field {
         SettingField::FontSize => Some(settings.font_size),
+        SettingField::PresentationFontSize => Some(settings.presentation_font_size),
         SettingField::UiScale => Some(settings.ui_scale),
         SettingField::LineSpacing => Some(settings.line_spacing),
+        SettingField::RightMargin => Some(settings.right_margin as f32),
         SettingField::TabSize => Some(settings.tab_size as f32),
         SettingField::IndentSize => Some(settings.indent_size as f32),
         SettingField::CompletionDelay => Some(settings.completion_delay_ms as f32),
@@ -1032,6 +1226,8 @@ pub fn number_label(settings: &Settings, id: &str) -> Option<String> {
         SettingField::FontSize | SettingField::TabSize | SettingField::IndentSize => {
             format!("{value}")
         }
+        SettingField::PresentationFontSize => format!("{value}"),
+        SettingField::RightMargin => format!("{value}"),
         SettingField::UiScale | SettingField::LineSpacing => format!("{value:.1}"),
         SettingField::CompletionDelay => format!("{value} ms"),
         SettingField::HttpTimeout => format!("{value} s"),
@@ -1053,8 +1249,19 @@ pub fn adjust_number(settings: &mut Settings, id: &str, delta: f32) -> bool {
     };
     match setting.field {
         SettingField::FontSize => *settings = settings.with_font_step(delta),
+        SettingField::PresentationFontSize => {
+            *settings = settings.with_presentation_font_step(delta)
+        }
         SettingField::UiScale => *settings = settings.with_ui_scale_step(delta),
         SettingField::LineSpacing => *settings = settings.with_line_spacing_step(delta),
+        SettingField::RightMargin => {
+            let value = update(
+                settings.right_margin as f32,
+                workspace::MIN_RIGHT_MARGIN as f32,
+                workspace::MAX_RIGHT_MARGIN as f32,
+            ) as u32;
+            settings.right_margin = value;
+        }
         SettingField::TabSize => {
             let value = update(settings.tab_size as f32, 1., MAX_INDENT_SIZE) as u32;
             // A tab size that still matches the step moves both, as the Code Style page
@@ -1117,6 +1324,7 @@ pub fn set_text(settings: &mut Settings, id: &str, text: &str) -> bool {
         SettingField::TerminalShell => settings.terminal_shell = text.to_owned(),
         SettingField::TerminalStartDirectory => settings.terminal_start_directory = text.to_owned(),
         SettingField::TerminalEnvironment => settings.terminal_environment = text.to_owned(),
+        SettingField::DebugTypeRenderers => settings.debug_type_renderers = text.to_owned(),
         _ => return false,
     }
     true
@@ -1145,6 +1353,7 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
         SettingField::TerminalShell => settings.terminal_shell.clone(),
         SettingField::TerminalStartDirectory => settings.terminal_start_directory.clone(),
         SettingField::TerminalEnvironment => settings.terminal_environment.clone(),
+        SettingField::DebugTypeRenderers => settings.debug_type_renderers.clone(),
         _ => return None,
     })
 }
@@ -1195,8 +1404,10 @@ mod tests {
     #[test]
     fn a_part_of_a_name_finds_the_setting() {
         let font = search("font", 10);
-        assert_eq!(font.len(), 1);
-        assert_eq!(font[0].id, "font_size");
+        assert!(
+            font.iter().any(|setting| setting.id == "font_size"),
+            "the font size of the editor is one of the settings of the word: {font:?}"
+        );
         assert!(
             search("wrap", 10)
                 .iter()

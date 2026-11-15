@@ -1883,6 +1883,23 @@ impl ProjectPanel {
                 compare = compare.shortcut(hint);
             }
             entries.push(compare);
+            let (diagram_panel, diagram_folder) = (panel.clone(), path.clone());
+            entries.push(MenuEntry::new("Show Diagram", move |window, cx| {
+                let folder = diagram_folder.clone();
+                let show = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    this.workspace
+                        .update(cx, |workspace, cx| {
+                            crate::diagram::show(
+                                workspace,
+                                crate::diagram::DiagramSource::Folder(folder),
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                };
+                Self::later(window, diagram_panel.clone(), cx, show);
+            }));
         }
         if !is_root {
             let (rename_panel, rename_path) = (panel.clone(), path.clone());
@@ -1931,6 +1948,24 @@ impl ProjectPanel {
         entries.push(MenuEntry::new("Reveal in Explorer", move |_, cx| {
             ui_kit::reveal_path(cx, &reveal)
         }));
+        if is_folder {
+            let folder = path.clone();
+            let terminal_workspace = self.workspace.clone();
+            entries.push(MenuEntry::new("Open in Terminal", move |window, cx| {
+                let directory = folder.clone();
+                let terminal = cx
+                    .try_global::<crate::terminal_panel::ActiveTerminal>()
+                    .map(|active| active.0.clone());
+                if let Some(terminal) = terminal {
+                    terminal.update(cx, |panel, cx| panel.open_tab_in(directory, window, cx));
+                }
+                terminal_workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.show_tool(workspace::TERMINAL_TOOL, window, cx)
+                    })
+                    .ok();
+            }));
+        }
         if !is_folder {
             let (log_panel, log_path) = (cx.weak_entity(), path.clone());
             let show = MenuEntry::new("Show History", move |window, cx| {

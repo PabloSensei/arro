@@ -90,6 +90,32 @@ pub struct Languages {
 
 impl Global for Languages {}
 
+/// Names the code style language of a file when its syntax does not. The application
+/// knows the language that the project style files spell differently from the editor.
+pub struct CodeStyleLanguages(pub fn(&Path) -> Option<&'static str>);
+
+impl Global for CodeStyleLanguages {}
+
+/// The name a project code style file gives the language of this file: what the
+/// application says, else the name of the syntax with the few names the other IDE
+/// spells its own way.
+pub fn code_style_language(
+    path: &Path,
+    language: Option<&LanguageConfig>,
+    cx: &App,
+) -> Option<&'static str> {
+    if let Some(names) = cx.try_global::<CodeStyleLanguages>()
+        && let Some(name) = (names.0)(path)
+    {
+        return Some(name);
+    }
+    language.map(|language| match language.name {
+        "Shell" => "Shell Script",
+        "Windows Batch" => "Batch",
+        name => name,
+    })
+}
+
 /// Colour spans of a format that has no grammar, from its lines alone. The application
 /// names the format and gives the spans; the editor only paints them.
 pub struct PlainSyntax {
@@ -100,6 +126,14 @@ pub struct PlainSyntax {
 }
 
 impl Global for PlainSyntax {}
+
+/// Turns the text of a paste into the text this kind of file takes, before the editor
+/// inserts it. The application names the format; the editor knows none.
+pub type PasteTextBuilder = dyn Fn(&Path, &str) -> Option<String>;
+
+pub struct PasteText(pub Rc<PasteTextBuilder>);
+
+impl Global for PasteText {}
 
 /// Files where Ctrl+Enter asks a tool window to run what is there. A format that already
 /// owns Ctrl+Enter keeps it: the predicates are independent and either may take the key.
@@ -330,6 +364,16 @@ pub struct InlineValue {
     pub changed: bool,
 }
 
+/// An inline watch of the window: an expression of the stopped program and its last
+/// value, shown after the line it was set on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineWatchRow {
+    /// The buffer line, from zero.
+    pub line: usize,
+    pub expression: String,
+    pub text: String,
+}
+
 /// The most characters of one value the line shows; the rest is cut with an ellipsis.
 const INLINE_VALUE_LIMIT: usize = 60;
 
@@ -557,10 +601,14 @@ pub enum EditorEvent {
     CallHierarchy(lang_api::DocumentSpot),
     /// Ctrl+Shift+H: the window shows the hierarchy of the method at this place.
     MethodHierarchy(lang_api::DocumentSpot),
+    /// Ctrl+Alt+Shift+U: the window shows the diagram of the type at this place.
+    ShowDiagram(lang_api::DocumentSpot),
     /// Safe Delete of a type alone in its file: the window removes the file too.
     DeleteFile(PathBuf),
     /// A generation created files: the window writes them and opens the first one.
     CreateFiles(Vec<lang_api::GeneratedFile>),
+    /// Alt+Enter picked Create Test: the window shows its form for this place.
+    CreateTest(lang_api::DocumentSpot),
     /// Ctrl+Alt+L: the window formats with the flags of the Reformat File dialog.
     Reformat,
     /// The text changed, by typing or from outside.
@@ -605,6 +653,23 @@ pub enum EditorEvent {
     ShowUsages(UsagesUpdate),
     /// A right click in the text: the window shows the menu of the editor here.
     ContextMenu(Point<Pixels>),
+    /// Alt+Enter chose to turn a check off in the settings of the project.
+    DisableInspection {
+        id: String,
+        title: String,
+    },
+    /// Alt+Enter chose to open the settings of a check.
+    EditInspection(String),
+    /// Alt+Enter picked Add Inline Watch: the line, from zero, and the expression.
+    AddInlineWatch {
+        line: usize,
+        expression: String,
+    },
+    /// The cross of an inline watch was clicked: its expression and line, from zero.
+    InlineWatchRemoved {
+        line: usize,
+        expression: String,
+    },
     /// The text scrolled: the first visible row in pixels, for a view that follows it.
     Scrolled(f32),
 }
@@ -659,10 +724,20 @@ struct HippieCycle {
 pub struct EditorOptions {
     /// Numbers in the gutter.
     pub line_numbers: bool,
+    /// The icons of the gutter: breakpoints, run marks, bookmarks and the fold arrows.
+    pub gutter_icons: bool,
     /// The background of the caret line.
     pub highlight_current_line: bool,
     /// The vertical lines at the steps of the indentation.
     pub indent_guides: bool,
+    /// The declarations around the caret under the text.
+    pub breadcrumbs: bool,
+    /// The declarations that the top of the editor holds while the caret is in their body.
+    pub sticky_lines: bool,
+    /// The text is centred, with the gutter hidden: the mode of Distraction Free.
+    pub centered_text: bool,
+    /// The column of the right margin, and the width of the centred text.
+    pub right_margin: usize,
     /// The caret blinks while the editor has the focus.
     pub caret_blink: bool,
     /// Ctrl+wheel changes the font size rather than scrolling.
@@ -705,8 +780,13 @@ impl Default for EditorOptions {
     fn default() -> Self {
         Self {
             line_numbers: true,
+            gutter_icons: true,
             highlight_current_line: true,
             indent_guides: true,
+            breadcrumbs: true,
+            sticky_lines: true,
+            centered_text: false,
+            right_margin: 120,
             caret_blink: true,
             wheel_zoom: true,
             save: crate::state::SaveOptions::default(),
@@ -781,6 +861,8 @@ pub struct EditorView {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) scroll_top: f32,
     pub(crate) scroll_left: f32,
+    /// The room that centres the text of Distraction Free Mode, in pixels.
+    pub(crate) center_inset: f32,
     /// The horizontal bar was painted in the last frame.
     pub(crate) horizontal_bar: bool,
     /// The widest row of the text and the rows it was counted on, so that a repaint
@@ -868,6 +950,11 @@ pub struct EditorView {
     pending_frames: Vec<Instant>,
     /// The values of the stopped frame, by buffer line, drawn after the line.
     pub(crate) debug_values: Vec<InlineValue>,
+    /// The inline watches of the stopped program, by buffer line.
+    pub(crate) inline_watches: Vec<InlineWatchRow>,
+    /// The program is stopped in this file, so a caret expression can become an inline
+    /// watch.
+    pub(crate) inline_watch_ready: bool,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -1032,7 +1119,10 @@ impl EditorView {
             }
             None => {
                 let load = view.path.clone();
-                let task = cx.background_spawn(async move { EditorState::load(&load, language) });
+                let style_language = code_style_language(&load, language.as_ref(), cx);
+                let task = cx.background_spawn(async move {
+                    EditorState::load(&load, language, style_language)
+                });
                 cx.spawn_in(window, async move |this, cx| {
                     let result = task.await;
                     this.update(cx, |this, cx| this.loaded(result, cx)).ok();
@@ -1216,8 +1306,6 @@ impl EditorView {
                     lsp.marks.clear();
                     lsp.server_marks.clear();
                     lsp.native_marks.clear();
-                    lsp.server_entries.clear();
-                    lsp.native_entries.clear();
                     lsp.server_tokens.clear();
                     lsp.native_tokens.clear();
                     lsp.received = false;
@@ -1322,6 +1410,7 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             scroll_top: 0.,
             scroll_left: 0.,
+            center_inset: 0.,
             horizontal_bar: false,
             widest: None,
             scrollbar_hovered: false,
@@ -1373,6 +1462,8 @@ impl EditorView {
             picture_cache: None,
             pending_frames: Vec::with_capacity(8),
             debug_values: Vec::new(),
+            inline_watches: Vec::new(),
+            inline_watch_ready: false,
         }
     }
 
@@ -1728,6 +1819,56 @@ impl EditorView {
         self.debug_values.iter().find(|value| value.line == line)
     }
 
+    /// The inline watch of one buffer line, when it has one.
+    pub(crate) fn inline_watch_at(&self, line: usize) -> Option<&InlineWatchRow> {
+        self.inline_watches.iter().find(|watch| watch.line == line)
+    }
+
+    /// Shows the inline watches of the stopped program after their lines, and takes
+    /// them away when the program runs.
+    pub fn set_inline_watches(&mut self, watches: &[InlineWatchRow], cx: &mut Context<Self>) {
+        if self.inline_watches != watches {
+            self.inline_watches = watches.to_vec();
+            cx.notify();
+        }
+    }
+
+    /// The inline watches the editor shows, for a test.
+    pub fn inline_watches(&self) -> &[InlineWatchRow] {
+        &self.inline_watches
+    }
+
+    /// Whether Alt+Enter offers Add Inline Watch: the program is stopped in this file.
+    pub fn set_inline_watch_ready(&mut self, ready: bool, cx: &mut Context<Self>) {
+        if self.inline_watch_ready != ready {
+            self.inline_watch_ready = ready;
+            cx.notify();
+        }
+    }
+
+    /// The line of the caret and the expression of the identifier chain around it, for
+    /// an inline watch.
+    pub fn inline_watch_at_caret(&self) -> Option<(usize, String)> {
+        let state = self.state.as_ref()?;
+        let caret = state.selections().primary().head;
+        let expression = identifier_chain_at(&state.text(), caret)?;
+        Some((state.store().offset_to_line(caret), expression))
+    }
+
+    /// The place of the cross of the inline watch on `line`, for a test that clicks it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inline_watch_cross_point(&self, line: usize) -> Option<Point<Pixels>> {
+        let layout = self.layout.as_ref()?;
+        let row = layout.rows.iter().find(|row| {
+            row.buffer_line == line && row.watch.as_ref().is_some_and(|_| !row.line.continuation)
+        })?;
+        let watch = row.watch.as_ref()?;
+        Some(point(
+            watch.cross_x + watch.cross.width() / 2.,
+            row.y + px(self.style.line_height / 2.),
+        ))
+    }
+
     /// Shows the values of the stopped frame after the lines of its method that name
     /// them. `line` is the buffer line of the stop, from zero; `None` takes the values
     /// away when the program runs.
@@ -1813,6 +1954,35 @@ impl EditorView {
             return;
         };
         let change = state.apply_edits(edits);
+        self.changed(change, cx);
+    }
+
+    /// Edits from outside the keyboard, joined with the previous step when `merge` says
+    /// they belong to the same edit: a field of a table keeps one undo step per run.
+    pub fn apply_edits_merging(
+        &mut self,
+        edits: Vec<text_core::Edit>,
+        merge: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.catch_up(cx);
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let change = state.apply_edits(edits);
+        if change.is_some() && merge {
+            state.merge_last_undo(2);
+        }
+        self.changed(change, cx);
+    }
+
+    /// Takes back the last edit, as the undo key of the editor does.
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        self.catch_up(cx);
+        let change = self
+            .state
+            .as_mut()
+            .and_then(|state| state.perform(keymap::editor::UNDO, 1));
         self.changed(change, cx);
     }
 
@@ -1984,9 +2154,13 @@ impl EditorView {
         }
     }
 
-    /// The room of the gutter and of the blame column before the text.
+    /// The room of the gutter before the text; zero in the mode of Distraction Free.
     pub(crate) fn gutter_room(&self) -> f32 {
-        GUTTER_WIDTH + self.annotation_width()
+        if self.options.centered_text {
+            self.annotation_width()
+        } else {
+            GUTTER_WIDTH + self.annotation_width()
+        }
     }
 
     /// The text as the buffer holds it now, with LF line ends. `None` while loading.
@@ -2136,6 +2310,31 @@ impl EditorView {
         })
     }
 
+    /// Where the indentation of the open file came from, when a file of the project
+    /// named it: `.editorconfig` or the code style of the project.
+    pub fn indent_source_name(&self) -> Option<&'static str> {
+        self.state
+            .as_ref()
+            .and_then(|state| match state.indent().source {
+                text_core::IndentSource::EditorConfig => Some("EditorConfig"),
+                text_core::IndentSource::Project => Some("Project"),
+                _ => None,
+            })
+    }
+
+    /// Uses the window settings for this file from now on, because the user turned the
+    /// project code style off. The next open reads the switch from the project.
+    pub fn use_arro_code_style(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.state {
+            state.drop_project_indent(
+                self.options.use_tabs,
+                self.options.indent_size,
+                self.options.tab_size,
+            );
+        }
+        cx.notify();
+    }
+
     /// The width a tab takes on screen.
     pub fn tab_width(&self) -> usize {
         self.state.as_ref().map_or(4, EditorState::tab_width)
@@ -2277,6 +2476,27 @@ impl EditorView {
     /// Pastes text the way Ctrl+V does.
     pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.catch_up(cx);
+        let converted = self.application_paste(text, cx);
+        let text = converted.as_deref().unwrap_or(text);
+        let change = self.state.as_mut().and_then(|state| state.paste(text));
+        self.changed(change, cx);
+    }
+
+    /// The text a paste inserts: the application may turn a copied command line into the
+    /// request of this file.
+    fn application_paste(&self, text: &str, cx: &App) -> Option<String> {
+        let hook = cx.try_global::<PasteText>()?;
+        (hook.0)(&self.path, text)
+    }
+
+    /// Ctrl+V: the clipboard as the application wants it in this file.
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        self.catch_up(cx);
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let converted = self.application_paste(&text, cx);
+        let text = converted.as_deref().unwrap_or(&text);
         let change = self.state.as_mut().and_then(|state| state.paste(text));
         self.changed(change, cx);
     }
@@ -2678,6 +2898,7 @@ impl EditorView {
                 lsp.retain_transformed_tokens(&change.steps, len);
             }
             self.apply_tokens(cx);
+            self.apply_marks(cx);
             self.usages = None;
             self.sync_bookmarks(cx);
         }
@@ -3615,6 +3836,7 @@ impl EditorView {
             actions::OVERRIDE_METHODS => return self.override_methods(false, cx),
             actions::IMPLEMENT_METHODS => return self.override_methods(true, cx),
             actions::CALL_HIERARCHY => return self.call_hierarchy(cx),
+            actions::SHOW_DIAGRAM => return self.show_diagram(cx),
             actions::GOTO_TYPE_DECLARATION => return self.type_declaration(cx),
             actions::QUICK_DEFINITION => return self.quick_definition(cx),
             actions::COPY_REFERENCE => return self.copy_reference(cx),
@@ -3685,6 +3907,7 @@ impl EditorView {
                 return;
             }
             actions::PASTE_HISTORY => return cx.emit(EditorEvent::PasteHistory),
+            actions::PASTE => return self.paste_from_clipboard(cx),
             actions::TOGGLE_SOFT_WRAP => {
                 if !self.wrap_locked {
                     self.soft_wrap = !self.soft_wrap;
@@ -3733,10 +3956,6 @@ impl EditorView {
                 remember_clip(cx, text.clone());
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 state.cut()
-            }
-            actions::PASTE => {
-                let text = cx.read_from_clipboard().and_then(|item| item.text());
-                text.and_then(|text| state.paste(&text))
             }
             actions::PASTE_SIMPLE => {
                 let text = cx.read_from_clipboard().and_then(|item| item.text());
@@ -3801,9 +4020,10 @@ impl EditorView {
     }
 
     fn in_gutter(&self, position: Point<Pixels>) -> bool {
+        let gutter = self.gutter_room() - self.annotation_width();
         self.layout
             .as_ref()
-            .is_some_and(|layout| position.x < layout.bounds.left() + px(GUTTER_WIDTH))
+            .is_some_and(|layout| gutter > 0. && position.x < layout.bounds.left() + px(gutter))
     }
 
     /// Whether a right click at `position` belongs to the gutter or to the blame column,
@@ -3822,7 +4042,10 @@ impl EditorView {
             .iter()
             .position(|laid_out| position.y < laid_out.y + line_height)
             .unwrap_or(layout.rows.len().checked_sub(1)?);
-        let x = position.x - layout.bounds.left() - px(self.gutter_room() + TEXT_INSET)
+        let x = position.x
+            - layout.bounds.left()
+            - px(self.gutter_room() + TEXT_INSET)
+            - px(self.center_inset)
             + px(self.scroll_left);
         Some((
             shown,
@@ -4010,6 +4233,20 @@ impl EditorView {
         let Some((shown, column)) = self.hit(event.position) else {
             return;
         };
+        // The cross of an inline watch removes it; the text of the watch is not a link.
+        if layout.rows[shown].watch.as_ref().is_some_and(|watch| {
+            event.position.x >= watch.cross_x
+                && event.position.x < watch.cross_x + watch.cross.width() + px(4.)
+        }) {
+            let expression = layout.rows[shown]
+                .watch
+                .as_ref()
+                .map(|watch| watch.expression.clone())
+                .unwrap_or_default();
+            let line = layout.rows[shown].buffer_line;
+            cx.emit(EditorEvent::InlineWatchRemoved { line, expression });
+            return;
+        }
         // The blame column takes the click: a label opens its commit, the rest is dead.
         if self.in_annotations(event.position) {
             let row = &layout.rows[shown];
@@ -4083,7 +4320,8 @@ impl EditorView {
             .state
             .as_ref()
             .map(|state| state.store().offset_to_line(line.start_offset));
-        if let Some(buffer_line) = run_line
+        if self.options.gutter_icons
+            && let Some(buffer_line) = run_line
             && !line.continuation
         {
             let x = event.position.x - layout.bounds.left();
@@ -4108,7 +4346,8 @@ impl EditorView {
                 return;
             }
         }
-        if let Some(buffer_line) = run_line
+        if self.options.gutter_icons
+            && let Some(buffer_line) = run_line
             && !line.continuation
             && event.position.x - layout.bounds.left() < px(crate::element::FOLD_X)
             && self
@@ -4124,7 +4363,8 @@ impl EditorView {
             cx.emit(event);
             return;
         }
-        if let Some(buffer_line) = run_line
+        if self.options.gutter_icons
+            && let Some(buffer_line) = run_line
             && !line.continuation
             && layout.rows[shown].doc_icon.is_some()
         {
@@ -4136,16 +4376,16 @@ impl EditorView {
                 return;
             }
         }
+        let in_gutter = self.in_gutter(event.position);
         self.catch_up(cx);
         let Some(state) = &mut self.state else {
             return;
         };
-        if position_in_fold_column(event.position, layout.bounds) {
+        if self.options.gutter_icons && position_in_fold_column(event.position, layout.bounds) {
             state.toggle_fold_at_line(state.store().offset_to_line(line.start_offset));
             cx.notify();
             return;
         }
-        let in_gutter = event.position.x - layout.bounds.left() < px(GUTTER_WIDTH);
         if in_gutter && !line.continuation {
             if let Some(buffer_line) = run_line {
                 cx.emit(EditorEvent::GutterClick {
@@ -4343,6 +4583,41 @@ impl EditorView {
     }
 }
 
+/// The identifier chain, with dots, around a byte offset of the text.
+pub(crate) fn identifier_chain_at(text: &str, head: usize) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let head = head.min(text.len());
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '.';
+    let mut start = head;
+    while start > 0 {
+        let previous = text[..start].chars().next_back()?;
+        if !ident(previous) {
+            break;
+        }
+        start -= previous.len_utf8();
+    }
+    let mut end = head;
+    while end < text.len() {
+        let next = text[end..].chars().next()?;
+        if !ident(next) {
+            break;
+        }
+        end += next.len_utf8();
+    }
+    let expression = text.get(start..end)?.trim_matches('.');
+    if expression.is_empty()
+        || !expression
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+    {
+        return None;
+    }
+    Some(expression.to_owned())
+}
+
 /// The word under a caret, with the byte offset of its start, for a text that is read
 /// again under the same caret.
 fn word_at_caret(text: &str, caret: (usize, usize)) -> Option<(String, usize)> {
@@ -4409,6 +4684,9 @@ pub(crate) fn inside(area: Bounds<Pixels>, position: Point<Pixels>) -> bool {
 impl EditorView {
     /// The declarations around the caret as a path under the text.
     fn render_crumbs(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.options.breadcrumbs {
+            return None;
+        }
         let around = self.enclosing();
         if around.is_empty() {
             return None;
@@ -4514,7 +4792,8 @@ impl EditorView {
         let (layout, state) = (self.layout.as_ref()?, self.state.as_ref()?);
         let at = state.display().to_display(offset);
         let shown = layout.rows.iter().find(|shown| shown.row == at.row)?;
-        let x = layout.bounds.left() + px(self.gutter_room() + TEXT_INSET) - px(self.scroll_left)
+        let x = layout.bounds.left() + px(self.gutter_room() + TEXT_INSET + self.center_inset)
+            - px(self.scroll_left)
             + shown.text.x_for_index(at.column);
         Some(point(x, shown.y + px(self.style.line_height)))
     }
@@ -4542,7 +4821,8 @@ impl EditorView {
         let (layout, state) = (self.layout.as_ref()?, self.state.as_ref()?);
         let at = state.display().to_display(offset);
         let shown = layout.rows.iter().find(|shown| shown.row == at.row)?;
-        let x = layout.bounds.left() + px(self.gutter_room() + TEXT_INSET) - px(self.scroll_left)
+        let x = layout.bounds.left() + px(self.gutter_room() + TEXT_INSET + self.center_inset)
+            - px(self.scroll_left)
             + shown.text.x_for_index(at.column);
         Some(popup_placement(
             x,
@@ -5386,24 +5666,32 @@ impl Render for EditorView {
             None => {
                 let bar = self.render_bar(cx);
                 let toolbar = self.preview_toolbar(cx);
+                let bundle_toolbar = self.bundle_toolbar(cx);
+                let bundle = self.bundle_area(window, cx);
                 let crumbs = self.render_crumbs(cx);
                 let widget = self.render_problem_widget(cx);
                 let file_bar = self.file_bar(window, cx);
-                let text = div()
-                    .id("editor-text")
-                    .debug_selector(|| "editor-text".to_owned())
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .w_full()
-                    .child(EditorElement::new(cx.entity()))
-                    .children(widget);
-                let text = self.preview_area(text.into_any_element(), window, cx);
+                let text = match bundle {
+                    Some(bundle) => bundle,
+                    None => {
+                        let text = div()
+                            .id("editor-text")
+                            .debug_selector(|| "editor-text".to_owned())
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .w_full()
+                            .child(EditorElement::new(cx.entity()))
+                            .children(widget);
+                        self.preview_area(text.into_any_element(), window, cx)
+                    }
+                };
                 root.flex()
                     .flex_col()
                     .children(bar)
                     .children(toolbar)
+                    .children(bundle_toolbar)
                     .children(file_bar)
                     .child(text)
                     .children(crumbs)

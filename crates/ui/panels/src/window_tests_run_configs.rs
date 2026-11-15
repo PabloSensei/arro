@@ -88,6 +88,7 @@ fn config(name: &str) -> RunConfig {
         provider: "fixture".into(),
         assemble_first: false,
         settings: Default::default(),
+        ..RunConfig::default()
     }
 }
 

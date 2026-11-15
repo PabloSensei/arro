@@ -408,6 +408,7 @@ mod tests {
             severity: Severity::Error,
             message: "cannot resolve".into(),
             unnecessary: false,
+            code: None,
         };
         let mut state = ProblemsState::default();
         state.set_file_diagnostics(path.clone(), std::slice::from_ref(&diagnostic));

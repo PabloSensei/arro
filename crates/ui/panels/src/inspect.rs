@@ -56,6 +56,14 @@ impl Finding {
         note: &DiagnosticNote,
         support: &dyn lang_api::LanguageSupport,
     ) -> Self {
+        // The server may name a compiler problem by its numeric `IProblem` id; the
+        // settings and the tree use the id of the check.
+        let code = note
+            .code
+            .as_deref()
+            .and_then(|code| support.inspection_of(Some(code), &note.message))
+            .map(|info| info.id)
+            .or_else(|| note.code.clone());
         Self {
             path: path.to_path_buf(),
             line: note.span.start.line as usize,
@@ -64,7 +72,7 @@ impl Finding {
             end_character: note.span.end.character as usize,
             severity: note.severity,
             message: note.message.clone(),
-            code: note.code.clone(),
+            code,
             kind: support.problem_kind(note.code.as_deref(), &note.message),
             fixed: false,
         }
@@ -92,6 +100,26 @@ impl Finding {
     }
 }
 
+/// Whether the settings show a finding, and with which severity.
+fn show_finding(finding: &mut Finding, settings: &lang_api::InspectionSettings) -> bool {
+    let Some(code) = finding.code.as_deref() else {
+        return true;
+    };
+    let Some(setting) = settings.setting(code) else {
+        return true;
+    };
+    if !setting.enabled {
+        return false;
+    }
+    if let Some(level) = setting.level {
+        match level.severity() {
+            Some(severity) => finding.severity = severity,
+            None => return false,
+        }
+    }
+    true
+}
+
 fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by_key(|finding| {
         (
@@ -101,6 +129,23 @@ fn sort_findings(findings: &mut [Finding]) {
             finding.column,
         )
     });
+}
+
+/// The notes the server published for a file and the checks the language computes
+/// itself, one row per problem: Inspect Code shows both, as an editor does.
+fn merge_notes(server: Vec<DiagnosticNote>, native: Vec<DiagnosticNote>) -> Vec<DiagnosticNote> {
+    let mut notes = server;
+    for note in native {
+        if notes
+            .iter()
+            .any(|known| known.span == note.span && known.message == note.message)
+        {
+            continue;
+        }
+        notes.push(note);
+    }
+    notes.sort_by_key(|note| (note.span.start.line, note.span.start.character));
+    notes
 }
 
 fn severity_label(severity: Severity) -> &'static str {
@@ -566,33 +611,27 @@ impl InspectHub {
                     break;
                 }
                 let uri = CanonPath::new(&path).ok().map(|path| path.to_uri());
-                let cached = uri
+                let mut notes = uri
                     .as_ref()
                     .and_then(|uri| known.remove(uri))
-                    .filter(|notes| !notes.is_empty());
-                let notes: Vec<DiagnosticNote> = match cached {
-                    Some(notes) => notes,
-                    None => match (per_file, uri) {
-                        (Some(provider), Some(uri)) => {
-                            let mut replies = ask(provider, DiagnosticsQuery(uri));
-                            let mut found = Vec::new();
-                            if let Some(answer) = replies.next().await {
-                                found = answer
-                                    .value
-                                    .iter()
-                                    .map(|entry| DiagnosticNote {
-                                        span: entry.span,
-                                        severity: entry.severity,
-                                        message: entry.message.clone(),
-                                        code: None,
-                                    })
-                                    .collect();
-                            }
-                            found
-                        }
-                        _ => Vec::new(),
-                    },
-                };
+                    .unwrap_or_default();
+                if let (Some(provider), Some(uri)) = (per_file, uri) {
+                    let mut replies = ask(provider, DiagnosticsQuery(uri));
+                    let mut found = Vec::new();
+                    if let Some(answer) = replies.next().await {
+                        found = answer
+                            .value
+                            .iter()
+                            .map(|entry| DiagnosticNote {
+                                span: entry.span,
+                                severity: entry.severity,
+                                message: entry.message.clone(),
+                                code: entry.code.clone(),
+                            })
+                            .collect();
+                    }
+                    notes = merge_notes(notes, found);
+                }
                 for note in &notes {
                     findings.push(Finding::from_note(&path, note, support.as_ref()));
                 }
@@ -819,6 +858,11 @@ impl InspectHub {
         if let Some(kind) = filter {
             findings.retain(|finding| finding.kind == kind);
         }
+        let settings = cx
+            .try_global::<editor_view::InspectionProfile>()
+            .map(|profile| profile.0.clone())
+            .unwrap_or_default();
+        findings.retain_mut(|finding| show_finding(finding, &settings));
         sort_findings(&mut findings);
         let mut kinds: Vec<String> = findings
             .iter()
@@ -905,29 +949,24 @@ impl InspectHub {
                     continue;
                 };
                 let uri = uri.to_uri();
-                let notes = match known.remove(&uri) {
-                    Some(notes) => notes,
-                    None => match per_file {
-                        Some(provider) => {
-                            let mut replies = ask(provider, DiagnosticsQuery(uri));
-                            let mut found = Vec::new();
-                            if let Some(answer) = replies.next().await {
-                                found = answer
-                                    .value
-                                    .iter()
-                                    .map(|entry| DiagnosticNote {
-                                        span: entry.span,
-                                        severity: entry.severity,
-                                        message: entry.message.clone(),
-                                        code: None,
-                                    })
-                                    .collect();
-                            }
-                            found
-                        }
-                        None => Vec::new(),
-                    },
-                };
+                let mut notes = known.remove(&uri).unwrap_or_default();
+                if let Some(provider) = per_file {
+                    let mut replies = ask(provider, DiagnosticsQuery(uri));
+                    let mut found = Vec::new();
+                    if let Some(answer) = replies.next().await {
+                        found = answer
+                            .value
+                            .iter()
+                            .map(|entry| DiagnosticNote {
+                                span: entry.span,
+                                severity: entry.severity,
+                                message: entry.message.clone(),
+                                code: entry.code.clone(),
+                            })
+                            .collect();
+                    }
+                    notes = merge_notes(notes, found);
+                }
                 weak.update(cx, |hub, cx| {
                     hub.replace_file_findings(&path, notes, support.as_ref(), cx)
                 })
@@ -953,8 +992,15 @@ impl InspectHub {
             .collect();
         self.findings
             .retain(|finding| finding.path != path || finding.fixed);
+        let settings = cx
+            .try_global::<editor_view::InspectionProfile>()
+            .map(|profile| profile.0.clone())
+            .unwrap_or_default();
         for note in &notes {
-            let finding = Finding::from_note(path, note, support);
+            let mut finding = Finding::from_note(path, note, support);
+            if !show_finding(&mut finding, &settings) {
+                continue;
+            }
             if fixed.iter().any(|known| known.same_problem(&finding)) {
                 continue;
             }
@@ -1848,6 +1894,86 @@ impl InspectPanel {
             let Some((_, actions)) = found.first() else {
                 return;
             };
+            let first = found.first().map(|(finding, _)| finding.clone());
+            let text = first.as_ref().and_then(|finding| {
+                workspace
+                    .read_with(cx, |workspace, cx| {
+                        workspace
+                            .view_of(&finding.path)
+                            .and_then(|view| view.downcast::<EditorView>().ok())
+                            .and_then(|view| view.read(cx).text())
+                    })
+                    .ok()
+                    .flatten()
+            });
+            let mut extra: Vec<MenuEntry> = Vec::new();
+            if let Some(finding) = &first
+                && let Some(code) = finding.code.clone()
+                && let Some(info) = support.inspection_of(Some(&code), &finding.message)
+            {
+                let uri = CanonPath::new(&finding.path).map(|path| path.to_uri()).ok();
+                let offset = text
+                    .as_ref()
+                    .map(|text| lang_api::offset_in(text, finding.span().start));
+                let annotation = text.as_ref().zip(offset).and_then(|(text, offset)| {
+                    support.suppression_edit(lang_api::SuppressionQuery {
+                        text: text.as_str().into(),
+                        offset,
+                        code: Some(code.clone()),
+                        target: lang_api::SuppressionTarget::Statement,
+                    })
+                });
+                let edit = annotation.or_else(|| {
+                    info.configurable.then(|| DocumentEdit {
+                        span: TextSpan {
+                            start: TextPoint {
+                                line: finding.line as u32,
+                                character: 0,
+                            },
+                            end: TextPoint {
+                                line: finding.line as u32,
+                                character: 0,
+                            },
+                        },
+                        text: format!("//noinspection {}\n", info.id),
+                    })
+                });
+                if let (Some(edit), Some(uri)) = (edit, uri) {
+                    let workspace = workspace.clone();
+                    extra.push(MenuEntry::new(
+                        "Suppress for statement",
+                        move |window, cx| {
+                            let change = WorkspaceChange {
+                                edits: vec![SourceEdit {
+                                    uri: uri.clone(),
+                                    edits: vec![edit.clone()],
+                                }],
+                                renames: Vec::new(),
+                            };
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    crate::changes::apply(workspace, change.clone(), window, cx)
+                                })
+                                .ok();
+                        },
+                    ));
+                }
+                if info.configurable {
+                    let workspace = workspace.clone();
+                    let id = info.id.clone();
+                    let title = info.title.clone();
+                    extra.push(MenuEntry::new(
+                        format!("Disable inspection '{}'", info.title),
+                        move |_, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    crate::inspection::disable(workspace, &id, &title, cx)
+                                })
+                                .ok();
+                        },
+                    ));
+                }
+            }
             let entries: Vec<MenuEntry> = actions
                 .iter()
                 .filter(|entry| !entry.edits.is_empty() || !entry.renames.is_empty())
@@ -1895,6 +2021,9 @@ impl InspectPanel {
                         }
                     })
                 })
+                .collect::<Vec<MenuEntry>>()
+                .into_iter()
+                .chain(extra)
                 .collect();
             if entries.is_empty() {
                 return;
@@ -2130,5 +2259,45 @@ impl Render for InspectPanel {
             .child(panel_header(self.title.clone(), GROUP, hide, &theme))
             .child(toolbar)
             .child(div().flex_1().min_h_0().pt(px(SPACE_S)).child(body))
+    }
+}
+
+#[cfg(test)]
+mod inspect_tests {
+    use super::merge_notes;
+    use lang_api::{DiagnosticNote, Severity, TextPoint, TextSpan};
+
+    fn note(line: u32, message: &str, code: &str, severity: Severity) -> DiagnosticNote {
+        DiagnosticNote {
+            span: TextSpan {
+                start: TextPoint { line, character: 0 },
+                end: TextPoint { line, character: 4 },
+            },
+            severity,
+            message: message.to_owned(),
+            code: Some(code.to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_native_checks_of_a_file_join_the_notes_of_the_server() {
+        let server = vec![note(4, "Cannot resolve symbol", "1", Severity::Error)];
+        let native = vec![
+            note(
+                1,
+                "Unused property",
+                "messages.unusedProperty",
+                Severity::Hint,
+            ),
+            // The provider of the language may answer the server notes again.
+            note(4, "Cannot resolve symbol", "1", Severity::Error),
+        ];
+
+        let notes = merge_notes(server, native);
+
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0].message, "Unused property");
+        assert_eq!(notes[1].message, "Cannot resolve symbol");
+        assert!(merge_notes(Vec::new(), Vec::new()).is_empty());
     }
 }

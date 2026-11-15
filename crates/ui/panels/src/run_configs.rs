@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use project_model::ProjectModel;
-use runner::{ConfigField, ConfigFieldKind, ConfigTemplate, RunConfig, RunConfigProvider};
+use runner::{
+    BeforeLaunchStep, ConfigField, ConfigFieldKind, ConfigTemplate, RunConfig, RunConfigProvider,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -41,6 +43,38 @@ struct FieldRow {
     flag: bool,
 }
 
+/// A before launch step and the input of its goal, task or configuration name.
+struct StepRow {
+    step: BeforeLaunchStep,
+    target: TextField,
+}
+
+impl StepRow {
+    fn new(step: BeforeLaunchStep, configs: &[String]) -> Self {
+        let mut target = match &step {
+            BeforeLaunchStep::Task { target } => target.clone(),
+            BeforeLaunchStep::Configuration { name } => name.clone(),
+            BeforeLaunchStep::Build => String::new(),
+        };
+        if target.is_empty()
+            && let BeforeLaunchStep::Configuration { .. } = step
+            && let Some(first) = configs.first()
+        {
+            target = first.clone();
+        }
+        let step = match &step {
+            BeforeLaunchStep::Configuration { .. } => BeforeLaunchStep::Configuration {
+                name: target.clone(),
+            },
+            other => other.clone(),
+        };
+        Self {
+            step,
+            target: TextField::from_text(target),
+        }
+    }
+}
+
 /// A template of the Add button with the provider that creates it.
 struct TemplateRow {
     provider: Arc<dyn RunConfigProvider>,
@@ -52,9 +86,16 @@ pub struct RunConfigDialog {
     items: Vec<Item>,
     selected: Option<usize>,
     name: TextField,
-    assemble_first: bool,
+    /// The steps before the program, in order.
+    steps: Vec<StepRow>,
+    /// The step whose goal is being typed.
+    step_active: Option<usize>,
+    /// The configurations a compound configuration starts.
+    compound: Vec<String>,
+    allow_multiple_instances: bool,
+    environment_file: TextField,
     rows: Vec<FieldRow>,
-    /// `0` is the name, then one per row.
+    /// `0` is the name, then one per row, then the environment file.
     active: usize,
     templates: Vec<TemplateRow>,
     templates_open: bool,
@@ -138,7 +179,11 @@ impl RunConfigDialog {
                 items,
                 selected,
                 name: TextField::default(),
-                assemble_first: true,
+                steps: Vec::new(),
+                step_active: None,
+                compound: Vec::new(),
+                allow_multiple_instances: false,
+                environment_file: TextField::default(),
                 rows: Vec::new(),
                 active: 0,
                 templates,
@@ -176,7 +221,11 @@ impl RunConfigDialog {
     /// Reads the fields of the selected configuration into the dialog.
     fn load_fields(&mut self) {
         self.name = TextField::default();
-        self.assemble_first = true;
+        self.steps.clear();
+        self.step_active = None;
+        self.compound.clear();
+        self.allow_multiple_instances = false;
+        self.environment_file = TextField::default();
         self.rows.clear();
         self.active = 0;
         let Some(index) = self.selected else {
@@ -186,7 +235,31 @@ impl RunConfigDialog {
             return;
         };
         self.name = TextField::from_text(config.name.clone());
-        self.assemble_first = config.assemble_first;
+        let other_names: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| item.config.name != config.name && !item.config.is_compound())
+            .map(|item| item.config.name.clone())
+            .collect();
+        self.steps = config
+            .before_launch_steps()
+            .into_iter()
+            .map(|step| StepRow::new(step, &other_names))
+            .collect();
+        self.compound = config
+            .compound
+            .iter()
+            .filter(|name| self.items.iter().any(|item| item.config.name == **name))
+            .cloned()
+            .collect();
+        self.allow_multiple_instances = config.allow_multiple_instances;
+        self.environment_file = TextField::from_text(
+            config
+                .environment_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
         let Some(provider) = self.provider_of(&config).cloned() else {
             return;
         };
@@ -212,7 +285,37 @@ impl RunConfigDialog {
             return;
         };
         item.config.name = self.name.text.trim().to_owned();
-        item.config.assemble_first = self.assemble_first;
+        let steps: Vec<BeforeLaunchStep> = self
+            .steps
+            .iter()
+            .map(|row| match &row.step {
+                BeforeLaunchStep::Task { .. } => BeforeLaunchStep::Task {
+                    target: row.target.text.trim().to_owned(),
+                },
+                BeforeLaunchStep::Configuration { .. } => BeforeLaunchStep::Configuration {
+                    name: row.target.text.trim().to_owned(),
+                },
+                BeforeLaunchStep::Build => BeforeLaunchStep::Build,
+            })
+            .collect();
+        // An untouched configuration keeps the old flag instead of gaining a list: an old
+        // file reads the same after a visit to the dialog.
+        if steps == [BeforeLaunchStep::Build]
+            && item.original.before_launch.is_none()
+            && item.original.assemble_first
+        {
+            item.config.before_launch = None;
+            item.config.assemble_first = true;
+        } else {
+            item.config.before_launch = Some(steps);
+            item.config.assemble_first = false;
+        }
+        item.config.allow_multiple_instances = self.allow_multiple_instances;
+        let file = self.environment_file.text.trim();
+        item.config.environment_file = (!file.is_empty()).then(|| file.into());
+        if item.config.is_compound() {
+            item.config.compound = self.compound.clone();
+        }
         let provider = self
             .providers
             .iter()
@@ -355,6 +458,41 @@ impl RunConfigDialog {
         cx.notify();
     }
 
+    /// Adds a step and gives its field the focus.
+    fn add_step(&mut self, step: BeforeLaunchStep, cx: &mut Context<Self>) {
+        let names = self
+            .items
+            .iter()
+            .filter(|item| !item.config.is_compound())
+            .map(|item| item.config.name.clone())
+            .collect::<Vec<_>>();
+        self.steps.push(StepRow::new(step, &names));
+        self.step_active = Some(self.steps.len() - 1);
+        self.active = usize::MAX;
+        cx.notify();
+    }
+
+    fn remove_step(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.steps.len() {
+            return;
+        }
+        self.steps.remove(index);
+        self.step_active = None;
+        cx.notify();
+    }
+
+    /// Moves a step one place up (`-1`) or down (`1`).
+    fn move_step(&mut self, index: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(target) = index
+            .checked_add_signed(delta)
+            .filter(|target| *target < self.steps.len())
+        else {
+            return;
+        };
+        self.steps.swap(index, target);
+        cx.notify();
+    }
+
     fn remove(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.selected else {
             return;
@@ -423,10 +561,21 @@ impl RunConfigDialog {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(event.keystroke.key.as_str(), "escape" | "enter")
+            && let Some(index) = self.step_active
+            && let Some(row) = self.steps.get_mut(index)
+        {
+            if row.target.key_with_clipboard(event, false, cx) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+        let env_active = self.rows.len() + 1;
         match event.keystroke.key.as_str() {
             "escape" => self.close(window, cx),
             "enter" => self.apply(true, window, cx),
-            "space" if self.active > 0 => {
+            "space" if self.active > 0 && self.active <= self.rows.len() => {
                 if let Some(row) = self.rows.get_mut(self.active - 1)
                     && row.field.kind == ConfigFieldKind::Bool
                 {
@@ -441,8 +590,14 @@ impl RunConfigDialog {
                     cx.notify();
                 }
             }
+            _ if self.active == env_active => {
+                if self.environment_file.key_with_clipboard(event, false, cx) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }
             _ => {
-                if let Some(row) = self.rows.get_mut(self.active - 1) {
+                if let Some(row) = self.rows.get_mut(self.active.saturating_sub(1)) {
                     if matches!(
                         row.field.kind,
                         ConfigFieldKind::Bool | ConfigFieldKind::ReadOnly
@@ -529,7 +684,13 @@ impl Render for RunConfigDialog {
             &self.name,
             name_active,
             &theme,
-        );
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.step_active = None;
+            this.active = 0;
+            window.focus(&this.focus, cx);
+            cx.notify();
+        }));
         let live = self.problem();
         let error = live.or_else(|| self.error.clone()).map(|error| {
             div()
@@ -538,12 +699,175 @@ impl Render for RunConfigDialog {
                 .child(error)
         });
 
-        let build_row = {
-            let on = self.assemble_first;
+        let step_rows = self
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let label: SharedString = row.step.label().into();
+                let up = small_button(
+                    ("run-config-step-up", index),
+                    format!("run-config-step-up-{index}"),
+                    "↑",
+                    &theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.move_step(index, -1, cx)));
+                let down = small_button(
+                    ("run-config-step-down", index),
+                    format!("run-config-step-down-{index}"),
+                    "↓",
+                    &theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.move_step(index, 1, cx)));
+                let remove = small_button(
+                    ("run-config-step-remove", index),
+                    format!("run-config-step-remove-{index}"),
+                    "×",
+                    &theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.remove_step(index, cx)));
+                let edit = match &row.step {
+                    BeforeLaunchStep::Task { .. } => Some(
+                        field_box(
+                            ("run-config-step-target", index),
+                            format!("run-config-step-target-{index}"),
+                            &row.target,
+                            self.step_active == Some(index),
+                            &theme,
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.step_active = Some(index);
+                            this.active = usize::MAX;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    ),
+                    BeforeLaunchStep::Configuration { name } => {
+                        let choices = self
+                            .items
+                            .iter()
+                            .filter(|item| !item.config.is_compound())
+                            .map(|item| item.config.name.clone())
+                            .filter(|choice| choice != name)
+                            .collect::<Vec<_>>();
+                        let buttons = choices.into_iter().map(|choice| {
+                            let value = choice.clone();
+                            let selector = format!("run-config-step-choice-{index}-{choice}");
+                            small_button(
+                                format!("run-config-step-choice-{index}-{choice}"),
+                                selector,
+                                &choice,
+                                &theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if let Some(row) = this.steps.get_mut(index) {
+                                        row.step = BeforeLaunchStep::Configuration {
+                                            name: value.clone(),
+                                        };
+                                        row.target = TextField::from_text(value.clone());
+                                        this.step_active = None;
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                        });
+                        Some(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(SPACE_XS))
+                                .child(
+                                    div()
+                                        .text_color(theme.text_secondary)
+                                        .child(format!("Run {name}")),
+                                )
+                                .children(buttons)
+                                .into_any_element(),
+                        )
+                    }
+                    BeforeLaunchStep::Build => None,
+                };
+                div()
+                    .id(("run-config-step", index))
+                    .debug_selector(move || format!("run-config-step-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(FIELD_HEIGHT))
+                    .child(div().w(px(60.)).flex_none().child(label))
+                    .children(edit)
+                    .child(div().flex_1())
+                    .child(up)
+                    .child(down)
+                    .child(remove)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let add_build = small_button(
+            "run-config-step-add-build",
+            "run-config-step-add-build".to_owned(),
+            "+ Build",
+            &theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.add_step(BeforeLaunchStep::Build, cx)));
+        let add_task = small_button(
+            "run-config-step-add-task",
+            "run-config-step-add-task".to_owned(),
+            "+ Task",
+            &theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.add_step(
+                BeforeLaunchStep::Task {
+                    target: String::new(),
+                },
+                cx,
+            )
+        }));
+        let add_config = small_button(
+            "run-config-step-add-config",
+            "run-config-step-add-config".to_owned(),
+            "+ Configuration",
+            &theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.add_step(
+                BeforeLaunchStep::Configuration {
+                    name: String::new(),
+                },
+                cx,
+            )
+        }));
+        let steps = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_XS))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .child(
+                        div()
+                            .w(px(LABEL_WIDTH))
+                            .flex_none()
+                            .text_color(theme.text_muted)
+                            .child("Before launch"),
+                    )
+                    .child(add_build)
+                    .child(add_task)
+                    .child(add_config),
+            )
+            .children(step_rows);
+
+        let multiple = {
+            let on = self.allow_multiple_instances;
             let (hover, pressed) = (theme.hover, theme.pressed);
             div()
-                .id("run-config-assemble")
-                .debug_selector(|| "run-config-assemble".to_owned())
+                .id("run-config-multiple")
+                .debug_selector(|| "run-config-multiple".to_owned())
                 .flex()
                 .items_center()
                 .gap(px(SPACE_S))
@@ -565,12 +889,100 @@ impl Render for RunConfigDialog {
                         })
                         .when(on, |this| this.bg(theme.accent)),
                 )
-                .child(div().text_color(theme.text).child("Build before run"))
+                .child(
+                    div()
+                        .text_color(theme.text)
+                        .child("Allow multiple instances"),
+                )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.assemble_first = !this.assemble_first;
+                    this.allow_multiple_instances = !this.allow_multiple_instances;
                     cx.notify();
                 }))
         };
+
+        let environment_active = self.active == self.rows.len() + 1;
+        let environment = field_box(
+            "run-config-environment",
+            "run-config-environment".to_owned(),
+            &self.environment_file,
+            environment_active,
+            &theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.step_active = None;
+            this.active = this.rows.len() + 1;
+            window.focus(&this.focus, cx);
+            cx.notify();
+        }));
+
+        let compound = self
+            .item()
+            .is_some_and(|item| item.config.is_compound())
+            .then(|| {
+                let rows = self.compound.iter().enumerate().map(|(index, name)| {
+                    let value = name.clone();
+                    let remove = small_button(
+                        ("run-config-compound-remove", index),
+                        format!("run-config-compound-remove-{index}"),
+                        "×",
+                        &theme,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.compound.retain(|name| name != &value);
+                        cx.notify();
+                    }));
+                    div()
+                        .id(("run-config-compound", index))
+                        .debug_selector(move || format!("run-config-compound-{index}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .h(px(FIELD_HEIGHT))
+                        .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                        .child(remove)
+                });
+                let choices = self
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        !item.config.is_compound() && !self.compound.contains(&item.config.name)
+                    })
+                    .map(|item| item.config.name.clone())
+                    .collect::<Vec<_>>();
+                let add = choices.into_iter().enumerate().map(|(index, name)| {
+                    let value = name.clone();
+                    let selector = format!("run-config-compound-add-{name}");
+                    small_button(
+                        format!("run-config-compound-add-{index}"),
+                        selector,
+                        &name,
+                        &theme,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.compound.push(value.clone());
+                        cx.notify();
+                    }))
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_XS))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .child(
+                                div()
+                                    .w(px(LABEL_WIDTH))
+                                    .flex_none()
+                                    .text_color(theme.text_muted)
+                                    .child("Configurations"),
+                            )
+                            .children(add),
+                    )
+                    .children(rows)
+            });
 
         let rows = self
             .rows
@@ -661,6 +1073,7 @@ impl Render for RunConfigDialog {
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
                                 this.active = index + 1;
+                                this.step_active = None;
                                 window.focus(&this.focus, cx);
                                 cx.notify();
                             },
@@ -858,7 +1271,23 @@ impl Render for RunConfigDialog {
                                         .child(name),
                                 )
                                 .children(error)
-                                .child(build_row)
+                                .child(steps)
+                                .children(compound)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(SPACE_M))
+                                        .child(
+                                            div()
+                                                .w(px(LABEL_WIDTH))
+                                                .flex_none()
+                                                .text_color(theme.text_muted)
+                                                .child("Environment file"),
+                                        )
+                                        .child(environment),
+                                )
+                                .child(multiple)
                                 .children(rows),
                             &theme,
                             window,

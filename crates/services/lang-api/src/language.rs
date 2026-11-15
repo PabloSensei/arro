@@ -4,14 +4,14 @@ use std::sync::Arc;
 use crate::{
     ActionProvider, AddOverridableMethodsProvider, CallHierarchyProvider,
     ChangeSignatureInfoProvider, ChangeSignatureProvider, CompletionProvider,
-    CompletionResolveProvider, DefinitionPreviewProvider, DiagnosticsProvider,
-    ExecuteCommandProvider, FileSymbolsProvider, FormatProvider, GenerateApplyProvider,
-    GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveProvider, NavigationProvider, OverridableMethodsProvider,
-    PrepareDiagnosticsProvider, ProjectProblemsProvider, RangeFormatProvider,
-    ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer, SignatureProvider,
-    SourceTextProvider, SymbolProvider, SyntaxProvider, WorkspaceDiagnosticsProvider,
-    WorkspaceSymbolProvider,
+    CompletionResolveProvider, DefinitionPreviewProvider, DependencyUpdatesProvider,
+    DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
+    GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
+    MethodHierarchyProvider, MoveDestinationProvider, MoveProvider, NavigationProvider,
+    OverridableMethodsProvider, PrepareDiagnosticsProvider, ProjectProblemsProvider,
+    RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
+    SemanticServer, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
+    WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use crate::{
     ExpectedTypeProvider, ExternalDocProvider, LibraryClassProvider, SignatureInfoProvider,
@@ -104,6 +104,17 @@ pub trait LanguageSupport: Send + Sync {
 
     fn diagnostics(&self) -> Option<&DiagnosticsProvider> {
         None
+    }
+
+    /// The newest stable version of the dependencies the project declares, for the
+    /// window that lists them.
+    fn dependency_updates(&self) -> Option<&DependencyUpdatesProvider> {
+        None
+    }
+
+    /// Whether the project asks for newer versions of its dependencies at all.
+    fn set_dependency_updates(&self, enabled: bool) {
+        let _ = enabled;
     }
 
     /// Hints the language puts between the characters of a line: parameter names,
@@ -250,6 +261,28 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Create Test: the libraries, the defaults and the methods of the window.
+    fn test_form(&self) -> Option<&crate::TestFormProvider> {
+        None
+    }
+
+    /// Create Test after the window is filled: the file of the new test.
+    fn create_test(&self) -> Option<&crate::TestCreateProvider> {
+        None
+    }
+
+    /// The Fix button of Create Test: the edits that add a missing library.
+    fn test_framework_fix(&self) -> Option<&crate::TestFixProvider> {
+        None
+    }
+
+    /// Whether a test class can be made for the declaration at `offset`, the Create Test
+    /// row of Alt+Enter.
+    fn can_create_test(&self, text: &str, offset: usize) -> bool {
+        let _ = (text, offset);
+        false
+    }
+
     /// Ctrl+Shift+H: where the method under a place is defined, inherited or awaited.
     fn method_hierarchy(&self) -> Option<&MethodHierarchyProvider> {
         None
@@ -311,6 +344,19 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The types around a place or a folder with their relationships, read natively from
+    /// the sources in the background, for a diagram.
+    fn type_graph(&self) -> Option<&crate::TypeGraphProvider> {
+        None
+    }
+
+    /// Find and Replace Structurally: templates over the shape of the code, read by the
+    /// language itself. The window walks the project and runs the search in the
+    /// background.
+    fn structural_search(&self) -> Option<&dyn crate::StructuralSearchProvider> {
+        None
+    }
+
     /// The command of a label the editor shows, when the server resolves labels apart.
     fn code_lens_resolve(&self) -> Option<&crate::CodeLensResolveProvider> {
         None
@@ -320,6 +366,31 @@ pub trait LanguageSupport: Send + Sync {
     /// sending the ones that are off.
     fn set_code_vision_settings(&self, settings: crate::CodeVisionSettings) {
         let _ = settings;
+    }
+
+    /// The checks the language runs, for Settings and for the menu of a problem. The
+    /// list is static data, so the window may ask for it while it draws.
+    fn inspections(&self) -> Vec<crate::InspectionInfo> {
+        Vec::new()
+    }
+
+    /// The choices of the user for the checks of the project. A language sends the ones
+    /// its server understands and leaves a check that is off unsent.
+    fn set_inspection_settings(&self, settings: crate::InspectionSettings) {
+        let _ = settings;
+    }
+
+    /// The check a diagnostic code names, with the title and the level of the catalog.
+    fn inspection_of(&self, code: Option<&str>, message: &str) -> Option<crate::InspectionInfo> {
+        let _ = (code, message);
+        None
+    }
+
+    /// The edit of a suppression of a check at a place, or `None` for a language that
+    /// takes the comment of the editor instead.
+    fn suppression_edit(&self, query: crate::SuppressionQuery) -> Option<crate::DocumentEdit> {
+        let _ = query;
+        None
     }
 
     /// Whether the provider colours a part of a document on its own. The editor then
@@ -352,6 +423,14 @@ pub trait LanguageSupport: Send + Sync {
     /// the text as is, for a file the language gives no name to.
     fn copy_element_text(&self, text: &str, name: &str) -> Option<String> {
         let _ = (text, name);
+        None
+    }
+
+    /// The files of the localized `.properties` set `path` belongs to, the base file and
+    /// the files of its locales. `None` when the language does not know the file; the
+    /// editor then builds the set from the file names in the same folder.
+    fn bundle_files(&self, path: &Path) -> Option<Vec<crate::BundleFile>> {
+        let _ = path;
         None
     }
 

@@ -421,6 +421,7 @@ fn a_point_with_several_candidates_warns(cx: &mut TestAppContext) {
         warnings: vec![BeanWarning {
             file: owners.clone(),
             range: 15..19,
+            id: "beans.noCandidate".to_owned(),
             message: message.to_owned(),
         }],
     };

@@ -16,8 +16,9 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use alacritty_terminal::vte::{Params, Parser, Perform};
 use crossbeam_channel::{Receiver, Sender, never, select};
 
-use crate::screen::{Cell, CellColor, CellFlags, Link, Modes, Screen};
-use crate::session::{Control, Shared, TerminalEvent};
+use crate::screen::{Cell, CellColor, CellFlags, Link, Modes, Screen, SearchResults};
+use crate::search::{RowText, reveal_offset, search_rows};
+use crate::session::{Control, SearchQuery, Shared, TerminalEvent};
 
 /// How often a stream of output turns into a new picture.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(8);
@@ -117,6 +118,7 @@ impl EventListener for Proxy {
 struct Tap {
     win32_input: bool,
     osc: Vec<(String, String)>,
+    cwd: Option<String>,
 }
 
 impl Perform for Tap {
@@ -131,6 +133,9 @@ impl Perform for Tap {
         let Some((code, rest)) = params.split_first() else {
             return;
         };
+        if let Some(cwd) = cwd_of(code, rest) {
+            self.cwd = Some(cwd);
+        }
         if FORWARDED_OSC.contains(code) {
             let payload: Vec<_> = rest
                 .iter()
@@ -139,6 +144,30 @@ impl Perform for Tap {
             let code = String::from_utf8_lossy(code).into_owned();
             self.osc.push((code, payload.join(";")));
         }
+    }
+}
+
+/// The working directory an OSC names: OSC 7 carries a URI, and the OSC 9;9 of Windows
+/// terminals carries the path itself.
+fn cwd_of(code: &[u8], rest: &[&[u8]]) -> Option<String> {
+    match code {
+        b"7" => {
+            let uri = String::from_utf8_lossy(rest.first()?).into_owned();
+            (!uri.is_empty()).then_some(uri)
+        }
+        b"9" => {
+            let (kind, path) = rest.split_first()?;
+            if kind != b"9" {
+                return None;
+            }
+            let path: Vec<_> = path
+                .iter()
+                .map(|part| String::from_utf8_lossy(part))
+                .collect();
+            let path = path.join(";");
+            (!path.is_empty()).then_some(path)
+        }
+        _ => None,
     }
 }
 
@@ -154,6 +183,13 @@ pub(crate) struct Engine {
     last_publish: Instant,
     version: u64,
     closed: bool,
+    /// The query the panel looks for, while the search bar is open.
+    search: Option<SearchQuery>,
+    search_generation: u64,
+    /// Output arrived since the rows were last searched.
+    search_dirty: bool,
+    /// The latest answer of the search, for the view that scrolls to a match.
+    results: SearchResults,
 }
 
 impl Engine {
@@ -190,6 +226,10 @@ impl Engine {
             last_publish: Instant::now(),
             version: 0,
             closed: false,
+            search: None,
+            search_generation: 0,
+            search_dirty: false,
+            results: SearchResults::default(),
         }
     }
 
@@ -249,6 +289,7 @@ impl Engine {
             .fetch_add(chunk.len() as u64, Ordering::Relaxed);
         drop(self.events.try_send(TerminalEvent::Output));
         self.dirty = true;
+        self.search_dirty = self.search.is_some();
     }
 
     /// A lost end-of-sync marker must not freeze the screen.
@@ -294,6 +335,39 @@ impl Engine {
                 self.term.scroll_display(Scroll::Bottom);
                 self.dirty = true;
             }
+            Control::RevealMatch(index) => {
+                self.update_search();
+                let Some(line) = self.results.matches.get(index).map(|found| found.line) else {
+                    return;
+                };
+                let offset = reveal_offset(line, self.term.grid().history_size());
+                let current = self.term.grid().display_offset() as i32;
+                self.term
+                    .scroll_display(Scroll::Delta(offset as i32 - current));
+                self.dirty = true;
+            }
+            Control::Search { query, generation } => {
+                self.search = Some(query);
+                self.search_generation = generation;
+                self.search_dirty = true;
+                self.results = SearchResults::default();
+                // A quiet terminal publishes nothing of itself, and the answer of the
+                // search would wait for the next output.
+                self.dirty = true;
+            }
+            Control::ClearSearch => {
+                self.search = None;
+                self.search_dirty = false;
+                self.results = SearchResults::default();
+                self.shared.search.set(SearchResults::default());
+            }
+            Control::Clear => {
+                // The terminal clears itself, as the clear command of a shell does:
+                // the screen and the scrollback both go.
+                self.parser.advance(&mut self.term, b"\x1b[H\x1b[2J\x1b[3J");
+                self.dirty = true;
+                self.search_dirty = self.search.is_some();
+            }
         }
     }
 
@@ -316,8 +390,49 @@ impl Engine {
     fn publish(&mut self) {
         self.version += 1;
         self.shared.screen.set(self.screen());
+        self.update_search();
         self.dirty = false;
         self.last_publish = Instant::now();
+    }
+
+    /// Searches the rows again when output arrived or a query is new, and hands the
+    /// answer to the view.
+    fn update_search(&mut self) {
+        let Some(query) = &self.search else {
+            return;
+        };
+        if !self.search_dirty {
+            return;
+        }
+        let rows = self.row_texts();
+        let results = search_rows(&rows, query, self.search_generation);
+        self.results = results;
+        self.shared.search.set(self.results.clone());
+        self.search_dirty = false;
+    }
+
+    /// Every row of the history and of the screen, as text.
+    fn row_texts(&self) -> Vec<RowText> {
+        let (cols, rows) = {
+            let size = self.notes.borrow().size;
+            (size.cols, size.rows)
+        };
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let mut texts = Vec::with_capacity(history + rows);
+        for line in -(history as i32)..rows as i32 {
+            let row = &grid[alacritty_terminal::index::Line(line)];
+            let cells = (0..cols as u16).filter_map(|column| {
+                let cell = &row[alacritty_terminal::index::Column(column as usize)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    return None;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                Some((column, ch, cell.flags.contains(Flags::WIDE_CHAR)))
+            });
+            texts.push(RowText::new(line, cells));
+        }
+        texts
     }
 
     fn screen(&self) -> Screen {
@@ -353,6 +468,7 @@ impl Engine {
             modes: self.modes(),
             links: links.finished,
             bells: notes.bells,
+            cwd: self.tap.cwd.clone(),
             version: self.version,
             exit_code: self.shared.exit.get().copied(),
             closed: self.closed,
@@ -418,5 +534,25 @@ fn convert(cell: &TermCell) -> Cell {
         fg: convert_color(cell.fg),
         bg: convert_color(cell.bg),
         flags,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cwd_of;
+
+    #[test]
+    fn the_working_directory_of_the_shell_is_read_from_its_escape() {
+        assert_eq!(
+            cwd_of(b"7", &[b"file://host/tmp/project"]).as_deref(),
+            Some("file://host/tmp/project")
+        );
+        assert_eq!(
+            cwd_of(b"9", &[b"9", b"C:\\project"]).as_deref(),
+            Some("C:\\project")
+        );
+        assert_eq!(cwd_of(b"0", &[b"title"]), None, "a title is not a folder");
+        assert_eq!(cwd_of(b"9", &[b"1", b"notice"]), None);
+        assert_eq!(cwd_of(b"7", &[b""]), None);
     }
 }

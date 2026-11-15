@@ -8,12 +8,14 @@
 //! the analyzer can copy the coordinates of an artifact or add an exclusion to the
 //! first-level dependency it comes through.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use editor_view::{EditorView, Semantic, Spot};
+use futures_util::StreamExt;
+use lang_api::{DependencyVersion, DependencyVersionQuery, ask};
 use project_model::{
     BuildGroup, BuildModule, BuildSystem, BuildTask, Coordinates, Dependency, Exclusion, Module,
     ProjectModel,
@@ -126,6 +128,13 @@ pub struct BuildPanel {
     artifacts: Vec<Artifact>,
     /// The model the artifacts were built from.
     analyzed: Option<Arc<ProjectModel>>,
+    /// The newest stable version of an artifact that is newer than the one the model
+    /// names, by `group:artifact`, as the language found it.
+    updates: HashMap<String, String>,
+    /// The model generation the updates belong to.
+    updates_generation: usize,
+    /// The generation the language was asked for.
+    updates_asked: usize,
     analyzer_selected: Option<usize>,
     analyzer_list_scroll: ScrollHandle,
     analyzer_details_scroll: ScrollHandle,
@@ -162,6 +171,9 @@ impl BuildPanel {
                 only_conflicts: false,
                 artifacts: Vec::new(),
                 analyzed: None,
+                updates: HashMap::new(),
+                updates_generation: 0,
+                updates_asked: 0,
                 analyzer_selected: None,
                 analyzer_list_scroll: ScrollHandle::new(),
                 analyzer_details_scroll: ScrollHandle::new(),
@@ -274,6 +286,20 @@ impl BuildPanel {
     #[cfg(test)]
     pub(crate) fn analyzer_details(&mut self, _cx: &mut Context<Self>) -> Vec<String> {
         self.details()
+    }
+
+    /// The artifacts with a newer stable version, as the analyzer marks them, for tests.
+    #[cfg(test)]
+    pub(crate) fn analyzer_marks(&mut self) -> Vec<(String, String)> {
+        let indices = self.filtered();
+        indices
+            .into_iter()
+            .filter_map(|index| {
+                let artifact = &self.artifacts[index];
+                let latest = self.updates.get(&artifact.name)?;
+                Some((artifact_label(artifact), latest.clone()))
+            })
+            .collect()
     }
 
     /// Types into the search field of the analyzer, for tests.
@@ -791,6 +817,57 @@ impl BuildPanel {
             .unwrap_or_default();
         self.analyzed = model;
         self.analyzer_selected = None;
+        self.updates.clear();
+        self.updates_generation += 1;
+    }
+
+    /// Asks the language for the newest stable version of the direct artifacts once per
+    /// model. The answers come from the cache first and from the repositories later, so
+    /// the window draws the list at once and adds a mark when one arrives.
+    fn request_updates(&mut self, cx: &mut Context<Self>) {
+        if self.updates_asked == self.updates_generation || self.artifacts.is_empty() {
+            return;
+        }
+        self.updates_asked = self.updates_generation;
+        let dependencies: Vec<(String, String)> = self
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.direct() && !artifact.selected.is_empty())
+            .map(|artifact| (artifact.name.clone(), artifact.selected.clone()))
+            .collect();
+        if dependencies.is_empty() {
+            return;
+        }
+        let Some(semantic) = cx.try_global::<Semantic>() else {
+            return;
+        };
+        let support = semantic.0.clone();
+        let Some(provider) = support.dependency_updates() else {
+            return;
+        };
+        let replies = ask(provider, DependencyVersionQuery { dependencies });
+        let generation = self.updates_generation;
+        cx.spawn(async move |this, cx| {
+            let _support = support;
+            let mut replies = replies;
+            while let Some(answer) = replies.next().await {
+                let versions: Vec<DependencyVersion> = answer.value;
+                this.update(cx, |panel, cx| {
+                    if panel.updates_generation != generation {
+                        return;
+                    }
+                    panel.updates = versions
+                        .into_iter()
+                        .filter_map(|version| {
+                            version.latest.map(|latest| (version.name.clone(), latest))
+                        })
+                        .collect();
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// The indices of the artifacts the filters keep.
@@ -1245,6 +1322,7 @@ impl BuildPanel {
     /// paths of the selected one on the right.
     fn analyzer_body(&mut self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         self.refresh_artifacts(cx);
+        self.request_updates(cx);
         let filtered = self.filtered();
         let selected = self.analyzer_selected;
         let rows = filtered.iter().enumerate().map(|(position, index)| {
@@ -1252,6 +1330,7 @@ impl BuildPanel {
             let artifact = &self.artifacts[artifact_index];
             let label = artifact_label(artifact);
             let conflict = artifact.conflict();
+            let latest = self.updates.get(&artifact.name).cloned();
             let chosen = selected == Some(artifact_index);
             div()
                 .id(("dependencies-artifact", position))
@@ -1270,6 +1349,14 @@ impl BuildPanel {
                 .child(div().flex_1().overflow_hidden().child(label))
                 .when(conflict, |this| {
                     this.child(div().text_color(theme.text_secondary).child("conflict"))
+                })
+                .when_some(latest, |this, latest| {
+                    this.child(
+                        div()
+                            .debug_selector(move || format!("dependencies-update-{position}"))
+                            .text_color(theme.accent)
+                            .child(format!("update available: {latest}")),
+                    )
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.analyzer_selected = Some(artifact_index);

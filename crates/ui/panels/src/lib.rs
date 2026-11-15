@@ -6,6 +6,7 @@ mod ansi;
 mod beans;
 mod branches;
 mod build;
+mod bundle_editor;
 mod call_hierarchy;
 mod change_signature;
 mod changelists;
@@ -18,8 +19,12 @@ mod conflict;
 mod console_input;
 mod copy_class;
 mod coverage;
+mod create_test;
 pub mod database_panel;
 mod debug;
+mod diagram;
+mod diagram_layout;
+mod diagram_svg;
 mod diff_view;
 mod docker;
 mod documentation;
@@ -30,12 +35,14 @@ mod file_tree;
 mod finder;
 mod folder_compare;
 mod git;
+mod git_history;
 mod git_log;
 mod history;
 mod history_view;
 mod http;
 mod index;
 mod inspect;
+mod inspection;
 mod items;
 pub mod jshell_panel;
 mod library_sources;
@@ -44,6 +51,7 @@ mod marks;
 mod merge_view;
 mod method_hierarchy;
 mod navigation;
+mod new_project;
 mod outline;
 mod palette;
 mod performance;
@@ -61,6 +69,7 @@ mod run;
 mod run_configs;
 mod script;
 mod settings;
+mod settings_archive;
 mod settings_catalog;
 mod settings_keymap;
 mod settings_templates;
@@ -69,8 +78,11 @@ mod spring_data;
 mod stack_trace_dialog;
 mod stack_traces;
 mod start;
+mod structural;
 mod structure;
 mod term_grid;
+mod term_links;
+mod term_tabs;
 mod terminal_panel;
 mod todo;
 mod tree_ops;
@@ -79,6 +91,8 @@ mod usages;
 mod window_features;
 mod window_popups;
 
+#[cfg(test)]
+mod test_alloc;
 #[cfg(test)]
 mod window_tests;
 #[cfg(test)]
@@ -96,6 +110,8 @@ mod window_tests_completion;
 #[cfg(test)]
 mod window_tests_debug_actions;
 #[cfg(test)]
+mod window_tests_diagram;
+#[cfg(test)]
 mod window_tests_edit;
 #[cfg(test)]
 mod window_tests_editing;
@@ -106,11 +122,15 @@ mod window_tests_first_open;
 #[cfg(test)]
 mod window_tests_git;
 #[cfg(test)]
+mod window_tests_git_history_selection;
+#[cfg(test)]
 mod window_tests_hierarchy;
 #[cfg(test)]
 mod window_tests_hotswap;
 #[cfg(test)]
 mod window_tests_http_client;
+#[cfg(test)]
+mod window_tests_http_curl;
 #[cfg(test)]
 mod window_tests_import;
 #[cfg(test)]
@@ -126,6 +146,8 @@ mod window_tests_live;
 #[cfg(test)]
 mod window_tests_log_graph;
 
+#[cfg(test)]
+mod window_tests_appearance;
 #[cfg(test)]
 mod window_tests_lookup;
 #[cfg(test)]
@@ -185,6 +207,8 @@ mod window_tests_audit;
 
 #[cfg(test)]
 mod window_tests_shelf;
+#[cfg(test)]
+mod window_tests_structural_search;
 
 #[cfg(test)]
 mod window_tests_stable;
@@ -236,6 +260,9 @@ mod window_tests_dead_buttons;
 mod window_tests_dependencies;
 
 #[cfg(test)]
+mod window_tests_dependency_updates;
+
+#[cfg(test)]
 mod window_tests_server_setup;
 
 #[cfg(test)]
@@ -267,6 +294,8 @@ mod window_tests_project_structure;
 #[cfg(test)]
 mod window_tests_branches;
 #[cfg(test)]
+mod window_tests_debug_depth;
+#[cfg(test)]
 mod window_tests_idle_events;
 #[cfg(test)]
 mod window_tests_inlay_hints;
@@ -283,6 +312,13 @@ mod window_tests_semantic_tokens;
 
 #[cfg(test)]
 mod window_tests_resource_bundles;
+
+#[cfg(test)]
+mod window_tests_bundle_buffers;
+#[cfg(test)]
+mod window_tests_bundle_editor;
+#[cfg(test)]
+mod window_tests_exit_buffers;
 
 #[cfg(test)]
 mod window_tests_spring_config;
@@ -321,6 +357,8 @@ mod window_tests_diff_side;
 mod window_tests_folder_compare;
 #[cfg(test)]
 mod window_tests_navigation_polish;
+#[cfg(test)]
+mod window_tests_new_project;
 
 #[cfg(test)]
 mod window_tests_branches_tree;
@@ -353,9 +391,13 @@ mod window_tests_cached_tails;
 #[cfg(test)]
 mod window_tests_close_terminal;
 #[cfg(test)]
+mod window_tests_create_test;
+#[cfg(test)]
 mod window_tests_diff_shared;
 #[cfg(test)]
 mod window_tests_terminal_leak;
+#[cfg(test)]
+mod window_tests_terminal_tabs;
 
 #[cfg(test)]
 mod window_tests_stripe_notifications;
@@ -365,6 +407,9 @@ mod window_tests_script_smoke;
 
 #[cfg(test)]
 mod window_tests_settings_window;
+
+#[cfg(test)]
+mod window_tests_inspection_settings;
 
 #[cfg(test)]
 mod window_tests_diff_views;
@@ -392,11 +437,15 @@ mod window_tests_interactive_rebase;
 mod window_tests_overlap;
 #[cfg(test)]
 mod window_tests_services;
+#[cfg(test)]
+mod window_tests_services_runs;
 
 #[cfg(test)]
 mod window_tests_coverage;
 #[cfg(test)]
 mod window_tests_endpoints;
+#[cfg(test)]
+mod window_tests_idle_polling;
 #[cfg(test)]
 mod window_tests_logpoints;
 #[cfg(test)]
@@ -408,12 +457,23 @@ mod window_tests_spring_beans;
 #[cfg(test)]
 mod window_tests_spring_data;
 #[cfg(test)]
+mod window_tests_stack_refinement;
+#[cfg(test)]
 mod window_tests_stack_traces;
 
 #[cfg(test)]
 mod window_tests_database_polish;
 #[cfg(test)]
+mod window_tests_idea_import;
+#[cfg(test)]
+mod window_tests_run_configurations;
+#[cfg(test)]
 mod window_tests_switcher_icons;
+
+#[cfg(test)]
+mod window_tests_platform_menu;
+#[cfg(test)]
+mod window_tests_platform_open;
 
 mod choice;
 mod invalidate;
@@ -431,9 +491,9 @@ use tool_gateway::LanguageTools;
 use ui_kit::*;
 use workspace::{
     AI_TOOL, BEANS_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL,
-    DockSide, ENDPOINTS_TOOL, INSPECTION_TOOL, LOG_TOOL, Launch, PERFORMANCE_TOOL, PROBLEMS_TOOL,
-    PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL,
-    TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    DockSide, ENDPOINTS_TOOL, INSPECTION_TOOL, LOG_TOOL, Launch, OpenRequests, PERFORMANCE_TOOL,
+    PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL, SELECTION_HISTORY_TOOL, SERVICES_TOOL,
+    STACK_TRACE_TOOL, STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
 };
 
 use crate::index::{IndexEvent, ProjectIndex};
@@ -452,7 +512,9 @@ pub use profiler::{ActiveProfiler, ProfileColumn, ProfilerTab};
 pub use run::ProjectSetup;
 pub use script::parse_script;
 pub use settings_templates::TemplatesSetup;
-pub use start::{ProjectTemplate, run as run_start};
+pub use start::{
+    Generators, ProjectTemplate, run as run_start, set_generators as set_project_generators,
+};
 pub use tree_ops::{Creates, FileTemplate};
 pub use usages::{ActiveUsages, UsagesHub};
 
@@ -508,6 +570,7 @@ pub fn run(
 ) {
     run_with_setup(
         launch,
+        OpenRequests::default(),
         languages,
         search,
         project,
@@ -515,16 +578,19 @@ pub fn run(
         None,
         CacheLocations::default(),
         TemplatesSetup::default(),
+        |_| None,
         mock_agents,
         script,
     )
 }
 
 /// [`run`] with the hint of a tool that was not found: the balloon offers its page and
-/// a second search that starts the server without restarting Arro.
+/// a second search that starts the server without restarting Arro. `requests` brings the
+/// paths that the system opens and the requests of a second start.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_setup(
     launch: Launch,
+    requests: OpenRequests,
     languages: Languages,
     search: SearchSetup,
     project: ProjectSetup,
@@ -532,6 +598,7 @@ pub fn run_with_setup(
     setup: Option<LanguageSetup>,
     cache: CacheLocations,
     templates: TemplatesSetup,
+    code_style_language: fn(&std::path::Path) -> Option<&'static str>,
     mock_agents: bool,
     script: Option<String>,
 ) {
@@ -539,8 +606,9 @@ pub fn run_with_setup(
         state_dir: launch.state_dir.clone(),
         mock: mock_agents,
     };
-    workspace::run(launch, move |workspace, window, cx| {
+    workspace::run(launch, requests, move |workspace, window, cx| {
         cx.set_global(languages);
+        cx.set_global(editor_view::CodeStyleLanguages(code_style_language));
         cx.set_global(cache);
         cx.set_global(templates.initial());
         install(workspace, search, project, agents, window, cx);
@@ -583,6 +651,9 @@ pub fn connect_server(
         status,
         debug,
     } = started;
+    if let Some(settings) = cx.try_global::<workspace::Settings>() {
+        support.set_dependency_updates(settings.check_dependency_updates);
+    }
     cx.global::<AgentLanguages>().0.register(support.clone());
     if let Some(debug) = debug
         && let Some(panel) = cx
@@ -593,6 +664,9 @@ pub fn connect_server(
     }
     let restart = support.clone();
     cx.set_global(Semantic(support.clone()));
+    let inspections = workspace::load_inspections(workspace.root());
+    support.set_inspection_settings(inspections.clone());
+    cx.set_global(editor_view::InspectionProfile(inspections));
     spring_data::follow(support.clone(), cx);
     if let Some(panel) = cx.try_global::<endpoints::ActiveEndpoints>() {
         let panel = panel.0.clone();
@@ -774,6 +848,7 @@ fn install(
     finder::bind_keys(cx);
     plugins::bind_keys(cx);
     usages::bind_keys(cx);
+    terminal_panel::bind_keys(cx);
 
     let mut templates = tree_ops::basic_templates();
     templates.extend(project.templates.iter().cloned());
@@ -826,6 +901,16 @@ fn install(
         cx,
     );
     cx.set_global(git_log::ActiveGitLog(log));
+    let history = git_history::SelectionHistoryPanel::create(git.clone(), weak.clone(), cx);
+    let focus = history.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        SELECTION_HISTORY_TOOL,
+        history.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(git_history::ActiveSelectionHistory(history));
     let root = workspace.root().to_path_buf();
     let commit = commit::CommitPanel::create(
         git,
@@ -857,8 +942,10 @@ fn install(
     cx.set_global(structure::ActiveStructure(structure));
 
     let terminal = terminal_panel::TerminalPanel::create(
+        weak.clone(),
         workspace.root().to_path_buf(),
         project.environment.clone(),
+        workspace.store(),
         cx,
     );
     let focus = terminal.read(cx).focus();
@@ -872,7 +959,8 @@ fn install(
     cx.set_global(terminal_panel::ActiveTerminal(terminal));
 
     let root = workspace.root().to_path_buf();
-    let services = docker::DockerPanel::create(root, weak.clone(), window.window_handle(), cx);
+    let services =
+        docker::DockerPanel::create(root, workspace, weak.clone(), window.window_handle(), cx);
     let focus = services.read(cx).focus();
     workspace.set_dock(
         DockSide::Bottom,
@@ -881,7 +969,7 @@ fn install(
         Some(focus),
         cx,
     );
-    cx.set_global(docker::ActiveDocker(services));
+    cx.set_global(docker::ActiveDocker(services.clone()));
 
     let state_dir = workspace.state_dir().to_path_buf();
     let http = http::HttpPanel::create(weak.clone(), state_dir, cx);
@@ -897,6 +985,7 @@ fn install(
     http::install(cx);
     library_sources::install(cx);
     library_sources::register(workspace, cx);
+    bundle_editor::install(weak.clone(), cx);
 
     let state_dir = workspace.state_dir().to_path_buf();
     let database = database_panel::DatabasePanel::create(weak.clone(), state_dir.clone(), cx);
@@ -924,6 +1013,7 @@ fn install(
     );
     workspace.set_run_controls(run::RunPanel::controls(&runs));
     cx.set_global(script::ActiveRunPanel(runs.clone()));
+    services.update(cx, |services, cx| services.set_runs(runs.clone(), cx));
     let coverage_source = runs.clone();
     let profiler_source = runs.clone();
 
@@ -1148,6 +1238,11 @@ fn install(
     workspace.register_command("window.show_beans", "Beans", |workspace, window, cx| {
         workspace.show_tool(BEANS_TOOL, window, cx)
     });
+    workspace.register_command(
+        "window.show_diagram",
+        "Show Diagram",
+        crate::diagram::show_current,
+    );
     window_features::register(workspace, window, cx);
     let inspect = inspect::InspectHub::create(
         root,
@@ -1188,6 +1283,9 @@ fn install(
         panel.update(cx, |panel, cx| panel.show(path.to_path_buf(), cx));
         let documentation = cx.global::<documentation::ActiveDocumentation>().0.clone();
         documentation.update(cx, |panel, cx| panel.show_path(path.to_path_buf(), cx));
+        if let Some(git) = cx.try_global::<git::ActiveGit>().map(|git| git.0.clone()) {
+            git.update(cx, |git, cx| git.active_editor_changed(path, cx));
+        }
     });
     // What the watcher missed shows up when the window comes back to the front.
     let rescan = index.clone();
@@ -1198,6 +1296,7 @@ fn install(
     })
     .detach();
     watch_project(events, files, cx);
+    settings_archive::bind_commands(workspace, cx);
     release_on_close(window, cx);
 }
 
@@ -1236,6 +1335,7 @@ fn release_globals(cx: &mut App) {
         endpoints::ActiveEndpoints,
         finder::ActiveFinder,
         git::ActiveGit,
+        git_history::ActiveSelectionHistory,
         git_log::ActiveGitLog,
         http::ActiveHttp,
         index::ActiveIndex,
@@ -1344,6 +1444,15 @@ fn watched_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context
 }
 
 fn disk_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context<Workspace>) {
+    let properties = changes.iter().any(|change| match change {
+        FsChange::Created(path) | FsChange::Changed(path) | FsChange::Removed(path) => path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("properties")),
+        FsChange::Rescan => false,
+    });
+    if properties {
+        crate::bundle_editor::files_changed(cx);
+    }
     // The language server registered the files it watches, such as build scripts. A
     // save of one comes through the watcher even when no editor is open on it.
     let mut model_changed = false;
