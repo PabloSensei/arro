@@ -1,9 +1,10 @@
 //! A thread per project takes the snapshots, in the order the turns happen. Everyone else reads
 //! the latest `ChangeSet` without waiting.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,8 +12,9 @@ use agent_core::AgentEvent;
 use base::Snapshot;
 use crossbeam_channel::{RecvTimeoutError, Sender, TrySendError, bounded};
 
-use crate::git::GitRunner;
-use crate::hidden::{ChangedFile, HiddenRepo};
+use crate::hidden::{ChangeKind, ChangedFile, HiddenRepo};
+use crate::review::FileReview;
+use vcs::GitRunner;
 
 const QUEUE: usize = 16;
 /// Output stops and starts all the time in a TUI, and a snapshot of a large tree is not free.
@@ -47,9 +49,45 @@ enum Command {
     Checkpoint { force: bool },
 }
 
+/// What a review compares against: the first snapshot, moved by what the user accepted.
+struct Base {
+    repo: HiddenRepo,
+    first: String,
+    /// Accepted texts by path, `None` for a file accepted as gone.
+    accepted: HashMap<String, Option<String>>,
+}
+
+impl Base {
+    fn current(&self, path: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.repo.work_tree().join(path)).ok()
+    }
+
+    /// Drops files whose accepted text is what the disk holds now.
+    fn pending(&self, changes: Vec<ChangedFile>) -> Vec<ChangedFile> {
+        let open = |change: &ChangedFile| match self.accepted.get(&change.path) {
+            None => true,
+            Some(accepted) => {
+                let accepted = accepted.as_ref().map(|text| text.as_bytes().to_vec());
+                accepted != self.current(&change.path)
+            }
+        };
+        let mut pending: Vec<ChangedFile> = changes.into_iter().filter(open).collect();
+        // A file accepted as added and then deleted is modified against the new base.
+        for change in &mut pending {
+            if self.accepted.contains_key(&change.path) && change.kind != ChangeKind::Deleted {
+                change.kind = ChangeKind::Modified;
+            }
+        }
+        pending
+    }
+}
+
+type SharedBase = Arc<Mutex<Option<Base>>>;
+
 pub struct ChangeTracker {
     commands: Sender<Command>,
     changes: Arc<Snapshot<ChangeSet>>,
+    base: SharedBase,
 }
 
 impl ChangeTracker {
@@ -58,11 +96,13 @@ impl ChangeTracker {
         let (commands, inbox) = bounded(QUEUE);
         let changes = Arc::new(Snapshot::new(ChangeSet::default()));
         let shared = changes.clone();
+        let base: SharedBase = Arc::new(Mutex::new(None));
+        let worker_base = base.clone();
         let (state_dir, project) = (state_dir.to_path_buf(), project.to_path_buf());
         thread::Builder::new()
             .name("change-tracker".to_string())
             .spawn(move || {
-                let worker = Worker::start(&git, &state_dir, &project, shared);
+                let worker = Worker::start(&git, &state_dir, &project, shared, worker_base);
                 let Some(mut worker) = worker else {
                     return;
                 };
@@ -79,7 +119,41 @@ impl ChangeTracker {
                     }
                 }
             })?;
-        Ok(Self { commands, changes })
+        Ok(Self {
+            commands,
+            changes,
+            base,
+        })
+    }
+
+    /// The hunks of one file against the base of the session. Runs git, so not on the UI thread.
+    pub fn review(&self, path: &str) -> io::Result<FileReview> {
+        let base = self.base.lock().unwrap();
+        let base = base
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the first snapshot is not ready"))?;
+        let before = match base.accepted.get(path) {
+            Some(accepted) => accepted.clone().map(String::into_bytes),
+            None => base.repo.read(&base.first, path)?,
+        };
+        Ok(FileReview::new(
+            path.to_string(),
+            before,
+            base.current(path),
+        ))
+    }
+
+    /// Takes `text` as the new base of `path`, and the list follows.
+    pub fn accept(&self, path: &str, text: Option<String>) {
+        if let Some(base) = self.base.lock().unwrap().as_mut() {
+            base.accepted.insert(path.to_string(), text);
+        }
+        self.refresh();
+    }
+
+    /// A snapshot now, after the IDE itself wrote a file.
+    pub fn refresh(&self) {
+        self.send(Command::Checkpoint { force: true });
     }
 
     pub fn changes(&self) -> Arc<ChangeSet> {
@@ -129,6 +203,7 @@ impl ChangeTracker {
 struct Worker {
     repo: HiddenRepo,
     shared: Arc<Snapshot<ChangeSet>>,
+    base: SharedBase,
     first: String,
     before_turn: String,
     last_checkpoint: Instant,
@@ -142,14 +217,21 @@ impl Worker {
         state_dir: &Path,
         project: &Path,
         shared: Arc<Snapshot<ChangeSet>>,
+        base: SharedBase,
     ) -> Option<Self> {
         let opened = HiddenRepo::open(git.clone(), state_dir, project);
         let baseline = opened.and_then(|repo| Ok((repo.snapshot()?, repo)));
         match baseline {
             Ok((first, repo)) => {
+                *base.lock().unwrap() = Some(Base {
+                    repo: repo.clone(),
+                    first: first.clone(),
+                    accepted: HashMap::new(),
+                });
                 let worker = Self {
                     repo,
                     shared,
+                    base,
                     before_turn: first.clone(),
                     last_checkpoint: Instant::now(),
                     deferred: None,
@@ -169,6 +251,13 @@ impl Worker {
                 shared.set(failed);
                 None
             }
+        }
+    }
+
+    fn pending(&self, changes: Vec<ChangedFile>) -> Vec<ChangedFile> {
+        match self.base.lock().unwrap().as_ref() {
+            Some(base) => base.pending(changes),
+            None => changes,
         }
     }
 
@@ -211,7 +300,7 @@ impl Worker {
         self.deferred = None;
         self.last_checkpoint = Instant::now();
         let now = self.repo.snapshot()?;
-        let session = self.repo.changed(&self.first, &now)?;
+        let session = self.pending(self.repo.changed(&self.first, &now)?);
         let current = self.shared.get();
         self.publish(ChangeSet {
             session,
@@ -222,7 +311,7 @@ impl Worker {
 
     fn turn_ended(&mut self) -> io::Result<()> {
         let now = self.repo.snapshot()?;
-        let session = self.repo.changed(&self.first, &now)?;
+        let session = self.pending(self.repo.changed(&self.first, &now)?);
         let turn = self.repo.changed(&self.before_turn, &now)?;
         self.before_turn = now;
         self.publish(ChangeSet {

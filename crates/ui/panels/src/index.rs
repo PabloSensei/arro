@@ -158,6 +158,33 @@ impl ProjectIndex {
     pub fn symbols_generation(&self) -> u64 {
         self.symbols_generation.load(Ordering::Acquire)
     }
+
+    /// The declaration of `name` in the project, for Ctrl+B while the language server is
+    /// not ready. The best match of the index wins; the text is read to give the line and
+    /// the column a server speaks.
+    pub fn locate(&self, name: &str) -> Option<lang_api::SourceSpan> {
+        let index = self.symbols.read().ok()?;
+        let found = index
+            .search(name, |symbol| symbol.name == name, 8)
+            .into_iter()
+            .next()?;
+        let path = found.item.path.clone();
+        let text = text_core::read_file(&path).ok()?.text;
+        let offset = found.item.symbol.name_range.start.min(text.len());
+        let before = &text[..offset];
+        let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+        let character = text[line_start..offset].encode_utf16().count() as u32;
+        let uri = ::platform::CanonPath::new(&path).ok()?.to_uri();
+        let point = lang_api::TextPoint { line, character };
+        Some(lang_api::SourceSpan {
+            uri,
+            span: lang_api::TextSpan {
+                start: point,
+                end: point,
+            },
+        })
+    }
 }
 
 /// The index of the window, for scripts and tests that wait for the project to be read.

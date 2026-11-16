@@ -76,6 +76,19 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Whether the language server can answer now. Navigation falls back to the project
+    /// index while it cannot, such as during the import of the project.
+    fn server_ready(&self) -> bool {
+        true
+    }
+
+    /// The names of the types people type most in this language. The completion list
+    /// puts them before the other types, as IDEA does. Empty by default, so a language
+    /// that has no such list keeps the order of its provider.
+    fn preferred_completion_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn completion(&self) -> Option<&CompletionProvider> {
         None
     }

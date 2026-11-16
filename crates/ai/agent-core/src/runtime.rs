@@ -41,6 +41,12 @@ pub enum AgentEvent {
         id: String,
         output: String,
     },
+    /// A tool call moved on. Runtimes that report progress send this instead of `ToolResult`.
+    ToolStatus {
+        id: String,
+        status: ToolStatus,
+        output: Option<String>,
+    },
     PermissionRequest {
         id: String,
         tool: String,
@@ -57,6 +63,45 @@ pub enum AgentEvent {
     Notification(String),
     Error(String),
     Exited(Option<u32>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolStatus {
+    Pending,
+    Running,
+    Done,
+    /// Refused or broken. An agent that refuses a call on its own still ends the turn
+    /// normally, so the call shows this and not the turn.
+    Failed,
+}
+
+/// A piece of a prompt. Files and snippets go to an agent that understands them as such,
+/// to the rest as text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptPart {
+    Text(String),
+    File(PathBuf),
+    Snippet {
+        path: PathBuf,
+        /// 1-based, inclusive.
+        lines: (u32, u32),
+        text: String,
+    },
+}
+
+impl PromptPart {
+    /// The plain form, for agents that take text only.
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::File(path) => format!("@{}", path.display()),
+            Self::Snippet { path, lines, text } => {
+                let (first, last) = lines;
+                let path = path.display();
+                format!("\n{path}:{first}-{last}\n```\n{text}\n```\n")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +216,12 @@ pub trait AgentSession: Send + Sync {
 
     /// Queues a message. A busy agent gets it when the current turn ends.
     fn prompt(&self, text: &str) -> Result<(), AgentError>;
+
+    /// A message with mentions. Without native support they become text.
+    fn prompt_parts(&self, parts: &[PromptPart]) -> Result<(), AgentError> {
+        let text: String = parts.iter().map(PromptPart::as_text).collect();
+        self.prompt(&text)
+    }
 
     fn cancel(&self) -> Result<(), AgentError>;
 

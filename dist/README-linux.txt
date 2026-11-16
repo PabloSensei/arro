@@ -67,6 +67,11 @@ work, while the Java features that need the server are unavailable. The status b
 says which piece was not found; a click on that line opens a balloon with a "Download
 JDK 25" link and a "Check again" button.
 
+The Database window keeps the passwords of its sources in the Secret Service of the
+desktop and needs the `secret-tool` program of the `libsecret-tools` package for it, plus
+a D-Bus session. Without them the window names the package and keeps the Save password
+flag off.
+
 The bundled servers live in
 
   tools/jdtls-1.63.0/

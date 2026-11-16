@@ -23,7 +23,7 @@ fn terminal_of(cx: &mut TestAppContext) -> gpui::Entity<TerminalPanel> {
 }
 
 /// Opens a window with the terminal in its dock and waits until the shell is up.
-fn open_terminal(
+pub(crate) fn open_terminal(
     cx: &mut TestAppContext,
     name: &str,
 ) -> (
@@ -48,7 +48,7 @@ fn open_terminal(
     (root, window, terminal)
 }
 
-fn session_of(
+pub(crate) fn session_of(
     cx: &mut TestAppContext,
     terminal: &gpui::Entity<TerminalPanel>,
 ) -> Arc<TerminalSession> {

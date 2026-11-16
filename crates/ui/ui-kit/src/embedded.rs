@@ -28,7 +28,11 @@ impl AssetSource for Assets {
 
 /// The application with our assets.
 pub fn app() -> Application {
-    gpui_kit::application().with_assets(Assets)
+    #[cfg(windows)]
+    let application = Application::with_platform(crate::scale::platform());
+    #[cfg(not(windows))]
+    let application = gpui_kit::application();
+    application.with_assets(Assets)
 }
 
 fn load_fonts(cx: &App) {

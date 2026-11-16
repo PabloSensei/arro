@@ -114,9 +114,6 @@ const ANSI_LIGHT: [u32; 16] = [
     0x000000, 0xc7222d, 0x067d17, 0x9e880d, 0x0033b3, 0x871094, 0x0f7b8a, 0x6f737a, 0x818594,
     0xe55765, 0x2e9c3b, 0xb59b1b, 0x3574f0, 0xb350bf, 0x1996a6, 0x1e1f22,
 ];
-const ERROR_DARK: u32 = 0xf75464;
-const ERROR_LIGHT: u32 = 0xc7222d;
-
 fn color(hex: u32) -> Hsla {
     rgb(hex).into()
 }
@@ -3862,16 +3859,12 @@ pub(crate) fn wrapped_line_element(line: &Line, theme: &Theme) -> AnyElement {
 
 /// The text of a line in the colours of the console, with no layout of its own.
 fn highlighted(line: &Line, theme: &Theme) -> StyledText {
-    let (palette, error) = if theme.dark {
-        (&ANSI_DARK, ERROR_DARK)
-    } else {
-        (&ANSI_LIGHT, ERROR_LIGHT)
-    };
+    let palette = if theme.dark { &ANSI_DARK } else { &ANSI_LIGHT };
     let highlights = line.spans.iter().map(|(range, style)| {
         let color = match (style.input, style.color, style.error) {
             (true, _, _) => Some(theme.console_input),
             (false, Some(index), _) => Some(color(palette[usize::from(index)])),
-            (false, None, true) => Some(color(error)),
+            (false, None, true) => Some(theme.error),
             (false, None, false) => None,
         };
         let highlight = HighlightStyle {

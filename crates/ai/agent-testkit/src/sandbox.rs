@@ -56,22 +56,32 @@ impl Sandbox {
         for directory in [&appdata, &local, &claude, &codex] {
             fs::create_dir_all(directory)?;
         }
-        let path = |value: &Path| value.to_string_lossy().replace('/', "\\");
         let mut env: Vec<(String, String)> = allowlisted();
         let overrides = [
-            ("USERPROFILE", path(&self.home)),
-            ("HOME", path(&self.home)),
-            ("HOMEPATH", path(&self.home)),
-            ("APPDATA", path(&appdata)),
-            ("LOCALAPPDATA", path(&local)),
-            ("CLAUDE_CONFIG_DIR", path(&claude)),
-            ("CODEX_HOME", path(&codex)),
+            ("USERPROFILE", native(&self.home)),
+            ("HOME", native(&self.home)),
+            ("HOMEPATH", native(&self.home)),
+            ("APPDATA", native(&appdata)),
+            ("LOCALAPPDATA", native(&local)),
+            ("CLAUDE_CONFIG_DIR", native(&claude)),
+            ("CODEX_HOME", native(&codex)),
         ];
         for (key, value) in overrides {
             env.retain(|(known, _)| !known.eq_ignore_ascii_case(key));
             env.push((key.to_string(), value));
         }
         Ok(env)
+    }
+}
+
+/// The path of a child of this system: Windows tools want backslashes, and a Unix home is
+/// a plain path that must keep its separators.
+fn native(value: &Path) -> String {
+    let text = value.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('/', "\\")
+    } else {
+        text.into_owned()
     }
 }
 

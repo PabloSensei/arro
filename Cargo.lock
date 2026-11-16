@@ -110,8 +110,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-acp"
+version = "0.1.19"
+dependencies = [
+ "agent-core",
+ "agent-testkit",
+ "crossbeam-channel",
+ "mcp-server",
+ "proc-sup",
+ "serde_json",
+ "test-support",
+ "tool-gateway",
+]
+
+[[package]]
 name = "agent-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "crossbeam-channel",
@@ -123,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "agent-pty"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "agent-core",
  "agent-testkit",
@@ -138,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "agent-testkit"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde_json",
  "terminal",
@@ -147,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "agent-try"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "agent-core",
  "agent-pty",
@@ -676,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "base"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "arc-swap",
 ]
@@ -1018,12 +1032,13 @@ dependencies = [
 
 [[package]]
 name = "change-tracker"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "agent-core",
  "base",
  "crossbeam-channel",
  "test-support",
+ "vcs",
 ]
 
 [[package]]
@@ -1218,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "container"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "proc-sup",
@@ -1532,7 +1547,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dap-client"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "lang-fixture",
  "proc-sup",
@@ -1549,8 +1564,9 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "database"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
+ "base",
  "platform",
  "proc-sup",
  "serde",
@@ -1669,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "display-map"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "proptest",
  "text-core",
@@ -1697,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "dockerfile-syntax"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "syntax",
  "tree-sitter",
@@ -1745,7 +1761,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "editor-view"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "display-map",
@@ -2000,22 +2016,38 @@ dependencies = [
 
 [[package]]
 name = "file-syntax"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "syntax",
  "text-core",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-batch",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
  "tree-sitter-css",
+ "tree-sitter-diff",
+ "tree-sitter-go",
  "tree-sitter-groovy",
  "tree-sitter-html",
+ "tree-sitter-ini",
  "tree-sitter-javascript",
  "tree-sitter-json",
  "tree-sitter-kotlin-ng",
+ "tree-sitter-lua",
+ "tree-sitter-make",
  "tree-sitter-md",
+ "tree-sitter-php",
+ "tree-sitter-powershell",
  "tree-sitter-properties",
+ "tree-sitter-proto",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
  "tree-sitter-sequel",
+ "tree-sitter-swift",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-xml",
@@ -2202,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "fs-watch"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "ignore",
  "notify 9.0.0-rc.7",
@@ -3392,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "http-client"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -3635,7 +3667,7 @@ checksum = "913a7d294ad056474749152107309fdee3ec17d2482d1ab70fdc61a81c64b9a3"
 
 [[package]]
 name = "ide"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "backtrace",
  "base",
@@ -3658,17 +3690,27 @@ dependencies = [
 
 [[package]]
 name = "ide-askpass"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "vcs",
 ]
 
 [[package]]
 name = "ide-ctrl"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "platform",
  "proc-sup",
+]
+
+[[package]]
+name = "ide-mcp"
+version = "0.1.19"
+dependencies = [
+ "agent-testkit",
+ "mcp-server",
+ "serde_json",
+ "tool-gateway",
 ]
 
 [[package]]
@@ -3912,7 +3954,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "java-exec"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "java-project",
@@ -3932,7 +3974,7 @@ dependencies = [
 
 [[package]]
 name = "java-lang"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "dap-client",
@@ -3953,6 +3995,7 @@ dependencies = [
  "proc-sup",
  "project-model",
  "repl",
+ "ring",
  "runner",
  "search",
  "semantic-router",
@@ -3967,13 +4010,14 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-java-orchard",
  "tree-sitter-language",
+ "ureq",
  "workspace-core",
  "zip",
 ]
 
 [[package]]
 name = "java-project"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "database",
@@ -3991,7 +4035,7 @@ dependencies = [
 
 [[package]]
 name = "java-syntax"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "lang-api",
  "regex",
@@ -4003,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "jdtls-adapter"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "lsp-client",
@@ -4097,7 +4141,7 @@ dependencies = [
 
 [[package]]
 name = "keymap"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde_json",
  "test-support",
@@ -4142,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "kube"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "proc-sup",
@@ -4176,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "lang-api"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "futures-channel",
@@ -4189,7 +4233,7 @@ dependencies = [
 
 [[package]]
 name = "lang-fixture"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde_json",
 ]
@@ -4296,7 +4340,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local-history"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "flate2",
  "test-support",
@@ -4339,7 +4383,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lsp-client"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "lsp-types",
  "platform",
@@ -4509,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-server"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -5398,8 +5442,9 @@ dependencies = [
 
 [[package]]
 name = "panels"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
+ "agent-acp",
  "agent-core",
  "agent-pty",
  "agent-testkit",
@@ -5721,7 +5766,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "libc",
  "test-support",
@@ -5759,7 +5804,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-host"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "keymap",
@@ -5920,7 +5965,7 @@ dependencies = [
 
 [[package]]
 name = "proc-sup"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "platform",
@@ -5948,7 +5993,7 @@ dependencies = [
 
 [[package]]
 name = "project-model"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "lang-api",
@@ -6459,7 +6504,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "repl"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "platform",
  "proc-sup",
@@ -6592,7 +6637,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "lang-api",
@@ -6975,7 +7020,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "futures-executor",
@@ -7022,7 +7067,7 @@ checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "semantic-router"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "futures-util",
@@ -7213,7 +7258,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidecar"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "lsp-client",
  "platform",
@@ -7377,7 +7422,7 @@ dependencies = [
 
 [[package]]
 name = "spelling"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "platform",
  "test-support",
@@ -7449,7 +7494,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "store"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "rusqlite",
  "serde",
@@ -7612,7 +7657,7 @@ dependencies = [
 
 [[package]]
 name = "syntax"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "lang-api",
  "streaming-iterator",
@@ -7713,7 +7758,7 @@ dependencies = [
 
 [[package]]
 name = "templates"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -7744,7 +7789,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "alacritty_terminal",
  "base",
@@ -7758,11 +7803,11 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.18"
+version = "0.1.19"
 
 [[package]]
 name = "text-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -7776,7 +7821,13 @@ dependencies = [
 
 [[package]]
 name = "theme"
-version = "0.1.18"
+version = "0.1.19"
+dependencies = [
+ "roxmltree 0.21.2",
+ "serde",
+ "serde_json",
+ "test-support",
+]
 
 [[package]]
 name = "thiserror"
@@ -8081,7 +8132,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tool-gateway"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "dap-client",
@@ -8187,10 +8238,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-c"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9b2eb57a55fed6b00812912e730b7a275cf4fe98bfd6a5d76263d4438371728"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c-sharp"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1aac67f1ad71de1d6d39708d34811081c26dfa495658de6c14c34200849357c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-cpp"
+version = "0.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-css"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5cbc5e18f29a2c6d6435891f42569525cf95435a3e01c2f1947abcde178686f"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-diff"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfe1e5ca280a65dfe5ba4205c1bcc84edf486464fed315db53dee6da9a335889"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -8204,6 +8295,16 @@ checksum = "5e61eb704364be179ab9be89e2891c8e77c0041eca5891a5c04164a21f6df7a0"
 dependencies = [
  "cc",
  "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]
@@ -8221,6 +8322,16 @@ name = "tree-sitter-html"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-ini"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "387f79682cd53b7c0a5777c96e601a02b9965a787984ef86dbb8952bdab2d62f"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -8273,10 +8384,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
 
 [[package]]
+name = "tree-sitter-lua"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8daaf5f4235188a58603c39760d5fa5d4b920d36a299c934adddae757f32a10c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-make"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5998dc7cbcbdab19fae8aefef982bf2d6544513d8d2e69cc44aec4c63810104"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-md"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed661bfe3c264961425f77cd89ad2998bf5d629e71ce8bab1e5d7e940d6246e"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-php"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9779e392d38af4254f48be0e57b7eed4d50ec7a6e55a7e5e2e74df8f8f032d3"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-powershell"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa49d15e5b291030a548447445e0547992eff1438e7cd9133bfec99a9ba962a9"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -8293,10 +8444,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-proto"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c93b6f1ed20de442e900eb636f2176af6063953dfaa9f76bf168dd3b490a3a1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bf85fd39652e740bf60f46f4cda9492c3a9ad75880575bf14960f775cb74a1c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-ruby"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be0484ea4ef6bb9c575b4fdabde7e31340a8d2dbc7d52b321ac83da703249f95"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-scala"
+version = "0.26.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a50564a8d499f956174da3bdff36b32d99c3cf713cd8e44337a61f8fc46b60d"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-sequel"
 version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "711e236e1ae0708f911d8413c3b5656f522416cba683ea91589aebc49eda1b5a"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-swift"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2688c06564afa397313e0db17d140a73e2c6a47f3884794614246167c9dd5dfd"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -8393,7 +8604,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "gpui-kit",
  "gpui-pre-windows",
@@ -8487,7 +8698,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "flate2",
  "platform",
@@ -8653,7 +8864,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vcs"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "imara-diff",
@@ -9190,7 +9401,7 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "window-language"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "dap-client",
@@ -9846,7 +10057,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "futures-channel",
  "keymap",
@@ -9865,7 +10076,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base",
  "encoding_rs",
@@ -9993,7 +10204,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "keymap",
  "pdb-addr2line",

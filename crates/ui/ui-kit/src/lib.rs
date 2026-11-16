@@ -12,6 +12,7 @@ mod motions;
 mod palette;
 mod popups;
 mod rows;
+mod scale;
 mod script;
 mod scrollbars;
 #[cfg(any(test, feature = "test-support"))]
@@ -21,8 +22,14 @@ mod widgets;
 
 pub use embedded::{Assets, app, init};
 pub use motions::{Slide, smoothstep};
-pub use palette::Theme;
+pub use palette::{
+    Theme, ThemeCatalog, ThemeDefinition, ThemeError, ThemeFile, ThemeLibrary, from_icls, slug,
+    themes_folder,
+};
 pub use popups::*;
+#[cfg(feature = "test-support")]
+pub use scale::scale_test_window;
+pub use scale::{set_ui_scale, text_scale, window_scale};
 // GPUI has a `surface` element of its own on macOS; the popup surface is the one meant.
 pub use popups::surface;
 pub use rows::*;

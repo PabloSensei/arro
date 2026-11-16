@@ -141,9 +141,9 @@ impl RowKind {
 
     fn color(self, theme: &Theme) -> Hsla {
         match self {
-            Self::OnlyLeft => Kind::Deleted.color(theme.dark),
-            Self::OnlyRight => Kind::Added.color(theme.dark),
-            Self::Differ => Kind::Modified.color(theme.dark),
+            Self::OnlyLeft => Kind::Deleted.color(theme),
+            Self::OnlyRight => Kind::Added.color(theme),
+            Self::Differ => Kind::Modified.color(theme),
             Self::Same => theme.text_muted,
         }
     }

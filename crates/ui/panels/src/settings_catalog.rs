@@ -4,6 +4,7 @@
 
 use std::sync::OnceLock;
 
+use ui_kit::Theme;
 use workspace::{MAX_COMPLETION_DELAY_MS, MAX_INDENT_SIZE, Settings};
 
 /// One page of the Settings window.
@@ -268,6 +269,9 @@ pub enum SettingField {
     KubectlPath,
     KubeconfigPath,
     DatabasePageRows,
+    ThemeSyncWithOs,
+    ThemeLight,
+    ThemeDark,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -323,6 +327,30 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Choice,
         field: SettingField::Theme,
         keywords: "dark light colors appearance",
+    },
+    Setting {
+        id: "theme_sync_with_os",
+        title: "Sync with OS",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Toggle,
+        field: SettingField::ThemeSyncWithOs,
+        keywords: "system appearance auto schedule automatic",
+    },
+    Setting {
+        id: "theme_light",
+        title: "Theme for the light system appearance",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Choice,
+        field: SettingField::ThemeLight,
+        keywords: "sync with os light theme colors appearance",
+    },
+    Setting {
+        id: "theme_dark",
+        title: "Theme for the dark system appearance",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Choice,
+        field: SettingField::ThemeDark,
+        keywords: "sync with os dark theme colors appearance",
     },
     Setting {
         id: "font_size",
@@ -1011,6 +1039,7 @@ pub fn pages_matching(query: &str) -> Vec<SettingsPage> {
 /// The switch of a boolean setting; `None` for a setting that is not a switch.
 pub fn value(settings: &Settings, id: &str) -> Option<bool> {
     match find(id)?.field {
+        SettingField::ThemeSyncWithOs => Some(settings.theme_sync_with_os),
         SettingField::SoftWrap => Some(settings.soft_wrap),
         SettingField::ShowWhitespace => Some(settings.show_whitespace),
         SettingField::ShowLineNumbers => Some(settings.show_line_numbers),
@@ -1093,13 +1122,18 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::HeapSnapshotFolder
         | SettingField::KubectlPath
         | SettingField::KubeconfigPath
-        | SettingField::DatabasePageRows => None,
+        | SettingField::DatabasePageRows
+        | SettingField::ThemeLight
+        | SettingField::ThemeDark => None,
     }
 }
 
 /// Flips a boolean setting. False when the id is not a switch.
 pub fn toggle(settings: &mut Settings, id: &str) -> bool {
     match find(id).map(|setting| setting.field) {
+        Some(SettingField::ThemeSyncWithOs) => {
+            settings.theme_sync_with_os = !settings.theme_sync_with_os;
+        }
         Some(SettingField::SoftWrap) => settings.soft_wrap = !settings.soft_wrap,
         Some(SettingField::ShowWhitespace) => {
             settings.show_whitespace = !settings.show_whitespace;
@@ -1254,7 +1288,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::HeapSnapshotFolder
             | SettingField::KubectlPath
             | SettingField::KubeconfigPath
-            | SettingField::DatabasePageRows,
+            | SettingField::DatabasePageRows
+            | SettingField::ThemeLight
+            | SettingField::ThemeDark,
         )
         | None => {
             return false;
@@ -1436,16 +1472,23 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
 }
 
 /// The chosen name of a setting with named choices, for the window to show.
-pub fn choice_label(settings: &Settings, id: &str) -> Option<&'static str> {
-    match find(id)?.field {
-        SettingField::TrimTrailingWhitespace => Some(settings.trim_trailing_whitespace.label()),
-        SettingField::ActionsOnSaveScope => Some(settings.actions_on_save_reformat_scope.label()),
-        SettingField::UseTabs => Some(if settings.use_tabs { "Tabs" } else { "Spaces" }),
-        SettingField::CompletionCase => Some(settings.completion_case.label()),
-        SettingField::InlayParameterNames => Some(settings.inlay_parameter_names.label()),
-        SettingField::GitUpdateMethod => Some(settings.git_update_method.label()),
-        _ => None,
-    }
+pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
+    let label = match find(id)?.field {
+        SettingField::TrimTrailingWhitespace => {
+            settings.trim_trailing_whitespace.label().to_owned()
+        }
+        SettingField::ActionsOnSaveScope => {
+            settings.actions_on_save_reformat_scope.label().to_owned()
+        }
+        SettingField::UseTabs => (if settings.use_tabs { "Tabs" } else { "Spaces" }).to_owned(),
+        SettingField::CompletionCase => settings.completion_case.label().to_owned(),
+        SettingField::InlayParameterNames => settings.inlay_parameter_names.label().to_owned(),
+        SettingField::GitUpdateMethod => settings.git_update_method.label().to_owned(),
+        SettingField::ThemeLight => Theme::label(&settings.theme_light),
+        SettingField::ThemeDark => Theme::label(&settings.theme_dark),
+        _ => return None,
+    };
+    Some(label)
 }
 
 /// The next choice of a setting with named choices. False when it has none.
@@ -1468,9 +1511,18 @@ pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
         Some(SettingField::GitUpdateMethod) => {
             settings.git_update_method = settings.git_update_method.next();
         }
+        Some(SettingField::ThemeLight) => settings.theme_light = next_theme(&settings.theme_light),
+        Some(SettingField::ThemeDark) => settings.theme_dark = next_theme(&settings.theme_dark),
         _ => return false,
     }
     true
+}
+
+/// The theme name after `name` in the list the settings offer.
+fn next_theme(name: &str) -> String {
+    let names = Theme::NAMES;
+    let index = names.iter().position(|known| *known == name).unwrap_or(0);
+    names[(index + 1) % names.len()].to_owned()
 }
 
 #[cfg(test)]

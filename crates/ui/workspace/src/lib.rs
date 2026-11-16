@@ -5,6 +5,7 @@ mod appearance;
 mod chrome;
 mod editor;
 mod external;
+mod git_settings;
 mod inspections;
 mod invalidate;
 mod keys;
@@ -21,16 +22,21 @@ mod about;
 pub use about::AboutView;
 pub use appearance::{
     DEFAULT_PRESENTATION_FONT_SIZE, EditorAppearance, MAX_PRESENTATION_FONT_SIZE,
-    MIN_PRESENTATION_FONT_SIZE, TOGGLE_BREADCRUMBS, TOGGLE_DISTRACTION_FREE, TOGGLE_FULL_SCREEN,
-    TOGGLE_GUTTER_ICONS, TOGGLE_INDENT_GUIDES, TOGGLE_LINE_NUMBERS, TOGGLE_NAVIGATION_BAR,
-    TOGGLE_PRESENTATION_MODE, TOGGLE_STATUS_BAR, TOGGLE_STICKY_LINES, TOGGLE_TOOL_WINDOW_BARS,
-    TOGGLE_TOOLBAR, TOGGLE_ZEN_MODE, WindowMode, checked_label,
+    MIN_PRESENTATION_FONT_SIZE, SystemAppearance, TOGGLE_BREADCRUMBS, TOGGLE_DISTRACTION_FREE,
+    TOGGLE_FULL_SCREEN, TOGGLE_GUTTER_ICONS, TOGGLE_INDENT_GUIDES, TOGGLE_LINE_NUMBERS,
+    TOGGLE_NAVIGATION_BAR, TOGGLE_PRESENTATION_MODE, TOGGLE_STATUS_BAR, TOGGLE_STICKY_LINES,
+    TOGGLE_TOOL_WINDOW_BARS, TOGGLE_TOOLBAR, TOGGLE_ZEN_MODE, WindowMode, apply_saved_theme,
+    checked_label, follow_system_theme, theme_of,
 };
 pub use editor::{
     BundleLayout, BundleReader, BundleSetter, BundleTab, EditorFactory, EditorStatus, EditorTab,
-    FileIcons, IndentChoice, IndentSetter, PreviewLayout, PreviewReader, PreviewSetter, PreviewTab,
+    FileIcons, HiddenGuard, IndentChoice, IndentSetter, PreviewLayout, PreviewReader,
+    PreviewSetter, PreviewTab,
 };
 pub use external::{OpenRequests, OpenTarget, Request, open_target};
+pub use git_settings::{
+    GitProjectSettings, git_settings_file, load_git_settings, save_git_settings,
+};
 pub use inspections::{inspections_file, load_inspections, save_inspections};
 pub use invalidate::{apply_pending_invalidation, pending_invalidation, schedule_invalidation};
 pub use keys::KeyRow;
@@ -68,4 +74,4 @@ pub use window::{
 };
 
 #[cfg(any(test, feature = "test-support"))]
-pub use window::{note_view_render, view_render_count, window_render_count};
+pub use window::{note_view_render, view_render_count, window_render_count, window_zoom_requests};

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::Provider;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct TextPoint {
     pub line: u32,
     pub character: u32,
@@ -120,6 +120,9 @@ pub struct CompletionEntry {
     pub kind: CompletionKind,
     /// The entry is out of use: the list strikes its name through and puts it last.
     pub deprecated: bool,
+    /// Markdown about the entry, when the answer already carries it. A server that sends
+    /// it only on resolve leaves this `None`, and the editor asks in the background.
+    pub documentation: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -129,7 +132,7 @@ pub struct CompletionList {
     pub complete: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum NavigationKind {
     Definition,
     TypeDefinition,

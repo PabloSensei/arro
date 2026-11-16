@@ -12,8 +12,8 @@ use editor_view::{EditorView, GutterKind, GutterMark};
 use ui_kit::*;
 use vcs::{
     BlameLine, Change, CommitOptions, CommitRequest, ConflictSide, FileStatus, GitRunner, Hunk,
-    LineChangeKind, Operation, RebasePlan, RebaseReport, Repository, ResetMode, RootsUpdate, Stash,
-    Status, UpdateMode, UpdateReport,
+    LineChangeKind, Operation, RebasePlan, RebaseReport, RefKind, Repository, ResetMode,
+    RootsUpdate, Stash, Status, UpdateMode, UpdateReport,
 };
 use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
@@ -45,6 +45,17 @@ fn push_rejected(error: &std::io::Error) -> bool {
     text.contains("rejected") || text.contains("non-fast-forward") || text.contains("fetch first")
 }
 
+/// The text of an editor changed: the marks of the gutter and of the scroll bar of every
+/// open editor follow its buffer, saved or not.
+pub(crate) fn editor_changed(view: &Entity<EditorView>, cx: &mut App) {
+    let Some(git) = cx.try_global::<ActiveGit>() else {
+        return;
+    };
+    let git = git.0.clone();
+    let view = view.clone();
+    git.update(cx, |git, cx| git.text_changed(view, cx));
+}
+
 /// A command that puts the branch of the last Delete back.
 pub const RESTORE_BRANCH_COMMAND: &str = "git.restore_deleted_branch";
 
@@ -59,6 +70,12 @@ pub const CLOSE_ANNOTATIONS_COMMAND: &str = "git.close_annotations";
 
 /// A change on disk waits for this long, so a save of many files is one read of the status.
 const DEBOUNCE: Duration = Duration::from_millis(300);
+/// An edit waits for this long before the hunks of the buffer are read again, so typing
+/// one line is one diff of the file.
+const MARKS_DEBOUNCE: Duration = Duration::from_millis(200);
+/// The pointer stays off the window of a change this long before it closes, so that a
+/// move from the gutter into the window does not close it on the way.
+const POPUP_CLOSE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -86,20 +103,14 @@ impl Kind {
     }
 
     /// The colour of a file name in the tree and of a mark in the gutter.
-    pub fn color(self, dark: bool) -> Hsla {
-        let hex = match (self, dark) {
-            (Self::Modified, true) => 0x6f9ee8,
-            (Self::Modified, false) => 0x2f5fc7,
-            (Self::Added, true) => 0x5fb865,
-            (Self::Added, false) => 0x067d17,
-            (Self::Deleted, true) => 0x868a91,
-            (Self::Deleted, false) => 0x6f737a,
-            (Self::Conflicted, true) => 0xf75464,
-            (Self::Conflicted, false) => 0xc7222d,
-            (Self::Untracked, true) => 0xd1855c,
-            (Self::Untracked, false) => 0xa65a2a,
-        };
-        rgb(hex).into()
+    pub fn color(self, theme: &Theme) -> Hsla {
+        match self {
+            Self::Modified => theme.info,
+            Self::Added => theme.success,
+            Self::Deleted => theme.text_muted,
+            Self::Conflicted => theme.error,
+            Self::Untracked => theme.accent,
+        }
     }
 }
 
@@ -154,6 +165,18 @@ pub struct GitState {
     /// How many commands have finished, so a view such as the log reloads after each of
     /// them even when HEAD does not move.
     revision: u64,
+    /// The window of a change the user opened, dead after its close.
+    popup: Option<WeakEntity<crate::hunk_popup::HunkPopup>>,
+    /// The change mark under the pointer and whether the pointer is over the window of
+    /// a change, for the open and the close of that window.
+    hovered_mark: Option<(PathBuf, u32)>,
+    popup_hovered: bool,
+    hover_serial: u64,
+    hover_task: Option<Task<()>>,
+    close_task: Option<Task<()>>,
+    /// The editors whose text changed and the marks have not been read for them yet.
+    pending_marks: HashMap<PathBuf, Entity<EditorView>>,
+    marks_task: Option<Task<()>>,
 }
 
 pub struct ActiveGit(pub Entity<GitState>);
@@ -200,6 +223,14 @@ impl GitState {
             stale: false,
             scheduled: false,
             revision: 0,
+            popup: None,
+            hovered_mark: None,
+            popup_hovered: false,
+            hover_serial: 0,
+            hover_task: None,
+            close_task: None,
+            pending_marks: HashMap::new(),
+            marks_task: None,
         });
         let configured = cx.try_global::<Settings>().cloned().unwrap_or_default();
         let found = cx.background_executor().spawn(async move {
@@ -660,7 +691,7 @@ impl GitState {
             binary_conflicts,
             active,
         } = refreshed;
-        let dark = cx.global::<Theme>().dark;
+        let theme = *cx.global::<Theme>();
         self.binary_conflicts = binary_conflicts;
         self.roots = roots;
         self.pointers = pointers;
@@ -688,7 +719,7 @@ impl GitState {
                 let notes = crate::annotate::notes(lines, messages);
                 view.update(cx, |view, cx| view.set_annotations(&notes, cx));
             }
-            let marks = hunks.get(&path).map(|hunks| marks_of(hunks, dark));
+            let marks = hunks.get(&path).map(|hunks| marks_of(hunks, &theme));
             if let Some(marks) = marks {
                 view.update(cx, |view, cx| view.set_gutter_marks(marks, cx));
             }
@@ -2022,9 +2053,293 @@ impl GitState {
             .ok();
     }
 
+    /// The pointer came to a change mark of a gutter, or left the marks. A press opens
+    /// the window of the change at once, the pointer only after the hint delay.
+    pub(crate) fn change_mark_hover(
+        &mut self,
+        view: Entity<EditorView>,
+        line: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        let path = view.read(cx).path().to_path_buf();
+        let next = line.map(|line| (path, line));
+        if self.hovered_mark == next {
+            return;
+        }
+        self.hovered_mark = next.clone();
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        let serial = self.hover_serial;
+        self.hover_task = None;
+        self.close_task = None;
+        match next {
+            Some((path, line)) => {
+                let task = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(TOOLTIP_DELAY).await;
+                    this.update(cx, |this, cx| {
+                        if this.hover_serial == serial && this.hovered_mark.is_some() {
+                            this.open_change_popup(view, path, line, cx);
+                        }
+                    })
+                    .ok();
+                });
+                self.hover_task = Some(task);
+            }
+            None => {
+                if self.live_popup().is_some() {
+                    self.schedule_popup_close(cx);
+                }
+            }
+        }
+    }
+
+    /// A press on a change mark: the window of the change opens at once.
+    pub(crate) fn change_mark_clicked(
+        &mut self,
+        view: Entity<EditorView>,
+        line: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let path = view.read(cx).path().to_path_buf();
+        self.hovered_mark = Some((path.clone(), line));
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        self.hover_task = None;
+        self.close_task = None;
+        self.open_change_popup(view, path, line, cx);
+    }
+
+    /// The text of an editor changed: the marks of the gutter and of the scroll bar
+    /// follow the buffer, saved or not.
+    pub(crate) fn text_changed(&mut self, view: Entity<EditorView>, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            return;
+        }
+        let path = view.read(cx).path().to_path_buf();
+        // The window of a change does not take the keys: typing reaches the editor and
+        // closes the window, as the window of IDEA closes on the first edit.
+        if self
+            .live_popup()
+            .is_some_and(|popup| popup.read(cx).is_for(&path))
+        {
+            self.close_popup(cx);
+        }
+        self.pending_marks.insert(path, view);
+        self.schedule_marks(cx);
+    }
+
+    fn schedule_marks(&mut self, cx: &mut Context<Self>) {
+        if self.marks_task.is_some() {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MARKS_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.marks_task = None;
+                this.read_marks(cx);
+            })
+            .ok();
+        });
+        self.marks_task = Some(task);
+    }
+
+    /// Reads the hunks of the editors that changed, off the UI thread.
+    fn read_marks(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_marks);
+        if pending.is_empty() {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let inputs: Vec<(PathBuf, String)> = pending
+            .iter()
+            .filter_map(|(path, view)| Some((path.clone(), view.read(cx).text()?)))
+            .collect();
+        let job = cx.background_executor().spawn(async move {
+            let mut result = Vec::new();
+            for (path, text) in inputs {
+                let relative = relative_of(repo.root(), &path);
+                let Ok(mut blobs) = repo.blobs() else {
+                    continue;
+                };
+                if let Ok(diff) = repo.file_diff(&mut blobs, &relative, &text) {
+                    result.push((path, text, diff.hunks));
+                }
+            }
+            result
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                let theme = *cx.global::<Theme>();
+                for (path, text, hunks) in result {
+                    let Some(view) = pending.get(&path) else {
+                        continue;
+                    };
+                    // The text moved on while the hunks were read: they belong to an
+                    // older text and another read follows for this editor.
+                    if view.read(cx).text().as_deref() != Some(text.as_str()) {
+                        this.pending_marks.insert(path, view.clone());
+                        continue;
+                    }
+                    let marks = marks_of(&hunks, &theme);
+                    view.update(cx, |view, cx| view.set_gutter_marks(marks, cx));
+                }
+                if !this.pending_marks.is_empty() {
+                    this.schedule_marks(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The window of a change is open and not closed by the user.
+    fn live_popup(&self) -> Option<Entity<crate::hunk_popup::HunkPopup>> {
+        self.popup.as_ref()?.upgrade()
+    }
+
+    /// Closes the window of a change when the overlay still shows it.
+    pub(crate) fn close_popup(&mut self, cx: &mut Context<Self>) {
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        self.hover_task = None;
+        self.close_task = None;
+        self.hovered_mark = None;
+        let Some(window) = self.window else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        // The window may close itself from its own update: the overlay goes after it.
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            if workspace.overlay_tag() == Some(crate::hunk_popup::TAG) {
+                                workspace.close_menu(window, cx);
+                            }
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    }
+
+    /// The user closed the window of a change.
+    pub(crate) fn popup_closed(&mut self, _cx: &mut Context<Self>) {
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        self.hover_task = None;
+        self.close_task = None;
+    }
+
+    /// The pointer is over the window of a change.
+    pub(crate) fn popup_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.popup_hovered = hovered;
+        if hovered {
+            self.close_task = None;
+        } else if self.live_popup().is_some() {
+            self.schedule_popup_close(cx);
+        }
+    }
+
+    fn schedule_popup_close(&mut self, cx: &mut Context<Self>) {
+        if self.close_task.is_some() {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(POPUP_CLOSE_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.close_task = None;
+                if !this.popup_hovered && this.live_popup().is_some() {
+                    this.close_popup(cx);
+                }
+            })
+            .ok();
+        });
+        self.close_task = Some(task);
+    }
+
+    /// Reads the hunks of the file under the mark and shows the window of the change
+    /// that holds `line`, off the UI thread.
+    fn open_change_popup(
+        &mut self,
+        view: Entity<EditorView>,
+        path: PathBuf,
+        line: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let Some(text) = view.read(cx).text() else {
+            return;
+        };
+        let relative = relative_of(
+            self.repo.as_ref().map_or(Path::new(""), |repo| repo.root()),
+            &path,
+        );
+        let Some(repo) = self.repo_of(&relative) else {
+            return;
+        };
+        self.popup_hovered = false;
+        let job_relative = relative_of(repo.root(), &path);
+        let job = cx.background_executor().spawn(async move {
+            let mut blobs = repo.blobs().ok()?;
+            repo.file_diff(&mut blobs, &job_relative, &text).ok()
+        });
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let Some(diff) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // The text moved on while the hunks were read: the window would show
+                // lines the buffer no longer has.
+                if view.read(cx).text().as_deref() != Some(diff.current.as_str()) {
+                    return;
+                }
+                let Some(index) = hunk_index_at(&diff.hunks, line) else {
+                    return;
+                };
+                let mut opened = None;
+                window
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                opened = crate::hunk_popup::HunkPopup::open(
+                                    git,
+                                    workspace,
+                                    window,
+                                    cx,
+                                    path,
+                                    view,
+                                    diff.base,
+                                    diff.current,
+                                    diff.hunks,
+                                    index,
+                                );
+                            })
+                            .ok();
+                    })
+                    .ok();
+                this.popup = opened.map(|view| view.downgrade());
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Takes the change under the caret, or every change the selection touches, back to
     /// the committed text.
     pub fn revert_at_caret(&mut self, cx: &mut Context<Self>) {
+        if let Some(popup) = self.live_popup() {
+            // The window may close itself here: the close reaches this state after the
+            // update that runs the key.
+            cx.defer(move |cx| {
+                popup.update(cx, |popup, cx| popup.rollback(cx));
+            });
+            return;
+        }
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -2130,6 +2445,10 @@ impl GitState {
     }
 
     fn show_change(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(popup) = self.live_popup() {
+            popup.update(cx, |popup, cx| popup.step(forward, cx));
+            return;
+        }
         let active = self
             .workspace
             .read_with(cx, |workspace, _| workspace.active_editor())
@@ -2163,9 +2482,9 @@ impl GitState {
         }
     }
 
-    /// The branch popup at `position`: search, Recent, Local and Remote branches, each
-    /// with the actions of the branch. The list comes from `git for-each-ref` off the
-    /// UI thread.
+    /// The branch popup at `position`: a search field, the actions above the list, and
+    /// the Recent, Local, Remote and Tags references below, folded by their slashes. The
+    /// list comes from `git for-each-ref` off the UI thread.
     pub fn show_branches(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else {
             return;
@@ -2173,22 +2492,50 @@ impl GitState {
         let Some(window) = self.window else {
             return;
         };
+        let Ok(root) = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.root().to_path_buf())
+        else {
+            return;
+        };
         let recent = self.recent.clone();
         let git = cx.entity();
         let workspace = self.workspace.clone();
-        let job = cx
-            .background_executor()
-            .spawn(async move { repo.branches().map_err(|error| error.to_string()) });
+        let job = cx.background_executor().spawn(async move {
+            let branches = repo.branches().map_err(|error| error.to_string())?;
+            let tags = repo
+                .labels()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|label| label.kind == RefKind::Tag)
+                .map(|label| crate::branches::Tag {
+                    name: label.name,
+                    commit: label.commit,
+                })
+                .collect();
+            let favourites = workspace::load_git_settings(&root).favourite_branches;
+            Ok::<_, String>((branches, tags, favourites))
+        });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             match result {
-                Ok(branches) => {
+                Ok((branches, tags, favourites)) => {
                     window
                         .update(cx, |_, window, cx| {
                             workspace
                                 .update(cx, |workspace, cx| {
                                     crate::branches::BranchPopup::open(
-                                        git, branches, recent, position, workspace, window, cx,
+                                        git,
+                                        crate::branches::OpenedBranches {
+                                            branches,
+                                            tags,
+                                            recent,
+                                            favourites,
+                                        },
+                                        position,
+                                        workspace,
+                                        window,
+                                        cx,
                                     )
                                 })
                                 .ok();
@@ -2250,6 +2597,41 @@ impl GitState {
                 );
             })
             .ok();
+    }
+
+    /// Checkout Tag or Revision...: the tag or the revision the user types, with HEAD
+    /// detached, as `git switch --detach` leaves it.
+    pub(crate) fn ask_checkout_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show(
+                    "Checkout Tag or Revision",
+                    "Tag or revision",
+                    move |revision, cx| {
+                        me.update(cx, |this, cx| this.checkout_named(revision, cx))
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    /// The revision Checkout Tag or Revision names, shown as the user typed it.
+    fn checkout_named(&mut self, revision: String, cx: &mut Context<Self>) {
+        let shown = revision.clone();
+        self.run(
+            "Checkout",
+            move |repo| repo.checkout_commit(&revision),
+            move |this, (), cx| {
+                this.reload_everything(cx);
+                this.tell("Checkout", format!("Checked out {shown}"), cx)
+            },
+            cx,
+        );
     }
 
     pub(crate) fn ask_rename_branch(
@@ -2361,7 +2743,7 @@ fn messages_of(repo: &Repository, lines: &[BlameLine]) -> HashMap<String, String
 }
 
 /// Marks of the hunks for the gutter of an editor.
-pub fn marks_of(hunks: &[Hunk], dark: bool) -> Vec<GutterMark> {
+pub fn marks_of(hunks: &[Hunk], theme: &Theme) -> Vec<GutterMark> {
     vcs::gutter(hunks)
         .into_iter()
         .map(|change| {
@@ -2373,7 +2755,7 @@ pub fn marks_of(hunks: &[Hunk], dark: bool) -> Vec<GutterMark> {
             GutterMark {
                 lines: change.lines,
                 kind,
-                color: color.color(dark),
+                color: color.color(theme),
             }
         })
         .collect()
@@ -2382,6 +2764,17 @@ pub fn marks_of(hunks: &[Hunk], dark: bool) -> Vec<GutterMark> {
 /// The hunk the line belongs to; a removal belongs to the line it sits before.
 pub fn hunk_at(hunks: &[Hunk], line: u32) -> Option<&Hunk> {
     hunks.iter().find(|hunk| {
+        if hunk.after.is_empty() {
+            hunk.after.start == line
+        } else {
+            hunk.after.contains(&line)
+        }
+    })
+}
+
+/// The place of [`hunk_at`] in the list, for the windows that walk the hunks.
+pub fn hunk_index_at(hunks: &[Hunk], line: u32) -> Option<usize> {
+    hunks.iter().position(|hunk| {
         if hunk.after.is_empty() {
             hunk.after.start == line
         } else {

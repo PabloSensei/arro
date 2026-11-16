@@ -1773,12 +1773,7 @@ impl CommitPanel {
                 cx.listener(move |this, _, window, cx| this.open_file(index, window, cx)),
             )
             .child(boxed)
-            .child(
-                div()
-                    .text_color(kind.color(theme.dark))
-                    .flex_none()
-                    .child(name),
-            )
+            .child(div().text_color(kind.color(theme)).flex_none().child(name))
             .child(
                 div()
                     .ml(px(8.))

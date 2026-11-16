@@ -9,7 +9,7 @@ use ui_kit::*;
 use crate::editor::FileIcons;
 use crate::external::{OpenRequests, Request};
 use crate::layout::{
-    Layout, WindowPlacement, load_dark_theme, load_layout, load_recent, remember_project,
+    Layout, WindowPlacement, load_layout, load_recent, load_theme, remember_project,
 };
 use crate::settings::{SETTINGS_FILE, Settings};
 use crate::window::{Workspace, bind_keys};
@@ -84,17 +84,40 @@ pub struct Launch {
 /// settings.
 pub struct StartContext {
     pub dark: bool,
+    /// The theme the first frame shows, by the name the settings save.
+    pub theme: Theme,
+    /// The themes the settings folder offers.
+    pub themes: ThemeCatalog,
     pub recent: Vec<PathBuf>,
     pub settings: Settings,
 }
 
 pub fn start_context(state_dir: &std::path::Path, settings_dir: &std::path::Path) -> StartContext {
     let store = Store::open(&state_dir.join(DATABASE)).ok();
+    let theme = store.as_ref().map_or_else(Default::default, load_theme);
+    let settings = settings_at(settings_dir, theme.chosen);
+    let themes = ThemeCatalog::load(settings_dir);
+    let id = if settings.theme_sync_with_os {
+        settings.theme_for(theme.dark).to_owned()
+    } else if settings.theme.is_empty() {
+        if theme.dark { "dark" } else { "light" }.to_owned()
+    } else {
+        settings.theme.clone()
+    };
+    let shown = Theme::from_library(themes.library(), &id);
     StartContext {
-        dark: store.as_ref().is_none_or(load_dark_theme),
+        dark: theme.dark,
+        theme: shown,
+        themes,
         recent: store.as_ref().map_or_else(Vec::new, load_recent),
-        settings: Settings::load(&settings_dir.join(SETTINGS_FILE)),
+        settings,
     }
+}
+
+/// The settings file of a start. A file written before Sync with OS existed keeps a theme
+/// the user already chose; a start without one follows the system.
+fn settings_at(settings_dir: &std::path::Path, theme_chosen: bool) -> Settings {
+    Settings::load_with_theme_choice(&settings_dir.join(SETTINGS_FILE), theme_chosen)
 }
 
 /// Starts the program of a project in a window of its own. Blocks only for the start.
@@ -178,21 +201,31 @@ fn open_store(launch: &Launch) -> Option<Arc<Store>> {
 }
 
 /// Saved bounds and their display. They count only if that display is still there:
-/// GPUI drops bounds that lie outside the display it is given.
+/// GPUI drops bounds that lie outside the display it is given. The layout keeps the
+/// bounds in the logical pixels of the display, whatever the interface scale was when
+/// they were written, so the window keeps its size on screen after a change of it.
 fn restored_bounds(
     placement: Option<WindowPlacement>,
     cx: &App,
 ) -> Option<(WindowBounds, DisplayId)> {
     let placement = placement?;
-    let bounds = Bounds::new(
+    let stored = Bounds::new(
         point(px(placement.x), px(placement.y)),
         size(px(placement.width), px(placement.height)),
     );
-    let center = bounds.center();
+    let center = stored.center();
     let displays = cx.displays();
     let display = displays
         .iter()
         .find(|display| display.bounds().contains(&center))?;
+    let scale = window_scale(
+        cx.try_global::<Settings>()
+            .map_or(1., |settings| settings.ui_scale),
+    );
+    let bounds = Bounds::new(
+        point(stored.left() / scale, stored.top() / scale),
+        size(stored.size.width / scale, stored.size.height / scale),
+    );
     let bounds = if placement.maximized {
         WindowBounds::Maximized(bounds)
     } else {
@@ -219,7 +252,10 @@ pub fn run(
     let layout = store
         .as_ref()
         .map_or_else(Layout::default, |store| load_layout(store, &launch.root));
-    let dark = store.as_ref().is_none_or(|store| load_dark_theme(store));
+    let theme = store
+        .as_ref()
+        .map_or_else(Default::default, |store| load_theme(store));
+    let dark = theme.dark;
     let recent = store.as_ref().map_or_else(Vec::new, |store| {
         if let Err(error) = remember_project(store, &launch.root) {
             eprintln!("recent projects are not saved: {error}");
@@ -227,7 +263,7 @@ pub fn run(
         load_recent(store)
     });
     let focus = !launch.background;
-    let settings = Settings::load(&launch.settings_dir.join(SETTINGS_FILE));
+    let settings = settings_at(&launch.settings_dir, theme.chosen);
 
     // The Finder hands a document to the delegate of the running application, and the
     // window takes it from the same queue as the paths of a second start.
@@ -243,14 +279,20 @@ pub fn run(
     let watched = requests;
     application.run(move |cx| {
         ui_kit::init(dark, cx);
+        let ui_scale = settings.ui_scale;
         cx.set_global(settings);
+        ui_kit::set_ui_scale(ui_scale);
         bind_keys(cx);
 
         let (width, height) = DEFAULT_SIZE;
         let restored = restored_bounds(layout.window, cx);
         let (window_bounds, display_id) = restored.map_or_else(
             || {
-                let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+                // The default size is the size on screen at the scale of 1, so a larger
+                // interface puts fewer logical pixels in the same window.
+                let scale = window_scale(ui_scale);
+                let bounds =
+                    Bounds::centered(None, size(px(width / scale), px(height / scale)), cx);
                 (WindowBounds::Windowed(bounds), None)
             },
             |(bounds, display)| (bounds, Some(display)),

@@ -17,6 +17,7 @@ mod input;
 mod live;
 mod markdown_images;
 mod markdown_preview;
+mod popups;
 mod quick_doc;
 mod refactor;
 mod regions;
@@ -45,8 +46,8 @@ pub use quick_doc::{
 pub use refactor::FolderMove;
 pub use semantic::{
     CompletionCase, CompletionSources, ExternalLinks, ExternalOpener, FileLanguages,
-    InspectionProfile, LocalCompletions, Semantic, completion_order, completion_order_with,
-    completion_parts, expand_snippet, show_location, uri_path,
+    InspectionProfile, LocalCompletions, Semantic, SymbolLookup, completion_order,
+    completion_order_with, completion_parts, expand_snippet, show_location, uri_path,
 };
 pub use spelling::SpellingMark;
 pub use state::{

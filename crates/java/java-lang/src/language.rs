@@ -23,6 +23,32 @@ use crate::problems;
 
 pub const LANGUAGE_ID: LanguageId = LanguageId("java");
 
+/// The names of the Java types people type most. The completion list puts them before
+/// the other types and before the types of the libraries, as they do in IDEA.
+const PREFERRED_COMPLETION_NAMES: &[&str] = &[
+    "String",
+    "Object",
+    "Integer",
+    "Long",
+    "Boolean",
+    "Double",
+    "Float",
+    "Character",
+    "Byte",
+    "Short",
+    "Number",
+    "Math",
+    "System",
+    "Exception",
+    "RuntimeException",
+    "Thread",
+    "Class",
+    "Enum",
+    "Iterable",
+    "Comparable",
+    "CharSequence",
+];
+
 /// The grammar and the `queries/java` files the editor uses.
 pub struct JavaSyntax {
     queries: Queries,
@@ -118,6 +144,14 @@ impl LanguageSupport for JavaProject {
 
     fn watches_file(&self, path: &Path) -> bool {
         jdtls_adapter::is_build_file(path)
+    }
+
+    fn server_ready(&self) -> bool {
+        self.status().borrow().state == sidecar::State::Ready
+    }
+
+    fn preferred_completion_names(&self) -> &'static [&'static str] {
+        PREFERRED_COMPLETION_NAMES
     }
 
     fn embedded_languages(&self) -> Vec<Arc<dyn LanguageSupport>> {

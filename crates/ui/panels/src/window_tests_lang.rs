@@ -938,7 +938,23 @@ fn definitions_open_in_another_tab_and_back_returns(cx: &mut TestAppContext) {
 
     press(cx, window, "ctrl-alt-left");
     draw(cx, window);
-    assert_eq!(active_path(cx, window), Some(main));
+    assert_eq!(active_path(cx, window), Some(main.clone()));
+
+    // The file of the place is open already, so the jump shows its tab rather than
+    // opening a second one, as IDEA does.
+    let tabs = window
+        .read_with(cx, |workspace, _| workspace.open_tabs())
+        .unwrap();
+    press(cx, window, "ctrl-b");
+    draw(cx, window);
+    assert_eq!(active_path(cx, window), Some(other));
+    assert_eq!(
+        window
+            .read_with(cx, |workspace, _| workspace.open_tabs())
+            .unwrap(),
+        tabs,
+        "a place of a file that is open keeps the tabs as they are"
+    );
 }
 
 #[ui_kit::gpui::test]

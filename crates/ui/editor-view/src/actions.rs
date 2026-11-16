@@ -34,6 +34,31 @@ pub(crate) enum Own {
     Inline,
 }
 
+/// A group of the Alt+Enter menu: the quick fixes come first, then the intentions.
+/// The kind comes from the language server's code action kind or the kind field of the
+/// language, never from the title of the action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuSection {
+    QuickFix,
+    Intention,
+}
+
+/// The section of an action the language gave.
+fn section_of(entry: &ActionEntry) -> MenuSection {
+    match entry.kind {
+        Some(ActionKind::QuickFix) => MenuSection::QuickFix,
+        Some(_) => MenuSection::Intention,
+        None => {
+            let code = entry.code.as_deref().unwrap_or_default();
+            if code == "quickfix" || code.starts_with("quickfix.") {
+                MenuSection::QuickFix
+            } else {
+                MenuSection::Intention
+            }
+        }
+    }
+}
+
 /// A row of a pick list: an action to apply or a place to go to.
 pub(crate) enum Pick {
     Action(ActionEntry),
@@ -133,6 +158,16 @@ impl Pick {
             _ => None,
         }
     }
+
+    /// The section a row belongs to. A correction of a misspelled word is a quick fix;
+    /// everything the editor adds itself, such as Create Test, is an intention.
+    fn section(&self) -> MenuSection {
+        match self {
+            Self::Action(entry) => section_of(entry),
+            Self::Spelling { .. } => MenuSection::QuickFix,
+            _ => MenuSection::Intention,
+        }
+    }
 }
 
 /// Alt+Enter, Generate, usages, the type hierarchy: rows picked with the keys of
@@ -140,6 +175,9 @@ impl Pick {
 pub(crate) struct ActionMenu {
     pub at: usize,
     pub rows: Vec<Pick>,
+    /// The section of every row, of the same length as `rows`. Empty for the flat
+    /// lists that have no sections.
+    pub sections: Vec<MenuSection>,
     pub selected: usize,
 }
 
@@ -148,6 +186,24 @@ impl ActionMenu {
         let start = self.selected.saturating_sub(crate::semantic::MAX_SHOWN - 1);
         start..(start + crate::semantic::MAX_SHOWN).min(self.rows.len())
     }
+
+    /// Whether the row is a quick fix, which carries the red bulb and comes first.
+    pub fn quick_fix(&self, row: usize) -> bool {
+        self.sections.get(row) == Some(&MenuSection::QuickFix)
+    }
+
+    /// Whether the list is the menu of Alt+Enter with its sections and its preview.
+    /// The flat lists of Generate and the hierarchies keep one look.
+    pub fn has_sections(&self) -> bool {
+        !self.sections.is_empty()
+    }
+}
+
+/// The change the selected row would make, shown beside the list when the language
+/// gave the edits without applying them.
+pub(crate) struct ActionPreview {
+    pub title: String,
+    pub lines: Vec<String>,
 }
 
 /// Edits of one server answer, all in the coordinates of `store`, in the order the
@@ -175,6 +231,9 @@ pub(crate) fn server_edits(store: &RopeStore, edits: Vec<DocumentEdit>) -> Optio
 }
 
 const OVERLAPPING: &str = "The language server sent overlapping edits, nothing was changed";
+
+/// Alt+Enter with nothing to offer.
+const NO_ACTIONS: &str = "No actions available here";
 
 /// Whole-word occurrences of `needle` in `text`, in text order.
 pub(crate) fn word_ranges(text: &str, needle: &str) -> Vec<Range<usize>> {
@@ -416,6 +475,7 @@ impl EditorView {
             lsp.actions = Some(ActionMenu {
                 at,
                 rows,
+                sections: Vec::new(),
                 selected: 0,
             });
             cx.notify();
@@ -485,6 +545,7 @@ impl EditorView {
     /// Alt+Enter: fixes of the problem under the caret first, then the suppressions of
     /// its check and the other actions.
     pub(crate) fn show_actions(&mut self, cx: &mut Context<Self>) {
+        self.before_actions_popup(cx);
         let Some(span) = self.selection_span() else {
             return;
         };
@@ -492,11 +553,21 @@ impl EditorView {
             .state
             .as_ref()
             .map_or(0, |state| state.selections().primary().head);
-        let mut own = self.own_action_rows();
-        own.extend(self.inspection_picks(caret));
+        let mut own: Vec<(MenuSection, Pick)> = self
+            .own_action_rows()
+            .into_iter()
+            .map(|row| (row.section(), row))
+            .collect();
+        own.extend(
+            self.inspection_picks(caret)
+                .into_iter()
+                .map(|row| (row.section(), row)),
+        );
         let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.actions()) else {
-            if !own.is_empty() {
-                self.show_picks(caret, own, "No actions here", cx);
+            if own.is_empty() {
+                self.show_transient_note(caret, NO_ACTIONS, cx);
+            } else {
+                self.show_action_sections(caret, own, cx);
             }
             return;
         };
@@ -527,29 +598,95 @@ impl EditorView {
                     None => Vec::new(),
                 };
                 entries.sort_by_key(|entry| {
-                    let fix = entry.kind == Some(ActionKind::QuickFix);
-                    (!entry.preferred, !fix)
+                    (section_of(entry) != MenuSection::QuickFix, !entry.preferred)
                 });
-                let mut rows: Vec<Pick> = entries
+                let entries = without_duplicate_actions(entries);
+                let mut rows: Vec<(MenuSection, Pick)> = entries
                     .into_iter()
                     .filter(|entry| !entry.edits.is_empty() || !entry.renames.is_empty())
-                    .map(Pick::Action)
+                    .map(|entry| (section_of(&entry), Pick::Action(entry)))
                     .collect();
                 rows.extend(own);
                 if rows.is_empty() {
-                    let note = if unknown {
-                        NO_ANSWER
+                    if unknown {
+                        this.show_transient_note(caret, NO_ANSWER, cx);
                     } else {
-                        "No actions here"
-                    };
-                    this.show_note(caret, note, cx);
+                        this.show_transient_note(caret, NO_ACTIONS, cx);
+                    }
                 } else {
-                    this.show_picks(caret, rows, "No actions here", cx);
+                    this.show_action_sections(caret, rows, cx);
                 }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Shows the sections of Alt+Enter: the quick fixes first, then the intentions,
+    /// each row with the bulb of its section.
+    fn show_action_sections(
+        &mut self,
+        at: usize,
+        mut rows: Vec<(MenuSection, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        // The sort is stable: the order the language and the editor gave inside a
+        // section stays as it is.
+        rows.sort_by_key(|(section, _)| *section != MenuSection::QuickFix);
+        let sections = rows.iter().map(|(section, _)| *section).collect();
+        let rows = rows.into_iter().map(|(_, row)| row).collect();
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        lsp.completion = None;
+        lsp.note = None;
+        lsp.move_to = None;
+        lsp.actions = Some(ActionMenu {
+            at,
+            rows,
+            sections,
+            selected: 0,
+        });
+        cx.notify();
+    }
+
+    /// The change the selected row would make, in the current document, when the
+    /// language gave its edits with the action. `None` when there is nothing to show.
+    pub(crate) fn action_preview(&self, menu: &ActionMenu) -> Option<ActionPreview> {
+        let Some(Pick::Action(entry)) = menu.rows.get(menu.selected) else {
+            return None;
+        };
+        let state = self.state.as_ref()?;
+        let uri = self.lsp.as_ref()?.uri.as_str();
+        let source = entry.edits.iter().find(|edit| edit.uri == uri)?;
+        if source.edits.is_empty() {
+            return None;
+        }
+        let store = state.store();
+        let mut lines = Vec::new();
+        for edit in source.edits.iter().take(6) {
+            let start = offset_at(&store, edit.span.start);
+            let end = offset_at(&store, edit.span.end).max(start);
+            let before = store.slice(start..end);
+            for line in before.lines().take(4) {
+                lines.push(format!("- {line}"));
+            }
+            let text = edit.text.replace("\r\n", "\n");
+            for line in text.lines().take(8) {
+                lines.push(format!("+ {line}"));
+            }
+            if lines.len() >= 16 {
+                break;
+            }
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        lines.truncate(16);
+        Some(ActionPreview {
+            title: entry.title.clone(),
+            lines,
+        })
     }
 
     /// The rows of ALT+Enter that the window adds beside the language actions, such as
@@ -703,7 +840,8 @@ impl EditorView {
         rows
     }
 
-    /// Keys of an open action list. Returns whether the key was taken.
+    /// Keys of an open action list. Returns whether the key was taken; Escape is
+    /// closed by the popup rules of the view.
     pub(crate) fn action_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         let Some(lsp) = &mut self.lsp else {
             return false;
@@ -722,7 +860,6 @@ impl EditorView {
                 menu.selected = (menu.selected + 1) % rows;
                 moved = true;
             }
-            "escape" => lsp.actions = None,
             "enter" | "tab" => {
                 let picked = lsp.actions.take().map(|mut menu| {
                     let selected = menu.selected;
@@ -979,12 +1116,31 @@ impl EditorView {
     }
 }
 
+/// The rows of a pick list without the same action twice: a server can offer one fix as
+/// a quick fix and as a source action, with one title and one edit or command. The row
+/// with the better kind stays, because the sort put it first.
+fn without_duplicate_actions(entries: Vec<ActionEntry>) -> Vec<ActionEntry> {
+    let mut kept: Vec<ActionEntry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let duplicate = kept.iter().any(|known| {
+            known.title == entry.title
+                && known.handle == entry.handle
+                && known.edits == entry.edits
+                && known.renames == entry.renames
+        });
+        if !duplicate {
+            kept.push(entry);
+        }
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use lang_api::{DocumentEdit, TextPoint, TextSpan};
     use text_core::{FileFormat, RopeStore, TextStore};
 
-    use super::{server_batches, server_edits};
+    use super::{server_batches, server_edits, without_duplicate_actions};
     use crate::EditorState;
 
     const TEXT: &str = "import b;\nimport a;\nclass X {}\n";
@@ -1009,6 +1165,51 @@ mod tests {
     }
 
     // The cases of the qa check of T-0025: lists a server may send.
+
+    #[test]
+    fn one_action_offered_twice_stays_once() {
+        use lang_api::{ActionEntry, ActionKind};
+
+        let entry = |kind: ActionKind, title: &str, code: &str| ActionEntry {
+            title: title.to_owned(),
+            kind: Some(kind),
+            code: Some(code.to_owned()),
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: None,
+        };
+        // The unused import comes back as a quick fix and as a source action, with the
+        // same title and the same edit but a code of its own kind.
+        let rows = without_duplicate_actions(vec![
+            entry(ActionKind::QuickFix, "Organize imports", "quickfix.import"),
+            entry(
+                ActionKind::Source,
+                "Organize imports",
+                "source.organizeImports",
+            ),
+            entry(ActionKind::Source, "Sort members", "source.sortMembers"),
+        ]);
+        let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
+        assert_eq!(titles, ["Organize imports", "Sort members"]);
+    }
+
+    #[test]
+    fn actions_that_differ_in_their_edit_are_kept_apart() {
+        use lang_api::ActionEntry;
+
+        let entry = |text: &str| ActionEntry {
+            title: "Organize imports".to_owned(),
+            kind: None,
+            code: None,
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: Some(text.to_owned()),
+        };
+        let rows = without_duplicate_actions(vec![entry("first"), entry("first"), entry("second")]);
+        assert_eq!(rows.len(), 2, "the same form is one row");
+    }
 
     #[test]
     fn unsorted_edits_apply_in_the_order_of_the_text() {

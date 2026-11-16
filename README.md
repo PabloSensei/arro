@@ -95,7 +95,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>Git built in</h3>
-      Commit, diff, log, branches with merge, rebase and compare, shelf and stash, conflict resolution, history of a selection or a method, submodules, local history.
+      Commit, diff, log, a branches popup like IntelliJ IDEA's with favourites, merge, rebase and compare, change markers next to the line numbers with rollback, shelf and stash, conflict resolution, history of a selection or a method, submodules, local history.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/light.png" alt="Arro in the light theme">
@@ -103,7 +103,7 @@
   </tr>
 </table>
 
-And the rest you expect from an IDE: a New Project wizard for Maven, Gradle and Spring Boot (Spring Initializr), Search Everywhere, Find in Files, a project tree, a terminal with tabs, splits, search and clickable paths, file structure, bookmarks, split editors, Compare with Clipboard, actions on save (reformat, optimize imports), dark and light themes, Distraction Free, Zen and Presentation modes, a configurable keymap, the code style of a project's <code>.idea</code> folder, settings export and import, Docker services, Lombok support, and automatic updates.
+And the rest you expect from an IDE: a New Project wizard for Maven, Gradle and Spring Boot (Spring Initializr), Search Everywhere, Find in Files, a project tree, a terminal with tabs, splits, search and clickable paths, file structure, bookmarks, split editors, Compare with Clipboard, actions on save (reformat, optimize imports), seven themes plus your own JSON themes and imported IntelliJ IDEA color schemes, syntax highlighting for Python, C, C++, C#, Go, Rust, Scala, PHP, Ruby, Swift, Lua, PowerShell and more, database drivers that download themselves, Distraction Free, Zen and Presentation modes, a configurable keymap, the code style of a project's <code>.idea</code> folder, settings export and import, Docker services, Lombok support, and automatic updates.
 
 ## Install
 

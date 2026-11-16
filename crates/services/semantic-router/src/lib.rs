@@ -1000,6 +1000,8 @@ fn request_metric(method: &str) -> &'static str {
         "textDocument/rename" => "lsp.rename",
         "textDocument/formatting" => "lsp.formatting",
         "textDocument/codeAction" => "lsp.code_action",
+        "textDocument/codeLens" => "lsp.code_lens",
+        "codeLens/resolve" => "lsp.code_lens_resolve",
         "textDocument/documentHighlight" => "lsp.document_highlight",
         "textDocument/semanticTokens/full" => "lsp.semantic_tokens",
         "textDocument/semanticTokens/range" => "lsp.semantic_tokens_range",

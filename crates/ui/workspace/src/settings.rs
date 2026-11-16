@@ -203,6 +203,18 @@ impl GitUpdateMethod {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// The theme follows the appearance of the system.
+    pub theme_sync_with_os: bool,
+    /// The theme the window uses while the system is light; the id of a theme of the
+    /// catalog.
+    pub theme_light: String,
+    /// The theme the window uses while the system is dark; the id of a theme of the
+    /// catalog.
+    pub theme_dark: String,
+    /// The theme of a window that does not follow the system; the id of any theme of the
+    /// catalog. Empty in a file written before themes became files: the window then takes
+    /// the base theme of the look.
+    pub theme: String,
     /// Size of the text in the editor, in points.
     pub font_size: f32,
     /// Size of the text of the editors in Presentation Mode, in points.
@@ -377,6 +389,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme_sync_with_os: true,
+            theme_light: "light".to_owned(),
+            theme_dark: "dark".to_owned(),
+            theme: String::new(),
             font_size: DEFAULT_FONT_SIZE,
             presentation_font_size: crate::appearance::DEFAULT_PRESENTATION_FONT_SIZE,
             ui_scale: DEFAULT_UI_SCALE,
@@ -472,9 +488,32 @@ impl Global for Settings {}
 impl Settings {
     /// A damaged or missing file is not an error: the defaults come back.
     pub fn load(path: &Path) -> Self {
+        Self::load_with_theme_choice(path, false)
+    }
+
+    /// Reads the file. A file written before Sync with OS existed keeps the theme of an
+    /// installation that already chose one: the sync stays off there. A file without an
+    /// explicit value in an installation without a chosen theme follows the system, as a
+    /// new one does.
+    pub fn load_with_theme_choice(path: &Path, theme_chosen: bool) -> Self {
         let text = std::fs::read_to_string(path).ok();
-        let parsed: Option<Self> = text.and_then(|text| serde_json::from_str(&text).ok());
-        parsed.map_or_else(Self::default, Self::clamped)
+        let parsed: Option<Self> = text
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok());
+        let mut settings = parsed.map_or_else(Self::default, Self::clamped);
+        if theme_chosen && text.as_deref().is_none_or(|text| !names_sync_with_os(text)) {
+            settings.theme_sync_with_os = false;
+        }
+        settings
+    }
+
+    /// The saved name of the theme the system appearance asks for.
+    pub fn theme_for(&self, system_dark: bool) -> &str {
+        if system_dark {
+            &self.theme_dark
+        } else {
+            &self.theme_light
+        }
     }
 
     /// Writes the file, creating its folder. The new text goes to a file beside the old
@@ -595,6 +634,14 @@ impl Settings {
     }
 }
 
+/// Whether a settings file names the switch of Sync with OS. A file of an older release
+/// does not, and its theme choice has to stand.
+fn names_sync_with_os(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .is_some_and(|value| value.get("theme_sync_with_os").is_some())
+}
+
 /// A name beside `path` that a save of this process has not taken yet.
 fn temp_path(path: &Path) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -641,6 +688,36 @@ mod tests {
         CompletionCase, MAX_COMPLETION_DELAY_MS, MAX_INDENT_SIZE, MIN_LINE_SPACING, Settings,
         TrimTrailingWhitespace,
     };
+
+    #[test]
+    fn an_old_settings_file_keeps_the_theme_the_installation_chose() {
+        let dir = test_support::scratch("settings-theme");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"font_size": 15.0}"#).unwrap();
+
+        let old = Settings::load_with_theme_choice(&file, true);
+        assert!(
+            !old.theme_sync_with_os,
+            "a theme chosen before Sync with OS existed keeps the sync off"
+        );
+        assert_eq!(old.font_size, 15.);
+        assert_eq!(old.theme_light, "light");
+        assert_eq!(old.theme_dark, "dark");
+        assert!(
+            Settings::load_with_theme_choice(&file, false).theme_sync_with_os,
+            "an installation without a chosen theme follows the system"
+        );
+
+        std::fs::write(&file, r#"{"theme_sync_with_os": true}"#).unwrap();
+        assert!(
+            Settings::load_with_theme_choice(&file, true).theme_sync_with_os,
+            "a file that names the switch keeps its value"
+        );
+        assert!(
+            !Settings::load_with_theme_choice(&dir.join("missing.json"), true).theme_sync_with_os,
+            "a start without a settings file keeps the chosen theme too"
+        );
+    }
 
     #[test]
     fn a_missing_or_damaged_file_gives_the_defaults() {

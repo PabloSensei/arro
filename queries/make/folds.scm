@@ -1,0 +1,2 @@
+(rule) @fold
+(recipe) @fold

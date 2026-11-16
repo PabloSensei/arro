@@ -46,7 +46,7 @@ fn wait_for(
     }
 }
 
-fn open_editor(
+pub(crate) fn open_editor(
     cx: &mut TestAppContext,
     name: &str,
     text: &str,
@@ -64,7 +64,7 @@ fn open_editor(
 
 /// The point of a text column and a buffer line, as the window tests find the text.
 /// The advance of the test font is eight pixels, as in `window_tests_lang`.
-fn text_point(
+pub(crate) fn text_point(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     line: usize,
@@ -196,7 +196,7 @@ fn scroll_at(
     draw(cx, window);
 }
 
-fn selected_text(cx: &TestAppContext, view: &gpui::Entity<EditorView>) -> String {
+pub(crate) fn selected_text(cx: &TestAppContext, view: &gpui::Entity<EditorView>) -> String {
     let text = buffer_of(cx, view);
     let (range, _) = view
         .read_with(cx, |view, _| view.selection())

@@ -45,6 +45,8 @@ mod process_tree;
 #[path = "process_tree_unix.rs"]
 mod process_tree;
 mod resources;
+/// Passwords kept by the system: Credential Manager, Keychain or Secret Service.
+pub mod secrets;
 #[cfg(windows)]
 mod shell;
 #[cfg(unix)]

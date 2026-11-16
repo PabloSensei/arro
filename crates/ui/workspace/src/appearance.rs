@@ -3,6 +3,120 @@
 
 use ui_kit::*;
 
+use crate::settings::Settings;
+
+/// What the system tells the windows to look like. A test platform has no appearance of
+/// its own, so a test sets this global and the windows take it as the look of the system.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SystemAppearance {
+    pub dark: bool,
+}
+
+impl SystemAppearance {
+    /// The appearance the window shows to the system.
+    pub fn of(window: &Window) -> Self {
+        Self {
+            dark: matches!(
+                window.appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            ),
+        }
+    }
+}
+
+impl Global for SystemAppearance {}
+
+/// The appearance the window reported last. It is what a settings change follows when it
+/// happens without a window of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LastSystemAppearance(SystemAppearance);
+
+impl Global for LastSystemAppearance {}
+
+/// The appearance the windows follow: the one a test put in place, or the one of the
+/// window itself.
+pub fn system_appearance(window: &Window, cx: &App) -> SystemAppearance {
+    current_appearance(cx).unwrap_or_else(|| SystemAppearance::of(window))
+}
+
+/// The appearance put in place by a test, or the one the windows reported last.
+fn current_appearance(cx: &App) -> Option<SystemAppearance> {
+    cx.try_global::<SystemAppearance>()
+        .copied()
+        .or_else(|| cx.try_global::<LastSystemAppearance>().map(|last| last.0))
+}
+
+fn remember_appearance(appearance: SystemAppearance, cx: &mut App) {
+    if cx.try_global::<LastSystemAppearance>() != Some(&LastSystemAppearance(appearance)) {
+        cx.set_global(LastSystemAppearance(appearance));
+    }
+}
+
+/// The window reports a new appearance of the system.
+pub(crate) fn system_appearance_changed(window: &Window, cx: &mut App) {
+    remember_appearance(SystemAppearance::of(window), cx);
+}
+
+/// Remembers the appearance of the window and takes the theme of the settings for it
+/// without a fade, as the first frame of a window has none.
+pub fn follow_system_theme(window: &Window, cx: &mut App) {
+    let appearance = system_appearance(window, cx);
+    remember_appearance(appearance, cx);
+    let Some(settings) = cx.try_global::<Settings>() else {
+        return;
+    };
+    if !settings.theme_sync_with_os {
+        return;
+    }
+    let theme = theme_of(settings, appearance.dark, cx);
+    if cx
+        .try_global::<Theme>()
+        .is_some_and(|current| current.id() == theme.id())
+    {
+        return;
+    }
+    cx.set_global(theme);
+}
+
+/// The theme of the settings for the look of the system, whether Sync with OS is on or the
+/// theme was chosen by hand. The first frame of a window shows it without a fade.
+pub fn apply_saved_theme(window: &Window, cx: &mut App) {
+    let appearance = system_appearance(window, cx);
+    remember_appearance(appearance, cx);
+    let Some(settings) = cx.try_global::<Settings>() else {
+        return;
+    };
+    let theme = theme_of(settings, appearance.dark, cx);
+    if cx
+        .try_global::<Theme>()
+        .is_some_and(|current| current.id() == theme.id())
+    {
+        return;
+    }
+    cx.set_global(theme);
+}
+
+/// The theme the settings ask for: the one of the system look while Sync with OS is on,
+/// and the chosen one otherwise. A name this build does not know falls back to the dark
+/// theme of the catalog.
+pub fn theme_of(settings: &Settings, system_dark: bool, cx: &App) -> Theme {
+    let library = ThemeCatalog::library_of(cx);
+    let id = if settings.theme_sync_with_os {
+        settings.theme_for(system_dark)
+    } else if settings.theme.is_empty() {
+        if system_dark { "dark" } else { "light" }
+    } else {
+        settings.theme.as_str()
+    };
+    Theme::from_library(library, id)
+}
+
+/// The appearance a settings change follows: the one the window reported last, or the one
+/// a test put in place.
+pub(crate) fn last_system_appearance(cx: &App) -> Option<SystemAppearance> {
+    current_appearance(cx)
+}
+
 /// The mode of the window. Every mode but `Normal` hides the tool windows, the stripes,
 /// the status bar, the tabs of the editors and the navigation bar of the editor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

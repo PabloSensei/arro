@@ -43,6 +43,7 @@ fn file_icons() -> FileIcons {
         ],
         fallback: "fileTypes/text",
     }
+    .with_languages()
 }
 
 /// What a file is: Java first, then the languages around a project.
@@ -698,11 +699,14 @@ fn main() -> ExitCode {
                 language: java_lang::templates_for(Path::new("Arro.java")),
                 files: java_lang::file_templates(),
             };
-            let database = Arc::new(java_lang::DatabaseSupport::new(
-                launch.root.clone(),
-                project.tool.clone(),
-                project.cache_root.clone(),
-            ));
+            let database = Arc::new(
+                java_lang::DatabaseSupport::new(
+                    launch.root.clone(),
+                    project.tool.clone(),
+                    project.cache_root.clone(),
+                )
+                .with_data_dir(launch.state_dir.clone()),
+            );
             panels::set_database_support(database.clone());
             panels::set_migration_support(database);
             panels::set_jshell_support(Arc::new(java_lang::JShellSupport::new(
@@ -862,7 +866,8 @@ mod tests {
     fn known_extensions_have_icons() {
         let icons = file_icons();
         assert_eq!(icons.icon_for(Path::new("App.java")), "nodes/class");
-        assert_eq!(icons.icon_for(Path::new("notes.md")), "fileTypes/text");
+        assert_eq!(icons.icon_for(Path::new("notes.md")), "fileTypes/markdown");
+        assert_eq!(icons.icon_for(Path::new("notes.log")), "fileTypes/text");
     }
 
     #[test]

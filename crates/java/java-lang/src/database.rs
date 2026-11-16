@@ -8,10 +8,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use database::{Driver, DriverKind, Launch, Suggestion, Support, VendorTemplate};
+use base::Cancel;
+use database::{
+    DownloadProgress, Driver, DriverKind, DriverPackage, Launch, Suggestion, Support,
+    VendorTemplate,
+};
 use project_model::{BuildSystem, Module, ProjectModel, open_project};
 
 use crate::BuildEnv;
+use crate::database_drivers;
 use crate::spring;
 
 /// How often the support looks at the model the build tool is reading.
@@ -27,6 +32,8 @@ const DRIVER_CLASS: &str = "spring.datasource.driver-class-name";
 pub struct DatabaseSupport {
     root: PathBuf,
     cache_root: PathBuf,
+    /// The data folder of the IDE, where the downloaded drivers are kept.
+    data_dir: Option<PathBuf>,
     model: Arc<Mutex<Option<Arc<ProjectModel>>>>,
 }
 
@@ -57,8 +64,16 @@ impl DatabaseSupport {
         Self {
             root,
             cache_root,
+            data_dir: None,
             model,
         }
+    }
+
+    /// The data folder of the IDE. A downloaded driver is kept under
+    /// `<dir>/drivers/<group>/<artifact>/<version>/`, never in the project.
+    pub fn with_data_dir(mut self, dir: PathBuf) -> Self {
+        self.data_dir = Some(dir);
+        self
     }
 
     /// The support of a project whose model the caller has already read: no model
@@ -67,6 +82,7 @@ impl DatabaseSupport {
         Self {
             root,
             cache_root: PathBuf::new(),
+            data_dir: None,
             model: Arc::new(Mutex::new(Some(model))),
         }
     }
@@ -321,6 +337,28 @@ impl Support for DatabaseSupport {
             .arg(classpath)
             .arg("ide.db.Helper"))
     }
+
+    fn packages(&self) -> Vec<DriverPackage> {
+        database_drivers::packages()
+    }
+
+    fn versions(&self, kind: DriverKind) -> Result<Vec<String>, String> {
+        database_drivers::versions(kind)
+    }
+
+    fn download(
+        &self,
+        kind: DriverKind,
+        version: Option<&str>,
+        progress: &DownloadProgress,
+        cancel: &Cancel,
+    ) -> Result<PathBuf, String> {
+        let data_dir = self
+            .data_dir
+            .as_deref()
+            .ok_or_else(|| "The data folder of the IDE is unknown.".to_owned())?;
+        database_drivers::download(kind, version, data_dir, progress, cancel)
+    }
 }
 
 impl DatabaseSupport {
@@ -348,6 +386,7 @@ mod tests {
         let support = DatabaseSupport {
             root: PathBuf::new(),
             cache_root: PathBuf::new(),
+            data_dir: None,
             model: Arc::new(Mutex::new(None)),
         };
 

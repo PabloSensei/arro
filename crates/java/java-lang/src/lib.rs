@@ -4,6 +4,7 @@
 mod beans;
 mod build_scripts;
 mod database;
+mod database_drivers;
 mod debug;
 mod diagram;
 mod doc;

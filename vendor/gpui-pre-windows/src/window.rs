@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-// Modified for Arro by Paweł Januszko, 2026: VK_PACKET input and a frame waker for the frame demand.
-// See NOTICE-ARRO.md in the root of this crate.
+// Modified for Arro by Paweł Januszko, 2026: VK_PACKET input, a frame waker for the frame
+// demand, a zoom that toggles the maximized state, and the interface scale over the DPI
+// scale of the monitor. See NOTICE-ARRO.md in the root of this crate.
 
 use std::{
     cell::{Cell, RefCell},
@@ -52,6 +53,11 @@ pub struct WindowsWindowState {
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
+    /// The DPI scale of the monitor, without the interface scale.
+    pub dpi_scale_factor: Cell<f32>,
+    /// The scale of the interface over the DPI scale: every logical pixel grows by it.
+    pub ui_scale: Cell<f32>,
+    /// The DPI scale of the monitor times the interface scale.
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
@@ -62,6 +68,9 @@ pub struct WindowsWindowState {
     pub pending_surrogate: Cell<Option<u16>>,
     /// A `VK_PACKET` key went down: the character itself arrives in `WM_CHAR`.
     pub packet_key_down: Cell<bool>,
+    /// A shortcut key went down and the window took it as an action: the character the
+    /// same press would put into `WM_CHAR` is not text.
+    pub swallow_char: Cell<bool>,
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
@@ -130,11 +139,13 @@ impl WindowsWindowState {
         invalidate_devices: Arc<AtomicBool>,
         frame_demand: Arc<FrameDemand>,
         draw_coordinator: Rc<DrawCoordinator>,
+        ui_scale: f32,
     ) -> Result<Self> {
-        let scale_factor = {
+        let dpi_scale_factor = {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
             monitor_dpi / USER_DEFAULT_SCREEN_DPI as f32
         };
+        let scale_factor = dpi_scale_factor * ui_scale;
         let origin = logical_point(window_params.x as f32, window_params.y as f32, scale_factor);
         let logical_size = {
             let physical_size = size(
@@ -172,6 +183,8 @@ impl WindowsWindowState {
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            dpi_scale_factor: Cell::new(dpi_scale_factor),
+            ui_scale: Cell::new(ui_scale),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -181,6 +194,7 @@ impl WindowsWindowState {
             ime_enabled: Cell::new(true),
             pending_surrogate: Cell::new(pending_surrogate),
             packet_key_down: Cell::new(false),
+            swallow_char: Cell::new(false),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
@@ -291,6 +305,7 @@ impl WindowsWindowInner {
             context.invalidate_devices.clone(),
             context.frame_demand.clone(),
             context.draw_coordinator.clone(),
+            context.ui_scale,
         )?;
 
         Ok(Rc::new(Self {
@@ -310,6 +325,45 @@ impl WindowsWindowInner {
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
         }))
+    }
+
+    /// Scales the interface of the window without moving it on screen: the DPI scale of
+    /// the monitor stays, and the logical size shrinks as every pixel grows.
+    pub(crate) fn set_ui_scale(&self, ui_scale: f32) {
+        self.state.ui_scale.set(ui_scale);
+        let old_scale = self.state.scale_factor.get();
+        let scale_factor = self.state.dpi_scale_factor.get() * ui_scale;
+        if (scale_factor - old_scale).abs() < f32::EPSILON {
+            return;
+        }
+        // The window stays where it is on screen, so its origin in logical pixels follows
+        // the same ratio as its size.
+        let ratio = old_scale / scale_factor;
+        let origin = self.state.origin.get();
+        self.state.origin.set(point(
+            px(f32::from(origin.x) * ratio),
+            px(f32::from(origin.y) * ratio),
+        ));
+        self.state.scale_factor.set(scale_factor);
+        self.state
+            .direct_manipulation
+            .set_scale_factor(scale_factor);
+        // A minimized window has no client area to resize; its next `WM_SIZE` reads the
+        // new scale factor and lays the restored window out.
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(self.hwnd, &mut rect) }.is_err() {
+            return;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        self.handle_size_change(
+            size(DevicePixels(width), DevicePixels(height)),
+            scale_factor,
+            true,
+        );
     }
 
     fn toggle_fullscreen(self: &Rc<Self>) {
@@ -443,6 +497,7 @@ struct WindowCreateContext {
     invalidate_devices: Arc<AtomicBool>,
     frame_demand: Arc<FrameDemand>,
     draw_coordinator: Rc<DrawCoordinator>,
+    ui_scale: f32,
     parent_hwnd: Option<HWND>,
 }
 
@@ -472,6 +527,7 @@ impl WindowsWindow {
             invalidate_devices,
             frame_demand,
             draw_coordinator,
+            ui_scale,
         } = creation_info;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
@@ -558,6 +614,7 @@ impl WindowsWindow {
             invalidate_devices,
             frame_demand,
             draw_coordinator,
+            ui_scale,
             parent_hwnd,
         };
         let creation_result = unsafe {
@@ -587,8 +644,13 @@ impl WindowsWindow {
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
-        let placement =
-            retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
+        let placement = retrieve_window_placement(
+            hwnd,
+            display,
+            params.bounds,
+            &this.state.border_offset,
+            display.scale_factor() * this.state.ui_scale.get(),
+        )?;
         if params.show {
             let mut placement = placement;
             if !params.focus {
@@ -967,10 +1029,18 @@ impl PlatformWindow for WindowsWindow {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }
 
+    /// Maximizes the window, or gives back the size it had before, as the platform of
+    /// Linux and macOS does for the same call. A double click on the title bar of a
+    /// window toggles the window with it.
     fn zoom(&self) {
         unsafe {
             if IsWindowVisible(self.0.hwnd).as_bool() {
-                ShowWindowAsync(self.0.hwnd, SW_MAXIMIZE).ok().log_err();
+                let command = if IsZoomed(self.0.hwnd).as_bool() {
+                    SW_RESTORE
+                } else {
+                    SW_MAXIMIZE
+                };
+                ShowWindowAsync(self.0.hwnd, command).ok().log_err();
             } else if let Some(mut status) = self.state.initial_placement.take() {
                 status.state = WindowOpenState::Maximized;
                 self.state.initial_placement.set(Some(status));
@@ -1600,26 +1670,48 @@ fn retrieve_window_placement(
     display: WindowsDisplay,
     initial_bounds: Bounds<Pixels>,
     border_offset: &WindowBorderOffset,
+    scale_factor: f32,
 ) -> Result<WINDOWPLACEMENT> {
     let mut placement = WINDOWPLACEMENT {
         length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
         ..Default::default()
     };
     unsafe { GetWindowPlacement(hwnd, &mut placement)? };
+    // The saved bounds are in the logical pixels of a window, where the interface scale
+    // made a pixel larger, while the display of the check speaks in its own logical
+    // pixels: the centre of the window needs the interface scale to land on the right
+    // monitor, and the default bounds of the display need it to keep the size on screen.
+    let ui_scale = (scale_factor / display.scale_factor()).max(0.01);
+    let center = initial_bounds.center();
+    let probe = Bounds::new(
+        point(
+            px(f32::from(center.x) * ui_scale),
+            px(f32::from(center.y) * ui_scale),
+        ),
+        initial_bounds.size,
+    );
     // the bounds may be not inside the display
-    let bounds = if display.check_given_bounds(initial_bounds) {
+    let bounds = if display.check_given_bounds(probe) {
         initial_bounds
     } else {
-        display.default_bounds()
+        let default = display.default_bounds();
+        Bounds::new(
+            point(default.left() / ui_scale, default.top() / ui_scale),
+            size(
+                default.size.width / ui_scale,
+                default.size.height / ui_scale,
+            ),
+        )
     };
-    // `bounds` is expressed in logical pixels for `display`, so it must be converted
-    // to device pixels using that display's own scale factor. The window's current
-    // scale factor can't be used here: `CreateWindowExW` was called with
-    // `CW_USEDEFAULT`, so at this point the window may still be sitting on whichever
-    // monitor Windows picked by default, which can have a different DPI than `display`
-    // and would otherwise throw off the physical position (e.g. leaving the window
-    // partially off-screen when moved to a monitor with a different scale factor).
-    let bounds = bounds.to_device_pixels(display.scale_factor());
+    // `bounds` is expressed in logical pixels of a window, where the interface scale
+    // already grew a pixel, so it must be converted to device pixels with the DPI scale
+    // of `display` times that interface scale. The window's current scale factor can't
+    // stand in: `CreateWindowExW` was called with `CW_USEDEFAULT`, so at this point the
+    // window may still be sitting on whichever monitor Windows picked by default, which
+    // can have a different DPI than `display` and would otherwise throw off the physical
+    // position (e.g. leaving the window partially off-screen when moved to a monitor
+    // with a different scale factor).
+    let bounds = bounds.to_device_pixels(scale_factor);
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
 }

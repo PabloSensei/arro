@@ -8,14 +8,15 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ::base::Cancel;
 use database::{
-    Column, Command, Dialect, Driver, DriverKind, Event, MAX_RESULT_BYTES, MAX_RESULT_ROWS,
-    ResultSet, Secret, Session, Source, SourceId, SourceStore, Suggestion, Support, Table, Value,
-    VendorTemplate,
+    Column, Command, Dialect, DownloadProgress, Driver, DriverKind, Event, MAX_RESULT_BYTES,
+    MAX_RESULT_ROWS, PasswordStore, ResultSet, Secret, Session, Source, SourceId, SourceStore,
+    Suggestion, Support, SystemPasswords, Table, Value, VendorTemplate,
 };
 use editor_view::{EditorView, RunFiles};
 use lang_api::{
@@ -43,6 +44,66 @@ impl Global for DatabaseConsoleRoot {}
 
 /// The support the application gave before the window was built.
 static SUPPORT: Mutex<Option<Arc<dyn Support>>> = Mutex::new(None);
+
+/// The store of source passwords, put in place before the window is built. A window test
+/// gives its own store, so no test writes the password of a user.
+pub struct ActivePasswords(pub Arc<dyn PasswordStore>);
+
+impl Global for ActivePasswords {}
+
+/// Whether the machine has a store of passwords, as the window learned it in the
+/// background. The reason of a missing store is the text the store gave.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Secrets {
+    #[default]
+    Checking,
+    Ready,
+    Unavailable(String),
+}
+
+impl Secrets {
+    fn ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// The order of the write jobs of the password store. The background calls of one source
+/// take the gate one at a time, and a job whose source already has a later job leaves the
+/// entry to it: a password written by an add cannot come back after the remove that
+/// followed it.
+#[derive(Default)]
+struct PasswordJobs {
+    next: AtomicU64,
+    /// The last job of each source.
+    latest: Mutex<HashMap<SourceId, u64>>,
+    /// One write of the store at a time.
+    gate: Mutex<()>,
+}
+
+impl PasswordJobs {
+    fn begin(&self, source: &SourceId) -> u64 {
+        let serial = self.next.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if let Ok(mut latest) = self.latest.lock() {
+            latest.insert(source.clone(), serial);
+        }
+        serial
+    }
+
+    fn is_latest(&self, source: &SourceId, serial: u64) -> bool {
+        self.latest
+            .lock()
+            .ok()
+            .and_then(|latest| latest.get(source).copied())
+            == Some(serial)
+    }
+}
 
 /// Puts the language side of the window in place. The application calls it before it opens
 /// the project, so no file of the project or of the language is read here.
@@ -80,6 +141,8 @@ pub fn migration_support() -> Option<Arc<dyn MigrationSupport>> {
 
 /// How often the window reads the events of its helpers.
 const POLL: Duration = Duration::from_millis(50);
+/// How often the window reads the bytes of a driver download.
+const DOWNLOAD_TICK: Duration = Duration::from_millis(100);
 /// The width of a cell of the result grid.
 const CELL_WIDTH: f32 = 160.;
 /// The width of the tree.
@@ -95,6 +158,7 @@ enum Field {
     User,
     Password,
     Driver,
+    Version,
 }
 
 impl Field {
@@ -104,12 +168,14 @@ impl Field {
             Self::Url => Self::User,
             Self::User => Self::Password,
             Self::Password => Self::Driver,
-            Self::Driver => Self::Name,
+            Self::Driver => Self::Version,
+            Self::Version => Self::Name,
         }
     }
 }
 
-/// The form behind `+`, kept in the memory of the window: the password is never written.
+/// The form behind `+`, kept in the memory of the window: the password reaches the store
+/// of the system only when `save_password` is on.
 struct Dialog {
     kind: DriverKind,
     module: Option<String>,
@@ -118,11 +184,25 @@ struct Dialog {
     user: TextField,
     password: TextField,
     driver: TextField,
+    /// The version of the driver to download; the newest stable one fills it when the
+    /// list of the repository arrives.
+    version: TextField,
+    /// The stable versions the repository offers, newest first.
+    versions: Vec<String>,
+    /// The kind whose versions the list holds, so an answer for another kind is dropped.
+    versions_for: Option<DriverKind>,
+    /// A request for the versions of the kind is in flight.
+    versions_loading: bool,
+    /// Why the versions could not be read, when they were not.
+    versions_error: Option<String>,
+    /// Why the last download of the form failed.
+    driver_error: Option<String>,
     field: Field,
+    save_password: bool,
 }
 
 impl Dialog {
-    fn new(kind: DriverKind, vendors: &[VendorTemplate]) -> Self {
+    fn new(kind: DriverKind, vendors: &[VendorTemplate], save_password: bool) -> Self {
         let mut dialog = Self {
             kind,
             module: None,
@@ -131,7 +211,14 @@ impl Dialog {
             user: TextField::default(),
             password: TextField::default(),
             driver: TextField::default(),
+            version: TextField::default(),
+            versions: Vec::new(),
+            versions_for: None,
+            versions_loading: false,
+            versions_error: None,
+            driver_error: None,
             field: Field::Url,
+            save_password,
         };
         dialog.template(vendors);
         dialog
@@ -160,6 +247,7 @@ impl Dialog {
             Field::User => &mut self.user,
             Field::Password => &mut self.password,
             Field::Driver => &mut self.driver,
+            Field::Version => &mut self.version,
         }
     }
 }
@@ -239,10 +327,32 @@ struct Scripted {
     commands: Arc<Mutex<Vec<ScriptedCommand>>>,
 }
 
+/// The answer of a download: the version and the jar, or the reason it failed.
+type DownloadAnswer = Result<(String, PathBuf), String>;
+
+/// A driver download in flight. The window shows its bytes each tick and stops it on
+/// request; the work itself is on a background thread and never waits for a frame.
+struct DriverDownload {
+    /// The source that waits for the driver; `None` for the form.
+    source: Option<SourceId>,
+    /// The form gets the file in its driver field.
+    form: bool,
+    kind: DriverKind,
+    /// What the button asked for; `None` is the newest stable version.
+    version: Option<String>,
+    progress: Arc<DownloadProgress>,
+    cancel: Cancel,
+    /// The version and the jar of a finished download, or the reason it failed.
+    result: Arc<Mutex<Option<DownloadAnswer>>>,
+}
+
 pub struct DatabasePanel {
     workspace: WeakEntity<Workspace>,
     state_dir: PathBuf,
     focus: FocusHandle,
+    /// The language side of the window: its drivers, the drivers of the project and the
+    /// download of a driver.
+    support: Option<Arc<dyn Support>>,
     sources: Vec<Source>,
     suggestions: Vec<Suggestion>,
     drivers: Vec<Driver>,
@@ -261,13 +371,26 @@ pub struct DatabasePanel {
     quotes: HashMap<SourceId, String>,
     sessions: HashMap<SourceId, Session>,
     query_ids: HashMap<SourceId, u64>,
+    /// The connect commands the helper has not answered yet.
+    connect_ids: HashMap<SourceId, u64>,
+    /// The sources whose driver the helper could not load, so the window offers the
+    /// download even when a jar is present.
+    driver_failed: HashSet<SourceId>,
     queue: VecDeque<(SourceId, String, Option<usize>)>,
     next_id: u64,
     passwords: HashMap<SourceId, Secret>,
     password: TextField,
     password_field: bool,
+    /// The store of the passwords of the sources, of the machine or of a window test.
+    password_store: Arc<dyn PasswordStore>,
+    /// The order of the write jobs of the store.
+    password_jobs: Arc<PasswordJobs>,
+    /// What the window learned about the store when it was built.
+    secrets: Secrets,
     status: Option<String>,
     dialog: Option<Dialog>,
+    /// The download of a driver that is in flight, if any.
+    driver_download: Option<DriverDownload>,
     /// The migration files of the project, the checks over them and the actions of their
     /// build plugin.
     migrations: MigrationModel,
@@ -308,10 +431,15 @@ impl DatabasePanel {
         cx: &mut App,
     ) -> Entity<Self> {
         let panel = cx.new(|cx| {
+            let password_store: Arc<dyn PasswordStore> = cx
+                .try_global::<ActivePasswords>()
+                .map(|active| active.0.clone())
+                .unwrap_or_else(|| Arc::new(SystemPasswords));
             let mut panel = Self {
                 workspace,
                 state_dir: state_dir.clone(),
                 focus: cx.focus_handle(),
+                support: support(),
                 sources: Vec::new(),
                 suggestions: Vec::new(),
                 drivers: Vec::new(),
@@ -329,13 +457,19 @@ impl DatabasePanel {
                 quotes: HashMap::new(),
                 sessions: HashMap::new(),
                 query_ids: HashMap::new(),
+                connect_ids: HashMap::new(),
+                driver_failed: HashSet::new(),
                 queue: VecDeque::new(),
                 next_id: 1,
                 passwords: HashMap::new(),
                 password: TextField::default(),
                 password_field: false,
+                password_store,
+                password_jobs: Arc::new(PasswordJobs::default()),
+                secrets: Secrets::Checking,
                 status: None,
                 dialog: None,
+                driver_download: None,
                 migrations: MigrationModel::default(),
                 migrations_open: true,
                 history_read: false,
@@ -358,6 +492,7 @@ impl DatabasePanel {
             panel.load_sources(cx);
             panel.load_migrations(cx);
             panel.refresh_catalog();
+            panel.check_passwords(cx);
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -666,6 +801,71 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    /// The language side of the window, for the window tests: the application puts one
+    /// in place before the window is built, a test after that.
+    #[cfg(test)]
+    pub(crate) fn set_support_for_test(&mut self, support: Arc<dyn Support>) {
+        self.support = Some(support);
+    }
+
+    /// The message of the driver notice of the selected source, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn driver_message_for_test(&self) -> Option<String> {
+        let source = self.selected_source()?;
+        (self.driver_missing(source) || self.driver_failed.contains(&source.id))
+            .then(|| driver_message(source))
+    }
+
+    /// The version of the driver in the open form, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn dialog_version_for_test(&self) -> Option<String> {
+        self.dialog
+            .as_ref()
+            .map(|dialog| dialog.version.text.trim().to_owned())
+            .filter(|version| !version.is_empty())
+    }
+
+    /// Whether the store of passwords of the test is ready, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn password_storage_ready_for_test(&self) -> bool {
+        self.secrets.ready()
+    }
+
+    /// The reason the store of passwords is off, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn password_storage_reason_for_test(&self) -> Option<String> {
+        self.secrets.reason().map(str::to_owned)
+    }
+
+    /// Whether the window holds the password of a source in memory, for the window
+    /// tests: a password read from the store is in place before a connection starts.
+    #[cfg(test)]
+    pub(crate) fn has_cached_password_for_test(&self, source: &SourceId) -> bool {
+        self.passwords.contains_key(source)
+    }
+
+    /// The password the window holds in memory, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn cached_password_for_test(&self, source: &SourceId) -> Option<String> {
+        self.passwords
+            .get(source)
+            .map(|password| password.expose().to_owned())
+    }
+
+    /// The Save password flag of the open form, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn dialog_save_password_for_test(&self) -> Option<bool> {
+        self.dialog.as_ref().map(|dialog| dialog.save_password)
+    }
+
+    /// The sources and the selected one, without a connection, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn sources_for_test(&mut self, sources: Vec<Source>, cx: &mut Context<Self>) {
+        self.selected = sources.first().map(|source| source.id.clone());
+        self.sources = sources;
+        cx.notify();
+    }
+
     /// The answers of a scripted connection, as the helper sends them, for the window
     /// tests.
     #[cfg(test)]
@@ -739,11 +939,23 @@ impl DatabasePanel {
 
     /// The application puts the sources, the drivers and the suggestions in place.
     fn refresh_catalog(&mut self) {
-        let Some(support) = support() else {
+        if self.support.is_none() {
+            self.support = support();
+        }
+        let Some(support) = self.support.as_ref() else {
             return;
         };
         self.drivers = support.drivers();
         self.suggestions = support.suggestions();
+    }
+
+    /// The package of a driver the language layer can download, when it has one.
+    fn package_of(&self, kind: DriverKind) -> Option<database::DriverPackage> {
+        self.support
+            .as_ref()?
+            .packages()
+            .into_iter()
+            .find(|package| package.kind == kind)
     }
 
     fn load_sources(&mut self, cx: &mut Context<Self>) {
@@ -775,6 +987,82 @@ impl DatabasePanel {
             .spawn(async move { store.save(&directory) });
         cx.spawn(async move |_, _| {
             let _ = job.await;
+        })
+        .detach();
+    }
+
+    /// Asks the store of the machine whether it can keep passwords, in the background:
+    /// the answer turns the Save password flag of the form on or gives the reason it is
+    /// off.
+    fn check_passwords(&mut self, cx: &mut Context<Self>) {
+        let store = self.password_store.clone();
+        let job = cx
+            .background_executor()
+            .spawn(async move { store.available() });
+        cx.spawn(async move |this, cx| {
+            let answer = job.await;
+            this.update(cx, |this, cx| {
+                this.secrets = match answer {
+                    Ok(()) => Secrets::Ready,
+                    Err(reason) => Secrets::Unavailable(reason),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Writes the password of a source to the store of the system, in the background.
+    fn remember_password(&self, source: &Source, password: Secret, cx: &mut Context<Self>) {
+        let serial = self.password_jobs.begin(&source.id);
+        let jobs = self.password_jobs.clone();
+        let id = source.id.clone();
+        let service = database::service_of(&source.id);
+        let account = source.user.clone();
+        let store = self.password_store.clone();
+        let job = cx.background_executor().spawn(async move {
+            let _gate = jobs.gate.lock().unwrap_or_else(|error| error.into_inner());
+            if !jobs.is_latest(&id, serial) {
+                return Ok(());
+            }
+            store.store(&service, &account, &password)
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = job.await {
+                this.update(cx, |this, cx| {
+                    this.status = Some(format!("The password is not saved: {error}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Removes the password of a source from the store of the system, in the background.
+    fn forget_password(&self, source: &Source, cx: &mut Context<Self>) {
+        let serial = self.password_jobs.begin(&source.id);
+        let jobs = self.password_jobs.clone();
+        let id = source.id.clone();
+        let service = database::service_of(&source.id);
+        let account = source.user.clone();
+        let store = self.password_store.clone();
+        let job = cx.background_executor().spawn(async move {
+            let _gate = jobs.gate.lock().unwrap_or_else(|error| error.into_inner());
+            if !jobs.is_latest(&id, serial) {
+                return Ok(());
+            }
+            store.delete(&service, &account)
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = job.await {
+                this.update(cx, |this, cx| {
+                    this.status = Some(format!("The password is not removed: {error}"));
+                    cx.notify();
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -863,6 +1151,8 @@ impl DatabasePanel {
                 auto_commit,
                 quote,
             } => {
+                self.connect_ids.remove(&source);
+                self.driver_failed.remove(&source);
                 self.auto_commit = auto_commit;
                 self.quotes.insert(source.clone(), quote);
                 self.status = Some(format!("Connected to {product}"));
@@ -921,6 +1211,21 @@ impl DatabasePanel {
                 cancelled,
                 ..
             } => {
+                if self.connect_ids.get(&source) == Some(&id) {
+                    // The helper answered the connect command: the driver or the database
+                    // refused it. The text of the driver is the reason the user needs.
+                    self.connect_ids.remove(&source);
+                    self.errors
+                        .insert(source.clone(), format!("The connection failed: {message}"));
+                    if driver_refused(&message) {
+                        self.driver_failed.insert(source.clone());
+                    }
+                    // The helper has no connection of its own; the next attempt starts a
+                    // fresh one, with the driver the user may download in between.
+                    self.sessions.remove(&source);
+                    cx.notify();
+                    return;
+                }
                 if self.query_ids.get(&source) == Some(&id) {
                     self.query_ids.remove(&source);
                     let text = if cancelled {
@@ -960,10 +1265,20 @@ impl DatabasePanel {
                 cx.notify();
             }
             Event::Exited { .. } => {
+                // A helper that never answered leaves its reason on the error stream; a
+                // generic "the helper ended" hides the driver class or the server the
+                // user has to fix.
+                let reason = self
+                    .sessions
+                    .get(&source)
+                    .and_then(|session| database::explain_output(&session.output_tail()));
                 self.sessions.remove(&source);
+                self.connect_ids.remove(&source);
                 self.errors.insert(
                     source,
-                    "The helper has ended; connect the source again.".into(),
+                    reason.unwrap_or_else(|| {
+                        "The helper has ended; connect the source again.".into()
+                    }),
                 );
                 cx.notify();
             }
@@ -1066,20 +1381,26 @@ impl DatabasePanel {
             .collect()
     }
 
+    /// Whether the source has no driver the helper could load: no jar at all, or a jar
+    /// that is no longer on the disk. The window then offers the download before it
+    /// starts a helper that cannot connect.
+    fn driver_missing(&self, source: &Source) -> bool {
+        let jars = self.jars_of(source);
+        jars.is_empty() || jars.iter().any(|jar| !jar.is_file())
+    }
+
     fn connect_source(&mut self, source: Source, password: Secret, cx: &mut Context<Self>) {
         if self.sessions.contains_key(&source.id) || self.scripted.is_some() {
             return;
         }
-        let jars = self.jars_of(&source);
-        if jars.is_empty() {
-            self.errors.insert(
-                source.id.clone(),
-                "No driver in the dependencies of the project; add one or choose its jar.".into(),
-            );
+        if self.driver_missing(&source) {
+            // The notice above the result already names the product and offers the
+            // download; a helper started without a driver could only fail.
             cx.notify();
             return;
         }
-        let Some(support) = support() else {
+        let jars = self.jars_of(&source);
+        let Some(support) = self.support.clone().or_else(support) else {
             self.errors.insert(
                 source.id.clone(),
                 "The language support of the Database window is not ready.".into(),
@@ -1088,6 +1409,7 @@ impl DatabasePanel {
             return;
         };
         let id = self.next();
+        self.connect_ids.insert(source.id.clone(), id);
         self.status = Some("Connecting…".into());
         let requested = source.clone();
         let job = cx.background_executor().spawn(async move {
@@ -1115,6 +1437,7 @@ impl DatabasePanel {
                         this.ensure_poll(cx);
                     }
                     Err(error) => {
+                        this.connect_ids.remove(&source.id);
                         this.errors.insert(source.id.clone(), error);
                     }
                 }
@@ -1125,15 +1448,268 @@ impl DatabasePanel {
         .detach();
     }
 
+    /// Reads the stable versions of the driver of the form in the background, so the
+    /// field shows one and the user may pick another.
+    fn load_versions(&mut self, cx: &mut Context<Self>) {
+        let Some(support) = self.support.clone() else {
+            return;
+        };
+        let Some(kind) = self.dialog.as_ref().map(|dialog| dialog.kind) else {
+            return;
+        };
+        if self.package_of(kind).is_none() {
+            if let Some(dialog) = &mut self.dialog
+                && dialog.kind == kind
+            {
+                dialog.versions.clear();
+                dialog.versions_for = None;
+                dialog.versions_error = None;
+            }
+            return;
+        }
+        let Some(dialog) = &mut self.dialog else {
+            return;
+        };
+        if dialog.versions_loading || dialog.versions_for == Some(kind) {
+            return;
+        }
+        dialog.versions_loading = true;
+        dialog.versions_for = Some(kind);
+        dialog.versions.clear();
+        dialog.versions_error = None;
+        let job = cx
+            .background_executor()
+            .spawn(async move { support.versions(kind) });
+        cx.spawn(async move |this, cx| {
+            let answer = job.await;
+            this.update(cx, |this, cx| {
+                let Some(dialog) = &mut this.dialog else {
+                    return;
+                };
+                if dialog.kind != kind {
+                    return;
+                }
+                dialog.versions_loading = false;
+                match answer {
+                    Ok(versions) => {
+                        if dialog.version.text.trim().is_empty()
+                            && let Some(newest) = versions.first()
+                        {
+                            dialog.version = TextField::from_text(newest.clone());
+                        }
+                        dialog.versions = versions;
+                    }
+                    Err(reason) => dialog.versions_error = Some(reason),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Downloads the driver of the source, or of the form when `form` is set. The work
+    /// is on a background thread; the window shows its bytes and stops it on request.
+    fn start_download(
+        &mut self,
+        source: Option<SourceId>,
+        form: bool,
+        version: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.driver_download.is_some() {
+            return;
+        }
+        let kind = if form {
+            self.dialog.as_ref().map(|dialog| dialog.kind)
+        } else {
+            source
+                .as_ref()
+                .and_then(|source| self.sources.iter().find(|known| &known.id == source))
+                .map(|source| source.kind)
+        };
+        let Some(kind) = kind else {
+            return;
+        };
+        let Some(support) = self.support.clone().or_else(support) else {
+            self.status = Some("The language support of the Database window is not ready.".into());
+            cx.notify();
+            return;
+        };
+        if self.package_of(kind).is_none() {
+            self.status = Some(format!("No {} driver can be downloaded.", kind.title()));
+            cx.notify();
+            return;
+        }
+        if form && let Some(dialog) = &mut self.dialog {
+            dialog.driver_error = None;
+        }
+        let progress = Arc::new(DownloadProgress::new());
+        let cancel = Cancel::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let result = Arc::new(Mutex::new(None));
+        let requested = version.clone();
+        let job_progress = progress.clone();
+        let job_cancel = cancel.clone();
+        let job_done = done.clone();
+        let job_result = result.clone();
+        let watch_done = done.clone();
+        self.driver_download = Some(DriverDownload {
+            source,
+            form,
+            kind,
+            version,
+            progress,
+            cancel,
+            result,
+        });
+        // The cancel token stops the transfer; the task is detached because the window
+        // watches the flag rather than the task.
+        cx.background_executor()
+            .spawn(async move {
+                let answer = support
+                    .download(kind, requested.as_deref(), &job_progress, &job_cancel)
+                    .map(|jar| {
+                        let version = requested
+                            .or_else(|| {
+                                jar.parent()
+                                    .and_then(|parent| parent.file_name())
+                                    .and_then(|name| name.to_str())
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_default();
+                        (version, jar)
+                    });
+                if let Ok(mut slot) = job_result.lock() {
+                    *slot = Some(answer);
+                }
+                job_done.store(true, Ordering::Release);
+            })
+            .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(DOWNLOAD_TICK).await;
+                let finished = watch_done.load(Ordering::Acquire);
+                let keep = this.update(cx, |this, cx| {
+                    if finished {
+                        this.finish_download(cx);
+                    } else {
+                        cx.notify();
+                    }
+                    this.driver_download.is_some()
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Puts the answer of a finished download in its source or its form.
+    fn finish_download(&mut self, cx: &mut Context<Self>) {
+        let Some(run) = self.driver_download.take() else {
+            return;
+        };
+        let answer = run.result.lock().ok().and_then(|mut slot| slot.take());
+        match answer {
+            Some(Ok((version, jar))) => {
+                if let Some(id) = &run.source {
+                    if let Some(source) = self.sources.iter_mut().find(|source| &source.id == id) {
+                        source.driver_jar = Some(jar.clone());
+                    }
+                    self.errors.remove(id);
+                    self.driver_failed.remove(id);
+                    self.save_sources(cx);
+                    // A source that waited for its driver goes on to the helper as soon
+                    // as the file is in place.
+                    let password = self
+                        .passwords
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| Secret::new(""));
+                    if let Some(source) =
+                        self.sources.iter().find(|source| &source.id == id).cloned()
+                    {
+                        self.connect_source(source, password, cx);
+                    }
+                }
+                if run.form
+                    && let Some(dialog) = &mut self.dialog
+                {
+                    dialog.version = TextField::from_text(version);
+                    dialog.driver = TextField::from_text(jar.display().to_string());
+                    dialog.driver_error = None;
+                }
+                self.status = Some("The driver is downloaded.".to_owned());
+            }
+            Some(Err(error)) => {
+                if let Some(id) = &run.source {
+                    self.errors.insert(id.clone(), error.clone());
+                }
+                if run.form
+                    && let Some(dialog) = &mut self.dialog
+                {
+                    dialog.driver_error = Some(error.clone());
+                }
+                self.status = Some(error);
+            }
+            None => {
+                let message = "The download ended without a file.".to_owned();
+                if let Some(id) = run.source {
+                    self.errors.insert(id, message.clone());
+                }
+                self.status = Some(message);
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_download(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = &self.driver_download {
+            run.cancel.cancel();
+            self.status = Some("Stopping the download…".into());
+            cx.notify();
+        }
+    }
+
     fn disconnect(&mut self, source: SourceId, cx: &mut Context<Self>) {
         self.sessions.remove(&source);
         self.query_ids.remove(&source);
+        self.connect_ids.remove(&source);
         self.quotes.remove(&source);
         self.schema_loading.remove(&source);
         self.history_queue.clear();
         self.history_pending = None;
         self.history_collected.clear();
         self.history_read = false;
+        cx.notify();
+    }
+
+    /// Removes a source from the project and its password from the store of the system.
+    /// The console file stays where it is: it holds the statements of the user, which
+    /// removing a connection does not throw away.
+    pub(crate) fn remove_source(&mut self, source: SourceId, cx: &mut Context<Self>) {
+        let Some(index) = self.sources.iter().position(|known| known.id == source) else {
+            return;
+        };
+        let removed = self.sources.remove(index);
+        self.disconnect(source.clone(), cx);
+        self.tables.remove(&source);
+        self.errors.remove(&source);
+        self.driver_failed.remove(&source);
+        self.expanded.retain(|(known, _, _)| known != &source);
+        self.passwords.remove(&source);
+        if self.selected.as_ref() == Some(&source) {
+            self.selected = self
+                .sources
+                .get(index.min(self.sources.len().saturating_sub(1)))
+                .map(|next| next.id.clone());
+        }
+        self.save_sources(cx);
+        if self.secrets.ready() {
+            self.forget_password(&removed, cx);
+        }
         cx.notify();
     }
 
@@ -1301,6 +1877,33 @@ impl DatabasePanel {
                     }),
                 );
             }
+        });
+    }
+
+    /// The menu of a source in the tree: its console, or its removal with its password.
+    fn source_menu(&mut self, source: Source, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let panel = cx.entity();
+        let console = panel.clone();
+        let console_source = source.id.clone();
+        let remove = panel;
+        let remove_source = source.id.clone();
+        let entries = vec![
+            MenuEntry::new("Open Console", move |window, cx| {
+                console.update(cx, |panel, cx| {
+                    panel.open_console(console_source.clone(), window, cx)
+                });
+            }),
+            MenuEntry::new("Remove", move |_, cx| {
+                remove.update(cx, |panel, cx| {
+                    panel.remove_source(remove_source.clone(), cx)
+                });
+            }),
+        ];
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_menu(position, entries, cx)
         });
     }
 
@@ -1664,13 +2267,23 @@ impl DatabasePanel {
             module: dialog.module,
             driver_jar: (!driver.is_empty()).then(|| PathBuf::from(driver)),
         };
-        if !dialog.password.text.is_empty() {
-            self.passwords
-                .insert(id.clone(), Secret::new(dialog.password.text.clone()));
+        let entered = Secret::new(dialog.password.text.clone());
+        if !entered.expose().is_empty() {
+            self.passwords.insert(id.clone(), entered.clone());
         }
+        let save = dialog.save_password && self.secrets.ready();
         self.sources.push(source.clone());
         self.selected = Some(id.clone());
         self.save_sources(cx);
+        if self.secrets.ready() {
+            if save && !entered.expose().is_empty() {
+                self.remember_password(&source, entered, cx);
+            } else {
+                // The flag is off, or the password was cleared: the old entry of the
+                // store must not come back on the next connection.
+                self.forget_password(&source, cx);
+            }
+        }
         let password = self
             .passwords
             .get(&id)
@@ -1695,12 +2308,49 @@ impl DatabasePanel {
             return;
         };
         self.refresh_catalog();
-        let password = self
-            .passwords
-            .get(&source.id)
-            .cloned()
-            .unwrap_or_else(|| Secret::new(self.password.text.clone()));
-        self.connect_source(source, password, cx);
+        if let Some(password) = self.passwords.get(&source.id).cloned() {
+            self.connect_source(source, password, cx);
+            return;
+        }
+        // The field of the toolbar is the question about the password, as it always was:
+        // what the user typed there wins over the store.
+        if !self.password.text.is_empty() {
+            let password = Secret::new(self.password.text.clone());
+            self.connect_source(source, password, cx);
+            return;
+        }
+        if !self.secrets.ready() {
+            self.connect_source(source, Secret::new(""), cx);
+            return;
+        }
+        let service = database::service_of(&source.id);
+        let account = source.user.clone();
+        let store = self.password_store.clone();
+        let jobs = self.password_jobs.clone();
+        let job = cx.background_executor().spawn(async move {
+            let _gate = jobs.gate.lock().unwrap_or_else(|error| error.into_inner());
+            store.load(&service, &account)
+        });
+        cx.spawn(async move |this, cx| {
+            let password = job.await;
+            this.update(cx, |this, cx| {
+                // The source may have gone while the store was read.
+                if !this.sources.iter().any(|known| known.id == source.id) {
+                    return;
+                }
+                match password {
+                    Some(password) => {
+                        this.passwords.insert(source.id.clone(), password.clone());
+                        this.connect_source(source, password, cx);
+                    }
+                    // Nothing is stored: the empty field asks for the password the way
+                    // it did before the store existed.
+                    None => this.connect_source(source, Secret::new(""), cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn copy_cell(&mut self, cx: &mut Context<Self>) {
@@ -1802,6 +2452,7 @@ impl DatabasePanel {
         for source in &self.sources {
             let selected = self.selected.as_ref() == Some(&source.id);
             let id = source.id.clone();
+            let menu_source = source.clone();
             let connected = self.sessions.contains_key(&source.id);
             rows.push(
                 div()
@@ -1830,6 +2481,13 @@ impl DatabasePanel {
                             .child(if connected { "●" } else { "○" }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.select(menu_source.id.clone(), cx);
+                            this.source_menu(menu_source.clone(), event.position, cx);
+                        }),
+                    )
                     .into_any_element(),
             );
             if !selected {
@@ -2239,6 +2897,91 @@ impl DatabasePanel {
         .into_any_element()
     }
 
+    /// The error of the selected source and, when it has no driver, the way to download
+    /// one: the message names the product before a helper would start without its driver.
+    fn notice(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selected = self.selected.clone()?;
+        let source = self
+            .sources
+            .iter()
+            .find(|source| source.id == selected)
+            .cloned()?;
+        let error = self.errors.get(&selected).cloned();
+        let missing = self.driver_missing(&source) || self.driver_failed.contains(&selected);
+        if error.is_none() && !missing {
+            return None;
+        }
+        let mut block = div().flex().flex_col().gap(px(SPACE_XS)).p(px(SPACE_S));
+        if let Some(error) = error {
+            block = block.child(
+                div()
+                    .debug_selector(|| "database-error".to_owned())
+                    .text_color(theme.stripe_error)
+                    .child(error),
+            );
+        }
+        if missing {
+            let running = self
+                .driver_download
+                .as_ref()
+                .is_some_and(|run| run.source.as_ref() == Some(&selected));
+            let mut line = div().flex().items_center().gap(px(SPACE_S));
+            if running {
+                if let Some(run) = &self.driver_download {
+                    line = line.child(
+                        div()
+                            .debug_selector(|| "database-download-progress".to_owned())
+                            .text_color(theme.text_muted)
+                            .child(download_text(run)),
+                    );
+                }
+                line = line.child(
+                    small_button("database-download-cancel", "Cancel", theme)
+                        .debug_selector(|| "database-download-cancel".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_download(cx))),
+                );
+            } else if let Some(package) = self.package_of(source.kind) {
+                let id = selected.clone();
+                line = line.child(
+                    small_button("database-download-driver", "Download driver", theme)
+                        .debug_selector(|| "database-download-driver".to_owned())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.start_download(Some(id.clone()), false, None, cx)
+                        })),
+                );
+                line = line.child(
+                    div()
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_muted)
+                        .child(format!(
+                            "{} · {} · {}",
+                            package.coordinate, package.license, package.repository
+                        )),
+                );
+            } else {
+                line = line.child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .child("This product has no download."),
+                );
+            }
+            block = block.child(
+                div()
+                    .debug_selector(|| "database-driver-missing".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_XS))
+                    .child(
+                        div()
+                            .text_color(theme.stripe_error)
+                            .child(driver_message(&source)),
+                    )
+                    .child(line),
+            );
+        }
+        Some(block.into_any_element())
+    }
+
     fn dialog(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(dialog) = &self.dialog else {
             return div().into_any_element();
@@ -2248,7 +2991,8 @@ impl DatabasePanel {
             .unwrap_or_default();
         let suggestions = self.suggestions.clone();
         let kind = dialog.kind;
-        let fields = [
+        let package = self.package_of(kind);
+        let mut fields = vec![
             (Field::Name, "Name", dialog.name.text.clone(), false),
             (Field::Url, "Address", dialog.url.text.clone(), false),
             (Field::User, "User", dialog.user.text.clone(), false),
@@ -2265,7 +3009,23 @@ impl DatabasePanel {
                 false,
             ),
         ];
+        if package.is_some() {
+            fields.push((
+                Field::Version,
+                "Driver version",
+                dialog.version.text.clone(),
+                false,
+            ));
+        }
         let focused = dialog.field;
+        let version_text = dialog.version.text.trim().to_owned();
+        let versions = dialog.versions.clone();
+        let versions_loading = dialog.versions_loading;
+        let versions_error = dialog.versions_error.clone();
+        let driver_error = dialog.driver_error.clone();
+        let storage_ready = self.secrets.ready();
+        let storage_reason = self.secrets.reason().map(str::to_owned);
+        let save_password = dialog.save_password && storage_ready;
         let mut body = div()
             .flex()
             .flex_col()
@@ -2308,6 +3068,9 @@ impl DatabasePanel {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(dialog) = &mut this.dialog {
                         dialog.kind = vendor_kind;
+                        dialog.versions.clear();
+                        dialog.versions_for = None;
+                        dialog.versions_error = None;
                         let url = vendor_template
                             .replace("{host}", &host)
                             .replace(
@@ -2318,6 +3081,7 @@ impl DatabasePanel {
                             .replace("{file}", "~/test");
                         dialog.url = TextField::from_text(url);
                     }
+                    this.load_versions(cx);
                     cx.notify();
                 })),
             );
@@ -2384,6 +3148,33 @@ impl DatabasePanel {
                     .child(value),
             );
         }
+        let mut save = div()
+            .id("database-save-password")
+            .debug_selector(|| "database-save-password".to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .pl(px(96. + SPACE_M))
+            .text_size(px(TEXT_SMALL))
+            .child(checkbox(save_password, theme))
+            .child("Save password");
+        if storage_ready {
+            save = save
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(dialog) = &mut this.dialog {
+                        dialog.save_password = !dialog.save_password;
+                    }
+                    cx.notify();
+                }));
+        } else {
+            save = save.text_color(theme.text_muted).cursor_default();
+            if let Some(reason) = storage_reason {
+                let hint = SharedString::from(reason);
+                save = save.tooltip(move |_, cx| tooltip(hint.clone(), None, cx));
+            }
+        }
+        body = body.child(save);
         if !suggestions.is_empty() {
             let mut list = div().flex().flex_col().gap(px(SPACE_XS));
             list = list.child(
@@ -2418,6 +3209,7 @@ impl DatabasePanel {
                                     dialog.kind = kind;
                                 }
                             }
+                            this.load_versions(cx);
                             cx.notify();
                         }),
                     ),
@@ -2437,7 +3229,11 @@ impl DatabasePanel {
                 )
             })
             .unwrap_or_else(|| {
-                "No driver in the dependencies; add one or give the jar path.".to_owned()
+                if package.is_some() {
+                    "No driver in the dependencies; download one or give the jar path.".to_owned()
+                } else {
+                    "No driver in the dependencies; add one or give the jar path.".to_owned()
+                }
             });
         body = body.child(
             div()
@@ -2445,9 +3241,101 @@ impl DatabasePanel {
                 .text_color(theme.text_muted)
                 .child(driver),
         );
+        if let Some(package) = package {
+            if !versions.is_empty() {
+                let mut choices = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .pl(px(96. + SPACE_M));
+                for (index, version) in versions.iter().take(6).enumerate() {
+                    let chosen = version_text == *version;
+                    let picked = version.clone();
+                    choices = choices.child(
+                        small_button(("database-version", index), version, theme)
+                            .when(chosen, |this| this.bg(theme.tab_selected))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(dialog) = &mut this.dialog {
+                                    dialog.version = TextField::from_text(picked.clone());
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                body = body.child(choices);
+            }
+            if versions_loading {
+                body = body.child(
+                    div()
+                        .pl(px(96. + SPACE_M))
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_muted)
+                        .child("Reading the versions of the repository…"),
+                );
+            } else if let Some(reason) = versions_error {
+                body = body.child(
+                    div()
+                        .pl(px(96. + SPACE_M))
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_muted)
+                        .child(reason),
+                );
+            }
+            let running = self.driver_download.as_ref().is_some_and(|run| run.form);
+            let mut download = div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .pl(px(96. + SPACE_M));
+            if running {
+                if let Some(run) = &self.driver_download {
+                    download = download.child(
+                        div()
+                            .debug_selector(|| "database-download-progress".to_owned())
+                            .text_size(px(TEXT_SMALL))
+                            .text_color(theme.text_muted)
+                            .child(download_text(run)),
+                    );
+                }
+                download = download.child(
+                    small_button("database-download-cancel", "Cancel", theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_download(cx))),
+                );
+            } else {
+                let asked = (!version_text.is_empty()).then(|| version_text.clone());
+                download = download.child(
+                    small_button("database-dialog-download", "Download driver", theme)
+                        .debug_selector(|| "database-dialog-download".to_owned())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.start_download(None, true, asked.clone(), cx)
+                        })),
+                );
+            }
+            download = download.child(
+                div()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_muted)
+                    .child(format!(
+                        "{} · {} · {}",
+                        package.coordinate, package.license, package.repository
+                    )),
+            );
+            body = body.child(download);
+            if let Some(error) = driver_error {
+                body = body.child(
+                    div()
+                        .pl(px(96. + SPACE_M))
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.stripe_error)
+                        .child(error),
+                );
+            }
+        }
         body = body.child(
             div().flex().justify_end().gap(px(SPACE_S)).child(
                 small_button("database-dialog-add", "Add", theme)
+                    .debug_selector(|| "database-dialog-add".to_owned())
                     .on_click(cx.listener(|this, _, _, cx| this.add_source(cx))),
             ),
         );
@@ -2542,16 +3430,19 @@ impl DatabasePanel {
             .border_b_1()
             .border_color(theme.border);
         bar = bar.child(
-            icon_button("database-add", "general/add", "Data Source", None, theme).on_click(
-                cx.listener(|this, _, _, cx| {
-                    let vendors = support()
+            icon_button("database-add", "general/add", "Data Source", None, theme)
+                .debug_selector(|| "database-add".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let vendors = this
+                        .support
+                        .as_ref()
                         .map(|support| support.vendors())
                         .unwrap_or_default();
                     this.refresh_catalog();
-                    this.dialog = Some(Dialog::new(DriverKind::H2, &vendors));
+                    this.dialog = Some(Dialog::new(DriverKind::H2, &vendors, this.secrets.ready()));
+                    this.load_versions(cx);
                     cx.notify();
-                }),
-            ),
+                })),
         );
         bar = bar.child(
             icon_button(
@@ -2657,13 +3548,13 @@ impl DatabasePanel {
                     ),
             );
             bar = bar.child(
-                icon_button("database-connect", "run/run", "Connect", None, theme).on_click(
-                    cx.listener(move |this, _, _, cx| {
+                icon_button("database-connect", "run/run", "Connect", None, theme)
+                    .debug_selector(|| "database-connect".to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.password_field = false;
                         this.connect_selected(cx);
                         let _ = &id;
-                    }),
-                ),
+                    })),
             );
         }
         bar = bar.child(div().flex_1());
@@ -2722,6 +3613,10 @@ impl Drop for DatabasePanel {
         if let Some(scripted) = &self.scripted {
             scripted.closed.store(true, Ordering::Relaxed);
         }
+        // A download of a closed window stops before it writes the rest of the file.
+        if let Some(run) = &self.driver_download {
+            run.cancel.cancel();
+        }
     }
 }
 
@@ -2739,6 +3634,7 @@ impl Render for DatabasePanel {
         let toolbar = self.toolbar(&theme, window, cx);
         let tree = self.tree(&theme, window, cx);
         let result = self.result_table(&theme, window, cx);
+        let notice = self.notice(&theme, cx);
         let dialog = self.dialog(&theme, cx);
         let clean = self.clean_dialog(&theme, cx);
         let tree = div()
@@ -2757,13 +3653,7 @@ impl Render for DatabasePanel {
             .flex_1()
             .min_w_0()
             .h_full()
-            .children(self.last_error().map(|error| {
-                div()
-                    .debug_selector(|| "database-error".to_owned())
-                    .p(px(SPACE_S))
-                    .text_color(theme.stripe_error)
-                    .child(error)
-            }))
+            .children(notice)
             .child(result);
         island(&theme)
             .id("database-panel")
@@ -2826,6 +3716,46 @@ pub(crate) fn run_line(
         panel.update(cx, |panel, cx| panel.run_sql(source, text, None, cx));
     }
     true
+}
+
+/// The line of a download in flight: the version when it is known, the percent when the
+/// server announced the size, the bytes otherwise.
+fn download_text(run: &DriverDownload) -> String {
+    let version = run
+        .version
+        .as_deref()
+        .map(|version| format!(" {version}"))
+        .unwrap_or_default();
+    match run.progress.total() {
+        Some(total) if total > 0 => format!(
+            "Downloading the {} driver{version}: {}%",
+            run.kind.title(),
+            run.progress.written() * 100 / total
+        ),
+        _ => format!(
+            "Downloading the {} driver{version}: {} KB",
+            run.kind.title(),
+            run.progress.written() / 1024
+        ),
+    }
+}
+
+/// The message of a source that has no driver to start the helper with.
+fn driver_message(source: &Source) -> String {
+    format!("No {} driver.", source.kind.title())
+}
+
+/// Whether the answer of a helper says that it found no driver to load.
+fn driver_refused(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "no suitable driver",
+        "classnotfoundexception",
+        "no driver",
+        "driver class",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 pub(crate) fn small_button(id: impl Into<ElementId>, label: &str, theme: &Theme) -> Stateful<Div> {
@@ -2975,7 +3905,10 @@ fn slug(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DriverKind, Source, SourceId, Value, compare_values, slug, source_name};
+    use super::{
+        DriverKind, Source, SourceId, Value, compare_values, driver_message, driver_refused, slug,
+        source_name,
+    };
 
     #[test]
     fn a_source_name_comes_from_the_address() {
@@ -2992,6 +3925,31 @@ mod tests {
         assert_eq!(slug("Pet Clinic"), "pet-clinic");
         assert_eq!(slug("../old"), "old");
         assert_eq!(slug(""), "source");
+    }
+
+    #[test]
+    fn a_driver_that_the_helper_could_not_load_offers_its_download() {
+        let source = Source {
+            id: SourceId::new("owners"),
+            name: "Owners".into(),
+            kind: DriverKind::PostgreSql,
+            url: "jdbc:postgresql://localhost:5432/owners".into(),
+            user: "pet".into(),
+            module: None,
+            driver_jar: None,
+        };
+
+        assert_eq!(driver_message(&source), "No PostgreSQL driver.");
+        assert!(driver_refused(
+            "org.postgresql.util.PSQLException: No suitable driver found"
+        ));
+        assert!(driver_refused(
+            "ClassNotFoundException: org.postgresql.Driver"
+        ));
+        assert!(!driver_refused(
+            "FATAL: password authentication failed for user \"pet\""
+        ));
+        assert!(!driver_refused("Connection refused (Connection refused)"));
     }
 
     #[test]

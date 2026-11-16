@@ -19,18 +19,47 @@ use crate::view::{
 };
 
 pub(crate) const GUTTER_WIDTH: f32 = 64.;
+/// The width of the marks left of the numbers: a breakpoint, a run mark or a bookmark.
+const GUTTER_MARK: f32 = 16.;
+/// The gap between the marks, the numbers and the fold button.
+const GUTTER_GAP: f32 = 2.;
+/// The square of the fold button and the inset after it, before the text.
+pub(crate) const FOLD_SIZE: f32 = 16.;
+const GUTTER_INSET: f32 = 4.;
 pub(crate) const TEXT_INSET: f32 = 3.;
-pub(crate) const FOLD_X: f32 = 43.;
-/// Where the mark of a handler is, between the line number and the fold button.
-pub(crate) const ENDPOINT_X: f32 = 25.;
+/// Where the badge of a place or a handler is, in the column left of the line numbers.
+pub(crate) const ENDPOINT_X: f32 = 0.;
 /// The room of the blame column left of the text, when the column is on.
 pub(crate) const ANNOTATE_WIDTH: f32 = 180.;
 /// The room between the left edge of the blame column and its label.
 const ANNOTATE_INSET: f32 = 4.;
-/// Where the run mark of a line is, over the line number.
-pub(crate) const RUN_X: f32 = 6.;
-const NUMBER_RIGHT: f32 = 23.;
+/// Where the debug marks of a line are, left of the line numbers: a breakpoint never
+/// covers a number.
+pub(crate) const RUN_X: f32 = 0.;
 const NUMBER_SIZE: f32 = 11.7;
+
+/// The number of digits of the largest line number of a file of `lines` lines.
+pub(crate) fn number_digits(lines: usize) -> u32 {
+    lines.max(1).ilog10() + 1
+}
+
+/// The width of the gutter for a number of `number_width` pixels: the marks, the number,
+/// the fold button and their gaps. A short number keeps the smallest width of the
+/// column, and a longer one grows it, so that no digit is cut.
+pub(crate) fn gutter_width(number_width: f32) -> f32 {
+    (GUTTER_MARK + GUTTER_GAP + number_width + GUTTER_GAP + FOLD_SIZE + GUTTER_INSET)
+        .max(GUTTER_WIDTH)
+}
+
+/// The right edge of the line numbers in a gutter of `gutter` pixels.
+pub(crate) fn number_right(gutter: f32) -> f32 {
+    gutter - GUTTER_INSET - FOLD_SIZE - GUTTER_GAP
+}
+
+/// The left edge of the fold button in a gutter of `gutter` pixels.
+pub(crate) fn fold_x(gutter: f32) -> f32 {
+    gutter - GUTTER_INSET - FOLD_SIZE
+}
 
 /// Rounds the size so that the advance of a monospaced font is a whole device pixel.
 fn snapped_size(size: f32, scale_factor: f32) -> f32 {
@@ -152,6 +181,31 @@ pub(crate) struct Layout {
     pub sticky_height: f32,
     /// The hints of the frame, for a test of their pills and baselines.
     pub inlays: Vec<InlayPaint>,
+}
+
+impl Layout {
+    /// The bounds of the number of the row of `line`, for a test that checks the column
+    /// of the numbers holds it whole.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn line_number_bounds(
+        &self,
+        line: usize,
+        height: Pixels,
+        gutter: f32,
+    ) -> Option<Bounds<Pixels>> {
+        let row = self.rows.iter().find(|row| {
+            !row.is_block
+                && !row.line.continuation
+                && row.buffer_line == line
+                && row.number_value.is_some()
+        })?;
+        let width = row.number.width();
+        let right = self.bounds.left() + px(number_right(gutter));
+        Some(Bounds::new(
+            point(right - width, row.y),
+            size(width, height),
+        ))
+    }
 }
 
 pub(crate) struct EditorElement {
@@ -719,10 +773,26 @@ impl Element for EditorElement {
         let line_height = style.line_height;
 
         let annotate = self.view.read(cx).annotation_width();
+        // The column of the numbers follows the count of them: a file that crosses 999,
+        // 9999 or 99999 lines grows it and a shorter one gives it back. The width of a
+        // digit comes from the font of the numbers, not from a guess.
+        let digits = self
+            .view
+            .read(cx)
+            .state
+            .as_ref()
+            .map_or(1, |state| number_digits(state.store().line_count()));
+        let number_width = {
+            let zeros = "0".repeat(digits as usize);
+            let runs = [run(zeros.len(), &code_font, style.line_number, false)];
+            text_system
+                .shape_line(zeros.into(), px(NUMBER_SIZE), &runs, None)
+                .width()
+        };
         let gutter = if options.centered_text {
             0.
         } else {
-            GUTTER_WIDTH
+            gutter_width(f32::from(number_width))
         };
         let text_width =
             (bounds.size.width - px(gutter + TEXT_INSET + annotate + scrollbar::BAND)).max(px(1.));
@@ -750,6 +820,7 @@ impl Element for EditorElement {
         self.view.update(cx, |view, _| {
             view.viewport = bounds.size;
             view.center_inset = center;
+            view.gutter_width = gutter_width(f32::from(number_width));
             if let Some(state) = &mut view.state
                 && state.wrap() != wrap
             {
@@ -1854,9 +1925,9 @@ impl Element for EditorElement {
         });
 
         let view = self.view.clone();
-        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
             if phase == DispatchPhase::Bubble {
-                view.update(cx, |view, _| view.mouse_up());
+                view.update(cx, |view, cx| view.mouse_up(event.position, cx));
             }
         });
 
@@ -1865,6 +1936,8 @@ impl Element for EditorElement {
             let char_width = prepaint.char_width;
             let text_x = prepaint.text_x;
             let gutter_right = bounds.left() + px(prepaint.gutter);
+            let numbers_right = number_right(prepaint.gutter);
+            let folds_left = fold_x(prepaint.gutter);
             let vertical = |x: Pixels| {
                 fill(
                     Bounds::new(point(x, bounds.top()), size(px(1.), bounds.size.height)),
@@ -1909,12 +1982,16 @@ impl Element for EditorElement {
                     continue;
                 }
                 let line = shown.buffer_line as u32;
+                // The left column of the gutter holds one mark of the line: a debug
+                // mark or the icon of a run or a bookmark.
+                let mut icon_taken = shown.run.is_some() || shown.bookmark;
                 if options.gutter_icons && !shown.is_doc && function_breakpoints.contains(&line) {
                     // A method breakpoint is a diamond, not a filled dot.
+                    icon_taken = true;
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
-                        point(bounds.left() + px(RUN_X + 1.), shown.y + px(3.)),
-                        size(px(14.), px(14.)),
+                        point(bounds.left() + px(RUN_X), shown.y + px(3.)),
+                        size(px(13.), px(13.)),
                     );
                     let path: SharedString =
                         format!("icons/debug/functionBreakpoint{suffix}.svg").into();
@@ -1931,10 +2008,11 @@ impl Element for EditorElement {
                 } else if options.gutter_icons && !shown.is_doc && field_watchpoints.contains(&line)
                 {
                     // A field watchpoint is an eye.
+                    icon_taken = true;
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
-                        point(bounds.left() + px(RUN_X + 1.), shown.y + px(3.)),
-                        size(px(14.), px(14.)),
+                        point(bounds.left() + px(RUN_X), shown.y + px(3.)),
+                        size(px(13.), px(13.)),
                     );
                     let path: SharedString =
                         format!("icons/debug/fieldWatchpoint{suffix}.svg").into();
@@ -1949,12 +2027,13 @@ impl Element for EditorElement {
                         )
                         .ok();
                 } else if options.gutter_icons && !shown.is_doc && breakpoints.contains(&line) {
+                    icon_taken = true;
                     if muted_breakpoints.contains(&line) {
                         // A point that does not stop the program is a muted point.
                         let suffix = if style.dark { "_dark" } else { "" };
                         let mark = Bounds::new(
-                            point(bounds.left() + px(RUN_X + 1.), shown.y + px(3.)),
-                            size(px(14.), px(14.)),
+                            point(bounds.left() + px(RUN_X), shown.y + px(3.)),
+                            size(px(13.), px(13.)),
                         );
                         let path: SharedString =
                             format!("icons/debug/breakpointMuted{suffix}.svg").into();
@@ -1970,21 +2049,21 @@ impl Element for EditorElement {
                             .ok();
                     } else {
                         let dot = Bounds::new(
-                            point(bounds.left() + px(RUN_X + 3.), shown.y + px(5.)),
-                            size(px(10.), px(10.)),
+                            point(bounds.left() + px(RUN_X + 2.), shown.y + px(5.)),
+                            size(px(9.), px(9.)),
                         );
-                        window.paint_quad(fill(dot, style.error).corner_radii(px(5.)));
+                        window.paint_quad(fill(dot, style.error).corner_radii(px(4.5)));
                         if temporary_breakpoints.contains(&line) {
                             // A temporary breakpoint is a ring, not a filled dot.
                             let hole = Bounds::new(
-                                point(bounds.left() + px(RUN_X + 5.), shown.y + px(7.)),
-                                size(px(6.), px(6.)),
+                                point(bounds.left() + px(RUN_X + 4.), shown.y + px(7.)),
+                                size(px(5.), px(5.)),
                             );
-                            window.paint_quad(fill(hole, style.background).corner_radii(px(3.)));
+                            window.paint_quad(fill(hole, style.background).corner_radii(px(2.5)));
                         }
                     }
                 }
-                let number_x = bounds.left() + px(NUMBER_RIGHT) - shown.number.width();
+                let number_x = bounds.left() + px(numbers_right) - shown.number.width();
                 if options.gutter_icons
                     && let Some((_, color)) = shown.run
                 {
@@ -2028,12 +2107,15 @@ impl Element for EditorElement {
                         )
                         .ok();
                 }
-                if options.gutter_icons
+                // A place or a handler of the line has its badge in the column of the
+                // debug marks; a breakpoint of the line takes it.
+                if !icon_taken
+                    && options.gutter_icons
                     && let Some((icon, color)) = &shown.place
                 {
                     let mark = Bounds::new(
                         point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
-                        size(px(16.), px(16.)),
+                        size(px(13.), px(13.)),
                     );
                     window
                         .paint_svg(
@@ -2045,12 +2127,13 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
-                } else if options.gutter_icons
+                } else if !icon_taken
+                    && options.gutter_icons
                     && let Some((icon, color)) = &shown.action
                 {
                     let mark = Bounds::new(
                         point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
-                        size(px(16.), px(16.)),
+                        size(px(13.), px(13.)),
                     );
                     window
                         .paint_svg(
@@ -2062,13 +2145,14 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
-                } else if options.gutter_icons
+                } else if !icon_taken
+                    && options.gutter_icons
                     && let Some(color) = shown.endpoint
                 {
                     let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
-                        size(px(16.), px(16.)),
+                        size(px(13.), px(13.)),
                     );
                     let path: SharedString =
                         format!("icons/toolwindows/services{suffix}.svg").into();
@@ -2082,7 +2166,7 @@ impl Element for EditorElement {
                     let name = if rendered { "hide" } else { "show" };
                     let suffix = if style.dark { "_dark" } else { "" };
                     let icon = Bounds::new(
-                        point(bounds.left() + px(FOLD_X), shown.y + px(3.)),
+                        point(bounds.left() + px(folds_left), shown.y + px(3.)),
                         size(px(16.), px(16.)),
                     );
                     let path: SharedString = format!("icons/general/{name}{suffix}.svg").into();
@@ -2107,7 +2191,7 @@ impl Element for EditorElement {
                     };
                     let suffix = if style.dark { "_dark" } else { "" };
                     let chevron = Bounds::new(
-                        point(bounds.left() + px(FOLD_X), shown.y + px(3.)),
+                        point(bounds.left() + px(folds_left), shown.y + px(3.)),
                         size(px(16.), px(16.)),
                     );
                     let path: SharedString = format!("icons/general/{name}{suffix}.svg").into();
@@ -2390,7 +2474,7 @@ impl Element for EditorElement {
                 ));
                 for (index, row) in prepaint.sticky.iter().enumerate() {
                     let y = bounds.top() + height * index as f32;
-                    let number_x = bounds.left() + px(NUMBER_RIGHT) - row.number.width();
+                    let number_x = bounds.left() + px(numbers_right) - row.number.width();
                     row.number
                         .paint(
                             point(number_x, y + px(2.)),
@@ -2498,6 +2582,29 @@ mod checks {
     use crate::view::{OutlineItem, OutlineKind};
 
     use super::{STICKY_MAX, pinned_items, push_text_runs};
+
+    #[test]
+    fn the_gutter_grows_with_the_digits_of_the_line_count() {
+        let digit = 7.02_f32;
+        let mut previous = 0.;
+        for (lines, digits) in [(9, 1), (99, 2), (999, 3), (5238, 4), (99999, 5)] {
+            assert_eq!(super::number_digits(lines), digits, "{lines} lines");
+            let width = super::gutter_width(digits as f32 * digit);
+            assert!(width >= super::GUTTER_WIDTH, "{lines} lines: {width}");
+            if digits > 3 {
+                assert!(
+                    width > previous,
+                    "{lines} lines grow the column: {width} after {previous}"
+                );
+            }
+            previous = width;
+        }
+        // The shortest files keep the width the editor had, and a fourth digit grows it.
+        assert_eq!(super::number_digits(1), 1);
+        assert_eq!(super::gutter_width(3. * digit), super::GUTTER_WIDTH);
+        assert!(super::gutter_width(4. * digit) > super::GUTTER_WIDTH);
+        assert!(super::gutter_width(5. * digit) > super::gutter_width(4. * digit));
+    }
 
     fn span(start: u32, end: u32) -> HighlightSpan {
         HighlightSpan {

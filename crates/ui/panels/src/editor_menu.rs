@@ -45,6 +45,8 @@ impl MenuModel {
             actions::OPTIMIZE_IMPORTS,
             actions::TOGGLE_COMMENT,
             workspace_keys::ROLLBACK_CHANGED_LINES,
+            workspace_keys::NEXT_CHANGE,
+            workspace_keys::PREVIOUS_CHANGE,
             "workspace::Run",
             "workspace::Debug",
             "workspace::ShowCommit",
@@ -346,7 +348,7 @@ fn build(
         ));
         let revert = keymap::workspace::ROLLBACK_CHANGED_LINES;
         let runner = workspace.clone();
-        let entry = MenuEntry::new("Revert Change", move |window, cx| {
+        let entry = MenuEntry::new("Rollback Lines", move |window, cx| {
             runner
                 .update(cx, |workspace, cx| {
                     workspace.run_command(revert, window, cx)
@@ -357,6 +359,23 @@ fn build(
             Some(shortcut) => entry.shortcut(shortcut),
             None => entry,
         });
+        for (label, command) in [
+            ("Show Next Change", keymap::workspace::NEXT_CHANGE),
+            ("Show Previous Change", keymap::workspace::PREVIOUS_CHANGE),
+        ] {
+            let runner = workspace.clone();
+            let entry = MenuEntry::new(label, move |window, cx| {
+                runner
+                    .update(cx, |workspace, cx| {
+                        workspace.run_command(command, window, cx)
+                    })
+                    .ok();
+            });
+            entries.push(match key(command) {
+                Some(shortcut) => entry.shortcut(shortcut),
+                None => entry,
+            });
+        }
         entries.push(dispatch_entry(
             "Branches...",
             key("workspace::ShowBranches"),

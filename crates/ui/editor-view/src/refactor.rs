@@ -4,6 +4,7 @@
 use std::ops::Range;
 use std::path::{Component, Path};
 
+use ::platform;
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt;
 use lang_api::{
@@ -355,6 +356,110 @@ impl EditorView {
     /// Ctrl+Alt+F7: the uses of the symbol, in the popup at the caret.
     pub(crate) fn show_usages(&mut self, cx: &mut Context<Self>) {
         self.usage_search(true, cx);
+    }
+
+    /// The uses of the declaration the caret names: Ctrl+B on the name of a field, a
+    /// method or a type shows them, one use goes there at once and several open the list
+    /// of uses as Ctrl+Alt+F7 does.
+    pub(crate) fn usages_of_declaration(&mut self, caret: usize, cx: &mut Context<Self>) {
+        let Some((spot, _)) = self.spot() else {
+            return;
+        };
+        let Some(support) = self.lsp.as_ref().map(|lsp| lsp.support.clone()) else {
+            return;
+        };
+        let name = self.word_at_caret(caret);
+        if let Some(provider) = support.usages() {
+            let mut replies = ask(provider, spot);
+            cx.spawn(async move |this, cx| {
+                let mut latest = Vec::new();
+                while let Some(answer) = replies.next().await {
+                    if answer.confidence == Confidence::Unknown {
+                        continue;
+                    }
+                    latest = answer.value;
+                }
+                this.update(cx, |this, cx| {
+                    let targets: Vec<SourceSpan> =
+                        latest.into_iter().map(|entry| entry.target).collect();
+                    this.show_declaration_usages(caret, &name, targets, cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        let Some(provider) = support.references() else {
+            self.show_note(caret, "No usages found", cx);
+            return;
+        };
+        let replies = ask(provider, spot);
+        cx.spawn(async move |this, cx| {
+            let Some((spans, confidence)) = first(replies).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if confidence == Confidence::Unknown {
+                    this.show_note(caret, "No usages found", cx);
+                    return;
+                }
+                this.show_declaration_usages(caret, &name, spans, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// One use of a declaration goes there at once; several open the popup of uses.
+    fn show_declaration_usages(
+        &mut self,
+        caret: usize,
+        name: &str,
+        targets: Vec<SourceSpan>,
+        cx: &mut Context<Self>,
+    ) {
+        // The declaration is not a use of itself, and a server may name one place twice.
+        let path = self.path().to_path_buf();
+        let mut seen = std::collections::HashSet::new();
+        let targets: Vec<SourceSpan> = targets
+            .into_iter()
+            .filter(|target| {
+                let here = uri_path(&target.uri)
+                    .is_some_and(|found| platform::path_key(&found) == platform::path_key(&path));
+                let own_name = here
+                    && self.state.as_ref().is_some_and(|state| {
+                        let from = offset_at(&state.store(), target.span.start);
+                        let to = offset_at(&state.store(), target.span.end).max(from);
+                        from <= caret && caret <= to
+                    });
+                !own_name
+                    && seen.insert((
+                        target.uri.clone(),
+                        target.span.start.line,
+                        target.span.start.character,
+                    ))
+            })
+            .collect();
+        match targets.as_slice() {
+            [] => self.show_note(caret, "No usages found", cx),
+            [one] => {
+                let target = one.clone();
+                self.go_to_location(&target, cx);
+            }
+            _ => {
+                // The popup opens with the search and takes the whole answer after it.
+                cx.emit(EditorEvent::ShowUsages(UsagesUpdate {
+                    name: name.to_owned(),
+                    usages: Vec::new(),
+                    done: false,
+                }));
+                cx.emit(EditorEvent::ShowUsages(UsagesUpdate {
+                    name: name.to_owned(),
+                    usages: usages_of(name, targets),
+                    done: true,
+                }));
+            }
+        }
     }
 
     /// The places of the usages answer that are in this file, so Ctrl+Alt+Down and

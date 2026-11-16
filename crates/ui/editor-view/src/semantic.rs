@@ -2,7 +2,7 @@
 //! language: the application sets [`Semantic`], and files it does not match get none.
 //! Every question runs off the UI thread; an answer for an older text is dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -33,12 +33,19 @@ use crate::actions::ActionMenu;
 use crate::refactor::{MoveField, RenameField};
 use crate::state::EditorState;
 use crate::view::{EditorEvent, EditorView};
+use crate::{DocBlock, DocInline};
 
 pub(crate) const NO_ANSWER: &str = "The language server did not answer, try again";
 pub(crate) const MAX_SHOWN: usize = 12;
 
 /// The wait before the semantic tokens are asked for after an edit, in milliseconds.
 const TOKENS_DELAY_MS: u64 = 250;
+/// The wait before the documentation of the selected entry is asked for, so a pick made
+/// at once does not send the same resolve twice.
+const COMPLETION_DOC_DELAY_MS: u64 = 150;
+/// How long a message about a question that found nothing stays on screen, in
+/// milliseconds. It closes by itself, as the messages of the status bar do in IDEA.
+const NOTE_LINGER_MS: u64 = 2500;
 /// Above this many lines the editor asks only for the visible part of a document, when
 /// the server colours a range.
 const TOKENS_RANGE_LINES: usize = 2000;
@@ -73,6 +80,16 @@ impl Global for ExternalLinks {}
 pub struct Semantic(pub Arc<dyn LanguageSupport>);
 
 impl Global for Semantic {}
+
+/// The place of a declaration of a name, or `None` when the project has no such name.
+pub type SymbolFinder = dyn Fn(&str) -> Option<SourceSpan> + Send + Sync;
+
+/// Finds the declaration of a name in the project index, as Ctrl+B falls back to it while
+/// the language server is not ready. Set by the application; `None` keeps the fallback
+/// off. The answer is the place of the declaration.
+pub struct SymbolLookup(pub Option<Arc<SymbolFinder>>);
+
+impl Global for SymbolLookup {}
 
 /// The choices of the user for the checks of the project, shared by the open editors.
 pub struct InspectionProfile(pub lang_api::InspectionSettings);
@@ -206,12 +223,22 @@ pub fn show_location(
     let support = cx
         .try_global::<Semantic>()
         .map(|semantic| semantic.0.clone());
+    let uri = target.uri.clone();
+    let path = source_path(&uri, extension);
+    // A class of a library that was opened before already has its text: showing it
+    // again asks the server nothing, which keeps a repeated Ctrl+B instant.
+    if cx
+        .try_global::<Sources>()
+        .is_some_and(|sources| sources.0.contains_key(&path))
+    {
+        cx.default_global::<Reveals>().0.insert(path.clone(), point);
+        cx.defer(move |cx| open(path, cx));
+        return;
+    }
     let Some(provider) = support.as_ref().and_then(|support| support.source_text()) else {
         cx.defer(missing);
         return;
     };
-    let uri = target.uri.clone();
-    let path = source_path(&uri, extension);
     let replies = ask(provider, SourceTextQuery(uri.clone()));
     cx.spawn(async move |cx| {
         let answer = first(replies).await;
@@ -303,8 +330,22 @@ pub(crate) struct Completion {
     /// Where the typed prefix starts: an accepted entry replaces from here.
     pub start: usize,
     entries: Vec<CompletionEntry>,
+    /// The text the list compares with the typed prefix, and its folded copy. They are
+    /// made once per answer: a keystroke only filters the list and never allocates them
+    /// again.
+    keys: Vec<String>,
+    folded: Vec<String>,
+    /// The class of every entry, made once per answer: a member or a local comes before
+    /// a type, a name the language prefers before a rare one.
+    ranks: Vec<u8>,
     pub shown: Vec<usize>,
     pub selected: usize,
+    /// The first row of the part of the list on screen: the list scrolls under the
+    /// selection when there are more entries than [`MAX_SHOWN`].
+    scroll: usize,
+    /// Whether the server sent every entry that can match the prefix. An incomplete list
+    /// is asked again when typing goes on.
+    pub complete: bool,
 }
 
 /// One completion row: the label split into the text on the left and the type on the
@@ -318,14 +359,51 @@ pub(crate) struct CompletionRow {
 }
 
 impl Completion {
+    fn new(
+        start: usize,
+        entries: Vec<CompletionEntry>,
+        complete: bool,
+        prefix: &str,
+        case: CompletionCase,
+        preferred: &'static [&'static str],
+    ) -> Self {
+        let keys: Vec<String> = entries.iter().map(completion_key).collect();
+        let folded: Vec<String> = keys.iter().map(|key| key.to_lowercase()).collect();
+        let ranks: Vec<u8> = entries
+            .iter()
+            .map(|entry| entry_class(entry, preferred))
+            .collect();
+        let mut completion = Self {
+            start,
+            entries,
+            keys,
+            folded,
+            ranks,
+            shown: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            complete,
+        };
+        completion.filter_with(prefix, case);
+        completion
+    }
+
     #[cfg(test)]
     fn filter(&mut self, prefix: &str) {
         self.filter_with(prefix, CompletionCase::None);
     }
 
     fn filter_with(&mut self, prefix: &str, case: CompletionCase) {
-        self.shown = completion_order_with(self.entries.as_slice(), prefix, case);
+        self.shown = order_entries(
+            &self.entries,
+            &self.keys,
+            &self.folded,
+            &self.ranks,
+            prefix,
+            case,
+        );
         self.selected = 0;
+        self.scroll = 0;
     }
 
     pub fn label(&self, row: usize) -> CompletionRow {
@@ -341,6 +419,13 @@ impl Completion {
             owner,
             deprecated: entry.deprecated,
         }
+    }
+
+    /// What the row names, for the icon before it.
+    pub fn kind(&self, row: usize) -> CompletionKind {
+        self.entries
+            .get(self.shown[row])
+            .map_or(CompletionKind::Unknown, |entry| entry.kind)
     }
 
     /// The text to insert and the span it replaces, when the entry has its own.
@@ -360,10 +445,71 @@ impl Completion {
         Some(entry.clone())
     }
 
-    /// Rows around the selection, at most [`MAX_SHOWN`].
+    /// The labels of the rows on screen and the label of the selected row. A test reads
+    /// them; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn visible_labels(&self) -> (Vec<String>, Option<String>) {
+        let labels = self
+            .window()
+            .map(|row| self.entries[self.shown[row]].label.clone())
+            .collect();
+        let selected = self
+            .shown
+            .get(self.selected)
+            .map(|index| self.entries[*index].label.clone());
+        (labels, selected)
+    }
+
+    /// The labels of the rows this list shows, in their order. A test reads them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn labels(&self) -> Vec<String> {
+        self.shown
+            .iter()
+            .map(|index| self.entries[*index].label.clone())
+            .collect()
+    }
+
+    /// The rows on screen, at most [`MAX_SHOWN`], from the row the list was scrolled to.
     pub fn window(&self) -> Range<usize> {
-        let start = self.selected.saturating_sub(MAX_SHOWN - 1);
-        start..(start + MAX_SHOWN).min(self.shown.len())
+        self.scroll..(self.scroll + MAX_SHOWN).min(self.shown.len())
+    }
+
+    /// Rows the list can scroll by: zero when every entry fits on screen.
+    fn scroll_limit(&self) -> usize {
+        self.shown.len().saturating_sub(MAX_SHOWN)
+    }
+
+    /// Scrolls the rows on screen by `rows`, a wheel notch or a page.
+    pub fn scroll_by(&mut self, rows: isize) {
+        let next = self.scroll as isize + rows;
+        self.scroll = next.clamp(0, self.scroll_limit() as isize) as usize;
+    }
+
+    /// Keeps the selected row on screen after the selection moved.
+    fn reveal_selected(&mut self) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + MAX_SHOWN {
+            self.scroll = self.selected + 1 - MAX_SHOWN;
+        }
+    }
+
+    /// Moves the selection by `rows`, wrapping around the list, and scrolls to it.
+    fn step_selection(&mut self, rows: isize) {
+        let len = self.shown.len();
+        if len == 0 {
+            return;
+        }
+        let len = len as isize;
+        self.selected = (self.selected as isize + rows).rem_euclid(len) as usize;
+        self.reveal_selected();
+    }
+
+    /// Moves the selection to `selected`, clamped to the list, and scrolls to it.
+    fn jump_selection(&mut self, selected: isize) {
+        let last = self.shown.len().saturating_sub(1) as isize;
+        self.selected = selected.clamp(0, last) as usize;
+        self.reveal_selected();
     }
 }
 
@@ -532,41 +678,85 @@ fn merge_completions(
 /// The indices of `entries` in the order the list shows them for `prefix`: entries that
 /// start with it first, then the ones that contain it. The server ranked its entries with
 /// `sortText`; that order stays, and an equal `sortText` puts the shorter name first, so
-/// `String` comes before `StringBuilder` and `StringIndexOutOfBoundsException`.
-pub fn completion_order(entries: &[CompletionEntry], prefix: &str) -> Vec<usize> {
-    completion_order_with(entries, prefix, CompletionCase::None)
+/// `Alpha` comes before `Alphabet` and `AlphaBeta`.
+pub fn completion_order(
+    entries: &[CompletionEntry],
+    prefix: &str,
+    preferred: &[&str],
+) -> Vec<usize> {
+    completion_order_with(entries, prefix, CompletionCase::None, preferred)
 }
 
 /// [`completion_order`] with the case rule of Settings: `None` ignores case,
 /// `FirstLetter` compares the case of the first letter and `All` compares every letter.
+/// `preferred` names the types the language puts before the others.
 pub fn completion_order_with(
     entries: &[CompletionEntry],
     prefix: &str,
     case: CompletionCase,
+    preferred: &[&str],
 ) -> Vec<usize> {
-    let folded = prefix.to_lowercase();
-    let keys: Vec<String> = entries
+    let keys: Vec<String> = entries.iter().map(completion_key).collect();
+    let folded: Vec<String> = keys.iter().map(|key| key.to_lowercase()).collect();
+    let ranks: Vec<u8> = entries
         .iter()
-        .map(|entry| {
-            entry
-                .filter_text
-                .as_deref()
-                .unwrap_or(&entry.label)
-                .to_owned()
-        })
+        .map(|entry| entry_class(entry, preferred))
         .collect();
-    let folded_keys: Vec<String> = keys.iter().map(|key| key.to_lowercase()).collect();
+    order_entries(entries, &keys, &folded, &ranks, prefix, case)
+}
+
+/// The text of an entry that the typed prefix is compared with: the server's own filter
+/// text, or the name of the label without its type, its package or its parameters.
+fn completion_key(entry: &CompletionEntry) -> String {
+    if let Some(filter) = &entry.filter_text {
+        return filter.clone();
+    }
+    let label = entry.label.split(" : ").next().unwrap_or(&entry.label);
+    let label = label.split(" - ").next().unwrap_or(label);
+    let label = label.split('(').next().unwrap_or(label);
+    label.trim().to_owned()
+}
+
+/// Where an entry stands when the prefix matches it equally well: a template of the
+/// editor, a member or a local, then a type. Among types a name the language prefers
+/// comes before a rare one and before a type of a library.
+fn entry_class(entry: &CompletionEntry, preferred: &[&str]) -> u8 {
+    // Entries without a `sortText` are the local templates, which stay in front.
+    if entry.sort_text.is_none() {
+        return 0;
+    }
+    let is_type =
+        entry.kind.is_type() || (entry.kind == CompletionKind::Unknown && looks_like_type(entry));
+    if !is_type {
+        return 1;
+    }
+    let name = entry.label.split(" - ").next().unwrap_or(&entry.label);
+    let name = name.split('(').next().unwrap_or(name).trim();
+    if preferred.contains(&name) { 2 } else { 3 }
+}
+
+/// The indices of `entries` in the order the list shows them for `prefix`. An entry that
+/// starts with the prefix and has the same case comes before one that only starts with
+/// it, then one that contains it; within a group a template, a member or a local comes
+/// before a type, and the order of the server's `sortText` decides between equal kinds.
+/// An equal `sortText` puts the shorter name first, so `Alpha` comes before `Alphabet`.
+fn order_entries(
+    entries: &[CompletionEntry],
+    keys: &[String],
+    folded: &[String],
+    ranks: &[u8],
+    prefix: &str,
+    case: CompletionCase,
+) -> Vec<usize> {
+    let folded_prefix = prefix.to_lowercase();
     let matches_case = |index: usize, at_start: bool| match case {
         CompletionCase::None => true,
-        CompletionCase::FirstLetter => {
-            let key = &keys[index];
-            match (prefix.chars().next(), key.chars().next()) {
-                (Some(typed), Some(key)) => {
-                    typed.is_uppercase() == key.is_uppercase() || !typed.is_alphabetic()
-                }
-                _ => true,
+        CompletionCase::FirstLetter => match (prefix.chars().next(), keys[index].chars().next()) {
+            (Some(typed), Some(key)) => {
+                typed.is_uppercase() == key.is_uppercase() || !typed.is_alphabetic()
             }
-        }
+            _ => true,
+        },
         CompletionCase::All => {
             if at_start {
                 keys[index].starts_with(prefix)
@@ -575,31 +765,52 @@ pub fn completion_order_with(
             }
         }
     };
-    let mut starts: Vec<usize> = Vec::new();
-    let mut contains: Vec<usize> = Vec::new();
-    for (index, key) in folded_keys.iter().enumerate() {
-        if key.starts_with(&folded) && matches_case(index, true) {
-            starts.push(index);
-        } else if key.contains(&folded) && matches_case(index, false) {
-            contains.push(index);
+    // The group of an entry by how well the prefix matches: the exact text, the same
+    // case at the start, the text at the start, the same case inside, the text inside.
+    let bucket = |index: usize| -> Option<u8> {
+        let key = &keys[index];
+        let folded = &folded[index];
+        if key == prefix {
+            Some(0)
+        } else if key.starts_with(prefix) {
+            Some(1)
+        } else if folded.starts_with(&folded_prefix) {
+            Some(2)
+        } else if key.contains(prefix) {
+            Some(3)
+        } else if folded.contains(&folded_prefix) {
+            Some(4)
+        } else {
+            None
         }
-    }
-    // Entries without a `sortText` are the local templates, which stay in front and in
-    // their own order.
-    let order = |a: &usize, b: &usize| match (&entries[*a].sort_text, &entries[*b].sort_text) {
-        (Some(a), Some(b)) if a != b => a.cmp(b),
-        (Some(_), Some(_)) => folded_keys[*a]
-            .chars()
-            .count()
-            .cmp(&folded_keys[*b].chars().count()),
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
     };
-    starts.sort_by(order);
-    contains.sort_by(order);
-    starts.extend(contains);
-    starts
+    let mut shown: Vec<(u8, u8, usize)> = Vec::new();
+    for index in 0..entries.len() {
+        let starts = keys[index].starts_with(prefix);
+        let Some(bucket) = bucket(index) else {
+            continue;
+        };
+        if !matches_case(index, starts) {
+            continue;
+        }
+        shown.push((bucket, ranks[index], index));
+    }
+    shown.sort_by(|(bucket_a, class_a, a), (bucket_b, class_b, b)| {
+        bucket_a
+            .cmp(bucket_b)
+            .then(class_a.cmp(class_b))
+            .then_with(|| match (&entries[*a].sort_text, &entries[*b].sort_text) {
+                // Entries without a sort text are the local templates: their own order
+                // stays.
+                (Some(one), Some(other)) if one != other => one.cmp(other),
+                (Some(_), Some(_)) => folded[*a].chars().count().cmp(&folded[*b].chars().count()),
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.cmp(b))
+    });
+    shown.into_iter().map(|(_, _, index)| index).collect()
 }
 
 /// A completion label in the three parts of the list: the name and parameters, the type
@@ -613,7 +824,7 @@ pub fn completion_parts(
 }
 
 /// [`completion_parts`] with the parts the server already split in `labelDetails`. A type
-/// label may carry its package after ` - ` (`StrictMath - com.example`); the package goes to
+/// label may carry its package after ` - ` (`Widget - com.example`); the package goes to
 /// the right and does not repeat the owner.
 pub(crate) fn completion_parts_with_label_details(
     label: &str,
@@ -912,6 +1123,304 @@ fn trimmed_range(text: &str, start: usize, end: usize, base: usize) -> Range<usi
     base + start + leading..base + start + trailing
 }
 
+/// The lines of the documentation the list shows under its rows. The list keeps a few
+/// of them, as IDEA does: the popup stays a list and never takes the screen.
+pub(crate) const COMPLETION_DOC_LINES: usize = 8;
+
+/// The documentation of the selected completion entry, loaded after the list is shown.
+pub(crate) struct CompletionDoc {
+    /// The index of the entry in the list, so a late answer for another one is dropped.
+    pub entry: usize,
+    /// The lines of the markdown, read once: a frame only draws them.
+    pub rows: Vec<CompletionDocRow>,
+}
+
+impl CompletionDoc {
+    pub(crate) fn new(entry: usize, text: impl AsRef<str>) -> Self {
+        Self {
+            entry,
+            rows: completion_doc_rows_of(text.as_ref()),
+        }
+    }
+}
+
+/// The icon the completion list puts before a name, from the icon set of the window.
+pub(crate) fn completion_kind_icon(kind: CompletionKind) -> &'static str {
+    match kind {
+        CompletionKind::Method | CompletionKind::Function | CompletionKind::Constructor => {
+            "nodes/method"
+        }
+        CompletionKind::Field | CompletionKind::Property => "nodes/field",
+        CompletionKind::Variable | CompletionKind::Value | CompletionKind::Unit => "nodes/variable",
+        CompletionKind::Class | CompletionKind::Struct | CompletionKind::TypeParameter => {
+            "nodes/class"
+        }
+        CompletionKind::Interface => "nodes/interface",
+        CompletionKind::Enum => "nodes/enum",
+        CompletionKind::Module => "nodes/package",
+        CompletionKind::Constant => "nodes/constant",
+        CompletionKind::Keyword | CompletionKind::Operator => "nodes/keyword",
+        CompletionKind::Snippet => "nodes/template",
+        CompletionKind::Folder => "nodes/folder",
+        CompletionKind::Color => "status/info",
+        CompletionKind::Text
+        | CompletionKind::Reference
+        | CompletionKind::File
+        | CompletionKind::Event
+        | CompletionKind::Unknown => "fileTypes/text",
+    }
+}
+
+/// A run of a line of documentation under the completion rows: text, or code set in the
+/// editor font on a tint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DocRun {
+    pub text: String,
+    pub code: bool,
+    pub strong: bool,
+    pub emphasis: bool,
+}
+
+/// One line of that documentation. A line of a quote or of a code block keeps the code
+/// look, and a list item keeps its indent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletionDocRow {
+    pub runs: Vec<DocRun>,
+    pub indent: usize,
+    pub code: bool,
+}
+
+/// The lines of the documentation that stand under the rows: at most
+/// [`COMPLETION_DOC_LINES`]. The markdown the server sends becomes plain lines, so the
+/// backticks, the bullets and the quote marks do not reach the screen.
+pub(crate) fn completion_doc_rows(doc: &CompletionDoc) -> Vec<CompletionDocRow> {
+    doc.rows.clone()
+}
+
+/// The markdown of a documentation answer as the lines of the list.
+fn completion_doc_rows_of(text: &str) -> Vec<CompletionDocRow> {
+    let mut rows = Vec::new();
+    for block in crate::parse_documentation(text) {
+        push_doc_block(block, false, &mut rows);
+        if rows.len() >= COMPLETION_DOC_LINES {
+            break;
+        }
+    }
+    rows.truncate(COMPLETION_DOC_LINES);
+    if rows.is_empty() {
+        let text = text.trim();
+        if !text.is_empty() {
+            rows.push(CompletionDocRow {
+                runs: vec![DocRun::text(text)],
+                indent: 0,
+                code: false,
+            });
+        }
+    }
+    rows
+}
+
+impl DocRun {
+    fn text(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            code: false,
+            strong: false,
+            emphasis: false,
+        }
+    }
+}
+
+fn push_doc_block(block: DocBlock, code: bool, rows: &mut Vec<CompletionDocRow>) {
+    match block {
+        DocBlock::Paragraph(inlines) => rows.push(CompletionDocRow {
+            runs: doc_runs(&inlines, code),
+            indent: 0,
+            code,
+        }),
+        DocBlock::Heading { text, .. } => rows.push(CompletionDocRow {
+            runs: doc_runs(&text, code)
+                .into_iter()
+                .map(|run| DocRun {
+                    strong: true,
+                    ..run
+                })
+                .collect(),
+            indent: 0,
+            code,
+        }),
+        DocBlock::List {
+            ordered,
+            start,
+            items,
+        } => {
+            for (at, item) in items.iter().enumerate() {
+                let bullet = if ordered {
+                    format!("{}. ", start as usize + at)
+                } else {
+                    "• ".to_owned()
+                };
+                let mut runs = vec![DocRun::text(&bullet)];
+                runs.extend(doc_runs(item, code));
+                rows.push(CompletionDocRow {
+                    runs,
+                    indent: 1,
+                    code,
+                });
+            }
+        }
+        DocBlock::Code { text, .. } => {
+            for line in text.lines() {
+                rows.push(CompletionDocRow {
+                    runs: vec![DocRun {
+                        code: true,
+                        ..DocRun::text(line)
+                    }],
+                    indent: 1,
+                    code: true,
+                });
+            }
+        }
+        // A quote reads as code: the `>` marks are the markup of the answer, not text.
+        DocBlock::Quote(blocks) => {
+            for inner in blocks {
+                push_doc_block(inner, true, rows);
+            }
+        }
+        DocBlock::Table {
+            header, rows: body, ..
+        } => {
+            let cells = |row: &[Vec<DocInline>]| {
+                row.iter()
+                    .map(|cell| {
+                        doc_runs(cell, code)
+                            .into_iter()
+                            .map(|run| run.text)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            };
+            rows.push(CompletionDocRow {
+                runs: vec![DocRun {
+                    strong: true,
+                    ..DocRun::text(&cells(&header))
+                }],
+                indent: 0,
+                code,
+            });
+            for row in body {
+                rows.push(CompletionDocRow {
+                    runs: vec![DocRun::text(&cells(&row))],
+                    indent: 1,
+                    code,
+                });
+            }
+        }
+        DocBlock::Image { alt, .. } => rows.push(CompletionDocRow {
+            runs: vec![DocRun::text(&alt)],
+            indent: 0,
+            code,
+        }),
+        DocBlock::Divider => rows.push(CompletionDocRow {
+            runs: vec![DocRun::text("────")],
+            indent: 0,
+            code,
+        }),
+    }
+}
+
+fn doc_runs(inlines: &[DocInline], code: bool) -> Vec<DocRun> {
+    let mut runs = Vec::new();
+    push_doc_runs(inlines, code, false, false, &mut runs);
+    runs
+}
+
+fn push_doc_runs(
+    inlines: &[DocInline],
+    code: bool,
+    strong: bool,
+    emphasis: bool,
+    runs: &mut Vec<DocRun>,
+) {
+    for inline in inlines {
+        match inline {
+            DocInline::Text(text) => runs.push(DocRun {
+                text: text.clone(),
+                code,
+                strong,
+                emphasis,
+            }),
+            DocInline::Code(text) => runs.push(DocRun {
+                text: text.clone(),
+                code: true,
+                strong,
+                emphasis,
+            }),
+            DocInline::Strong(inner) => push_doc_runs(inner, code, true, emphasis, runs),
+            DocInline::Emphasis(inner) => push_doc_runs(inner, code, strong, true, runs),
+            DocInline::Link { text, .. } => push_doc_runs(text, code, strong, emphasis, runs),
+            DocInline::Image(image) => runs.push(DocRun {
+                text: image.alt.clone(),
+                code,
+                strong,
+                emphasis,
+            }),
+        }
+    }
+}
+
+/// How many lines the documentation takes under the rows, which is the height the list
+/// adds for it.
+pub(crate) fn completion_doc_line_count(doc: &CompletionDoc) -> usize {
+    doc.rows.len()
+}
+
+/// Ctrl+B with more than one target: the places to pick from.
+pub(crate) struct NavigationList {
+    pub at: usize,
+    /// The places the server named, without repeats.
+    pub targets: Vec<SourceSpan>,
+    pub selected: usize,
+}
+
+impl NavigationList {
+    fn new(at: usize, mut targets: Vec<SourceSpan>) -> Self {
+        // A server sometimes names one place twice; the list keeps the first row.
+        let mut seen = HashSet::new();
+        targets.retain(|target| {
+            seen.insert((
+                target.uri.clone(),
+                target.span.start.line,
+                target.span.start.character,
+            ))
+        });
+        Self {
+            at,
+            targets,
+            selected: 0,
+        }
+    }
+
+    fn target(&self) -> Option<&SourceSpan> {
+        self.targets.get(self.selected)
+    }
+}
+
+/// The name of the file and the line of one target, as the list of the places shows it.
+pub(crate) fn location_label(target: &SourceSpan) -> String {
+    let file = uri_path(&target.uri)
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| {
+            let uri = &target.uri;
+            uri.rsplit(['/', '\\']).next().unwrap_or(uri).to_owned()
+        });
+    format!("{file}:{}", target.span.start.line + 1)
+}
+
 pub(crate) struct Lsp {
     pub support: Arc<dyn LanguageSupport>,
     pub uri: String,
@@ -928,6 +1437,13 @@ pub(crate) struct Lsp {
     /// The server answered about the diagnostics of this text at least once.
     pub received: bool,
     pub completion: Option<Completion>,
+    /// The documentation of the selected entry, when it arrived.
+    pub completion_doc: Option<CompletionDoc>,
+    /// Ctrl+B found more than one place: the list waits for the user's pick.
+    pub navigation_list: Option<NavigationList>,
+    /// The places Ctrl+B found in this text, by place and kind. A repeated press answers
+    /// at once; an edit clears the answers, as the places may have moved.
+    pub(crate) navigation_cache: HashMap<(String, i32, TextPoint, NavigationKind), Vec<SourceSpan>>,
     pub note: Option<Note>,
     /// Ctrl+Q and the hover popup: the documentation with its blocks and links.
     pub quick: Option<crate::quick_doc::QuickDoc>,
@@ -953,6 +1469,14 @@ pub(crate) struct Lsp {
     pub parameter_walk: Option<ParameterWalk>,
     /// Grows with each completion question, so a late answer is dropped.
     asked: u64,
+    /// The newest completion question the server has answered, so the editor knows
+    /// whether one is still on its way.
+    answered: u64,
+    /// The Ctrl+B questions asked and answered, for the same reason.
+    nav_asked: u64,
+    nav_answered: u64,
+    /// Grows with each request of the documentation of the selected entry.
+    doc_asked: u64,
     /// How the list compares the typed prefix with its entries.
     pub case: CompletionCase,
 }
@@ -960,6 +1484,7 @@ pub(crate) struct Lsp {
 impl Lsp {
     /// Moves both sets of marks over the edits of a text change and joins them again.
     pub fn retain_transformed_marks(&mut self, steps: &[Vec<text_core::Edit>], len: usize) {
+        self.navigation_cache.clear();
         for mark in self
             .server_marks
             .iter_mut()
@@ -997,6 +1522,13 @@ impl Lsp {
         }
     }
 
+    /// A question of the user is on its way to the language: a completion or a jump.
+    /// A long job of the editor, such as the search behind a usage count, waits for it,
+    /// because the server answers one thing at a time.
+    pub(crate) fn question_pending(&self) -> bool {
+        self.asked != self.answered || self.nav_asked != self.nav_answered
+    }
+
     /// The tokens of the server and of the native models, in one list.
     pub fn joined_tokens(&self) -> Vec<TokenSpan> {
         self.server_tokens
@@ -1015,6 +1547,11 @@ impl Lsp {
 
 /// How long the typing settles before the server is asked for hints again.
 pub(crate) const INLAY_TYPING_DELAY: Duration = Duration::from_millis(150);
+
+/// How long the typing settles before the labels above declarations are asked for
+/// again. A label of a language server is a whole document question, and the server
+/// answers it while the user is still typing.
+pub(crate) const CODE_LENS_TYPING_DELAY: Duration = Duration::from_millis(700);
 
 /// The room around the visible rows that one question covers, in screens. Scrolling
 /// within it asks nothing.
@@ -1300,6 +1837,9 @@ impl EditorView {
             native_tokens: HashMap::new(),
             received: !follows_diagnostics,
             completion: None,
+            completion_doc: None,
+            navigation_list: None,
+            navigation_cache: HashMap::new(),
             note: None,
             quick: None,
             actions: None,
@@ -1315,6 +1855,10 @@ impl EditorView {
             signature_asked: 0,
             parameter_walk: None,
             asked: 0,
+            answered: 0,
+            nav_asked: 0,
+            nav_answered: 0,
+            doc_asked: 0,
             case: self.options.completion_case,
         });
         self.semantic_tokens_now(cx);
@@ -1752,7 +2296,14 @@ impl EditorView {
         let Some(lsp) = &self.lsp else {
             return;
         };
-        if lsp.completion.is_some() {
+        if let Some(completion) = &lsp.completion {
+            // The list filters itself as the prefix grows. An incomplete answer may
+            // still hold entries beyond the ones it sent, so only such a list asks the
+            // server again.
+            let incomplete = !completion.complete;
+            if incomplete {
+                self.complete(false, cx);
+            }
             return;
         }
         let auto = self.options.completion_auto_popup;
@@ -1810,12 +2361,55 @@ impl EditorView {
         })
     }
 
+    /// A message about a question that found nothing, such as a jump without a place.
+    /// It stands under the caret for a moment and then goes away by itself: the user is
+    /// not asked to press a key to clear the screen.
+    pub(crate) fn show_transient_note(
+        &mut self,
+        at: usize,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_note(at, text, cx);
+        let shown = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.note.as_ref().map(|note| note.text.clone()));
+        self.note_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(NOTE_LINGER_MS))
+                .await;
+            this.update(cx, |this, cx| {
+                let still_shown = shown.is_some()
+                    && this
+                        .lsp
+                        .as_ref()
+                        .and_then(|lsp| lsp.note.as_ref())
+                        .is_some_and(|note| Some(&note.text) == shown.as_ref());
+                if !still_shown {
+                    return;
+                }
+                if let Some(lsp) = &mut this.lsp {
+                    lsp.note = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     pub(crate) fn show_note(
         &mut self,
         at: usize,
         text: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        if self.lsp.is_none() {
+            return;
+        }
+        // A message replaces the one before it, and that one does not close this one.
+        self.note_task = None;
+        self.before_note_popup(cx);
         if let Some(lsp) = &mut self.lsp {
             lsp.quick = None;
             lsp.note = Some(Note {
@@ -1839,13 +2433,19 @@ impl EditorView {
         explicit: bool,
         cx: &mut Context<Self>,
     ) {
+        self.before_completion_popup(cx);
         let Some((spot, caret)) = self.spot() else {
             return;
         };
+        // A new question replaces the old one: the answer of the old text or the old
+        // prefix would only be dropped, and the server should not keep computing it.
+        self.completion_task = None;
+        self.completion_doc_task = None;
         let case = self.options.completion_case;
         let (Some(lsp), Some(state)) = (&mut self.lsp, &self.state) else {
             return;
         };
+        lsp.completion_doc = None;
         let start = word_start(&state.store(), caret);
         let line_start = state
             .store()
@@ -1864,23 +2464,25 @@ impl EditorView {
         lsp.asked += 1;
         let asked = lsp.asked;
         lsp.parameter_walk = None;
+        let support = lsp.support.clone();
         if !local.is_empty() {
-            let mut completion = Completion {
+            let completion = Completion::new(
                 start,
-                entries: local.clone(),
-                shown: Vec::new(),
-                selected: 0,
-            };
-            completion.filter_with(&state.store().slice(start..caret), case);
+                local.clone(),
+                true,
+                &state.store().slice(start..caret),
+                case,
+                support.preferred_completion_names(),
+            );
             lsp.completion = (!completion.shown.is_empty()).then_some(completion);
             cx.notify();
         }
-        let support = lsp.support.clone();
         if support.completion().is_none() {
+            lsp.answered = asked;
             return;
         }
         let expected_spot = spot.clone();
-        cx.spawn(async move |this, cx| {
+        self.completion_task = Some(cx.spawn(async move |this, cx| {
             let expected = if mode == CompletionMode::SmartType {
                 match support.expected_type() {
                     Some(provider) => first(ask(provider, expected_spot))
@@ -1897,6 +2499,11 @@ impl EditorView {
             let replies = ask(provider, spot);
             let answer = first(replies).await;
             this.update(cx, |this, cx| {
+                if let Some(lsp) = &mut this.lsp
+                    && lsp.asked == asked
+                {
+                    lsp.answered = asked;
+                }
                 let Some((list, confidence)) = answer else {
                     return;
                 };
@@ -1916,59 +2523,159 @@ impl EditorView {
                 }
                 let entries = visible_entries(list.entries, mode, expected.as_deref());
                 let entries = merge_completions(local, entries);
-                let mut completion = Completion {
+                let completion = Completion::new(
                     start,
                     entries,
-                    shown: Vec::new(),
-                    selected: 0,
-                };
-                completion.filter_with(&state.store().slice(start..caret), case);
+                    list.complete,
+                    &state.store().slice(start..caret),
+                    case,
+                    support.preferred_completion_names(),
+                );
                 lsp.completion = (!completion.shown.is_empty()).then_some(completion);
+                cx.notify();
+                this.request_completion_doc(cx);
+            })
+            .ok();
+        }));
+        self.request_completion_doc(cx);
+    }
+
+    /// Asks the server for the documentation of the selected entry in the background. The
+    /// list is already on screen and does not wait; a late answer for another entry is
+    /// dropped. The answer may also carry the additional edits of the entry, which are
+    /// kept for the insertion instead of being asked for again.
+    fn request_completion_doc(&mut self, cx: &mut Context<Self>) {
+        let Some((entry, index, support)) = self.lsp.as_ref().and_then(|lsp| {
+            let completion = lsp.completion.as_ref()?;
+            let index = *completion.shown.get(completion.selected)?;
+            let entry = completion.entries.get(index)?.clone();
+            Some((entry, index, lsp.support.clone()))
+        }) else {
+            return;
+        };
+        if self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.completion_doc.as_ref())
+            .is_some_and(|doc| doc.entry == index)
+        {
+            return;
+        }
+        if let Some(documentation) = &entry.documentation {
+            let text = documentation.trim();
+            if !text.is_empty()
+                && let Some(lsp) = &mut self.lsp
+            {
+                lsp.completion_doc = Some(CompletionDoc::new(index, text));
+                cx.notify();
+            }
+            return;
+        }
+        if entry.resolve.is_none() || support.completion_resolve().is_none() {
+            return;
+        }
+        let (asked, entry) = {
+            let Some(lsp) = &mut self.lsp else {
+                return;
+            };
+            lsp.doc_asked += 1;
+            (lsp.doc_asked, entry)
+        };
+        self.completion_doc_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(COMPLETION_DOC_DELAY_MS))
+                .await;
+            let Some(provider) = support.completion_resolve() else {
+                return;
+            };
+            let mut replies = ask(provider, entry);
+            let Some(answer) = replies.next().await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let Some(lsp) = &mut this.lsp else {
+                    return;
+                };
+                if lsp.doc_asked != asked {
+                    return;
+                }
+                let selected = lsp
+                    .completion
+                    .as_ref()
+                    .and_then(|completion| completion.shown.get(completion.selected).copied());
+                if selected != Some(index) {
+                    return;
+                }
+                // The edits the server sends with the documentation are used when the
+                // user accepts the entry, unless the answer of the list already had them.
+                if let Some(entry) = lsp
+                    .completion
+                    .as_mut()
+                    .and_then(|completion| completion.entries.get_mut(index))
+                    && entry.additional_edits.is_empty()
+                {
+                    entry.additional_edits = answer.value.additional_edits.clone();
+                }
+                let text = answer.value.documentation.unwrap_or_default();
+                let text = text.trim();
+                if text.is_empty() {
+                    return;
+                }
+                lsp.completion_doc = Some(CompletionDoc::new(index, text));
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
-    /// Keys of an open completion: arrows move, Enter inserts before the rest of the
-    /// word, Tab replaces that rest, Ctrl+. inserts the entry with a dot and opens the
-    /// list again, Ctrl+Shift+Enter finishes the statement, Escape closes. Returns
-    /// whether the key was taken.
+    /// Keys of an open completion: arrows and pages move, Home and End go to the ends,
+    /// Enter inserts before the rest of the word, Tab replaces that rest, Ctrl+. inserts
+    /// the entry with a dot and opens the list again, Ctrl+Shift+Enter finishes the
+    /// statement. Returns whether the key was taken; Escape is closed by the popup rules
+    /// of the view.
     pub(crate) fn completion_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         let Some(lsp) = &mut self.lsp else {
             return false;
         };
-        if key == "escape" && lsp.signatures.take().is_some() {
-            cx.notify();
-            if lsp.completion.is_none() {
-                return true;
-            }
-        }
-        if key == "escape" && lsp.note.take().is_some() {
-            cx.notify();
-            if lsp.completion.is_none() {
-                return true;
-            }
-        }
         let Some(completion) = &mut lsp.completion else {
             return false;
         };
-        let rows = completion.shown.len();
+        let page = MAX_SHOWN as isize;
         match key {
             "up" => {
-                completion.selected = (completion.selected + rows - 1) % rows;
+                completion.step_selection(-1);
                 cx.notify();
+                self.request_completion_doc(cx);
                 return true;
             }
             "down" => {
-                completion.selected = (completion.selected + 1) % rows;
+                completion.step_selection(1);
                 cx.notify();
+                self.request_completion_doc(cx);
                 return true;
             }
-            "escape" => {
-                lsp.completion = None;
+            "pageup" => {
+                completion.step_selection(-page);
                 cx.notify();
+                self.request_completion_doc(cx);
+                return true;
+            }
+            "pagedown" => {
+                completion.step_selection(page);
+                cx.notify();
+                self.request_completion_doc(cx);
+                return true;
+            }
+            "home" => {
+                completion.jump_selection(0);
+                cx.notify();
+                self.request_completion_doc(cx);
+                return true;
+            }
+            "end" => {
+                completion.jump_selection(isize::MAX);
+                cx.notify();
+                self.request_completion_doc(cx);
                 return true;
             }
             "enter" | "tab" | "ctrl-." | "ctrl-shift-enter" => {}
@@ -1980,7 +2687,10 @@ impl EditorView {
         let start = completion.start;
         let entry = completion.chosen_entry();
         lsp.completion = None;
+        lsp.completion_doc = None;
         let support = lsp.support.clone();
+        self.completion_task = None;
+        self.completion_doc_task = None;
         let Some(entry) = entry else {
             return true;
         };
@@ -2014,6 +2724,42 @@ impl EditorView {
         }
         cx.notify();
         true
+    }
+
+    /// A click on the row `row` of the completion list selects it; a double click also
+    /// puts the entry in, as IDEA does. The row is counted from the first row on screen.
+    pub(crate) fn completion_click(
+        &mut self,
+        row: usize,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(completion) = self.lsp.as_mut().and_then(|lsp| lsp.completion.as_mut()) else {
+            return;
+        };
+        if row >= completion.shown.len() {
+            return;
+        }
+        completion.selected = row;
+        completion.reveal_selected();
+        cx.notify();
+        self.request_completion_doc(cx);
+        if click_count >= 2 {
+            self.completion_key("enter", cx);
+        }
+    }
+
+    /// A wheel notch over the completion list: the rows scroll under the selection,
+    /// which stays where the user put it.
+    pub(crate) fn completion_scroll(&mut self, rows: isize, cx: &mut Context<Self>) {
+        let Some(completion) = self.lsp.as_mut().and_then(|lsp| lsp.completion.as_mut()) else {
+            return;
+        };
+        let before = completion.scroll;
+        completion.scroll_by(rows);
+        if completion.scroll != before {
+            cx.notify();
+        }
     }
 
     /// Ctrl+Up and Ctrl+Down in an open Parameter Info: the previous or next overload.
@@ -2277,41 +3023,248 @@ impl EditorView {
         }
     }
 
-    /// Ctrl+B and Ctrl+Alt+B.
+    /// Ctrl+B and Ctrl+Alt+B. One target goes at once; several wait for a pick from the
+    /// list. While the server is not ready, Ctrl+B asks the project index instead.
     pub(crate) fn navigate(&mut self, kind: NavigationKind, cx: &mut Context<Self>) {
         let Some((spot, caret)) = self.spot() else {
             return;
         };
-        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.navigation()) else {
+        let word = self
+            .state
+            .as_ref()
+            .map(|state| {
+                let store = state.store();
+                store.slice(word_start(&store, caret)..word_end(&store, caret))
+            })
+            .filter(|word| !word.is_empty());
+        let Some((support, ready)) = self
+            .lsp
+            .as_ref()
+            .map(|lsp| (lsp.support.clone(), lsp.support.server_ready()))
+        else {
             return;
+        };
+        let fallback = (kind == NavigationKind::Definition && !ready)
+            .then(|| {
+                cx.try_global::<SymbolLookup>()
+                    .and_then(|lookup| lookup.0.clone())
+            })
+            .flatten()
+            .zip(word.clone());
+        // While the server imports, the project index answers at once. Only when it has
+        // no such name does the question go to the server.
+        if let Some((lookup, word)) = &fallback
+            && let Some(target) = lookup(word)
+        {
+            self.go_to_location(&target, cx);
+            return;
+        }
+        let key = (spot.uri.clone(), spot.version, spot.point, kind);
+        if let Some(spans) = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.navigation_cache.get(&key))
+            .cloned()
+        {
+            self.show_navigation_targets(spans, caret, cx);
+            return;
+        }
+        let Some(provider) = support.navigation() else {
+            if let Some((lookup, word)) = fallback {
+                if let Some(target) = lookup(&word) {
+                    self.go_to_location(&target, cx);
+                } else {
+                    self.show_transient_note(caret, "Cannot find declaration to go to", cx);
+                }
+            }
+            return;
+        };
+        let asked = match &mut self.lsp {
+            Some(lsp) => {
+                lsp.nav_asked += 1;
+                lsp.nav_asked
+            }
+            None => return,
         };
         let replies = ask(provider, NavigationQuery { kind, spot });
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
-            this.update(cx, |this, cx| match answer {
-                Some((spans, _)) if !spans.is_empty() => this.go_to_location(&spans[0], cx),
-                Some((_, confidence))
-                    if confidence != Confidence::Unknown
-                        && this
-                            .lsp
-                            .as_ref()
-                            .is_some_and(|lsp| lsp.support.definition_falls_back_to_hover()) =>
+            this.update(cx, |this, cx| {
+                if let Some(lsp) = &mut this.lsp
+                    && lsp.nav_asked == asked
                 {
-                    // A language whose places map onto configuration files shows what
-                    // it knows about the place rather than nothing.
-                    this.quick_doc(cx)
+                    lsp.nav_answered = asked;
                 }
-                Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
-                Some(_) => this.show_note(caret, "Cannot find declaration to go to", cx),
-                None => {}
+                match answer {
+                    Some((spans, _)) if !spans.is_empty() => {
+                        // Ctrl+B on the name of a declaration names the declaration
+                        // itself: the uses answer instead of a jump to the same place.
+                        if kind == NavigationKind::Definition
+                            && this.on_the_declaration(&spans, caret)
+                        {
+                            this.usages_of_declaration(caret, cx);
+                            return;
+                        }
+                        if let Some(lsp) = &mut this.lsp {
+                            // The same press on the same text is answered at once, without
+                            // asking the server to read the class again.
+                            lsp.navigation_cache.insert(key, spans.clone());
+                        }
+                        this.show_navigation_targets(spans, caret, cx);
+                    }
+                    Some((_, confidence))
+                        if confidence != Confidence::Unknown
+                            && this.lsp.as_ref().is_some_and(|lsp| {
+                                lsp.support.definition_falls_back_to_hover()
+                            }) =>
+                    {
+                        // A language whose places map onto configuration files shows what
+                        // it knows about the place rather than nothing.
+                        this.quick_doc(cx)
+                    }
+                    Some((_, Confidence::Unknown)) if fallback.is_some() => {
+                        let (lookup, word) = fallback.unwrap();
+                        if let Some(target) = lookup(&word) {
+                            this.go_to_location(&target, cx);
+                        } else {
+                            this.show_transient_note(caret, NO_ANSWER, cx);
+                        }
+                    }
+                    Some((_, Confidence::Unknown)) => {
+                        this.show_transient_note(caret, NO_ANSWER, cx)
+                    }
+                    Some(_) if fallback.is_some() => {
+                        let (lookup, word) = fallback.unwrap();
+                        if let Some(target) = lookup(&word) {
+                            this.go_to_location(&target, cx);
+                        } else {
+                            this.show_transient_note(caret, "Cannot find declaration to go to", cx);
+                        }
+                    }
+                    Some(_) => {
+                        this.show_transient_note(caret, "Cannot find declaration to go to", cx)
+                    }
+                    None if fallback.is_some() => {
+                        let (lookup, word) = fallback.unwrap();
+                        if let Some(target) = lookup(&word) {
+                            this.go_to_location(&target, cx);
+                        }
+                    }
+                    None => {}
+                }
             })
             .ok();
         })
         .detach();
     }
 
+    /// Whether the one place a navigation answer gives is the name the caret stands on:
+    /// the definition of a declaration is the declaration itself.
+    fn on_the_declaration(&self, spans: &[SourceSpan], caret: usize) -> bool {
+        let [target] = spans else {
+            return false;
+        };
+        let Some(state) = &self.state else {
+            return false;
+        };
+        let here = uri_path(&target.uri)
+            .is_some_and(|path| platform::path_key(&path) == platform::path_key(&self.path));
+        if !here {
+            return false;
+        }
+        let from = offset_at(&state.store(), target.span.start);
+        let to = offset_at(&state.store(), target.span.end).max(from);
+        from <= caret && caret <= to
+    }
+
+    /// Opens one place of a navigation answer at once, or shows the list of several,
+    /// with the one the user picks opened by the same path as one target.
+    fn show_navigation_targets(
+        &mut self,
+        spans: Vec<SourceSpan>,
+        caret: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if spans.len() == 1 {
+            self.go_to_location(&spans[0], cx);
+            return;
+        }
+        self.before_navigation_popup(cx);
+        if let Some(lsp) = &mut self.lsp {
+            lsp.navigation_list = Some(NavigationList::new(caret, spans));
+            cx.notify();
+        }
+    }
+
+    /// Keys of the list of places from Ctrl+B: arrows move, Enter opens the place and
+    /// Escape closes the list. Returns whether the key was taken.
+    pub(crate) fn navigation_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(lsp) = &mut self.lsp else {
+            return false;
+        };
+        let Some(list) = &mut lsp.navigation_list else {
+            return false;
+        };
+        let rows = list.targets.len();
+        match key {
+            "up" if rows > 0 => {
+                list.selected = (list.selected + rows - 1) % rows;
+                cx.notify();
+                true
+            }
+            "down" if rows > 0 => {
+                list.selected = (list.selected + 1) % rows;
+                cx.notify();
+                true
+            }
+            "enter" => {
+                let target = list.target();
+                let target = target.cloned();
+                let at = list.at;
+                lsp.navigation_list = None;
+                match target {
+                    Some(target) => self.go_to_location(&target, cx),
+                    None => self.show_transient_note(at, "Cannot find declaration to go to", cx),
+                }
+                true
+            }
+            "escape" => {
+                lsp.navigation_list = None;
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn go_to_location(&mut self, target: &SourceSpan, cx: &mut Context<Self>) {
         let caret = self.spot().map_or(0, |(_, caret)| caret);
+        // A place of this very text moves the caret here: no tab and no reveal take part.
+        // The jump tells the window where it starts from before the caret moves, so Back
+        // returns to that place as it does after a jump to another file.
+        let here = uri_path(&target.uri)
+            .is_some_and(|path| platform::path_key(&path) == platform::path_key(&self.path));
+        if here && let Some(state) = &self.state {
+            let at = offset_at(&state.store(), target.span.start);
+            // The window learns where the jump starts while the caret is still here.
+            cx.emit(EditorEvent::Navigate(self.path.clone()));
+            let moves = cx.weak_entity();
+            cx.defer(move |cx| {
+                moves
+                    .update(cx, |this, cx| {
+                        if let Some(state) = &mut this.state {
+                            state.select_range(at..at);
+                        }
+                        this.autoscroll = true;
+                        this.reveal_center = true;
+                        this.caret_on = true;
+                        this.changed(None, cx);
+                        cx.notify();
+                    })
+                    .ok();
+            });
+            return;
+        }
         let extension = self
             .path
             .extension()
@@ -2330,7 +3283,7 @@ impl EditorView {
             move |cx| {
                 missing
                     .update(cx, |this, cx| {
-                        this.show_note(caret, "No source for this place", cx)
+                        this.show_transient_note(caret, "No source for this place", cx)
                     })
                     .ok();
             },
@@ -2355,6 +3308,7 @@ impl EditorView {
         if self.toggle_quick_doc(cx) {
             return;
         }
+        self.before_quick_doc_popup(cx);
         let Some((spot, caret)) = self.spot() else {
             return;
         };
@@ -2381,6 +3335,7 @@ impl EditorView {
 
     /// Ctrl+P: the overloads of the call around the caret, the active parameter bold.
     pub(crate) fn parameter_info(&mut self, cx: &mut Context<Self>) {
+        self.before_parameter_info_popup(cx);
         let Some((spot, caret)) = self.spot() else {
             return;
         };
@@ -2674,9 +3629,91 @@ mod tests {
     use text_core::{RopeStore, TextStore};
 
     use super::{
-        Completion, completion_order, completion_parts, completion_parts_with_label_details,
-        merge_completions, offset_at, point_at, source_path, word_start,
+        Completion, CompletionCase, completion_doc_rows, completion_kind_icon, completion_order,
+        completion_parts, completion_parts_with_label_details, merge_completions, offset_at,
+        point_at, source_path, word_start,
     };
+
+    #[test]
+    fn every_kind_of_entry_has_its_own_picture() {
+        use lang_api::CompletionKind;
+
+        let icons = [
+            (CompletionKind::Class, "nodes/class"),
+            (CompletionKind::Interface, "nodes/interface"),
+            (CompletionKind::Enum, "nodes/enum"),
+            (CompletionKind::Method, "nodes/method"),
+            (CompletionKind::Field, "nodes/field"),
+            (CompletionKind::Variable, "nodes/variable"),
+            (CompletionKind::Keyword, "nodes/keyword"),
+            (CompletionKind::Snippet, "nodes/template"),
+            (CompletionKind::Constant, "nodes/constant"),
+            (CompletionKind::Module, "nodes/package"),
+        ];
+        for (kind, icon) in icons {
+            assert_eq!(completion_kind_icon(kind), icon, "{kind:?}");
+        }
+        // Every kind names an icon of the set, never the empty name.
+        for kind in [
+            CompletionKind::Unknown,
+            CompletionKind::Text,
+            CompletionKind::Function,
+            CompletionKind::Constructor,
+            CompletionKind::Property,
+            CompletionKind::Unit,
+            CompletionKind::Value,
+            CompletionKind::Color,
+            CompletionKind::File,
+            CompletionKind::Reference,
+            CompletionKind::Folder,
+            CompletionKind::Struct,
+            CompletionKind::Event,
+            CompletionKind::Operator,
+            CompletionKind::TypeParameter,
+        ] {
+            assert!(!completion_kind_icon(kind).is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_documentation_of_an_entry_loses_its_markup() {
+        use crate::semantic::CompletionDoc;
+
+        let doc = CompletionDoc::new(
+            0,
+            "`ArrayList` is a **list**.\n\n> a quoted line\n\n* first\n* second\n\n```\nnew ArrayList<>();\n```",
+        );
+        let rows = completion_doc_rows(&doc);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+            .collect();
+        assert_eq!(text[0], "ArrayList is a list.");
+        assert!(!text[0].contains('`') && !text[0].contains('*'), "{text:?}");
+        // A quote reads as code, and the quote marks are gone.
+        let quoted = rows
+            .iter()
+            .find(|row| row.code && row.runs.iter().any(|run| run.text.contains("quoted")))
+            .expect("the quote line is code");
+        assert!(quoted.runs.iter().all(|run| !run.text.starts_with('>')));
+        // The bullets of a list are bullets, not asterisks.
+        let bullets: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.indent > 0 && !row.code)
+            .flat_map(|row| row.runs.first().map(|run| run.text.as_str()))
+            .collect();
+        assert_eq!(bullets, ["• ", "• "]);
+        // The fenced block keeps its lines as code.
+        assert!(
+            rows.iter().any(|row| row.code
+                && row
+                    .runs
+                    .iter()
+                    .any(|run| run.text.contains("new ArrayList"))),
+            "{text:?}"
+        );
+        assert!(rows.len() <= super::COMPLETION_DOC_LINES);
+    }
 
     #[test]
     fn points_count_utf16_from_the_line_start() {
@@ -2705,12 +3742,14 @@ mod tests {
             label: label.to_owned(),
             ..CompletionEntry::default()
         };
-        let mut completion = Completion {
-            start: 0,
-            entries: vec![entry("isEmpty"), entry("size"), entry("resize")],
-            shown: Vec::new(),
-            selected: 0,
-        };
+        let mut completion = Completion::new(
+            0,
+            vec![entry("isEmpty"), entry("size"), entry("resize")],
+            true,
+            "",
+            CompletionCase::None,
+            &[],
+        );
         completion.filter("SI");
         assert_eq!(completion.shown, [1, 2]);
         assert_eq!(
@@ -2780,7 +3819,7 @@ mod tests {
             entry("StringIndexOutOfBoundsException", Some("0000")),
             entry("StringBuilder", Some("0000")),
         ];
-        let labels: Vec<&str> = completion_order(&entries, "Str")
+        let labels: Vec<&str> = completion_order(&entries, "Str", &[])
             .into_iter()
             .map(|index| entries[index].label.as_str())
             .collect();
@@ -2799,11 +3838,21 @@ mod tests {
     #[test]
     fn a_different_sort_text_keeps_the_order_of_the_server() {
         let entries = [
-            entry("String", Some("0002")),
-            entry("StringBuilder", Some("0001")),
+            entry("StringBuffer", Some("0002")),
+            entry("StrictMath", Some("0001")),
         ];
-        let order = completion_order(&entries, "Str");
+        let order = completion_order(&entries, "Str", &[]);
         assert_eq!(order, [1, 0]);
+    }
+
+    #[test]
+    fn a_preferred_type_comes_before_a_rare_one_of_the_server_order() {
+        let entries = [
+            entry("StrictMath", Some("0000")),
+            entry("String", Some("0005")),
+        ];
+        let order = completion_order(&entries, "Str", &["String"]);
+        assert_eq!(order, [1, 0], "the type the language prefers comes first");
     }
 
     #[test]
@@ -2877,7 +3926,7 @@ mod case_tests {
                 ..CompletionEntry::default()
             },
         ];
-        completion_order_with(&entries, prefix, case)
+        completion_order_with(&entries, prefix, case, &[])
             .into_iter()
             .map(|index| entries[index].label.clone())
             .collect()

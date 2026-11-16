@@ -2220,6 +2220,38 @@ impl EditorState {
         self.buffer.set_selections(moved);
     }
 
+    /// A drag that began with a double click: the whole words between the word of
+    /// `anchor` and the word under the pointer, as IDEA selects them.
+    pub fn drag_words(&mut self, anchor: usize, offset: usize) {
+        let store = self.buffer.store();
+        let first = commands::word_at(&store, anchor);
+        let second = commands::word_at(&store, offset);
+        let range = if offset < anchor {
+            second.start..first.end.max(second.end)
+        } else {
+            first.start.min(second.start)..second.end
+        };
+        self.buffer
+            .set_selections(SelectionSet::single(Selection::new(range.start, range.end)));
+    }
+
+    /// A drag that began with a triple click: the whole lines between the line of
+    /// `anchor` and the line under the pointer, their line ends included.
+    pub fn drag_lines(&mut self, anchor: usize, offset: usize) {
+        let store = self.buffer.store();
+        let first = store.offset_to_line(anchor);
+        let second = store.offset_to_line(offset);
+        let (from, to) = (first.min(second), first.max(second));
+        let start = store.line_to_offset(from);
+        let end = if to + 1 < store.line_count() {
+            store.line_to_offset(to + 1)
+        } else {
+            store.line_end(to)
+        };
+        self.buffer
+            .set_selections(SelectionSet::single(Selection::new(start, end)));
+    }
+
     /// IME: replaces `range`, or the marked text, or the selection.
     pub fn replace_range(
         &mut self,

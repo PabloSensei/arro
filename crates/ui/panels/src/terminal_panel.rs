@@ -2,6 +2,7 @@
 //! two screens, the search over the scrollback and the links of what the programs print.
 
 use std::cell::Cell as SharedCell;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use ui_kit::*;
 use workspace::{Settings, ToggleTerminal, Workspace};
 
 use crate::navigation;
-use crate::prompt::{Prompt, TextField};
+use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
     CellMetrics, GridView, Position, Selection, every_frame, grid, is_paste, line_selection,
     scroll_lines, selection_text, send_key, word_at,
@@ -173,6 +174,8 @@ pub struct TerminalPanel {
     renaming: Option<(usize, TextField)>,
     rename_focus: FocusHandle,
     dragging_split: Option<SplitDrag>,
+    /// The area of the panel on screen, for the questions that stand over it.
+    bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
 }
 
 /// The shell sees what the user sees in any console, plus the terminal variables and the
@@ -314,6 +317,7 @@ impl TerminalPanel {
                 renaming: None,
                 rename_focus: cx.focus_handle(),
                 dragging_split: None,
+                bounds: Rc::new(RefCell::new(None)),
             };
             for tab in 0..panel.tabs.len() {
                 for pane in 0..panel.tabs[tab].panes.len() {
@@ -711,10 +715,14 @@ impl TerminalPanel {
         }
         let workspace = self.workspace.clone();
         let paste = text.clone();
+        let place = self.bounds.borrow().map_or(Place::Center, |bounds| {
+            Place::At(point(bounds.center().x, bounds.top() + px(SPACE_M)))
+        });
         let _ = workspace.update(cx, |workspace, cx| {
-            Prompt::ask(
+            Prompt::ask_at(
                 "Paste",
                 "Paste multi-line text?",
+                place,
                 move |_| {
                     let _ = session.paste(&paste);
                 },
@@ -1782,9 +1790,22 @@ impl Render for TerminalPanel {
             .child(self.tabs_row(&theme, cx))
             .children(self.search_row(&theme, cx))
             .child(self.panes(focused, &theme, cx));
+        let measure = {
+            let bounds = self.bounds.clone();
+            canvas(
+                move |area, _, _| *bounds.borrow_mut() = Some(area),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        };
         island(&theme)
             .group(GROUP)
+            .relative()
             .h_full()
+            .child(measure)
             .child(panel_header("Terminal", GROUP, hide, &theme))
             .child(body)
     }

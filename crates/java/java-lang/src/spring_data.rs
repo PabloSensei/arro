@@ -906,6 +906,7 @@ fn method_completions(
                 resolve: None,
                 kind: CompletionKind::Keyword,
                 deprecated: false,
+                documentation: None,
             });
         }
         // An ordering takes its direction after the property.
@@ -925,6 +926,7 @@ fn method_completions(
                     resolve: None,
                     kind: CompletionKind::Keyword,
                     deprecated: false,
+                    documentation: None,
                 });
             }
         }
@@ -981,6 +983,7 @@ fn completion_entry(
         resolve: None,
         kind,
         deprecated: false,
+        documentation: None,
     }
 }
 

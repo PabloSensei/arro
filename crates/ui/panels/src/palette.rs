@@ -290,6 +290,9 @@ pub struct Palette {
     /// reads the rows: only the last answer of a group may still change them.
     pending_replies: usize,
     tasks: Vec<Task<()>>,
+    /// How many times the popup asked the window for a frame, for a test of typing.
+    #[cfg(test)]
+    pub(crate) frames_asked: usize,
 }
 
 impl Palette {
@@ -354,6 +357,8 @@ impl Palette {
                 navigated: false,
                 pending_replies: 0,
                 tasks: Vec::new(),
+                #[cfg(test)]
+                frames_asked: 0,
             };
             palette.refresh(cx);
             palette
@@ -1074,14 +1079,20 @@ impl Palette {
         }
     }
 
-    fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
+        if key.key == "escape" {
+            cx.stop_propagation();
+            self.dismiss(window, cx);
+            return;
+        }
         if key.key == "right"
             && !key.modifiers.control
             && !key.modifiers.alt
             && self.toggle_selected_setting(cx)
         {
             cx.stop_propagation();
+            self.ask_for_frame(window);
             return;
         }
         if !self.query.key_with_clipboard(event, false, cx) {
@@ -1089,6 +1100,7 @@ impl Palette {
         }
         cx.stop_propagation();
         self.refresh(cx);
+        self.ask_for_frame(window);
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1173,12 +1185,26 @@ impl Palette {
                 }
             })
             .ok();
+        // The window draws the file without waiting for the pointer to move.
+        self.ask_for_frame(window);
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace
             .update(cx, |workspace, cx| workspace.dismiss(window, cx))
             .ok();
+        self.ask_for_frame(window);
+    }
+
+    /// Asks the window for the frame that shows the change. The popup is drawn in a
+    /// deferred pass of the window, and its own notify alone does not always wake the
+    /// frame source of the platform: typing then waits for the next mouse move.
+    fn ask_for_frame(&mut self, window: &mut Window) {
+        #[cfg(test)]
+        {
+            self.frames_asked += 1;
+        }
+        window.refresh();
     }
 
     fn row(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1384,14 +1410,35 @@ impl Render for Palette {
             .w(width)
             .p(px(POPUP_PADDING))
             .when(!collapsed, |this| this.h(px(HEIGHT)))
-            .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
-            .on_action(cx.listener(|this, _: &Previous, _, cx| this.move_selection(-1, cx)))
-            .on_action(cx.listener(|this, _: &Next, _, cx| this.move_selection(1, cx)))
-            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.iterate(1, cx)))
-            .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.iterate(-1, cx)))
-            .on_action(cx.listener(|this, _: &NextGroup, _, cx| this.next_group(1, cx)))
-            .on_action(cx.listener(|this, _: &PreviousGroup, _, cx| this.next_group(-1, cx)))
-            .on_action(cx.listener(|this, _: &ToggleEdited, _, cx| this.toggle_edited(cx)))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &Previous, window, cx| {
+                this.move_selection(-1, cx);
+                this.ask_for_frame(window);
+            }))
+            .on_action(cx.listener(|this, _: &Next, window, cx| {
+                this.move_selection(1, cx);
+                this.ask_for_frame(window);
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                this.iterate(1, cx);
+                this.ask_for_frame(window);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
+                this.iterate(-1, cx);
+                this.ask_for_frame(window);
+            }))
+            .on_action(cx.listener(|this, _: &NextGroup, window, cx| {
+                this.next_group(1, cx);
+                this.ask_for_frame(window);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousGroup, window, cx| {
+                this.next_group(-1, cx);
+                this.ask_for_frame(window);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleEdited, window, cx| {
+                this.toggle_edited(cx);
+                this.ask_for_frame(window);
+            }))
             .on_modifiers_changed(
                 cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
                     if !event.modifiers.control {

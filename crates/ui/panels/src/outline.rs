@@ -44,6 +44,40 @@ impl OpenEditors {
             .filter_map(|view| view.upgrade())
             .collect()
     }
+
+    /// An editor of `path` holds edits that are not on disk.
+    pub fn is_dirty(path: &Path, cx: &App) -> bool {
+        let editor = Self::get(cx, path);
+        editor.is_some_and(|editor| editor.read(cx).is_dirty())
+    }
+
+    /// A clean editor of `path` takes the disk text as one edit that undo can take back.
+    pub fn reload(path: &Path, cx: &mut App) {
+        if let Some(editor) = Self::get(cx, path) {
+            editor.update(cx, |editor, cx| editor.reload(cx));
+        }
+    }
+
+    /// The lines of the primary selection, from one, and its text.
+    pub fn selection(path: &Path, cx: &App) -> Option<(usize, usize, String)> {
+        let editor = Self::get(cx, path)?;
+        let editor = editor.read(cx);
+        let text = editor.text()?;
+        let (range, _) = editor.selection()?;
+        let picked = text.get(range.clone())?;
+        if picked.is_empty() {
+            return None;
+        }
+        let line_at = |offset: usize| text[..offset].matches('\n').count() + 1;
+        let first = line_at(range.start);
+        let last = line_at(range.end.saturating_sub(1).max(range.start));
+        Some((first, last, picked.to_string()))
+    }
+
+    /// The text of the editor of `path` with its unsaved edits.
+    pub fn text(path: &Path, cx: &App) -> Option<String> {
+        Self::get(cx, path)?.read(cx).text()
+    }
 }
 
 fn kind_of(kind: SymbolKind) -> OutlineKind {

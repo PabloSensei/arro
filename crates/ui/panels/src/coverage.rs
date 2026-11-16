@@ -21,10 +21,6 @@ const GROUP: &str = "bottom-panel";
 const COLUMN_WIDTH: f32 = 64.;
 const HEADER_HEIGHT: f32 = 24.;
 
-const COVERED: (u32, u32) = (0x5fb865, 0x208a3c);
-const PARTIAL: (u32, u32) = (0xf2c55c, 0xb59b1b);
-const NOT_COVERED: (u32, u32) = (0xf75464, 0xc7222d);
-
 /// The panel of the window, for the tests and the coverage stripes.
 pub struct ActiveCoverage(pub Entity<CoveragePanel>);
 
@@ -365,16 +361,12 @@ fn type_percent(kind: &TypeCoverage, column: CoverageColumn) -> Option<u32> {
     }
 }
 
-fn color((dark, light): (u32, u32), is_dark: bool) -> Hsla {
-    rgb(if is_dark { dark } else { light }).into()
-}
-
 /// The stripe of a line in the colour of its state.
-pub fn mark_color(state: CoverageState, dark: bool) -> Hsla {
+pub fn mark_color(state: CoverageState, theme: &Theme) -> Hsla {
     match state {
-        CoverageState::Covered => color(COVERED, dark),
-        CoverageState::Partial => color(PARTIAL, dark),
-        CoverageState::NotCovered => color(NOT_COVERED, dark),
+        CoverageState::Covered => theme.success,
+        CoverageState::Partial => theme.warning_mark,
+        CoverageState::NotCovered => theme.error,
     }
 }
 
@@ -388,7 +380,7 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
         return;
     };
     let report = panel.read(cx).coverage();
-    let dark = cx.global::<Theme>().dark;
+    let theme = *cx.global::<Theme>();
     let Some(report) = report else {
         view.set_coverage(Vec::new(), cx);
         return;
@@ -412,7 +404,7 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
                         branches: line
                             .branches
                             .map(|branches| (branches.covered, branches.total)),
-                        color: mark_color(state, dark),
+                        color: mark_color(state, &theme),
                     }
                 })
                 .collect()

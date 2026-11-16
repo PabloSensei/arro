@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::git::GitRunner;
+use vcs::GitRunner;
 
 /// `core.bigFileThreshold=1` packs a whole `git add` into one file instead of one per object,
 /// which takes the first snapshot of 15k files from 70 to 18 s (measured in S7).
@@ -37,6 +37,7 @@ pub struct ChangedFile {
     pub kind: ChangeKind,
 }
 
+#[derive(Clone)]
 pub struct HiddenRepo {
     git: GitRunner,
     git_dir: PathBuf,
@@ -81,6 +82,11 @@ impl HiddenRepo {
     }
 
     fn run(&self, arguments: &[&str]) -> io::Result<String> {
+        let output = self.run_bytes(arguments)?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
+
+    fn run_bytes(&self, arguments: &[&str]) -> io::Result<Vec<u8>> {
         let mut command = self.git.command(&self.work_tree);
         Self::isolate(&mut command);
         command
@@ -88,8 +94,21 @@ impl HiddenRepo {
             .arg(format!("--work-tree={}", self.work_tree.display()))
             .env("GIT_INDEX_FILE", &self.index)
             .args(arguments);
-        let output = GitRunner::checked(command)?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(GitRunner::checked(command)?.stdout)
+    }
+
+    /// The content of `path` in a snapshot, `None` when the file was not there.
+    pub fn read(&self, tree: &str, path: &str) -> io::Result<Option<Vec<u8>>> {
+        let listed = self.run(&["ls-tree", "--name-only", tree, "--", path])?;
+        if listed.trim().is_empty() {
+            return Ok(None);
+        }
+        let object = format!("{tree}:{path}");
+        self.run_bytes(&["cat-file", "blob", &object]).map(Some)
+    }
+
+    pub fn work_tree(&self) -> &Path {
+        &self.work_tree
     }
 
     /// Takes the working tree without ignored files and returns the id of the tree.

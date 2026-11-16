@@ -152,12 +152,55 @@ pub fn clear_recent(store: &Store) -> Result<(), store::Error> {
     store.put(RECENT_KEY, "[]")
 }
 
-pub fn load_dark_theme(store: &Store) -> bool {
-    store.get(THEME_KEY).ok().flatten().as_deref() != Some(LIGHT)
+/// The theme of the window as the state database holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedTheme {
+    pub dark: bool,
+    /// The user chose a theme at least once. A window that never chose one follows the
+    /// system while Sync with OS is on.
+    pub chosen: bool,
+}
+
+impl Default for SavedTheme {
+    fn default() -> Self {
+        Self {
+            dark: true,
+            chosen: false,
+        }
+    }
+}
+
+/// A missing or damaged value is the default theme that no one chose yet. A saved name
+/// this build does not know keeps its look of the base dark theme.
+pub fn load_theme(store: &Store) -> SavedTheme {
+    match store.get(THEME_KEY).ok().flatten().as_deref() {
+        Some(LIGHT) => SavedTheme {
+            dark: false,
+            chosen: true,
+        },
+        Some(DARK) => SavedTheme {
+            dark: true,
+            chosen: true,
+        },
+        Some(name) => SavedTheme {
+            dark: ui_kit::Theme::named(name).dark,
+            chosen: true,
+        },
+        None => SavedTheme::default(),
+    }
 }
 
 pub fn save_dark_theme(store: &Store, dark: bool) -> Result<(), store::Error> {
     store.put(THEME_KEY, if dark { DARK } else { LIGHT })
+}
+
+/// Remembers the chosen theme by its id, so that a theme of the settings folder opens
+/// again after a restart. The look of an id this build does not know stays dark.
+pub fn save_theme(store: &Store, id: &str, dark: bool) -> Result<(), store::Error> {
+    if id.is_empty() {
+        return save_dark_theme(store, dark);
+    }
+    store.put(THEME_KEY, id)
 }
 
 #[cfg(test)]
@@ -245,8 +288,15 @@ mod tests {
     #[test]
     fn theme_defaults_to_dark() {
         let store = Store::in_memory().unwrap();
-        assert!(load_dark_theme(&store));
+        assert_eq!(load_theme(&store), SavedTheme::default());
+        assert!(!load_theme(&store).chosen, "no theme was chosen yet");
         save_dark_theme(&store, false).unwrap();
-        assert!(!load_dark_theme(&store));
+        assert_eq!(
+            load_theme(&store),
+            SavedTheme {
+                dark: false,
+                chosen: true
+            }
+        );
     }
 }

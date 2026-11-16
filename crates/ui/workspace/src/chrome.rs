@@ -1,5 +1,6 @@
 //! What the main window looks like: the layout of the S10 mock on real state.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -45,6 +46,9 @@ use crate::window::{
 
 /// Wider than the gap itself so that the edge is easy to catch.
 const EDGE_GRIP: f32 = 6.;
+/// The border of a window that draws its own title bar, where a press resizes the
+/// window: the width of the border of the system windows of Ubuntu.
+const WINDOW_RESIZE_BORDER: f32 = 6.;
 const TAB_ID_SHIFT: usize = 16;
 /// The padding of both sides of a section of the menu bar.
 const MENU_ITEM_PADDING: f32 = SPACE_L;
@@ -95,6 +99,52 @@ fn own_chrome() -> bool {
     !cfg!(target_os = "macos") || cfg!(feature = "test-support")
 }
 
+/// The edge of the window a press at `position` resizes: the border that a window drawing
+/// its own title bar gives to the edges and corners of its frame. A maximized window has
+/// no border.
+fn resize_edge_at(
+    position: Point<Pixels>,
+    size: Size<Pixels>,
+    maximized: bool,
+) -> Option<ResizeEdge> {
+    if maximized {
+        return None;
+    }
+    let border = px(WINDOW_RESIZE_BORDER);
+    let left = position.x < border;
+    let right = position.x >= size.width - border;
+    let top = position.y < border;
+    let bottom = position.y >= size.height - border;
+    match (top, bottom, left, right) {
+        (true, _, true, _) => Some(ResizeEdge::TopLeft),
+        (true, _, _, true) => Some(ResizeEdge::TopRight),
+        (true, _, _, _) => Some(ResizeEdge::Top),
+        (_, true, true, _) => Some(ResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(ResizeEdge::BottomRight),
+        (_, true, _, _) => Some(ResizeEdge::Bottom),
+        (_, _, true, _) => Some(ResizeEdge::Left),
+        (_, _, _, true) => Some(ResizeEdge::Right),
+        _ => None,
+    }
+}
+
+/// Maximizes the window, or gives back the size it had before. macOS follows the system
+/// setting of a double click on the title bar, so a window there can minimize instead or
+/// do nothing. The test platform changes no window and only records the request.
+#[cfg(any(test, feature = "test-support"))]
+fn toggle_window_zoom(_window: &mut Window, cx: &mut App) {
+    let count = cx.default_global::<crate::window::WindowZoomRequests>();
+    count.0.set(count.0.get() + 1);
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn toggle_window_zoom(window: &mut Window, _cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    window.titlebar_double_click();
+    #[cfg(not(target_os = "macos"))]
+    window.zoom_window();
+}
+
 #[derive(Clone, Copy)]
 struct DraggedEdge(DockSide);
 
@@ -121,9 +171,16 @@ fn minimize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> State
     button.on_click(|_: &ClickEvent, window: &mut Window, _: &mut App| window.minimize_window())
 }
 
+/// The area of the platform is what the system finds in the frame it drew last. A
+/// press that reaches the client area instead, as after a resize a stale area can, is
+/// taken by the button itself; stopping the event keeps the system from doing the work
+/// a second time when it did find the area.
 #[cfg(windows)]
 fn minimize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
-    button
+    button.on_click(|_: &ClickEvent, window: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        window.minimize_window();
+    })
 }
 
 #[cfg(unix)]
@@ -133,7 +190,10 @@ fn maximize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> State
 
 #[cfg(windows)]
 fn maximize_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
-    button
+    button.on_click(|_: &ClickEvent, window: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        toggle_window_zoom(window, cx);
+    })
 }
 
 #[cfg(unix)]
@@ -143,9 +203,97 @@ fn close_button(button: Stateful<Div>, cx: &mut Context<Workspace>) -> Stateful<
     }))
 }
 
+/// The close area of the caption closes the window from the system, but the platform
+/// reads that area from the frame it drew last: on a frame that only the editor redrew
+/// the toolbar has no area, the press reaches the client area and nothing closes the
+/// window. The button takes its own click, as on Unix. Stopping the event keeps the
+/// system from closing the window a second time when it did find the area.
 #[cfg(windows)]
-fn close_button(button: Stateful<Div>, _cx: &mut Context<Workspace>) -> Stateful<Div> {
-    button
+fn close_button(button: Stateful<Div>, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+        cx.stop_propagation();
+        this.close_window(window, cx);
+    }))
+}
+
+/// The areas the caption drew last: the three window buttons and the empty space that
+/// moves the window. The platform asks for them in the frame it drew last, and the title
+/// bar is a cached view, so most frames have none of them. The window root draws every
+/// frame and gives the platform the areas the caption left here.
+#[derive(Clone, Default)]
+pub(crate) struct WindowControlAreas {
+    bounds: Rc<RefCell<WindowControlBounds>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct WindowControlBounds {
+    /// The buttons of the caption, in the order Min, Max, Close.
+    buttons: [Option<Bounds<Pixels>>; 3],
+    /// The empty part of the toolbar between its groups.
+    drag: Option<Bounds<Pixels>>,
+}
+
+impl WindowControlAreas {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Keeps the areas of the three buttons of the caption, in the order Min, Max, Close.
+    fn record_buttons(&self, bounds: &[Bounds<Pixels>]) {
+        let mut buttons = [None; 3];
+        for (slot, bounds) in buttons.iter_mut().zip(bounds) {
+            *slot = Some(*bounds);
+        }
+        self.bounds.borrow_mut().buttons = buttons;
+    }
+
+    fn record_drag(&self, bounds: Bounds<Pixels>) {
+        self.bounds.borrow_mut().drag = Some(bounds);
+    }
+
+    /// Forgets the areas of the caption: the window draws no title bar of its own, so the
+    /// platform must not find a control where there is no button.
+    pub(crate) fn clear(&self) {
+        *self.bounds.borrow_mut() = WindowControlBounds::default();
+    }
+
+    /// The hitboxes the frame gives the platform, one for each area of the caption. The
+    /// bounds are read while the frame is prepared, after the title bar has recorded its
+    /// own, so a frame that moves the buttons moves the areas with them.
+    #[cfg(windows)]
+    fn prepaint(&self, window: &mut Window) -> Vec<(WindowControlArea, Hitbox)> {
+        let bounds = *self.bounds.borrow();
+        let mut areas = Vec::with_capacity(4);
+        for (area, bounds) in [
+            (WindowControlArea::Min, bounds.buttons[0]),
+            (WindowControlArea::Max, bounds.buttons[1]),
+            (WindowControlArea::Close, bounds.buttons[2]),
+            (WindowControlArea::Drag, bounds.drag),
+        ] {
+            if let Some(bounds) = bounds {
+                areas.push((area, window.insert_hitbox(bounds, HitboxBehavior::Normal)));
+            }
+        }
+        areas
+    }
+
+    /// The areas of the last frame the caption drew, by the name a test knows them by.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn drawn(&self) -> Vec<(&'static str, Bounds<Pixels>)> {
+        let bounds = *self.bounds.borrow();
+        let mut areas = Vec::with_capacity(4);
+        for (name, bounds) in [
+            ("w-area-min", bounds.buttons[0]),
+            ("w-area-max", bounds.buttons[1]),
+            ("w-area-close", bounds.buttons[2]),
+            ("w-area-drag", bounds.drag),
+        ] {
+            if let Some(bounds) = bounds {
+                areas.push((name, bounds));
+            }
+        }
+        areas
+    }
 }
 
 /// A tab on its way to another place, by the pointer.
@@ -577,6 +725,172 @@ impl Workspace {
         });
     }
 
+    /// The areas of the window controls that the platform reads for hit testing. The title
+    /// bar is cached, so most frames do not carry them on their own; the root gives the
+    /// platform the bounds the bar left when it drew last, on every frame. The canvas
+    /// stands after the title bar in the tree, so a frame that draws the bar moves the
+    /// areas with it, and a window that draws no caption forgets them.
+    #[cfg(windows)]
+    fn caption_areas_canvas(&self) -> Option<AnyElement> {
+        if !own_chrome() {
+            return None;
+        }
+        let areas = self.window_control_areas.clone();
+        Some(
+            canvas(
+                move |_, window, _| areas.prepaint(window),
+                |_, hitboxes, window, _| {
+                    for (area, hitbox) in hitboxes {
+                        window.insert_window_control_hitbox(area, hitbox);
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into_any_element(),
+        )
+    }
+
+    /// The platforms with a title bar of their own take the controls from the elements
+    /// themselves, and the root adds no areas.
+    #[cfg(not(windows))]
+    fn caption_areas_canvas(&self) -> Option<AnyElement> {
+        None
+    }
+
+    /// The border of a window that draws its own title bar: a press on the border resizes
+    /// the window, and the cursor of the border says so. Windows and macOS decorate their
+    /// windows from the system, and a compositor that draws the frame of a Linux window
+    /// needs no border of ours either; a maximized window has no border at all.
+    fn window_resize_zones(&self, window: &Window) -> Vec<AnyElement> {
+        let Decorations::Client { .. } = window.window_decorations() else {
+            return Vec::new();
+        };
+        if !own_chrome() || window.is_maximized() || window.is_fullscreen() {
+            return Vec::new();
+        }
+        let size = window.viewport_size();
+        let border = px(WINDOW_RESIZE_BORDER);
+        let double = px(WINDOW_RESIZE_BORDER * 2.);
+        if size.width <= double || size.height <= double {
+            return Vec::new();
+        }
+        // The press: one area covers the window and reads the point of the press, so the
+        // border takes it anywhere on the border, as the frame of a system window does. A
+        // press off the border does nothing and goes on to the element below.
+        let press = div()
+            .id("window-resize")
+            .debug_selector(|| "window-resize".to_owned())
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                    let Some(edge) = resize_edge_at(
+                        event.position,
+                        window.viewport_size(),
+                        window.is_maximized(),
+                    ) else {
+                        return;
+                    };
+                    cx.stop_propagation();
+                    window.start_window_resize(edge);
+                },
+            )
+            .into_any_element();
+        // The cursor comes from the element under the pointer, so every side and corner
+        // of the border is an element of its own. They take no press.
+        let middle_width = size.width - double;
+        let middle_height = size.height - double;
+        let right = size.width - border;
+        let bottom = size.height - border;
+        let mut zones = Vec::with_capacity(9);
+        zones.push(press);
+        for (id, x, y, width, height, cursor) in [
+            (
+                "window-resize-top",
+                border,
+                px(0.),
+                middle_width,
+                border,
+                CursorStyle::ResizeUp,
+            ),
+            (
+                "window-resize-bottom",
+                border,
+                bottom,
+                middle_width,
+                border,
+                CursorStyle::ResizeDown,
+            ),
+            (
+                "window-resize-left",
+                px(0.),
+                border,
+                border,
+                middle_height,
+                CursorStyle::ResizeLeft,
+            ),
+            (
+                "window-resize-right",
+                right,
+                border,
+                border,
+                middle_height,
+                CursorStyle::ResizeRight,
+            ),
+            (
+                "window-resize-top-left",
+                px(0.),
+                px(0.),
+                border,
+                border,
+                CursorStyle::ResizeUpLeftDownRight,
+            ),
+            (
+                "window-resize-top-right",
+                right,
+                px(0.),
+                border,
+                border,
+                CursorStyle::ResizeUpRightDownLeft,
+            ),
+            (
+                "window-resize-bottom-left",
+                px(0.),
+                bottom,
+                border,
+                border,
+                CursorStyle::ResizeUpRightDownLeft,
+            ),
+            (
+                "window-resize-bottom-right",
+                right,
+                bottom,
+                border,
+                border,
+                CursorStyle::ResizeUpLeftDownRight,
+            ),
+        ] {
+            zones.push(
+                div()
+                    .id(id)
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(width)
+                    .h(height)
+                    .cursor(cursor)
+                    .into_any_element(),
+            );
+        }
+        zones
+    }
+
     fn toolbar(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let initial: String = self
             .name
@@ -670,10 +984,15 @@ impl Workspace {
         } else {
             TOOLBAR_WINDOW_GAP_IDLE
         };
+        // The platform reads a caption area in the frame it drew last, and this title bar
+        // is a cached view. The buttons leave their areas here so that the window root can
+        // put them back on the frames that keep this one.
+        let caption_space = self.window_control_areas.clone();
         let window_buttons = div()
             .flex()
             .items_center()
             .ml(px(window_gap))
+            .on_children_prepainted(move |bounds, _, _| caption_space.record_buttons(&bounds))
             .child(minimize_button(
                 window_button(
                     "w-min",
@@ -737,20 +1056,53 @@ impl Workspace {
             .children(controls.then_some(tools))
             .children(own_chrome().then_some(window_buttons));
 
+        // The empty space of the toolbar moves the window. Interactive elements stand
+        // beside it rather than over it, so a press on a menu or a button never starts a
+        // move. The area is recorded here and put back by the window root every frame.
+        let drag_space = self.window_control_areas.clone();
+        let drag_probe = canvas(
+            move |bounds, _, _| drag_space.record_drag(bounds),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let titlebar_drag = div()
+            .id("titlebar-drag")
+            .debug_selector(|| "w-drag-space".to_owned())
+            .flex_1()
+            .h_full()
+            .child(drag_probe);
+        // A second press on the empty part of the title bar maximizes the window, or gives
+        // back the size it had. The first press moves the window, as the caption of a
+        // system window does. Taking the second press keeps the platform from handling the
+        // double click of the caption itself, as the default handler of a Windows window
+        // would.
         #[cfg(unix)]
-        let titlebar_drag = Some(
-            div()
-                .id("titlebar-drag")
-                .flex_1()
-                .h_full()
-                .on_mouse_down(MouseButton::Left, |_, window: &mut Window, _: &mut App| {
+        let titlebar_drag = titlebar_drag.on_mouse_down(
+            MouseButton::Left,
+            |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                if event.click_count >= 2 {
+                    cx.stop_propagation();
+                    toggle_window_zoom(window, cx);
+                } else {
                     window.start_window_move()
-                }),
+                }
+            },
         );
         #[cfg(windows)]
-        let titlebar_drag: Option<Div> = None;
+        let titlebar_drag = titlebar_drag.on_mouse_down(
+            MouseButton::Left,
+            |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                if event.click_count >= 2 {
+                    cx.stop_propagation();
+                    toggle_window_zoom(window, cx);
+                }
+            },
+        );
 
-        div()
+        let toolbar = div()
             .id("toolbar")
             .debug_selector(|| "toolbar".to_owned())
             .relative()
@@ -758,8 +1110,12 @@ impl Workspace {
             .items_center()
             .justify_between()
             .flex_none()
-            .h(px(TOOLBAR_HEIGHT))
-            .window_control_area(WindowControlArea::Drag)
+            .h(px(TOOLBAR_HEIGHT));
+        // Unix client decorations move the window from this area themselves; Windows gets
+        // it from the root each frame, where a cached frame cannot lose it.
+        #[cfg(not(windows))]
+        let toolbar = toolbar.window_control_area(WindowControlArea::Drag);
+        toolbar
             .child(
                 div()
                     .id("left-group")
@@ -781,7 +1137,7 @@ impl Workspace {
                             .flatten(),
                     ),
             )
-            .children(titlebar_drag)
+            .child(titlebar_drag)
             .child(right)
     }
 
@@ -1592,7 +1948,9 @@ impl Workspace {
                 command("git.show_selection_history", "Show History for Selection"),
                 command("git.show_method_history", "Show History for Method"),
                 command("git.show_log", "Git Log"),
-                command(workspace_keys::ROLLBACK_CHANGED_LINES, "Revert Change"),
+                command(workspace_keys::ROLLBACK_CHANGED_LINES, "Rollback Lines"),
+                command(workspace_keys::NEXT_CHANGE, "Show Next Change"),
+                command(workspace_keys::PREVIOUS_CHANGE, "Show Previous Change"),
             ],
         );
 
@@ -1693,10 +2051,12 @@ impl Workspace {
         sections: &[MenuEntry],
         cx: &mut Context<Self>,
     ) -> usize {
-        let scale = cx
-            .try_global::<Settings>()
-            .map_or(1., |settings| settings.ui_scale);
-        let font_size = px(UI_SIZE * scale);
+        // The text grows by itself only where the platform does not grow the window.
+        let font_size = px(UI_SIZE
+            * text_scale(
+                cx.try_global::<Settings>()
+                    .map_or(1., |settings| settings.ui_scale),
+            ));
         let widths: Vec<f32> = sections
             .iter()
             .map(|section| {
@@ -2525,10 +2885,21 @@ impl Render for Workspace {
         }
         let theme = *cx.global::<Theme>();
         let gap = px(ISLAND_GAP);
-        let scale = cx
-            .try_global::<Settings>()
-            .map_or(1., |settings| settings.ui_scale);
-        window.set_rem_size(px(16. * scale));
+        #[cfg(feature = "test-support")]
+        self.apply_test_ui_scale(window);
+        // The text grows by itself only where the platform does not grow the window.
+        let text = text_scale(
+            cx.try_global::<Settings>()
+                .map_or(1., |settings| settings.ui_scale),
+        );
+        window.set_rem_size(px(16. * text));
+        // The platform looks for the areas of the caption in the frame it drew last, and
+        // the title bar is a cached view: the root gives them back on every frame. A
+        // window without a caption of its own has none, and the areas of an older frame
+        // must not stay where no button is drawn.
+        if !own_chrome() {
+            self.window_control_areas.clear();
+        }
         let viewport = window.viewport_size();
         let (shows_stripes, shows_status) = {
             let settings = cx.try_global::<Settings>();
@@ -2629,7 +3000,7 @@ impl Render for Workspace {
             .bg(theme.main_bg)
             .text_color(theme.text)
             .font_family(UI_FONT)
-            .text_size(px(UI_SIZE * scale))
+            .text_size(px(UI_SIZE * text))
             .child(
                 // The side buttons of the mouse are the keys of Back and Forward:
                 // pressing one runs the same command wherever the pointer is, even over
@@ -2916,6 +3287,10 @@ impl Render for Workspace {
                     )
                     .into_any_element(),
             )
+            // After the title bar: a frame that draws the bar records the bounds of its
+            // buttons first, and the areas of the platform follow it in the same frame.
+            // Every other frame keeps the cached bar and gets the areas it left behind.
+            .children(self.caption_areas_canvas())
             .child(
                 div()
                     .flex()
@@ -2966,6 +3341,9 @@ impl Render for Workspace {
             }))
             .children(self.overlay_element(&theme, window, cx))
             .children(self.balloon_element(&theme, cx))
+            // The border stands above the window: a press on it resizes the window and
+            // never reaches the scrollbar or a button under the pointer.
+            .children(self.window_resize_zones(window))
     }
 }
 
@@ -3128,6 +3506,24 @@ impl TabBarView {
             cx.notify();
         }
     }
+
+    /// Runs a change of the workspace once this bar is free. A change that takes a tab
+    /// out of its group may drop the group and renumbers every strip, which updates this
+    /// bar too: from a handler of the bar itself that would update it while it is already
+    /// being updated.
+    fn defer_change(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| change(workspace, window, cx))
+                .ok();
+        });
+    }
 }
 
 impl Render for TabBarView {
@@ -3176,24 +3572,19 @@ impl Render for TabBarView {
                 pinned,
             };
             // The dot of a pinned tab unpins it, the cross of another one closes it.
-            let close_workspace = self.workspace.clone();
-            let close = cx.listener(move |_, _: &ClickEvent, window, cx| {
+            let close = cx.listener(move |this, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                close_workspace
-                    .update(cx, |workspace, cx| {
-                        if pinned {
-                            workspace.toggle_pin(pane, index, window, cx);
-                        } else {
-                            workspace.close_tab(pane, index, window, cx);
-                        }
-                    })
-                    .ok();
+                this.defer_change(window, cx, move |workspace, window, cx| {
+                    if pinned {
+                        workspace.toggle_pin(pane, index, window, cx);
+                    } else {
+                        workspace.close_tab(pane, index, window, cx);
+                    }
+                });
             });
             let dragged = DraggedTab { pane, index, title };
             let select_workspace = self.workspace.clone();
-            let middle_workspace = self.workspace.clone();
             let menu_workspace = self.workspace.clone();
-            let drop_workspace = self.workspace.clone();
             tab(style, close, &theme)
                 .debug_selector(move || format!("tab-{pane}-{index}"))
                 .on_click(cx.listener(move |_, _, window, cx| {
@@ -3205,12 +3596,10 @@ impl Render for TabBarView {
                 }))
                 .on_mouse_down(
                     MouseButton::Middle,
-                    cx.listener(move |_, _, window, cx| {
-                        middle_workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.close_tab(pane, index, window, cx)
-                            })
-                            .ok();
+                    cx.listener(move |this, _, window, cx| {
+                        this.defer_change(window, cx, move |workspace, window, cx| {
+                            workspace.close_tab(pane, index, window, cx)
+                        });
                     }),
                 )
                 .on_mouse_down(
@@ -3228,16 +3617,13 @@ impl Render for TabBarView {
                     cx.new(|_| TabDragPreview(title))
                 })
                 .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(selection))
-                .on_drop(cx.listener(move |_, dragged: &DraggedTab, window, cx| {
+                .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                     let from = (dragged.pane, dragged.index);
-                    drop_workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.move_tab(from, (pane, index), window, cx)
-                        })
-                        .ok();
+                    this.defer_change(window, cx, move |workspace, window, cx| {
+                        workspace.move_tab(from, (pane, index), window, cx)
+                    });
                 }))
         });
-        let end_workspace = self.workspace.clone();
         let strip = div()
             .id(("tabs", pane))
             .debug_selector(move || format!("tabs-{pane}"))
@@ -3249,14 +3635,12 @@ impl Render for TabBarView {
             .track_scroll(&scroll)
             .children(items)
             .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(selection))
-            .on_drop(cx.listener(move |_, dragged: &DraggedTab, window, cx| {
+            .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                 let from = (dragged.pane, dragged.index);
-                end_workspace
-                    .update(cx, |workspace, cx| {
-                        let end = workspace.panes[pane].tabs.len();
-                        workspace.move_tab(from, (pane, end), window, cx);
-                    })
-                    .ok();
+                this.defer_change(window, cx, move |workspace, window, cx| {
+                    let end = workspace.panes.get(pane).map_or(0, |pane| pane.tabs.len());
+                    workspace.move_tab(from, (pane, end), window, cx);
+                });
             }));
         div()
             .flex()
@@ -3374,8 +3758,12 @@ impl Render for StatusBarView {
             status_widget("st-zoom", text, &theme).debug_selector(|| "st-zoom".to_owned())
         });
         let language = language_status.map(|text| {
+            // A server that is still starting or importing cannot answer: its line is
+            // shown in the warning colour, so the user sees why Ctrl+B waits.
+            let ready = text.ends_with("ready");
             let widget = status_widget("st-language", text, &theme)
-                .debug_selector(|| "st-language".to_owned());
+                .debug_selector(|| "st-language".to_owned())
+                .when(!ready, |widget| widget.text_color(theme.warning_mark));
             if language_details {
                 let workspace = self.workspace.clone();
                 widget
@@ -3541,6 +3929,7 @@ impl Render for StatusBarView {
 mod tests {
     use super::path_parts;
     use std::path::Path;
+    use ui_kit::gpui::{Bounds, Pixels, ResizeEdge, point, px, size};
 
     #[test]
     fn a_recent_project_shows_its_name_and_folder() {
@@ -3553,5 +3942,107 @@ mod tests {
         let root = Path::new("C:/project");
         let path = Path::new("C:/project/src/App.txt");
         assert_eq!(path_parts(root, path), ["src", "App.txt"]);
+    }
+
+    /// An area of a caption, ten pixels high and as wide as the test names.
+    fn area(left: f32, width: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(left), px(0.)),
+            size: size(px(width), px(10.)),
+        }
+    }
+
+    #[test]
+    fn the_areas_of_the_caption_are_its_buttons_and_its_empty_space() {
+        let areas = super::WindowControlAreas::new();
+        assert!(
+            areas.drawn().is_empty(),
+            "a caption that did not draw has no areas"
+        );
+
+        areas.record_buttons(&[area(0., 10.), area(10., 10.), area(20., 10.)]);
+        areas.record_drag(area(30., 40.));
+
+        assert_eq!(
+            areas.drawn(),
+            vec![
+                ("w-area-min", area(0., 10.)),
+                ("w-area-max", area(10., 10.)),
+                ("w-area-close", area(20., 10.)),
+                ("w-area-drag", area(30., 40.)),
+            ],
+            "the areas are the buttons of the caption and the space that moves the window"
+        );
+    }
+
+    #[test]
+    fn a_window_without_the_caption_forgets_its_areas() {
+        let areas = super::WindowControlAreas::new();
+        areas.record_buttons(&[area(0., 10.), area(10., 10.), area(20., 10.)]);
+        areas.record_drag(area(30., 40.));
+
+        areas.clear();
+
+        assert!(
+            areas.drawn().is_empty(),
+            "no area of an older frame stays where no button is drawn"
+        );
+    }
+
+    #[test]
+    fn the_border_of_the_window_gives_the_edge_that_resizes_it() {
+        let window = size(px(800.), px(600.));
+        for (position, edge) in [
+            (point(px(400.), px(1.)), ResizeEdge::Top),
+            (point(px(400.), px(599.)), ResizeEdge::Bottom),
+            (point(px(1.), px(300.)), ResizeEdge::Left),
+            (point(px(799.), px(300.)), ResizeEdge::Right),
+            (point(px(1.), px(1.)), ResizeEdge::TopLeft),
+            (point(px(799.), px(1.)), ResizeEdge::TopRight),
+            (point(px(1.), px(599.)), ResizeEdge::BottomLeft),
+            (point(px(799.), px(599.)), ResizeEdge::BottomRight),
+        ] {
+            assert_eq!(
+                super::resize_edge_at(position, window, false),
+                Some(edge),
+                "a press at {position:?} resizes from {edge:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_press_off_the_border_resizes_nothing() {
+        let window = size(px(800.), px(600.));
+        let border = super::WINDOW_RESIZE_BORDER;
+        for position in [
+            point(px(border), px(border)),
+            point(px(400.), px(300.)),
+            point(px(800. - border - 1.), px(600. - border - 1.)),
+            point(px(80.), px(300.)),
+        ] {
+            assert_eq!(
+                super::resize_edge_at(position, window, false),
+                None,
+                "a press at {position:?} is inside the window and resizes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_maximized_window_has_no_border() {
+        let window = size(px(800.), px(600.));
+        for position in [
+            point(px(0.), px(0.)),
+            point(px(1.), px(300.)),
+            point(px(799.), px(1.)),
+            point(px(799.), px(599.)),
+            point(px(400.), px(300.)),
+        ] {
+            assert_eq!(
+                super::resize_edge_at(position, window, true),
+                None,
+                "a maximized window at {position:?} has no edge to resize"
+            );
+        }
     }
 }

@@ -115,18 +115,13 @@ impl EditorStyle {
             inline_code_background: theme.hover,
             fold_background: theme.fold_bg,
             fold_text: theme.fold_text,
-            // No theme token yet: the red of an IDEA error stripe.
-            error_mark: rgb(0xe55757).into(),
+            error_mark: theme.error,
             warning_mark: theme.warning_mark,
             spell_mark: theme.spell_mark,
             panel: theme.popup_bg,
             panel_border: theme.popup_border,
             accent: theme.accent,
-            error: if theme.dark {
-                rgb(0xf75464).into()
-            } else {
-                rgb(0xc7222d).into()
-            },
+            error: theme.error,
             occurrence: theme.selection_muted,
             bracket: theme.selection_inactive,
             find_match: Hsla {

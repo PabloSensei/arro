@@ -8,7 +8,7 @@ use editor_view::{EditorView, Spot};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{UI_SCALE_STEP, Workspace};
+use workspace::{Dismiss, UI_SCALE_STEP, Workspace};
 
 use crate::navigation;
 
@@ -365,14 +365,29 @@ impl Render for NavBarPopup {
     }
 }
 
-/// Ctrl+Backquote: the theme, the keymap and the scale of the interface in one list.
+/// Ctrl+Backquote: a scheme of the window. The first rows are the theme, the keymap and
+/// the scale, then every theme of the catalog. Arrows show a theme at once, Enter keeps
+/// it, Esc brings the theme of the open back.
 pub struct ChangeSchemePopup {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
     selected: usize,
-    theme_dark: bool,
     scale: f32,
+    /// The theme the window showed when the list opened.
+    original: Theme,
+    original_name: String,
+    themes: Vec<ThemeRow>,
 }
+
+/// One theme of the list, with the colours its row previews.
+struct ThemeRow {
+    id: String,
+    name: String,
+    theme: Theme,
+}
+
+/// The rows before the themes: the theme of the window, the keymap and the scale.
+const SCHEME_ROWS: usize = 3;
 
 pub(crate) fn show_change_scheme(
     workspace: &mut Workspace,
@@ -380,36 +395,83 @@ pub(crate) fn show_change_scheme(
     cx: &mut Context<Workspace>,
 ) {
     let weak = cx.weak_entity();
-    let theme_dark = cx.global::<Theme>().dark;
+    let original = *cx.global::<Theme>();
     let scale = workspace.ui_scale(cx);
+    let library = ThemeCatalog::library_of(cx);
+    let original_name = library.get(original.id()).map_or_else(
+        || Theme::label(original.id()),
+        |definition| definition.name.clone(),
+    );
+    let themes = library
+        .themes()
+        .iter()
+        .map(|definition| ThemeRow {
+            id: definition.id.clone(),
+            name: definition.name.clone(),
+            theme: Theme::from_definition(definition),
+        })
+        .collect();
     let view = cx.new(|cx| ChangeSchemePopup {
         workspace: weak,
         focus: cx.focus_handle(),
         selected: 0,
-        theme_dark,
         scale,
+        original,
+        original_name,
+        themes,
     });
     let focus = view.read(cx).focus.clone();
     workspace.show_overlay(view.into(), focus, window, cx);
 }
 
 impl ChangeSchemePopup {
-    fn rows(&self) -> Vec<(&'static str, String)> {
-        vec![
-            (
-                "Theme",
-                if self.theme_dark { "Dark" } else { "Light" }.to_owned(),
-            ),
-            ("Keymap", "IntelliJ IDEA (Windows)".to_owned()),
-            ("Scale", format!("{}%", (self.scale * 100.).round())),
-        ]
+    /// The value of one of the three rows before the themes.
+    fn value(&self, index: usize) -> String {
+        match index {
+            0 => self.original_name.clone(),
+            1 => "IntelliJ IDEA (Windows)".to_owned(),
+            _ => format!("{}%", (self.scale * 100.).round()),
+        }
+    }
+
+    /// The title of one of the three rows before the themes.
+    fn title(index: usize) -> &'static str {
+        match index {
+            0 => "Theme",
+            1 => "Keymap",
+            _ => "Scale",
+        }
+    }
+
+    /// The theme the list opened with, for a click outside it.
+    fn theme_of_open(&self) -> Theme {
+        self.original
+    }
+
+    /// The theme under the selection, when a theme row has it.
+    fn theme_at(&self, index: usize) -> Option<&ThemeRow> {
+        self.themes.get(index.checked_sub(SCHEME_ROWS)?)
+    }
+
+    /// Shows the theme under the selection, or the theme of the open on the rows above
+    /// the themes. Nothing is saved.
+    fn preview(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let _ = window;
+        let original = self.original;
+        let id = self.theme_at(self.selected).map(|row| row.id.clone());
+        self.workspace
+            .update(cx, |workspace, cx| match id {
+                Some(id) => workspace.preview_theme(&id, cx),
+                None => workspace.restore_theme(original, cx),
+            })
+            .ok();
     }
 
     fn pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = index;
+        let theme = self.theme_at(index).map(|row| (row.id.clone(), row.theme));
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.dismiss(window, cx);
                 match index {
                     0 => workspace.toggle_theme(cx),
                     1 => workspace.notify_user(
@@ -417,22 +479,30 @@ impl ChangeSchemePopup {
                         "IntelliJ IDEA (Windows) is the only keymap",
                         cx,
                     ),
-                    _ => workspace.zoom_ide(UI_SCALE_STEP, cx),
+                    2 => workspace.zoom_ide(UI_SCALE_STEP, cx),
+                    _ => {
+                        if let Some((id, _)) = &theme {
+                            workspace.choose_theme(id, cx);
+                        }
+                    }
                 }
+                workspace.dismiss(window, cx);
             })
             .ok();
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.as_str();
-        match key {
+        let last = SCHEME_ROWS + self.themes.len().saturating_sub(1);
+        match event.keystroke.key.as_str() {
             "up" | "left" => {
                 self.selected = self.selected.saturating_sub(1);
+                self.preview(window, cx);
                 cx.stop_propagation();
                 cx.notify();
             }
             "down" | "right" => {
-                self.selected = (self.selected + 1).min(2);
+                self.selected = (self.selected + 1).min(last);
+                self.preview(window, cx);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -441,8 +511,12 @@ impl ChangeSchemePopup {
                 cx.stop_propagation();
             }
             "escape" => {
+                let original = self.original;
                 self.workspace
-                    .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+                    .update(cx, |workspace, cx| {
+                        workspace.restore_theme(original, cx);
+                        workspace.dismiss(window, cx);
+                    })
                     .ok();
                 cx.stop_propagation();
             }
@@ -457,11 +531,8 @@ impl Render for ChangeSchemePopup {
         let viewport = window.viewport_size();
         let left = (viewport.width - px(WIDTH)) / 2.;
         let top = viewport.height * 0.18;
-        let rows: Vec<_> = self
-            .rows()
-            .into_iter()
-            .enumerate()
-            .map(|(index, (title, value))| {
+        let mut rows: Vec<AnyElement> = (0..SCHEME_ROWS)
+            .map(|index| {
                 let selected = index == self.selected;
                 div()
                     .id(("scheme-row", index))
@@ -477,26 +548,83 @@ impl Render for ChangeSchemePopup {
                     .when(!selected, |this| {
                         this.hover(|style| style.bg(theme.selection_hover))
                     })
-                    .child(title)
+                    .child(Self::title(index))
                     .child(
                         div()
                             .text_color(theme.text_secondary)
-                            .child(SharedString::from(value)),
+                            .child(SharedString::from(self.value(index))),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| this.pick(index, window, cx)))
+                    .into_any_element()
             })
             .collect();
+        for (index, row) in self.themes.iter().enumerate() {
+            let selected = SCHEME_ROWS + index == self.selected;
+            let current = row.theme.id() == theme.id();
+            let row_theme = row.theme;
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("scheme-theme-{}", row.id)))
+                    .debug_selector({
+                        let id = row.id.clone();
+                        move || format!("scheme-theme-{}", id)
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .flex_none()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .rounded(px(ROW_RADIUS))
+                    .when(selected, |this| this.bg(theme.selection))
+                    .when(!selected, |this| {
+                        this.hover(|style| style.bg(theme.selection_hover))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(SPACE_XS))
+                            .child(swatch(row_theme.main_bg))
+                            .child(swatch(row_theme.text))
+                            .child(swatch(row_theme.accent)),
+                    )
+                    .child(SharedString::from(row.name.clone()))
+                    .when(current, |this| {
+                        this.child(div().text_color(theme.accent).child("\u{2713}"))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.pick(SCHEME_ROWS + index, window, cx)
+                    }))
+                    .into_any_element(),
+            );
+        }
         let body = surface(&theme)
             .id("scheme-popup")
             .debug_selector(|| "scheme-popup".to_owned())
             .track_focus(&self.focus)
             .occlude()
             .w(px(WIDTH))
+            .max_h(px(ROWS_HEIGHT + ROW_HEIGHT * (SCHEME_ROWS as f32)))
+            .overflow_hidden()
             .p(px(POPUP_PADDING))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+            .capture_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                let original = this.theme_of_open();
                 this.workspace
-                    .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+                    .update(cx, |workspace, cx| {
+                        workspace.restore_theme(original, cx);
+                        workspace.dismiss(window, cx);
+                    })
+                    .ok();
+                cx.stop_propagation();
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                let original = this.theme_of_open();
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.restore_theme(original, cx);
+                        workspace.dismiss(window, cx);
+                    })
                     .ok();
             }))
             .child(
@@ -515,6 +643,11 @@ impl Render for ChangeSchemePopup {
             .top(top)
             .child(enter("scheme-enter", body))
     }
+}
+
+/// A little colour strip of a theme row.
+fn swatch(color: Hsla) -> Div {
+    div().w(px(14.)).h(px(10.)).rounded(px(2.)).bg(color)
 }
 
 /// Ctrl+Alt+Shift+Insert: the language of a new scratch file, from the running servers.

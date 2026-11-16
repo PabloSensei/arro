@@ -33,7 +33,10 @@ use crate::element::{ANNOTATE_WIDTH, EditorElement, GUTTER_WIDTH, Layout, Stripe
 use crate::live::LiveTemplates;
 use crate::refactor::Refactoring;
 use crate::scrollbar::{Axis, Drag};
-use crate::semantic::{CompletionMode, Lsp, Reveals, signature_segments};
+use crate::semantic::{
+    CompletionMode, Lsp, Reveals, completion_doc_rows, completion_kind_icon, location_label,
+    signature_segments,
+};
 use crate::state::{Conflict, EditorState, LoadError, Saved};
 use crate::style::EditorStyle;
 
@@ -650,6 +653,12 @@ pub enum EditorEvent {
         line: u32,
         shift: bool,
     },
+    /// A change mark beside the line numbers was clicked: the line of the mark, from
+    /// zero. The window shows what the line was before the change.
+    ChangeMarkClick(u32),
+    /// The pointer came to a change mark of the gutter, or left the marks: the line of
+    /// the mark, from zero, and `None` when no mark is under the pointer.
+    ChangeMarkHover(Option<u32>),
     /// A blame label was clicked: the window shows this commit in the history.
     BlameCommit(String),
     /// Ctrl+Shift+V: the window shows what was copied, [`EditorView::paste_text`] takes the pick.
@@ -740,6 +749,46 @@ struct HippieCycle {
     /// Every candidate in the forward order, so both directions walk the same list.
     words: Vec<String>,
     index: usize,
+}
+
+/// A press in the gutter that waits for the release: a click places a breakpoint, a
+/// drag selects whole lines.
+struct GutterPress {
+    /// The line of the press, from zero.
+    line: u32,
+    /// Shift was held, which puts a breakpoint that does not stop the program.
+    shift: bool,
+    /// Where the press began, so a drag is told from a click.
+    start: Point<Pixels>,
+    /// The pointer moved far enough to select lines rather than place a breakpoint.
+    dragging: bool,
+}
+
+/// A drag that began with a multiple click: the selection grows by words or by lines
+/// from the place of the press, as IDEA selects them.
+#[derive(Clone, Copy)]
+enum DragUnit {
+    /// The offset of the press; a drag takes the whole words around both ends.
+    Words(usize),
+    /// The offset of the press; a drag takes the whole lines around both ends.
+    Lines(usize),
+}
+
+/// The unit of a drag for a press that is the second or the third click of a series.
+fn drag_of(click_count: usize, offset: usize) -> Option<DragUnit> {
+    match click_count {
+        2 => Some(DragUnit::Words(offset)),
+        3.. => Some(DragUnit::Lines(offset)),
+        _ => None,
+    }
+}
+
+/// The rows of an open Alt+Enter list and the preview of the selected one, for a test.
+#[cfg(any(test, feature = "test-support"))]
+pub struct ActionRows {
+    /// The section of the row, true for a quick fix, and its label.
+    pub rows: Vec<(bool, String)>,
+    pub preview: Option<Vec<String>>,
 }
 
 /// The behaviour of an open editor that comes from Settings. The colours and the size
@@ -876,6 +925,8 @@ pub struct EditorView {
     pub(crate) sticky: Vec<usize>,
     /// Alt+drag: where it began and the carets that were there before.
     block_drag: Option<(usize, Vec<Selection>)>,
+    /// A press in the gutter that waits for the release.
+    gutter_press: Option<GutterPress>,
     /// The first key of a chord that waits for the next one.
     chords: Vec<Keystroke>,
     /// Alt+Q: the header of the enclosing declaration, shown while the caret stays.
@@ -887,6 +938,8 @@ pub struct EditorView {
     pub(crate) scroll_left: f32,
     /// The room that centres the text of Distraction Free Mode, in pixels.
     pub(crate) center_inset: f32,
+    /// The width of the gutter of the last frame: it follows the digits of the numbers.
+    pub(crate) gutter_width: f32,
     /// The horizontal bar was painted in the last frame.
     pub(crate) horizontal_bar: bool,
     /// The widest row of the text and the rows it was counted on, so that a repaint
@@ -904,6 +957,9 @@ pub struct EditorView {
     coverage_hint: Option<(String, Point<Pixels>)>,
     /// The hint of a badge of the gutter under the pointer, and where it stands.
     place_hint: Option<(String, Point<Pixels>)>,
+    /// The line of the change mark under the pointer, from zero, so that the window
+    /// hears about coming to a mark and leaving it once.
+    change_mark_hovered: Option<u32>,
     pub(crate) autoscroll: bool,
     /// The next autoscroll puts the caret near the middle, as a jump to a place does.
     pub(crate) reveal_center: bool,
@@ -930,6 +986,8 @@ pub struct EditorView {
     pub(crate) field_watchpoints: Vec<u32>,
     pub(crate) gutter_marks: Vec<GutterMark>,
     selecting: bool,
+    /// How a drag that began with a double or a triple click grows the selection.
+    drag: Option<DragUnit>,
     was_dirty: bool,
     /// The saves of this view whose text has not reached the disk yet. A count, because
     /// a blocking save may write while a background one is on its way; the task that
@@ -955,6 +1013,12 @@ pub struct EditorView {
     pub(crate) inlay_range: Option<(usize, usize)>,
     /// The open question for inlay hints; a new one cancels the old at the server.
     pub(crate) inlays_task: Option<Task<()>>,
+    /// The open completion question; a new key cancels the old at the server.
+    pub(crate) completion_task: Option<Task<()>>,
+    /// The open question for the documentation of the selected completion entry.
+    pub(crate) completion_doc_task: Option<Task<()>>,
+    /// The message under the caret that closes by itself.
+    pub(crate) note_task: Option<Task<()>>,
     /// The labels above declarations, as the language gave them for this text.
     pub(crate) code_lens: Vec<crate::code_lens::CodeLensItem>,
     /// The parts of each block row, in the order the row draws them.
@@ -967,6 +1031,9 @@ pub struct EditorView {
     pub(crate) code_lens_resolved: Vec<usize>,
     /// The open code lens question; a new one cancels the old at the server.
     pub(crate) code_lens_task: Option<Task<()>>,
+    /// The labels of the visible rows waiting for their counts; a new question or a
+    /// keystroke stops it.
+    pub(crate) code_lens_resolve_task: Option<Task<()>>,
     /// The documentation comments of the language and the choices made for each.
     pub(crate) docs: crate::rendered_doc::RenderedDocs,
     /// The preview of a markdown file beside its text, `None` for other files.
@@ -1165,6 +1232,14 @@ impl EditorView {
         }
         cx.observe_global::<Reveals>(|this, cx| this.reveal(cx))
             .detach();
+        // The window lost the focus of the system: its popups go with it, as IDEA
+        // closes them.
+        cx.observe_window_activation(window, |view, window, cx| {
+            if !window.is_window_active() {
+                view.dismiss_popups(cx);
+            }
+        })
+        .detach();
         view.start_blink(window, cx);
         view
     }
@@ -1437,6 +1512,7 @@ impl EditorView {
             awaiting_mnemonic: false,
             sticky: Vec::new(),
             block_drag: None,
+            gutter_press: None,
             chords: Vec::new(),
             context_info: None,
             region_popup: None,
@@ -1444,6 +1520,7 @@ impl EditorView {
             scroll_top: 0.,
             scroll_left: 0.,
             center_inset: 0.,
+            gutter_width: GUTTER_WIDTH,
             horizontal_bar: false,
             widest: None,
             scrollbar_hovered: false,
@@ -1452,6 +1529,7 @@ impl EditorView {
             annotate_hint: None,
             coverage_hint: None,
             place_hint: None,
+            change_mark_hovered: None,
             autoscroll: false,
             reveal_center: false,
             caret_on: true,
@@ -1470,6 +1548,7 @@ impl EditorView {
             field_watchpoints: Vec::new(),
             gutter_marks: Vec::new(),
             selecting: false,
+            drag: None,
             was_dirty: false,
             saving: Arc::new(AtomicUsize::new(0)),
             last_saved: None,
@@ -1485,12 +1564,16 @@ impl EditorView {
             pending_spot: None,
             inlay_range: None,
             inlays_task: None,
+            completion_task: None,
+            completion_doc_task: None,
+            note_task: None,
             code_lens: Vec::new(),
             code_vision_labels: Vec::new(),
             code_vision_hovered: None,
             code_lens_asked: 0,
             code_lens_resolved: Vec::new(),
             code_lens_task: None,
+            code_lens_resolve_task: None,
             docs: crate::rendered_doc::RenderedDocs::default(),
             preview: None,
             picture_cache: None,
@@ -1808,6 +1891,39 @@ impl EditorView {
             .map(|mark| mark.bounds)
     }
 
+    /// Where the change mark of the gutter stands, for a click in a test.
+    pub fn change_mark_bounds(&self, line: usize) -> Option<Bounds<Pixels>> {
+        let layout = self.layout.as_ref()?;
+        let shown = layout
+            .rows
+            .iter()
+            .find(|row| !row.is_block && row.buffer_line == line)?;
+        let right = layout.bounds.left() + px(self.gutter_width);
+        Some(Bounds::new(
+            point(right - px(9.), shown.y),
+            size(px(10.), px(self.style.line_height)),
+        ))
+    }
+
+    /// The place of the editor in the window, as the last frame painted it.
+    pub fn editor_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.layout.as_ref().map(|layout| layout.bounds)
+    }
+
+    /// The row of `line` in the window, when the last frame painted it; `None` while the
+    /// line is out of sight or taken by a fold.
+    pub fn line_bounds(&self, line: usize) -> Option<Bounds<Pixels>> {
+        let layout = self.layout.as_ref()?;
+        let shown = layout
+            .rows
+            .iter()
+            .find(|row| !row.is_block && row.buffer_line == line)?;
+        Some(Bounds::new(
+            point(layout.bounds.left(), shown.y),
+            size(layout.bounds.size.width, px(self.style.line_height)),
+        ))
+    }
+
     /// The rows of the last frame, from the top, with the number of each in the gutter.
     pub fn row_paint(&self) -> Vec<RowPaint> {
         let Some(layout) = &self.layout else {
@@ -1823,6 +1939,24 @@ impl EditorView {
                 block: row.is_block,
             })
             .collect()
+    }
+
+    /// The width of the gutter of the last frame, for a test that checks the column of
+    /// the numbers follows the digits of the file.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn gutter_width(&self) -> f32 {
+        self.gutter_width
+    }
+
+    /// The bounds of the number of `line` in the last frame, for a test that checks the
+    /// column of the numbers holds it whole. `None` when the row is out of sight.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn line_number_bounds(&self, line: usize) -> Option<Bounds<Pixels>> {
+        self.layout.as_ref()?.line_number_bounds(
+            line,
+            px(self.style.line_height),
+            self.gutter_width,
+        )
     }
 
     /// The height of the panel of sticky lines as the last frame painted it.
@@ -1902,6 +2036,52 @@ impl EditorView {
         let caret = state.selections().primary().head;
         let expression = identifier_chain_at(&state.text(), caret)?;
         Some((state.store().offset_to_line(caret), expression))
+    }
+
+    /// The labels of an open completion list, in the order it shows them. A test reads
+    /// them; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completion_rows(&self) -> Option<Vec<String>> {
+        let completion = self.lsp.as_ref()?.completion.as_ref()?;
+        Some(completion.labels())
+    }
+
+    /// The rows of an open completion list on screen and the selected one. A test reads
+    /// them; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completion_visible(&self) -> Option<(Vec<String>, Option<String>)> {
+        let completion = self.lsp.as_ref()?.completion.as_ref()?;
+        Some(completion.visible_labels())
+    }
+
+    /// The sections and the labels of an open Alt+Enter list, in the order it shows
+    /// them, and the preview lines of the selected row. A test reads them; nothing else
+    /// does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn actions_visible(&self) -> Option<ActionRows> {
+        let menu = self.lsp.as_ref()?.actions.as_ref()?;
+        let rows = menu
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(row, pick)| (menu.quick_fix(row), pick.label().to_owned()))
+            .collect();
+        let preview = menu
+            .has_sections()
+            .then(|| self.action_preview(menu))
+            .flatten()
+            .map(|preview| preview.lines);
+        Some(ActionRows { rows, preview })
+    }
+
+    /// The places of an open Ctrl+B list, from zero. A test reads them; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn navigation_targets(&self) -> Option<usize> {
+        self.lsp
+            .as_ref()?
+            .navigation_list
+            .as_ref()
+            .map(|list| list.targets.len())
     }
 
     /// The place of the cross of the inline watch on `line`, for a test that clicks it.
@@ -2208,8 +2388,13 @@ impl EditorView {
         if self.options.centered_text {
             self.annotation_width()
         } else {
-            GUTTER_WIDTH + self.annotation_width()
+            self.gutter_width + self.annotation_width()
         }
+    }
+
+    /// The left edge of the fold button of the gutter.
+    fn fold_x(&self) -> f32 {
+        crate::element::fold_x(self.gutter_width)
     }
 
     /// The text as the buffer holds it now, with LF line ends. `None` while loading.
@@ -2471,6 +2656,7 @@ impl EditorView {
                     .set_code_vision_settings(crate::semantic::code_vision_settings(&self.options));
             }
             self.code_lens_task = None;
+            self.code_lens_resolve_task = None;
             self.code_lens_resolved.clear();
             if let Some(state) = &mut self.state {
                 state.set_blocks(Vec::new());
@@ -2890,6 +3076,12 @@ impl EditorView {
     }
 
     fn finish_change(&mut self, change: Option<Change>, cx: &mut Context<Self>) {
+        // The menu of Alt+Enter belongs to the text and the word it opened on.
+        if change.is_some() {
+            self.dismiss_actions_popup(cx);
+        } else {
+            self.follow_actions_popup(cx);
+        }
         if let (Some(change), Some(state)) = (&change, &self.state)
             && state.language().is_some()
         {
@@ -2900,7 +3092,7 @@ impl EditorView {
         if change.is_some() {
             self.semantic_tokens_later(cx);
             self.request_inlays(crate::semantic::INLAY_TYPING_DELAY, cx);
-            self.request_code_lens(crate::semantic::INLAY_TYPING_DELAY, cx);
+            self.request_code_lens(crate::semantic::CODE_LENS_TYPING_DELAY, cx);
             if let Some(change) = &change {
                 self.shift_code_lens(change, cx);
                 self.shift_doc_comments(change);
@@ -3620,6 +3812,16 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
+        // Escape closes the topmost popup of the editor and nothing else.
+        if stroke.key == "escape"
+            && !stroke.ctrl
+            && !stroke.alt
+            && !stroke.shift
+            && self.close_top_popup(cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         // The second key of a chord: Ctrl+* then a digit, for instance.
         if !self.chords.is_empty() {
             let mut keys = self.chords.clone();
@@ -3664,6 +3866,10 @@ impl EditorView {
         // Enter expands a template that chose Enter, when its abbreviation ends here and
         // no list of a popup is open.
         if plain && stroke.key == "enter" && self.template_expand_key(ExpandWith::Enter, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if plain && self.navigation_key(&stroke.key, cx) {
             cx.stop_propagation();
             return;
         }
@@ -3814,7 +4020,7 @@ impl EditorView {
                 return;
             }
             actions::CHOOSE_LOOKUP_ITEM => {
-                if self.completion_key("enter", cx) {
+                if self.navigation_key("enter", cx) || self.completion_key("enter", cx) {
                     return;
                 }
             }
@@ -3829,12 +4035,12 @@ impl EditorView {
                 }
             }
             actions::LOOKUP_UP => {
-                if self.completion_key("up", cx) {
+                if self.navigation_key("up", cx) || self.completion_key("up", cx) {
                     return;
                 }
             }
             actions::LOOKUP_DOWN => {
-                if self.completion_key("down", cx) {
+                if self.navigation_key("down", cx) || self.completion_key("down", cx) {
                     return;
                 }
             }
@@ -4076,6 +4282,20 @@ impl EditorView {
             .is_some_and(|layout| gutter > 0. && position.x < layout.bounds.left() + px(gutter))
     }
 
+    /// Whether the left column of the gutter shows a mark of the line: a debug mark, a
+    /// run mark or a bookmark. The badge of a place or a handler gives way to it, so its
+    /// own click waits for a line without one.
+    pub(crate) fn debug_mark_on_line(&self, line: u32) -> bool {
+        self.function_breakpoints.contains(&line)
+            || self.field_watchpoints.contains(&line)
+            || self.breakpoints.contains(&line)
+            || self.run_marks.iter().any(|mark| mark.line == line)
+            || self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.bookmark_at_line(line as usize).is_some())
+    }
+
     /// Whether a right click at `position` belongs to the gutter or to the blame column,
     /// where the menu offers the annotation.
     pub fn gutter_menu_at(&self, position: Point<Pixels>) -> bool {
@@ -4117,8 +4337,8 @@ impl EditorView {
         };
         let width = self.annotation_width();
         width > 0.
-            && position.x >= layout.bounds.left() + px(GUTTER_WIDTH)
-            && position.x < layout.bounds.left() + px(GUTTER_WIDTH + width)
+            && position.x >= layout.bounds.left() + px(self.gutter_width)
+            && position.x < layout.bounds.left() + px(self.gutter_width + width)
     }
 
     /// The label of the blame column under `position`, the line it belongs to and where
@@ -4155,9 +4375,7 @@ impl EditorView {
     fn place_hint_at(&self, position: Point<Pixels>) -> Option<(String, Point<Pixels>)> {
         let layout = self.layout.as_ref()?;
         let left = layout.bounds.left();
-        if !self.in_gutter(position)
-            || position.x < left + px(crate::element::ENDPOINT_X)
-            || position.x >= left + px(crate::element::ENDPOINT_X + 16.)
+        if !self.in_gutter(position) || position.x < left || position.x >= left + px(self.fold_x())
         {
             return None;
         }
@@ -4172,7 +4390,38 @@ impl EditorView {
             .place_marks
             .iter()
             .find(|mark| mark.line as usize == shown.buffer_line)?;
+        if self.debug_mark_on_line(shown.buffer_line as u32) {
+            return None;
+        }
         Some((mark.hint.to_string(), point(position.x, shown.y)))
+    }
+
+    /// The change mark of the gutter under `position`: its line, from zero. The marks
+    /// stand against the right edge of the number column, where the text begins.
+    fn change_mark_at(&self, position: Point<Pixels>) -> Option<u32> {
+        if !self.options.gutter_icons || self.options.centered_text {
+            return None;
+        }
+        let layout = self.layout.as_ref()?;
+        let right = layout.bounds.left() + px(self.gutter_width);
+        if position.x < right - px(9.) || position.x > right + px(1.) {
+            return None;
+        }
+        let line_height = px(self.style.line_height);
+        let shown = layout.rows.iter().find(|row| {
+            !row.is_block
+                && !row.line.continuation
+                && position.y >= row.y
+                && position.y < row.y + line_height
+        })?;
+        let line = shown.buffer_line as u32;
+        self.gutter_marks
+            .iter()
+            .any(|mark| match mark.kind {
+                GutterKind::Deleted => mark.lines.start == line,
+                _ => mark.lines.contains(&line),
+            })
+            .then_some(line)
     }
 
     /// The hint of the coverage stripe under the pointer, when the pointer is in the
@@ -4264,6 +4513,10 @@ impl EditorView {
     pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.cancel_hover();
         self.close_quick_doc(cx);
+        // A click in the editor closes the list of entries in the way.
+        self.dismiss_click_popups(cx);
+        self.gutter_press = None;
+        self.drag = None;
         let Some(layout) = self.layout.clone() else {
             return;
         };
@@ -4356,6 +4609,7 @@ impl EditorView {
                     event.click_count,
                 );
             }
+            self.drag = drag_of(event.click_count, offset);
             if let Some(lsp) = &mut self.lsp {
                 lsp.actions = None;
             }
@@ -4374,9 +4628,9 @@ impl EditorView {
             && let Some(buffer_line) = run_line
             && !line.continuation
         {
-            let x = event.position.x - layout.bounds.left();
-            if x >= px(crate::element::ENDPOINT_X)
-                && x < px(crate::element::ENDPOINT_X + 16.)
+            let left_of_fold = event.position.x - layout.bounds.left() < px(self.fold_x());
+            if left_of_fold
+                && !self.debug_mark_on_line(buffer_line as u32)
                 && self
                     .place_marks
                     .iter()
@@ -4385,8 +4639,8 @@ impl EditorView {
                 cx.emit(EditorEvent::PlaceMark(buffer_line as u32));
                 return;
             }
-            if x >= px(crate::element::ENDPOINT_X)
-                && x < px(crate::element::ENDPOINT_X + 16.)
+            if left_of_fold
+                && !self.debug_mark_on_line(buffer_line as u32)
                 && self
                     .action_marks
                     .iter()
@@ -4395,8 +4649,8 @@ impl EditorView {
                 cx.emit(EditorEvent::ActionMark(buffer_line as u32));
                 return;
             }
-            if x >= px(crate::element::ENDPOINT_X)
-                && x < px(crate::element::ENDPOINT_X + 16.)
+            if left_of_fold
+                && !self.debug_mark_on_line(buffer_line as u32)
                 && self
                     .endpoint_marks
                     .iter()
@@ -4409,7 +4663,7 @@ impl EditorView {
         if self.options.gutter_icons
             && let Some(buffer_line) = run_line
             && !line.continuation
-            && event.position.x - layout.bounds.left() < px(crate::element::FOLD_X)
+            && event.position.x - layout.bounds.left() < px(self.fold_x())
             && self
                 .run_marks
                 .iter()
@@ -4429,32 +4683,51 @@ impl EditorView {
             && layout.rows[shown].doc_icon.is_some()
         {
             let x = event.position.x - layout.bounds.left();
-            if x >= px(crate::element::FOLD_X) && x < px(crate::element::FOLD_X + 16.) {
+            if x >= px(self.fold_x()) && x < px(self.fold_x() + crate::element::FOLD_SIZE) {
                 if let Some(range) = self.doc_range_at_line(buffer_line) {
                     self.toggle_rendered_doc_at(range, cx);
                 }
                 return;
             }
         }
+        // A change mark opens the window of the hunk, not a breakpoint.
+        if let Some(mark) = self.change_mark_at(event.position) {
+            self.change_mark_hovered = Some(mark);
+            cx.emit(EditorEvent::ChangeMarkClick(mark));
+            return;
+        }
         let in_gutter = self.in_gutter(event.position);
         self.catch_up(cx);
-        let Some(state) = &mut self.state else {
-            return;
-        };
-        if self.options.gutter_icons && position_in_fold_column(event.position, layout.bounds) {
+        if self.options.gutter_icons
+            && position_in_fold_column(
+                event.position,
+                layout.bounds,
+                self.fold_x(),
+                self.gutter_width,
+            )
+            && let Some(state) = &mut self.state
+        {
             state.toggle_fold_at_line(state.store().offset_to_line(line.start_offset));
             cx.notify();
             return;
         }
         if in_gutter && !line.continuation {
+            // The breakpoint waits for the release: a drag over the lines selects them
+            // instead of toggling, as IDEA does. The whole number and icon area is one
+            // zone, so a click on a number places a breakpoint.
             if let Some(buffer_line) = run_line {
-                cx.emit(EditorEvent::GutterClick {
+                self.gutter_press = Some(GutterPress {
                     line: buffer_line as u32,
                     shift: event.modifiers.shift,
+                    start: event.position,
+                    dragging: false,
                 });
             }
             return;
         }
+        let Some(state) = &mut self.state else {
+            return;
+        };
         let placeholder = line.chunks.iter().find_map(|(range, chunk)| match chunk {
             DisplayChunk::Placeholder { fold_start, .. } if range.contains(&column) => {
                 Some(*fold_start)
@@ -4484,6 +4757,7 @@ impl EditorView {
             add_caret,
             event.click_count,
         );
+        self.drag = drag_of(event.click_count, offset);
         self.block_drag = block.then(|| (offset, if modifiers.alt { kept } else { Vec::new() }));
         if let Some(bar) = &mut self.bar {
             bar.active = false;
@@ -4500,6 +4774,7 @@ impl EditorView {
     /// A right click puts the caret where the pointer is, unless it lands inside a
     /// selection, and then asks the window for the menu of the editor.
     pub(crate) fn right_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.dismiss_click_popups(cx);
         // The blame column has no text: the menu opens and the caret stays where it is.
         if self.in_annotations(event.position) {
             cx.emit(EditorEvent::ContextMenu(event.position));
@@ -4543,6 +4818,12 @@ impl EditorView {
                     }
                 }
             }
+            return;
+        }
+
+        // A drag that began on a line number selects whole lines; the click that
+        // places a breakpoint comes on the release.
+        if event.dragging() && self.gutter_drag(event.position, cx) {
             return;
         }
 
@@ -4601,6 +4882,12 @@ impl EditorView {
             cx.notify();
         }
 
+        let change_mark = self.change_mark_at(event.position);
+        if change_mark != self.change_mark_hovered {
+            self.change_mark_hovered = change_mark;
+            cx.emit(EditorEvent::ChangeMarkHover(change_mark));
+        }
+
         let hovered = self.in_gutter(event.position);
         if hovered != self.gutter_hovered {
             self.gutter_hovered = hovered;
@@ -4627,19 +4914,77 @@ impl EditorView {
         }
         let offset = self.offset_at(event.position);
         if let (Some(offset), Some(state)) = (offset, &mut self.state) {
-            match &self.block_drag {
-                Some((origin, kept)) => state.select_block(kept, *origin, offset),
-                None => state.drag_to(offset),
+            match (&self.block_drag, self.drag) {
+                (Some((origin, kept)), _) => state.select_block(kept, *origin, offset),
+                (None, Some(DragUnit::Words(anchor))) => state.drag_words(anchor, offset),
+                (None, Some(DragUnit::Lines(anchor))) => state.drag_lines(anchor, offset),
+                (None, None) => state.drag_to(offset),
             }
             self.autoscroll = true;
             cx.notify();
         }
     }
 
-    pub(crate) fn mouse_up(&mut self) {
+    pub(crate) fn mouse_up(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        // A press in the gutter that did not become a drag is a click: the line places
+        // or removes a breakpoint, or the run mark of it, as the language allows. A
+        // release outside the gutter is no click of it.
+        if let Some(press) = self.gutter_press.take()
+            && !press.dragging
+            && self.in_gutter(position)
+        {
+            cx.emit(EditorEvent::GutterClick {
+                line: press.line,
+                shift: press.shift,
+            });
+        }
         self.selecting = false;
+        self.drag = None;
         self.block_drag = None;
         self.scrollbar_drag = None;
+    }
+
+    /// A pointer held down after a press in the gutter. A drag selects the lines it
+    /// crosses, the way IDEA does; the press itself only waits for the release.
+    /// Answers whether the pointer still belongs to the gutter.
+    fn gutter_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(press) = &mut self.gutter_press else {
+            return false;
+        };
+        if (position.y - press.start.y).abs() >= px(2.) {
+            press.dragging = true;
+        }
+        if !press.dragging {
+            return true;
+        }
+        let first = press.line as usize;
+        let Some(layout) = self.layout.clone() else {
+            return true;
+        };
+        let line_height = px(self.style.line_height);
+        let Some(row) = layout
+            .rows
+            .iter()
+            .find(|row| !row.is_block && position.y >= row.y && position.y < row.y + line_height)
+        else {
+            return true;
+        };
+        let last = row.buffer_line;
+        let Some(state) = &mut self.state else {
+            return true;
+        };
+        let store = state.store();
+        let (first, last) = (first.min(last), first.max(last));
+        let from = store.line_to_offset(first);
+        let to = if last + 1 < store.line_count() {
+            store.line_to_offset(last + 1)
+        } else {
+            store.line_end(last)
+        };
+        state.select_range(from..to);
+        self.caret_on = true;
+        self.changed(None, cx);
+        true
     }
 }
 
@@ -4728,9 +5073,14 @@ fn nearest_word(text: &str, word: &str, offset: usize) -> Option<usize> {
     best.map(|(start, _)| start)
 }
 
-fn position_in_fold_column(position: Point<Pixels>, bounds: Bounds<Pixels>) -> bool {
+fn position_in_fold_column(
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    fold_x: f32,
+    gutter: f32,
+) -> bool {
     let x = position.x - bounds.left();
-    x >= px(crate::element::FOLD_X) && x < px(GUTTER_WIDTH)
+    x >= px(fold_x) && x < px(gutter)
 }
 
 /// Whether `position` is inside `area`, edges of the left and top included.
@@ -5024,15 +5374,13 @@ impl EditorView {
             popups.push(self.render_quick_doc(doc, window, cx));
         }
         if let Some(completion) = &lsp.completion
-            && let Some(rows) = completion.window().len().checked_sub(1)
-            && let Some((position, anchor)) = self.popup_position(
-                completion.start,
-                (rows + 1) as f32 * self.style.line_height + 8.,
-            )
+            && let Some(height) = self.completion_height()
+            && let Some((position, anchor)) = self.popup_position(completion.start, height)
         {
             let rows =
                 completion.window().map(|row| {
                     let parts = completion.label(row);
+                    let kind = completion.kind(row);
                     let selected = row == completion.selected;
                     let left = if parts.deprecated {
                         let len = parts.left.len();
@@ -5052,11 +5400,17 @@ impl EditorView {
                         parts.left.into_any_element()
                     };
                     div()
+                        .id(("completion-row", row))
+                        .debug_selector(move || format!("completion-row-{row}"))
                         .flex()
                         .items_center()
                         .gap_3()
                         .px_2()
                         .when(selected, |row| row.bg(theme.selection))
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            this.completion_click(row, event.click_count(), cx);
+                        }))
+                        .child(icon_sized(completion_kind_icon(kind), 14., &theme))
                         .child(
                             div()
                                 .flex_1()
@@ -5075,14 +5429,79 @@ impl EditorView {
                                 .child(owner)
                         }))
                 });
+            let documentation = lsp
+                .completion_doc
+                .as_ref()
+                .filter(|doc| completion.shown.get(completion.selected) == Some(&doc.entry))
+                .map(|doc| {
+                    let font = self.style.font_family.clone();
+                    let rows = completion_doc_rows(doc).into_iter().map(|row| {
+                        let font = font.clone();
+                        let code = row.code;
+                        let runs = row.runs.into_iter().map(|run| {
+                            div()
+                                .child(run.text)
+                                .when(run.code, |this| {
+                                    this.font_family(font.clone())
+                                        .bg(theme.pressed)
+                                        .px(px(2.))
+                                        .rounded(px(2.))
+                                })
+                                .when(run.strong, |this| this.font_weight(FontWeight::MEDIUM))
+                                .when(run.emphasis, |this| this.italic())
+                        });
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .when(code, |this| this.text_color(theme.text))
+                            .pl(px(row.indent as f32 * SPACE_S))
+                            .children(runs)
+                    });
+                    div()
+                        .debug_selector(|| "completion-doc".to_owned())
+                        .flex()
+                        .flex_col()
+                        .mx_2()
+                        .mt_1()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_size(px(self.style.font_size))
+                        .font_family(self.style.font_family.clone())
+                        .text_color(theme.text_muted)
+                        .children(rows)
+                });
+            let row_height = self.style.line_height.max(CODE_LINE_HEIGHT);
             let list = surface(&theme)
+                .id("completion-list")
+                // A click on a row belongs to the list: the text under the popup must
+                // not take it and close the list, as a click in the editor does.
+                .occlude()
                 .debug_selector(|| "completion-popup".to_owned())
                 .min_w(px(280.))
                 .max_w(px(640.))
                 .py_1()
                 .font_family(self.style.font_family.clone())
                 .text_size(px(self.style.font_size))
-                .children(rows);
+                .on_scroll(cx.listener(move |this, event: &ScrollEvent, _, cx| {
+                    // The wheel delta points against the content, as it does over the
+                    // text: a notch down has a negative `y` and shows the rows below.
+                    let delta = event.delta.pixel_delta(px(row_height));
+                    let mut rows = (-f32::from(delta.y) / row_height).round();
+                    // A device that reports pixels may send less than a row: the list
+                    // still moves one row, so it never looks stuck.
+                    if rows == 0. && delta.y != px(0.) {
+                        rows = if delta.y < px(0.) { 1. } else { -1. };
+                    }
+                    if rows != 0. {
+                        this.completion_scroll(rows as isize, cx);
+                    }
+                }))
+                .children(rows)
+                .children(documentation);
             popups.push(
                 deferred(
                     anchored()
@@ -5095,9 +5514,47 @@ impl EditorView {
                 .into_any_element(),
             );
         }
+        if let Some(list) = &lsp.navigation_list
+            && let Some((position, anchor)) = self.popup_position(
+                list.at,
+                (list.targets.len() + 1) as f32 * self.style.line_height + 8.,
+            )
+        {
+            let rows = list.targets.iter().enumerate().map(|(row, target)| {
+                let selected = row == list.selected;
+                div()
+                    .debug_selector(move || format!("navigation-row-{row}"))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_2()
+                    .when(selected, |row| row.bg(theme.selection))
+                    .text_color(theme.text)
+                    .child(location_label(target))
+            });
+            let body = surface(&theme)
+                .debug_selector(|| "navigation-popup".to_owned())
+                .min_w(px(280.))
+                .max_w(px(640.))
+                .py_1()
+                .font_family(self.style.font_family.clone())
+                .text_size(px(self.style.font_size))
+                .children(rows);
+            popups.push(
+                deferred(
+                    anchored()
+                        .anchor(anchor)
+                        .position(position)
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
         if let Some(signature) = &lsp.signatures
             && let Some((position, anchor)) =
-                self.popup_position(signature.at, 3. * self.style.line_height + 8.)
+                self.parameter_info_position(signature.at, 3. * self.style.line_height + 8.)
         {
             let shown = signature.signature();
             let segments = signature_segments(shown, signature.parameter);
@@ -5157,38 +5614,116 @@ impl EditorView {
                 (menu.window().len() + 1) as f32 * self.style.line_height + 8.,
             )
         {
-            let rows = menu.window().map(|row| {
+            let mut rows: Vec<Div> = Vec::new();
+            let sections = menu.has_sections();
+            for row in menu.window() {
                 let selected = row == menu.selected;
-                div()
+                let quick_fix = menu.quick_fix(row);
+                if sections && row > 0 && quick_fix != menu.quick_fix(row - 1) {
+                    rows.push(
+                        div()
+                            .debug_selector(|| "actions-separator".to_owned())
+                            .mx_2()
+                            .my_1()
+                            .h(px(1.))
+                            .bg(theme.border),
+                    );
+                }
+                let mut item = div()
+                    .debug_selector({
+                        let selector = if quick_fix {
+                            format!("actions-quick-fix-{row}")
+                        } else {
+                            format!("actions-intention-{row}")
+                        };
+                        move || selector.clone()
+                    })
                     .px_2()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap(px(SPACE_L))
+                    .gap(px(SPACE_S))
                     .when(selected, |row| row.bg(theme.selection))
-                    .text_color(theme.text)
-                    .child(menu.rows[row].label().to_owned())
+                    .text_color(theme.text);
+                if sections {
+                    item = item.child(icon_sized(
+                        if quick_fix {
+                            "codeInsight/quickFix"
+                        } else {
+                            "codeInsight/intention"
+                        },
+                        14.,
+                        &theme,
+                    ));
+                }
+                rows.push(
+                    item.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(menu.rows[row].label().to_owned()),
+                    )
                     .children(menu.rows[row].hint().map(|hint| {
                         div()
                             .flex_none()
                             .text_color(theme.text_muted)
                             .child(hint.to_owned())
-                    }))
-            });
+                    })),
+                );
+            }
             let list = surface(&theme)
                 .debug_selector(|| "actions-popup".to_owned())
-                .min_w(px(280.))
+                .min_w(px(320.))
                 .max_w(px(640.))
                 .py_1()
                 .text_size(px(self.style.font_size))
                 .children(rows);
+            let preview = menu
+                .has_sections()
+                .then(|| self.action_preview(menu))
+                .flatten()
+                .map(|preview| {
+                    let lines = preview.lines.into_iter().map(|line| {
+                        let color = if line.starts_with('+') {
+                            theme.success
+                        } else if line.starts_with('-') {
+                            theme.error
+                        } else {
+                            theme.text
+                        };
+                        div().whitespace_nowrap().text_color(color).child(line)
+                    });
+                    surface(&theme)
+                        .debug_selector(|| "actions-preview".to_owned())
+                        .w(px(380.))
+                        .max_h(px(420.))
+                        .overflow_hidden()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_size(px(self.style.font_size))
+                        .child(
+                            div()
+                                .text_color(theme.text_muted)
+                                .truncate()
+                                .child(preview.title),
+                        )
+                        .children(lines)
+                });
+            let menu_view = div()
+                .flex()
+                .items_start()
+                .gap(px(SPACE_S))
+                .child(list)
+                .children(preview);
             popups.push(
                 deferred(
                     anchored()
                         .anchor(anchor)
                         .position(position)
                         .snap_to_window_with_margin(px(SPACE_M))
-                        .child(list),
+                        .child(menu_view),
                 )
                 .with_priority(1)
                 .into_any_element(),
@@ -5692,6 +6227,12 @@ impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for started in self.pending_frames.drain(..) {
             perf::observe("editor.keystroke", started.elapsed());
+        }
+        // A list of the editor belongs to the editor that holds the focus: a click into
+        // another view closes it, as IDEA does. The pointer popup stays, the pointer
+        // never took the focus.
+        if self.list_popups_open() && !self.focus_handle.is_focused(window) {
+            self.dismiss_list_popups(cx);
         }
         self.prepare_preview(cx);
         let head = self.state.as_ref().map(EditorState::head);

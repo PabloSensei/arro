@@ -1,0 +1,22 @@
+[package]
+name = "agent-acp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+crossbeam-channel = "0.5"
+proc-sup.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+agent-testkit = { path = "../agent-testkit" }
+mcp-server = { path = "../mcp-server" }
+test-support = { path = "../../../tools/test-support" }
+tool-gateway = { path = "../tool-gateway" }
+
+[[bin]]
+name = "acp-stub"
+path = "src/bin/acp_stub.rs"
+test = false

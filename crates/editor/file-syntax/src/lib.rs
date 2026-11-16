@@ -1,7 +1,9 @@
 //! Highlighting of the text formats around a project: JSON, XML, YAML, shell, Windows
 //! batch, properties, Groovy, Kotlin, TOML, SQL, HTML, CSS, JavaScript, TypeScript and
-//! Markdown files. Each format brings a tree-sitter grammar and our own highlight query.
-//! There are no folds for the formats where a fold would not help.
+//! Markdown files, plus the source languages Python, C, C++, C#, Go, Rust, Scala, PHP,
+//! Ruby, Swift, Lua, PowerShell, Protobuf, INI, diff and Makefile. Each format brings a
+//! tree-sitter grammar and our own highlight query. There are no folds for the formats
+//! where a fold would not help.
 
 use std::path::Path;
 
@@ -184,6 +186,278 @@ pub fn kotlin() -> LanguageConfig {
     }
 }
 
+pub fn python() -> LanguageConfig {
+    LanguageConfig {
+        name: "Python",
+        grammar: tree_sitter_python::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/python/highlights.scm"),
+        folds: include_str!("../../../../queries/python/folds.scm"),
+        indents: include_str!("../../../../queries/python/indents.scm"),
+        fold_styles: PLAIN_FOLD_STYLES,
+        line_comment: Some("#"),
+        block_comment: None,
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.py *.pyi",
+        injections: Vec::new(),
+    }
+}
+
+pub fn c() -> LanguageConfig {
+    LanguageConfig {
+        name: "C",
+        grammar: tree_sitter_c::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/c/highlights.scm"),
+        folds: include_str!("../../../../queries/c/folds.scm"),
+        indents: include_str!("../../../../queries/c/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.c *.h",
+        injections: Vec::new(),
+    }
+}
+
+pub fn cpp() -> LanguageConfig {
+    LanguageConfig {
+        name: "C++",
+        grammar: tree_sitter_cpp::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/cpp/highlights.scm"),
+        folds: include_str!("../../../../queries/cpp/folds.scm"),
+        indents: include_str!("../../../../queries/cpp/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.cpp *.cc *.cxx *.hpp *.hh *.hxx",
+        injections: Vec::new(),
+    }
+}
+
+pub fn csharp() -> LanguageConfig {
+    LanguageConfig {
+        name: "C#",
+        grammar: tree_sitter_c_sharp::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/csharp/highlights.scm"),
+        folds: include_str!("../../../../queries/csharp/folds.scm"),
+        indents: include_str!("../../../../queries/csharp/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.cs",
+        injections: Vec::new(),
+    }
+}
+
+pub fn go() -> LanguageConfig {
+    LanguageConfig {
+        name: "Go",
+        grammar: tree_sitter_go::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/go/highlights.scm"),
+        folds: include_str!("../../../../queries/go/folds.scm"),
+        indents: include_str!("../../../../queries/go/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "\t",
+        file_mask: "*.go",
+        injections: Vec::new(),
+    }
+}
+
+pub fn rust() -> LanguageConfig {
+    LanguageConfig {
+        name: "Rust",
+        grammar: tree_sitter_rust::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/rust/highlights.scm"),
+        folds: include_str!("../../../../queries/rust/folds.scm"),
+        indents: include_str!("../../../../queries/rust/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.rs",
+        injections: Vec::new(),
+    }
+}
+
+pub fn scala() -> LanguageConfig {
+    LanguageConfig {
+        name: "Scala",
+        grammar: tree_sitter_scala::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/scala/highlights.scm"),
+        folds: include_str!("../../../../queries/scala/folds.scm"),
+        indents: include_str!("../../../../queries/scala/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "  ",
+        file_mask: "*.scala *.sc *.sbt",
+        injections: Vec::new(),
+    }
+}
+
+pub fn php() -> LanguageConfig {
+    LanguageConfig {
+        name: "PHP",
+        grammar: tree_sitter_php::LANGUAGE_PHP.into(),
+        highlights: include_str!("../../../../queries/php/highlights.scm"),
+        folds: include_str!("../../../../queries/php/folds.scm"),
+        indents: include_str!("../../../../queries/php/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.php",
+        injections: Vec::new(),
+    }
+}
+
+pub fn ruby() -> LanguageConfig {
+    LanguageConfig {
+        name: "Ruby",
+        grammar: tree_sitter_ruby::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/ruby/highlights.scm"),
+        folds: include_str!("../../../../queries/ruby/folds.scm"),
+        indents: include_str!("../../../../queries/ruby/indents.scm"),
+        fold_styles: PLAIN_FOLD_STYLES,
+        line_comment: Some("#"),
+        block_comment: None,
+        statements: None,
+        indent_unit: "  ",
+        file_mask: "*.rb Gemfile Rakefile",
+        injections: Vec::new(),
+    }
+}
+
+pub fn swift() -> LanguageConfig {
+    LanguageConfig {
+        name: "Swift",
+        grammar: tree_sitter_swift::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/swift/highlights.scm"),
+        folds: include_str!("../../../../queries/swift/folds.scm"),
+        indents: include_str!("../../../../queries/swift/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.swift",
+        injections: Vec::new(),
+    }
+}
+
+pub fn lua() -> LanguageConfig {
+    LanguageConfig {
+        name: "Lua",
+        grammar: tree_sitter_lua::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/lua/highlights.scm"),
+        folds: include_str!("../../../../queries/lua/folds.scm"),
+        indents: include_str!("../../../../queries/lua/indents.scm"),
+        fold_styles: PLAIN_FOLD_STYLES,
+        line_comment: Some("--"),
+        block_comment: Some(("--[[", "]]")),
+        statements: None,
+        indent_unit: "  ",
+        file_mask: "*.lua",
+        injections: Vec::new(),
+    }
+}
+
+pub fn powershell() -> LanguageConfig {
+    LanguageConfig {
+        name: "PowerShell",
+        grammar: tree_sitter_powershell::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/powershell/highlights.scm"),
+        folds: include_str!("../../../../queries/powershell/folds.scm"),
+        indents: include_str!("../../../../queries/powershell/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("#"),
+        block_comment: Some(("<#", "#>")),
+        statements: None,
+        indent_unit: "    ",
+        file_mask: "*.ps1 *.psm1",
+        injections: Vec::new(),
+    }
+}
+
+pub fn protobuf() -> LanguageConfig {
+    LanguageConfig {
+        name: "Protobuf",
+        grammar: tree_sitter_proto::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/protobuf/highlights.scm"),
+        folds: include_str!("../../../../queries/protobuf/folds.scm"),
+        indents: include_str!("../../../../queries/protobuf/indents.scm"),
+        fold_styles: BRACED_FOLD_STYLES,
+        line_comment: Some("//"),
+        block_comment: Some(("/*", "*/")),
+        statements: None,
+        indent_unit: "  ",
+        file_mask: "*.proto",
+        injections: Vec::new(),
+    }
+}
+
+pub fn ini() -> LanguageConfig {
+    LanguageConfig {
+        name: "INI",
+        grammar: tree_sitter_ini::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/ini/highlights.scm"),
+        folds: include_str!("../../../../queries/ini/folds.scm"),
+        indents: include_str!("../../../../queries/ini/indents.scm"),
+        fold_styles: BRACKET_FOLD_STYLES,
+        line_comment: Some("#"),
+        block_comment: None,
+        statements: None,
+        indent_unit: "  ",
+        file_mask: "*.ini *.cfg",
+        injections: Vec::new(),
+    }
+}
+
+pub fn diff() -> LanguageConfig {
+    LanguageConfig {
+        name: "Diff",
+        grammar: tree_sitter_diff::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/diff/highlights.scm"),
+        folds: include_str!("../../../../queries/diff/folds.scm"),
+        indents: include_str!("../../../../queries/diff/indents.scm"),
+        fold_styles: PLAIN_FOLD_STYLES,
+        line_comment: None,
+        block_comment: None,
+        statements: None,
+        indent_unit: "  ",
+        file_mask: "*.diff *.patch",
+        injections: Vec::new(),
+    }
+}
+
+pub fn make() -> LanguageConfig {
+    LanguageConfig {
+        name: "Makefile",
+        grammar: tree_sitter_make::LANGUAGE.into(),
+        highlights: include_str!("../../../../queries/make/highlights.scm"),
+        folds: include_str!("../../../../queries/make/folds.scm"),
+        indents: include_str!("../../../../queries/make/indents.scm"),
+        fold_styles: PLAIN_FOLD_STYLES,
+        line_comment: Some("#"),
+        block_comment: None,
+        statements: None,
+        indent_unit: "\t",
+        file_mask: "Makefile *.mk",
+        injections: Vec::new(),
+    }
+}
+
 pub fn toml() -> LanguageConfig {
     LanguageConfig {
         name: "TOML",
@@ -357,14 +631,22 @@ pub fn language_by_name(name: &str) -> Option<LanguageConfig> {
 }
 
 /// The format of `path` by its extension, whatever its case. `Jenkinsfile` has no
-/// extension and is the build script of a Jenkins project.
+/// extension and is the build script of a Jenkins project; `Makefile`, `Gemfile`,
+/// `Rakefile` and `.editorconfig` are known by name for the same reason.
 pub fn language_for(path: &Path) -> Option<LanguageConfig> {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("jenkinsfile"))
-    {
-        return Some(groovy());
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        if name.eq_ignore_ascii_case("jenkinsfile") {
+            return Some(groovy());
+        }
+        if name.eq_ignore_ascii_case("makefile") {
+            return Some(make());
+        }
+        if name.eq_ignore_ascii_case("gemfile") || name.eq_ignore_ascii_case("rakefile") {
+            return Some(ruby());
+        }
+        if name.eq_ignore_ascii_case(".editorconfig") {
+            return Some(ini());
+        }
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match extension.as_str() {
@@ -384,6 +666,22 @@ pub fn language_for(path: &Path) -> Option<LanguageConfig> {
         "ts" | "typescript" => typescript(),
         "tsx" => tsx(),
         "md" | "markdown" => markdown(),
+        "py" | "pyi" | "python" => python(),
+        "c" | "h" => c(),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "c++" => cpp(),
+        "cs" | "csharp" | "c#" => csharp(),
+        "go" => go(),
+        "rs" | "rust" => rust(),
+        "scala" | "sc" | "sbt" => scala(),
+        "php" => php(),
+        "rb" | "ruby" => ruby(),
+        "swift" => swift(),
+        "lua" => lua(),
+        "ps1" | "psm1" | "powershell" => powershell(),
+        "proto" | "protobuf" => protobuf(),
+        "ini" | "cfg" | "editorconfig" => ini(),
+        "diff" | "patch" => diff(),
+        "mk" | "make" | "makefile" => make(),
         _ => return None,
     })
 }
@@ -620,9 +918,8 @@ mod tests {
             language_for(Path::new("APP.JS")).map(|config| config.name),
             Some("JavaScript")
         );
-        assert!(language_for(Path::new("Main.rs")).is_none());
         assert!(language_for(Path::new("README.txt")).is_none());
-        assert!(language_for(Path::new("Makefile")).is_none());
+        assert!(language_for(Path::new("archive.zip")).is_none());
     }
 
     #[test]
@@ -1034,5 +1331,497 @@ def build() {\n\
         assert!(
             !texts(&second.highlights, edited, HighlightKind::Strong).contains(&"bold".to_owned())
         );
+    }
+
+    #[test]
+    fn source_paths_choose_the_language() {
+        for (name, expected) in [
+            ("script.py", "Python"),
+            ("types.pyi", "Python"),
+            ("main.c", "C"),
+            ("main.h", "C"),
+            ("main.cpp", "C++"),
+            ("main.cc", "C++"),
+            ("main.cxx", "C++"),
+            ("main.hpp", "C++"),
+            ("main.hh", "C++"),
+            ("main.hxx", "C++"),
+            ("App.cs", "C#"),
+            ("main.go", "Go"),
+            ("main.rs", "Rust"),
+            ("Main.scala", "Scala"),
+            ("Main.sc", "Scala"),
+            ("build.sbt", "Scala"),
+            ("index.php", "PHP"),
+            ("app.rb", "Ruby"),
+            ("main.swift", "Swift"),
+            ("init.lua", "Lua"),
+            ("run.ps1", "PowerShell"),
+            ("run.psm1", "PowerShell"),
+            ("app.proto", "Protobuf"),
+            ("settings.ini", "INI"),
+            ("app.cfg", "INI"),
+            ("app.editorconfig", "INI"),
+            ("change.diff", "Diff"),
+            ("change.patch", "Diff"),
+            ("build.mk", "Makefile"),
+            ("Makefile", "Makefile"),
+            ("Gemfile", "Ruby"),
+            ("Rakefile", "Ruby"),
+            (".editorconfig", "INI"),
+        ] {
+            let config = language_for(Path::new(name)).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(config.name, expected, "{name}");
+        }
+        for (name, expected) in [
+            ("MAIN.PY", "Python"),
+            ("MAIN.C", "C"),
+            ("MAIN.CPP", "C++"),
+            ("APP.CS", "C#"),
+            ("MAIN.GO", "Go"),
+            ("MAIN.RS", "Rust"),
+            ("MAIN.SCALA", "Scala"),
+            ("INDEX.PHP", "PHP"),
+            ("APP.RB", "Ruby"),
+            ("MAIN.SWIFT", "Swift"),
+            ("INIT.LUA", "Lua"),
+            ("RUN.PS1", "PowerShell"),
+            ("APP.PROTO", "Protobuf"),
+            ("APP.INI", "INI"),
+            ("CHANGE.DIFF", "Diff"),
+            ("BUILD.MK", "Makefile"),
+            ("MAKEFILE", "Makefile"),
+            ("GEMFILE", "Ruby"),
+            ("RAKEFILE", "Ruby"),
+        ] {
+            let config = language_for(Path::new(name)).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(config.name, expected, "{name}");
+        }
+        for name in ["python", "c++", "c#", "cpp", "cs", "go", "rust", "scala"] {
+            assert!(
+                language_by_name(name).is_some(),
+                "the fence language {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_source_is_coloured() {
+        let text = "# a helper\n\
+class Build:\n\
+    count = 42\n\
+\n\
+    @staticmethod\n\
+    def run(count: int) -> bool:\n\
+        print(\"app\")\n\
+        return True\n";
+        let found = captures(&python(), text);
+        has(&found, "keyword class");
+        has(&found, "keyword return");
+        has(&found, "keyword Build");
+        has(&found, "annotation staticmethod");
+        has(&found, "function run");
+        has(&found, "function print");
+        has(&found, "field count");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment # a helper");
+        has(&found, "constant True");
+    }
+
+    #[test]
+    fn c_source_is_coloured() {
+        let text = "#include <stdio.h>\n\
+\n\
+// a helper\n\
+struct Build {\n\
+    int count;\n\
+};\n\
+\n\
+int main(void) {\n\
+    struct Build build = {42};\n\
+    printf(\"app\");\n\
+    return 0;\n\
+}\n";
+        let found = captures(&c(), text);
+        has(&found, "keyword #include");
+        has(&found, "keyword int");
+        has(&found, "keyword struct");
+        has(&found, "keyword Build");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function main");
+        has(&found, "function printf");
+    }
+
+    #[test]
+    fn cpp_source_is_coloured() {
+        let text = "#include <iostream>\n\
+\n\
+// a helper\n\
+class Build {\n\
+public:\n\
+    int count = 42;\n\
+    void run() {\n\
+        std::cout << \"app\";\n\
+    }\n\
+};\n\
+\n\
+int main() {\n\
+    Build build;\n\
+    build.run();\n\
+    return 0;\n\
+}\n";
+        let found = captures(&cpp(), text);
+        has(&found, "keyword #include");
+        has(&found, "keyword class");
+        has(&found, "keyword public");
+        has(&found, "keyword Build");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function run");
+        has(&found, "function main");
+    }
+
+    #[test]
+    fn csharp_source_is_coloured() {
+        let text = "// a helper\n\
+namespace App {\n\
+    class Build {\n\
+        public int Count = 42;\n\
+\n\
+        public void Run() {\n\
+            Console.WriteLine(\"app\");\n\
+        }\n\
+    }\n\
+}\n";
+        let found = captures(&csharp(), text);
+        has(&found, "keyword namespace");
+        has(&found, "keyword class");
+        has(&found, "keyword public");
+        has(&found, "keyword Build");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function Run");
+        has(&found, "function WriteLine");
+    }
+
+    #[test]
+    fn go_source_is_coloured() {
+        let text = "package app\n\
+\n\
+// a helper\n\
+type Build struct {\n\
+    Count int\n\
+}\n\
+\n\
+func run(count int) int {\n\
+    return count + 42\n\
+}\n\
+\n\
+func main() {\n\
+    run(1)\n\
+    println(\"app\")\n\
+}\n";
+        let found = captures(&go(), text);
+        has(&found, "keyword package");
+        has(&found, "keyword func");
+        has(&found, "keyword Build");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function run");
+        has(&found, "function main");
+        has(&found, "function println");
+    }
+
+    #[test]
+    fn rust_source_is_coloured() {
+        let text = "// a helper\n\
+struct Build {\n\
+    count: u32,\n\
+}\n\
+\n\
+fn run(count: u32) -> u32 {\n\
+    let name = \"app\";\n\
+    println!(\"{}\", 42);\n\
+    count\n\
+}\n\
+\n\
+fn main() {\n\
+    let build = Build { count: 1 };\n\
+    run(build.count);\n\
+}\n";
+        let found = captures(&rust(), text);
+        has(&found, "keyword struct");
+        has(&found, "keyword fn");
+        has(&found, "keyword let");
+        has(&found, "keyword Build");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function run");
+        has(&found, "function main");
+        has(&found, "field count");
+    }
+
+    #[test]
+    fn scala_source_is_coloured() {
+        let text = "// a helper\n\
+class Build {\n\
+  val count: Int = 42\n\
+\n\
+  def run(name: String): Boolean = {\n\
+    println(\"app\")\n\
+    true\n\
+  }\n\
+}\n";
+        let found = captures(&scala(), text);
+        has(&found, "keyword class");
+        has(&found, "keyword def");
+        has(&found, "keyword Build");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function run");
+        has(&found, "function println");
+        has(&found, "constant true");
+    }
+
+    #[test]
+    fn php_source_is_coloured() {
+        let text = "<?php\n\
+// a helper\n\
+class Build {\n\
+    public int $count = 42;\n\
+\n\
+    public function run(): void {\n\
+        echo \"app\";\n\
+    }\n\
+}\n\
+\n\
+$build = new Build();\n\
+$build->run();\n";
+        let found = captures(&php(), text);
+        has(&found, "keyword class");
+        has(&found, "keyword public");
+        has(&found, "keyword function");
+        has(&found, "keyword Build");
+        has(&found, "keyword int");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function run");
+    }
+
+    #[test]
+    fn ruby_source_is_coloured() {
+        let text = "# a helper\n\
+class Build\n\
+  def run(count)\n\
+    name = \"app\"\n\
+    puts name\n\
+    42\n\
+  end\n\
+end\n\
+\n\
+Build.new.run(1)\n";
+        let found = captures(&ruby(), text);
+        has(&found, "keyword class");
+        has(&found, "keyword def");
+        has(&found, "keyword Build");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment # a helper");
+        has(&found, "function run");
+        has(&found, "function puts");
+    }
+
+    #[test]
+    fn swift_source_is_coloured() {
+        let text = "// a helper\n\
+class Build {\n\
+    let count = 42\n\
+\n\
+    func run() -> String {\n\
+        return \"app\"\n\
+    }\n\
+}\n\
+\n\
+let build = Build()\n\
+build.run()\n";
+        let found = captures(&swift(), text);
+        has(&found, "keyword class");
+        has(&found, "keyword func");
+        has(&found, "keyword Build");
+        has(&found, "string app");
+        has(&found, "number 42");
+        has(&found, "comment // a helper");
+        has(&found, "function run");
+    }
+
+    #[test]
+    fn lua_source_is_coloured() {
+        let text = "-- a helper\n\
+local function run(count)\n\
+    local name = \"app\"\n\
+    print(name, 42)\n\
+end\n\
+\n\
+run(1)\n";
+        let found = captures(&lua(), text);
+        has(&found, "keyword local");
+        has(&found, "keyword function");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment -- a helper");
+        has(&found, "function run");
+    }
+
+    #[test]
+    fn powershell_script_is_coloured() {
+        let text = "# a helper\n\
+function Run-Build {\n\
+    param([int]$count = 42)\n\
+    Write-Output \"app\"\n\
+}\n\
+\n\
+Run-Build -count 1\n";
+        let found = captures(&powershell(), text);
+        has(&found, "keyword function");
+        has(&found, "keyword param");
+        has(&found, "string \"app\"");
+        has(&found, "number 42");
+        has(&found, "comment # a helper");
+        has(&found, "function Run-Build");
+        has(&found, "function Write-Output");
+    }
+
+    #[test]
+    fn protobuf_schema_is_coloured() {
+        let text = "// a helper\n\
+syntax = \"proto3\";\n\
+\n\
+message Build {\n\
+  int32 count = 1;\n\
+  string name = 2;\n\
+}\n\
+\n\
+service Builder {\n\
+  rpc Run (Build) returns (Build);\n\
+}\n";
+        let found = captures(&protobuf(), text);
+        has(&found, "keyword message");
+        has(&found, "keyword service");
+        has(&found, "keyword Build");
+        has(&found, "string \"proto3\"");
+        has(&found, "number 1");
+        has(&found, "comment // a helper");
+        has(&found, "function Run");
+        has(&found, "field count");
+    }
+
+    #[test]
+    fn ini_settings_are_coloured() {
+        let text = "# a helper\n\
+[build]\n\
+name=app\n\
+count=42\n";
+        let found = captures(&ini(), text);
+        has(&found, "keyword build");
+        has(&found, "field name");
+        has(&found, "string app");
+        has(&found, "string 42");
+        assert!(
+            found
+                .iter()
+                .any(|item| item.starts_with("comment # a helper")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn diff_changes_are_coloured() {
+        let text = "# a helper\n\
+diff --git a/app.py b/app.py\n\
+index 1234567..89abcde 100644\n\
+--- a/app.py\n\
++++ b/app.py\n\
+@@ -1,3 +1,4 @@\n\
+-old line\n\
++new line\n";
+        let found = captures(&diff(), text);
+        has(&found, "keyword -old line");
+        has(&found, "string +new line");
+        has(&found, "constant 1234567");
+        has(&found, "annotation @@ -1,3 +1,4 @@");
+        has(&found, "number -1,3");
+        has(&found, "comment # a helper");
+    }
+
+    #[test]
+    fn makefile_rules_are_coloured() {
+        let text = "# a helper\n\
+NAME := $(shell echo app)\n\
+FLAGS := -O2\n\
+\n\
+all: build\n\
+\n\
+build:\n\
+\techo \"app\"\n";
+        let found = captures(&make(), text);
+        has(&found, "field NAME");
+        has(&found, "field FLAGS");
+        has(&found, "function shell");
+        has(&found, "constant build");
+        has(&found, "comment # a helper");
+    }
+
+    #[test]
+    fn source_blocks_fold() {
+        let python = folds_of(&python(), "def run():\n    print(\"app\")\n");
+        assert!(
+            python.iter().any(|fold| fold.contains("print")),
+            "{python:?}"
+        );
+
+        let cpp = folds_of(&cpp(), "int main() {\n    return 0;\n}\n");
+        assert!(
+            cpp.iter()
+                .any(|fold| fold.starts_with('{') && fold.ends_with('}')),
+            "{cpp:?}"
+        );
+
+        let rust = folds_of(&rust(), "fn main() {\n    let a = 1;\n}\n");
+        assert!(
+            rust.iter()
+                .any(|fold| fold.starts_with('{') && fold.ends_with('}')),
+            "{rust:?}"
+        );
+
+        let scala = folds_of(&scala(), "class Build {\n  val a = 1\n}\n");
+        assert!(
+            scala
+                .iter()
+                .any(|fold| fold.starts_with('{') && fold.ends_with('}')),
+            "{scala:?}"
+        );
+    }
+
+    #[test]
+    fn a_markdown_fence_of_python_takes_the_python_grammar() {
+        let text = "```python\ndef run(count):\n    # a helper\n    print(\"app\", 42)\n```\n";
+        let (service, receiver) = syntax(markdown(), text);
+        let snapshot = snapshot(&receiver);
+        drop(service);
+        let spans = &snapshot.highlights;
+        coloured(spans, text, HighlightKind::Keyword, "def");
+        coloured(spans, text, HighlightKind::Comment, "# a helper");
+        coloured(spans, text, HighlightKind::String, "\"app\"");
+        coloured(spans, text, HighlightKind::Number, "42");
+        coloured(spans, text, HighlightKind::Function, "print");
     }
 }

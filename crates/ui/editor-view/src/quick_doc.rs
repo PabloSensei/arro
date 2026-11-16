@@ -1189,6 +1189,11 @@ impl EditorView {
         if !self.options.quick_doc_on_hover {
             return;
         }
+        // A list that holds the screen keeps the pointer popup away, as IDEA does.
+        if self.hover_popup_blocked() {
+            self.cancel_hover();
+            return;
+        }
         if self.lsp.as_ref().is_some_and(|lsp| {
             lsp.quick
                 .as_ref()
@@ -1240,6 +1245,7 @@ impl EditorView {
                     this.hover_serial == serial
                         && this.hover_word.as_ref() == Some(&range)
                         && this.options.quick_doc_on_hover
+                        && !this.hover_popup_blocked()
                         && !this.lsp.as_ref().is_some_and(|lsp| {
                             lsp.quick
                                 .as_ref()
@@ -1258,6 +1264,7 @@ impl EditorView {
                 if this.hover_serial != serial
                     || this.hover_word.as_ref() != Some(&range)
                     || !this.options.quick_doc_on_hover
+                    || this.hover_popup_blocked()
                     || this.lsp.as_ref().is_some_and(|lsp| {
                         lsp.quick
                             .as_ref()

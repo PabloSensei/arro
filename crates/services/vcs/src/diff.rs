@@ -212,6 +212,35 @@ mod tests {
         }
     }
 
+    fn marked<'a>(text: &'a str, ranges: &[Range<usize>]) -> Vec<&'a str> {
+        ranges.iter().map(|range| &text[range.clone()]).collect()
+    }
+
+    #[test]
+    fn words_that_differ_are_marked_and_the_rest_is_not() {
+        let before = "let count = 1;";
+        let after = "let total = 2;";
+
+        let changes = word_changes(before, after);
+
+        assert_eq!(marked(before, &changes.before), ["count", "1"]);
+        assert_eq!(marked(after, &changes.after), ["total", "2"]);
+    }
+
+    #[test]
+    fn word_ranges_stay_inside_the_text_and_skip_punctuation() {
+        let before = "a_b(c)";
+        let after = "a_b(d)";
+
+        let changes = word_changes(before, after);
+
+        assert_eq!(marked(before, &changes.before), ["c"]);
+        assert_eq!(marked(after, &changes.after), ["d"]);
+        for range in changes.before.iter().chain(&changes.after) {
+            assert!(range.start <= range.end);
+        }
+    }
+
     #[test]
     fn one_hunk_is_reverted_and_the_rest_stays() {
         let before = "a\nb\nc\nd\ne\n";

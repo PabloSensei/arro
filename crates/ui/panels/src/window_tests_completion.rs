@@ -67,7 +67,8 @@ public class CompletionOrder {
         |_| entries.lock().unwrap().is_some(),
     );
     let entries = entries.lock().unwrap().clone().unwrap();
-    let order = editor_view::completion_order(&entries, "Str");
+    let preferred = support.preferred_completion_names();
+    let order = editor_view::completion_order(&entries, "Str", preferred);
     let first = entries[order[0]].label.clone();
     assert_eq!(
         first.split(" - ").next(),

@@ -11,7 +11,7 @@ members = [
 exclude = ["spikes", "vendor"]
 
 [workspace.package]
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 publish = false
 
@@ -66,6 +66,22 @@ tree-sitter-toml-ng = "=0.7.0"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-xml = "=0.7.0"
 tree-sitter-yaml = "=0.7.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-c-sharp = "=0.23.5"
+tree-sitter-go = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-scala = "=0.26.13"
+tree-sitter-php = "=0.25.1"
+tree-sitter-ruby = "=0.23.1"
+tree-sitter-swift = "=0.7.4"
+tree-sitter-lua = "=0.5.0"
+tree-sitter-powershell = "=0.26.6"
+tree-sitter-proto = "=0.6.0"
+tree-sitter-ini = "=1.4.0"
+tree-sitter-diff = "=0.1.0"
+tree-sitter-make = "=1.1.1"
 updater = { path = "crates/services/updater" }
 vcs = { path = "crates/services/vcs" }
 workspace-core = { path = "crates/services/workspace-core" }

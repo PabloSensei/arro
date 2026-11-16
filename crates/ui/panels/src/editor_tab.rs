@@ -38,7 +38,7 @@ pub(crate) fn style_of(cx: &App) -> EditorStyle {
             .try_global::<workspace::EditorAppearance>()
             .and_then(|appearance| appearance.presentation_font)
             .unwrap_or(settings.font_size);
-        let font_size = (points * settings.ui_scale).round().max(6.);
+        let font_size = (points * text_scale(settings.ui_scale)).round().max(6.);
         if !settings.editor_font_family.trim().is_empty() {
             style.font_family = settings.editor_font_family.clone().into();
         }
@@ -283,6 +283,7 @@ fn open(
                     view.update(cx, crate::coverage::refresh);
                     crate::endpoints::editor_changed(&view, cx);
                     crate::spelling::editor_changed(&view, cx);
+                    crate::git::editor_changed(&view, cx);
                     outline::refresh(&view, matches!(event, EditorEvent::Changed), cx);
                     if matches!(event, EditorEvent::Changed) {
                         places::remember(&view, cx);
@@ -686,6 +687,24 @@ fn open(
                         }
                     }
                 }
+                EditorEvent::ChangeMarkClick(line) => {
+                    let Some(git) = cx.try_global::<crate::git::ActiveGit>() else {
+                        return;
+                    };
+                    let git = git.0.clone();
+                    let line = *line;
+                    let view = view.clone();
+                    git.update(cx, |git, cx| git.change_mark_clicked(view, line, cx));
+                }
+                EditorEvent::ChangeMarkHover(line) => {
+                    let Some(git) = cx.try_global::<crate::git::ActiveGit>() else {
+                        return;
+                    };
+                    let git = git.0.clone();
+                    let line = *line;
+                    let view = view.clone();
+                    git.update(cx, |git, cx| git.change_mark_hover(view, line, cx));
+                }
                 EditorEvent::BlameCommit(id) => {
                     let id = id.clone();
                     let workspace = runner.clone();
@@ -983,6 +1002,7 @@ fn open(
     .detach();
 
     let focus = view.focus_handle(cx);
+    let hidden = view.clone();
     let (status, save, save_now) = (view.clone(), view.clone(), view.clone());
     let (caret, restore, format) = (view.clone(), view.clone(), view.clone());
     let indent = view.clone();
@@ -1052,6 +1072,9 @@ fn open(
         preview,
         bundle,
         can_close: None,
+        on_hidden: Some(Rc::new(move |cx| {
+            hidden.update(cx, |view, cx| view.dismiss_popups(cx));
+        })),
     }
 }
 /// The factory the workspace opens files with.

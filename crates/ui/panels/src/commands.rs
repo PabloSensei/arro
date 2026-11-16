@@ -474,7 +474,7 @@ pub fn register(
     });
     workspace.register_command(
         keys::ROLLBACK_CHANGED_LINES,
-        "Revert Changed Lines",
+        "Rollback Lines",
         |_, _, cx| {
             let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
                 return;

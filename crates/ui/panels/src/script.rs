@@ -4,6 +4,13 @@
 //! Steps are separated by `;` or by a line end, paths are relative to the project root:
 //! `reveal:src/main`, `open:pom.xml`, `key:ctrl-s`, `type:text`, `theme`, `split`,
 //! `close-tab`, `next-tab`, `dock:left|right|bottom`, `search`, `dismiss`, `wait:MS`,
+//! `agent:claude|codex|acp-codex|acp-claude|mock`, `agent-input:MS`, `wait-agent:MS`,
+//! `allow`, `allow-always`, `deny`, `agent-stop`, `changes`, `review:FILE`, `accept-hunk:N`,
+//! `revert-hunk:N`, `accept-file`, `revert-file`, `accept-all`, `revert-all`, `agents-md`.
+//! `agent-input` waits until the active session shows its input box and
+//! closes the window when it does not, so a script never types into a login or permission
+//! screen. `wait-agent` waits until a chat ends its turn or asks for permission. `type` and `key` go to whatever has the focus,
+//! the terminal of a dock included.
 //! `report:FILE`, `quit`. `config:NAME` waits for a run configuration and selects it,
 //! `show:TOOL` opens a tool window, `task:NAME` runs a task of the build tool, `until:TEXT`
 //! waits for the run console to show the text. `goto:LINE` moves the caret of the active
@@ -25,7 +32,6 @@
 //! (`font_size`, `soft_wrap`, `show_whitespace`, `autosave`, `runtime_home`).
 //! `history:PATH` opens Local History of a file or folder, `history-revert` reverts the file to
 //! the version picked there, `label:TEXT` puts a label over the project.
-//! `agent:claude|codex`, `agent-input:MS`. `agent-input` waits until the
 //! active session shows its input box and closes the window when it does not, so a script never
 //! types into a login or permission screen. `type` and `key` go to whatever has the focus,
 //! the terminal of a dock included; `type` reads `\n`, `\t` and `\\` as the keys Enter,
@@ -50,11 +56,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agent_core::Harness;
+use agent_core::PermissionReply;
 use ui_kit::*;
 use workspace::{DockSide, Workspace};
 
-use crate::agents::ActiveAgents;
+use crate::agents::{ActiveAgents, AgentKind, AgentsPanel, Tab};
+use crate::ai_review::Action;
 use crate::build::BuildPanel;
 use crate::commit::CommitPanel;
 use crate::diff_view::DiffView;
@@ -132,8 +139,15 @@ pub enum Step {
     Dock(DockSide),
     Search,
     Dismiss,
-    Agent(Harness),
+    Agent(AgentKind),
     AgentInput(u64),
+    WaitAgent(u64),
+    Answer(PermissionReply),
+    AgentStop,
+    Changes,
+    ReviewFile(String),
+    Act(Action),
+    AgentsMd,
     Wait(u64),
     WaitReady,
     Config(String),
@@ -263,10 +277,26 @@ fn parse_step(step: &str) -> Result<Step, String> {
         }),
         "search" => Step::Search,
         "dismiss" => Step::Dismiss,
-        "agent" => {
-            let harness = Harness::ALL.iter().find(|harness| harness.stem() == value);
-            Step::Agent(*harness.ok_or(format!("unknown harness {value}"))?)
+        "agent" => Step::Agent(AgentKind::parse(value).ok_or(format!("unknown agent {value}"))?),
+        "wait-agent" => Step::WaitAgent(value.parse().map_err(|_| format!("bad wait {value}"))?),
+        "allow" => Step::Answer(PermissionReply::AllowOnce),
+        "allow-always" => Step::Answer(PermissionReply::AllowAlways),
+        "deny" => Step::Answer(PermissionReply::Deny),
+        "agent-stop" => Step::AgentStop,
+        "changes" => Step::Changes,
+        "review" => Step::ReviewFile(value.to_string()),
+        "accept-hunk" | "revert-hunk" => {
+            let index = value.parse().map_err(|_| format!("bad hunk {value}"))?;
+            Step::Act(match name {
+                "accept-hunk" => Action::AcceptHunk(index),
+                _ => Action::RevertHunk(index),
+            })
         }
+        "accept-file" => Step::Act(Action::AcceptFile),
+        "revert-file" => Step::Act(Action::RevertFile),
+        "accept-all" => Step::Act(Action::AcceptAll),
+        "revert-all" => Step::Act(Action::RevertAll),
+        "agents-md" => Step::AgentsMd,
         "wait" => Step::Wait(value.parse().map_err(|_| format!("bad wait {value}"))?),
         "wait-ready" => Step::WaitReady,
         "config" => Step::Config(value.into()),
@@ -511,7 +541,7 @@ fn report(workspace: &Workspace, cx: &App) -> String {
         let shown = screen.lines().into_iter().filter(|line| !line.is_empty());
         lines.extend(shown.map(|line| format!("terminal {line}")));
     }
-    lines.extend(cx.global::<ActiveAgents>().0.read(cx).report());
+    lines.extend(cx.global::<ActiveAgents>().0.read(cx).report(cx));
     lines.extend(cx.global::<ActivePlugins>().0.read(cx).report());
     lines.extend(cx.global::<ActiveDocker>().0.read(cx).report());
     lines.extend(crate::history_view::report(cx));
@@ -641,6 +671,15 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
         | Step::Until(_)
         | Step::Docker(..)
         | Step::DockerUntil(_)
+        | Step::Agent(_)
+        | Step::AgentInput(_)
+        | Step::WaitAgent(_)
+        | Step::Answer(_)
+        | Step::AgentStop
+        | Step::Changes
+        | Step::ReviewFile(_)
+        | Step::Act(_)
+        | Step::AgentsMd
         | Step::Click(_)
         | Step::Expect(..)
         | Step::ExpectTool(..)
@@ -666,7 +705,6 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
             let panel = cx.global::<ActiveTodo>().0.clone();
             crate::todo::rescan(&panel, root, cx);
         }
-        Step::Agent(_) | Step::AgentInput(_) => {}
     }
 }
 
@@ -685,6 +723,22 @@ fn reveal(path: &Path, cx: &mut App) {
         let path = panel.tree().rows()[0].path.join(path);
         panel.reveal(&path, cx);
     });
+}
+
+/// Steps that only touch the panel.
+fn panel_step(step: &Step, panel: &mut AgentsPanel, cx: &mut Context<AgentsPanel>) {
+    match step {
+        Step::Answer(reply) => panel.answer(*reply, cx),
+        Step::AgentStop => panel.stop(cx),
+        Step::Changes => panel.show_tab(Tab::Changes, cx),
+        Step::ReviewFile(path) => {
+            panel.show_tab(Tab::Changes, cx);
+            panel.select_change(path.clone(), cx);
+        }
+        Step::Act(action) => panel.act(*action, cx),
+        Step::AgentsMd => panel.add_agents_md(cx),
+        _ => {}
+    }
 }
 
 /// Whether a waiting step is through. The run panel updates the workspace, so this runs
@@ -708,6 +762,20 @@ fn git_step(step: &Step, window: &mut Window, cx: &mut App) {
             DiffView::open(git, workspace, path, window, cx);
         }
         _ => {}
+    }
+}
+
+/// Waits for `ready` on the panel up to `ms`; false when the time is out or the window gone.
+async fn wait_for(cx: &mut AsyncWindowContext, ms: u64, ready: fn(&AgentsPanel) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        let now = cx.update(|_, cx| ready(cx.global::<ActiveAgents>().0.read(cx)));
+        match now {
+            Ok(true) => return true,
+            Ok(false) if std::time::Instant::now() < deadline => {}
+            _ => return false,
+        }
+        cx.background_executor().timer(INPUT_POLL).await;
     }
 }
 
@@ -1114,18 +1182,30 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                     }
                     continue;
                 }
+                Step::WaitAgent(ms) => {
+                    // A turn that does not settle in time is reported as it is, not stopped.
+                    if !wait_for(cx, *ms, AgentsPanel::agent_settled).await {
+                        eprintln!("the agent did not settle in {ms} ms");
+                    }
+                    continue;
+                }
+                Step::Answer(_)
+                | Step::AgentStop
+                | Step::Changes
+                | Step::ReviewFile(_)
+                | Step::Act(_)
+                | Step::AgentsMd => {
+                    let done = cx.update(|_, cx| {
+                        let panel = cx.global::<ActiveAgents>().0.clone();
+                        panel.update(cx, |panel, cx| panel_step(&step, panel, cx));
+                    });
+                    if done.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 Step::AgentInput(ms) => {
-                    let deadline = std::time::Instant::now() + Duration::from_millis(*ms);
-                    let ready = loop {
-                        let ready =
-                            cx.update(|_, cx| cx.global::<ActiveAgents>().0.read(cx).input_ready());
-                        match ready {
-                            Ok(true) => break true,
-                            Ok(false) if std::time::Instant::now() < deadline => {}
-                            _ => break false,
-                        }
-                        cx.background_executor().timer(INPUT_POLL).await;
-                    };
+                    let ready = wait_for(cx, *ms, AgentsPanel::input_ready).await;
                     if !ready {
                         eprintln!("the agent shows no input box, the script stops here");
                         this.update_in(cx, |workspace, window, cx| {
@@ -1137,11 +1217,11 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                     continue;
                 }
                 // The panel may open the trust dialog, which updates the workspace.
-                Step::Agent(harness) => {
-                    let harness = *harness;
+                Step::Agent(kind) => {
+                    let kind = kind.clone();
                     let started = cx.update(|window, cx| {
                         let panel = cx.global::<ActiveAgents>().0.clone();
-                        panel.update(cx, |panel, cx| panel.request(harness, window, cx));
+                        panel.update(cx, |panel, cx| panel.request(kind, window, cx));
                     });
                     if started.is_err() {
                         break;
@@ -1207,7 +1287,8 @@ fn exit_failed() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DockSide, Harness, Step, parse_script};
+    use super::{Action, AgentKind, DockSide, Step, parse_script};
+    use agent_core::Harness;
 
     #[test]
     fn parses_every_kind_of_step() {
@@ -1230,7 +1311,7 @@ mod tests {
                 Step::Until("Started".into()),
                 Step::Docker("stop".into(), "web".into()),
                 Step::DockerUntil("tick".into()),
-                Step::Agent(Harness::Codex),
+                Step::Agent(AgentKind::Tui(Harness::Codex)),
                 Step::Settings,
                 Step::Setting("font_size".into(), "15".into()),
                 Step::Problem {
@@ -1258,6 +1339,10 @@ mod tests {
                 Step::Quit,
             ]
         );
+        let review = parse_script("agent:mock;wait-agent:10;deny;review:a.txt;revert-hunk:1");
+        let review = review.unwrap();
+        assert_eq!(review[0], Step::Agent(AgentKind::Mock));
+        assert_eq!(review[4], Step::Act(Action::RevertHunk(1)));
     }
 
     #[test]

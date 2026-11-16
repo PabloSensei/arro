@@ -9,10 +9,10 @@ publish.workspace = true
 # from the platform crate rather than from gpui-kit: gpui-kit's own `test-support`
 # also asks the optional Fast backend for it, and that backend pins versions the
 # engine cannot use.
-test-support = ["dep:gpui_windows", "gpui_windows/test-support"]
+test-support = ["gpui_windows/test-support"]
 
 [dependencies]
 gpui-kit.workspace = true
-gpui_windows = { workspace = true, optional = true, default-features = false }
+gpui_windows = { workspace = true, default-features = false }
 rust-embed = { version = "8.13.0", features = ["debug-embed"] }
 theme = { path = "../../editor/theme" }

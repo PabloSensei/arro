@@ -19,6 +19,12 @@ use ui_kit::*;
 use crate::semantic::{first, offset_at, point_at};
 use crate::view::{EditorEvent, EditorView, Usage, UsagesUpdate};
 
+/// The wait before each label of the visible rows is resolved. The search behind a usage
+/// count is the longest job a language server has, and it holds the answer of the next
+/// completion or jump while it runs: a label waits for a text that is not being typed and
+/// for the questions of the user that are still on their way.
+const RESOLVE_DELAY: Duration = Duration::from_millis(1200);
+
 /// One label of the server, with its place in this text.
 #[derive(Clone, Debug)]
 pub(crate) struct CodeLensItem {
@@ -65,6 +71,7 @@ impl EditorView {
     /// replaces the older one, and its answer is dropped.
     pub(crate) fn request_code_lens(&mut self, delay: Duration, cx: &mut Context<Self>) {
         self.code_lens_task = None;
+        self.code_lens_resolve_task = None;
         if !self.options.code_vision_usages && !self.options.code_vision_implementations {
             if let Some(state) = &mut self.state {
                 state.set_labels(Vec::new());
@@ -141,8 +148,14 @@ impl EditorView {
             .map(|entry| CodeLensItem::from_entry(entry, &store))
             .collect();
         keep_shown_titles(&self.code_lens, &mut fresh);
+        // A label that still shows its text keeps it: asking the server about the same
+        // place again would run the search behind the count once more.
+        self.code_lens_resolved.retain(|offset| {
+            fresh
+                .iter()
+                .any(|item| item.offset == *offset && !item.title.trim().is_empty())
+        });
         self.code_lens = fresh;
-        self.code_lens_resolved.clear();
         self.refresh_code_vision(cx);
         self.resolve_visible_code_lens(cx);
     }
@@ -151,17 +164,22 @@ impl EditorView {
     /// until the server answers about the new text. A label inside a replaced piece
     /// goes away.
     pub(crate) fn shift_code_lens(&mut self, change: &text_core::Change, cx: &mut Context<Self>) {
+        self.code_lens_resolve_task = None;
         for step in &change.steps {
             for edit in step {
                 self.code_lens.retain(|item| {
                     !(edit.range.start < item.offset && item.offset < edit.range.end)
                 });
+                self.code_lens_resolved
+                    .retain(|offset| !(edit.range.start < *offset && *offset < edit.range.end));
             }
             for item in &mut self.code_lens {
                 item.offset = text_core::transform_offset(item.offset, step);
             }
+            for offset in &mut self.code_lens_resolved {
+                *offset = text_core::transform_offset(*offset, step);
+            }
         }
-        self.code_lens_resolved.clear();
         self.refresh_code_vision(cx);
     }
 
@@ -296,13 +314,38 @@ impl EditorView {
             return;
         }
         let support = lsp.support.clone();
-        let offsets: Vec<usize> = wanted.iter().map(|(offset, _)| *offset).collect();
-        self.code_lens_resolved.extend(offsets);
-        cx.spawn(async move |this, cx| {
+        self.code_lens_resolve_task = Some(cx.spawn(async move |this, cx| {
             for (offset, query) in wanted {
+                // The count of the next label waits for a text nobody types. A keystroke
+                // or a question of the user that is still in flight ends the task: the
+                // search would hold their answer for seconds.
+                cx.background_executor().timer(RESOLVE_DELAY).await;
+                let ready = this
+                    .update(cx, |this, _| {
+                        this.state
+                            .as_ref()
+                            .is_some_and(|state| state.version() as i32 == version)
+                            && !this.lsp.as_ref().is_some_and(|lsp| lsp.question_pending())
+                    })
+                    .unwrap_or(false);
+                if !ready {
+                    return;
+                }
                 let Some(provider) = support.code_lens_resolve() else {
                     return;
                 };
+                let marked = this
+                    .update(cx, |this, _| {
+                        if this.code_lens_resolved.contains(&offset) {
+                            return false;
+                        }
+                        this.code_lens_resolved.push(offset);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !marked {
+                    continue;
+                }
                 let mut replies = ask(provider, query);
                 let Some(answer) = replies.next().await else {
                     continue;
@@ -331,8 +374,7 @@ impl EditorView {
                     return;
                 }
             }
-        })
-        .detach();
+        }));
     }
 
     /// The buffer lines of the rows on the screen.
@@ -419,9 +461,9 @@ impl EditorView {
                     }));
                 }
                 Some((_, Confidence::Unknown)) => {
-                    this.show_note(offset, crate::semantic::NO_ANSWER, cx)
+                    this.show_transient_note(offset, crate::semantic::NO_ANSWER, cx)
                 }
-                Some(_) => this.show_note(offset, "No implementations found", cx),
+                Some(_) => this.show_transient_note(offset, "No implementations found", cx),
                 None => {}
             })
             .ok();

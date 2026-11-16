@@ -1105,9 +1105,9 @@ fn strip_button(
 /// The colour of a chunk in the strips and in the panes.
 fn chunk_kind_color(kind: SegmentKind, theme: &Theme) -> Hsla {
     match kind {
-        SegmentKind::Conflict => Kind::Conflicted.color(theme.dark),
-        SegmentKind::Yours => Kind::Modified.color(theme.dark),
-        SegmentKind::Theirs | SegmentKind::Both => Kind::Added.color(theme.dark),
+        SegmentKind::Conflict => Kind::Conflicted.color(theme),
+        SegmentKind::Yours => Kind::Modified.color(theme),
+        SegmentKind::Theirs | SegmentKind::Both => Kind::Added.color(theme),
         SegmentKind::Unchanged => theme.text_secondary,
     }
 }

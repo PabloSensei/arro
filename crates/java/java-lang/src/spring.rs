@@ -1641,6 +1641,7 @@ fn completion_entries(
             resolve: None,
             kind: CompletionKind::Property,
             deprecated: property.deprecated(),
+            documentation: None,
         });
     }
     for prefix in &metadata.prefixes {
@@ -1665,6 +1666,7 @@ fn completion_entries(
             resolve: None,
             kind: CompletionKind::Property,
             deprecated: false,
+            documentation: None,
         });
     }
     entries.sort_by(|left, right| left.sort_text.cmp(&right.sort_text));
@@ -1711,6 +1713,7 @@ fn annotation_key_entries(
             resolve: None,
             kind: CompletionKind::Property,
             deprecated: property.deprecated(),
+            documentation: None,
         });
     }
     for prefix in &metadata.prefixes {
@@ -1732,6 +1735,7 @@ fn annotation_key_entries(
             resolve: None,
             kind: CompletionKind::Property,
             deprecated: false,
+            documentation: None,
         });
     }
     entries.sort_by(|left, right| left.sort_text.cmp(&right.sort_text));
@@ -1853,6 +1857,7 @@ fn value_entries(
             resolve: None,
             kind: CompletionKind::Value,
             deprecated: false,
+            documentation: None,
         })
         .collect();
     entries.sort_by(|left, right| left.sort_text.cmp(&right.sort_text));

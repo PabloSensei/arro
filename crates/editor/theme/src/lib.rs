@@ -1,6 +1,16 @@
-//! Design tokens: our own palette on warm greys with an orange accent, dark and light.
-//! Text and code keep a WCAG contrast of 4.5:1 on their background, muted text 3:1,
+//! Design tokens: our own palette on warm greys with an orange accent, dark and light,
+//! and a theme as data: a JSON file with the tokens it changes and a parent theme for the
+//! rest. Text and code keep a WCAG contrast of 4.5:1 on their background, muted text 3:1,
 //! see the tests. This crate knows nothing about the UI framework.
+
+mod builtin;
+pub mod format;
+mod icls;
+mod library;
+
+pub use format::{ThemeError, ThemeFile};
+pub use icls::from_icls;
+pub use library::{ThemeDefinition, ThemeLibrary, slug, themes_folder};
 
 /// A colour in sRGB, each channel in 0..=1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12,6 +22,14 @@ pub struct Color {
 }
 
 impl Color {
+    /// A colour no theme writes; a token left at this value is missing.
+    pub const TRANSPARENT: Self = Self {
+        r: 0.,
+        g: 0.,
+        b: 0.,
+        a: 0.,
+    };
+
     /// `hex` is 0xRRGGBBAA.
     pub fn from_hex(hex: u32) -> Self {
         let channel = |shift: u32| ((hex >> shift) & 0xff) as f32 / 255.;
@@ -22,10 +40,42 @@ impl Color {
             a: channel(0),
         }
     }
+
+    /// A colour of a theme file: `#rrggbb`, `#rrggbbaa` or the same without the number
+    /// sign. A theme of the other IDE writes its colours without it.
+    pub fn from_text(text: &str) -> Option<Self> {
+        let text = text.trim().trim_start_matches('#');
+        if !text.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u32::from_str_radix(text, 16).ok()?;
+        let hex = match text.len() {
+            6 => (value << 8) | 0xff,
+            8 => value,
+            _ => return None,
+        };
+        Some(Self::from_hex(hex))
+    }
+
+    /// The colour as a theme file writes it, `#rrggbb` or `#rrggbbaa`.
+    pub fn to_text(self) -> String {
+        let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u32;
+        let (r, g, b, a) = (
+            channel(self.r),
+            channel(self.g),
+            channel(self.b),
+            channel(self.a),
+        );
+        if a == 0xff {
+            format!("#{r:02x}{g:02x}{b:02x}")
+        } else {
+            format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+        }
+    }
 }
 
 macro_rules! tokens {
-    ($($field:ident: $dark:expr, $light:expr;)*) => {
+    ($($field:ident;)*) => {
         /// One value per token. `C` is [`Color`] here and the colour type of the
         /// UI framework in `ui-kit`.
         #[derive(Clone, Copy, Debug)]
@@ -35,12 +85,20 @@ macro_rules! tokens {
         }
 
         impl Tokens<Color> {
+            /// The built-in dark theme.
             pub fn dark() -> Self {
-                Self { dark: true, $($field: Color::from_hex($dark),)* }
+                builtin::tokens("dark")
             }
 
+            /// The built-in light theme.
             pub fn light() -> Self {
-                Self { dark: false, $($field: Color::from_hex($light),)* }
+                builtin::tokens("light")
+            }
+
+            /// Every token transparent: a theme file fills the ones it names, and a token
+            /// left transparent went missing.
+            fn blank(dark: bool) -> Self {
+                Self { dark, $($field: Color::TRANSPARENT,)* }
             }
         }
 
@@ -63,98 +121,114 @@ macro_rules! tokens {
                 }
                 true
             }
+
+            /// The token called `name`, the way a theme file spells it.
+            pub fn get(&self, name: &str) -> Option<C> {
+                Some(match name {
+                    $(stringify!($field) => self.$field,)*
+                    _ => return None,
+                })
+            }
         }
+
+        /// Every token name, as a theme file spells it.
+        pub const TOKEN_NAMES: &[&str] = &[$(stringify!($field),)*];
     };
 }
 
 tokens! {
     // Window chrome. Comments name the role of a group of tokens; Islands key names
     // stand for the same role.
-    main_bg: 0x2a2826ff, 0xebe8e3ff;
-    island_bg: 0x1c1b1aff, 0xfdfcfaff;
-    editor_bg: 0x1c1b1aff, 0xfdfcfaff;
-    border: 0x2a2826ff, 0xebe8e3ff;
+    main_bg;
+    island_bg;
+    editor_bg;
+    border;
     // Text: default, muted, secondary, disabled, link, over the accent.
-    text: 0xdedad3ff, 0x1c1b1aff;
-    text_muted: 0xa8a39aff, 0x5e5a54ff;
-    text_secondary: 0x928c83ff, 0x6f6a63ff;
-    text_disabled: 0x56524cff, 0xa8a39aff;
-    link: 0xfdba74ff, 0x9a3412ff;
-    over_accent: 0x1c1b1aff, 0xffffffff;
+    text;
+    text_muted;
+    text_secondary;
+    text_disabled;
+    link;
+    over_accent;
     // Selection in lists and trees.
-    selection: 0x3d2a1cff, 0xffedd5ff;
-    selection_muted: 0x30241bff, 0xfff7edff;
-    selection_inactive: 0x363330ff, 0xe6e2dcff;
-    selection_hover: 0xfff4e612, 0x2a201008;
+    selection;
+    selection_muted;
+    selection_inactive;
+    selection_hover;
     // Toolbar buttons: hovered, pressed, border; the accent.
-    hover: 0xfff4e619, 0x2a201012;
-    pressed: 0xfff4e62b, 0x2a201020;
-    toolbar_border: 0xfff4e622, 0x2a201020;
-    accent: 0xf97316ff, 0xc2410cff;
+    hover;
+    pressed;
+    toolbar_border;
+    accent;
     // The selected editor tab.
-    tab_selected: 0x3d2a1cff, 0xffedd5ff;
-    tab_selected_border: 0xf97316ff, 0xfdba74ff;
+    tab_selected;
+    tab_selected_border;
     // Popups, notifications, controls.
-    popup_bg: 0x2a2826ff, 0xfdfcfaff;
-    popup_border: 0x383532ff, 0xe6e2dcff;
-    feedback_bg: 0x383532ff, 0xfdfcfaff;
-    feedback_border: 0x383532ff, 0xd6d1c9ff;
-    control_border: 0x46423eff, 0xd6d1c9ff;
-    control_small: 0x46423eff, 0xdedad3ff;
+    popup_bg;
+    popup_border;
+    feedback_bg;
+    feedback_border;
+    control_border;
+    control_small;
     // A search match and the text over it. The blue stays apart from the orange
     // selection, and the light text keeps its contrast on the dark blue.
-    match_bg: 0x1e4a6bff, 0xbfdbfeff;
-    match_text: 0xfff7edff, 0x1c1b1aff;
+    match_bg;
+    match_text;
     // The close button hover of Windows 11.
-    close_hover: 0xc42b1cff, 0xc42b1cff;
+    close_hover;
     // Code.
-    code: 0xd4d0c8ff, 0x1f1d1bff;
-    keyword: 0xe8899cff, 0xb02a4fff;
-    string: 0xd8b46eff, 0x8a5a00ff;
-    number: 0xb8a2f4ff, 0x5b3fc4ff;
-    comment: 0x8f8a81ff, 0x75706aff;
-    doc: 0x9d9ab5ff, 0x6a6593ff;
-    doc_tag: 0xbcb6e0ff, 0x564f8cff;
-    function: 0x7db6f5ff, 0x1d5fa8ff;
-    annotation: 0x5ccfbfff, 0x0b7363ff;
-    field: 0xa9d18aff, 0x356a19ff;
-    unused: 0x77726aff, 0x878279ff;
+    code;
+    keyword;
+    string;
+    number;
+    comment;
+    doc;
+    doc_tag;
+    function;
+    annotation;
+    field;
+    unused;
     // Semantic tokens: what a name is, painted over the syntax colours.
-    semantic_field: 0xc4a1f5ff, 0x7b3fb0ff;
-    semantic_parameter: 0x8ec7d8ff, 0x1b6f86ff;
-    semantic_local: 0xa9bdd4ff, 0x35536eff;
-    semantic_method: 0x86b9f5ff, 0x1d5fa8ff;
-    semantic_type: 0x8fd3a2ff, 0x2c7a45ff;
-    semantic_type_parameter: 0xc5dfa0ff, 0x4f6f1fff;
-    semantic_constant: 0xd9a7e8ff, 0x8a3f9eff;
-    semantic_annotation: 0x5ccfbfff, 0x0b7363ff;
-    caret_row: 0x242220ff, 0xf4f1ecff;
-    caret: 0xe8e3daff, 0x1c1b1aff;
-    line_number: 0x7a756dff, 0x8c877fff;
-    line_number_current: 0xb3ada3ff, 0x5e5a54ff;
-    indent_guide: 0x312e2bff, 0xece8e2ff;
+    semantic_field;
+    semantic_parameter;
+    semantic_local;
+    semantic_method;
+    semantic_type;
+    semantic_type_parameter;
+    semantic_constant;
+    semantic_annotation;
+    caret_row;
+    caret;
+    line_number;
+    line_number_current;
+    indent_guide;
     // Inlay hints and their background.
-    inlay: 0x948f86ff, 0x77726bff;
-    inlay_bg: 0x3a37338c, 0xebe7e18c;
+    inlay;
+    inlay_bg;
     // Scrollbars: the thumb at rest and under the pointer, and the track behind it.
-    scrollbar_thumb: 0x8a847bcc, 0x8c877fcc;
-    scrollbar_thumb_hover: 0xb8b2a8ff, 0x6f6a63ff;
-    scrollbar_track: 0xffffff0d, 0x0000000d;
+    scrollbar_thumb;
+    scrollbar_thumb_hover;
+    scrollbar_track;
     // A warning on the scrollbar.
-    warning_mark: 0xd9a441ff, 0xe0a530ff;
+    warning_mark;
     // A misspelled word under its green wave, apart from the warnings of a language.
-    spell_mark: 0x6ccf8eff, 0x1f8a36ff;
+    spell_mark;
     // Folded text.
-    fold_bg: 0x3a3733ff, 0xece6f7ff;
-    fold_text: 0xb0aa9fff, 0x4f4a63ff;
+    fold_bg;
+    fold_text;
     // The marks on the editor scrollbar: errors, warnings, find matches and the caret
     // line.
-    stripe_error: 0xf75464ff, 0xc7222dff;
-    stripe_warning: 0xd9a441ff, 0xe0a530ff;
-    stripe_find: 0x6aa9ffff, 0x2c6fbbff;
-    stripe_caret: 0xe8e3daff, 0x1c1b1aff;
+    stripe_error;
+    stripe_warning;
+    stripe_find;
+    stripe_caret;
     // What the user typed into a console, as IDEA colours its input line.
-    console_input: 0x62b543ff, 0x067d17ff;
+    console_input;
+    // The states of the rest of the window: a test that passed, a change of the version
+    // control, a failure. They read on any background a theme puts them over.
+    success;
+    info;
+    error;
 }
 
 /// Metrics in logical pixels.

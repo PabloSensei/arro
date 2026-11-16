@@ -1,4 +1,4 @@
-// Modified for Arro by Paweł Januszko, 2026: the vsync thread sleeps while no window asks for a frame.
+// Modified for Arro by Paweł Januszko, 2026: the vsync thread sleeps while no window asks for a frame, and the interface scale multiplies the DPI scale of every window.
 // See NOTICE-ARRO.md in the root of this crate.
 use std::{
     cell::{Cell, RefCell},
@@ -55,6 +55,9 @@ impl TrackedWindow {
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[TrackedWindow; 4]>>>,
+    /// The scale of the interface over the DPI scale of the monitor: every logical pixel
+    /// of a window grows by it, while the size of the window on screen stays the same.
+    ui_scale: Cell<f32>,
     /// The windowing mode to start in, applied when `run` starts. Windowed when unset.
     initial_windowing: RefCell<Option<WindowingRequest>>,
     /// Set to stop the current `VSyncProvider` thread, which runs while windowed.
@@ -139,6 +142,11 @@ impl WindowsPlatformState {
         }
     }
 }
+
+/// The limits of the interface scale. Settings keeps a narrower range; the platform
+/// takes any finite value so a test or another caller cannot break the layout.
+const MIN_UI_SCALE: f32 = 0.5;
+const MAX_UI_SCALE: f32 = 4.;
 
 struct PowerRequest {
     handle: HANDLE,
@@ -285,6 +293,7 @@ impl WindowsPlatform {
             inner,
             handle,
             raw_window_handles,
+            ui_scale: Cell::new(1.),
             initial_windowing: RefCell::new(None),
             vsync_stop: RefCell::new(None),
             headless,
@@ -307,6 +316,29 @@ impl WindowsPlatform {
 
     pub(crate) fn window_from_hwnd(&self, hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
         self.inner.window_from_hwnd(hwnd)
+    }
+
+    /// Scales the interface of every window of the application. The scale multiplies the
+    /// DPI scale factor of the monitor, so all logical pixels grow together and the
+    /// window keeps its size on screen. Windows opened later start at this scale.
+    pub fn set_ui_scale(&self, ui_scale: f32) {
+        let ui_scale = if ui_scale.is_finite() {
+            ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
+        } else {
+            1.
+        };
+        self.ui_scale.set(ui_scale);
+        let handles: Vec<HWND> = self
+            .raw_window_handles
+            .read()
+            .iter()
+            .map(TrackedWindow::as_raw)
+            .collect();
+        for hwnd in handles {
+            if let Some(window) = self.window_from_hwnd(hwnd) {
+                window.set_ui_scale(ui_scale);
+            }
+        }
     }
 
     #[inline]
@@ -334,6 +366,7 @@ impl WindowsPlatform {
             invalidate_devices: self.invalidate_devices.clone(),
             frame_demand: self.frame_demand.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
+            ui_scale: self.ui_scale.get(),
         }
     }
 
@@ -1537,6 +1570,9 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) frame_demand: Arc<FrameDemand>,
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
+    /// The scale of the interface over the DPI scale of the monitor, at the moment the
+    /// window opens.
+    pub(crate) ui_scale: f32,
 }
 
 struct PlatformWindowCreateContext {

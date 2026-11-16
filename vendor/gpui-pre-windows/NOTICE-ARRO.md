@@ -9,10 +9,10 @@ Arro changed these files; each one says so in its first lines:
 
 | File | Change |
 |---|---|
-| `src/events.rs` | Keyboard input on any layout: `VK_PACKET`, dead keys, a modifier pressed on its own; the window frame stays drawn by Windows. |
+| `src/events.rs` | Keyboard input on any layout: `VK_PACKET`, dead keys, a modifier pressed on its own; the window frame stays drawn by Windows; the DPI change keeps the interface scale of the window. |
 | `src/keyboard.rs` | Shortcuts match on any keyboard layout, not only on US English. |
-| `src/platform.rs` | The vsync thread sleeps while no window asks for a frame. |
+| `src/platform.rs` | The vsync thread sleeps while no window asks for a frame; the interface scale multiplies the DPI scale of every window. |
 | `src/vsync.rs` | `FrameDemand`: windows ask for frames, the thread waits for the compositor clock only while they do. |
-| `src/window.rs` | `VK_PACKET` input and a frame waker that feeds `FrameDemand`. |
+| `src/window.rs` | `VK_PACKET` input, a frame waker that feeds `FrameDemand`, a `zoom` that toggles the maximized state as the other platforms do, and the interface scale over the DPI scale of the monitor. |
 
 The other files are unchanged apart from line endings.

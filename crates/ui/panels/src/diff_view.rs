@@ -317,16 +317,16 @@ fn line_tint(kind: Option<Kind>, right: bool, theme: &Theme) -> Option<Hsla> {
     match kind? {
         Kind::Added if !right => None,
         Kind::Deleted if right => None,
-        kind => Some(kind.color(theme.dark)),
+        kind => Some(kind.color(theme)),
     }
 }
 
 fn word_tint(kind: Option<Kind>, right: bool, theme: &Theme) -> Option<Hsla> {
     (kind == Some(Kind::Modified)).then(|| {
         if right {
-            Kind::Added.color(theme.dark)
+            Kind::Added.color(theme)
         } else {
-            Kind::Conflicted.color(theme.dark)
+            Kind::Conflicted.color(theme)
         }
     })
 }
@@ -612,6 +612,31 @@ impl DiffView {
             Source::WorkingTree,
             files,
             index,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// The diff of a file at `line`: the hunk of that line is the one the keys act on,
+    /// as Show Diff of the window of a change opens it.
+    pub fn open_at(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        path: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let files = vec![path.clone()];
+        Self::open_source(
+            git,
+            workspace,
+            path,
+            Source::WorkingTree,
+            files,
+            0,
+            Some(line),
             window,
             cx,
         );
@@ -634,6 +659,7 @@ impl DiffView {
             Source::Commit(commit),
             files,
             0,
+            None,
             window,
             cx,
         );
@@ -659,6 +685,7 @@ impl DiffView {
             Source::Branch(branch),
             files,
             index,
+            None,
             window,
             cx,
         );
@@ -695,6 +722,7 @@ impl DiffView {
                         Source::Shelf(shelf),
                         Vec::new(),
                         0,
+                        None,
                         diff.current,
                         FileFormat::default(),
                         diff.base,
@@ -807,6 +835,7 @@ impl DiffView {
         source: Source,
         files: Vec<PathBuf>,
         index: usize,
+        target: Option<u32>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -852,8 +881,8 @@ impl DiffView {
                         current
                     };
                     Self::show(
-                        git, workspace, path, source, files, index, current, format, diff.base,
-                        diff.hunks, window, cx,
+                        git, workspace, path, source, files, index, target, current, format,
+                        diff.base, diff.hunks, window, cx,
                     );
                 })
                 .ok();
@@ -887,6 +916,7 @@ impl DiffView {
                         source,
                         Vec::new(),
                         0,
+                        None,
                         current,
                         FileFormat::default(),
                         base,
@@ -908,6 +938,7 @@ impl DiffView {
         source: Source,
         files: Vec<PathBuf>,
         index: usize,
+        target: Option<u32>,
         current: String,
         format: FileFormat,
         base: String,
@@ -918,6 +949,9 @@ impl DiffView {
         let Some(shared) = workspace.upgrade() else {
             return;
         };
+        let selected = target
+            .and_then(|line| crate::git::hunk_index_at(&hunks, line))
+            .unwrap_or(0);
         let weak = workspace.clone();
         let tab = editor_of(&workspace, &path, cx);
         let side_by_side = cx
@@ -992,7 +1026,7 @@ impl DiffView {
                 source,
                 files,
                 index,
-                selected: 0,
+                selected,
                 tab,
                 attached,
                 detached_base,
@@ -1989,7 +2023,7 @@ impl DiffView {
                     .w(px(4.))
                     .h(px(height))
                     .rounded(px(CONTROL_RADIUS))
-                    .bg(kind.color(theme.dark))
+                    .bg(kind.color(theme))
                     .opacity(0.8),
             );
             let apply_left = div()
@@ -2141,8 +2175,8 @@ pub(crate) fn hunk_lines(base: &str, current: &str, hunk: &Hunk, theme: &Theme) 
     let to = (end + CONTEXT_LINES).min(after.len());
     let removed_from = (hunk.before.start as usize).min(before.len());
     let removed_to = (hunk.before.end as usize).min(before.len());
-    let removed = Some(Kind::Conflicted.color(theme.dark));
-    let added = Some(Kind::Added.color(theme.dark));
+    let removed = Some(Kind::Conflicted.color(theme));
+    let added = Some(Kind::Added.color(theme));
 
     let mut rows = div().flex().flex_col();
     for text in &after[from..start] {

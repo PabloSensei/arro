@@ -12,12 +12,12 @@ use crate::run::RunPanel;
 use crate::run_configs::RunConfigDialog;
 use crate::script::ActiveRunPanel;
 
-const READY: (u32, u32) = (0x5fb865, 0x208a3c);
-const RUNNING: (u32, u32) = (0xf2c55c, 0xb59b1b);
-const FAILED: (u32, u32) = (0xf75464, 0xc7222d);
-
-fn mark_color((dark, light): (u32, u32), is_dark: bool) -> Hsla {
-    rgb(if is_dark { dark } else { light }).into()
+fn mark_color(state: RunMarkState, theme: &Theme) -> Hsla {
+    match state {
+        RunMarkState::Running => theme.warning_mark,
+        RunMarkState::Failed => theme.error,
+        _ => theme.success,
+    }
 }
 
 fn panel_of(cx: &App) -> Option<Entity<RunPanel>> {
@@ -37,7 +37,7 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
     let Some(text) = view.text() else {
         return;
     };
-    let dark = cx.global::<Theme>().dark;
+    let theme = *cx.global::<Theme>();
     let panel = panel.read(cx);
     let sites = if panel.can_test() {
         sites_in(view, &text, panel)
@@ -48,16 +48,16 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
         .iter()
         .map(|site| {
             let state = panel.test_state(&site.suite, site.case.as_deref());
-            let (state, colors) = match state {
-                Some(TestState::Running) => (RunMarkState::Running, RUNNING),
-                Some(TestState::Passed) => (RunMarkState::Passed, READY),
-                Some(TestState::Failed { .. }) => (RunMarkState::Failed, FAILED),
-                _ => (RunMarkState::Ready, READY),
+            let state = match state {
+                Some(TestState::Running) => RunMarkState::Running,
+                Some(TestState::Passed) => RunMarkState::Passed,
+                Some(TestState::Failed { .. }) => RunMarkState::Failed,
+                _ => RunMarkState::Ready,
             };
             RunMark {
                 line: site.line.saturating_sub(1),
                 state,
-                color: mark_color(colors, dark),
+                color: mark_color(state, &theme),
             }
         })
         .collect();
@@ -69,7 +69,7 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
             .map(|point| RunMark {
                 line: point.line.saturating_sub(1),
                 state: RunMarkState::Ready,
-                color: mark_color(READY, dark),
+                color: mark_color(RunMarkState::Ready, &theme),
             }),
     );
     // Every request of a request file starts on its own line.
@@ -79,7 +79,7 @@ pub(crate) fn refresh(view: &mut EditorView, cx: &mut Context<EditorView>) {
             .map(|line| RunMark {
                 line,
                 state: RunMarkState::Ready,
-                color: mark_color(READY, dark),
+                color: mark_color(RunMarkState::Ready, &theme),
             }),
     );
     marks.sort_by_key(|mark| mark.line);

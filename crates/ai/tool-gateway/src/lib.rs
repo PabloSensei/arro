@@ -4,6 +4,7 @@
 mod audit;
 mod backend;
 mod gateway;
+mod hint;
 mod language;
 mod render;
 mod tools;
@@ -15,5 +16,6 @@ pub use backend::{
     SymbolInfo, SymbolPage, SymbolQuery, ToolBackend, ToolError, Unavailable,
 };
 pub use gateway::{Decision, Policy, ToolGateway};
+pub use hint::{agents_md_section, with_agents_md_section};
 pub use language::LanguageTools;
 pub use tools::{TOOL_NAMES, ToolClass, ToolSpec};

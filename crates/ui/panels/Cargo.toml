@@ -11,6 +11,7 @@ mock-agents = ["dep:agent-testkit"]
 [dependencies]
 dap-client.workspace = true
 database.workspace = true
+agent-acp = { path = "../../ai/agent-acp" }
 agent-core = { path = "../../ai/agent-core" }
 agent-pty = { path = "../../ai/agent-pty" }
 agent-testkit = { path = "../../ai/agent-testkit", optional = true }

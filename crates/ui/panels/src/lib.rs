@@ -1,6 +1,7 @@
 //! Tool windows and popups on top of the workspace.
 
 mod agents;
+mod ai_review;
 mod annotate;
 mod ansi;
 mod beans;
@@ -11,10 +12,12 @@ mod call_hierarchy;
 mod change_signature;
 mod changelists;
 mod changes;
+mod chat;
 mod clipboard;
 mod commands;
 mod commit;
 mod compare;
+mod composer;
 mod conflict;
 mod console_input;
 mod copy_class;
@@ -43,6 +46,7 @@ pub mod heap_dump;
 mod history;
 mod history_view;
 mod http;
+mod hunk_popup;
 mod index;
 mod inspect;
 mod inspection;
@@ -92,7 +96,9 @@ mod term_grid;
 mod term_links;
 mod term_tabs;
 mod terminal_panel;
+mod theme_import;
 mod todo;
+mod transcript;
 mod tree_ops;
 mod trust;
 mod usages;
@@ -109,6 +115,8 @@ mod window_tests_actions;
 mod window_tests_actions_on_save;
 #[cfg(test)]
 mod window_tests_actuator;
+#[cfg(test)]
+mod window_tests_ai;
 #[cfg(test)]
 mod window_tests_annotate;
 #[cfg(test)]
@@ -187,6 +195,8 @@ mod window_tests_signature;
 #[cfg(test)]
 mod window_tests_snippets;
 #[cfg(test)]
+mod window_tests_speed;
+#[cfg(test)]
 mod window_tests_tools;
 #[cfg(test)]
 mod window_tests_ui;
@@ -203,6 +213,10 @@ mod window_tests_window;
 mod window_tests_database;
 #[cfg(test)]
 mod window_tests_database_data;
+#[cfg(test)]
+mod window_tests_database_driver;
+#[cfg(test)]
+mod window_tests_database_passwords;
 
 #[cfg(test)]
 mod window_tests_jshell;
@@ -312,10 +326,13 @@ mod window_tests_branches;
 mod window_tests_debug_depth;
 #[cfg(test)]
 mod window_tests_idle_events;
+
 #[cfg(test)]
 mod window_tests_inlay_hints;
 #[cfg(test)]
 mod window_tests_inline_values;
+#[cfg(test)]
+mod window_tests_lookup_idea;
 #[cfg(test)]
 mod window_tests_menu_gaps;
 #[cfg(test)]
@@ -491,6 +508,14 @@ mod window_tests_run_configurations;
 mod window_tests_switcher_icons;
 
 #[cfg(test)]
+mod window_tests_close_cross;
+#[cfg(test)]
+mod window_tests_editor_popups;
+#[cfg(test)]
+mod window_tests_gutter_width;
+#[cfg(test)]
+mod window_tests_hunk_popup;
+#[cfg(test)]
 mod window_tests_jakarta;
 #[cfg(test)]
 mod window_tests_migrations;
@@ -498,6 +523,25 @@ mod window_tests_migrations;
 mod window_tests_platform_menu;
 #[cfg(test)]
 mod window_tests_platform_open;
+#[cfg(test)]
+mod window_tests_theme_sync;
+#[cfg(test)]
+mod window_tests_themes;
+#[cfg(test)]
+mod window_tests_ui_scale;
+#[cfg(test)]
+mod window_tests_window_frame;
+
+#[cfg(test)]
+mod window_tests_branches_idea;
+#[cfg(test)]
+mod window_tests_editor_idea;
+#[cfg(test)]
+mod window_tests_live_fixes;
+#[cfg(test)]
+mod window_tests_source_languages;
+#[cfg(test)]
+mod window_tests_tab_move;
 
 mod choice;
 mod invalidate;
@@ -527,8 +571,8 @@ pub use agents::{AgentLanguages, AgentOptions};
 pub use coverage::{ActiveCoverage, CoverageColumn};
 pub use database_data::DatabaseDataView;
 pub use database_panel::{
-    ActiveDatabase, ActiveMigrations, DatabasePanel, migration_support, set_database_support,
-    set_migration_support,
+    ActiveDatabase, ActiveMigrations, ActivePasswords, DatabasePanel, migration_support,
+    set_database_support, set_migration_support,
 };
 pub use debug::{ActiveDebug, BreakpointsChanged, DebugPanel};
 pub use index::SearchSetup;
@@ -1098,10 +1142,12 @@ fn install(
     languages.register_debug(workspace.root().to_path_buf(), hub.clone());
     cx.set_global(debug::ActiveDebugHub(hub));
     cx.set_global(AgentLanguages(languages));
+    let files = cx.new(|_| Arc::new(Vec::new()));
     let agent_panel = agents::AgentsPanel::create(
         workspace,
         weak.clone(),
         agents,
+        files.clone(),
         project.environment.clone(),
         cx,
     );
@@ -1250,7 +1296,10 @@ fn install(
     let (index, events) =
         ProjectIndex::start(root.clone(), vec![keymap_file, templates_file], search);
     cx.set_global(crate::index::ActiveIndex(index.clone()));
-    let files = cx.new(|_| Arc::new(Vec::new()));
+    let lookup = index.clone();
+    cx.set_global(editor_view::SymbolLookup(Some(Arc::new(
+        move |name: &str| lookup.locate(name),
+    ))));
     let runs = cx.global::<script::ActiveRunPanel>().0.clone();
     runs.update(cx, |runs, _| runs.set_files(files.clone()));
     commands::register(workspace, &index, &files);
@@ -1384,6 +1433,7 @@ fn release_globals(cx: &mut App) {
         debug::ActiveDebugHub,
         docker::ActiveDocker,
         documentation::ActiveDocumentation,
+        editor_view::SymbolLookup,
         endpoints::ActiveEndpoints,
         finder::ActiveFinder,
         git::ActiveGit,

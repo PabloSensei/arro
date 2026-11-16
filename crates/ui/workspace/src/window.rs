@@ -18,15 +18,20 @@ use ui_kit::*;
 use workspace_core::CommandRegistry;
 
 use crate::about::AboutView;
-use crate::appearance::{EditorAppearance, WindowMode};
-use crate::chrome::{ChromeView, EditorChromeSignal, StatusBarView, TabBarView};
+use crate::appearance::{
+    EditorAppearance, WindowMode, apply_saved_theme, last_system_appearance,
+    system_appearance_changed, theme_of,
+};
+use crate::chrome::{
+    ChromeView, EditorChromeSignal, StatusBarView, TabBarView, WindowControlAreas,
+};
 use crate::editor::{
     BundleLayout, CloseGuard, EditorFactory, EditorStatus, EditorTab, FileIcons, PreviewLayout,
 };
 use crate::external::{OpenRequests, OpenTarget, Request, open_target};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{
-    DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_dark_theme, save_layout,
+    DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_layout, save_theme,
 };
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
@@ -346,6 +351,22 @@ pub fn window_render_count(cx: &App) -> usize {
         .map_or(0, |count| count.0.get())
 }
 
+/// How many times the window asked to maximize or to give back its size, for tests: the
+/// test platform changes no window and only counts the requests.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub struct WindowZoomRequests(pub Cell<usize>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Global for WindowZoomRequests {}
+
+/// The number of requests to maximize or to restore the window, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn window_zoom_requests(cx: &App) -> usize {
+    cx.try_global::<WindowZoomRequests>()
+        .map_or(0, |count| count.0.get())
+}
+
 /// How many times each heavy view drew itself, by the name of the view, for tests that
 /// check which changes rebuild a cached view and which do not.
 #[cfg(any(test, feature = "test-support"))]
@@ -625,6 +646,8 @@ pub struct Workspace {
     pub(crate) menu_bar_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     /// The area of the overflow row of the menu bar, measured while drawing.
     pub(crate) menu_bar_overflow: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The areas of the window buttons and of the drag space that the title bar drew last.
+    pub(crate) window_control_areas: WindowControlAreas,
     /// The areas of the controls that open menus, measured while drawing.
     pub(crate) t_config_anchor: MenuAnchor,
     pub(crate) t_project_anchor: MenuAnchor,
@@ -652,6 +675,13 @@ pub struct Workspace {
     maximized: Option<DockSide>,
     /// The mode of View | Appearance: the parts of the window a mode hides.
     mode: WindowMode,
+    /// The scale factor of the window at the scale of 1, for the test platform, which
+    /// has no platform of the application to multiply the interface scale into.
+    #[cfg(feature = "test-support")]
+    ui_scale_base: f32,
+    /// A change of the interface scale that the next frame of the test platform applies.
+    #[cfg(feature = "test-support")]
+    pending_ui_scale: Option<f32>,
     /// Whether the window fills the screen, as the last toggle of the window left it.
     full_screen: bool,
     /// Whether Zen Mode turned the full screen on, so that leaving it turns it off.
@@ -683,6 +713,8 @@ pub struct Workspace {
     /// An update is downloading or being installed; a second one does not start.
     installing_update: bool,
     theme_fade: Option<ThemeFade>,
+    /// The themes this window offers: the built-in ones and the files of the settings.
+    themes: ThemeCatalog,
     keymap: Keymap,
     /// The actions the keymap knows: the default ones and the plugin commands.
     keymap_actions: ActionRegistry,
@@ -738,17 +770,23 @@ fn save_actions_on(cx: &App) -> bool {
     })
 }
 
-fn placement_of(window: &Window) -> Option<WindowPlacement> {
+/// The place of the window on screen, in the logical pixels the display has whatever the
+/// interface scale is: the scale of the window grows a pixel, the screen does not.
+fn placement_of(window: &Window, cx: &App) -> Option<WindowPlacement> {
     let (bounds, maximized) = match window.window_bounds() {
         WindowBounds::Windowed(bounds) => (bounds, false),
         WindowBounds::Maximized(bounds) => (bounds, true),
         WindowBounds::Fullscreen(_) => return None,
     };
+    let scale = window_scale(
+        cx.try_global::<Settings>()
+            .map_or(1., |settings| settings.ui_scale),
+    );
     Some(WindowPlacement {
-        x: f32::from(bounds.origin.x),
-        y: f32::from(bounds.origin.y),
-        width: f32::from(bounds.size.width),
-        height: f32::from(bounds.size.height),
+        x: f32::from(bounds.origin.x) * scale,
+        y: f32::from(bounds.origin.y) * scale,
+        width: f32::from(bounds.size.width) * scale,
+        height: f32::from(bounds.size.height) * scale,
         maximized,
     })
 }
@@ -874,7 +912,7 @@ impl Workspace {
         let left_stripe_view = ChromeView::left_stripe(chrome_weak.clone(), cx);
         let right_stripe_view = ChromeView::right_stripe(chrome_weak.clone(), cx);
         let bounds = cx.observe_window_bounds(window, |this, window, cx| {
-            this.placement = placement_of(window).or(this.placement);
+            this.placement = placement_of(window, cx).or(this.placement);
             this.layout_changed(cx);
         });
         // Leaving the window for another program writes what is unsaved, as the IDE does.
@@ -888,6 +926,12 @@ impl Workspace {
             } else if autosave_on(cx) {
                 this.save_all_now(cx);
             }
+        });
+        // The system changes its look with the clock, or with the switch of its settings:
+        // a window that syncs with it changes with it.
+        let appearance = cx.observe_window_appearance(window, |this, window, cx| {
+            system_appearance_changed(window, cx);
+            this.on_system_appearance_changed(cx);
         });
         // A key bound as an action, Ctrl+C in the project tree for one, never reaches
         // the key listeners of the window, yet it must break a Double Ctrl as well.
@@ -945,6 +989,9 @@ impl Workspace {
             _ => layout.bottom,
         };
 
+        let themes = ThemeCatalog::load(&settings_dir);
+        cx.set_global(themes.clone());
+
         let keymap_path = settings_dir.join(KEYMAP_FILE);
         let (keymap_actions, keymap) = keymap::default_keymap();
 
@@ -980,6 +1027,7 @@ impl Workspace {
             menu_task: None,
             menu_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
             menu_bar_overflow: Rc::new(Cell::new(None)),
+            window_control_areas: WindowControlAreas::new(),
             t_config_anchor: MenuAnchor::new(),
             t_project_anchor: MenuAnchor::new(),
             t_branch_anchor: MenuAnchor::new(),
@@ -997,6 +1045,10 @@ impl Workspace {
             hidden_docks: None,
             maximized: None,
             mode: WindowMode::Normal,
+            #[cfg(feature = "test-support")]
+            ui_scale_base: window.scale_factor(),
+            #[cfg(feature = "test-support")]
+            pending_ui_scale: None,
             full_screen: window.is_fullscreen(),
             zen_full_screen: false,
             zoom_notice: None,
@@ -1017,6 +1069,7 @@ impl Workspace {
             update_release: None,
             installing_update: false,
             theme_fade: None,
+            themes,
             keymap,
             keymap_actions,
             keymap_file: KeymapFile::default(),
@@ -1032,7 +1085,7 @@ impl Workspace {
             tab_listener: None,
             tab_closed_hooks: Vec::new(),
             buffers: HashMap::new(),
-            placement: layout.window.or_else(|| placement_of(window)),
+            placement: layout.window.or_else(|| placement_of(window, cx)),
             layout,
             store,
             save_serial: 0,
@@ -1041,7 +1094,7 @@ impl Workspace {
             close_hooks: Vec::new(),
             skip_save_on_close: false,
             root,
-            _subscriptions: vec![bounds, activation, keystrokes],
+            _subscriptions: vec![bounds, activation, appearance, keystrokes],
         };
         workspace.panes[0].bar = Some(TabBarView::create(
             chrome_weak,
@@ -1056,6 +1109,7 @@ impl Workspace {
         });
         workspace.start_update_tasks(cx);
         workspace.reload_keymap(cx);
+        workspace.apply_system_theme(window, cx);
         workspace.publish_editor_appearance(cx);
         workspace.refresh_platform_menus(cx);
         workspace
@@ -2562,38 +2616,182 @@ impl Workspace {
         active
     }
 
-    pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let from = *cx.global::<Theme>();
-        let to = match &self.theme_fade {
-            Some(fade) if fade.to.dark => Theme::light(),
-            Some(_) => Theme::dark(),
-            None if from.dark => Theme::light(),
-            None => Theme::dark(),
+    /// The system changed its look: a window with Sync with OS fades to the theme the
+    /// settings give the new look. The observer of the window calls this; a test sets
+    /// `SystemAppearance` and calls it.
+    pub fn on_system_appearance_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(appearance) = last_system_appearance(cx) else {
+            return;
         };
+        let Some(settings) = cx.try_global::<Settings>() else {
+            return;
+        };
+        if !settings.theme_sync_with_os {
+            return;
+        }
+        let to = theme_of(settings, appearance.dark, cx);
+        if cx
+            .try_global::<Theme>()
+            .is_some_and(|current| current.id() == to.id())
+        {
+            return;
+        }
+        self.fade_to_theme(to, cx);
+    }
+
+    /// Takes the theme of the settings for the appearance of the window, without a fade:
+    /// the window shows it in its first frame. A window that never chose a theme follows
+    /// the system from the start.
+    fn apply_system_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.theme_fade = None;
+        apply_saved_theme(window, cx);
+    }
+
+    /// Takes the theme of the other look: the one the settings name for it, or a built-in
+    /// one when that name is not there.
+    pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        let from = match &self.theme_fade {
+            Some(fade) => fade.to,
+            None => *cx.global::<Theme>(),
+        };
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let preferred = if from.dark {
+            &settings.theme_light
+        } else {
+            &settings.theme_dark
+        };
+        let library = self.themes.library();
+        let to = library
+            .get(preferred)
+            .map(Theme::from_definition)
+            .filter(|theme| theme.dark != from.dark)
+            .unwrap_or_else(|| {
+                Theme::from_library(library, if from.dark { "light" } else { "dark" })
+            });
         self.set_theme(to, cx);
     }
 
-    /// Fades to `to` and remembers whether it is dark. A theme of a plugin is not kept
-    /// across restarts.
+    /// The theme of the catalog called `id` becomes the theme of the window.
+    pub fn choose_theme(&mut self, id: &str, cx: &mut Context<Self>) {
+        let to = self.themes.theme(id);
+        self.set_theme(to, cx);
+    }
+
+    /// Takes the theme of `id` for the system look it belongs to. With Sync with OS off
+    /// the pick also becomes the theme of the window. The theme shows at once when its
+    /// look is the one on screen, so the Settings list answers a click.
+    pub fn assign_theme(&mut self, id: &str, dark: bool, cx: &mut Context<Self>) {
+        let sync = cx
+            .try_global::<Settings>()
+            .is_some_and(|settings| settings.theme_sync_with_os);
+        let current_dark = cx.try_global::<Theme>().is_some_and(|theme| theme.dark);
+        let theme = self.themes.theme(id);
+        let owned = id.to_owned();
+        self.update_settings(
+            move |settings| {
+                if dark {
+                    settings.theme_dark.clone_from(&owned);
+                } else {
+                    settings.theme_light.clone_from(&owned);
+                }
+                if !settings.theme_sync_with_os {
+                    settings.theme.clone_from(&owned);
+                }
+            },
+            cx,
+        );
+        if !sync || current_dark == dark {
+            self.show_theme(id, cx);
+        }
+        if !sync {
+            self.save_theme_choice(theme, cx);
+        }
+    }
+
+    /// Fades to the theme of `id` without touching the settings.
+    pub fn show_theme(&mut self, id: &str, cx: &mut Context<Self>) {
+        let to = self.themes.theme(id);
+        self.fade_to_theme(to, cx);
+    }
+
+    /// Shows the theme of `id` while the user walks a list of themes. Nothing is saved:
+    /// Enter keeps it through [`Workspace::set_theme`], Esc brings the old one back
+    /// through [`Workspace::restore_theme`].
+    pub fn preview_theme(&mut self, id: &str, cx: &mut Context<Self>) {
+        let to = self.themes.theme(id);
+        if cx
+            .try_global::<Theme>()
+            .is_some_and(|current| current.id() == to.id())
+        {
+            return;
+        }
+        self.theme_fade = None;
+        cx.set_global(to);
+        cx.notify();
+    }
+
+    /// Puts a theme on screen without saving it, for the Esc of a list of themes.
+    pub fn restore_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        self.theme_fade = None;
+        cx.set_global(theme);
+        cx.notify();
+    }
+
+    /// The themes of the window.
+    pub fn themes(&self) -> &ThemeCatalog {
+        &self.themes
+    }
+
+    /// Reads the `themes` folder again, after an import or a change of a file there.
+    pub fn reload_themes(&mut self, cx: &mut Context<Self>) {
+        self.themes.reload();
+        cx.set_global(self.themes.clone());
+        cx.notify();
+    }
+
+    /// A theme chosen by hand fades in and becomes the theme of the window: the choice
+    /// wins over the system, so Sync with OS goes off as it does in IDEA. The theme of a
+    /// plugin is not kept across restarts.
     pub fn set_theme(&mut self, to: Theme, cx: &mut Context<Self>) {
+        self.fade_to_theme(to, cx);
+        let id = to.id().to_owned();
+        self.update_settings(
+            move |settings| {
+                settings.theme_sync_with_os = false;
+                settings.theme = id;
+            },
+            cx,
+        );
+        self.save_theme_choice(to, cx);
+    }
+
+    /// Starts the fade to `to` without touching the saved theme.
+    fn fade_to_theme(&mut self, to: Theme, cx: &mut Context<Self>) {
         let from = *cx.global::<Theme>();
         self.theme_fade = Some(ThemeFade {
             from,
             to,
             started: Instant::now(),
         });
-        if let Some(store) = self.store.clone() {
-            let dark = to.dark;
-            let write = async move { save_dark_theme(&store, dark) };
-            let write = cx.background_executor().spawn(write);
-            cx.spawn(async move |_, _| {
-                if let Err(error) = write.await {
-                    eprintln!("theme is not saved: {error}");
-                }
-            })
-            .detach();
-        }
         cx.notify();
+    }
+
+    /// Remembers a theme chosen by hand: a window that does not follow the system opens
+    /// with it next time.
+    fn save_theme_choice(&self, theme: Theme, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = theme.id().to_owned();
+        let dark = theme.dark;
+        let write = async move { save_theme(&store, &id, dark) };
+        let write = cx.background_executor().spawn(write);
+        cx.spawn(async move |_, _| {
+            if let Err(error) = write.await {
+                eprintln!("theme is not saved: {error}");
+            }
+        })
+        .detach();
     }
 
     pub fn toggle_panel(&mut self, side: DockSide, window: &mut Window, cx: &mut Context<Self>) {
@@ -2748,6 +2946,7 @@ impl Workspace {
             preview: None,
             bundle: None,
             can_close: None,
+            on_hidden: None,
         };
         let tab = Tab {
             path,
@@ -2854,12 +3053,28 @@ impl Workspace {
         self.active_pane = pane;
         self.panes[pane].active = index;
         self.tab_serial += 1;
+        self.hide_other_tabs((pane, index), cx);
         self.focus_active(window, cx);
         self.layout_changed(cx);
         if let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path()) {
             listener(&path, cx);
         }
         cx.notify();
+    }
+
+    /// A tab that leaves the screen drops the popups of its view, as IDEA does. Only the
+    /// tabs on screen keep them; the others give theirs up when another tab is chosen.
+    fn hide_other_tabs(&self, active: (usize, usize), cx: &mut App) {
+        for (pane_index, pane) in self.panes.iter().enumerate() {
+            for (index, tab) in pane.tabs.iter().enumerate() {
+                if (pane_index, index) == active {
+                    continue;
+                }
+                if let Some(hidden) = &tab.editor.on_hidden {
+                    hidden(cx);
+                }
+            }
+        }
     }
 
     /// Shift+Enter: the file opens in a group of its own on the right, or below.
@@ -2991,11 +3206,66 @@ impl Workspace {
         self.store_settings(settings, cx);
     }
 
+    /// Grows or shrinks every logical pixel of the window by the interface scale. The
+    /// platform does it for all windows after this update, because the new size comes back
+    /// into GPUI with an update of the window of its own.
+    fn apply_ui_scale(&mut self, ui_scale: f32, cx: &mut Context<Self>) {
+        #[cfg(feature = "test-support")]
+        {
+            // The window of the test platform has no platform behind it, and there is no
+            // window here: the frame applies the scale before it lays the window out.
+            let _ = cx;
+            self.pending_ui_scale = Some(ui_scale);
+        }
+        #[cfg(not(feature = "test-support"))]
+        cx.spawn(async move |_, cx| {
+            ui_kit::set_ui_scale(ui_scale);
+            // The platform resizes the window for the new scale, and the frame of that
+            // resize still lays the text out at the old one. One frame more draws the
+            // whole window at the scale it now has, the editor under an open dialog too.
+            cx.update(|cx| cx.refresh_windows());
+        })
+        .detach();
+    }
+
+    /// Applies a change of the interface scale that waits for the frame of the test
+    /// platform, which cannot be reached from a change of settings without a window.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn apply_test_ui_scale(&mut self, window: &mut Window) {
+        if let Some(ui_scale) = self.pending_ui_scale.take() {
+            ui_kit::scale_test_window(window, self.ui_scale_base, ui_scale);
+            window.request_animation_frame();
+        }
+    }
+
     /// Puts the settings in force and writes the file in the background.
     fn store_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
+        let before = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let scale_changed = (before.ui_scale - settings.ui_scale).abs() > f32::EPSILON;
+        let follow_system = settings.theme_sync_with_os
+            && (!before.theme_sync_with_os
+                || before.theme_light != settings.theme_light
+                || before.theme_dark != settings.theme_dark);
+        let keep_theme = before.theme_sync_with_os && !settings.theme_sync_with_os;
+        let ui_scale = settings.ui_scale;
         cx.set_global(settings.clone());
+        if scale_changed {
+            self.apply_ui_scale(ui_scale, cx);
+        }
         // The font of Presentation Mode follows the settings while the mode is on.
         self.publish_editor_appearance(cx);
+        // Turning Sync with OS on takes the theme of the system at once; turning it off
+        // keeps the theme that is on screen.
+        if follow_system {
+            self.on_system_appearance_changed(cx);
+        }
+        if keep_theme {
+            let theme = self
+                .theme_fade
+                .as_ref()
+                .map_or_else(|| *cx.global::<Theme>(), |fade| fade.to);
+            self.save_theme_choice(theme, cx);
+        }
         // The checks of View | Appearance and its labels follow the switch that ran.
         self.refresh_platform_menus(cx);
         let path = self.settings_dir.join(SETTINGS_FILE);
@@ -3262,6 +3532,7 @@ impl Workspace {
         self.active_pane = pane;
         self.panes[pane].active = index;
         self.tab_serial += 1;
+        self.hide_other_tabs((pane, index), cx);
         self.focus_active(window, cx);
         self.layout_changed(cx);
         if let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path()) {
@@ -3872,6 +4143,17 @@ impl Workspace {
         self.panes.iter().map(paths).collect()
     }
 
+    /// The icon of the tab of `path`, for a test that checks the icon the file type
+    /// gives it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tab_icon(&self, path: &Path) -> Option<&'static str> {
+        self.panes
+            .iter()
+            .flat_map(|pane| pane.tabs.iter())
+            .find(|tab| tab.path == path)
+            .map(|tab| tab.icon)
+    }
+
     /// Titles of open tabs pane by pane, for scripts and tests.
     pub fn tab_titles(&self) -> Vec<Vec<String>> {
         let titles = |pane: &Pane| pane.tabs.iter().map(|tab| tab.title.to_string()).collect();
@@ -3989,12 +4271,24 @@ impl Workspace {
 
     /// Shows a popup that keeps the focus where it is, such as the value at the caret.
     pub fn show_popup(&mut self, view: AnyView, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_popup_tagged(view, None, window, cx);
+    }
+
+    /// Shows a popup that keeps the focus where it is under a name of its own, so that a
+    /// late close of the pointer finds only its own window.
+    pub fn show_popup_tagged(
+        &mut self,
+        view: AnyView,
+        tag: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.overlay_serial += 1;
         self.action_menu_anchor.borrow_mut().take();
         self.overlay = Some(Overlay::View {
             view,
             rows: None,
-            tag: None,
+            tag,
         });
         let _ = window;
         cx.notify();
@@ -4037,9 +4331,11 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let scale = cx
-            .try_global::<Settings>()
-            .map_or(1., |settings| settings.ui_scale);
+        // The text grows by itself only where the platform does not grow the window.
+        let scale = text_scale(
+            cx.try_global::<Settings>()
+                .map_or(1., |settings| settings.ui_scale),
+        );
         let size = menu_size(window, &entries, px(UI_SIZE * scale));
         let position = menu_position(anchor, size, window.viewport_size());
         self.show_menu(position, entries, cx);
@@ -4857,6 +5153,21 @@ impl Workspace {
         window.remove_window();
     }
 
+    /// The areas of the window controls the platform reads in the frame the window drew
+    /// last, by the name of each control: what the title bar left there when it drew, and
+    /// what the root gave the platform on that frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn caption_areas(&self) -> Vec<(&'static str, Bounds<Pixels>)> {
+        self.window_control_areas.drawn()
+    }
+
+    /// Forgets the areas of the caption, as the root does for a window that draws no
+    /// caption of its own. The tests have no such window.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forget_caption_areas(&mut self) {
+        self.window_control_areas.clear();
+    }
+
     /// File > Exit: closes every window of the application. `save` writes the unsaved text
     /// first; without it the windows close as they are.
     pub fn close_all_windows(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -4890,7 +5201,7 @@ impl Workspace {
         for editor in self.buffers.values() {
             (editor.save_now)(cx);
         }
-        self.placement = placement_of(window).or(self.placement);
+        self.placement = placement_of(window, cx).or(self.placement);
         if let (Some(store), Some(json)) = (self.store.clone(), self.fresh_json(cx))
             && let Err(error) = save_layout(&store, &self.root, &json)
         {

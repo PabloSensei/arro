@@ -16,10 +16,10 @@ use workspace::Workspace;
 use crate::prompt::TextField;
 use crate::run::RunPanel;
 
-const WIDTH: f32 = 820.;
-/// The height of the list and the fields together.
-const BODY_HEIGHT: f32 = 360.;
-const LIST_WIDTH: f32 = 240.;
+const WIDTH: f32 = 980.;
+/// The share of the window height the dialog takes, as the Settings window does.
+const HEIGHT_SHARE: f32 = 0.8;
+const LIST_WIDTH: f32 = 260.;
 const LABEL_WIDTH: f32 = 150.;
 const FIELD_HEIGHT: f32 = 26.;
 const CHECKBOX: f32 = 14.;
@@ -618,9 +618,11 @@ impl Render for RunConfigDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let viewport = window.viewport_size();
-        let width = px(WIDTH);
+        let width = px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING));
+        let height =
+            (viewport.height * HEIGHT_SHARE).min(viewport.height - px(2. * DIALOG_PADDING));
         let left = (viewport.width - width) / 2.;
-        let top = (viewport.height - px(BODY_HEIGHT)) * 0.25;
+        let top = ((viewport.height - height) / 2.).max(px(DIALOG_PADDING));
 
         let items = self.items.iter().enumerate().map(|(index, item)| {
             let selected = self.selected == Some(index);
@@ -1190,6 +1192,7 @@ impl Render for RunConfigDialog {
             .track_focus(&self.focus)
             .occlude()
             .w(width)
+            .h(height)
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
@@ -1200,13 +1203,15 @@ impl Render for RunConfigDialog {
                 div()
                     .text_size(px(TEXT_TITLE))
                     .font_weight(FontWeight::SEMIBOLD)
+                    .flex_none()
                     .child("Run/Debug Configurations"),
             )
             .child(
                 div()
                     .flex()
                     .gap(px(DIALOG_GAP))
-                    .h(px(BODY_HEIGHT))
+                    .flex_1()
+                    .min_h_0()
                     .child(
                         div()
                             .flex()
@@ -1256,6 +1261,7 @@ impl Render for RunConfigDialog {
                                 .gap(px(SPACE_M))
                                 .overflow_y_scroll()
                                 .track_scroll(&self.scroll_fields)
+                                .pb(px(SPACE_M))
                                 .child(
                                     div()
                                         .flex()
@@ -1301,6 +1307,7 @@ impl Render for RunConfigDialog {
                 div()
                     .flex()
                     .justify_end()
+                    .flex_none()
                     .gap(px(SPACE_M))
                     .child(
                         dialog_button(

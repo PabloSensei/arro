@@ -195,6 +195,7 @@ fn completion_entry(item: lsp::CompletionItem) -> CompletionEntry {
     });
     CompletionEntry {
         label: item.label,
+        documentation: completion_documentation(item.documentation),
         label_details: item.label_details.map(|details| CompletionLabelDetails {
             detail: details.detail,
             description: details.description,
@@ -210,6 +211,15 @@ fn completion_entry(item: lsp::CompletionItem) -> CompletionEntry {
         resolve,
         kind: completion_kind(item.kind),
         deprecated: item.deprecated.unwrap_or(false),
+    }
+}
+
+/// The documentation of a completion item as Markdown, whether the server sent plain
+/// text or markup.
+fn completion_documentation(documentation: Option<lsp::Documentation>) -> Option<String> {
+    match documentation? {
+        lsp::Documentation::String(text) => Some(text),
+        lsp::Documentation::MarkupContent(content) => Some(content.value),
     }
 }
 

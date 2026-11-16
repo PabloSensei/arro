@@ -131,7 +131,13 @@ pub struct EditorTab {
     /// shows its question here and closes itself once the user has answered. `None`
     /// closes the tab at once.
     pub can_close: Option<CloseGuard>,
+    /// A tab that leaves the screen, such as the one another tab replaces: its view drops
+    /// what it showed over the text. `None` for a tab without such a view.
+    pub on_hidden: Option<HiddenGuard>,
 }
+
+/// What a tab does when it leaves the screen.
+pub type HiddenGuard = Rc<dyn Fn(&mut App)>;
 
 /// Line ends and encodings the status bar offers, by the names `EditorTab::set_format` takes.
 pub const LINE_ENDS: [&str; 3] = ["LF", "CRLF", "CR"];
@@ -152,13 +158,85 @@ impl FileIcons {
     pub fn icon_for(&self, path: &Path) -> &'static str {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let extension = path.extension().unwrap_or_default().to_string_lossy();
-        let key = |key: &&(&str, &str)| key.0 == name || key.0 == extension;
+        let key = |key: &&(&str, &str)| {
+            key.0.eq_ignore_ascii_case(&name) || key.0.eq_ignore_ascii_case(&extension)
+        };
         self.by_name
             .iter()
             .find(key)
             .map_or(self.fallback, |entry| entry.1)
     }
+
+    /// The icons of the languages the editor knows, by extension and by file name.
+    /// The application adds its own files first, so a language it names itself wins.
+    pub fn with_languages(mut self) -> Self {
+        self.by_name.extend(LANGUAGE_ICONS);
+        self
+    }
 }
+
+/// The icons of the languages the editor knows, by extension and by file name. The
+/// neutral crate only names file types; a language it knows through another crate stays
+/// the business of the application.
+const LANGUAGE_ICONS: &[(&str, &str)] = &[
+    ("Dockerfile", "fileTypes/dockerfile"),
+    ("Gemfile", "fileTypes/ruby"),
+    ("Rakefile", "fileTypes/ruby"),
+    (".bashrc", "fileTypes/shell"),
+    (".zshrc", "fileTypes/shell"),
+    (".profile", "fileTypes/shell"),
+    ("py", "fileTypes/python"),
+    ("pyw", "fileTypes/python"),
+    ("c", "fileTypes/c"),
+    ("h", "fileTypes/c"),
+    ("cpp", "fileTypes/cpp"),
+    ("cc", "fileTypes/cpp"),
+    ("cxx", "fileTypes/cpp"),
+    ("hpp", "fileTypes/cpp"),
+    ("hh", "fileTypes/cpp"),
+    ("hxx", "fileTypes/cpp"),
+    ("cs", "fileTypes/csharp"),
+    ("go", "fileTypes/go"),
+    ("rs", "fileTypes/rust"),
+    ("scala", "fileTypes/scala"),
+    ("sc", "fileTypes/scala"),
+    ("php", "fileTypes/php"),
+    ("rb", "fileTypes/ruby"),
+    ("gemspec", "fileTypes/ruby"),
+    ("swift", "fileTypes/swift"),
+    ("lua", "fileTypes/lua"),
+    ("ps1", "fileTypes/powershell"),
+    ("psm1", "fileTypes/powershell"),
+    ("psd1", "fileTypes/powershell"),
+    ("proto", "fileTypes/protobuf"),
+    ("kt", "fileTypes/kotlin"),
+    ("kts", "fileTypes/kotlin"),
+    ("groovy", "fileTypes/groovy"),
+    ("gvy", "fileTypes/groovy"),
+    ("js", "fileTypes/javascript"),
+    ("jsx", "fileTypes/javascript"),
+    ("mjs", "fileTypes/javascript"),
+    ("cjs", "fileTypes/javascript"),
+    ("ts", "fileTypes/typescript"),
+    ("tsx", "fileTypes/typescript"),
+    ("mts", "fileTypes/typescript"),
+    ("cts", "fileTypes/typescript"),
+    ("json", "fileTypes/json"),
+    ("yaml", "fileTypes/yaml"),
+    ("yml", "fileTypes/yaml"),
+    ("toml", "fileTypes/toml"),
+    ("sql", "fileTypes/sql"),
+    ("html", "fileTypes/html"),
+    ("htm", "fileTypes/html"),
+    ("css", "fileTypes/css"),
+    ("md", "fileTypes/markdown"),
+    ("markdown", "fileTypes/markdown"),
+    ("sh", "fileTypes/shell"),
+    ("bash", "fileTypes/shell"),
+    ("zsh", "fileTypes/shell"),
+    ("fish", "fileTypes/shell"),
+    ("dockerfile", "fileTypes/dockerfile"),
+];
 
 #[cfg(test)]
 mod tests {

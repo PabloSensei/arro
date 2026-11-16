@@ -6,7 +6,7 @@ publish.workspace = true
 
 [features]
 # Builds a window against the test platform of GPUI, with no real window.
-test-support = []
+test-support = ["ui-kit/test-support"]
 
 [dependencies]
 futures-channel = "0.3"

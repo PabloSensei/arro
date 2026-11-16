@@ -29,6 +29,23 @@ impl FoldMap {
 
     pub fn set_candidates(&mut self, mut candidates: Vec<Fold>) {
         candidates.sort_by_key(|fold| (fold.range.start, std::cmp::Reverse(fold.range.end)));
+        // A collapsed region keeps hiding the block it hid when the text changed. The
+        // parser reads the block again, and a line that joined it, an import added above
+        // the others, is part of the same block now: the fold takes the new range so the
+        // whole block stays behind one placeholder.
+        for fold in &mut self.collapsed {
+            let found = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.range.start <= fold.range.start
+                        && fold.range.end <= candidate.range.end
+                })
+                .min_by_key(|candidate| candidate.range.end - candidate.range.start);
+            if let Some(candidate) = found {
+                fold.range = candidate.range.clone();
+                fold.placeholder = candidate.placeholder.clone();
+            }
+        }
         self.candidates = candidates;
     }
 
@@ -255,6 +272,32 @@ mod tests {
         map.collapse(fold(50, 90));
         assert!(map.expand_recursive(20));
         assert_eq!(map.as_slice(), &[fold(50, 90)]);
+    }
+
+    #[test]
+    fn a_collapsed_import_block_takes_a_line_that_joins_it_from_above() {
+        let mut map = FoldMap::default();
+        // The imports of a file, joined by the parser: `package p;\n` then two imports
+        // whose hidden part starts after the first `import ` and ends with the last one.
+        map.set_candidates(vec![fold(18, 31)]);
+        map.collapse(fold(18, 31));
+        // An import line inserted above the block, as the server's auto-import does. The
+        // edit stands before the fold, so the fold moves down with the text.
+        map.apply_edits(&[text_core::Edit::insert(11, "import z;\n")]);
+        assert_eq!(map.as_slice(), &[fold(28, 41)]);
+
+        // The parser now reads one block that holds the new line too, and the fold takes
+        // its whole range: the block stays behind one placeholder.
+        map.set_candidates(vec![fold(18, 41)]);
+        assert_eq!(map.as_slice(), &[fold(18, 41)]);
+    }
+
+    #[test]
+    fn a_collapsed_fold_keeps_its_range_when_the_parser_agrees() {
+        let mut map = nested();
+        map.collapse(fold(20, 30));
+        map.set_candidates(vec![fold(0, 100), fold(10, 40), fold(20, 30)]);
+        assert_eq!(map.as_slice(), &[fold(20, 30)]);
     }
 
     #[test]

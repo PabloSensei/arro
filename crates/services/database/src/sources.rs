@@ -8,7 +8,9 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use base::Cancel;
 use serde::{Deserialize, Serialize};
 
 use crate::session::Launch;
@@ -53,6 +55,21 @@ pub enum DriverKind {
     SqlServer,
 }
 
+impl DriverKind {
+    /// The name of the product, as the window and the form show it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::H2 => "H2",
+            Self::PostgreSql => "PostgreSQL",
+            Self::MySql => "MySQL",
+            Self::MariaDb => "MariaDB",
+            Self::Sqlite => "SQLite",
+            Self::Oracle => "Oracle",
+            Self::SqlServer => "SQL Server",
+        }
+    }
+}
+
 /// One connection, as the project state keeps it. No password is a part of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Source {
@@ -69,24 +86,7 @@ pub struct Source {
 }
 
 /// A password that a caller may pass to a helper and read nowhere else.
-#[derive(Clone)]
-pub struct Secret(String);
-
-impl Secret {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Secret(<redacted>)")
-    }
-}
+pub use platform::secrets::Secret;
 
 /// A product of the dialog and the address its driver expects.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +106,51 @@ pub struct Driver {
     pub label: String,
     pub jars: Vec<PathBuf>,
     pub module: Option<String>,
+}
+
+/// A driver the language layer can fetch from the repository of its ecosystem, with the
+/// license the window shows next to the button.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriverPackage {
+    pub kind: DriverKind,
+    /// The coordinate of the artifact in its repository, as the window shows it.
+    pub coordinate: String,
+    /// The license of the driver, as the window shows it.
+    pub license: String,
+    /// The repository the file comes from, as the window shows it.
+    pub repository: String,
+}
+
+/// How far a download has come: the bytes written and the size the server announced.
+#[derive(Debug, Default)]
+pub struct DownloadProgress {
+    written: AtomicU64,
+    total: AtomicU64,
+}
+
+impl DownloadProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the bytes written so far; `total` is `None` until the server says.
+    pub fn set(&self, written: u64, total: Option<u64>) {
+        self.written.store(written, Ordering::Relaxed);
+        self.total.store(total.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// The bytes written so far.
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
+    }
+
+    /// The whole size of the file, when the server announced it.
+    pub fn total(&self) -> Option<u64> {
+        match self.total.load(Ordering::Relaxed) {
+            0 => None,
+            total => Some(total),
+        }
+    }
 }
 
 /// A source a project file suggests, for the dialog to offer.
@@ -132,6 +177,32 @@ pub trait Support: Send + Sync {
 
     /// Starts the helper with the given driver files. The launch carries no password.
     fn helper(&self, jars: &[PathBuf]) -> Result<Launch, String>;
+
+    /// The drivers of the language layer that the user may download.
+    fn packages(&self) -> Vec<DriverPackage> {
+        Vec::new()
+    }
+
+    /// The stable versions of the driver of `kind`, the newest first. Reads the network:
+    /// the window calls it away from its frame.
+    fn versions(&self, _kind: DriverKind) -> Result<Vec<String>, String> {
+        Err("No driver can be downloaded for this source.".to_owned())
+    }
+
+    /// Downloads the driver of `kind`, or the newest stable version when `version` is
+    /// empty, into the data folder of the IDE and returns its jar. Reads the network and
+    /// writes a file, so the window calls it away from its frame. A driver downloaded
+    /// earlier is returned without a request. `progress` follows the bytes and `cancel`
+    /// stops the download.
+    fn download(
+        &self,
+        _kind: DriverKind,
+        _version: Option<&str>,
+        _progress: &DownloadProgress,
+        _cancel: &Cancel,
+    ) -> Result<PathBuf, String> {
+        Err("No driver can be downloaded for this source.".to_owned())
+    }
 }
 
 /// The sources of one project, kept in its state folder. Passwords are not a part of it.

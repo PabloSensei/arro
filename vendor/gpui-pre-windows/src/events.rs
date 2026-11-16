@@ -1,4 +1,4 @@
-// Modified for Arro by Paweł Januszko, 2026: keyboard input on any layout (VK_PACKET, dead keys, modifiers on their own) and the window frame kept to Windows.
+// Modified for Arro by Paweł Januszko, 2026: keyboard input on any layout (VK_PACKET, dead keys, modifiers on their own), the window frame kept to Windows, and the interface scale kept over the DPI scale of a window.
 // See NOTICE-ARRO.md in the root of this crate.
 use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
 
@@ -253,7 +253,7 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_size_change(
+    pub(crate) fn handle_size_change(
         &self,
         device_size: Size<DevicePixels>,
         scale_factor: f32,
@@ -429,6 +429,9 @@ impl WindowsWindowInner {
     // It's a known bug that you can't trigger `ctrl-shift-0`. See:
     // https://superuser.com/questions/1455762/ctrl-shift-number-key-combination-has-stopped-working-for-a-few-numbers
     pub(crate) fn handle_keydown_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        // A new press starts a new key: the character of the previous one, if it comes at
+        // all, arrives before this message.
+        self.state.swallow_char.set(false);
         // `SendInput` with `KEYEVENTF_UNICODE`, the emoji panel and some IMEs send the key as
         // `VK_PACKET` and put the character into the following `WM_CHAR` only. Remember it so
         // that message can also feed the key listeners that read `key_char`.
@@ -458,6 +461,15 @@ impl WindowsWindowInner {
 
         self.state.callbacks.input.set(Some(func));
 
+        if handled {
+            // A shortcut the window ran still gets its `WM_CHAR` from `TranslateMessage`.
+            // That character belongs to the shortcut, not to the text: the editor under a
+            // popup must not take it, and neither must the field the shortcut opened.
+            self.state
+                .swallow_char
+                .set(has_command_modifier(&current_modifier_flags()));
+        }
+
         if handled { Some(0) } else { Some(1) }
     }
 
@@ -479,8 +491,12 @@ impl WindowsWindowInner {
     }
 
     fn handle_char_msg(&self, wparam: WPARAM) -> Option<isize> {
-        let input = self.parse_char_message(wparam)?;
         let from_packet = self.state.packet_key_down.take();
+        let swallow = self.state.swallow_char.take();
+        let input = self.parse_char_message(wparam)?;
+        if is_shortcut_char(swallow, &current_modifier_flags()) {
+            return Some(0);
+        }
         self.with_input_handler(|input_handler| {
             input_handler.replace_text_in_range(None, &input);
         });
@@ -915,7 +931,9 @@ impl WindowsWindowInner {
         let new_dpi = wparam.loword() as f32;
 
         let is_maximized = self.state.is_maximized();
-        let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
+        let dpi_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
+        let new_scale_factor = dpi_scale_factor * self.state.ui_scale.get();
+        self.state.dpi_scale_factor.set(dpi_scale_factor);
         self.state.scale_factor.set(new_scale_factor);
         self.state.border_offset.update(handle).log_err();
 
@@ -1873,6 +1891,56 @@ pub(crate) fn current_modifiers() -> Modifiers {
     }
 }
 
+/// The command keys that are down, with the sides the AltGr rule needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ModifierFlags {
+    control: bool,
+    alt: bool,
+    right_alt: bool,
+    right_control: bool,
+    platform: bool,
+}
+
+impl ModifierFlags {
+    fn from_state(state: &[u8; 256]) -> Self {
+        let down = |key: VIRTUAL_KEY| (state[key.0 as usize] & 0x80) != 0;
+        Self {
+            control: down(VK_CONTROL),
+            alt: down(VK_MENU),
+            right_alt: down(VK_RMENU),
+            right_control: down(VK_RCONTROL),
+            platform: down(VK_LWIN) || down(VK_RWIN),
+        }
+    }
+
+    /// AltGr, which Windows reports as Ctrl+Alt, types characters of the layout and is
+    /// not a shortcut.
+    fn alt_gr(self) -> bool {
+        self.control && self.right_alt && !self.right_control
+    }
+}
+
+/// The command keys that are down now. Windows reports the keyboard as it is when the
+/// message is handled, which is after the key press and before its release.
+pub(crate) fn current_modifier_flags() -> ModifierFlags {
+    let mut state = [0u8; 256];
+    if unsafe { GetKeyboardState(&mut state) }.is_err() {
+        return ModifierFlags::default();
+    }
+    ModifierFlags::from_state(&state)
+}
+
+/// Whether the key that went down carried a command modifier. AltGr does not count.
+fn has_command_modifier(flags: &ModifierFlags) -> bool {
+    !flags.alt_gr() && (flags.control || flags.alt || flags.platform)
+}
+
+/// Whether a `WM_CHAR` character belongs to a shortcut rather than to the text: the key
+/// it follows was taken as an action, or a command key is still held.
+fn is_shortcut_char(swallow: bool, flags: &ModifierFlags) -> bool {
+    swallow || has_command_modifier(flags)
+}
+
 #[inline]
 pub(crate) fn current_capslock() -> Capslock {
     let on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) & 1 } > 0;
@@ -1922,7 +1990,43 @@ fn notify_frame_changed(handle: HWND) {
 mod tests {
     use std::cell::Cell;
 
-    use super::parse_char_unit;
+    use super::{ModifierFlags, is_shortcut_char, parse_char_unit};
+
+    fn flags(control: bool, alt: bool, right_alt: bool, right_control: bool) -> ModifierFlags {
+        ModifierFlags {
+            control,
+            alt,
+            right_alt,
+            right_control,
+            platform: false,
+        }
+    }
+
+    #[test]
+    fn a_character_after_a_handled_shortcut_is_not_text() {
+        let ctrl = flags(true, false, false, false);
+        assert!(is_shortcut_char(false, &ctrl), "Ctrl+` is a shortcut");
+        assert!(is_shortcut_char(true, &flags(false, false, false, false)), "the press ran an action");
+        let alt = flags(false, true, false, false);
+        assert!(is_shortcut_char(false, &alt), "Alt+` is a shortcut");
+        let win = ModifierFlags {
+            platform: true,
+            ..ModifierFlags::default()
+        };
+        assert!(is_shortcut_char(false, &win), "Win+letter is a shortcut");
+    }
+
+    #[test]
+    fn alt_gr_and_plain_keys_are_text() {
+        let alt_gr = flags(true, true, true, false);
+        assert!(!is_shortcut_char(false, &alt_gr), "AltGr types a character");
+        assert!(!is_shortcut_char(
+            false,
+            &flags(false, false, false, false)
+        ));
+        let shift = ModifierFlags::default();
+        assert!(!is_shortcut_char(false, &shift));
+    }
 
     #[test]
     fn a_character_arrives_as_text() {

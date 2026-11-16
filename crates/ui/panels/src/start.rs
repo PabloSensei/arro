@@ -96,6 +96,8 @@ pub struct StartScreen {
     /// A window opened only for the wizard closes instead of showing the start screen.
     standalone: bool,
     focus: FocusHandle,
+    /// The look of the system while Sync with OS is on.
+    appearance: Option<Subscription>,
     /// Tests create projects without starting a program of their own.
     #[cfg(test)]
     no_spawn: bool,
@@ -122,8 +124,14 @@ pub fn run(
     });
     application.run(move |cx| {
         ui_kit::init(context.dark, cx);
+        let ui_scale = context.settings.ui_scale;
+        cx.set_global(context.themes.clone());
+        cx.set_global(context.theme);
         cx.set_global(context.settings);
-        let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
+        ui_kit::set_ui_scale(ui_scale);
+        // The size on screen stays the same as the interface grows.
+        let scale = ui_kit::window_scale(ui_scale);
+        let bounds = Bounds::centered(None, size(px(900. / scale), px(560. / scale)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             focus: !background,
@@ -137,7 +145,16 @@ pub fn run(
                 cx.new(|cx| {
                     let focus = cx.focus_handle();
                     window.focus(&focus, cx);
-                    StartScreen::new(recent, state_dir, templates, generators, focus, Mode::Home)
+                    let mut screen = StartScreen::new(
+                        recent,
+                        state_dir,
+                        templates,
+                        generators,
+                        focus,
+                        Mode::Home,
+                    );
+                    screen.watch_appearance(window, cx);
+                    screen
                 })
             })
             .expect("open window");
@@ -192,9 +209,19 @@ impl StartScreen {
             busy: false,
             standalone: false,
             focus,
+            appearance: None,
             #[cfg(test)]
             no_spawn: false,
         }
+    }
+
+    /// Takes the theme the settings give the system, and keeps following the system while
+    /// Sync with OS is on.
+    fn watch_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        workspace::follow_system_theme(window, cx);
+        self.appearance = Some(cx.observe_window_appearance(window, |_, window, cx| {
+            workspace::follow_system_theme(window, cx);
+        }));
     }
 
     /// Builds the screen in a window of the test platform, without starting a project.
@@ -208,6 +235,7 @@ impl StartScreen {
     ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        workspace::follow_system_theme(window, cx);
         Self::new(recent, state_dir, templates, Vec::new(), focus, Mode::Home)
     }
 
@@ -555,6 +583,7 @@ pub fn open_window(state_dir: PathBuf, cx: &mut App) {
                 Mode::New,
             );
             screen.standalone = true;
+            screen.watch_appearance(window, cx);
             screen
         })
     })

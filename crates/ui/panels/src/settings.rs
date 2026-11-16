@@ -1510,6 +1510,149 @@ fn resize_grip(
     }
 }
 
+impl SettingsView {
+    /// The themes of the Appearance page: every theme with a strip of its colours, the
+    /// light ones apart from the dark ones, the files that did not load under them, and
+    /// the Import button.
+    fn theme_section(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
+        let library = ThemeCatalog::library_of(cx);
+        let mut rows = vec![
+            heading("Themes", theme),
+            note(crate::theme_import::THEMES_NOTE, theme),
+        ];
+        for (dark, title) in [(false, "Light appearance"), (true, "Dark appearance")] {
+            let cards: Vec<AnyElement> =
+                library
+                    .themes()
+                    .iter()
+                    .filter(|definition| definition.dark == dark)
+                    .map(|definition| {
+                        let preview = Theme::from_definition(definition);
+                        let chosen = if dark {
+                            self.draft.theme_dark == definition.id
+                        } else {
+                            self.draft.theme_light == definition.id
+                        };
+                        let id = definition.id.clone();
+                        let debug = format!("theme-card-{}", definition.id);
+                        let hover = theme.selection_hover;
+                        div()
+                            .id(SharedString::from(debug.clone()))
+                            .debug_selector({
+                                let debug = debug.clone();
+                                move || debug.clone()
+                            })
+                            .w(px(196.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(SPACE_XS))
+                            .p(px(SPACE_M))
+                            .rounded(px(CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(if chosen {
+                                theme.tab_selected_border
+                            } else {
+                                theme.popup_border
+                            })
+                            .bg(if chosen {
+                                theme.tab_selected
+                            } else {
+                                theme.popup_bg
+                            })
+                            .hover(move |style| style.bg(hover))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(SPACE_XS))
+                                    .child(colour_strip(preview.main_bg))
+                                    .child(colour_strip(preview.text))
+                                    .child(colour_strip(preview.accent)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(definition.name.clone())),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_theme(id.clone(), dark, cx)
+                            }))
+                            .into_any_element()
+                    })
+                    .collect();
+            if !cards.is_empty() {
+                rows.push(
+                    div()
+                        .pt(px(SPACE_S))
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_secondary)
+                        .child(title),
+                );
+                rows.push(div().flex().flex_wrap().gap(px(SPACE_M)).children(cards));
+            }
+        }
+        if !library.errors().is_empty() {
+            rows.push(heading("Theme Problems", theme));
+            let errors: Vec<Div> = library
+                .errors()
+                .iter()
+                .map(|error| {
+                    div()
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.warning_mark)
+                        .child(error.to_string())
+                })
+                .collect();
+            rows.push(div().flex().flex_col().gap(px(SPACE_XS)).children(errors));
+        }
+        let hover = theme.hover;
+        let import = div()
+            .id("theme-import")
+            .debug_selector(|| "settings-theme-import".to_owned())
+            .flex()
+            .items_center()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_L))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.control_border)
+            .hover(move |style| style.bg(hover))
+            .child("Import\u{2026}")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        crate::theme_import::import(workspace, cx)
+                    })
+                    .ok();
+            }));
+        rows.push(div().pt(px(SPACE_S)).child(import));
+        rows
+    }
+
+    /// A card of a theme takes the slot of its look: Sync with OS keeps choosing between
+    /// the light and the dark slot, and a window that does not sync takes the theme at
+    /// once.
+    fn pick_theme(&mut self, id: String, dark: bool, cx: &mut Context<Self>) {
+        if dark {
+            self.draft.theme_dark.clone_from(&id);
+        } else {
+            self.draft.theme_light.clone_from(&id);
+        }
+        if !self.draft.theme_sync_with_os {
+            self.draft.theme.clone_from(&id);
+        }
+        self.workspace
+            .update(cx, |workspace, cx| workspace.assign_theme(&id, dark, cx))
+            .ok();
+        self.search_editing = false;
+        cx.notify();
+    }
+}
+
+/// One colour of the strip a theme card shows: its background, its text and its accent.
+fn colour_strip(color: Hsla) -> Div {
+    div().w(px(24.)).h(px(10.)).rounded(px(2.)).bg(color)
+}
+
 /// A line that says a control of the page does not wait for Apply.
 fn note(text: &'static str, theme: &Theme) -> Div {
     div()
@@ -1643,6 +1786,7 @@ impl Render for SettingsView {
                 }
                 if self.page == SettingsPage::Appearance {
                     content.push(note("The theme applies at once.", &theme));
+                    content.extend(self.theme_section(&theme, cx));
                 }
                 if self.page == SettingsPage::Debugger {
                     content.push(note(
@@ -1682,7 +1826,7 @@ impl Render for SettingsView {
                                 let id = entry.id;
                                 let label = settings_catalog::choice_label(&settings, id)
                                     .unwrap_or_default();
-                                pill(id, label, true, &theme)
+                                pill(id, &label, true, &theme)
                                     .debug_selector(move || {
                                         format!("settings-{}", id.replace('_', "-"))
                                     })

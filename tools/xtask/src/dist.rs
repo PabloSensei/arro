@@ -743,7 +743,8 @@ fn render_third_party(groups: &BTreeMap<String, Vec<String>>) -> String {
         "java-debug {DEBUG_VERSION} is bundled in tools\\vscode-java-debug-{DEBUG_VERSION}.\n\
          The com.microsoft.java.debug.plugin jar {DEBUG_PLUGIN_VERSION} is licensed under\n\
          EPL-1.0; the extension around it is MIT-licensed. Its dependencies include\n\
-         commons-io (Apache-2.0), RxJava (Apache-2.0) and Reactive Streams (CC0-1.0).\n\
+         commons-io 2.19.0 (Apache-2.0), RxJava 2.2.21 (Apache-2.0) and Reactive Streams\n\
+         1.0.4 (MIT-0), inside the plugin jar's lib folder.\n\
          Sources: {DEBUG_SOURCE}\n\n"
     ));
     text.push_str("BUNDLED ASSETS\n");
@@ -815,6 +816,16 @@ pub(crate) fn java_notice(tools: &JavaTools) -> String {
             );
         }
     }
+    text.push_str(
+        "\nThe plugin jar carries its dependencies in its lib folder: Apache Commons IO\n\
+         2.19.0 and RxJava 2.2.21 under the Apache License 2.0, whose text is in this file,\n\
+         and Reactive Streams 1.0.4 under MIT No Attribution (MIT-0). The NOTICE of\n\
+         Apache Commons IO follows.\n\n\
+         \x20 Apache Commons IO\n\
+         \x20 Copyright 2002-2025 The Apache Software Foundation\n\n\
+         \x20 This product includes software developed at\n\
+         \x20 The Apache Software Foundation (https://www.apache.org/).\n",
+    );
     text.push_str(&format!(
         "\nJaCoCo {JACOCO_VERSION} runs Run with Coverage: its agent is bundled in\n\
          tools\\coverage, and org.jacoco.core with ASM {ASM_VERSION} (asm, asm-commons,\n\

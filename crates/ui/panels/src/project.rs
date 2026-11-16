@@ -2248,7 +2248,7 @@ impl ProjectPanel {
                 let target = path.clone();
                 let row = tree_row(style, &theme)
                     .debug_selector(move || format!("tree-row-{name}"))
-                    .when_some(tint, |this, kind| this.text_color(kind.color(theme.dark)))
+                    .when_some(tint, |this, kind| this.text_color(kind.color(&theme)))
                     .when(issue, |this| {
                         this.text_color(theme.stripe_error).underline()
                     })

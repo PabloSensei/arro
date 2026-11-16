@@ -9,7 +9,7 @@ mod store;
 pub use harness::{Harness, Installed, detect};
 pub use mock::{MockRuntime, MockStep, ToolInvoker};
 pub use runtime::{
-    AgentError, AgentEvent, AgentRuntime, AgentSession, PermissionReply, Role, RuntimeCaps,
-    SessionSpec, SessionStatus, Surface, SurfaceKind, ToolEndpoint,
+    AgentError, AgentEvent, AgentRuntime, AgentSession, PermissionReply, PromptPart, Role,
+    RuntimeCaps, SessionSpec, SessionStatus, Surface, SurfaceKind, ToolEndpoint, ToolStatus,
 };
 pub use store::{SessionRecord, SessionStore};

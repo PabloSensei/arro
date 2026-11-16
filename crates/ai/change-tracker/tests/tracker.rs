@@ -22,7 +22,7 @@ impl Fixture {
         fs::create_dir_all(project.join("src")).expect("project");
         fs::write(project.join(".gitignore"), "output/\n").expect("ignore");
         fs::write(project.join("src/kept.txt"), "same\n").expect("file");
-        fs::write(project.join("src/edited.txt"), "before\n").expect("file");
+        fs::write(project.join("src/edited.txt"), "one\ntwo\nthree\n").expect("file");
         fs::write(project.join("src/deleted.txt"), "before\n").expect("file");
         let path = std::env::var_os("PATH").unwrap_or_default();
         let git = GitRunner::find(&path).expect("git on PATH");
@@ -101,6 +101,34 @@ fn edits_of_a_turn_are_listed_by_kind() {
     assert_eq!(entry(files, "src/added.txt"), Some(ChangeKind::Added));
     assert_eq!(entry(files, "src/deleted.txt"), Some(ChangeKind::Deleted));
     assert_eq!(entry(files, "src/kept.txt"), None);
+}
+
+#[test]
+fn a_reverted_hunk_and_an_accepted_file_leave_the_review() {
+    let fixture = Fixture::new("review");
+    fixture.run_turn(|project| {
+        fs::write(project.join("src/edited.txt"), "ONE\ntwo\nTHREE\n").expect("edit");
+        fs::write(project.join("src/added.txt"), "new\n").expect("add");
+    });
+
+    let review = fixture.tracker.review("src/edited.txt").expect("review");
+    assert_eq!(review.hunks.len(), 2);
+    let text = review.reverted_hunk(0).unwrap().unwrap();
+    fs::write(fixture.project.join("src/edited.txt"), &text).expect("revert");
+    let review = fixture.tracker.review("src/edited.txt").expect("review");
+    assert_eq!(review.hunks.len(), 1);
+    assert_eq!(review.hunks[0].added, ["THREE"]);
+
+    fixture
+        .tracker
+        .accept("src/added.txt", Some("new\n".to_string()));
+    let changes = wait_for(&fixture.tracker, |changes| {
+        entry(&changes.session, "src/added.txt").is_none()
+    });
+    assert_eq!(
+        entry(&changes.session, "src/edited.txt"),
+        Some(ChangeKind::Modified)
+    );
 }
 
 #[test]

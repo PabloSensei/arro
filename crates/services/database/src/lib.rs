@@ -8,6 +8,7 @@
 
 mod console;
 mod data;
+mod passwords;
 mod protocol;
 mod schema;
 mod session;
@@ -18,12 +19,14 @@ pub use data::{
     Cell, DataModel, DataRow, Dialect, PageQuery, Plan, RowKind, Statement, TableRef, csv,
     insert_literal, tsv,
 };
+pub use passwords::{PasswordStore, SystemPasswords, service_of};
 pub use protocol::{Command, Event, PROTOCOL, Value};
 pub use schema::{Column, ColumnKind, ForeignKey, Index, ResultSet, Schema, Table, TableKind};
-pub use session::{Launch, Session};
+pub use session::{Launch, Session, explain_output};
 pub use sources::{
-    Driver, DriverKind, Secret, Source, SourceId, SourceStore, Suggestion, Support, VendorTemplate,
-    console_path, ensure_console, source_of_console, state_folder,
+    DownloadProgress, Driver, DriverKind, DriverPackage, Secret, Source, SourceId, SourceStore,
+    Suggestion, Support, VendorTemplate, console_path, ensure_console, source_of_console,
+    state_folder,
 };
 
 /// How many rows one message carries before the console asks for the next one.

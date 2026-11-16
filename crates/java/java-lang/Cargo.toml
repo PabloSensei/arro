@@ -31,6 +31,12 @@ tree-sitter.workspace = true
 tree-sitter-java-orchard.workspace = true
 tree-sitter-language = "0.1"
 file-syntax = { path = "../../editor/file-syntax" }
+ring = "0.17"
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "_ring",
+    "platform-verifier",
+] }
 zip = { version = "9", default-features = false }
 
 [dev-dependencies]
