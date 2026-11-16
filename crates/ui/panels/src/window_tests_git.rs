@@ -15,7 +15,7 @@ use ui_kit::gpui::{
 use crate::git_log::ActiveGitLog;
 use crate::window_tests::{
     bounds_of, buffer_of, click, draw, editor_of, open_path, open_window, press, scratch,
-    type_text, with_window,
+    type_text, wait_for_settled_bounds, with_window,
 };
 use workspace::Workspace;
 
@@ -530,6 +530,9 @@ fn the_log_lists_commits_and_double_click_on_a_file_opens_its_diff(cx: &mut Test
     cx.executor().advance_clock(Duration::from_millis(5000));
     cx.run_until_parked();
     draw(cx, window);
+    // The dock of the tool window slides in over a few frames: the row clicked at the
+    // place of a frame in the middle of the slide would move away before the press.
+    wait_for_settled_bounds(cx, window, "log-commit-0");
     click(cx, window, "log-commit-0");
     wait_for(cx, "the changed files", |cx| {
         has_selector(cx, window, "log-file-0")

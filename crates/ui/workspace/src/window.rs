@@ -21,7 +21,7 @@ use crate::about::AboutView;
 use crate::appearance::{EditorAppearance, WindowMode};
 use crate::chrome::{ChromeView, EditorChromeSignal, StatusBarView, TabBarView};
 use crate::editor::{
-    BundleLayout, EditorFactory, EditorStatus, EditorTab, FileIcons, PreviewLayout,
+    BundleLayout, CloseGuard, EditorFactory, EditorStatus, EditorTab, FileIcons, PreviewLayout,
 };
 use crate::external::{OpenRequests, OpenTarget, Request, open_target};
 use crate::launch::{AppInfo, Launch};
@@ -851,6 +851,14 @@ impl Workspace {
 
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
+            // A tab with unsaved work asks first and keeps the window open until the
+            // user has answered, as the close button of such a tab does.
+            let allowed = weak
+                .update(cx, |this, cx| this.tabs_may_close(cx))
+                .unwrap_or(true);
+            if !allowed {
+                return false;
+            }
             let saved = weak.update(cx, |this, cx| {
                 if !this.skip_save_on_close {
                     this.save_now(window, cx);
@@ -2739,6 +2747,7 @@ impl Workspace {
             reload_from_disk: Rc::new(|_| {}),
             preview: None,
             bundle: None,
+            can_close: None,
         };
         let tab = Tab {
             path,
@@ -2788,6 +2797,29 @@ impl Workspace {
         self.layout_changed(cx);
         cx.notify();
         view
+    }
+
+    /// Asks a view tab whether it may close. A tab with unsaved work shows its question
+    /// from this callback and answers `false` until the user has chosen.
+    pub fn set_tab_can_close(&mut self, path: &Path, can_close: CloseGuard) {
+        let key = ::platform::path_key(path);
+        for tab in self.panes.iter_mut().flat_map(|pane| &mut pane.tabs) {
+            if ::platform::path_key(&tab.path) == key {
+                tab.editor.can_close = Some(can_close.clone());
+            }
+        }
+    }
+
+    /// Whether every tab of the window agrees to close. A refusal usually shows a
+    /// question of the view, so the window stays until the user answers it.
+    fn tabs_may_close(&self, cx: &mut App) -> bool {
+        let guards: Vec<CloseGuard> = self
+            .panes
+            .iter()
+            .flat_map(|pane| &pane.tabs)
+            .filter_map(|tab| tab.editor.can_close.clone())
+            .collect();
+        guards.iter().all(|guard| guard(cx))
     }
 
     /// Opens a file without writing the unsaved text of the active tab, for Save As: the
@@ -3280,6 +3312,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(can_close) = self.panes[pane].tabs[index].editor.can_close.clone()
+            && !can_close(cx)
+        {
+            return;
+        }
         (self.panes[pane].tabs[index].editor.save)(cx);
         let tab = self.drop_tab(pane, index, cx);
         let path = tab.path.clone();
@@ -3292,6 +3329,14 @@ impl Workspace {
         let pane = self.active_pane;
         if !self.panes[pane].tabs.is_empty() {
             let index = self.panes[pane].active;
+            self.close_tab(pane, index, window, cx);
+        }
+    }
+
+    /// Closes the tab of `path`, when the window has one. A view tab that keeps unsaved
+    /// work asks first, as its close button does.
+    pub fn close_tab_of(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((pane, index)) = self.open_tab(path) {
             self.close_tab(pane, index, window, cx);
         }
     }
@@ -3389,6 +3434,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         for index in indexes.into_iter().rev() {
+            if let Some(can_close) = self.panes[pane].tabs[index].editor.can_close.clone()
+                && !can_close(cx)
+            {
+                continue;
+            }
             (self.panes[pane].tabs[index].editor.save)(cx);
             let tab = self.drop_tab(pane, index, cx);
             remember_closed(&mut self.closed, tab.path.clone());
@@ -4800,6 +4850,9 @@ impl Workspace {
 
     /// Closes the window the way its close button does.
     pub fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs_may_close(cx) {
+            return;
+        }
         self.save_now(window, cx);
         window.remove_window();
     }

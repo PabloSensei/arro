@@ -1,5 +1,6 @@
-//! T-0212: a double click on a table asks for its rows through the limits and the
-//! identifier quotes of the connected driver, so the text carries no dialect clause.
+//! T-0212/T-0251: a double click on a table opens its data tab, whose page asks for the
+//! rows through the limit and the offset of the source kind, so the text carries no
+//! dialect clause.
 //!
 //! `cargo test -p panels window_tests_database_polish`
 
@@ -78,7 +79,7 @@ fn double_click(cx: &mut TestAppContext, window: WindowHandle<Workspace>, select
 }
 
 #[ui_kit::gpui::test]
-fn a_double_clicked_table_carries_its_limit_and_the_quotes_of_the_driver(cx: &mut TestAppContext) {
+fn a_double_clicked_table_carries_its_page_and_the_quotes_of_the_dialect(cx: &mut TestAppContext) {
     let root = sample_project("database-polish");
     let window = open_window(cx, root);
     window
@@ -107,7 +108,7 @@ fn a_double_clicked_table_carries_its_limit_and_the_quotes_of_the_driver(cx: &mu
     });
     draw(cx, window);
 
-    // The quote comes from the `connected` answer, not from the window.
+    // The quote comes from the kind of the source, not from the `connected` answer.
     panel.update(cx, |panel, cx| {
         panel.connected_for_test(SourceId::new(SOURCE), "H2 2.4.240", "`", cx);
     });
@@ -115,11 +116,19 @@ fn a_double_clicked_table_carries_its_limit_and_the_quotes_of_the_driver(cx: &mu
     double_click(cx, window, "database-table-OWNERS");
 
     let queries = panel.read_with(cx, |panel, _| panel.queries_for_test());
-    let (sql, max_rows) = queries.last().expect("the table asks for its rows");
-    assert_eq!(sql, "SELECT * FROM `PUBLIC`.`OWNERS`", "{queries:?}");
-    assert!(
-        !sql.to_ascii_uppercase().contains("LIMIT"),
-        "the address does not carry the dialect: {sql}"
+    let (sql, max_rows) = queries
+        .iter()
+        .find(|(sql, _)| sql.starts_with("SELECT * FROM"))
+        .expect("the table asks for its page");
+    assert_eq!(
+        sql, "SELECT * FROM \"PUBLIC\".\"OWNERS\" LIMIT 500 OFFSET 0",
+        "{queries:?}"
     );
     assert_eq!(*max_rows, Some(500));
+    assert!(
+        queries
+            .iter()
+            .any(|(sql, _)| sql == "SELECT COUNT(*) FROM \"PUBLIC\".\"OWNERS\""),
+        "{queries:?}"
+    );
 }

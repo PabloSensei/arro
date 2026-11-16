@@ -47,14 +47,17 @@ commands:
   build-helpers --out DIR [--maven-lib DIR] [--jacoco-lib DIR]
                              the helper jars that run in project JVMs, needs a JDK;
                              the JaCoCo jars come from DIR or the local Maven repositories
-  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--deb] [--rpm] [--dmg] [--target windows|linux|macos]
+  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--deb] [--rpm] [--appimage] [--dmg] [--target windows|linux|macos]
                              release Arro, helpers, jdtls, java-debug, README, run-arro.cmd
                              and THIRD-PARTY.txt; the jdtls and java-debug archives come
                              from --tools DIR, $IDE_CORPUS/tools by default; arro.pdb and
                              arro.exe go to DIR-symbols/<commit> by default. --target linux
                              writes arro, tools, arro.desktop, the icon and install.sh, and
-                             with --deb the arro_<version>_amd64.deb package and with --rpm
-                             the arro-<version>-1.x86_64.rpm package; --target macos
+                             with --deb the arro_<version>_amd64.deb package, with --rpm
+                             the arro-<version>-1.x86_64.rpm package and with --appimage
+                             the arro-<version>-x86_64.AppImage file, which runs after
+                             chmod +x and needs appimagetool from $APPIMAGETOOL or the
+                             PATH; --target macos
                              builds Arro.app with an ad-hoc signature, and with --dmg the
                              disk image; both are built on their own system
   symbolize LOG [--symbols DIR]
@@ -159,8 +162,8 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// `--out DIR`, `--symbols DIR`, `--tools DIR`, `--zip`, `--deb`, `--rpm`, `--dmg` and
-/// `--target` in any order.
+/// `--out DIR`, `--symbols DIR`, `--tools DIR`, `--zip`, `--deb`, `--rpm`, `--appimage`,
+/// `--dmg` and `--target` in any order.
 fn dist_command(root: &Path, args: &[&str]) -> Result {
     let mut out = None;
     let mut symbols = None;
@@ -169,6 +172,7 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
     let mut zip = false;
     let mut deb = false;
     let mut rpm = false;
+    let mut appimage = false;
     let mut dmg = false;
     let mut index = 0;
     while index < args.len() {
@@ -176,6 +180,7 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
             "--zip" => zip = true,
             "--deb" => deb = true,
             "--rpm" => rpm = true,
+            "--appimage" => appimage = true,
             "--dmg" => dmg = true,
             "--target" => {
                 index += 1;
@@ -206,10 +211,10 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
     let out = out.ok_or("dist needs --out DIR")?;
     match target {
         "windows" => {
-            if deb || rpm || dmg {
-                return Err(
-                    "--deb and --rpm belong to the linux target, --dmg to the macos target".into(),
-                );
+            if deb || rpm || appimage || dmg {
+                return Err("--deb, --rpm and --appimage belong to the linux target, \
+                            --dmg to the macos target"
+                    .into());
             }
             dist::run(root, out, symbols, tools, zip)
         }
@@ -217,11 +222,13 @@ fn dist_command(root: &Path, args: &[&str]) -> Result {
             if dmg {
                 return Err("a disk image is built by --target macos".into());
             }
-            dist_linux::run(root, out, tools, zip, deb, rpm)
+            dist_linux::run(root, out, tools, zip, deb, rpm, appimage)
         }
         "macos" => {
-            if deb || rpm {
-                return Err("Debian and RPM packages are built by --target linux".into());
+            if deb || rpm || appimage {
+                return Err(
+                    "The Debian, RPM and AppImage packages are built by --target linux".into(),
+                );
             }
             dist_macos::run(root, out, tools, zip, dmg)
         }
@@ -256,4 +263,25 @@ fn symbolize_command(root: &Path, args: &[&str]) -> Result {
 /// The cargo that started xtask, so nested runs stay on the pinned toolchain.
 fn cargo() -> std::ffi::OsString {
     env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The AppImage is built on Linux like the packages, and the other targets refuse
+    /// it before anything is written.
+    #[test]
+    fn the_linux_packages_are_refused_on_the_other_targets() {
+        let out = test_support::scratch("dist-flags");
+        let out = out.to_str().unwrap();
+        let windows = dist_command(Path::new("."), &["--out", out, "--appimage"]).unwrap_err();
+        assert!(windows.to_string().contains("--appimage"), "{windows}");
+        let macos = dist_command(
+            Path::new("."),
+            &["--out", out, "--target", "macos", "--appimage"],
+        )
+        .unwrap_err();
+        assert!(macos.to_string().contains("AppImage"), "{macos}");
+    }
 }

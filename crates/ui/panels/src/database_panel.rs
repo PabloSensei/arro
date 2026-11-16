@@ -1,5 +1,6 @@
 //! The Database tool window: the sources of the project, their schema, the SQL console
-//! of each source and the grid of its last result.
+//! of each source and the grid of its last result. A table or a view opens as a tab of
+//! its own, where its rows are edited in place.
 //!
 //! The window itself knows no database product and no driver: it asks [`database::Support`]
 //! for what the project has and starts a helper through it. The helper and its protocol
@@ -12,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use database::{
-    BATCH_ROWS, Column, Command, Driver, DriverKind, Event, MAX_RESULT_BYTES, MAX_RESULT_ROWS,
+    Column, Command, Dialect, Driver, DriverKind, Event, MAX_RESULT_BYTES, MAX_RESULT_ROWS,
     ResultSet, Secret, Session, Source, SourceId, SourceStore, Suggestion, Support, Table, Value,
     VendorTemplate,
 };
@@ -24,7 +25,9 @@ use lang_api::{
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{DATABASE_TOOL, Workspace};
+use workspace::{DATABASE_TOOL, Settings, Workspace};
+
+use crate::database_data::DatabaseDataView;
 
 /// The panel of the window, for scripts and for tests.
 pub struct ActiveDatabase(pub Entity<DatabasePanel>);
@@ -83,8 +86,6 @@ const CELL_WIDTH: f32 = 160.;
 const TREE_WIDTH: f32 = 240.;
 /// The height of a field of the form.
 const FIELD_HEIGHT: f32 = 26.;
-/// How long a result of a double-clicked table may be.
-const TABLE_SAMPLE: usize = BATCH_ROWS;
 
 /// One field of the new source form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +167,64 @@ impl Dialog {
 /// A statement the window sends, with the row limit that goes with it.
 type SentQuery = (String, Option<usize>);
 
+/// What a data tab asked the connection for, so that the answer lands in the right place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataRequest {
+    Page,
+    Count,
+    AutoCommit,
+    Statement(usize),
+    Commit,
+    Rollback,
+}
+
+/// One request of a data tab: its own serial and what it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DataTicket {
+    pub serial: u64,
+    pub request: DataRequest,
+}
+
+/// An answer of the connection, as a data tab reads it.
+#[derive(Clone, Debug)]
+pub(crate) enum DataEvent {
+    Columns(Vec<Column>),
+    Rows(Vec<Vec<Value>>),
+    Done {
+        update_count: Option<u64>,
+        cancelled: bool,
+    },
+    Error(String),
+}
+
+/// A transaction command of a data tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataCommand {
+    AutoCommit(bool),
+    Commit,
+    Rollback,
+}
+
+/// One answer of a connection that has no helper, for the window tests.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScriptedReply {
+    pub result: ResultSet,
+    pub error: Option<String>,
+}
+
+/// What a scripted connection was asked, in order, for the window tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScriptedCommand {
+    Query {
+        sql: String,
+        max_rows: Option<usize>,
+    },
+    AutoCommit(bool),
+    Commit,
+    Rollback,
+    Cancel,
+}
+
 /// A connection of the window tests: no process, the answers are known in advance.
 struct Scripted {
     source: SourceId,
@@ -174,6 +233,10 @@ struct Scripted {
     closed: Arc<AtomicBool>,
     /// The statements the window would send.
     queries: Arc<Mutex<Vec<SentQuery>>>,
+    /// The answers of the data tab, one per request; an empty queue answers with `rows`.
+    replies: VecDeque<ScriptedReply>,
+    /// Every request of the window, with the transaction commands of a data tab.
+    commands: Arc<Mutex<Vec<ScriptedCommand>>>,
 }
 
 pub struct DatabasePanel {
@@ -222,6 +285,8 @@ pub struct DatabasePanel {
     /// The Clean action waiting for the answer of the user.
     clean_pending: Option<lang_api::MigrationAction>,
     scripted: Option<Scripted>,
+    /// The requests of the data tabs that the helper has not answered yet.
+    data_pending: HashMap<(SourceId, u64), (Entity<DatabaseDataView>, DataTicket)>,
     /// Set while the task that reads the answers of the helpers runs: it runs only while
     /// at least one connection is alive.
     polling: bool,
@@ -281,6 +346,7 @@ impl DatabasePanel {
                 history_pending: None,
                 clean_pending: None,
                 scripted: None,
+                data_pending: HashMap::new(),
                 polling: false,
                 #[cfg(test)]
                 poll_ticks: 0,
@@ -594,6 +660,8 @@ impl DatabasePanel {
             error,
             closed,
             queries: Arc::new(Mutex::new(Vec::new())),
+            replies: VecDeque::new(),
+            commands: Arc::new(Mutex::new(Vec::new())),
         });
         cx.notify();
     }
@@ -627,6 +695,46 @@ impl DatabasePanel {
             .as_ref()
             .and_then(|scripted| scripted.queries.lock().ok().map(|queries| queries.clone()))
             .unwrap_or_default()
+    }
+
+    /// The answers the scripted connection gives to the data tab, in order.
+    #[cfg(test)]
+    pub(crate) fn scripted_replies_for_test(&mut self, replies: Vec<ScriptedReply>) {
+        if let Some(scripted) = &mut self.scripted {
+            scripted.replies = replies.into();
+        }
+    }
+
+    /// Every request the scripted connection got, with the transaction commands.
+    #[cfg(test)]
+    pub(crate) fn scripted_commands_for_test(&self) -> Vec<ScriptedCommand> {
+        self.scripted
+            .as_ref()
+            .and_then(|scripted| {
+                scripted
+                    .commands
+                    .lock()
+                    .ok()
+                    .map(|commands| commands.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The data tab of a table, when it is open.
+    #[cfg(test)]
+    pub(crate) fn data_view_for_test(
+        &self,
+        source: &SourceId,
+        table: &Table,
+        cx: &App,
+    ) -> Option<Entity<DatabaseDataView>> {
+        let workspace = self.workspace.upgrade()?;
+        let path = data_path(workspace.read(cx).root(), source, table);
+        workspace
+            .read(cx)
+            .view_of(&path)?
+            .downcast::<DatabaseDataView>()
+            .ok()
     }
 
     /// The application puts the sources, the drivers and the suggestions in place.
@@ -742,6 +850,9 @@ impl DatabasePanel {
 
     fn event(&mut self, source: SourceId, event: Event, cx: &mut Context<Self>) {
         if self.history_event(&source, event.clone(), cx) {
+            return;
+        }
+        if self.data_event(&source, event.clone(), cx) {
             return;
         }
         match event {
@@ -1106,24 +1217,365 @@ impl DatabasePanel {
         }
     }
 
-    fn sample_table(&mut self, source: SourceId, table: Table, cx: &mut Context<Self>) {
-        let quote = self.quotes.get(&source).map_or("\"", String::as_str);
-        let name = if table.schema.is_empty() {
-            quote_identifier(&table.name, quote)
-        } else {
-            format!(
-                "{}.{}",
-                quote_identifier(&table.schema, quote),
-                quote_identifier(&table.name, quote)
-            )
+    /// Opens the tab of a table or a view: its rows, edited in place.
+    pub(crate) fn open_data(
+        &mut self,
+        source: SourceId,
+        table: Table,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
         };
-        // The row limit belongs to the statement, so the text runs on every dialect.
-        self.run_sql(
-            source,
-            format!("SELECT * FROM {name}"),
-            Some(TABLE_SAMPLE),
-            cx,
-        );
+        let Some(kind) = self
+            .sources
+            .iter()
+            .find(|known| known.id == source)
+            .map(|known| known.kind)
+        else {
+            self.errors
+                .insert(source, "The source of the table is gone.".into());
+            cx.notify();
+            return;
+        };
+        let rows = cx
+            .try_global::<Settings>()
+            .map_or(workspace::DEFAULT_DATABASE_PAGE_ROWS, |settings| {
+                settings.database_page_rows
+            }) as usize;
+        let file = data_path(workspace.read(cx).root(), &source, &table);
+        let existing = workspace
+            .read(cx)
+            .view_of(&file)
+            .and_then(|view| view.downcast::<DatabaseDataView>().ok());
+        let mut guard = None;
+        let view = match existing {
+            Some(view) => view,
+            None => {
+                let panel = cx.entity().downgrade();
+                let weak = self.workspace.clone();
+                let handle = window.window_handle().downcast::<Workspace>();
+                let view = cx.new(|cx| {
+                    DatabaseDataView::create(
+                        weak,
+                        panel,
+                        handle,
+                        file.clone(),
+                        source.clone(),
+                        table.clone(),
+                        Dialect::of(kind),
+                        rows,
+                        cx,
+                    )
+                });
+                guard = Some(view.downgrade());
+                let started = view.clone();
+                cx.defer(move |cx| {
+                    started.update(cx, |view, cx| view.start(cx));
+                });
+                view
+            }
+        };
+        let title = table.name.clone();
+        let focus = view.read(cx).focus();
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_view_tab(
+                file.clone(),
+                title,
+                "toolwindows/database",
+                view.into(),
+                focus,
+                window,
+                cx,
+            );
+            // The tab is in place now, so the guard finds it: a close with unsaved edits
+            // asks the view instead of dropping them.
+            if let Some(weak_view) = guard {
+                workspace.set_tab_can_close(
+                    &file,
+                    std::rc::Rc::new(move |cx| {
+                        weak_view
+                            .update(cx, |view, cx| view.ask_to_close(cx))
+                            .unwrap_or(true)
+                    }),
+                );
+            }
+        });
+    }
+
+    /// The menu of a table in the tree: Open Data, or the console of its source.
+    fn table_menu(
+        &mut self,
+        source: SourceId,
+        table: Table,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.entity();
+        let data = panel.clone();
+        let source_of_data = source.clone();
+        let table_of_data = table.clone();
+        let console = panel.clone();
+        let source_of_console = source.clone();
+        let entries = vec![
+            MenuEntry::new("Open Data", move |window, cx| {
+                data.update(cx, |panel, cx| {
+                    panel.open_data(source_of_data.clone(), table_of_data.clone(), window, cx)
+                });
+            })
+            .shortcut("Enter"),
+            MenuEntry::new("Open Console", move |window, cx| {
+                console.update(cx, |panel, cx| {
+                    panel.open_console(source_of_console.clone(), window, cx)
+                });
+            }),
+        ];
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_menu(position, entries, cx)
+        });
+    }
+
+    /// Sends a statement of a data tab and answers it through the tab.
+    pub(crate) fn data_query(
+        &mut self,
+        source: SourceId,
+        sql: String,
+        max_rows: Option<usize>,
+        ticket: DataTicket,
+        reader: Entity<DatabaseDataView>,
+        cx: &mut Context<Self>,
+    ) {
+        let scripted = if let Some(scripted) = &mut self.scripted {
+            if scripted.source != source {
+                return;
+            }
+            if let Ok(mut queries) = scripted.queries.lock() {
+                queries.push((sql.clone(), max_rows));
+            }
+            if let Ok(mut commands) = scripted.commands.lock() {
+                commands.push(ScriptedCommand::Query {
+                    sql: sql.clone(),
+                    max_rows,
+                });
+            }
+            Some(
+                scripted
+                    .replies
+                    .pop_front()
+                    .unwrap_or_else(|| ScriptedReply {
+                        result: scripted.rows.clone(),
+                        error: scripted.error.clone(),
+                    }),
+            )
+        } else {
+            None
+        };
+        if let Some(reply) = scripted {
+            self.answer_scripted(reader, ticket, reply, cx);
+            return;
+        }
+        let id = self.next();
+        let Some(session) = self.sessions.get(&source) else {
+            self.answer_error(
+                reader,
+                ticket,
+                "Connect the source before reading its data.".to_owned(),
+                cx,
+            );
+            return;
+        };
+        let command = Command::Query {
+            id,
+            sql,
+            timeout: None,
+            max_rows,
+        };
+        if let Err(error) = session.send(command) {
+            self.answer_error(reader, ticket, error.to_string(), cx);
+            return;
+        }
+        self.data_pending.insert((source, id), (reader, ticket));
+        cx.notify();
+    }
+
+    /// Sends a transaction command of a data tab: auto-commit, commit or rollback.
+    pub(crate) fn data_command(
+        &mut self,
+        source: SourceId,
+        command: DataCommand,
+        ticket: DataTicket,
+        reader: Entity<DatabaseDataView>,
+        cx: &mut Context<Self>,
+    ) {
+        if let DataCommand::AutoCommit(on) = command {
+            self.auto_commit = on;
+        }
+        if let Some(scripted) = &self.scripted {
+            if scripted.source != source {
+                return;
+            }
+            if let Ok(mut commands) = scripted.commands.lock() {
+                commands.push(match command {
+                    DataCommand::AutoCommit(on) => ScriptedCommand::AutoCommit(on),
+                    DataCommand::Commit => ScriptedCommand::Commit,
+                    DataCommand::Rollback => ScriptedCommand::Rollback,
+                });
+            }
+            cx.defer(move |cx| {
+                reader.update(cx, |view, cx| {
+                    view.event(
+                        ticket,
+                        DataEvent::Done {
+                            update_count: None,
+                            cancelled: false,
+                        },
+                        cx,
+                    )
+                });
+            });
+            return;
+        }
+        let id = self.next();
+        let Some(session) = self.sessions.get(&source) else {
+            self.answer_error(reader, ticket, "The connection is closed.".to_owned(), cx);
+            return;
+        };
+        let command = match command {
+            DataCommand::AutoCommit(on) => Command::AutoCommit { id, on },
+            DataCommand::Commit => Command::Commit { id },
+            DataCommand::Rollback => Command::Rollback { id },
+        };
+        if let Err(error) = session.send(command) {
+            self.answer_error(reader, ticket, error.to_string(), cx);
+            return;
+        }
+        self.data_pending.insert((source, id), (reader, ticket));
+        cx.notify();
+    }
+
+    /// Asks the helper to stop the statement of a data tab.
+    pub(crate) fn data_cancel(
+        &mut self,
+        source: SourceId,
+        ticket: DataTicket,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(scripted) = &self.scripted {
+            // A scripted answer arrives on the next turn of the window: nothing to stop,
+            // but the test still sees that the tab asked.
+            if let Ok(mut commands) = scripted.commands.lock() {
+                commands.push(ScriptedCommand::Cancel);
+            }
+            return;
+        }
+        let found = self
+            .data_pending
+            .iter()
+            .find(|((known, _), (_, waiting))| known == &source && *waiting == ticket)
+            .map(|((_, id), _)| *id);
+        if let (Some(id), Some(session)) = (found, self.sessions.get(&source)) {
+            let _ = session.send(Command::Cancel { id });
+        }
+        cx.notify();
+    }
+
+    /// The answers of a scripted connection, as the helper sends them.
+    fn answer_scripted(
+        &mut self,
+        reader: Entity<DatabaseDataView>,
+        ticket: DataTicket,
+        reply: ScriptedReply,
+        cx: &mut Context<Self>,
+    ) {
+        let columns = reply.result.columns.clone();
+        let rows = reply.result.rows.clone();
+        let update_count = reply.result.update_count;
+        cx.defer(move |cx| {
+            if !columns.is_empty() {
+                let columns = columns.clone();
+                reader.update(cx, |view, cx| {
+                    view.event(ticket, DataEvent::Columns(columns), cx)
+                });
+            }
+            if !rows.is_empty() {
+                let rows = rows.clone();
+                reader.update(cx, |view, cx| view.event(ticket, DataEvent::Rows(rows), cx));
+            }
+            let event = match reply.error {
+                Some(message) => DataEvent::Error(message),
+                None => DataEvent::Done {
+                    update_count,
+                    cancelled: false,
+                },
+            };
+            reader.update(cx, |view, cx| view.event(ticket, event, cx));
+        });
+    }
+
+    fn answer_error(
+        &mut self,
+        reader: Entity<DatabaseDataView>,
+        ticket: DataTicket,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.defer(move |cx| {
+            reader.update(cx, |view, cx| {
+                view.event(ticket, DataEvent::Error(message), cx)
+            });
+        });
+    }
+
+    /// The answer of the helper that belongs to a data tab, when the id is one of theirs.
+    fn data_event(&mut self, source: &SourceId, event: Event, cx: &mut Context<Self>) -> bool {
+        let id = match &event {
+            Event::Columns { id, .. }
+            | Event::Rows { id, .. }
+            | Event::Done { id, .. }
+            | Event::Error { id, .. } => *id,
+            _ => return false,
+        };
+        let Some((reader, ticket)) = self.data_pending.remove(&(source.clone(), id)) else {
+            return false;
+        };
+        let terminal = matches!(event, Event::Done { .. } | Event::Error { .. });
+        let batches = matches!(event, Event::Rows { .. });
+        let event = match event {
+            Event::Columns { columns, .. } => DataEvent::Columns(columns),
+            Event::Rows { rows, .. } => DataEvent::Rows(rows),
+            Event::Done {
+                update_count,
+                cancelled,
+                ..
+            } => DataEvent::Done {
+                update_count,
+                cancelled,
+            },
+            Event::Error {
+                message, cancelled, ..
+            } => DataEvent::Error(if cancelled {
+                "The statement was cancelled.".to_owned()
+            } else {
+                message
+            }),
+            _ => return false,
+        };
+        if !terminal {
+            self.data_pending
+                .insert((source.clone(), id), (reader.clone(), ticket));
+        }
+        if batches && let Some(session) = self.sessions.get(source) {
+            // A full batch waits for a fetch, as it does for the console.
+            let _ = session.send(Command::Fetch { id });
+        }
+        cx.defer(move |cx| {
+            reader.update(cx, |view, cx| view.event(ticket, event, cx));
+        });
+        true
     }
 
     fn toggle_table(&mut self, source: SourceId, table: (String, String), cx: &mut Context<Self>) {
@@ -1418,6 +1870,8 @@ impl DatabasePanel {
                 let table_name = table.name.clone();
                 let open_source = source.id.clone();
                 let open_table = table.clone();
+                let menu_source = source.id.clone();
+                let menu_table = table.clone();
                 let toggle = (table.schema.clone(), table.name.clone());
                 rows.push(
                     div()
@@ -1444,13 +1898,24 @@ impl DatabasePanel {
                             theme,
                         ))
                         .child(div().flex_1().overflow_hidden().child(table_name.clone()))
-                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             if event.click_count() >= 2 {
-                                this.sample_table(open_source.clone(), open_table.clone(), cx);
+                                this.open_data(open_source.clone(), open_table.clone(), window, cx);
                             } else {
                                 this.toggle_table(open_source.clone(), toggle.clone(), cx);
                             }
                         }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.table_menu(
+                                    menu_source.clone(),
+                                    menu_table.clone(),
+                                    event.position,
+                                    cx,
+                                );
+                            }),
+                        )
                         .into_any_element(),
                 );
                 if !open {
@@ -2363,7 +2828,7 @@ pub(crate) fn run_line(
     true
 }
 
-fn small_button(id: impl Into<ElementId>, label: &str, theme: &Theme) -> Stateful<Div> {
+pub(crate) fn small_button(id: impl Into<ElementId>, label: &str, theme: &Theme) -> Stateful<Div> {
     let hover = theme.hover;
     let pressed = theme.pressed;
     div()
@@ -2465,16 +2930,14 @@ fn compare_values(
     if ascending { order } else { order.reverse() }
 }
 
-/// Wraps an identifier in the quotes of the connected driver. A driver that quotes no
-/// identifier gets the name as the schema wrote it.
-fn quote_identifier(name: &str, quote: &str) -> String {
-    if quote.trim().is_empty() {
-        return name.to_owned();
-    }
-    format!(
-        "{quote}{}{quote}",
-        name.replace(quote, &format!("{quote}{quote}"))
-    )
+/// The tab of a table: a name inside the state folder of the project that no file has.
+fn data_path(root: &Path, source: &SourceId, table: &Table) -> PathBuf {
+    root.join(".database").join(format!(
+        "{}-{}-{}.data",
+        slug(source.as_str()),
+        slug(&table.schema),
+        slug(&table.name)
+    ))
 }
 
 fn source_name(url: &str) -> String {

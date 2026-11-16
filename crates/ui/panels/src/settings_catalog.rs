@@ -33,6 +33,7 @@ pub enum SettingsPage {
     EditorFileTemplates,
     Debugger,
     Kubernetes,
+    Database,
 }
 
 /// The names the language gives its two build tools. They are no part of this crate:
@@ -60,7 +61,7 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 24] = [
+    pub const ALL: [SettingsPage; 25] = [
         SettingsPage::Appearance,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
@@ -85,6 +86,7 @@ impl SettingsPage {
         SettingsPage::HttpClient,
         SettingsPage::Plugins,
         SettingsPage::Keymap,
+        SettingsPage::Database,
     ];
 
     pub fn title(self) -> &'static str {
@@ -113,6 +115,7 @@ impl SettingsPage {
             SettingsPage::EditorFileTemplates => "File and Code Templates",
             SettingsPage::Debugger => "Debugger",
             SettingsPage::Kubernetes => "Kubernetes",
+            SettingsPage::Database => "Database",
         }
     }
 
@@ -130,6 +133,7 @@ impl SettingsPage {
             | SettingsPage::ActionsOnSave
             | SettingsPage::Terminal
             | SettingsPage::Kubernetes
+            | SettingsPage::Database
             | SettingsPage::EditorLiveTemplates
             | SettingsPage::EditorFileTemplates => 1,
             SettingsPage::EditorPostfix => 2,
@@ -162,9 +166,10 @@ impl SettingsPage {
                 Some(SettingsPage::BuildTools)
             }
             SettingsPage::Git => Some(SettingsPage::VersionControl),
-            SettingsPage::ActionsOnSave | SettingsPage::Terminal | SettingsPage::Kubernetes => {
-                Some(SettingsPage::Tools)
-            }
+            SettingsPage::ActionsOnSave
+            | SettingsPage::Terminal
+            | SettingsPage::Kubernetes
+            | SettingsPage::Database => Some(SettingsPage::Tools),
             _ => None,
         }
     }
@@ -262,6 +267,7 @@ pub enum SettingField {
     HeapSnapshotFolder,
     KubectlPath,
     KubeconfigPath,
+    DatabasePageRows,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -918,6 +924,14 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::HeapSnapshotFolder,
         keywords: "heap dump memory snapshot hprof profiler capture folder directory",
     },
+    Setting {
+        id: "database_page_rows",
+        title: "Rows per page",
+        page: SettingsPage::Database,
+        kind: SettingKind::Number,
+        field: SettingField::DatabasePageRows,
+        keywords: "database table rows page grid data editor",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1078,7 +1092,8 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::RightMargin
         | SettingField::HeapSnapshotFolder
         | SettingField::KubectlPath
-        | SettingField::KubeconfigPath => None,
+        | SettingField::KubeconfigPath
+        | SettingField::DatabasePageRows => None,
     }
 }
 
@@ -1238,7 +1253,8 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::RightMargin
             | SettingField::HeapSnapshotFolder
             | SettingField::KubectlPath
-            | SettingField::KubeconfigPath,
+            | SettingField::KubeconfigPath
+            | SettingField::DatabasePageRows,
         )
         | None => {
             return false;
@@ -1259,6 +1275,7 @@ pub fn number(settings: &Settings, id: &str) -> Option<f32> {
         SettingField::IndentSize => Some(settings.indent_size as f32),
         SettingField::CompletionDelay => Some(settings.completion_delay_ms as f32),
         SettingField::HttpTimeout => Some(settings.http_timeout_seconds as f32),
+        SettingField::DatabasePageRows => Some(settings.database_page_rows as f32),
         _ => None,
     }
 }
@@ -1276,6 +1293,7 @@ pub fn number_label(settings: &Settings, id: &str) -> Option<String> {
         SettingField::UiScale | SettingField::LineSpacing => format!("{value:.1}"),
         SettingField::CompletionDelay => format!("{value} ms"),
         SettingField::HttpTimeout => format!("{value} s"),
+        SettingField::DatabasePageRows => format!("{value} rows"),
         _ => format!("{value}"),
     })
 }
@@ -1336,6 +1354,14 @@ pub fn adjust_number(settings: &mut Settings, id: &str, delta: f32) -> bool {
                 workspace::MAX_HTTP_TIMEOUT_SECONDS as f32,
             ) as u32;
             settings.http_timeout_seconds = value;
+        }
+        SettingField::DatabasePageRows => {
+            let value = update(
+                settings.database_page_rows as f32,
+                1.,
+                workspace::MAX_DATABASE_PAGE_ROWS as f32,
+            ) as u32;
+            settings.database_page_rows = value;
         }
         _ => return false,
     }

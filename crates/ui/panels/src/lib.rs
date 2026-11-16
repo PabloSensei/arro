@@ -20,6 +20,7 @@ mod console_input;
 mod copy_class;
 mod coverage;
 mod create_test;
+pub mod database_data;
 pub mod database_panel;
 mod debug;
 mod diagram;
@@ -200,6 +201,8 @@ mod window_tests_window;
 
 #[cfg(test)]
 mod window_tests_database;
+#[cfg(test)]
+mod window_tests_database_data;
 
 #[cfg(test)]
 mod window_tests_jshell;
@@ -522,6 +525,7 @@ use crate::navigation::Navigator;
 
 pub use agents::{AgentLanguages, AgentOptions};
 pub use coverage::{ActiveCoverage, CoverageColumn};
+pub use database_data::DatabaseDataView;
 pub use database_panel::{
     ActiveDatabase, ActiveMigrations, DatabasePanel, migration_support, set_database_support,
     set_migration_support,

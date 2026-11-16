@@ -179,6 +179,28 @@ pub(crate) fn wait_for_signal(
     }
 }
 
+/// Waits until the place of an element stays the same in two frames drawn one turn
+/// apart. A tool window slides into its dock over a few frames of the real clock, and a
+/// place read in the middle of the slide belongs to another row once the slide is over.
+pub(crate) fn wait_for_settled_bounds(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    selector: &'static str,
+) {
+    let mut previous = None;
+    wait_for_signal(cx, "the settled place of the tool window", |cx| {
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let bounds = visual.debug_bounds(selector);
+        let settled = bounds.is_some() && bounds == previous;
+        previous = bounds;
+        settled
+    });
+}
+
 /// Waits until the symbols of the project are in the index.
 pub(crate) fn wait_for_project_index(cx: &mut TestAppContext) {
     wait_for_signal(cx, "the project index", |cx| {

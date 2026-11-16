@@ -42,6 +42,10 @@ Debian and Ubuntu have a .deb, Fedora and openSUSE an .rpm; both install into
 manager: Arro does not replace those files itself and its update window opens the
 release page instead.
 
+The AppImage is the alternative on the other distributions: chmod +x
+arro-<version>-x86_64.AppImage and run it. It is one file, and it updates itself by
+replacing that file.
+
 What you need besides this folder
 ---------------------------------
 

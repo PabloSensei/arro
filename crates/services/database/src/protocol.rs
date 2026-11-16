@@ -435,6 +435,29 @@ pub enum Value {
     },
 }
 
+impl Value {
+    /// The text a grid shows for a value. A missing value is the word `NULL`.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Null => "NULL".to_owned(),
+            Self::Integer(integer) => integer.to_string(),
+            Self::Decimal(decimal) => decimal.clone(),
+            Self::Real(real) => real.to_string(),
+            Self::Boolean(boolean) => boolean.to_string(),
+            Self::Text(text) | Self::Date(text) | Self::Time(text) | Self::Timestamp(text) => {
+                text.clone()
+            }
+            Self::Binary { base64, bytes, .. } => {
+                if base64.is_empty() {
+                    format!("[binary {bytes} bytes]")
+                } else {
+                    format!("[binary {bytes} bytes] {base64}")
+                }
+            }
+        }
+    }
+}
+
 fn cell_value(value: &Json) -> Value {
     match value {
         Json::Null => Value::Null,

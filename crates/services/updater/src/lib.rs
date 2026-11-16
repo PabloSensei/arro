@@ -1,6 +1,7 @@
 //! Version checks and in-place updates from GitHub Releases. There is no UI and no
 //! network work on its own: the caller runs every request away from the interface.
 
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -97,6 +98,13 @@ pub const NO_RELEASE_NOTICE: &str =
 /// The list of files the installed release brought, one relative path per line. It
 /// tells the first start after an update which folders of the old release are gone.
 pub const MANIFEST_FILE: &str = "install.manifest";
+/// The variable the AppImage runtime sets to the file the program runs from. A program
+/// inside an image lives in a temporary folder of the runtime, so the image is what an
+/// update replaces.
+pub const APPIMAGE_ENV: &str = "APPIMAGE";
+/// The name of the image of a release after the version: only x86-64 is built, as for
+/// the packages.
+const APPIMAGE_SUFFIX: &str = "x86_64.AppImage";
 
 const USER_AGENT: &str = "Arro";
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -257,8 +265,14 @@ impl UpdateSource {
 }
 
 /// The release in a GitHub Releases response. `None` for a draft, a prerelease and a
-/// system without a release of its own.
+/// system without a release of its own. The file of the release is the AppImage when the
+/// program runs from one, the archive of the platform otherwise.
 pub fn parse_release(text: &str) -> Result<Option<Release>, Error> {
+    parse_release_of(text, std::env::var_os(APPIMAGE_ENV).as_deref())
+}
+
+/// [`parse_release`] for the value of `APPIMAGE`, which tests pass in themselves.
+fn parse_release_of(text: &str, appimage: Option<&OsStr>) -> Result<Option<Release>, Error> {
     let response: GithubRelease =
         serde_json::from_str(text).map_err(|error| Error::InvalidJson(error.to_string()))?;
     if response.draft || response.prerelease {
@@ -269,7 +283,7 @@ pub fn parse_release(text: &str) -> Result<Option<Release>, Error> {
     if !version.pre.is_empty() {
         return Ok(None);
     }
-    let Some(expected) = archive_name(&version) else {
+    let Some(expected) = asset_name_of(&version, appimage) else {
         return Ok(None);
     };
     let checksum_name = format!("{expected}.sha256");
@@ -314,6 +328,40 @@ pub fn archive_name(version: &Version) -> Option<String> {
     archive_name_for(version, Platform::current())
 }
 
+/// What the image of `version` is called: `arro-0.2.0-x86_64.AppImage`, the name
+/// `appimagetool` writes and the release publishes next to the archives.
+pub fn appimage_name(version: &Version) -> String {
+    format!("arro-{version}-{APPIMAGE_SUFFIX}")
+}
+
+/// The image the program was started from, or `None` when it was unpacked from an
+/// archive or installed by a package. The AppImage runtime names the image in
+/// `APPIMAGE`.
+pub fn appimage_path() -> Option<PathBuf> {
+    appimage_path_of(std::env::var_os(APPIMAGE_ENV).as_deref())
+}
+
+/// [`appimage_path`] for the value of `APPIMAGE`, which tests pass in themselves.
+fn appimage_path_of(value: Option<&OsStr>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+/// The file of the release this build updates itself with: the AppImage when the program
+/// runs from one, the archive of the platform otherwise. The checksum of the release is
+/// the same name with `.sha256` after it.
+pub fn asset_name(version: &Version) -> Option<String> {
+    asset_name_of(version, std::env::var_os(APPIMAGE_ENV).as_deref())
+}
+
+/// [`asset_name`] for the value of `APPIMAGE`.
+fn asset_name_of(version: &Version, appimage: Option<&OsStr>) -> Option<String> {
+    match appimage_path_of(appimage) {
+        Some(_) => Some(appimage_name(version)),
+        None => archive_name(version),
+    }
+}
+
 /// The message a manual "Check for Updates" shows on `platform`, or `None` when the
 /// project publishes a release for it and the check may ask the server.
 pub fn manual_check_notice(platform: Option<Platform>) -> Option<&'static str> {
@@ -325,11 +373,23 @@ pub fn parse_version(text: &str) -> Option<Version> {
     Version::parse(text.trim()).ok()
 }
 
-/// The folder an update replaces: the folder of the executable, or the `*.app` bundle
-/// that holds it on macOS.
+/// The folder an update works in: the folder of the executable, the `*.app` bundle that
+/// holds it on macOS, or the folder of the AppImage the program runs from. An image is
+/// replaced as one file inside its folder, and the folder is what the update window
+/// checks for write rights.
 pub fn install_dir() -> io::Result<PathBuf> {
     let executable = std::env::current_exe()?;
-    Ok(bundle_root(&executable))
+    Ok(install_folder(&executable, appimage_path().as_deref()))
+}
+
+/// [`install_dir`] for a program at `executable` and the image `APPIMAGE` names.
+fn install_folder(executable: &Path, appimage: Option<&Path>) -> PathBuf {
+    if let Some(image) = appimage {
+        return image
+            .parent()
+            .map_or_else(|| image.to_path_buf(), Path::to_path_buf);
+    }
+    bundle_root(executable)
 }
 
 /// [`install_dir`] for a program at `executable`. macOS keeps the program inside a
@@ -352,8 +412,10 @@ fn bundle_root(executable: &Path) -> PathBuf {
 /// files under `/opt` or `/usr` on Linux, or in `Program Files` on Windows, and the
 /// user cannot write to them: the package manager owns the folder and replaces it,
 /// while the updater can only point at the release page. The `.deb` and the `.rpm`
-/// share the tree, so both land in the same folders. A folder of the user that lost
-/// its write rights counts too, because the updater would fail halfway through it.
+/// share the tree, so both land in the same folders. An AppImage in a folder the user
+/// cannot write is the same case: the release page is the only place the new file can
+/// come from. A folder of the user that lost its write rights counts too, because the
+/// updater would fail halfway through it.
 pub fn installed_from_package(install_dir: &Path) -> bool {
     system_folder(install_dir) || (install_dir.is_dir() && !writable(install_dir))
 }
@@ -422,11 +484,15 @@ fn bundle_executable(bundle: &Path, name: &str) -> PathBuf {
     bundle.join("Contents").join("MacOS").join(name)
 }
 
-/// Replaces the files of `install_dir` with the contents of `archive` and returns the
-/// program of the new release to start. The running executable is renamed to `*.old`
-/// first; any error puts every file back the way it was. On macOS the whole `*.app`
-/// bundle is replaced.
+/// Installs `archive` over `install_dir` and returns the program of the new release to
+/// start. The running executable is renamed to `*.old` first; any error puts every file
+/// back the way it was. On macOS the whole `*.app` bundle is replaced. A program that
+/// runs from an AppImage is one file: the image `APPIMAGE` names is replaced instead,
+/// whatever `install_dir` says.
 pub fn stage(archive: &Path, install_dir: &Path) -> Result<PathBuf, Error> {
+    if let Some(image) = appimage_path() {
+        return replace_appimage(archive, &image);
+    }
     let name = std::env::current_exe()
         .ok()
         .and_then(|path| {
@@ -444,6 +510,45 @@ pub fn stage(archive: &Path, install_dir: &Path) -> Result<PathBuf, Error> {
     #[cfg(not(target_os = "macos"))]
     stage_as(archive, install_dir, Some(&name))?;
     Ok(executable_for(install_dir, &name))
+}
+
+/// Puts the downloaded release in place of the AppImage at `image` and returns the image
+/// to start. [`UpdateSource::download`] has checked the file against the `.sha256` of the
+/// release; the copy is made next to the image and renamed over it in one step, so a
+/// reader sees the old file or the new one and never half of each. The process that runs
+/// from the old image keeps its own copy mapped and is not stopped by the replacement.
+pub fn replace_appimage(downloaded: &Path, image: &Path) -> Result<PathBuf, Error> {
+    let folder = image.parent().ok_or_else(|| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the AppImage has no folder",
+        ))
+    })?;
+    let name = image.file_name().ok_or_else(|| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the AppImage has no name",
+        ))
+    })?;
+    let temp = folder.join(format!(".{}.new-{}", name.to_string_lossy(), next_id()));
+    let replaced = put_image(downloaded, &temp, image);
+    if replaced.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    replaced?;
+    Ok(image.to_path_buf())
+}
+
+/// The steps of [`replace_appimage`] that may fail and leave the temporary file behind.
+fn put_image(downloaded: &Path, temp: &Path, image: &Path) -> Result<(), Error> {
+    fs::copy(downloaded, temp)?;
+    platform::make_executable(temp)?;
+    // Publish only bytes the disk has seen: a crash between the rename and the write
+    // back would leave a truncated file in place of a working image, and the old one is
+    // gone by then.
+    File::options().write(true).open(temp)?.sync_all()?;
+    fs::rename(temp, image)?;
+    Ok(())
 }
 
 /// [`stage`] with the name of the executable that is running. Tests name it themselves.
@@ -657,8 +762,13 @@ pub fn remove_stale_tools(install_dir: &Path) -> io::Result<usize> {
 }
 
 /// The work of the first start after an update: the `*.old` files and the tool folders
-/// of an older release. Errors go to the journal and do not stop the others.
+/// of an older release. Errors go to the journal and do not stop the others. An AppImage
+/// replaces one file and keeps nothing next to it, so only the copies an interrupted
+/// update left are removed: the folder around the image belongs to the user.
 pub fn cleanup(install_dir: &Path) -> io::Result<usize> {
+    if let Some(image) = appimage_path() {
+        return remove_image_leftovers(&image);
+    }
     let mut removed = remove_old(install_dir)?;
     #[cfg(target_os = "macos")]
     {
@@ -667,6 +777,31 @@ pub fn cleanup(install_dir: &Path) -> io::Result<usize> {
     match remove_stale_tools(install_dir) {
         Ok(stale) => removed += stale,
         Err(error) => eprintln!("the tools of an older release are not removed: {error}"),
+    }
+    Ok(removed)
+}
+
+/// Removes the copies an interrupted [`replace_appimage`] left next to the image. Only
+/// the names of those copies go, so a user file of another name in the same folder stays.
+fn remove_image_leftovers(image: &Path) -> io::Result<usize> {
+    let Some(folder) = image.parent() else {
+        return Ok(0);
+    };
+    let Some(name) = image.file_name() else {
+        return Ok(0);
+    };
+    let prefix = format!(".{}.new-", name.to_string_lossy());
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            fs::remove_file(entry.path())?;
+            removed += 1;
+        }
     }
     Ok(removed)
 }
@@ -1572,6 +1707,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod appimage_tests;
 #[cfg(test)]
 mod package_tests;
 #[cfg(test)]

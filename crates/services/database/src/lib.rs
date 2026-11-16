@@ -7,12 +7,17 @@
 //! layer, which hands this crate a [`Launch`].
 
 mod console;
+mod data;
 mod protocol;
 mod schema;
 mod session;
 mod sources;
 
 pub use console::{split_statements, statement_at};
+pub use data::{
+    Cell, DataModel, DataRow, Dialect, PageQuery, Plan, RowKind, Statement, TableRef, csv,
+    insert_literal, tsv,
+};
 pub use protocol::{Command, Event, PROTOCOL, Value};
 pub use schema::{Column, ColumnKind, ForeignKey, Index, ResultSet, Schema, Table, TableKind};
 pub use session::{Launch, Session};

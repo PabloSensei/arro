@@ -41,6 +41,10 @@ pub const DEFAULT_HTTP_TIMEOUT_SECONDS: u32 = 60;
 /// The longest timeout the Settings window allows.
 pub const MAX_HTTP_TIMEOUT_SECONDS: u32 = 600;
 pub const COMPLETION_DELAY_STEP_MS: u32 = 100;
+/// The rows one page of a data tab reads when the user has not changed the setting.
+pub const DEFAULT_DATABASE_PAGE_ROWS: u32 = 500;
+/// The most rows one page of a data tab reads.
+pub const MAX_DATABASE_PAGE_ROWS: u32 = 10_000;
 
 /// What a save does with the spaces and tabs at the end of a line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +370,8 @@ pub struct Settings {
     /// The kubeconfig the Kubernetes tool window reads; empty means `KUBECONFIG` or the
     /// usual file of the user.
     pub kubeconfig_path: String,
+    /// How many rows one page of a data tab reads from the table.
+    pub database_page_rows: u32,
 }
 
 impl Default for Settings {
@@ -456,6 +462,7 @@ impl Default for Settings {
             http_timeout_seconds: DEFAULT_HTTP_TIMEOUT_SECONDS,
             kubectl_path: String::new(),
             kubeconfig_path: String::new(),
+            database_page_rows: DEFAULT_DATABASE_PAGE_ROWS,
         }
     }
 }

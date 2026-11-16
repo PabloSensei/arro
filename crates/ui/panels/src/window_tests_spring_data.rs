@@ -499,17 +499,20 @@ fn a_text_block_of_a_query_is_checked_on_the_lines_of_its_text(cx: &mut TestAppC
         caret_after(BLOCK_QUERY, "where o.nickname"),
     );
 
+    // The reader of the entities answers with its first model: a check that runs before
+    // it names the entity itself. The test waits for the checks of the loaded model.
+    let expected = ["nickname", "name"];
     wait_for(
         cx,
         "the checks of the text block",
         Duration::from_secs(10),
         |cx| {
             draw(cx, window);
-            !marks(&view, cx).is_empty()
+            marked_text(&view, cx) == expected
         },
     );
     let found = marked_text(&view, cx);
-    assert_eq!(found, ["nickname", "name"], "{found:?}");
+    assert_eq!(found, expected, "{found:?}");
 }
 
 #[ui_kit::gpui::test]

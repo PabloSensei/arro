@@ -14,7 +14,9 @@ use workspace::{TERMINAL_TOOL, Workspace};
 
 use crate::term_tabs::{Split, TabsState};
 use crate::terminal_panel::{ActiveTerminal, TerminalPanel};
-use crate::window_tests::{bounds_of, draw, open_sample_window, press, type_text, wait_for_signal};
+use crate::window_tests::{
+    bounds_of, draw, open_sample_window, press, type_text, wait_for_settled_bounds, wait_for_signal,
+};
 
 fn terminal_of(cx: &mut TestAppContext) -> gpui::Entity<TerminalPanel> {
     cx.read(|cx| cx.global::<ActiveTerminal>().0.clone())
@@ -40,6 +42,9 @@ fn open_terminal(
         terminal.read_with(cx, |panel, _| panel.session().is_some())
     });
     draw(cx, window);
+    // The dock slides in over a few frames, and the size of the grid changes with it. A
+    // place of the grid is read only after the slide, or it names another row.
+    wait_for_settled_bounds(cx, window, "terminal-grid");
     (root, window, terminal)
 }
 
@@ -290,10 +295,9 @@ fn a_dragged_selection_goes_to_the_clipboard(cx: &mut TestAppContext) {
     let row = row_of(&session, "copy-me-123");
     let start = cell_position(cx, window, row);
     let bounds = bounds_of(cx, window, "terminal-grid");
-    let end = point(
-        bounds.right() - px(12.),
-        bounds.top() + px(6. + 18. * row as f32 + 9.),
-    );
+    // The end of the drag keeps the row of its start: only the column moves to the right
+    // edge of the grid.
+    let end = point(bounds.right() - px(12.), start.y);
 
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());

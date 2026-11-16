@@ -1,6 +1,6 @@
-//! The Linux folder, its `tar.gz` and its packages: the program, the helper jars, the
-//! language tools, the icon, a desktop entry and an `install.sh`; the `.deb` and the
-//! `.rpm` are packed from one tree.
+//! The Linux folder, its `tar.gz` and the packages built from it: the `.deb`, the `.rpm`
+//! and the AppImage carry the program, the helper jars, the language tools, the icon, a
+//! desktop entry and an `install.sh`. All three are packed from one tree.
 //!
 //! The folder and the packages are built on Linux, where the release binary and the
 //! executable bits of `install.sh` come from. Everything that is text is written here, so
@@ -66,6 +66,23 @@ exit 0
 const RPMBUILD_MISSING: &str = "rpmbuild is not available: install the rpm-build \
                                  package (dnf install rpm-build, or zypper install \
                                  rpm-build), or build the .rpm on Fedora or openSUSE";
+/// The variable that names the program packing an AppDir, for a machine where it is not
+/// in the PATH.
+const APPIMAGETOOL_ENV: &str = "APPIMAGETOOL";
+/// Where the release lives inside the AppDir.
+const APPDIR_RELEASE: &str = "usr";
+/// The launcher of the image. The runtime names the folder of the image in `APPDIR`; a
+/// folder unpacked by hand finds it next to this script.
+const APPRUN: &str = "#!/bin/sh
+set -e
+here=${APPDIR:-$(dirname \"$0\")}
+exec \"$here/usr/arro\" \"$@\"
+";
+/// The tool that packs the AppDir. Nothing downloads it: the message names the variable
+/// and the project that builds the tool.
+const APPIMAGETOOL_MISSING: &str = "appimagetool is not available: set APPIMAGETOOL to the \
+                                   program, or install it from \
+                                   https://github.com/AppImage/appimagetool/releases";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -76,6 +93,7 @@ pub fn run(
     archive: bool,
     deb: bool,
     rpm: bool,
+    appimage: bool,
 ) -> Result {
     let out = dist::absolute(out)?;
     let root = dist::absolute(root)?;
@@ -148,6 +166,10 @@ pub fn run(
         let package = rpm_package(&root, &out)?;
         println!("{}", package.display());
     }
+    if appimage {
+        let image = appimage_file(&root, &out)?;
+        println!("{}", image.display());
+    }
     Ok(())
 }
 
@@ -200,7 +222,15 @@ fn control_text(version: &str) -> String {
 /// The desktop entry of the package: the same file the folder carries, with the folder
 /// of the program written in.
 fn desktop_entry() -> String {
-    DESKTOP.replace("@ARRO_DIR@", OPT_DIR)
+    desktop_entry_for(&format!("\"{OPT_DIR}/{BINARY}\""))
+}
+
+/// The desktop entry for a program named by `program`. The packages write the folder of
+/// the program; an AppImage names its launcher, which the runtime starts from the root
+/// of the unpacked image. The associations are the same in both, so a file manager and
+/// the system keep one entry for the program.
+fn desktop_entry_for(program: &str) -> String {
+    DESKTOP.replace("\"@ARRO_DIR@/arro\"", program)
 }
 
 /// Fills `tree` with the files both packages carry: the release folder under
@@ -327,6 +357,125 @@ fn rpmbuild_command(top: &Path, spec: &Path, stage: &Path) -> Command {
         .arg(format!("arro_stage {}", stage.display()))
         .arg(spec);
     command
+}
+
+/// The `.AppImage` of the release sits next to the folder like the packages: one file
+/// that runs on a system without `dpkg` and `rpm`. `appimagetool` packs an AppDir this
+/// module assembles; a system without the tool stops with a message instead of writing
+/// half an image.
+fn appimage_file(root: &Path, out: &Path) -> Result<PathBuf> {
+    let parent = out.parent().ok_or("the output folder has no parent")?;
+    let image = parent.join(appimage_name(env!("CARGO_PKG_VERSION")));
+    if image.exists() {
+        fs::remove_file(&image)?;
+    }
+    // A system without the tool should say so before the tree is copied, not after
+    // minutes of work.
+    check_appimagetool()?;
+    let tree = parent.join(format!(
+        ".arro-appimage-{}-{}",
+        std::process::id(),
+        next_id()
+    ));
+    let result = build_appdir(root, out, &tree).and_then(|()| run_appimagetool(&tree, &image));
+    let _ = fs::remove_dir_all(&tree);
+    if result.is_err() {
+        // A failed run must not leave an image that a later step may attach.
+        let _ = fs::remove_file(&image);
+    }
+    result?;
+    Ok(image)
+}
+
+/// `arro-0.1.16-x86_64.AppImage`: the name the tool writes and the updater looks for.
+fn appimage_name(version: &str) -> String {
+    format!("arro-{version}-{ARCH}.AppImage")
+}
+
+/// Fills `app_dir` from the release tree the `.deb` and the `.rpm` are built from and
+/// adds what the AppImage specification wants at the root: the launcher, the desktop
+/// entry, the 256 render of the icon and `.DirIcon`. The program and everything next to
+/// it live under `usr/`.
+fn build_appdir(root: &Path, out: &Path, app_dir: &Path) -> Result {
+    copy_tree(out, &app_dir.join(APPDIR_RELEASE), &NOT_IN_OPT)?;
+
+    let app_run = app_dir.join("AppRun");
+    dist::write_unix_text(&app_run, APPRUN)?;
+    set_mode(&app_run, 0o755)?;
+    write_file(&app_dir.join("arro.desktop"), &appimage_desktop_entry())?;
+
+    let (_, icon) = icon_sources(root)?
+        .into_iter()
+        .find(|(size, _)| *size == 256)
+        .ok_or("the resources have no 256x256 render of the icon")?;
+    for name in ["arro.png", ".DirIcon"] {
+        let target = app_dir.join(name);
+        fs::copy(&icon, &target)?;
+        set_mode(&target, 0o644)?;
+    }
+    set_directory_modes(app_dir)?;
+    Ok(())
+}
+
+/// The desktop entry of the image: the same associations as the packages, with the
+/// launcher of the AppDir as the program. The entry stays inside the image, where no
+/// program of the system is on the PATH: a `TryExec` that names the launcher would hide
+/// the entry after a desktop integration, and the integration writes `Exec` itself.
+fn appimage_desktop_entry() -> String {
+    desktop_entry_for("AppRun")
+        .replace("\r\n", "\n")
+        .replace("TryExec=AppRun\n", "")
+}
+
+/// The program that packs the AppDir: `APPIMAGETOOL` when it names one, `appimagetool`
+/// from the PATH otherwise. Nothing is downloaded here.
+fn appimagetool_program() -> PathBuf {
+    std::env::var_os(APPIMAGETOOL_ENV)
+        .filter(|program| !program.is_empty())
+        .map_or_else(|| PathBuf::from("appimagetool"), PathBuf::from)
+}
+
+/// The command of the tool with the environment the packing needs: the tool is an AppImage
+/// in most downloads, and a runner without FUSE unpacks it itself when the runtime reads
+/// `APPIMAGE_EXTRACT_AND_RUN`. The architecture is the one the packages are built for.
+fn appimagetool_base() -> Command {
+    let mut command = Command::new(appimagetool_program());
+    command
+        .env("APPIMAGE_EXTRACT_AND_RUN", "1")
+        .env("ARCH", ARCH);
+    command
+}
+
+fn check_appimagetool() -> Result {
+    let mut command = appimagetool_base();
+    command.arg("--version");
+    match command.output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!("appimagetool --version failed: {}", output.status).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(APPIMAGETOOL_MISSING.into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `appimagetool APPDIR IMAGE`.
+fn appimagetool_command(app_dir: &Path, image: &Path) -> Command {
+    let mut command = appimagetool_base();
+    command.arg(app_dir).arg(image);
+    command
+}
+
+fn run_appimagetool(app_dir: &Path, image: &Path) -> Result {
+    let mut command = appimagetool_command(app_dir, image);
+    match command.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("appimagetool failed: {status}").into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(APPIMAGETOOL_MISSING.into())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// A file or folder of the package tree, as `%files` names it.
@@ -832,6 +981,166 @@ mod tests {
         dist::make_executable(&out.join("install.sh")).unwrap();
         fs::write(out.join("arro.desktop"), DESKTOP).unwrap();
         fs::write(out.join("arro-256.png"), b"png256").unwrap();
+    }
+
+    #[test]
+    fn the_appimage_name_holds_the_version_and_the_architecture() {
+        assert_eq!(appimage_name("0.1.16"), "arro-0.1.16-x86_64.AppImage");
+    }
+
+    /// The launcher finds the folder of the release: the runtime names it in `APPDIR`,
+    /// and a folder unpacked by hand leaves the variable out.
+    #[test]
+    fn the_launcher_reads_the_folder_and_starts_the_program() {
+        assert!(APPRUN.starts_with("#!/bin/sh\n"), "{APPRUN}");
+        assert!(
+            APPRUN.contains("here=${APPDIR:-$(dirname \"$0\")}"),
+            "{APPRUN}"
+        );
+        assert!(
+            APPRUN.contains("exec \"$here/usr/arro\" \"$@\""),
+            "{APPRUN}"
+        );
+    }
+
+    /// The AppDir carries the release under `usr/` and the files the image needs at the
+    /// root: the launcher, the desktop entry, the 256 render and `.DirIcon`.
+    #[test]
+    fn the_appdir_holds_the_release_the_launcher_and_the_desktop_entry() {
+        let temp = TempDir::new("dist-appimage-tree");
+        let root = temp.path().join("repo");
+        let out = temp.path().join("dist");
+        let app_dir = temp.path().join("AppDir");
+        release_tree(&root, &out);
+
+        build_appdir(&root, &out, &app_dir).unwrap();
+
+        assert_eq!(fs::read(app_dir.join("usr/arro")).unwrap(), b"program");
+        assert!(app_dir.join("usr/helpers/one.jar").is_file());
+        assert!(app_dir.join("usr/tools/engine/server.jar").is_file());
+        assert!(app_dir.join("usr/README.txt").is_file());
+        assert!(app_dir.join("usr/NOTICE.txt").is_file());
+        // The root holds what the runtime and the desktop look for; a copy inside
+        // `usr/` would be a second, stale one.
+        assert!(!app_dir.join("usr/install.sh").exists());
+        assert!(!app_dir.join("usr/arro.desktop").exists());
+        assert!(!app_dir.join("usr/arro-256.png").exists());
+
+        let entry = fs::read_to_string(app_dir.join("arro.desktop")).unwrap();
+        assert!(entry.contains("Exec=AppRun %F"), "{entry}");
+        assert!(!entry.contains("TryExec="), "{entry}");
+        assert!(entry.contains("Icon=arro"), "{entry}");
+        assert!(!entry.contains("@ARRO_DIR@"), "{entry}");
+        // A file manager sees the same association as with a package.
+        let mime = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("MimeType="))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(mime(&entry), mime(&desktop_entry()));
+        assert!(entry.contains("StartupWMClass=arro"), "{entry}");
+
+        assert_eq!(fs::read(app_dir.join("arro.png")).unwrap(), b"png256");
+        assert_eq!(fs::read(app_dir.join(".DirIcon")).unwrap(), b"png256");
+        assert_eq!(fs::read_to_string(app_dir.join("AppRun")).unwrap(), APPRUN);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_launcher_of_the_appdir_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let temp = TempDir::new("dist-appimage-modes");
+        let root = temp.path().join("repo");
+        let out = temp.path().join("dist");
+        let app_dir = temp.path().join("AppDir");
+        release_tree(&root, &out);
+
+        build_appdir(&root, &out, &app_dir).unwrap();
+
+        assert_eq!(mode(&app_dir.join("AppRun")), 0o755);
+        assert_eq!(mode(&app_dir.join("usr/arro")), 0o755);
+        assert_eq!(mode(&app_dir.join("arro.desktop")), 0o644);
+        assert_eq!(mode(&app_dir.join("arro.png")), 0o644);
+        assert_eq!(mode(&app_dir), 0o755);
+    }
+
+    #[test]
+    fn appimagetool_gets_the_appdir_the_image_and_the_architecture() {
+        let app_dir = Path::new("/tmp/AppDir");
+        let image = Path::new("/tmp/arro-0.1.16-x86_64.AppImage");
+        let command = appimagetool_command(app_dir, image);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["/tmp/AppDir", "/tmp/arro-0.1.16-x86_64.AppImage"]);
+        let env: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        // The tool is an AppImage itself in most downloads, and the runner may have no
+        // FUSE.
+        assert!(
+            env.contains(&("APPIMAGE_EXTRACT_AND_RUN".to_owned(), Some("1".to_owned()))),
+            "{env:?}"
+        );
+        assert!(
+            env.contains(&("ARCH".to_owned(), Some(ARCH.to_owned()))),
+            "{env:?}"
+        );
+    }
+
+    /// A real image needs `appimagetool`, which is not part of the repository. The test
+    /// reports a skip where the tool is missing instead of failing.
+    #[test]
+    fn appimagetool_builds_a_real_image() {
+        if check_appimagetool().is_err() {
+            eprintln!("appimagetool is not installed; the test is skipped");
+            return;
+        }
+
+        let temp = TempDir::new("dist-appimage-real");
+        let root = temp.path().join("repo");
+        let out = temp.path().join("dist");
+        release_tree(&root, &out);
+
+        let image = appimage_file(&root, &out).unwrap();
+        assert_eq!(
+            image.file_name().unwrap().to_string_lossy().into_owned(),
+            appimage_name(env!("CARGO_PKG_VERSION"))
+        );
+
+        // The image carries the AppDir: the runtime extracts it without FUSE.
+        let extracted = temp.path().join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        let status = Command::new(&image)
+            .arg("--appimage-extract")
+            .current_dir(&extracted)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let unpacked = extracted.join("squashfs-root");
+        for path in [
+            "AppRun",
+            "arro.desktop",
+            "arro.png",
+            "usr/arro",
+            "usr/helpers/one.jar",
+        ] {
+            assert!(unpacked.join(path).exists(), "{path} is not in the image");
+        }
+        assert_eq!(fs::read_to_string(unpacked.join("AppRun")).unwrap(), APPRUN);
     }
 
     /// The spec builds no sources: `%install` copies the tree the `.deb` is assembled

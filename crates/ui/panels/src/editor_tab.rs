@@ -1051,6 +1051,7 @@ fn open(
         }),
         preview,
         bundle,
+        can_close: None,
     }
 }
 /// The factory the workspace opens files with.

@@ -89,7 +89,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>Tools in the window</h3>
-      A database console for JDBC sources with a schema tree, an HTTP client for <code>.http</code> files that turns pasted cURL into requests and back, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), heap dumps with retained sizes, dominators and paths to GC roots, Flyway and Liquibase migrations with their state in the database, Kubernetes clusters next to Docker in the Services window, a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, newer dependency versions marked in <code>pom.xml</code> and Gradle files, a table editor for <code>.properties</code> bundles of all locales, library sources on demand, and a Markdown preview with images.
+      A database console for JDBC sources with a schema tree and a table data editor, an HTTP client for <code>.http</code> files that turns pasted cURL into requests and back, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), heap dumps with retained sizes, dominators and paths to GC roots, Flyway and Liquibase migrations with their state in the database, Kubernetes clusters next to Docker in the Services window, a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, newer dependency versions marked in <code>pom.xml</code> and Gradle files, a table editor for <code>.properties</code> bundles of all locales, library sources on demand, and a Markdown preview with images.
     </td>
   </tr>
   <tr>

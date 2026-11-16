@@ -71,6 +71,8 @@ pub type PreviewReader = Rc<dyn Fn(&App) -> PreviewLayout>;
 
 /// Changes what a tab with a rendered document shows.
 pub type PreviewSetter = Rc<dyn Fn(PreviewLayout, &mut App)>;
+/// Asks whether a tab may close; `false` keeps it open while its view asks the user.
+pub type CloseGuard = Rc<dyn Fn(&mut App) -> bool>;
 
 /// Reads and changes what a tab with a rendered document shows: the tab itself and the
 /// mode the layout of the project keeps for the file.
@@ -125,6 +127,10 @@ pub struct EditorTab {
     pub preview: Option<PreviewTab>,
     /// What the tab of a file of a localized set shows; `None` for other files.
     pub bundle: Option<BundleTab>,
+    /// Asks whether the tab may close. `false` keeps it open: a view with unsaved work
+    /// shows its question here and closes itself once the user has answered. `None`
+    /// closes the tab at once.
+    pub can_close: Option<CloseGuard>,
 }
 
 /// Line ends and encodings the status bar offers, by the names `EditorTab::set_format` takes.
