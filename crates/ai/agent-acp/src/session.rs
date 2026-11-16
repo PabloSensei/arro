@@ -304,6 +304,9 @@ impl Worker {
         loop {
             select! {
                 recv(answer) -> response => {
+                    // Updates the agent sent just before this answer are already waiting: the
+                    // handshake keeps the order of the agent, the caller sees them first.
+                    self.drain(incoming);
                     return response.unwrap_or_else(|_| Err("the agent exited".to_string()));
                 }
                 recv(incoming) -> message => match message {
@@ -313,6 +316,20 @@ impl Worker {
                 recv(deadline) -> _ => return Err("the agent did not answer in time".to_string()),
             }
         }
+    }
+
+    /// Handles everything that is already waiting, in the order the agent sent it. The reader
+    /// thread puts a notification into this channel before it resolves the answer that followed
+    /// it, so an answer that is ready means the messages before it are waiting here too.
+    /// Returns false when the agent has closed its output.
+    fn drain(&self, incoming: &Receiver<Incoming>) -> bool {
+        for message in incoming.try_iter() {
+            if let Incoming::Closed = message {
+                return false;
+            }
+            self.handle(message);
+        }
+        true
     }
 
     fn handshake(&mut self, incoming: &Receiver<Incoming>) -> Result<String, String> {
@@ -378,8 +395,15 @@ impl Worker {
                     Err(_) => break,
                 },
                 recv(turn_answer) -> response => {
+                    let response = response.unwrap_or_else(|_| Err("the agent exited".to_string()));
                     turn = None;
-                    self.end_turn(response.unwrap_or_else(|_| Err("the agent exited".to_string())));
+                    // The text and the tool events of the turn come before its answer in the
+                    // stream, and they may still be waiting here when the answer is ready.
+                    let alive = self.drain(&incoming);
+                    self.end_turn(response);
+                    if !alive {
+                        break;
+                    }
                 }
                 recv(cancels) -> _ => {
                     if turn.is_some() {

@@ -1,6 +1,10 @@
 //! A tiny ACP agent for tests: no network, no model. The prompt is the script:
 //! `WRITE <path> <text>` lines write files, `ASK` asks for permission first, `HANG` waits for a
-//! cancel, anything else is echoed back in pieces together with the names of linked files.
+//! cancel, `BURST <n>` sends `n` chunks in a row and answers right after them, anything else is
+//! echoed back in pieces together with the names of linked files.
+//!
+//! `--greet <n>` sends `n` chunks just before the answer to `session/new`, so a test can see
+//! whether the handshake waits for the messages that came first.
 
 use std::io::{BufRead, Write};
 use std::sync::mpsc::{Receiver, channel};
@@ -12,6 +16,16 @@ struct Agent {
     inbox: Receiver<Value>,
     next_id: u64,
     cwd: String,
+    /// Chunks to send just before the answer to `session/new`.
+    greet: usize,
+}
+
+/// The number that follows `flag` on the command line, or 0.
+fn count_of(flag: &str) -> usize {
+    let mut args = std::env::args().skip_while(|arg| arg != flag).skip(1);
+    args.next()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
 }
 
 fn send(message: &Value) {
@@ -20,13 +34,31 @@ fn send(message: &Value) {
     let _ = stdout.flush();
 }
 
+/// Puts a whole run of messages into the pipe at once, so the reader of the IDE sees them as
+/// one burst instead of one line at a time.
+fn send_all(messages: &[Value]) {
+    let mut text = String::new();
+    for message in messages {
+        text.push_str(&message.to_string());
+        text.push('\n');
+    }
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
+}
+
 fn reply(id: &Value, result: Value) {
     send(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
 }
 
 fn update(session: &str, update: Value) {
+    send(&update_message(session, update));
+}
+
+/// A `session/update` notification without sending it, for a run that goes into the pipe at once.
+fn update_message(session: &str, update: Value) -> Value {
     let params = json!({"sessionId": session, "update": update});
-    send(&json!({"jsonrpc": "2.0", "method": "session/update", "params": params}));
+    json!({"jsonrpc": "2.0", "method": "session/update", "params": params})
 }
 
 fn chunk(session: &str, text: &str) {
@@ -85,6 +117,22 @@ impl Agent {
                     return;
                 }
             }
+            return;
+        }
+        if let Some(count) = text.trim().strip_prefix("BURST ") {
+            let count: usize = count.trim().parse().unwrap_or(0);
+            let mut messages: Vec<Value> = (0..count)
+                .map(|index| {
+                    let content = json!({"type": "text", "text": index.to_string()});
+                    update_message(
+                        &session,
+                        json!({"sessionUpdate": "agent_message_chunk", "content": content}),
+                    )
+                })
+                .collect();
+            messages
+                .push(json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}}));
+            send_all(&messages);
             return;
         }
         let writes: Vec<(String, String)> = text
@@ -148,6 +196,7 @@ fn main() {
         inbox,
         next_id: 1000,
         cwd: String::new(),
+        greet: count_of("--greet"),
     };
     while let Ok(message) = agent.inbox.recv() {
         let id = message["id"].clone();
@@ -161,7 +210,23 @@ fn main() {
                 agent.cwd = params["cwd"].as_str().unwrap_or(".").to_string();
                 let servers = params["mcpServers"].as_array().map_or(0, Vec::len);
                 eprintln!("mcp servers: {servers}");
-                reply(&id, json!({"sessionId": "stub-session"}));
+                if agent.greet > 0 {
+                    let content = json!({"type": "text", "text": "hello "});
+                    let mut messages: Vec<Value> = (0..agent.greet)
+                        .map(|_| {
+                            update_message(
+                                "stub-session",
+                                json!({"sessionUpdate": "agent_message_chunk", "content": content}),
+                            )
+                        })
+                        .collect();
+                    messages.push(
+                        json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "stub-session"}}),
+                    );
+                    send_all(&messages);
+                } else {
+                    reply(&id, json!({"sessionId": "stub-session"}));
+                }
             }
             "session/prompt" => agent.prompt(&id, &params),
             _ => {}
