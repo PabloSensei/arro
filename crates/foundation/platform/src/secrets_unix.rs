@@ -262,7 +262,9 @@ mod tests {
         let args = fs::read_to_string(folder.path().join("args")).unwrap();
         let lines: Vec<&str> = args.lines().collect();
         assert_eq!(lines[0], "store");
-        assert_eq!(lines[1], "Arro/database/owners (sa)");
+        // One argument of `--label=`, as `secret-tool store --label='Label' attribute value`
+        // takes it, so the spaces of the label never split it.
+        assert_eq!(lines[1], "--label=Arro/database/owners (sa)");
         assert_eq!(
             &lines[2..],
             ["service", "Arro/database/owners", "account", "sa"]
