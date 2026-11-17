@@ -45,7 +45,7 @@
 </p>
 
 <p align="center">
-  <img src=".github/readme/hero.png" alt="Arro editing a Spring PetClinic controller: project tree, semantic highlighting, parameter hints" width="100%">
+  <img src=".github/readme/hero.png" alt="Arro in the Dark theme: a Spring PetClinic controller and its repository side by side, sticky lines, endpoint marks and parameter hints" width="100%">
 </p>
 
 > [!WARNING]
@@ -67,10 +67,10 @@
   <tr>
     <td width="50%" valign="top">
       <h3>Code intelligence</h3>
-      Completion with auto-import, quick fixes on Alt+Enter, semantic highlighting, parameter name hints, Find Usages, call and type hierarchy, class and sequence diagrams, rename, extract, inline, change signature, safe delete, Structural Search and Replace, live and postfix templates, reformat, optimize imports, Create Test, spell checking of comments, strings and names with fixes through Rename, and per-project inspection levels with suppression on Alt+Enter.
+      Fast completion with documentation and auto-import, Alt+Enter with quick fixes and intentions and a preview of the change, Ctrl+B that jumps at once, semantic highlighting, parameter name hints, Find Usages, call and type hierarchy, class and sequence diagrams, rename, extract, inline, change signature, safe delete, Structural Search and Replace, live and postfix templates, reformat, optimize imports, Create Test, spell checking of comments, strings and names with fixes through Rename, and per-project inspection levels with suppression on Alt+Enter.
     </td>
     <td width="50%" valign="top">
-      <img src=".github/readme/completion.png" alt="Completion popup in the editor">
+      <img src=".github/readme/completion.png" alt="Completion with documentation in the Paper theme">
     </td>
   </tr>
   <tr>
@@ -95,15 +95,33 @@
   <tr>
     <td width="50%" valign="top">
       <h3>Git built in</h3>
-      Commit, diff, log, a branches popup like IntelliJ IDEA's with favourites, merge, rebase and compare, change markers next to the line numbers with rollback, shelf and stash, conflict resolution, history of a selection or a method, submodules, local history.
+      A branches popup like IntelliJ IDEA's: search, favourites, branches folded by their slashes, and checkout, merge, rebase, compare and push from one arrow. Change markers next to the line numbers show the original text and roll a change back. Commit, diff, log, shelf and stash, conflict resolution, history of a selection or a method, submodules, local history.
     </td>
     <td width="50%" valign="top">
-      <img src=".github/readme/light.png" alt="Arro in the light theme">
+      <img src=".github/readme/branches.png" alt="The Git branches popup in the Nord theme">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src=".github/readme/themes.png" alt="Theme cards in Settings, in the Mocha theme">
+    </td>
+    <td width="50%" valign="top">
+      <h3>Themes</h3>
+      Seven built-in themes: Dark, Light, High Contrast, Retro, Nord, Mocha and Paper. Pick one for the light and one for the dark system appearance and let Arro follow the OS, preview a theme with Quick Switch Scheme (Ctrl+`), write your own as a short JSON file, or import an IntelliJ IDEA <code>.icls</code> color scheme.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Editor and terminal</h3>
+      Split editors, a terminal with tabs, search and clickable paths, file type icons, folding, sticky lines, highlighting for Python, C, C++, C#, Go, Rust, Scala, PHP, Ruby, Swift, Lua, PowerShell, Protobuf and more, next to Java. An AI Sessions panel for Claude Code and Codex over the Agent Client Protocol is in early preview.
+    </td>
+    <td width="50%" valign="top">
+      <img src=".github/readme/terminal.png" alt="Split editors and the terminal in the Retro theme">
     </td>
   </tr>
 </table>
 
-And the rest you expect from an IDE: a New Project wizard for Maven, Gradle and Spring Boot (Spring Initializr), Search Everywhere, Find in Files, a project tree, a terminal with tabs, splits, search and clickable paths, file structure, bookmarks, split editors, Compare with Clipboard, actions on save (reformat, optimize imports), seven themes plus your own JSON themes and imported IntelliJ IDEA color schemes, syntax highlighting for Python, C, C++, C#, Go, Rust, Scala, PHP, Ruby, Swift, Lua, PowerShell and more, database drivers that download themselves, Distraction Free, Zen and Presentation modes, a configurable keymap, the code style of a project's <code>.idea</code> folder, settings export and import, Docker services, Lombok support, and automatic updates.
+And the rest you expect from an IDE: a New Project wizard for Maven, Gradle and Spring Boot (Spring Initializr), Search Everywhere, Find in Files, a project tree, file structure, bookmarks, Compare with Clipboard, actions on save (reformat, optimize imports), database drivers that download themselves and passwords kept in the system keychain, Distraction Free, Zen and Presentation modes, a configurable keymap, the code style of a project's <code>.idea</code> folder, settings export and import, Docker services, Lombok support, and automatic updates.
 
 ## Install
 
