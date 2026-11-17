@@ -1,0 +1,217 @@
+// Writes one JSON file per project into the directory given by -Pide.model.out.
+//   gradlew --init-script ide-model.init.gradle --no-configuration-cache --no-scan \n//       -Pide.model.out=DIR ideModel
+//
+// Every project resolves its own configurations in its own task, so no task reaches into
+// another project.
+
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+import org.gradle.api.artifacts.result.UnresolvedDependencyResult
+
+// How deep a tree may go before it is a cycle the build left in the graph.
+def MAX_DEPTH = 64
+
+// `group:module:version` of a component, its project path for a neighbour project.
+def coordinatesOf = { component ->
+    def id = component.id
+    if (id instanceof ModuleComponentIdentifier) {
+        return "${id.group}:${id.module}:${id.version}".toString()
+    }
+    if (id instanceof ProjectComponentIdentifier) {
+        return id.projectPath.toString()
+    }
+    return id.displayName.toString()
+}
+
+// The version the edge asks for, when it is a module selector of another version.
+def requestedOf = { dependency, selected ->
+    def requested = dependency.requested
+    if (!(requested instanceof org.gradle.api.artifacts.component.ModuleComponentSelector)) {
+        return null
+    }
+    if (!(selected.id instanceof ModuleComponentIdentifier)) {
+        return null
+    }
+    def id = selected.id
+    if (requested.group != id.group || requested.module != id.module || requested.version != id.version) {
+        return "${requested.group}:${requested.module}:${requested.version}".toString()
+    }
+    return null
+}
+
+// The tree of one configuration, from the resolution result: every edge the graph keeps,
+// with the component resolution chose for it.
+def treeOf = { project, String name, List problems ->
+    def configuration = name == null ? null : project.configurations.findByName(name)
+    if (configuration == null) {
+        return []
+    }
+    def root
+    try {
+        root = configuration.incoming.resolutionResult.root
+    } catch (Exception e) {
+        problems << "${name}: ${e.message}".toString()
+        return []
+    }
+    def walk
+    walk = { component, Set path, int depth ->
+        def entries = []
+        def own = coordinatesOf(component)
+        if (depth >= MAX_DEPTH || path.contains(own)) {
+            return entries
+        }
+        def visited = new LinkedHashSet(path)
+        visited.add(own)
+        component.dependencies.each { dependency ->
+            if (dependency instanceof UnresolvedDependencyResult) {
+                problems << "${name}: ${dependency.attempted.displayName} is not resolved".toString()
+                return
+            }
+            if (!(dependency instanceof ResolvedDependencyResult)) {
+                return
+            }
+            def selected = dependency.selected
+            def entry = [
+                coordinates: coordinatesOf(selected),
+                scope: name,
+            ]
+            def requested = requestedOf(dependency, selected)
+            if (requested != null) {
+                entry.requested = requested
+            }
+            if (selected.id instanceof ProjectComponentIdentifier) {
+                entry.module = selected.id.projectPath.toString()
+            }
+            def children = walk(selected, visited, depth + 1)
+            if (!children.isEmpty()) {
+                entry.children = children
+            }
+            entries << entry
+        }
+        return entries
+    }
+    walk(root, new LinkedHashSet(), 0)
+}
+
+// Compilation, run and test trees of the source sets the build has.
+def dependencyTreesOf = { project, List sets, List problems ->
+    def byName = [:]
+    sets.each { set -> byName[set.name] = set }
+    def trees = [:]
+    def main = byName['main']
+    if (main != null) {
+        trees.compile = treeOf(project, main.compileClasspathConfigurationName, problems)
+        trees.runtime = treeOf(project, main.runtimeClasspathConfigurationName, problems)
+    }
+    def test = byName['test']
+    if (test != null) {
+        trees.test = treeOf(project, test.compileClasspathConfigurationName, problems)
+    }
+    trees
+}
+
+def classpathOf = { project, String name, List problems ->
+    def configuration = project.configurations.findByName(name)
+    if (configuration == null) {
+        return []
+    }
+    // Lenient: a project dependency gives its output path without building anything.
+    def view = configuration.incoming.artifactView { lenient(true) }
+    def entries = view.artifacts.artifacts.collect { artifact ->
+        def id = artifact.id.componentIdentifier
+        def entry = [path: artifact.file.path]
+        if (id instanceof ProjectComponentIdentifier) {
+            entry.kind = 'module'
+            entry.module = id.projectPath
+            entry.built = artifact.file.exists()
+        } else if (id instanceof ModuleComponentIdentifier) {
+            entry.kind = 'library'
+            entry.coordinates = id.displayName
+        } else {
+            entry.kind = 'file'
+        }
+        entry
+    }
+    view.artifacts.failures.each { problems << "${name}: ${it.message}".toString() }
+    entries
+}
+
+// Plugins add to a source set's classpath past its configuration (jmh does), and a test set
+// sees the main output there. Those entries have no component id, so they stay plain files.
+def withFilesOf = { List entries, classpath, Set ownOutput, List problems ->
+    def known = entries*.path as Set
+    try {
+        classpath.files.each { file ->
+            if (!known.contains(file.path) && !ownOutput.contains(file.path)) {
+                entries << [path: file.path, kind: 'file']
+            }
+        }
+    } catch (Exception e) {
+        problems << e.message
+    }
+    entries
+}
+
+def describe = { project ->
+    def problems = []
+    def sourceSets = project.extensions.findByName('sourceSets')
+    def sets = sourceSets == null ? [] : sourceSets.collect { set ->
+        def ownOutput = set.output.classesDirs.files*.path as Set
+        if (set.output.resourcesDir != null) {
+            ownOutput << set.output.resourcesDir.path
+        }
+        [
+            name: set.name,
+            sourceRoots: set.allJava.srcDirs*.path.sort(),
+            allSourceRoots: set.allSource.srcDirs*.path.sort(),
+            resourceRoots: set.resources.srcDirs*.path.sort(),
+            classesDirs: set.output.classesDirs.files*.path.sort(),
+            resourcesDir: set.output.resourcesDir?.path,
+            compileClasspath: withFilesOf(
+                classpathOf(project, set.compileClasspathConfigurationName, problems),
+                set.compileClasspath, ownOutput, problems),
+            runtimeClasspath: withFilesOf(
+                classpathOf(project, set.runtimeClasspathConfigurationName, problems),
+                set.runtimeClasspath, ownOutput, problems),
+            compileClasspathConfigurationName: set.compileClasspathConfigurationName,
+            runtimeClasspathConfigurationName: set.runtimeClasspathConfigurationName,
+        ]
+    }
+    [
+        path: project.path,
+        name: project.name,
+        projectDir: project.projectDir.path,
+        buildFile: project.buildFile == null ? null : project.buildFile.path,
+        buildDir: project.layout.buildDirectory.get().asFile.path,
+        plugins: [
+            java: project.plugins.hasPlugin('java'),
+            kotlin: project.plugins.hasPlugin('org.jetbrains.kotlin.jvm'),
+        ],
+        sourceSets: sets,
+        dependencies: dependencyTreesOf(project, sets, problems),
+        problems: problems,
+    ]
+}
+
+
+allprojects { project ->
+    project.tasks.register('ideModel') {
+        group = 'ide'
+        doNotTrackState('The model is written on every request')
+        doLast {
+            def directory = new File(project.property('ide.model.out').toString())
+            directory.mkdirs()
+            def name = project.path == ':' ? 'root' : project.path.substring(1).replace(':', '.')
+            def model = [
+                schema: 1,
+                tool: 'gradle',
+                toolVersion: project.gradle.gradleVersion,
+                javaVersion: System.getProperty('java.version'),
+                project: describe(project),
+            ]
+            new File(directory, "${name}.json").setText(JsonOutput.toJson(model), 'UTF-8')
+        }
+    }
+}

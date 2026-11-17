@@ -1,0 +1,11 @@
+[package]
+name = "syntax"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lang-api.workspace = true
+streaming-iterator.workspace = true
+text-core = { path = "../text-core" }
+tree-sitter.workspace = true

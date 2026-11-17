@@ -1,0 +1,11 @@
+[package]
+name = "display-map"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+text-core = { path = "../text-core" }
+
+[dev-dependencies]
+proptest.workspace = true

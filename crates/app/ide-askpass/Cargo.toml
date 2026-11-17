@@ -1,0 +1,8 @@
+[package]
+name = "ide-askpass"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+vcs.workspace = true

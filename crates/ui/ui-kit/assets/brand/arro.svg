@@ -1,0 +1,6 @@
+<!-- Arro logo, own drawing: an orange dart-shaped arrowhead and a text caret on a dark square. -->
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="256" height="256" rx="58" fill="#1F1F23"/>
+<path d="M48 70L152 128L48 186L84 128Z" fill="#EA580C" stroke="#EA580C" stroke-width="8" stroke-linejoin="round"/>
+<rect x="182" y="50" width="18" height="156" rx="9" fill="#FFFFFF"/>
+</svg>

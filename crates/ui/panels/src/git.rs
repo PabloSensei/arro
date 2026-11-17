@@ -1,0 +1,2979 @@
+//! Git in the window. The status of the repository is kept up to date in the background:
+//! colours for the project tree, marks for the gutter of open editors, the branch in the
+//! status bar. The actions behind the keys live here too, and every call to git runs off the
+//! UI thread.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use editor_view::{EditorView, GutterKind, GutterMark};
+use ui_kit::*;
+use vcs::{
+    BlameLine, Change, CommitOptions, CommitRequest, ConflictSide, FileStatus, GitRunner, Hunk,
+    LineChangeKind, Operation, RebasePlan, RebaseReport, RefKind, Repository, ResetMode,
+    RootsUpdate, Stash, Status, UpdateMode, UpdateReport,
+};
+use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
+
+use crate::conflict::ConflictView;
+use crate::project::ActiveProjectPanel;
+use crate::prompt::Prompt;
+
+/// The Git of the settings: the configured program, or the one on `PATH`.
+pub(crate) fn configured_git(settings: &Settings) -> Option<GitRunner> {
+    let path = settings.git_path.trim();
+    if path.is_empty() {
+        GitRunner::from_env()
+    } else {
+        Some(GitRunner::new(PathBuf::from(path)))
+    }
+}
+
+/// How Update Project brings the upstream in, as the settings page chose.
+pub(crate) fn update_mode(settings: &Settings) -> UpdateMode {
+    match settings.git_update_method {
+        workspace::GitUpdateMethod::Merge => UpdateMode::Merge,
+        workspace::GitUpdateMethod::Rebase => UpdateMode::Rebase,
+    }
+}
+
+/// Whether git refused a push because the branch is behind its remote.
+fn push_rejected(error: &std::io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("rejected") || text.contains("non-fast-forward") || text.contains("fetch first")
+}
+
+/// The text of an editor changed: the marks of the gutter and of the scroll bar of every
+/// open editor follow its buffer, saved or not.
+pub(crate) fn editor_changed(view: &Entity<EditorView>, cx: &mut App) {
+    let Some(git) = cx.try_global::<ActiveGit>() else {
+        return;
+    };
+    let git = git.0.clone();
+    let view = view.clone();
+    git.update(cx, |git, cx| git.text_changed(view, cx));
+}
+
+/// A command that puts the branch of the last Delete back.
+pub const RESTORE_BRANCH_COMMAND: &str = "git.restore_deleted_branch";
+
+/// The command of the button a rebase stopped for an edit shows: it continues the rebase
+/// with the message git wrote.
+pub const CONTINUE_REBASE_COMMAND: &str = "git.rebase_continue";
+
+/// The command of the gutter menu that puts the blame of a file before its text, and the
+/// one that takes the column away.
+pub const ANNOTATE_COMMAND: &str = "git.annotate";
+pub const CLOSE_ANNOTATIONS_COMMAND: &str = "git.close_annotations";
+
+/// A change on disk waits for this long, so a save of many files is one read of the status.
+const DEBOUNCE: Duration = Duration::from_millis(300);
+/// An edit waits for this long before the hunks of the buffer are read again, so typing
+/// one line is one diff of the file.
+const MARKS_DEBOUNCE: Duration = Duration::from_millis(200);
+/// The pointer stays off the window of a change this long before it closes, so that a
+/// move from the gutter into the window does not close it on the way.
+const POPUP_CLOSE_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Modified,
+    Added,
+    Deleted,
+    Conflicted,
+    Untracked,
+}
+
+impl Kind {
+    pub fn of(file: &FileStatus) -> Self {
+        let sides = [file.index, file.worktree];
+        if sides.contains(&Change::Conflicted) {
+            Self::Conflicted
+        } else if file.worktree == Change::Untracked {
+            Self::Untracked
+        } else if file.index == Change::Added {
+            Self::Added
+        } else if sides.contains(&Change::Deleted) {
+            Self::Deleted
+        } else {
+            Self::Modified
+        }
+    }
+
+    /// The colour of a file name in the tree and of a mark in the gutter.
+    pub fn color(self, theme: &Theme) -> Hsla {
+        match self {
+            Self::Modified => theme.info,
+            Self::Added => theme.success,
+            Self::Deleted => theme.text_muted,
+            Self::Conflicted => theme.error,
+            Self::Untracked => theme.accent,
+        }
+    }
+}
+
+/// One root of the project: the repository itself, or a submodule with its own.
+#[derive(Clone)]
+struct GitRoot {
+    /// The path of the root inside the project, empty for the project itself.
+    prefix: String,
+    repo: Arc<Repository>,
+    status: Status,
+}
+
+/// The repository of the project and what is known about it. `None` repository: not a
+/// Git project, and everything here stays quiet.
+pub struct GitState {
+    repo: Option<Arc<Repository>>,
+    /// The project and its checked-out submodules, the project first.
+    roots: Vec<GitRoot>,
+    status: Status,
+    kinds: HashMap<PathBuf, Kind>,
+    folders: HashSet<PathBuf>,
+    /// The commit the parent records for a submodule and the one its working tree has.
+    pointers: HashMap<String, (Option<String>, Option<String>)>,
+    workspace: WeakEntity<Workspace>,
+    refreshing: bool,
+    /// What is going on that the user waits for, shown by the commit window.
+    busy: Option<&'static str>,
+    /// The last failure of an action, for the commit window and scripts.
+    last_error: Option<String>,
+    /// A merge or a rebase git waits to end.
+    operation: Operation,
+    /// Git holds local changes and puts them back when the operation ends.
+    autostash: bool,
+    /// The message a merge commit starts with.
+    merge_message: String,
+    /// The conflicted files whose bytes are not text, by path relative to the root: Merge
+    /// has three versions to show only for a text file.
+    binary_conflicts: HashSet<String>,
+    /// The branches the user left, newest first, as the Recent section of the popup lists
+    /// them.
+    recent: Vec<String>,
+    /// The branch the last Delete took away, and its commit, for Restore.
+    last_deleted: Option<(String, String)>,
+    /// The window the actions open popups in; set when the keys are bound.
+    window: Option<AnyWindowHandle>,
+    /// Whether the window is in front. A change behind it only marks the status stale.
+    active: bool,
+    /// A change on disk has not reached the status yet.
+    stale: bool,
+    /// A read waits for the debounce to pass; further changes need no second read.
+    scheduled: bool,
+    /// How many commands have finished, so a view such as the log reloads after each of
+    /// them even when HEAD does not move.
+    revision: u64,
+    /// The window of a change the user opened, dead after its close.
+    popup: Option<WeakEntity<crate::hunk_popup::HunkPopup>>,
+    /// The change mark under the pointer and whether the pointer is over the window of
+    /// a change, for the open and the close of that window.
+    hovered_mark: Option<(PathBuf, u32)>,
+    popup_hovered: bool,
+    hover_serial: u64,
+    hover_task: Option<Task<()>>,
+    close_task: Option<Task<()>>,
+    /// The editors whose text changed and the marks have not been read for them yet.
+    pending_marks: HashMap<PathBuf, Entity<EditorView>>,
+    marks_task: Option<Task<()>>,
+}
+
+pub struct ActiveGit(pub Entity<GitState>);
+
+impl Global for ActiveGit {}
+
+/// What one background read of the repository brought back.
+struct Refreshed {
+    status: Result<Status, String>,
+    roots: Vec<GitRoot>,
+    pointers: HashMap<String, (Option<String>, Option<String>)>,
+    hunks: HashMap<PathBuf, Vec<Hunk>>,
+    /// The blame of every editor that shows the column, with the messages of its commits.
+    blames: HashMap<PathBuf, (Vec<BlameLine>, HashMap<String, String>)>,
+    operation: Operation,
+    autostash: bool,
+    merge_message: String,
+    binary_conflicts: HashSet<String>,
+    /// The path of the file the active editor shows, for the branch of its root.
+    active: Option<PathBuf>,
+}
+
+impl GitState {
+    pub fn create(root: PathBuf, workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<Self> {
+        let git = cx.new(|_| Self {
+            repo: None,
+            roots: Vec::new(),
+            status: Status::default(),
+            kinds: HashMap::new(),
+            folders: HashSet::new(),
+            pointers: HashMap::new(),
+            workspace,
+            refreshing: false,
+            busy: None,
+            last_error: None,
+            operation: Operation::None,
+            autostash: false,
+            merge_message: String::new(),
+            binary_conflicts: HashSet::new(),
+            recent: Vec::new(),
+            last_deleted: None,
+            window: None,
+            active: true,
+            stale: false,
+            scheduled: false,
+            revision: 0,
+            popup: None,
+            hovered_mark: None,
+            popup_hovered: false,
+            hover_serial: 0,
+            hover_task: None,
+            close_task: None,
+            pending_marks: HashMap::new(),
+            marks_task: None,
+        });
+        let configured = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let found = cx.background_executor().spawn(async move {
+            let git = configured_git(&configured)?;
+            Repository::open(git, &root).ok().map(Arc::new)
+        });
+        let weak = git.downgrade();
+        cx.spawn(async move |cx| {
+            let repo = found.await;
+            weak.update(cx, |this, cx| {
+                this.roots = repo
+                    .as_ref()
+                    .map(|repo| {
+                        vec![GitRoot {
+                            prefix: String::new(),
+                            repo: repo.clone(),
+                            status: Status::default(),
+                        }]
+                    })
+                    .unwrap_or_default();
+                this.repo = repo;
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+        git
+    }
+
+    pub fn repo(&self) -> Option<Arc<Repository>> {
+        self.repo.clone()
+    }
+
+    /// The roots of the project: the prefix inside the project and the name of the root.
+    /// The project itself is empty-prefixed and first.
+    pub fn roots(&self) -> Vec<(String, String)> {
+        self.roots
+            .iter()
+            .map(|root| (root.prefix.clone(), self.root_label(&root.prefix)))
+            .collect()
+    }
+
+    /// The name of a root: the folder of the project, or the path of the submodule.
+    pub fn root_label(&self, prefix: &str) -> String {
+        if !prefix.is_empty() {
+            return prefix.to_owned();
+        }
+        self.repo
+            .as_ref()
+            .and_then(|repo| repo.root().file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Project".to_owned())
+    }
+
+    /// The prefix of the root a relative path belongs to, empty for the project itself.
+    pub fn root_of(&self, relative: &str) -> String {
+        self.roots
+            .iter()
+            .filter(|root| {
+                root.prefix.is_empty()
+                    || relative == root.prefix
+                    || relative.starts_with(&format!("{}/", root.prefix))
+            })
+            .max_by_key(|root| root.prefix.len())
+            .map(|root| root.prefix.clone())
+            .unwrap_or_default()
+    }
+
+    /// The repository of the root a relative path belongs to.
+    pub fn repo_of(&self, relative: &str) -> Option<Arc<Repository>> {
+        let prefix = self.root_of(relative);
+        self.roots
+            .iter()
+            .find(|root| root.prefix == prefix)
+            .map(|root| root.repo.clone())
+            .or_else(|| self.repo.clone())
+    }
+
+    /// The recorded and working commits of a changed submodule pointer.
+    pub fn pointer(&self, path: &str) -> Option<&(Option<String>, Option<String>)> {
+        self.pointers.get(path)
+    }
+
+    pub fn status(&self) -> &Status {
+        &self.status
+    }
+
+    /// Whether a read of the repository is on its way, for the tests of the idle window.
+    #[cfg(test)]
+    pub(crate) fn refreshing(&self) -> bool {
+        self.refreshing
+    }
+
+    /// Where a popup of a Git key goes: the caret, the selected tree row, or the pointer.
+    fn popup_anchor(&self, window: &Window, cx: &App) -> Point<Pixels> {
+        self.workspace.upgrade().map_or_else(
+            || window.mouse_position(),
+            |workspace| {
+                let workspace = workspace.read(cx);
+                if let Some(anchor) = workspace.take_action_menu_anchor() {
+                    return point(
+                        anchor.left(),
+                        anchor.bottom() + px(ui_kit::metrics::SPACE_XS),
+                    );
+                }
+                crate::commands::popup_anchor(workspace, window, cx)
+            },
+        )
+    }
+
+    /// The place under the branch name of the title bar, where IDEA opens the branch popup
+    /// from the menu of VCS. None while the title bar has not been drawn yet.
+    fn title_branch_position(&self, cx: &App) -> Option<Point<Pixels>> {
+        let workspace = self.workspace.upgrade()?;
+        let anchor = workspace.read(cx).title_branch_bounds()?;
+        Some(point(
+            anchor.left(),
+            anchor.bottom() + px(ui_kit::metrics::SPACE_XS),
+        ))
+    }
+
+    pub fn busy(&self) -> Option<&'static str> {
+        self.busy
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    pub fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    /// How many git commands the state has finished, for the views that reload after an
+    /// operation which leaves HEAD in place, such as New Tag.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Whether the index or the working tree differs from the last commit, so that a
+    /// reset can tell the user what Hard throws away.
+    pub fn has_local_changes(&self) -> bool {
+        !self.status.files.is_empty()
+    }
+
+    /// The status bar line of the root the active file belongs to.
+    fn branch_label(
+        &self,
+        active: Option<&Path>,
+        operation: Operation,
+        autostash: bool,
+    ) -> Option<String> {
+        let relative = active
+            .and_then(|path| {
+                self.repo
+                    .as_ref()
+                    .map(|repo| relative_of(repo.root(), path))
+            })
+            .unwrap_or_default();
+        let prefix = self.root_of(&relative);
+        let status = self
+            .roots
+            .iter()
+            .find(|root| root.prefix == prefix)
+            .map(|root| &root.status)
+            .unwrap_or(&self.status);
+        branch_label(status, operation, autostash)
+    }
+
+    /// Git holds local changes it puts back when the operation ends.
+    pub fn autostash(&self) -> bool {
+        self.autostash
+    }
+
+    pub fn merge_message(&self) -> &str {
+        &self.merge_message
+    }
+
+    /// The files git left in conflict.
+    pub fn conflicts(&self) -> Vec<String> {
+        self.status
+            .files
+            .iter()
+            .filter(|file| file.index == Change::Conflicted || file.worktree == Change::Conflicted)
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    /// Whether Merge can show the three versions of a conflict: a binary file has no text
+    /// to split into chunks, so only the two sides can be taken.
+    pub fn merge_available(&self, path: &str) -> bool {
+        !self.binary_conflicts.contains(path)
+    }
+
+    pub fn kind_of(&self, path: &Path) -> Option<Kind> {
+        match self.kinds.get(path) {
+            Some(kind) => Some(*kind),
+            None => self.folders.contains(path).then_some(Kind::Modified),
+        }
+    }
+
+    /// Absolute path of a file of the status.
+    pub fn absolute(&self, relative: &str) -> Option<PathBuf> {
+        Some(self.repo.as_ref()?.root().join(relative))
+    }
+
+    /// A file of the working tree or of the repository metadata changed. The read waits
+    /// for the debounce, and a window in the background only marks the status stale.
+    pub fn repository_changed(&mut self, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            return;
+        }
+        if !self.active {
+            self.stale = true;
+            return;
+        }
+        self.schedule(cx);
+    }
+
+    /// The tab of another file became active: the status bar shows the branch of the
+    /// root that file belongs to.
+    pub fn active_editor_changed(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.roots.len() < 2 {
+            return;
+        }
+        let branch = self.branch_label(Some(path), self.operation, self.autostash);
+        let workspace = self.workspace.clone();
+        // A tab becomes active while the window is being updated: the status bar waits
+        // for the end of that update.
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| workspace.set_branch(branch, cx))
+                .ok();
+        });
+    }
+
+    /// The window came to the front or went behind another one.
+    pub fn window_activation(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        // Whatever happened while the window was behind another one is read once, now.
+        if active {
+            self.stale = false;
+            self.refresh(cx);
+        }
+    }
+
+    fn schedule(&mut self, cx: &mut Context<Self>) {
+        if self.scheduled {
+            return;
+        }
+        self.scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.scheduled = false;
+                if !this.active {
+                    this.stale = true;
+                    return;
+                }
+                this.stale = false;
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reads the status and the diffs of the open editors, off the UI thread.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if self.refreshing {
+            // A read that is running already sees most of this change; one more follows.
+            self.stale = true;
+            return;
+        }
+        self.refreshing = true;
+        let editors = self.editors(cx);
+        let active = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_editor())
+            .ok()
+            .flatten()
+            .map(|(path, _)| path);
+        let inputs: Vec<(PathBuf, String)> = editors
+            .iter()
+            .filter_map(|(path, view)| Some((path.clone(), view.read(cx).text()?)))
+            .collect();
+        let annotated: Vec<PathBuf> = editors
+            .iter()
+            .filter(|(_, view)| view.read(cx).has_annotations())
+            .map(|(path, _)| path.clone())
+            .collect();
+        let job = cx.background_executor().spawn(async move {
+            let mut roots = vec![(String::new(), repo.clone())];
+            if let Ok(submodules) = repo.submodules() {
+                for submodule in submodules {
+                    if submodule.state == vcs::SubmoduleState::Uninitialized {
+                        continue;
+                    }
+                    if let Ok(repository) =
+                        Repository::open(repo.git().clone(), &repo.root().join(&submodule.path))
+                    {
+                        roots.push((submodule.path, Arc::new(repository)));
+                    }
+                }
+            }
+            let mut read = Vec::new();
+            let mut combined: Option<Status> = None;
+            let mut failure = None;
+            for (prefix, repository) in roots {
+                match repository.status() {
+                    Ok(status) => {
+                        match &mut combined {
+                            Some(all) => combine_status(all, &prefix, &status),
+                            None => combined = Some(status.clone()),
+                        }
+                        read.push(GitRoot {
+                            prefix,
+                            repo: repository,
+                            status,
+                        });
+                    }
+                    Err(error) if prefix.is_empty() => failure = Some(error.to_string()),
+                    Err(_) => {}
+                }
+            }
+            let status = match failure {
+                Some(message) => Err(message),
+                None => combined.ok_or_else(|| "no repository".to_string()),
+            };
+            let mut pointers = HashMap::new();
+            if let Ok(all) = &status {
+                for root in &read {
+                    if root.prefix.is_empty() {
+                        continue;
+                    }
+                    if all.files.iter().any(|file| file.path == root.prefix)
+                        && let Ok(Some(pointer)) = repo.submodule_pointer(&root.prefix)
+                    {
+                        pointers.insert(root.prefix.clone(), pointer);
+                    }
+                }
+            }
+            let operation = repo.operation().unwrap_or_default();
+            let autostash = operation != Operation::None && repo.autostash().unwrap_or(false);
+            let merge_message = match operation {
+                Operation::Merge => repo.merge_message().unwrap_or_default(),
+                _ => String::new(),
+            };
+            let mut hunks = HashMap::new();
+            let mut blames = HashMap::new();
+            let mut readers: HashMap<String, vcs::BlobReader> = HashMap::new();
+            for (path, text) in inputs {
+                let relative = relative_of(repo.root(), &path);
+                let root = read
+                    .iter()
+                    .filter(|root| {
+                        root.prefix.is_empty()
+                            || relative == root.prefix
+                            || relative.starts_with(&format!("{}/", root.prefix))
+                    })
+                    .max_by_key(|root| root.prefix.len());
+                let Some(root) = root else {
+                    continue;
+                };
+                let relative = relative_of(root.repo.root(), &path);
+                if !readers.contains_key(&root.prefix)
+                    && let Ok(reader) = root.repo.blobs()
+                {
+                    readers.insert(root.prefix.clone(), reader);
+                }
+                let Some(reader) = readers.get_mut(&root.prefix) else {
+                    continue;
+                };
+                if let Ok(diff) = root.repo.file_diff(reader, &relative, &text) {
+                    hunks.insert(path, diff.hunks);
+                }
+            }
+            for path in annotated {
+                let relative = relative_of(repo.root(), &path);
+                let root = read
+                    .iter()
+                    .filter(|root| {
+                        root.prefix.is_empty()
+                            || relative == root.prefix
+                            || relative.starts_with(&format!("{}/", root.prefix))
+                    })
+                    .max_by_key(|root| root.prefix.len());
+                let Some(root) = root else {
+                    continue;
+                };
+                let relative = relative_of(root.repo.root(), &path);
+                if let Ok(lines) = root.repo.blame(&relative) {
+                    let messages = messages_of(&root.repo, &lines);
+                    blames.insert(path, (lines, messages));
+                }
+            }
+            // A binary file has no three texts to merge: the row keeps only the two sides.
+            let binary_conflicts = match &status {
+                Ok(status) => status
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        file.index == Change::Conflicted || file.worktree == Change::Conflicted
+                    })
+                    .filter(|file| {
+                        text_core::read_file(&repo.root().join(&file.path))
+                            .is_ok_and(|decoded| !decoded.lossless)
+                    })
+                    .map(|file| file.path.clone())
+                    .collect(),
+                Err(_) => HashSet::new(),
+            };
+            Refreshed {
+                status,
+                roots: read,
+                pointers,
+                hunks,
+                blames,
+                operation,
+                autostash,
+                merge_message,
+                binary_conflicts,
+                active,
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let refreshed = job.await;
+            this.update(cx, |this, cx| {
+                this.refreshing = false;
+                this.apply(refreshed, editors, cx);
+                if this.stale && this.active {
+                    this.stale = false;
+                    this.schedule(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn editors(&self, cx: &mut Context<Self>) -> Vec<(PathBuf, Entity<EditorView>)> {
+        let open = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.open_editors())
+            .unwrap_or_default();
+        open.into_iter()
+            .filter_map(|(path, view)| Some((path, view.downcast::<EditorView>().ok()?)))
+            .collect()
+    }
+
+    fn apply(
+        &mut self,
+        refreshed: Refreshed,
+        editors: Vec<(PathBuf, Entity<EditorView>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Refreshed {
+            status,
+            roots,
+            pointers,
+            hunks,
+            blames,
+            operation,
+            autostash,
+            merge_message,
+            binary_conflicts,
+            active,
+        } = refreshed;
+        let theme = *cx.global::<Theme>();
+        self.binary_conflicts = binary_conflicts;
+        self.roots = roots;
+        self.pointers = pointers;
+        match status {
+            Ok(status) => {
+                if status != self.status
+                    || operation != self.operation
+                    || autostash != self.autostash
+                {
+                    let branch = self.branch_label(active.as_deref(), operation, autostash);
+                    self.set_status(status);
+                    self.operation = operation;
+                    self.autostash = autostash;
+                    self.merge_message = merge_message;
+                    self.workspace
+                        .update(cx, |workspace, cx| workspace.set_branch(branch, cx))
+                        .ok();
+                    cx.notify();
+                }
+            }
+            Err(message) => self.last_error = Some(message),
+        }
+        for (path, view) in editors {
+            if let Some((lines, messages)) = blames.get(&path) {
+                let notes = crate::annotate::notes(lines, messages);
+                view.update(cx, |view, cx| view.set_annotations(&notes, cx));
+            }
+            let marks = hunks.get(&path).map(|hunks| marks_of(hunks, &theme));
+            if let Some(marks) = marks {
+                view.update(cx, |view, cx| view.set_gutter_marks(marks, cx));
+            }
+        }
+    }
+
+    fn set_status(&mut self, status: Status) {
+        let root = self
+            .repo
+            .as_ref()
+            .map(|repo| repo.root().to_path_buf())
+            .unwrap_or_default();
+        self.kinds.clear();
+        self.folders.clear();
+        for file in &status.files {
+            let path = root.join(&file.path);
+            let kind = Kind::of(file);
+            for parent in path.ancestors().skip(1) {
+                if parent.starts_with(&root) {
+                    self.folders.insert(parent.to_path_buf());
+                }
+            }
+            self.kinds.insert(path, kind);
+        }
+        self.status = status;
+    }
+
+    pub fn report(&mut self, title: &str, message: String, cx: &mut Context<Self>) {
+        self.last_error = Some(message.clone());
+        let title = title.to_string();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user(title, message, cx)
+            })
+            .ok();
+    }
+
+    /// Runs `work` off the UI thread, then refreshes and lets `done` look at the result.
+    pub fn run<T: Send + 'static>(
+        &mut self,
+        what: &'static str,
+        work: impl FnOnce(&Repository) -> std::io::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if self.busy.is_some() {
+            self.report(
+                "Git",
+                format!("Still busy: {}", self.busy.unwrap_or("")),
+                cx,
+            );
+            return;
+        }
+        self.busy = Some(what);
+        self.last_error = None;
+        cx.notify();
+        let job = cx
+            .background_executor()
+            .spawn(async move { work(&repo).map_err(|error| error.to_string()) });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                this.busy = None;
+                match result {
+                    Ok(value) => done(this, value, cx),
+                    Err(message) => this.report(what, message, cx),
+                }
+                this.revision = this.revision.wrapping_add(1);
+                this.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Commits the chosen files of every root, one commit per root with the same message,
+    /// as the Commit window does for a project with submodules.
+    pub fn commit_roots(
+        &mut self,
+        request: CommitRequest,
+        options: CommitOptions,
+        push: bool,
+        done: impl FnOnce(&mut Self, Vec<String>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.repo.is_none() {
+            return;
+        }
+        if self.busy.is_some() {
+            self.report(
+                "Commit",
+                format!("Still busy: {}", self.busy.unwrap_or("")),
+                cx,
+            );
+            return;
+        }
+        let mut groups = Vec::new();
+        let mut order: Vec<&GitRoot> = self.roots.iter().collect();
+        // Submodules go first, the deepest before its parent: the commit of the parent
+        // records their new commits.
+        order.sort_by_key(|root| std::cmp::Reverse(root.prefix.len()));
+        for root in order {
+            let mut paths = Vec::new();
+            for path in &request.paths {
+                if root.prefix.is_empty() {
+                    // The project takes its own files and the pointers of its submodules.
+                    if self.root_of(path).is_empty()
+                        || self.roots.iter().any(|other| other.prefix == *path)
+                    {
+                        paths.push(path.clone());
+                    }
+                } else if path != &root.prefix
+                    && path.strip_prefix(&format!("{}/", root.prefix)).is_some()
+                {
+                    paths.push(
+                        path.strip_prefix(&format!("{}/", root.prefix))
+                            .unwrap_or(path)
+                            .to_owned(),
+                    );
+                }
+            }
+            if !paths.is_empty() {
+                groups.push((root.repo.clone(), paths));
+            }
+        }
+        if groups.is_empty() {
+            self.report("Commit", "Tick at least one file".to_string(), cx);
+            return;
+        }
+        let message = request.message.clone();
+        let amend = request.amend;
+        self.busy = Some("Commit");
+        self.last_error = None;
+        cx.notify();
+        let job = cx.background_executor().spawn(async move {
+            let mut ids = Vec::new();
+            for (repo, paths) in groups {
+                let request = CommitRequest {
+                    message: message.clone(),
+                    paths,
+                    amend,
+                };
+                let id = repo.commit_with(&request, &options)?;
+                if push {
+                    repo.push()?;
+                }
+                ids.push(id);
+            }
+            Ok::<_, std::io::Error>(ids)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                this.busy = None;
+                match result {
+                    Ok(ids) => {
+                        let done_ids = ids.clone();
+                        done(this, ids, cx);
+                        let short: Vec<String> =
+                            done_ids.iter().map(|id| short_commit(id)).collect();
+                        if short.len() > 1 {
+                            this.tell(
+                                "Commit",
+                                format!("Committed each root: {}", short.join(", ")),
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => this.report("Commit", error.to_string(), cx),
+                }
+                this.revision = this.revision.wrapping_add(1);
+                this.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The files changed on disk behind the back of the editors and the tree.
+    pub fn reload_everything(&mut self, cx: &mut Context<Self>) {
+        self.reload_all(false, cx);
+    }
+
+    /// Reads every open file from disk, even one that had edits, as Reload from Disk.
+    pub fn reload_everything_from_disk(&mut self, cx: &mut Context<Self>) {
+        self.reload_all(true, cx);
+    }
+
+    fn reload_all(&mut self, forced: bool, cx: &mut Context<Self>) {
+        for (_, view) in self.editors(cx) {
+            view.update(cx, |view, cx| {
+                if forced {
+                    view.reload_from_disk(cx);
+                } else {
+                    view.reload(cx);
+                }
+            });
+        }
+        if let Some(panel) = cx.try_global::<ActiveProjectPanel>().map(|p| p.0.clone()) {
+            panel.update(cx, |panel, cx| panel.reload(cx));
+        }
+    }
+
+    /// Writes the open files before a git command that reads the working tree.
+    fn save_open_files(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let mut paths: Vec<PathBuf> = self.editors(cx).into_iter().map(|(path, _)| path).collect();
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.save_editor_now(&path, cx))
+                .unwrap_or_else(|_| Err("the window is gone".to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn push(&mut self, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Push", message, cx);
+            return;
+        }
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let auto = settings.git_auto_update_on_reject;
+        let mode = update_mode(&settings);
+        self.run(
+            "Push",
+            move |repo| {
+                let first = repo.push();
+                if !auto {
+                    return first;
+                }
+                match first {
+                    Err(error) if push_rejected(&error) => {
+                        repo.update_with(mode)?;
+                        repo.push()
+                    }
+                    other => other,
+                }
+            },
+            |this, (), cx| this.tell("Push", "Pushed to the remote", cx),
+            cx,
+        );
+    }
+
+    /// Fetch without merging; the status and the ahead/behind counts follow.
+    pub fn fetch(&mut self, cx: &mut Context<Self>) {
+        self.run(
+            "Fetch",
+            |repo| repo.fetch(),
+            |this, (), cx| this.tell("Fetch", "Fetched from the remote", cx),
+            cx,
+        );
+    }
+
+    pub fn stash(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Stash", message, cx);
+            return;
+        }
+        let shown = message.clone();
+        self.run(
+            "Stash",
+            move |repo| repo.stash_push(&message),
+            move |this, (), cx| {
+                this.reload_everything_from_disk(cx);
+                this.tell("Stash", format!("Stashed: {shown}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// The stashes as a menu at `position`: Apply and Pop each one, Drop asks first.
+    pub fn show_stashes(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let job = cx
+            .background_executor()
+            .spawn(async move { repo.stash_list().map_err(|error| error.to_string()) });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| match result {
+                Ok(stashes) => this.stash_menu(stashes, position, cx),
+                Err(message) => this.report("Unstash", message, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn stash_menu(&mut self, stashes: Vec<Stash>, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let me = cx.weak_entity();
+        let mut entries = Vec::new();
+        if stashes.is_empty() {
+            entries.push(MenuEntry::disabled("No stashes"));
+        }
+        for stash in stashes {
+            let label = format!("stash@{{{}}}: {}", stash.index, stash.message);
+            entries.push(MenuEntry::disabled(label));
+            for (text, pop) in [("Apply", false), ("Pop", true)] {
+                let me = me.clone();
+                let index = stash.index;
+                entries.push(
+                    MenuEntry::new(format!("    {text} stash@{{{index}}}"), move |_, cx| {
+                        me.update(cx, |this, cx| this.apply_stash(index, pop, cx))
+                            .ok();
+                    })
+                    .icon("general/vcs"),
+                );
+            }
+            let me = me.clone();
+            let index = stash.index;
+            entries.push(
+                MenuEntry::new(format!("    Drop stash@{{{index}}}"), move |window, cx| {
+                    let state = me.clone();
+                    let question = format!("Drop stash@{{{index}}}?");
+                    me.update(cx, |this, cx| {
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                Prompt::ask(
+                                    "Drop Stash",
+                                    &question,
+                                    move |cx| {
+                                        state
+                                            .update(cx, |this, cx| this.drop_stash(index, cx))
+                                            .ok();
+                                    },
+                                    workspace,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    })
+                    .ok();
+                })
+                .icon("general/delete"),
+            );
+            entries.push(MenuEntry::separator());
+        }
+        if entries.last().is_some_and(|entry| entry.label.is_empty()) {
+            entries.pop();
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
+    }
+
+    pub fn apply_stash(&mut self, index: usize, pop: bool, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Unstash", message, cx);
+            return;
+        }
+        let what = if pop { "Pop stash" } else { "Apply stash" };
+        self.run(
+            what,
+            move |repo| {
+                if pop {
+                    repo.stash_pop(index)
+                } else {
+                    repo.stash_apply(index)
+                }
+            },
+            move |this, (), cx| {
+                this.reload_everything_from_disk(cx);
+                let text = if pop {
+                    format!("Popped stash@{{{index}}}")
+                } else {
+                    format!("Applied stash@{{{index}}}")
+                };
+                this.tell("Unstash", text, cx);
+            },
+            cx,
+        );
+    }
+
+    pub fn drop_stash(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.run(
+            "Drop stash",
+            move |repo| repo.stash_drop(index),
+            move |this, (), cx| this.tell("Unstash", format!("Dropped stash@{{{index}}}"), cx),
+            cx,
+        );
+    }
+
+    /// Ctrl+T: fetch, then merge, or ask Merge or Rebase when the branch has diverged.
+    pub fn update_project(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Update", message, cx);
+            return;
+        }
+        self.run(
+            "Fetch",
+            |repo| {
+                repo.fetch()?;
+                repo.status()
+            },
+            move |this, status, cx| {
+                let settings = cx.global::<Settings>().clone();
+                let mode = update_mode(&settings);
+                let diverged = status.upstream.is_some() && status.ahead > 0 && status.behind > 0;
+                // A rebase is the answer of the page: the divergence needs no question.
+                if diverged && mode == UpdateMode::Merge {
+                    this.show_update_choice(position, cx);
+                } else {
+                    this.update_with(mode, cx);
+                }
+            },
+            cx,
+        );
+    }
+
+    pub fn update_with(&mut self, mode: UpdateMode, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Update", message, cx);
+            return;
+        }
+        let submodules = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.git_update_submodules);
+        self.run(
+            "Update",
+            move |repo| repo.update_all(mode, submodules),
+            move |this, update, cx| this.finish_update(update, cx),
+            cx,
+        );
+    }
+
+    fn show_update_choice(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let me = cx.weak_entity();
+        let mut entries = Vec::new();
+        for (label, mode) in [("Merge", UpdateMode::Merge), ("Rebase", UpdateMode::Rebase)] {
+            let me = me.clone();
+            entries.push(
+                MenuEntry::new(label, move |_, cx| {
+                    me.update(cx, |this, cx| this.update_with(mode, cx)).ok();
+                })
+                .icon("general/vcs"),
+            );
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
+    }
+
+    fn finish_update(&mut self, update: RootsUpdate, cx: &mut Context<Self>) {
+        let report = update.report;
+        self.operation = report.operation;
+        self.autostash = report.autostash;
+        self.merge_message = report.merge_message;
+        self.reload_everything_from_disk(cx);
+        if !update.errors.is_empty() {
+            self.report("Update", update.errors.join("\n"), cx);
+        } else if let Some(stash) = &report.stash {
+            self.report("Update", stash_left_message(stash), cx);
+        } else if !report.conflicts.is_empty() {
+            self.tell(
+                "Update",
+                format!("{} file(s) in conflict", report.conflicts.len()),
+                cx,
+            );
+        } else if report.operation == Operation::None {
+            self.tell("Update", "The project is up to date", cx);
+        }
+        if !report.conflicts.is_empty() || report.operation != Operation::None {
+            self.open_conflicts(cx);
+        }
+    }
+
+    /// Opens the Conflicts window, which asks for the rest of a merge or a rebase.
+    pub fn open_conflicts(&mut self, cx: &mut Context<Self>) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            ConflictView::open(git.clone(), workspace, window, cx)
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    }
+
+    /// Ends the operation git waits for: a merge commit with the message, or a rebase.
+    pub fn finish_operation(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Update", message, cx);
+            return;
+        }
+        self.run(
+            "Update",
+            move |repo| repo.finish(&message),
+            |this, stash, cx| {
+                let operation = this.operation;
+                this.reload_everything_from_disk(cx);
+                if operation == Operation::Merge {
+                    this.merge_message.clear();
+                }
+                this.refresh(cx);
+                if let Some(stash) = stash {
+                    this.report("Update", stash_left_message(&stash), cx);
+                } else {
+                    this.tell("Update", "The operation is finished", cx);
+                }
+            },
+            cx,
+        );
+    }
+
+    pub fn abort_operation(&mut self, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Update", message, cx);
+            return;
+        }
+        self.run(
+            "Abort",
+            |repo| repo.abort(),
+            |this, stash, cx| {
+                this.operation = Operation::None;
+                this.autostash = false;
+                this.merge_message.clear();
+                this.reload_everything_from_disk(cx);
+                if let Some(stash) = stash {
+                    this.report("Update", stash_left_message(&stash), cx);
+                } else {
+                    this.tell("Update", "The operation was aborted", cx);
+                }
+            },
+            cx,
+        );
+    }
+
+    pub fn accept_side(&mut self, path: String, side: ConflictSide, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Conflict", message, cx);
+            return;
+        }
+        self.run(
+            "Conflict",
+            move |repo| repo.accept_side(&path, side),
+            |this, (), cx| {
+                this.reload_everything_from_disk(cx);
+                this.refresh(cx);
+            },
+            cx,
+        );
+    }
+
+    pub fn mark_resolved(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Conflict", message, cx);
+            return;
+        }
+        self.run(
+            "Conflict",
+            move |repo| repo.mark_resolved(&path),
+            |this, (), cx| {
+                this.refresh(cx);
+            },
+            cx,
+        );
+    }
+
+    pub fn switch(&mut self, branch: String, cx: &mut Context<Self>) {
+        let name = branch.clone();
+        self.run(
+            "Switch branch",
+            move |repo| repo.switch(&name),
+            move |this, (), cx| {
+                this.remember_recent(&branch);
+                this.reload_everything(cx);
+                this.tell("Branch", format!("Switched to {branch}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// A local branch of a remote one: checkout creates it tracking the remote.
+    pub fn checkout_remote(&mut self, branch: String, cx: &mut Context<Self>) {
+        let name = branch.clone();
+        let local = branch
+            .split_once('/')
+            .map_or_else(|| branch.clone(), |(_, name)| name.to_owned());
+        self.run(
+            "Checkout branch",
+            move |repo| repo.checkout_remote(&name),
+            move |this, (), cx| {
+                this.remember_recent(&local);
+                this.reload_everything(cx);
+                this.tell("Branch", format!("Checked out {branch}"), cx)
+            },
+            cx,
+        );
+    }
+
+    pub fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        self.create_branch_from(name, "HEAD".to_owned(), cx);
+    }
+
+    pub fn create_branch_from(&mut self, name: String, start: String, cx: &mut Context<Self>) {
+        let (made, shown) = (name.clone(), name);
+        self.run(
+            "New branch",
+            move |repo| {
+                repo.create_branch(&made, &start)?;
+                repo.switch(&made)
+            },
+            move |this, (), cx| {
+                this.remember_recent(&shown);
+                this.tell("Branch", format!("Created {shown}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// Checkout Revision of the log: the commit itself, with HEAD detached. Local changes
+    /// git cannot keep are the error of the command, as they are for a branch.
+    pub fn checkout_revision(&mut self, commit: String, cx: &mut Context<Self>) {
+        let short = short_commit(&commit);
+        self.run(
+            "Checkout Revision",
+            move |repo| repo.checkout_commit(&commit),
+            move |this, (), cx| {
+                this.reload_everything(cx);
+                this.tell("Checkout", format!("Checked out revision {short}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// New Branch of the log: the name and whether the branch is checked out, as the
+    /// dialog of IDEA asks.
+    pub fn ask_branch_at_commit(
+        &mut self,
+        start: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show_with_option(
+                    "New Branch",
+                    "Branch name",
+                    "Checkout branch",
+                    true,
+                    move |name, checkout, cx| {
+                        let start = start.clone();
+                        me.update(cx, |this, cx| {
+                            this.create_branch_at(name, start, checkout, cx)
+                        })
+                        .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    fn create_branch_at(
+        &mut self,
+        name: String,
+        start: String,
+        checkout: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = name.clone();
+        self.run(
+            "New branch",
+            move |repo| repo.branch_from(&name, &start, checkout),
+            move |this, (), cx| {
+                if checkout {
+                    this.remember_recent(&shown);
+                    this.tell("Branch", format!("Created and checked out {shown}"), cx);
+                } else {
+                    this.tell("Branch", format!("Created {shown}"), cx);
+                }
+            },
+            cx,
+        );
+    }
+
+    /// New Tag of the log: the name of the tag at the chosen commit.
+    pub fn ask_tag_at_commit(
+        &mut self,
+        commit: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show(
+                    "New Tag",
+                    "Tag name",
+                    move |name, cx| {
+                        let commit = commit.clone();
+                        me.update(cx, |this, cx| this.create_tag(name, commit, cx))
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    fn create_tag(&mut self, name: String, commit: String, cx: &mut Context<Self>) {
+        let shown = name.clone();
+        self.run(
+            "New Tag",
+            move |repo| repo.create_tag(&name, &commit),
+            move |this, (), cx| this.tell("Tag", format!("Created tag {shown}"), cx),
+            cx,
+        );
+    }
+
+    /// Cherry-Pick of the log: the commit on the current branch. A conflict opens the
+    /// Conflicts window, which continues or aborts the operation.
+    pub fn cherry_pick(&mut self, commit: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Cherry-Pick", message, cx);
+            return;
+        }
+        let short = short_commit(&commit);
+        self.run(
+            "Cherry-Pick",
+            move |repo| repo.cherry_pick(std::slice::from_ref(&commit)),
+            move |this, report, cx| {
+                this.finish_branch_update(
+                    report,
+                    "Cherry-Pick",
+                    format!("Cherry-picked {short}"),
+                    cx,
+                )
+            },
+            cx,
+        );
+    }
+
+    /// Revert Commit of the log: an opposite commit on the current branch. A conflict
+    /// opens the Conflicts window, as a merge does.
+    pub fn revert_commit(&mut self, commit: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Revert", message, cx);
+            return;
+        }
+        let short = short_commit(&commit);
+        self.run(
+            "Revert",
+            move |repo| repo.revert_commit(&commit),
+            move |this, report, cx| {
+                this.finish_branch_update(report, "Revert", format!("Reverted {short}"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// Reset Current Branch to Here: the branch moves to the commit, keeping or throwing
+    /// the local changes away as the dialog chose.
+    pub fn reset_to(&mut self, commit: String, mode: ResetMode, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Reset", message, cx);
+            return;
+        }
+        let short = short_commit(&commit);
+        let label = mode.label();
+        self.run(
+            "Reset",
+            move |repo| repo.reset(&commit, mode),
+            move |this, (), cx| {
+                this.reload_everything_from_disk(cx);
+                this.tell("Reset", format!("Reset to {short} ({label})"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// Checks `branch` out and rebases it onto the branch the user was on, as IDEA does.
+    pub fn checkout_and_rebase(&mut self, branch: String, onto: String, cx: &mut Context<Self>) {
+        let (name, target) = (branch.clone(), onto.clone());
+        let shown = (branch.clone(), onto.clone());
+        self.run(
+            "Checkout and Rebase",
+            move |repo| {
+                repo.switch(&name)?;
+                repo.rebase_onto(&target)
+            },
+            move |this, report, cx| {
+                this.remember_recent(&shown.0);
+                this.finish_branch_update(
+                    report,
+                    "Rebase",
+                    format!("Rebased {} onto {}", shown.0, shown.1),
+                    cx,
+                )
+            },
+            cx,
+        );
+    }
+
+    /// Keeps the branches the user switched to, newest first, at most five of them.
+    fn remember_recent(&mut self, branch: &str) {
+        self.recent.retain(|known| known != branch);
+        self.recent.insert(0, branch.to_owned());
+        self.recent.truncate(5);
+    }
+
+    /// Merges `branch` into the current one; a conflict opens the Conflicts window.
+    pub fn merge_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Merge", message, cx);
+            return;
+        }
+        let name = branch.clone();
+        self.run(
+            "Merge",
+            move |repo| repo.merge_branch(&name),
+            move |this, report, cx| {
+                this.finish_branch_update(
+                    report,
+                    "Merge",
+                    format!("Merged {branch} into the current branch"),
+                    cx,
+                )
+            },
+            cx,
+        );
+    }
+
+    /// Rebases the current branch onto `branch`; a conflict opens the Conflicts window.
+    pub fn rebase_onto(&mut self, branch: String, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Rebase", message, cx);
+            return;
+        }
+        let name = branch.clone();
+        self.run(
+            "Rebase",
+            move |repo| repo.rebase_onto(&name),
+            move |this, report, cx| {
+                this.finish_branch_update(
+                    report,
+                    "Rebase",
+                    format!("Rebased the current branch onto {branch}"),
+                    cx,
+                )
+            },
+            cx,
+        );
+    }
+
+    /// What a merge or a rebase left behind: the reload, the note the user reads and the
+    /// Conflicts window when git waits for the user.
+    fn finish_branch_update(
+        &mut self,
+        report: UpdateReport,
+        what: &str,
+        done: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.operation = report.operation;
+        self.autostash = report.autostash;
+        self.merge_message = report.merge_message;
+        self.reload_everything_from_disk(cx);
+        if let Some(stash) = &report.stash {
+            self.report(what, stash_left_message(stash), cx);
+        } else if !report.conflicts.is_empty() {
+            self.tell(
+                what,
+                format!("{} file(s) in conflict", report.conflicts.len()),
+                cx,
+            );
+        } else if report.operation == Operation::None {
+            self.tell(what, done, cx);
+        }
+        if !report.conflicts.is_empty() || report.operation != Operation::None {
+            self.open_conflicts(cx);
+        }
+    }
+
+    /// Replays the plan of the Rebase dialog. A stop for an edit or a conflict opens the
+    /// Conflicts window, which continues or aborts the rebase, and the notification of the
+    /// edit names the commit git waits at.
+    pub fn start_rebase(&mut self, plan: RebasePlan, cx: &mut Context<Self>) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Rebase", message, cx);
+            return;
+        }
+        self.run(
+            "Rebase",
+            move |repo| repo.rebase(&plan),
+            |this, report, cx| this.finish_rebase(report, cx),
+            cx,
+        );
+    }
+
+    fn finish_rebase(&mut self, report: RebaseReport, cx: &mut Context<Self>) {
+        self.operation = report.operation;
+        self.autostash = report.autostash;
+        self.reload_everything_from_disk(cx);
+        let stopped = report.stopped.clone();
+        if let Some(stash) = &report.stash {
+            self.report("Rebase", stash_left_message(stash), cx);
+        } else if !report.conflicts.is_empty() {
+            self.tell(
+                "Rebase",
+                format!("{} file(s) in conflict", report.conflicts.len()),
+                cx,
+            );
+        } else if let Some(id) = stopped {
+            let text = format!("Rebase stopped at {} for editing", short_commit(&id));
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user_with_command(
+                        "Rebase",
+                        text,
+                        "Continue Rebase",
+                        CONTINUE_REBASE_COMMAND,
+                        cx,
+                    )
+                })
+                .ok();
+        } else if report.operation == Operation::None {
+            self.tell("Rebase", "The rebase is finished", cx);
+        }
+        if !report.conflicts.is_empty() || report.operation != Operation::None {
+            self.open_conflicts(cx);
+        }
+    }
+
+    /// Deletes a local branch. A branch git sees as not merged waits for Force Delete.
+    pub fn delete_branch(&mut self, name: String, force: bool, cx: &mut Context<Self>) {
+        if force {
+            self.force_delete_branch(name, cx);
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let job_name = name.clone();
+        let job = cx.background_executor().spawn(async move {
+            let head = repo
+                .branch_head(&job_name)
+                .map_err(|error| error.to_string())?;
+            let merged = repo
+                .is_branch_merged(&job_name)
+                .map_err(|error| error.to_string())?;
+            if merged {
+                repo.delete_branch(&job_name)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok((head, merged))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| match result {
+                Ok((head, true)) => this.finish_delete(name, head, cx),
+                Ok((_, false)) => this.ask_force_delete(name, cx),
+                Err(message) => this.report("Delete Branch", message, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn force_delete_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        let shown = name.clone();
+        self.run(
+            "Delete Branch",
+            move |repo| {
+                let head = repo.branch_head(&name)?;
+                repo.force_delete_branch(&name)?;
+                Ok(head)
+            },
+            move |this, head, cx| this.finish_delete(shown, head, cx),
+            cx,
+        );
+    }
+
+    /// The note a deleted branch leaves: Restore puts it back at its commit.
+    fn finish_delete(&mut self, name: String, head: String, cx: &mut Context<Self>) {
+        let short: String = head.chars().take(7).collect();
+        self.last_deleted = Some((name.clone(), head));
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user_with_command(
+                    "Branches",
+                    format!("Deleted branch {name} (was {short})"),
+                    "Restore",
+                    RESTORE_BRANCH_COMMAND,
+                    cx,
+                )
+            })
+            .ok();
+        cx.notify();
+    }
+
+    /// Puts the branch of the last Delete back at the commit it pointed at.
+    pub fn restore_deleted_branch(&mut self, cx: &mut Context<Self>) {
+        let Some((name, head)) = self.last_deleted.take() else {
+            return;
+        };
+        let shown = name.clone();
+        self.run(
+            "Restore Branch",
+            move |repo| repo.restore_branch(&name, &head),
+            move |this, (), cx| this.tell("Branches", format!("Restored branch {shown}"), cx),
+            cx,
+        );
+    }
+
+    fn ask_force_delete(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        let question = format!("Branch '{name}' is not merged. Force Delete?");
+        let shown = name.clone();
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let git = git.clone();
+                            let name = shown.clone();
+                            Prompt::ask(
+                                "Delete Branch",
+                                &question,
+                                move |cx| {
+                                    git.update(cx, |this, cx| {
+                                        this.force_delete_branch(name.clone(), cx);
+                                    });
+                                },
+                                workspace,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    }
+
+    /// Deletes a branch on its remote after a question, as Delete of a remote branch does.
+    pub fn delete_remote_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let Some((remote, name)) = branch.split_once('/') else {
+            return;
+        };
+        let remote = remote.to_owned();
+        let name = name.to_owned();
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        let question = format!("Delete '{branch}' on the remote?");
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let git = git.clone();
+                            let (remote, name) = (remote.clone(), name.clone());
+                            let shown = format!("{remote}/{name}");
+                            Prompt::ask(
+                                "Delete Remote Branch",
+                                &question,
+                                move |cx| {
+                                    let (remote, name) = (remote.clone(), name.clone());
+                                    let shown = shown.clone();
+                                    git.update(cx, |this, cx| {
+                                        this.run(
+                                            "Delete Remote Branch",
+                                            move |repo| repo.delete_remote_branch(&remote, &name),
+                                            move |this, (), cx| {
+                                                this.tell(
+                                                    "Branches",
+                                                    format!("Deleted {shown} on the remote"),
+                                                    cx,
+                                                )
+                                            },
+                                            cx,
+                                        );
+                                    })
+                                },
+                                workspace,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    }
+
+    /// The commits of the branch and of the current one side by side, in the Compare
+    /// window.
+    pub fn compare_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let current = self.current_branch_name();
+        let name = branch.clone();
+        let job = cx
+            .background_executor()
+            .spawn(async move { repo.compare_with(&name).map_err(|error| error.to_string()) });
+        let Some(window) = self.window else {
+            return;
+        };
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            match result {
+                Ok(report) => window
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                crate::compare::CompareView::open(
+                                    git, report, branch, current, false, workspace, window, cx,
+                                )
+                            })
+                            .ok();
+                    })
+                    .ok(),
+                Err(message) => this
+                    .update(cx, |this, cx| this.report("Compare", message, cx))
+                    .ok(),
+            }
+        })
+        .detach();
+    }
+
+    /// The files the working tree changed against `branch`, in the Compare window.
+    pub fn show_working_tree_diff(&mut self, branch: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let name = branch.clone();
+        let job = cx.background_executor().spawn(async move {
+            repo.working_tree_compare(&name)
+                .map_err(|error| error.to_string())
+        });
+        let Some(window) = self.window else {
+            return;
+        };
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            match result {
+                Ok(report) => window
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                crate::compare::CompareView::open(
+                                    git,
+                                    report,
+                                    branch,
+                                    "Working Tree".to_owned(),
+                                    true,
+                                    workspace,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .ok();
+                    })
+                    .ok(),
+                Err(message) => this
+                    .update(cx, |this, cx| this.report("Compare", message, cx))
+                    .ok(),
+            }
+        })
+        .detach();
+    }
+
+    /// The branch checked out, or `HEAD` when git points at a commit.
+    pub fn current_branch_name(&self) -> String {
+        self.status
+            .branch
+            .clone()
+            .unwrap_or_else(|| "HEAD".to_owned())
+    }
+
+    /// Gives a local branch another name. The one checked out keeps its work.
+    pub fn rename_branch(&mut self, from: String, to: String, cx: &mut Context<Self>) {
+        let (old, new) = (from.clone(), to.clone());
+        self.run(
+            "Rename branch",
+            move |repo| repo.rename_branch(&old, &new),
+            move |this, (), cx| this.tell("Branch", format!("Renamed {from} to {to}"), cx),
+            cx,
+        );
+    }
+
+    /// Fetches the upstream and merges it in, as Pull does.
+    pub fn pull(&mut self, cx: &mut Context<Self>) {
+        self.update_with(UpdateMode::Merge, cx);
+    }
+
+    /// Takes the named files back to the last commit, as Rollback does.
+    pub fn revert_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        self.run(
+            "Rollback",
+            move |repo| repo.revert_paths(&paths),
+            move |this, (), cx| {
+                this.reload_everything_from_disk(cx);
+                this.tell("Rollback", format!("Rolled back {count} file(s)"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// Alt+`: the most common VCS operations as one popup.
+    pub fn quick_list(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let me = cx.weak_entity();
+        let mut entries = Vec::new();
+        let commit = me.clone();
+        entries.push(
+            MenuEntry::new("Commit...", move |window, cx| {
+                commit
+                    .update(cx, |this, cx| this.show_commit_window(window, cx))
+                    .ok();
+            })
+            .icon("general/vcs"),
+        );
+        let update = me.clone();
+        entries.push(
+            MenuEntry::new("Update Project", move |_, cx| {
+                update
+                    .update(cx, |this, cx| this.update_project(position, cx))
+                    .ok();
+            })
+            .icon("general/vcs"),
+        );
+        let push = me.clone();
+        entries.push(
+            MenuEntry::new("Push...", move |_, cx| {
+                push.update(cx, |this, cx| this.push(cx)).ok();
+            })
+            .icon("general/vcs"),
+        );
+        let pull = me.clone();
+        entries.push(
+            MenuEntry::new("Pull", move |_, cx| {
+                pull.update(cx, |this, cx| this.pull(cx)).ok();
+            })
+            .icon("general/vcs"),
+        );
+        entries.push(MenuEntry::separator());
+        let branches = me.clone();
+        // The popup of the branches opens under the branch name of the title bar, not at the
+        // caret where this list was opened.
+        let at_branch = self.title_branch_position(cx).unwrap_or(position);
+        entries.push(
+            MenuEntry::new("Branches...", move |_, cx| {
+                branches
+                    .update(cx, |this, cx| this.show_branches(at_branch, cx))
+                    .ok();
+            })
+            .icon("general/vcs"),
+        );
+        let history = me.clone();
+        entries.push(
+            MenuEntry::new("Show History", move |window, cx| {
+                history
+                    .update(cx, |this, cx| {
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.run_command("git.show_log", window, cx)
+                            })
+                            .ok();
+                    })
+                    .ok();
+            })
+            .icon("general/vcs"),
+        );
+        let rollback = me.clone();
+        entries.push(
+            MenuEntry::new("Rollback...", move |window, cx| {
+                rollback
+                    .update(cx, |this, cx| this.show_commit_window(window, cx))
+                    .ok();
+            })
+            .icon("general/delete"),
+        );
+        let stash = me;
+        entries.push(
+            MenuEntry::new("Stash Changes...", move |window, cx| {
+                stash
+                    .update(cx, |this, cx| this.ask_stash_message(window, cx))
+                    .ok();
+            })
+            .icon("general/vcs"),
+        );
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
+    }
+
+    pub fn tell(&mut self, title: &str, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let (title, text) = (title.to_string(), text.into());
+        self.workspace
+            .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+            .ok();
+    }
+
+    /// The pointer came to a change mark of a gutter, or left the marks. A press opens
+    /// the window of the change at once, the pointer only after the hint delay.
+    pub(crate) fn change_mark_hover(
+        &mut self,
+        view: Entity<EditorView>,
+        line: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        let path = view.read(cx).path().to_path_buf();
+        let next = line.map(|line| (path, line));
+        if self.hovered_mark == next {
+            return;
+        }
+        self.hovered_mark = next.clone();
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        let serial = self.hover_serial;
+        self.hover_task = None;
+        self.close_task = None;
+        match next {
+            Some((path, line)) => {
+                let task = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(TOOLTIP_DELAY).await;
+                    this.update(cx, |this, cx| {
+                        if this.hover_serial == serial && this.hovered_mark.is_some() {
+                            this.open_change_popup(view, path, line, cx);
+                        }
+                    })
+                    .ok();
+                });
+                self.hover_task = Some(task);
+            }
+            None => {
+                if self.live_popup().is_some() {
+                    self.schedule_popup_close(cx);
+                }
+            }
+        }
+    }
+
+    /// A press on a change mark: the window of the change opens at once.
+    pub(crate) fn change_mark_clicked(
+        &mut self,
+        view: Entity<EditorView>,
+        line: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let path = view.read(cx).path().to_path_buf();
+        self.hovered_mark = Some((path.clone(), line));
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        self.hover_task = None;
+        self.close_task = None;
+        self.open_change_popup(view, path, line, cx);
+    }
+
+    /// The text of an editor changed: the marks of the gutter and of the scroll bar
+    /// follow the buffer, saved or not.
+    pub(crate) fn text_changed(&mut self, view: Entity<EditorView>, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            return;
+        }
+        let path = view.read(cx).path().to_path_buf();
+        // The window of a change does not take the keys: typing reaches the editor and
+        // closes the window, as the window of IDEA closes on the first edit.
+        if self
+            .live_popup()
+            .is_some_and(|popup| popup.read(cx).is_for(&path))
+        {
+            self.close_popup(cx);
+        }
+        self.pending_marks.insert(path, view);
+        self.schedule_marks(cx);
+    }
+
+    fn schedule_marks(&mut self, cx: &mut Context<Self>) {
+        if self.marks_task.is_some() {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MARKS_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.marks_task = None;
+                this.read_marks(cx);
+            })
+            .ok();
+        });
+        self.marks_task = Some(task);
+    }
+
+    /// Reads the hunks of the editors that changed, off the UI thread.
+    fn read_marks(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_marks);
+        if pending.is_empty() {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let inputs: Vec<(PathBuf, String)> = pending
+            .iter()
+            .filter_map(|(path, view)| Some((path.clone(), view.read(cx).text()?)))
+            .collect();
+        let job = cx.background_executor().spawn(async move {
+            let mut result = Vec::new();
+            for (path, text) in inputs {
+                let relative = relative_of(repo.root(), &path);
+                let Ok(mut blobs) = repo.blobs() else {
+                    continue;
+                };
+                if let Ok(diff) = repo.file_diff(&mut blobs, &relative, &text) {
+                    result.push((path, text, diff.hunks));
+                }
+            }
+            result
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                let theme = *cx.global::<Theme>();
+                for (path, text, hunks) in result {
+                    let Some(view) = pending.get(&path) else {
+                        continue;
+                    };
+                    // The text moved on while the hunks were read: they belong to an
+                    // older text and another read follows for this editor.
+                    if view.read(cx).text().as_deref() != Some(text.as_str()) {
+                        this.pending_marks.insert(path, view.clone());
+                        continue;
+                    }
+                    let marks = marks_of(&hunks, &theme);
+                    view.update(cx, |view, cx| view.set_gutter_marks(marks, cx));
+                }
+                if !this.pending_marks.is_empty() {
+                    this.schedule_marks(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The window of a change is open and not closed by the user.
+    fn live_popup(&self) -> Option<Entity<crate::hunk_popup::HunkPopup>> {
+        self.popup.as_ref()?.upgrade()
+    }
+
+    /// Closes the window of a change when the overlay still shows it.
+    pub(crate) fn close_popup(&mut self, cx: &mut Context<Self>) {
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        self.hover_task = None;
+        self.close_task = None;
+        self.hovered_mark = None;
+        let Some(window) = self.window else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        // The window may close itself from its own update: the overlay goes after it.
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            if workspace.overlay_tag() == Some(crate::hunk_popup::TAG) {
+                                workspace.close_menu(window, cx);
+                            }
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    }
+
+    /// The user closed the window of a change.
+    pub(crate) fn popup_closed(&mut self, _cx: &mut Context<Self>) {
+        self.hover_serial = self.hover_serial.wrapping_add(1);
+        self.hover_task = None;
+        self.close_task = None;
+    }
+
+    /// The pointer is over the window of a change.
+    pub(crate) fn popup_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.popup_hovered = hovered;
+        if hovered {
+            self.close_task = None;
+        } else if self.live_popup().is_some() {
+            self.schedule_popup_close(cx);
+        }
+    }
+
+    fn schedule_popup_close(&mut self, cx: &mut Context<Self>) {
+        if self.close_task.is_some() {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(POPUP_CLOSE_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.close_task = None;
+                if !this.popup_hovered && this.live_popup().is_some() {
+                    this.close_popup(cx);
+                }
+            })
+            .ok();
+        });
+        self.close_task = Some(task);
+    }
+
+    /// Reads the hunks of the file under the mark and shows the window of the change
+    /// that holds `line`, off the UI thread.
+    fn open_change_popup(
+        &mut self,
+        view: Entity<EditorView>,
+        path: PathBuf,
+        line: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let Some(text) = view.read(cx).text() else {
+            return;
+        };
+        let relative = relative_of(
+            self.repo.as_ref().map_or(Path::new(""), |repo| repo.root()),
+            &path,
+        );
+        let Some(repo) = self.repo_of(&relative) else {
+            return;
+        };
+        self.popup_hovered = false;
+        let job_relative = relative_of(repo.root(), &path);
+        let job = cx.background_executor().spawn(async move {
+            let mut blobs = repo.blobs().ok()?;
+            repo.file_diff(&mut blobs, &job_relative, &text).ok()
+        });
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let Some(diff) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // The text moved on while the hunks were read: the window would show
+                // lines the buffer no longer has.
+                if view.read(cx).text().as_deref() != Some(diff.current.as_str()) {
+                    return;
+                }
+                let Some(index) = hunk_index_at(&diff.hunks, line) else {
+                    return;
+                };
+                let mut opened = None;
+                window
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                opened = crate::hunk_popup::HunkPopup::open(
+                                    git,
+                                    workspace,
+                                    window,
+                                    cx,
+                                    path,
+                                    view,
+                                    diff.base,
+                                    diff.current,
+                                    diff.hunks,
+                                    index,
+                                );
+                            })
+                            .ok();
+                    })
+                    .ok();
+                this.popup = opened.map(|view| view.downgrade());
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Takes the change under the caret, or every change the selection touches, back to
+    /// the committed text.
+    pub fn revert_at_caret(&mut self, cx: &mut Context<Self>) {
+        if let Some(popup) = self.live_popup() {
+            // The window may close itself here: the close reaches this state after the
+            // update that runs the key.
+            cx.defer(move |cx| {
+                popup.update(cx, |popup, cx| popup.rollback(cx));
+            });
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let active = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_editor())
+            .ok()
+            .flatten();
+        let Some((path, view)) = active else {
+            return;
+        };
+        let Ok(view) = view.downcast::<EditorView>() else {
+            return;
+        };
+        let (line, end_line) = {
+            let view = view.read(cx);
+            let caret = view.caret().0 as u32;
+            let selection = view.selection();
+            let text = view.text().unwrap_or_default();
+            match selection {
+                Some((range, _)) if range.start != range.end => {
+                    let start = text[..range.start]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count();
+                    let end = text[..range.end]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count();
+                    (start as u32, end as u32)
+                }
+                _ => (caret, caret),
+            }
+        };
+        let Some(text) = view.read(cx).text() else {
+            return;
+        };
+        let (job_path, job_text) = (path.clone(), text.clone());
+        let job = cx.background_executor().spawn(async move {
+            let relative = relative_of(repo.root(), &job_path);
+            let mut blobs = repo.blobs().ok()?;
+            let diff = repo.file_diff(&mut blobs, &relative, &job_text).ok()?;
+            let touched: Vec<Hunk> = if line == end_line {
+                hunk_at(&diff.hunks, line).cloned().into_iter().collect()
+            } else {
+                diff.hunks
+                    .iter()
+                    .filter(|hunk| {
+                        if hunk.after.is_empty() {
+                            (line..=end_line).contains(&hunk.after.start)
+                        } else {
+                            hunk.after.start <= end_line && hunk.after.end > line
+                        }
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if touched.is_empty() {
+                return None;
+            }
+            Some(
+                touched
+                    .iter()
+                    .map(|hunk| vcs::revert_hunk(&diff.base, &job_text, hunk))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let Some(edits) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // The text moved on while git was asked: the edit would land wrong.
+                if view.read(cx).text().as_deref() != Some(text.as_str()) {
+                    return;
+                }
+                let bytes = view.read(cx).file_bytes();
+                let cause = local_history::Cause::BeforeGitRevert;
+                crate::history::snapshot_bytes(&path, bytes, cause, cx);
+                let edits = edits
+                    .into_iter()
+                    .map(|edit| text_core::Edit::new(edit.range, edit.text))
+                    .collect();
+                view.update(cx, |view, cx| view.apply_edits(edits, cx));
+                workspace
+                    .update(cx, |workspace, cx| workspace.save_editor(&path, cx))
+                    .ok();
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ctrl+Alt+Shift+Down and Ctrl+Alt+Shift+Up: the next or previous changed line.
+    pub fn show_next_change(&mut self, cx: &mut Context<Self>) {
+        self.show_change(true, cx);
+    }
+
+    pub fn show_previous_change(&mut self, cx: &mut Context<Self>) {
+        self.show_change(false, cx);
+    }
+
+    fn show_change(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(popup) = self.live_popup() {
+            popup.update(cx, |popup, cx| popup.step(forward, cx));
+            return;
+        }
+        let active = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_editor())
+            .ok()
+            .flatten();
+        let Some((_, view)) = active else {
+            return;
+        };
+        let Ok(view) = view.downcast::<EditorView>() else {
+            return;
+        };
+        let (line, marks) = {
+            let view = view.read(cx);
+            let line = view.caret().0 as u32;
+            let mut marks: Vec<u32> = view
+                .gutter_marks()
+                .iter()
+                .map(|mark| mark.lines.start)
+                .collect();
+            marks.sort_unstable();
+            marks.dedup();
+            (line, marks)
+        };
+        let target = if forward {
+            marks.iter().copied().find(|mark| *mark > line)
+        } else {
+            marks.iter().rev().copied().find(|mark| *mark < line)
+        };
+        if let Some(target) = target {
+            view.update(cx, |view, cx| view.go_to_line(target as usize, cx));
+        }
+    }
+
+    /// The branch popup at `position`: a search field, the actions above the list, and
+    /// the Recent, Local, Remote and Tags references below, folded by their slashes. The
+    /// list comes from `git for-each-ref` off the UI thread.
+    pub fn show_branches(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let Some(window) = self.window else {
+            return;
+        };
+        let Ok(root) = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.root().to_path_buf())
+        else {
+            return;
+        };
+        let recent = self.recent.clone();
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        let job = cx.background_executor().spawn(async move {
+            let branches = repo.branches().map_err(|error| error.to_string())?;
+            let tags = repo
+                .labels()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|label| label.kind == RefKind::Tag)
+                .map(|label| crate::branches::Tag {
+                    name: label.name,
+                    commit: label.commit,
+                })
+                .collect();
+            let favourites = workspace::load_git_settings(&root).favourite_branches;
+            Ok::<_, String>((branches, tags, favourites))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            match result {
+                Ok((branches, tags, favourites)) => {
+                    window
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    crate::branches::BranchPopup::open(
+                                        git,
+                                        crate::branches::OpenedBranches {
+                                            branches,
+                                            tags,
+                                            recent,
+                                            favourites,
+                                        },
+                                        position,
+                                        workspace,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        })
+                        .ok();
+                }
+                Err(message) => {
+                    this.update(cx, |this, cx| this.report("Branches", message, cx))
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn ask_stash_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show(
+                    "Stash Changes",
+                    "Stash message",
+                    move |message, cx| {
+                        me.update(cx, |this, cx| this.stash(message, cx)).ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    pub(crate) fn ask_branch_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_branch_name_from("HEAD".to_owned(), window, cx);
+    }
+
+    /// New Branch from '<branch>...': the name starts a branch at `start`.
+    pub(crate) fn ask_branch_name_from(
+        &mut self,
+        start: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::prompt::Prompt::show(
+                    "New Branch",
+                    "Branch name",
+                    move |name, cx| {
+                        let start = start.clone();
+                        me.update(cx, |this, cx| this.create_branch_from(name, start, cx))
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    /// Checkout Tag or Revision...: the tag or the revision the user types, with HEAD
+    /// detached, as `git switch --detach` leaves it.
+    pub(crate) fn ask_checkout_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let me = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::show(
+                    "Checkout Tag or Revision",
+                    "Tag or revision",
+                    move |revision, cx| {
+                        me.update(cx, |this, cx| this.checkout_named(revision, cx))
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    /// The revision Checkout Tag or Revision names, shown as the user typed it.
+    fn checkout_named(&mut self, revision: String, cx: &mut Context<Self>) {
+        let shown = revision.clone();
+        self.run(
+            "Checkout",
+            move |repo| repo.checkout_commit(&revision),
+            move |this, (), cx| {
+                this.reload_everything(cx);
+                this.tell("Checkout", format!("Checked out {shown}"), cx)
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn ask_rename_branch(
+        &mut self,
+        from: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let me = cx.weak_entity();
+        let original = from.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::prompt::Prompt::show_with(
+                    "Rename Branch",
+                    &from,
+                    move |name, cx| {
+                        let name = name.trim().to_owned();
+                        if name.is_empty() || name == original {
+                            return;
+                        }
+                        me.update(cx, |this, cx| {
+                            this.rename_branch(original.clone(), name, cx)
+                        })
+                        .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    pub fn show_commit_window(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(COMMIT_TOOL, window, cx)
+            })
+            .ok();
+    }
+
+    /// The active editor that shows text, for the actions that act on its column.
+    fn active_editor(&self, cx: &mut Context<Self>) -> Option<(PathBuf, Entity<EditorView>)> {
+        let (path, view) = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_editor())
+            .ok()??;
+        Some((path, view.downcast::<EditorView>().ok()?))
+    }
+
+    /// Git > Annotate with Git Blame: the blame of the active file in a column before its
+    /// text. The read stays off the UI thread, however long the history of the file is.
+    pub fn annotate(&mut self, cx: &mut Context<Self>) {
+        let Some((path, view)) = self.active_editor(cx) else {
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if view.read(cx).has_annotations() {
+            return;
+        }
+        // The blame reads the working tree, so the unsaved text has to reach the disk
+        // first; then the labels belong to the lines on screen.
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Annotate", message, cx);
+            return;
+        }
+        let relative = relative_of(repo.root(), &path);
+        let job = cx.background_executor().spawn(async move {
+            let lines = repo.blame(&relative).map_err(|error| error.to_string())?;
+            let messages = messages_of(&repo, &lines);
+            Ok::<_, String>((lines, messages))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            match result {
+                Ok((lines, messages)) => {
+                    let notes = crate::annotate::notes(&lines, &messages);
+                    view.update(cx, |view, cx| view.set_annotations(&notes, cx));
+                }
+                Err(message) => {
+                    this.update(cx, |this, cx| this.report("Annotate", message, cx))
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Close Annotations: takes the blame column of the active editor away.
+    pub fn close_annotations(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, view)) = self.active_editor(cx) {
+            view.update(cx, |view, cx| view.clear_annotations(cx));
+        }
+    }
+}
+
+/// The full messages of the commits the blame names, by id, for the hint of a label.
+fn messages_of(repo: &Repository, lines: &[BlameLine]) -> HashMap<String, String> {
+    let mut ids: Vec<String> = lines
+        .iter()
+        .filter(|line| line.is_committed())
+        .map(|line| line.commit.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    repo.commit_messages(&ids).unwrap_or_default()
+}
+
+/// Marks of the hunks for the gutter of an editor.
+pub fn marks_of(hunks: &[Hunk], theme: &Theme) -> Vec<GutterMark> {
+    vcs::gutter(hunks)
+        .into_iter()
+        .map(|change| {
+            let (kind, color) = match change.kind {
+                LineChangeKind::Added => (GutterKind::Added, Kind::Added),
+                LineChangeKind::Modified => (GutterKind::Modified, Kind::Modified),
+                LineChangeKind::Deleted => (GutterKind::Deleted, Kind::Deleted),
+            };
+            GutterMark {
+                lines: change.lines,
+                kind,
+                color: color.color(theme),
+            }
+        })
+        .collect()
+}
+
+/// The hunk the line belongs to; a removal belongs to the line it sits before.
+pub fn hunk_at(hunks: &[Hunk], line: u32) -> Option<&Hunk> {
+    hunks.iter().find(|hunk| {
+        if hunk.after.is_empty() {
+            hunk.after.start == line
+        } else {
+            hunk.after.contains(&line)
+        }
+    })
+}
+
+/// The place of [`hunk_at`] in the list, for the windows that walk the hunks.
+pub fn hunk_index_at(hunks: &[Hunk], line: u32) -> Option<usize> {
+    hunks.iter().position(|hunk| {
+        if hunk.after.is_empty() {
+            hunk.after.start == line
+        } else {
+            hunk.after.contains(&line)
+        }
+    })
+}
+
+/// The files of a submodule root under the prefix of that root in the project status.
+fn combine_status(all: &mut Status, prefix: &str, root: &Status) {
+    for file in &root.files {
+        let mut file = file.clone();
+        file.path = format!("{prefix}/{}", file.path);
+        if let Some(original) = file.original.as_mut() {
+            *original = format!("{prefix}/{original}");
+        }
+        all.files.push(file);
+    }
+}
+
+/// `path` relative to the repository, with `/`, as git names it.
+pub fn relative_of(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+/// The first seven characters of a commit id, as the log shows them.
+pub(crate) fn short_commit(id: &str) -> String {
+    id.chars().take(7).collect()
+}
+
+/// The branch in the status bar, with ahead/behind counts and the operation in progress.
+fn branch_label(status: &Status, operation: Operation, autostash: bool) -> Option<String> {
+    let mut label = status.branch.clone().or_else(|| {
+        status
+            .head
+            .as_ref()
+            .map(|head| format!("detached {}", &head[..head.len().min(7)]))
+    })?;
+    if status.ahead > 0 {
+        label.push_str(&format!(" ↑{}", status.ahead));
+    }
+    if status.behind > 0 {
+        label.push_str(&format!(" ↓{}", status.behind));
+    }
+    match operation {
+        Operation::Merge => label.push_str(" (merging)"),
+        Operation::Rebase => label.push_str(" (rebasing)"),
+        Operation::CherryPick => label.push_str(" (cherry-picking)"),
+        Operation::Revert => label.push_str(" (reverting)"),
+        Operation::None => {}
+    }
+    if autostash && operation != Operation::None {
+        label.push_str(" · local changes will be restored when the operation ends");
+    }
+    Some(label)
+}
+
+/// The text for local changes git could not put back and kept in the stash.
+fn stash_left_message(stash: &Stash) -> String {
+    format!(
+        "Local changes did not apply cleanly and are kept in stash@{{{}}}: {}, see Unstash Changes",
+        stash.index, stash.message
+    )
+}
+
+/// Handles the actions of the keys. The window only declares them. `window` is the one the
+/// repository belongs to: the active window may be none while a script drives it.
+pub fn bind_actions(git: Entity<GitState>, window: AnyWindowHandle, cx: &mut App) {
+    use workspace::{PushChanges, RevertChange, ShowBranches, ShowCommit, UpdateProject};
+    crate::diff_view::bind_keys(cx);
+    crate::merge_view::bind_keys(cx);
+    crate::branches::bind_keys(cx);
+    git.update(cx, |this, _| this.window = Some(window));
+    let state = git.clone();
+    cx.on_action(move |_: &PushChanges, cx| {
+        let state = state.clone();
+        // The window is being updated while its action runs, so the save waits for it.
+        cx.defer(move |cx| state.update(cx, |this, cx| this.push(cx)));
+    });
+    let state = git.clone();
+    cx.on_action(move |_: &UpdateProject, cx| {
+        let state = state.clone();
+        // The window is being updated while its action runs, so the rest waits for the effects.
+        cx.defer(move |cx| {
+            let position = window
+                .update(cx, |_, window, cx| state.read(cx).popup_anchor(window, cx))
+                .unwrap_or_default();
+            state.update(cx, |this, cx| this.update_project(position, cx));
+        });
+    });
+    let state = git.clone();
+    cx.on_action(move |_: &RevertChange, cx| state.update(cx, |this, cx| this.revert_at_caret(cx)));
+    let state = git.clone();
+    // The window is being updated while its action runs, so the rest waits for the effects.
+    cx.on_action(move |_: &ShowBranches, cx| {
+        let state = state.clone();
+        cx.defer(move |cx| {
+            let position = window
+                .update(cx, |_, window, cx| state.read(cx).popup_anchor(window, cx))
+                .unwrap_or_default();
+            state.update(cx, |this, cx| this.show_branches(position, cx));
+        });
+    });
+    let state = git.clone();
+    let shown = state.clone();
+    cx.on_action(move |_: &ShowCommit, cx| {
+        let state = shown.clone();
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    state.update(cx, |this, cx| this.show_commit_window(window, cx))
+                })
+                .ok();
+        });
+    });
+    let state = state.clone();
+    cx.on_action(move |_: &VcsQuickList, cx| {
+        let state = state.clone();
+        cx.defer(move |cx| {
+            let position = window
+                .update(cx, |_, window, cx| state.read(cx).popup_anchor(window, cx))
+                .unwrap_or_default();
+            state.update(cx, |this, cx| this.quick_list(position, cx));
+        });
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use std::path::Path;
+
+    use vcs::{Change, FileStatus, Hunk};
+
+    #[cfg(windows)]
+    use super::relative_of;
+    use super::{Kind, hunk_at};
+
+    fn file(index: Change, worktree: Change) -> FileStatus {
+        FileStatus {
+            path: "a".into(),
+            original: None,
+            index,
+            worktree,
+        }
+    }
+
+    #[test]
+    fn the_kind_says_what_the_user_cares_about() {
+        let kind = |index, worktree| Kind::of(&file(index, worktree));
+        assert_eq!(kind(Change::Unmodified, Change::Modified), Kind::Modified);
+        assert_eq!(kind(Change::Added, Change::Unmodified), Kind::Added);
+        assert_eq!(kind(Change::Unmodified, Change::Untracked), Kind::Untracked);
+        assert_eq!(kind(Change::Unmodified, Change::Deleted), Kind::Deleted);
+        assert_eq!(
+            kind(Change::Conflicted, Change::Conflicted),
+            Kind::Conflicted
+        );
+    }
+
+    #[test]
+    fn a_hunk_is_found_by_its_line_and_a_removal_by_the_line_after_it() {
+        let hunks = [
+            Hunk {
+                before: 2..3,
+                after: 2..4,
+            },
+            Hunk {
+                before: 8..10,
+                after: 9..9,
+            },
+        ];
+        assert_eq!(hunk_at(&hunks, 3), Some(&hunks[0]));
+        assert_eq!(hunk_at(&hunks, 9), Some(&hunks[1]));
+        assert_eq!(hunk_at(&hunks, 5), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_are_relative_with_forward_slashes() {
+        let root = Path::new("C:/repo");
+        assert_eq!(
+            relative_of(root, Path::new("C:\\repo\\src\\A.txt")),
+            "src/A.txt"
+        );
+    }
+}

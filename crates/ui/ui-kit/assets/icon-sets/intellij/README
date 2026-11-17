@@ -1,0 +1,20 @@
+IntelliJ New UI icon set
+========================
+
+Source: https://github.com/JetBrains/intellij-community
+Path in the source: platform/icons/src/expui
+Commit: d5b79b0022b004b719c1d733975856ad7ec7779b (2026-11-17)
+License: Apache-2.0. Every copied SVG keeps the copyright line of the source:
+"Copyright 2000-2023 JetBrains s.r.o. and contributors. Use of this source code is
+governed by the Apache 2.0 license." The full license text is in LICENSE, the NOTICE
+of the source repository in NOTICE.
+
+The files keep the paths of the source below platform/icons/src/expui, without the
+product logos: the folders `welcome`, `ultimate`, `meetNewUi`, `survey` and `ide` are
+not part of this set. `map.toml` maps the logical icon names of the window to the paths
+here; a name that is missing there has no icon in this set and comes from `arro`.
+
+The tool window icons keep the `@20x20` files of the source for the stripes.
+
+`fileTypes/gitignore` and `fileTypes/http` have no dark variant in the source; the light
+file is copied under the `_dark` name too.

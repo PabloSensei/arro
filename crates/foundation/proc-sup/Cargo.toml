@@ -1,0 +1,19 @@
+[package]
+name = "proc-sup"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+platform.workspace = true
+
+[[bin]]
+# A window program of the tests, not shipped: a console cleanup must not reach it.
+name = "gui-probe"
+path = "src/bin/gui_probe.rs"
+test = false
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

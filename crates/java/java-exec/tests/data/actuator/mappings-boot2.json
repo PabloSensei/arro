@@ -1,0 +1,41 @@
+{
+  "contexts": {
+    "application": {
+      "mappings": {
+        "dispatcherServlets": {
+          "dispatcherServlet": [
+            {
+              "predicate": "{GET [/owners], produces [application/json]}",
+              "handler": "org.springframework.samples.petclinic.owner.OwnerController#findAll()",
+              "details": {
+                "handlerMethod": {
+                  "className": "org.springframework.samples.petclinic.owner.OwnerController",
+                  "name": "findAll"
+                },
+                "requestMappingConditions": {
+                  "consumes": [],
+                  "headers": [],
+                  "methods": ["GET"],
+                  "params": [],
+                  "patterns": ["/owners"],
+                  "produces": ["application/json"]
+                }
+              }
+            },
+            {
+              "predicate": "{POST [/owners/new]}",
+              "handler": "org.springframework.samples.petclinic.owner.OwnerController#create()",
+              "details": {
+                "requestMappingConditions": {
+                  "methods": ["POST"],
+                  "patterns": ["/owners/new"]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "parentId": null
+    }
+  }
+}

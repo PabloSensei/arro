@@ -1,0 +1,291 @@
+mod affected;
+#[cfg(all(test, windows))]
+mod app_resources_tests;
+mod budgets;
+mod ci;
+mod conpty;
+mod dist;
+mod dist_linux;
+mod dist_macos;
+mod fields;
+mod helpers;
+mod icon_sets;
+mod icons;
+mod idea_keymap;
+mod layers;
+mod macos_keymap;
+mod notice;
+mod release;
+mod scrollbars;
+mod spacing;
+mod symbolize;
+#[cfg(test)]
+mod third_party_tests;
+mod tooltips;
+
+use std::env;
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
+
+const USAGE: &str = "usage: cargo xtask <command>
+
+commands:
+  ci                         fmt, clippy, tests, cargo deny, check-layers, check-budgets,
+                             check-spacing, check-tooltips, check-scrollbars, check-fields,
+                             check-icon-sets
+  ci-linux                   clippy, tests and check-layers, for a Unix machine
+  check-layers [--root DIR]  dependency graph and forbidden words, ARCHITECTURE.md section 4
+  check-budgets              budgets.toml structure
+  check-spacing              padding, margins and gaps in the UI crates are on the spacing scale
+  check-tooltips             every icon-only button in the UI crates names itself in a tooltip
+  check-scrollbars           every scrolled area in the UI crates has scrollbars or is exempt
+  check-fields               every TextField in the UI crates is drawn with its caret and selection
+  check-icon-sets            the bundled icon sets keep their licence and have no product logos
+  affected [--base REF] [--run test|clippy|both] [--list]
+                             the workspace crates a change touches and their dependents,
+                             REF is main by default; prints `-p` names or runs the checks
+  build-helpers --out DIR [--maven-lib DIR] [--jacoco-lib DIR]
+                             the helper jars that run in project JVMs, needs a JDK;
+                             the JaCoCo jars come from DIR or the local Maven repositories
+  dist --out DIR [--symbols DIR] [--tools DIR] [--zip] [--deb] [--rpm] [--appimage] [--dmg] [--target windows|linux|macos]
+                             release Arro, helpers, jdtls, java-debug, README, run-arro.cmd
+                             and THIRD-PARTY.txt; the jdtls and java-debug archives come
+                             from --tools DIR, $IDE_CORPUS/tools by default; arro.pdb and
+                             arro.exe go to DIR-symbols/<commit> by default. --target linux
+                             writes arro, tools, arro.desktop, the icon and install.sh, and
+                             with --deb the arro_<version>_amd64.deb package, with --rpm
+                             the arro-<version>-1.x86_64.rpm package and with --appimage
+                             the arro-<version>-x86_64.AppImage file, which runs after
+                             chmod +x and needs appimagetool from $APPIMAGETOOL or the
+                             PATH; --target macos
+                             builds Arro.app with an ad-hoc signature, and with --dmg the
+                             disk image; both are built on their own system
+  symbolize LOG [--symbols DIR]
+                             function and file:line for the arro.exe frames of a panic log;
+                             DIR is target/symbols by default
+  release-assets --out DIR   zip a ready dist folder and write its .sha256 next to it
+  fetch-conpty               download the pinned ConPTY package into crates/services/terminal/vendor
+  idea-keymap XML JSON       IntelliJ IDEA $default.xml to the keymap crate's JSON
+  macos-keymap IN OUT        the Windows keymap of the keymap crate to its macOS one
+  icons --lucide DIR         generate assets/icons from the Lucide sources in DIR";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let root = workspace_root();
+    let result = match args.as_slice() {
+        ["ci"] => ci::run(&root),
+        ["ci-linux"] => ci::run_linux(&root),
+        ["check-layers"] => layers::run(&root),
+        ["check-layers", "--root", other] => layers::run(Path::new(other)),
+        ["check-budgets"] => budgets::run(&root),
+        ["check-spacing"] => spacing::run(&root),
+        ["check-tooltips"] => tooltips::run(&root),
+        ["check-scrollbars"] => scrollbars::run(&root),
+        ["check-fields"] => fields::run(&root),
+        ["check-icon-sets"] => icon_sets::run(&root),
+        ["affected", args @ ..] => affected_command(&root, args),
+        ["fetch-conpty"] => conpty::fetch(&root),
+        ["idea-keymap", xml, json] => idea_keymap::run(Path::new(xml), Path::new(json)),
+        ["macos-keymap", windows, macos] => macos_keymap::run(Path::new(windows), Path::new(macos)),
+        ["build-helpers", "--out", out] => helpers::run(&root, Path::new(out), None),
+        ["build-helpers", "--out", out, "--maven-lib", lib] => {
+            helpers::run(&root, Path::new(out), Some(Path::new(lib)))
+        }
+        ["build-helpers", "--out", out, "--jacoco-lib", lib] => {
+            helpers::run_with(&root, Path::new(out), None, Some(Path::new(lib)))
+        }
+        [
+            "build-helpers",
+            "--out",
+            out,
+            "--maven-lib",
+            maven,
+            "--jacoco-lib",
+            lib,
+        ]
+        | [
+            "build-helpers",
+            "--out",
+            out,
+            "--jacoco-lib",
+            lib,
+            "--maven-lib",
+            maven,
+        ] => helpers::run_with(
+            &root,
+            Path::new(out),
+            Some(Path::new(maven)),
+            Some(Path::new(lib)),
+        ),
+        ["dist", args @ ..] => dist_command(&root, args),
+        ["symbolize", args @ ..] => symbolize_command(&root, args),
+        ["release-assets", "--out", out] => release::run(Path::new(out)),
+        ["icons", "--lucide", dir] => icons::run(&root, Path::new(dir)),
+        _ => Err(USAGE.into()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `--base REF`, `--run test|clippy|both` and `--list` in any order.
+fn affected_command(root: &Path, args: &[&str]) -> Result {
+    let mut base = "main";
+    let mut run = None;
+    let mut list = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--list" => list = true,
+            "--base" => {
+                index += 1;
+                base = args.get(index).ok_or("--base needs a git ref")?;
+            }
+            "--run" => {
+                index += 1;
+                let mode = args.get(index).ok_or("--run needs test, clippy or both")?;
+                run = Some(affected::Mode::parse(mode)?);
+            }
+            other => return Err(format!("unknown affected option: {other}").into()),
+        }
+        index += 1;
+    }
+    affected::run(root, base, run, list)
+}
+
+/// `--out DIR`, an optional `--tools DIR` and `--zip`, in any order.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// `--out DIR`, `--symbols DIR`, `--tools DIR`, `--zip`, `--deb`, `--rpm`, `--appimage`,
+/// `--dmg` and `--target` in any order.
+fn dist_command(root: &Path, args: &[&str]) -> Result {
+    let mut out = None;
+    let mut symbols = None;
+    let mut tools = None;
+    let mut target = "windows";
+    let mut zip = false;
+    let mut deb = false;
+    let mut rpm = false;
+    let mut appimage = false;
+    let mut dmg = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--zip" => zip = true,
+            "--deb" => deb = true,
+            "--rpm" => rpm = true,
+            "--appimage" => appimage = true,
+            "--dmg" => dmg = true,
+            "--target" => {
+                index += 1;
+                target = args
+                    .get(index)
+                    .ok_or("--target needs windows, linux or macos")?;
+            }
+            "--out" => {
+                index += 1;
+                out = Some(Path::new(args.get(index).ok_or("--out needs a directory")?));
+            }
+            "--symbols" => {
+                index += 1;
+                symbols = Some(Path::new(
+                    args.get(index).ok_or("--symbols needs a directory")?,
+                ));
+            }
+            "--tools" => {
+                index += 1;
+                tools = Some(Path::new(
+                    args.get(index).ok_or("--tools needs a directory")?,
+                ));
+            }
+            other => return Err(format!("unknown dist option: {other}").into()),
+        }
+        index += 1;
+    }
+    let out = out.ok_or("dist needs --out DIR")?;
+    match target {
+        "windows" => {
+            if deb || rpm || appimage || dmg {
+                return Err("--deb, --rpm and --appimage belong to the linux target, \
+                            --dmg to the macos target"
+                    .into());
+            }
+            dist::run(root, out, symbols, tools, zip)
+        }
+        "linux" => {
+            if dmg {
+                return Err("a disk image is built by --target macos".into());
+            }
+            dist_linux::run(root, out, tools, zip, deb, rpm, appimage)
+        }
+        "macos" => {
+            if deb || rpm || appimage {
+                return Err(
+                    "The Debian, RPM and AppImage packages are built by --target linux".into(),
+                );
+            }
+            dist_macos::run(root, out, tools, zip, dmg)
+        }
+        other => Err(format!("unknown dist target: {other}; windows, linux or macos").into()),
+    }
+}
+
+/// `LOG` and an optional `--symbols DIR`.
+fn symbolize_command(root: &Path, args: &[&str]) -> Result {
+    let mut log = None;
+    let mut symbols = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--symbols" => {
+                index += 1;
+                symbols = Some(Path::new(
+                    args.get(index).ok_or("--symbols needs a directory")?,
+                ));
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown symbolize option: {other}").into());
+            }
+            other => log = Some(Path::new(other)),
+        }
+        index += 1;
+    }
+    let log = log.ok_or("symbolize needs a log file")?;
+    symbolize::run(root, log, symbols)
+}
+
+/// The cargo that started xtask, so nested runs stay on the pinned toolchain.
+fn cargo() -> std::ffi::OsString {
+    env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The AppImage is built on Linux like the packages, and the other targets refuse
+    /// it before anything is written.
+    #[test]
+    fn the_linux_packages_are_refused_on_the_other_targets() {
+        let out = test_support::scratch("dist-flags");
+        let out = out.to_str().unwrap();
+        let windows = dist_command(Path::new("."), &["--out", out, "--appimage"]).unwrap_err();
+        assert!(windows.to_string().contains("--appimage"), "{windows}");
+        let macos = dist_command(
+            Path::new("."),
+            &["--out", out, "--target", "macos", "--appimage"],
+        )
+        .unwrap_err();
+        assert!(macos.to_string().contains("AppImage"), "{macos}");
+    }
+}

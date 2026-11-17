@@ -1,0 +1,1417 @@
+//! Edits that a language server computes: Ctrl+Alt+L, Ctrl+Alt+O, Alt+Enter, and the
+//! occurrences of the symbol under the caret.
+
+use std::ops::Range;
+use std::time::Duration;
+
+use lang_api::{
+    ActionEntry, ActionKind, ActionQuery, ActionResolveQuery, Confidence, DocumentEdit,
+    DocumentSpot, GenerateKind, SourceSpan, SuppressionQuery, SuppressionTarget, TextPoint,
+    TextSpan, UnwrapEdit, WorkspaceChange, ask,
+};
+use text_core::{Edit, RopeStore, TextStore};
+use ui_kit::*;
+
+use crate::semantic::{NO_ANSWER, first, offset_at, point_at};
+use crate::view::{EditorEvent, EditorView};
+
+/// The caret rests this long before its occurrences are asked for.
+const HIGHLIGHT_DELAY: Duration = Duration::from_millis(250);
+
+/// A refactoring the editor runs itself, by the same code as its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Own {
+    Rename,
+    ChangeSignature,
+    Move,
+    Copy,
+    SafeDelete,
+    ExtractMethod,
+    ExtractVariable,
+    ExtractField,
+    ExtractConstant,
+    IntroduceParameter,
+    Inline,
+}
+
+/// A group of the Alt+Enter menu: the quick fixes come first, then the intentions.
+/// The kind comes from the language server's code action kind or the kind field of the
+/// language, never from the title of the action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuSection {
+    QuickFix,
+    Intention,
+}
+
+/// The section of an action the language gave.
+fn section_of(entry: &ActionEntry) -> MenuSection {
+    match entry.kind {
+        Some(ActionKind::QuickFix) => MenuSection::QuickFix,
+        Some(_) => MenuSection::Intention,
+        None => {
+            let code = entry.code.as_deref().unwrap_or_default();
+            if code == "quickfix" || code.starts_with("quickfix.") {
+                MenuSection::QuickFix
+            } else {
+                MenuSection::Intention
+            }
+        }
+    }
+}
+
+/// A row of a pick list: an action to apply or a place to go to.
+pub(crate) enum Pick {
+    Action(ActionEntry),
+    /// A change of signature opens a form of the window, so the pick only starts it.
+    ChangeSignature {
+        label: String,
+    },
+    /// A refactoring of the editor, with the key that runs it from the text.
+    Refactor {
+        label: String,
+        hint: String,
+        own: Own,
+    },
+    /// An action of the server that asks for values in a form before it runs.
+    Form {
+        label: String,
+        handle: String,
+    },
+    Place {
+        label: String,
+        target: SourceSpan,
+    },
+    /// A row of Source Generate; most need a list of parts before any edit.
+    Generate {
+        label: String,
+        kind: GenerateKind,
+    },
+    /// A row of Unwrap/Remove, with the edit it applies.
+    Unwrap {
+        label: String,
+        edit: UnwrapEdit,
+    },
+    /// A suppression of a check, with the edit it writes.
+    Suppress {
+        label: String,
+        edit: DocumentEdit,
+    },
+    /// A row that turns a check off in the settings of the project.
+    DisableInspection {
+        label: String,
+        id: String,
+        title: String,
+    },
+    /// A row that opens the settings of a check.
+    EditInspection {
+        label: String,
+        id: String,
+    },
+    /// Create Test: the window shows its form for this place.
+    CreateTest {
+        spot: DocumentSpot,
+    },
+    /// Add Inline Watch: the expression of the caret and its line, from zero.
+    InlineWatch {
+        line: usize,
+        expression: String,
+    },
+    /// A correction of a misspelled word. A word of a declaration renames the symbol.
+    Spelling {
+        label: String,
+        range: Range<usize>,
+        replacement: String,
+        declaration: bool,
+    },
+    /// Alt+Enter saved a misspelled word to a dictionary.
+    SaveSpelling {
+        label: String,
+        word: String,
+        project: bool,
+    },
+}
+
+impl Pick {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Action(entry) => &entry.title,
+            Self::ChangeSignature { label }
+            | Self::Refactor { label, .. }
+            | Self::Form { label, .. }
+            | Self::Place { label, .. }
+            | Self::Generate { label, .. }
+            | Self::Unwrap { label, .. }
+            | Self::Suppress { label, .. }
+            | Self::DisableInspection { label, .. }
+            | Self::EditInspection { label, .. }
+            | Self::Spelling { label, .. }
+            | Self::SaveSpelling { label, .. } => label,
+            Self::CreateTest { .. } => "Create Test",
+            Self::InlineWatch { .. } => "Add Inline Watch",
+        }
+    }
+
+    /// The key beside the row, as the menus write it.
+    pub fn hint(&self) -> Option<&str> {
+        match self {
+            Self::Refactor { hint, .. } if !hint.is_empty() => Some(hint),
+            _ => None,
+        }
+    }
+
+    /// The section a row belongs to. A correction of a misspelled word is a quick fix;
+    /// everything the editor adds itself, such as Create Test, is an intention.
+    fn section(&self) -> MenuSection {
+        match self {
+            Self::Action(entry) => section_of(entry),
+            Self::Spelling { .. } => MenuSection::QuickFix,
+            _ => MenuSection::Intention,
+        }
+    }
+}
+
+/// Alt+Enter, Generate, usages, the type hierarchy: rows picked with the keys of
+/// completion.
+pub(crate) struct ActionMenu {
+    pub at: usize,
+    pub rows: Vec<Pick>,
+    /// The section of every row, of the same length as `rows`. Empty for the flat
+    /// lists that have no sections.
+    pub sections: Vec<MenuSection>,
+    pub selected: usize,
+    /// The question for the preview of the selected row, while the language computes
+    /// the edit on resolve. Dropping it cancels the question.
+    pub preview_task: Option<Task<()>>,
+}
+
+impl ActionMenu {
+    pub fn window(&self) -> Range<usize> {
+        let start = self.selected.saturating_sub(crate::semantic::MAX_SHOWN - 1);
+        start..(start + crate::semantic::MAX_SHOWN).min(self.rows.len())
+    }
+
+    /// Whether the row is a quick fix, which carries the red bulb and comes first.
+    pub fn quick_fix(&self, row: usize) -> bool {
+        self.sections.get(row) == Some(&MenuSection::QuickFix)
+    }
+
+    /// Whether the list is the menu of Alt+Enter with its sections and its preview.
+    /// The flat lists of Generate and the hierarchies keep one look.
+    pub fn has_sections(&self) -> bool {
+        !self.sections.is_empty()
+    }
+}
+
+/// The change the selected row would make, shown beside the list when the language
+/// gave the edits without applying them.
+pub(crate) struct ActionPreview {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+/// Edits of one server answer, all in the coordinates of `store`, in the order the
+/// buffer needs. LSP does not sort them; inserts at one place keep their order, since
+/// that is the order of their text. Overlapping edits are forbidden by LSP but sent by
+/// real servers: `None`, nothing of them applies.
+pub(crate) fn server_edits(store: &RopeStore, edits: Vec<DocumentEdit>) -> Option<Vec<Edit>> {
+    let mut edits: Vec<(Range<usize>, String)> = edits
+        .into_iter()
+        .map(|edit| {
+            let start = offset_at(store, edit.span.start);
+            let end = offset_at(store, edit.span.end).max(start);
+            (start..end, edit.text.replace("\r\n", "\n"))
+        })
+        .collect();
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let overlap = edits.windows(2).any(|pair| pair[1].0.start < pair[0].0.end);
+    if overlap {
+        return None;
+    }
+    let edits = edits
+        .into_iter()
+        .map(|(range, text)| Edit::new(range, text.as_str()));
+    Some(edits.collect())
+}
+
+const OVERLAPPING: &str = "The language server sent overlapping edits, nothing was changed";
+
+/// Alt+Enter with nothing to offer.
+const NO_ACTIONS: &str = "No actions available here";
+
+/// Whole-word occurrences of `needle` in `text`, in text order.
+pub(crate) fn word_ranges(text: &str, needle: &str) -> Vec<Range<usize>> {
+    let is_word =
+        |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+    let mut ranges = Vec::new();
+    if needle.is_empty() {
+        return ranges;
+    }
+    let mut from = 0;
+    while let Some(found) = text[from..].find(needle) {
+        let start = from + found;
+        let end = start + needle.len();
+        let clean = !text[..start].chars().next_back().is_some_and(is_word)
+            && !text[end..].chars().next().is_some_and(is_word);
+        if clean {
+            ranges.push(start..end);
+        }
+        from = end;
+    }
+    ranges
+}
+
+/// Edits of every `TextDocumentEdit` of one answer, each in the coordinates of the text
+/// after the one before it. `None` when any of them overlaps, so nothing applies.
+fn server_batches(
+    store: &RopeStore,
+    sources: impl IntoIterator<Item = Vec<DocumentEdit>>,
+) -> Option<Vec<Vec<Edit>>> {
+    let mut probe = store.clone();
+    let mut format = text_core::FileFormat::default();
+    let mut batches = Vec::new();
+    for edits in sources {
+        if edits.is_empty() {
+            continue;
+        }
+        let edits = server_edits(&probe, edits)?;
+        text_core::apply_edits(&mut probe, &mut format, &edits);
+        batches.push(edits);
+    }
+    Some(batches)
+}
+
+fn whole(store: &RopeStore) -> TextSpan {
+    TextSpan {
+        start: TextPoint::default(),
+        end: point_at(store, store.len()),
+    }
+}
+
+impl EditorView {
+    pub(crate) fn asked_version(&self) -> Option<(String, i32, usize)> {
+        let (lsp, state) = (self.lsp.as_ref()?, self.state.as_ref()?);
+        let caret = state.selections().primary().head;
+        Some((lsp.uri.clone(), state.version() as i32, caret))
+    }
+
+    /// Edits in the coordinates of this document as it is now, as one undo step.
+    pub fn apply_document_edits(&mut self, edits: Vec<DocumentEdit>, cx: &mut Context<Self>) {
+        self.apply_document_batches(vec![edits], cx);
+    }
+
+    /// Several `TextDocumentEdit`s of this file from one answer. Each works on the text
+    /// after the one before it and all undo in one step.
+    pub fn apply_document_batches(
+        &mut self,
+        batches: Vec<Vec<DocumentEdit>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.catch_up(cx);
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let caret = state.selections().primary().head;
+        let Some(batches) = server_batches(&state.store(), batches) else {
+            self.show_note(caret, OVERLAPPING, cx);
+            return;
+        };
+        let change = state.apply_edits_batches(batches);
+        self.changed(change, cx);
+    }
+
+    /// Applies a change if the text is still the one asked about. A change of this
+    /// document alone applies here; one that reaches other files or moves files goes
+    /// to the window, which applies every part of it.
+    ///
+    /// Each `TextDocumentEdit` applies to the text after the one before it, as LSP
+    /// says. All of them are checked first: if any one overlaps, nothing is applied.
+    pub(crate) fn apply_change(
+        &mut self,
+        version: i32,
+        change: WorkspaceChange,
+        cx: &mut Context<Self>,
+    ) {
+        self.catch_up(cx);
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return;
+        };
+        if state.version() as i32 != version || change.is_empty() {
+            return;
+        }
+        let local = change.renames.is_empty()
+            && change
+                .edits
+                .iter()
+                .all(|source| source.uri == lsp.uri || source.edits.is_empty());
+        if !local {
+            cx.emit(EditorEvent::ApplyChange(change));
+            return;
+        }
+        let caret = state.selections().primary().head;
+        let sources = change.edits.into_iter().map(|source| source.edits);
+        let Some(batches) = server_batches(&state.store(), sources) else {
+            self.show_note(caret, OVERLAPPING, cx);
+            return;
+        };
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let change = state.apply_edits_batches(batches);
+        self.changed(change, cx);
+    }
+
+    fn apply_entry(&mut self, version: i32, entry: ActionEntry, cx: &mut Context<Self>) {
+        let change = WorkspaceChange {
+            edits: entry.edits,
+            renames: entry.renames,
+        };
+        self.apply_change(version, change, cx);
+    }
+
+    /// Applies a correction of a misspelled word. A piece of a declaration name
+    /// renames the symbol, so every use follows; a word of prose is a plain edit.
+    fn apply_correction(
+        &mut self,
+        version: i32,
+        range: Range<usize>,
+        replacement: String,
+        declaration: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return;
+        };
+        if state.version() as i32 != version {
+            return;
+        }
+        if !declaration {
+            let span = TextSpan {
+                start: point_at(&state.store(), range.start),
+                end: point_at(&state.store(), range.end),
+            };
+            self.apply_document_edits(
+                vec![DocumentEdit {
+                    span,
+                    text: replacement,
+                }],
+                cx,
+            );
+            return;
+        }
+        let Some(provider) = lsp.support.rename() else {
+            let span = TextSpan {
+                start: point_at(&state.store(), range.start),
+                end: point_at(&state.store(), range.end),
+            };
+            self.apply_document_edits(
+                vec![DocumentEdit {
+                    span,
+                    text: replacement,
+                }],
+                cx,
+            );
+            return;
+        };
+        let text = state.text();
+        let (start, end) = Self::identifier_around(&text, range.clone());
+        let new_name = format!(
+            "{}{}{}",
+            &text[start..range.start],
+            replacement,
+            &text[range.end..end]
+        );
+        let Some(spot) = self.spot_at(start) else {
+            return;
+        };
+        let replies = ask(provider, lang_api::RenameQuery { spot, new_name });
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                if let Some((change, _)) = answer {
+                    this.apply_change(version, change, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The bytes of the identifier around `range`, which is a piece of it.
+    fn identifier_around(text: &str, range: Range<usize>) -> (usize, usize) {
+        let is_name =
+            |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+        let mut start = range.start.min(text.len());
+        while start > 0 {
+            let character = text[..start].chars().next_back().unwrap_or(' ');
+            if !is_name(character) {
+                break;
+            }
+            start -= character.len_utf8();
+        }
+        let mut end = range.end.min(text.len());
+        while end < text.len() {
+            let character = text[end..].chars().next().unwrap_or(' ');
+            if !is_name(character) {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        (start, end)
+    }
+
+    /// Opens a pick list at the caret, or says `empty` when there is nothing.
+    pub(crate) fn show_picks(
+        &mut self,
+        at: usize,
+        rows: Vec<Pick>,
+        empty: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if rows.is_empty() {
+            self.show_note(at, empty.to_owned(), cx);
+            return;
+        }
+        if let Some(lsp) = &mut self.lsp {
+            lsp.completion = None;
+            lsp.note = None;
+            lsp.move_to = None;
+            lsp.actions = Some(ActionMenu {
+                at,
+                rows,
+                sections: Vec::new(),
+                selected: 0,
+                preview_task: None,
+            });
+            cx.notify();
+        }
+    }
+
+    /// Ctrl+Alt+L: the whole file, through the flags of the Reformat File dialog.
+    pub(crate) fn reformat(&mut self, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::Reformat);
+    }
+
+    pub(crate) fn ask_actions(
+        &mut self,
+        span: TextSpan,
+        only: Option<ActionKind>,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, i32, usize, Vec<ActionEntry>, &mut Context<Self>) + 'static,
+    ) {
+        let Some((uri, version, caret)) = self.asked_version() else {
+            return;
+        };
+        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.actions()) else {
+            return;
+        };
+        let query = ActionQuery {
+            uri,
+            version,
+            span,
+            only,
+        };
+        let replies = ask(provider, query);
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| match answer {
+                Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
+                Some((entries, _)) => done(this, version, caret, entries, cx),
+                None => {}
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ctrl+Alt+O.
+    pub(crate) fn optimize_imports(&mut self, cx: &mut Context<Self>) {
+        let Some(span) = self.state.as_ref().map(|state| whole(&state.store())) else {
+            return;
+        };
+        let only = Some(ActionKind::OrganizeImports);
+        self.ask_actions(span, only, cx, |this, version, _, entries, cx| {
+            if let Some(entry) = entries.into_iter().next() {
+                this.apply_entry(version, entry, cx);
+            }
+        });
+    }
+
+    /// The selection, or the caret, as a span.
+    pub(crate) fn selection_span(&self) -> Option<TextSpan> {
+        let state = self.state.as_ref()?;
+        let selection = state.selections().primary();
+        Some(TextSpan {
+            start: point_at(&state.store(), selection.start()),
+            end: point_at(&state.store(), selection.end()),
+        })
+    }
+
+    /// Alt+Enter: fixes of the problem under the caret first, then the suppressions of
+    /// its check and the other actions.
+    pub(crate) fn show_actions(&mut self, cx: &mut Context<Self>) {
+        self.before_actions_popup(cx);
+        let Some(span) = self.selection_span() else {
+            return;
+        };
+        let caret = self
+            .state
+            .as_ref()
+            .map_or(0, |state| state.selections().primary().head);
+        let mut own: Vec<(MenuSection, Pick)> = self
+            .own_action_rows()
+            .into_iter()
+            .map(|row| (row.section(), row))
+            .collect();
+        own.extend(
+            self.inspection_picks(caret)
+                .into_iter()
+                .map(|row| (row.section(), row)),
+        );
+        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.actions()) else {
+            if own.is_empty() {
+                self.show_transient_note(caret, NO_ACTIONS, cx);
+            } else {
+                self.show_action_sections(caret, own, cx);
+            }
+            return;
+        };
+        let Some((uri, version, _)) = self.asked_version() else {
+            return;
+        };
+        let replies = ask(
+            provider,
+            ActionQuery {
+                uri,
+                version,
+                span,
+                only: None,
+            },
+        );
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let unknown = answer
+                    .as_ref()
+                    .is_none_or(|(_, confidence)| *confidence == Confidence::Unknown);
+                let mut entries: Vec<ActionEntry> = match answer {
+                    Some((mut entries, Confidence::Unknown)) => {
+                        entries.clear();
+                        entries
+                    }
+                    Some((entries, _)) => entries,
+                    None => Vec::new(),
+                };
+                entries.sort_by_key(|entry| {
+                    (section_of(entry) != MenuSection::QuickFix, !entry.preferred)
+                });
+                let entries = without_duplicate_actions(entries);
+                let mut rows: Vec<(MenuSection, Pick)> = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        !entry.edits.is_empty()
+                            || !entry.renames.is_empty()
+                            || entry.resolve.is_some()
+                    })
+                    .map(|entry| (section_of(&entry), Pick::Action(entry)))
+                    .collect();
+                rows.extend(own);
+                if rows.is_empty() {
+                    if unknown {
+                        this.show_transient_note(caret, NO_ANSWER, cx);
+                    } else {
+                        this.show_transient_note(caret, NO_ACTIONS, cx);
+                    }
+                } else {
+                    this.show_action_sections(caret, rows, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Shows the sections of Alt+Enter: the quick fixes first, then the intentions,
+    /// each row with the bulb of its section.
+    fn show_action_sections(
+        &mut self,
+        at: usize,
+        mut rows: Vec<(MenuSection, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        // The sort is stable: the order the language and the editor gave inside a
+        // section stays as it is.
+        rows.sort_by_key(|(section, _)| *section != MenuSection::QuickFix);
+        let sections = rows.iter().map(|(section, _)| *section).collect();
+        let rows = rows.into_iter().map(|(_, row)| row).collect();
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        lsp.completion = None;
+        lsp.note = None;
+        lsp.move_to = None;
+        lsp.actions = Some(ActionMenu {
+            at,
+            rows,
+            sections,
+            selected: 0,
+            preview_task: None,
+        });
+        cx.notify();
+        self.request_action_preview(cx);
+    }
+
+    /// The change the selected row would make, in the current document, when the
+    /// language gave its edits with the action. `None` when there is nothing to show.
+    pub(crate) fn action_preview(&self, menu: &ActionMenu) -> Option<ActionPreview> {
+        let Some(Pick::Action(entry)) = menu.rows.get(menu.selected) else {
+            return None;
+        };
+        let state = self.state.as_ref()?;
+        let uri = self.lsp.as_ref()?.uri.as_str();
+        let source = entry.edits.iter().find(|edit| edit.uri == uri)?;
+        if source.edits.is_empty() {
+            return None;
+        }
+        let store = state.store();
+        let mut lines = Vec::new();
+        for edit in source.edits.iter().take(6) {
+            let start = offset_at(&store, edit.span.start);
+            let end = offset_at(&store, edit.span.end).max(start);
+            let before = store.slice(start..end);
+            for line in before.lines().take(4) {
+                lines.push(format!("- {line}"));
+            }
+            let text = edit.text.replace("\r\n", "\n");
+            for line in text.lines().take(8) {
+                lines.push(format!("+ {line}"));
+            }
+            if lines.len() >= 16 {
+                break;
+            }
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        lines.truncate(16);
+        Some(ActionPreview {
+            title: entry.title.clone(),
+            lines,
+        })
+    }
+
+    /// Asks the language for the edit of the selected row when the row has none: a
+    /// server that sends its code actions without edits fills them in on resolve. The
+    /// list does not wait; the preview appears when the answer comes.
+    fn request_action_preview(&mut self, cx: &mut Context<Self>) {
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return;
+        };
+        let Some(menu) = &lsp.actions else {
+            return;
+        };
+        let Some(Pick::Action(entry)) = menu.rows.get(menu.selected) else {
+            return;
+        };
+        if !entry.edits.is_empty() || !entry.renames.is_empty() {
+            return;
+        }
+        let Some(resolve) = entry.resolve.clone() else {
+            return;
+        };
+        let Some(provider) = lsp.support.action_resolve() else {
+            return;
+        };
+        let uri = lsp.uri.clone();
+        let version = state.version() as i32;
+        let title = entry.title.clone();
+        let replies = ask(
+            provider,
+            ActionResolveQuery {
+                uri,
+                version,
+                resolve,
+            },
+        );
+        let task = cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let Some((Some(resolved), _)) = answer else {
+                    return;
+                };
+                let Some(lsp) = &mut this.lsp else {
+                    return;
+                };
+                let Some(menu) = &mut lsp.actions else {
+                    return;
+                };
+                let Some(Pick::Action(entry)) = menu.rows.get_mut(menu.selected) else {
+                    return;
+                };
+                // The row may have changed while the answer was on its way.
+                if entry.title != title || !entry.edits.is_empty() {
+                    return;
+                }
+                *entry = resolved;
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(lsp) = &mut self.lsp
+            && let Some(menu) = &mut lsp.actions
+        {
+            menu.preview_task = Some(task);
+        }
+    }
+
+    /// Applies a row whose server computes the edit only on resolve, once the answer
+    /// comes. The text is checked against the version the list was opened on.
+    fn resolve_and_apply(&mut self, entry: ActionEntry, version: i32, cx: &mut Context<Self>) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let Some(resolve) = entry.resolve.clone() else {
+            return;
+        };
+        let Some(provider) = lsp.support.action_resolve() else {
+            return;
+        };
+        let uri = lsp.uri.clone();
+        let replies = ask(
+            provider,
+            ActionResolveQuery {
+                uri,
+                version,
+                resolve,
+            },
+        );
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                if let Some((Some(resolved), _)) = answer {
+                    this.apply_entry(version, resolved, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The rows of ALT+Enter that the window adds beside the language actions, such as
+    /// Create Test on the name of a type or an inline watch on a value.
+    fn own_action_rows(&self) -> Vec<Pick> {
+        let Some(state) = &self.state else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        if self.inline_watch_ready
+            && let Some((line, expression)) = self.inline_watch_at_caret()
+        {
+            rows.push(Pick::InlineWatch { line, expression });
+        }
+        let Some(lsp) = &self.lsp else {
+            return rows;
+        };
+        let caret = state.selections().primary().head;
+        rows.extend(self.spelling_picks(caret));
+        if !lsp.support.can_create_test(&state.text(), caret) {
+            return rows;
+        }
+        if let Some(spot) = self.spot_at(caret) {
+            rows.push(Pick::CreateTest { spot });
+        }
+        rows
+    }
+
+    /// The rows of a misspelled word: its corrections, saving the word to a dictionary
+    /// and turning the check off.
+    fn spelling_picks(&self, caret: usize) -> Vec<Pick> {
+        let Some(mark) = self.spelling_mark_at(caret) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for suggestion in &mark.suggestions {
+            rows.push(Pick::Spelling {
+                label: format!("Change to '{suggestion}'"),
+                range: mark.range.clone(),
+                replacement: suggestion.clone(),
+                declaration: mark.declaration,
+            });
+        }
+        rows.push(Pick::SaveSpelling {
+            label: format!("Save '{}' to project dictionary", mark.word),
+            word: mark.word.clone(),
+            project: true,
+        });
+        rows.push(Pick::SaveSpelling {
+            label: "Save to application dictionary".to_owned(),
+            word: mark.word.clone(),
+            project: false,
+        });
+        rows.push(Pick::DisableInspection {
+            label: "Disable spell checking".to_owned(),
+            id: lang_api::SPELLING_INSPECTION.to_owned(),
+            title: lang_api::SPELLING_TITLE.to_owned(),
+        });
+        rows
+    }
+    fn inspection_picks(&self, caret: usize) -> Vec<Pick> {
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return Vec::new();
+        };
+        let Some(mark) = lsp
+            .server_marks
+            .iter()
+            .chain(lsp.native_marks.values().flatten())
+            .find(|mark| mark.range.start <= caret && caret <= mark.range.end)
+        else {
+            return Vec::new();
+        };
+        // The spelling check names itself in the rows of [`Self::spelling_picks`].
+        if mark.code.as_deref() == Some(lang_api::SPELLING_INSPECTION) {
+            return Vec::new();
+        }
+        let Some(code) = mark.code.clone() else {
+            return Vec::new();
+        };
+        let support = lsp.support.clone();
+        let catalog = support.inspections();
+        let info = support
+            .inspection_of(Some(&code), &mark.message)
+            .or_else(|| catalog.iter().find(|info| info.id == code).cloned());
+        let Some(info) = info else {
+            return Vec::new();
+        };
+        let text = state.text();
+        let text: std::sync::Arc<str> = text.into();
+        let mut rows = Vec::new();
+        let annotation = |target| {
+            support.suppression_edit(SuppressionQuery {
+                text: text.clone(),
+                offset: mark.range.start,
+                code: Some(code.clone()),
+                target,
+            })
+        };
+        if let Some(edit) = annotation(SuppressionTarget::Statement) {
+            rows.push(Pick::Suppress {
+                label: "Suppress for statement".to_owned(),
+                edit,
+            });
+            if let Some(edit) = annotation(SuppressionTarget::Method) {
+                rows.push(Pick::Suppress {
+                    label: "Suppress for method".to_owned(),
+                    edit,
+                });
+            }
+            if let Some(edit) = annotation(SuppressionTarget::Class) {
+                rows.push(Pick::Suppress {
+                    label: "Suppress for class".to_owned(),
+                    edit,
+                });
+            }
+        } else if info.configurable {
+            let line = state.store().offset_to_line(mark.range.start);
+            let line_start = state.store().line_to_offset(line);
+            let indent: String = text[line_start..]
+                .chars()
+                .take_while(|character| character.is_whitespace() && *character != '\n')
+                .collect();
+            rows.push(Pick::Suppress {
+                label: "Suppress for statement".to_owned(),
+                edit: DocumentEdit {
+                    span: TextSpan {
+                        start: TextPoint {
+                            line: line as u32,
+                            character: 0,
+                        },
+                        end: TextPoint {
+                            line: line as u32,
+                            character: 0,
+                        },
+                    },
+                    text: format!("{indent}//noinspection {}\n", info.id),
+                },
+            });
+        }
+        if info.configurable {
+            rows.push(Pick::DisableInspection {
+                label: format!("Disable inspection '{}'", info.title),
+                id: info.id.clone(),
+                title: info.title.clone(),
+            });
+            rows.push(Pick::EditInspection {
+                label: "Edit inspection profile setting".to_owned(),
+                id: info.id,
+            });
+        }
+        rows
+    }
+
+    /// Keys of an open action list. Returns whether the key was taken; Escape is
+    /// closed by the popup rules of the view.
+    pub(crate) fn action_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(lsp) = &mut self.lsp else {
+            return false;
+        };
+        let Some(menu) = &mut lsp.actions else {
+            return false;
+        };
+        let rows = menu.rows.len();
+        let mut moved = false;
+        match key {
+            "up" => {
+                menu.selected = (menu.selected + rows - 1) % rows;
+                menu.preview_task = None;
+                moved = true;
+            }
+            "down" => {
+                menu.selected = (menu.selected + 1) % rows;
+                menu.preview_task = None;
+                moved = true;
+            }
+            "enter" | "tab" => {
+                let picked = lsp.actions.take().map(|mut menu| {
+                    let selected = menu.selected;
+                    menu.rows.swap_remove(selected)
+                });
+                let version = self.state.as_ref().map(|state| state.version() as i32);
+                match (picked, version) {
+                    (Some(Pick::Action(entry)), Some(version)) => {
+                        if entry.edits.is_empty()
+                            && entry.renames.is_empty()
+                            && entry.resolve.is_some()
+                        {
+                            self.resolve_and_apply(entry, version, cx);
+                        } else {
+                            self.apply_entry(version, entry, cx);
+                        }
+                    }
+                    (Some(Pick::ChangeSignature { .. }), _) => self.change_signature(cx),
+                    (Some(Pick::Refactor { own, .. }), _) => self.run_own(own, cx),
+                    (Some(Pick::Form { handle, .. }), _) => {
+                        cx.emit(EditorEvent::RefactorForm(handle))
+                    }
+                    (Some(Pick::Place { target, .. }), _) => self.go_to_location(&target, cx),
+                    (Some(Pick::Generate { kind, .. }), _) => self.start_generation(kind, cx),
+                    (Some(Pick::Unwrap { edit, .. }), _) => self.apply_unwrap(edit, cx),
+                    (Some(Pick::Suppress { edit, .. }), _) => {
+                        self.apply_document_edits(vec![edit], cx);
+                    }
+                    (Some(Pick::DisableInspection { id, title, .. }), _) => {
+                        cx.emit(EditorEvent::DisableInspection { id, title })
+                    }
+                    (Some(Pick::EditInspection { id, .. }), _) => {
+                        cx.emit(EditorEvent::EditInspection(id))
+                    }
+                    (Some(Pick::CreateTest { spot }), _) => cx.emit(EditorEvent::CreateTest(spot)),
+                    (Some(Pick::InlineWatch { line, expression }), _) => {
+                        cx.emit(EditorEvent::AddInlineWatch { line, expression })
+                    }
+                    (
+                        Some(Pick::Spelling {
+                            range,
+                            replacement,
+                            declaration,
+                            ..
+                        }),
+                        Some(version),
+                    ) => self.apply_correction(version, range, replacement, declaration, cx),
+                    (Some(Pick::SaveSpelling { word, project, .. }), _) => {
+                        cx.emit(EditorEvent::SaveSpelling { word, project })
+                    }
+                    _ => {}
+                }
+            }
+            _ => return false,
+        }
+        if moved {
+            self.highlight_action_row();
+            self.request_action_preview(cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Marks the text an Unwrap choice leaves in place, so the pick list shows what
+    /// stays before Enter applies it.
+    pub(crate) fn highlight_action_row(&mut self) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let Some(menu) = &lsp.actions else {
+            return;
+        };
+        let Some(Pick::Unwrap { edit, .. }) = menu.rows.get(menu.selected) else {
+            return;
+        };
+        lsp.highlights = std::iter::once(edit.start..edit.end).collect();
+    }
+
+    /// Ctrl+Shift+F7: shows every occurrence of the thing under the caret, from the
+    /// language server when it answers and from the whole words of the text otherwise.
+    pub(crate) fn highlight_usages(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let selection = state.selections().primary();
+        let word = state.caret_word().or_else(|| {
+            (!selection.is_empty())
+                .then(|| text_core::commands::word_at(&state.store(), selection.start()))
+                .filter(|word| !word.is_empty())
+        });
+        let Some(word) = word else {
+            return;
+        };
+        let needle = state.store().slice(word);
+        self.usages = Some(word_ranges(&state.text(), &needle));
+        let Some(support) = self.lsp.as_ref().map(|lsp| lsp.support.clone()) else {
+            cx.notify();
+            return;
+        };
+        let Some(provider) = support.highlights() else {
+            cx.notify();
+            return;
+        };
+        let Some((spot, _)) = self.spot() else {
+            cx.notify();
+            return;
+        };
+        let version = spot.version;
+        let asked = match &mut self.lsp {
+            Some(lsp) => {
+                lsp.highlight_asked += 1;
+                lsp.highlight_asked
+            }
+            None => {
+                cx.notify();
+                return;
+            }
+        };
+        let replies = ask(provider, spot);
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let Some((spans, _)) = answer else {
+                    return;
+                };
+                let (Some(lsp), Some(state)) = (&mut this.lsp, &this.state) else {
+                    return;
+                };
+                if lsp.highlight_asked != asked
+                    || state.version() as i32 != version
+                    || this.usages.is_none()
+                {
+                    return;
+                }
+                let store = state.store();
+                let mut ranges: Vec<Range<usize>> = spans
+                    .into_iter()
+                    .map(|span| {
+                        let start = offset_at(&store, span.start);
+                        start..offset_at(&store, span.end).max(start)
+                    })
+                    .collect();
+                ranges.sort_by_key(|range| range.start);
+                this.usages = Some(ranges);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// F3 and Shift+F3 while Highlight Usages is on.
+    pub(crate) fn step_usage(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let (Some(usages), Some(state)) = (self.usages.clone(), &mut self.state) else {
+            return;
+        };
+        let selection = state.selections().primary();
+        let (start, end) = (selection.start(), selection.end());
+        let empty = selection.is_empty();
+        let target = if forward {
+            usages
+                .iter()
+                .find(|range| {
+                    if empty {
+                        range.start > start
+                    } else {
+                        range.start >= end
+                    }
+                })
+                .or_else(|| usages.first())
+        } else {
+            usages
+                .iter()
+                .rev()
+                .find(|range| {
+                    if empty {
+                        range.end < start
+                    } else {
+                        range.end <= start
+                    }
+                })
+                .or_else(|| usages.last())
+        };
+        let Some(target) = target else {
+            return;
+        };
+        state.select_range(target.clone());
+        self.autoscroll = true;
+        self.caret_on = true;
+        cx.notify();
+    }
+
+    /// Asks for the occurrences under the caret once it rests.
+    pub(crate) fn highlight_later(&mut self, cx: &mut Context<Self>) {
+        let caret = self
+            .state
+            .as_ref()
+            .map(|state| state.selections().primary().head);
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if lsp.support.highlights().is_none() {
+            return;
+        }
+        lsp.highlight_asked += 1;
+        let asked = lsp.highlight_asked;
+        // Occurrences stay while the caret is on one of them, so they do not blink.
+        let on_one = caret.is_some_and(|caret| {
+            lsp.highlights
+                .iter()
+                .any(|range| range.start <= caret && caret <= range.end)
+        });
+        if !on_one {
+            lsp.highlights.clear();
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HIGHLIGHT_DELAY).await;
+            this.update(cx, |this, cx| this.highlight(asked, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn highlight(&mut self, asked: u64, cx: &mut Context<Self>) {
+        let Some((spot, _)) = self.spot() else {
+            return;
+        };
+        let Some(lsp) = &self.lsp else {
+            return;
+        };
+        if lsp.highlight_asked != asked {
+            return;
+        }
+        let Some(provider) = lsp.support.highlights() else {
+            return;
+        };
+        let version = spot.version;
+        let replies = ask(provider, spot);
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let (Some(lsp), Some(state)) = (&mut this.lsp, &this.state) else {
+                    return;
+                };
+                if lsp.highlight_asked != asked || state.version() as i32 != version {
+                    return;
+                }
+                let spans = answer.map(|(spans, _)| spans).unwrap_or_default();
+                let store = state.store();
+                lsp.highlights = spans
+                    .into_iter()
+                    .map(|span| {
+                        let start = offset_at(&store, span.start);
+                        start..offset_at(&store, span.end).max(start)
+                    })
+                    .collect();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// The rows of a pick list without the same action twice: a server can offer one fix as
+/// a quick fix and as a source action, with one title and one edit or command. The row
+/// with the better kind stays, because the sort put it first.
+fn without_duplicate_actions(entries: Vec<ActionEntry>) -> Vec<ActionEntry> {
+    let mut kept: Vec<ActionEntry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let duplicate = kept.iter().any(|known| {
+            known.title == entry.title
+                && known.handle == entry.handle
+                && known.resolve == entry.resolve
+                && known.edits == entry.edits
+                && known.renames == entry.renames
+        });
+        if !duplicate {
+            kept.push(entry);
+        }
+    }
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    use lang_api::{DocumentEdit, TextPoint, TextSpan};
+    use text_core::{FileFormat, RopeStore, TextStore};
+
+    use super::{server_batches, server_edits, without_duplicate_actions};
+    use crate::EditorState;
+
+    const TEXT: &str = "import b;\nimport a;\nclass X {}\n";
+
+    fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> DocumentEdit {
+        let point = |(line, character)| TextPoint { line, character };
+        DocumentEdit {
+            span: TextSpan {
+                start: point(start),
+                end: point(end),
+            },
+            text: text.to_owned(),
+        }
+    }
+
+    /// What the editor does with an answer: sort, check, apply as one step.
+    fn apply(edits: Vec<DocumentEdit>) -> Option<String> {
+        let mut state = EditorState::new(TEXT, FileFormat::default(), None, false);
+        let edits = server_edits(&RopeStore::from_text(TEXT), edits)?;
+        state.apply_edits(edits);
+        Some(state.text())
+    }
+
+    // The cases of the qa check of T-0025: lists a server may send.
+
+    #[test]
+    fn one_action_offered_twice_stays_once() {
+        use lang_api::{ActionEntry, ActionKind};
+
+        let entry = |kind: ActionKind, title: &str, code: &str| ActionEntry {
+            title: title.to_owned(),
+            kind: Some(kind),
+            code: Some(code.to_owned()),
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: None,
+            resolve: None,
+        };
+        // The unused import comes back as a quick fix and as a source action, with the
+        // same title and the same edit but a code of its own kind.
+        let rows = without_duplicate_actions(vec![
+            entry(ActionKind::QuickFix, "Organize imports", "quickfix.import"),
+            entry(
+                ActionKind::Source,
+                "Organize imports",
+                "source.organizeImports",
+            ),
+            entry(ActionKind::Source, "Sort members", "source.sortMembers"),
+        ]);
+        let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
+        assert_eq!(titles, ["Organize imports", "Sort members"]);
+    }
+
+    #[test]
+    fn actions_that_differ_in_their_edit_are_kept_apart() {
+        use lang_api::ActionEntry;
+
+        let entry = |text: &str| ActionEntry {
+            title: "Organize imports".to_owned(),
+            kind: None,
+            code: None,
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: Some(text.to_owned()),
+            resolve: None,
+        };
+        let rows = without_duplicate_actions(vec![entry("first"), entry("first"), entry("second")]);
+        assert_eq!(rows.len(), 2, "the same form is one row");
+    }
+
+    #[test]
+    fn unsorted_edits_apply_in_the_order_of_the_text() {
+        let edits = vec![
+            edit((1, 0), (1, 9), "import c;"),
+            edit((0, 0), (0, 9), "import z;"),
+        ];
+        assert_eq!(
+            apply(edits).as_deref(),
+            Some("import z;\nimport c;\nclass X {}\n")
+        );
+    }
+
+    #[test]
+    fn inserts_at_one_place_keep_the_order_of_the_answer() {
+        let edits = vec![edit((0, 0), (0, 0), "A\n"), edit((0, 0), (0, 0), "B\n")];
+        assert_eq!(
+            apply(edits).as_deref(),
+            Some("A\nB\nimport b;\nimport a;\nclass X {}\n")
+        );
+    }
+
+    #[test]
+    fn overlapping_edits_change_nothing() {
+        let edits = vec![edit((0, 0), (0, 9), "x"), edit((0, 5), (1, 2), "y")];
+        assert_eq!(apply(edits), None);
+    }
+
+    #[test]
+    fn an_insert_where_a_replace_starts_is_not_an_overlap() {
+        let edits = vec![
+            edit((0, 0), (0, 9), "import z;"),
+            edit((0, 0), (0, 0), "// a\n"),
+        ];
+        assert_eq!(
+            apply(edits).as_deref(),
+            Some("// a\nimport z;\nimport a;\nclass X {}\n")
+        );
+    }
+
+    #[test]
+    fn one_overlapping_document_edit_stops_all_of_them() {
+        let sources = vec![
+            vec![edit((0, 0), (0, 9), "import z;")],
+            vec![edit((0, 0), (0, 9), "x"), edit((0, 5), (1, 2), "y")],
+        ];
+        assert!(server_batches(&RopeStore::from_text(TEXT), sources).is_none());
+    }
+
+    #[test]
+    fn several_document_edits_of_one_answer_undo_in_one_step() {
+        let sources = vec![
+            vec![edit((0, 0), (0, 0), "// header\n")],
+            vec![edit((0, 0), (1, 0), "// changed\n")],
+        ];
+        let batches = server_batches(&RopeStore::from_text(TEXT), sources).unwrap();
+        let mut state = EditorState::new(TEXT, FileFormat::default(), None, false);
+        state.apply_edits_batches(batches);
+        assert_eq!(
+            state.text(),
+            "// changed\nimport b;\nimport a;\nclass X {}\n"
+        );
+        state.perform(keymap::editor::UNDO, 10);
+        assert_eq!(state.text(), TEXT);
+    }
+
+    #[test]
+    fn each_document_edit_works_on_the_text_of_the_one_before() {
+        // The first edit adds a line; the second one replaces it by its new place.
+        let sources = vec![
+            vec![edit((0, 0), (0, 0), "// header\n")],
+            vec![edit((0, 0), (1, 0), "// changed\n")],
+        ];
+        let batches = server_batches(&RopeStore::from_text(TEXT), sources).unwrap();
+        let mut store = RopeStore::from_text(TEXT);
+        let mut format = FileFormat::default();
+        for edits in batches {
+            text_core::apply_edits(&mut store, &mut format, &edits);
+        }
+        assert_eq!(
+            store.text(),
+            "// changed\nimport b;\nimport a;\nclass X {}\n"
+        );
+    }
+}

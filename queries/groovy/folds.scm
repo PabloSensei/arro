@@ -1,0 +1,9 @@
+(block) @fold
+(class_body) @fold
+(interface_body) @fold
+(enum_body) @fold
+(annotation_type_body) @fold
+(constructor_body) @fold
+(switch_block) @fold
+(closure) @fold
+(array_initializer) @fold

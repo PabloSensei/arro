@@ -1,0 +1,307 @@
+# Single source of budget values, see docs/ARCHITECTURE.md section 6.
+# All values are targets, not measurements.
+#
+# target        exceeding it produces a warning
+# limit         exceeding it fails the build
+# applies_from  first stage where the metric is enforced
+# pending       spike that sets the value; used instead of target and limit
+# observe       recorded in the report, never fails the build; takes no values
+
+[[metric]]
+id = "first_frame"
+unit = "ms"
+target = 250
+limit = 500
+applies_from = "M11"
+
+[[metric]]
+id = "editable_caret_50k_loc_cached"
+unit = "ms"
+target = 600
+limit = 1000
+applies_from = "M11"
+reference = "Zed 420 ms on macOS"
+
+[[metric]]
+id = "hover_press_to_changed_frame"
+unit = "frames"
+target = 1
+limit = 2
+applies_from = "M11"
+
+[[metric]]
+id = "dropped_frames_animation_hover_resize"
+unit = "percent_frames"
+target = 0
+limit = 0.1
+applies_from = "M11"
+reference = "at the monitor refresh rate, up to 165 Hz"
+
+[[metric]]
+id = "open_menu_popup_tooltip"
+unit = "ms"
+target = 16
+limit = 33
+applies_from = "M11"
+
+[[metric]]
+id = "switch_tab_file_already_open"
+unit = "ms"
+target = 16
+limit = 33
+applies_from = "M11"
+
+[[metric]]
+id = "theme_switch"
+unit = "ms"
+target = 100
+limit = 200
+applies_from = "M11"
+
+[[metric]]
+id = "window_resize_and_monitor_move_black_frames"
+unit = "count"
+target = 0
+limit = 0
+applies_from = "M11"
+reference = "no black frames and no flicker"
+
+[[metric]]
+id = "idle_cpu_with_caret"
+unit = "percent_core"
+target = 0.5
+limit = 1
+applies_from = "M11"
+reference = "0 repaints without focus"
+
+[[metric]]
+id = "keydown_to_present_p95"
+unit = "ms"
+target = 8
+limit = 12
+applies_from = "M11"
+
+[[metric]]
+id = "keypress_to_photon_60hz"
+unit = "ms"
+target = 25
+limit = 35
+applies_from = "M11"
+reference = "Typometer, manual at milestones"
+
+[[metric]]
+id = "scroll_100k_lines_frames_over_monitor_period"
+unit = "percent_frames"
+target = 0
+limit = 0.1
+applies_from = "M11"
+reference = "S1 measured p99 frame 2.4 ms at 165 Hz"
+
+[[metric]]
+id = "open_file_100k_lines"
+unit = "ms"
+target = 200
+limit = 500
+applies_from = "M11"
+
+[[metric]]
+id = "search_everywhere_open"
+unit = "ms"
+target = 33
+limit = 50
+applies_from = "M11"
+
+[[metric]]
+id = "fuzzy_100k_names_keypress"
+unit = "ms"
+target = 16
+limit = 30
+applies_from = "M11"
+
+[[metric]]
+id = "find_in_files_first_result"
+unit = "ms"
+target = 50
+limit = 100
+applies_from = "M11"
+
+[[metric]]
+id = "find_in_files_15k_files_warm"
+unit = "ms"
+target = 300
+limit = 500
+applies_from = "M11"
+reference = "rg 234 ms (measured)"
+
+[[metric]]
+id = "find_in_files_15k_files_cold"
+unit = "ms"
+target = 1000
+limit = 2000
+applies_from = "M11"
+reference = "0.5-0.7 s (estimate)"
+
+[[metric]]
+id = "source_index_15k_files"
+unit = "ms"
+target = 3000
+limit = 5000
+applies_from = "M11"
+reference = "limit is for 8 threads"
+
+[[metric]]
+id = "completion_keypress_to_list_p95"
+unit = "ms"
+target = 50
+limit = 100
+applies_from = "M11"
+reference = "Javelin warm p95 0.6 ms, after_edit 39.6 ms on 540 KB (measured, other code)"
+
+[[metric]]
+id = "completion_jdtls_p95"
+unit = "ms"
+pending = "S9"
+applies_from = "M11"
+reference = "the jdtls wait window alone is 150-300 ms"
+
+[[metric]]
+id = "ctrl_b_certain_p95"
+unit = "ms"
+target = 30
+limit = 60
+applies_from = "M11"
+
+[[metric]]
+id = "ctrl_b_jdtls_p95"
+unit = "ms"
+pending = "S9"
+applies_from = "M11"
+reference = "the jdtls wait window alone is 150-300 ms"
+
+[[metric]]
+id = "t1_after_debounce"
+unit = "ms"
+target = 100
+limit = 200
+applies_from = "M11"
+
+[[metric]]
+id = "t2_single_file"
+unit = "ms"
+target = 1500
+limit = 3000
+applies_from = "M11"
+reference = "cold javac 0.4 s on a trivial classpath (measured)"
+
+[[metric]]
+id = "find_usages_rare_name_15k_files"
+unit = "ms"
+target = 1000
+limit = 2000
+applies_from = "M11"
+
+[[metric]]
+id = "git_status_update"
+unit = "ms"
+target = 100
+limit = 200
+applies_from = "M11"
+reference = "CLI 33 ms (measured)"
+
+[[metric]]
+id = "first_jdk_index"
+unit = "ms"
+target = 2000
+limit = 5000
+applies_from = "M11"
+reference = "under 1 s on one thread (estimate)"
+
+[[metric]]
+id = "jdtls_warm_start_to_ready"
+unit = "ms"
+pending = "S9"
+applies_from = "M11"
+reference = "HelloWorld about 8 s (2020)"
+
+[[metric]]
+id = "memory_empty_window_private_ws"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "memory_empty_window_private_bytes"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "memory_50k_loc_10_files_idle_private_ws"
+unit = "MB"
+observe = true
+applies_from = "M11"
+reference = "Zed 180-222 MB"
+
+[[metric]]
+id = "memory_50k_loc_10_files_idle_private_bytes"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "memory_ai_panel_no_harness_private_ws"
+unit = "MB"
+observe = true
+applies_from = "M11"
+reference = "Zed ~340 MB"
+
+[[metric]]
+id = "memory_ai_panel_no_harness_private_bytes"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "memory_full_stack_ws"
+unit = "MB"
+observe = true
+applies_from = "M11"
+reference = "ide.exe, 1 and 2 harnesses, Gradle, application JVM; compared with IDEA in the same scenario"
+
+[[metric]]
+id = "memory_full_stack_private_bytes"
+unit = "MB"
+observe = true
+applies_from = "M11"
+reference = "ide.exe, 1 and 2 harnesses, Gradle, application JVM; compared with IDEA in the same scenario"
+
+[[metric]]
+id = "memory_ide_extra_with_jdtls"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "jdtls_private_ws_over_xmx"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "gpu_memory_1440p"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "gpu_memory_4k"
+unit = "MB"
+observe = true
+applies_from = "M11"
+
+[[metric]]
+id = "distribution_size_no_formatter_no_jdtls"
+unit = "MB"
+observe = true
+applies_from = "M11"
+reference = "hello gpui-kit ~12 MB"

@@ -1,0 +1,975 @@
+use std::collections::VecDeque;
+use std::io::Read;
+use std::sync::mpsc::{
+    Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, sleep};
+use std::time::{Duration, Instant};
+
+use base::Cancel;
+use proc_sup::{Input, InputWriter, Process, ProcessSpec};
+
+use crate::RunPlan;
+
+/// Pieces of output on their way to the reader. The program waits when this is full, so a
+/// program that prints without end cannot fill memory.
+const QUEUE: usize = 256;
+const POLL: Duration = Duration::from_millis(20);
+/// How long output may still arrive after the program exited while something it started
+/// still runs.
+const DRAIN: Duration = Duration::from_millis(200);
+/// The same when nothing of the program runs any more: the pipes are closed, so this only
+/// bounds a handle some other process inherited by chance.
+const TAIL: Duration = Duration::from_secs(5);
+/// How much of the output is kept for a marker search. A build prints much more.
+const WATCH_TAIL: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsoleEvent {
+    /// A step of the plan started.
+    Started { pid: u32, step: Step },
+    Output {
+        /// The process that wrote it, so a reader can keep an unfinished line apart.
+        process: u32,
+        stream: Stream,
+        text: String,
+    },
+    /// Could not start a step.
+    Failed { message: String },
+    /// The process of the plan ended. Output that a child or a server still writes may
+    /// come after it, until [`ConsoleEvent::Closed`].
+    Exited { code: Option<i32>, step: Step },
+    /// The last event: the pipes are closed and no more output will come.
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Before,
+    Program,
+}
+
+/// A running plan and its output. Dropping it ends what is running.
+pub struct Console {
+    events: Receiver<ConsoleEvent>,
+    backlog: Mutex<VecDeque<ConsoleEvent>>,
+    stop: Cancel,
+    keeper: Option<thread::JoinHandle<()>>,
+    watch: Arc<OutputWatch>,
+    /// The program reads its input; `None` when nothing was open to write to.
+    input: Option<Input>,
+}
+
+/// The events of a console, with what [`Console::wait_for_output`] took aside while it
+/// waited. The window sees them in order.
+pub struct ConsoleEvents<'a> {
+    events: &'a Receiver<ConsoleEvent>,
+    backlog: &'a Mutex<VecDeque<ConsoleEvent>>,
+}
+
+impl ConsoleEvents<'_> {
+    pub fn try_recv(&self) -> Result<ConsoleEvent, TryRecvError> {
+        if let Some(event) = self.take_backlog() {
+            return Ok(event);
+        }
+        self.events.try_recv()
+    }
+
+    pub fn recv_timeout(&self, limit: Duration) -> Result<ConsoleEvent, RecvTimeoutError> {
+        if let Some(event) = self.take_backlog() {
+            return Ok(event);
+        }
+        self.events.recv_timeout(limit)
+    }
+
+    pub fn recv(&self) -> Result<ConsoleEvent, RecvError> {
+        if let Some(event) = self.take_backlog() {
+            return Ok(event);
+        }
+        self.events.recv()
+    }
+
+    fn take_backlog(&self) -> Option<ConsoleEvent> {
+        self.backlog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+    }
+}
+
+/// The tail of the output and whether the plan is over, for a caller that waits for a
+/// marker without taking events away from the window.
+#[derive(Default)]
+struct OutputWatch {
+    state: Mutex<WatchState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct WatchState {
+    tail: String,
+    ended: bool,
+}
+
+impl OutputWatch {
+    fn observe(&self, text: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.tail.push_str(text);
+        if state.tail.len() > WATCH_TAIL {
+            let mut cut = state.tail.len() - WATCH_TAIL;
+            while cut < state.tail.len() && !state.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            state.tail.drain(..cut);
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn end(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.ended = true;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn wait_for(&self, marker: &str, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.tail.contains(marker) {
+                return true;
+            }
+            if state.ended {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+    }
+
+    fn contains(&self, marker: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tail
+            .contains(marker)
+    }
+
+    fn ended(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ended
+    }
+}
+
+/// What the keeper of a console runs.
+enum Work {
+    Plan {
+        plan: RunPlan,
+        /// The before launch steps of the configuration, in order. Each must end with
+        /// success before the next one starts.
+        steps: Vec<ProcessSpec>,
+        /// A Stop that came before the console was made keeps every step from starting.
+        stop_before_start: bool,
+    },
+    /// One step only, for a caller that starts the program itself after it succeeds.
+    Single {
+        spec: ProcessSpec,
+        step: Step,
+        grace: Duration,
+    },
+}
+
+impl Work {
+    /// Whether the program of the work reads its input. A single step is a build, which
+    /// never does.
+    fn reads_input(&self) -> bool {
+        match self {
+            Self::Plan { plan, .. } => plan.program.reads_input(),
+            Self::Single { .. } => false,
+        }
+    }
+}
+
+impl Console {
+    pub fn start(plan: RunPlan) -> Self {
+        Self::spawn(Work::Plan {
+            plan,
+            steps: Vec::new(),
+            stop_before_start: false,
+        })
+    }
+
+    /// The same plan after the before launch steps of the configuration. The console stops
+    /// when `stop` is already cancelled, so a Stop before the first process keeps the
+    /// program from starting at all.
+    pub fn start_with_steps(plan: RunPlan, steps: Vec<ProcessSpec>, stop: Cancel) -> Self {
+        Self::spawn_with(
+            Work::Plan {
+                plan,
+                steps,
+                stop_before_start: true,
+            },
+            stop,
+        )
+    }
+
+    /// Runs one build step and stops there. `ConsoleEvent::Exited` with [`Step::Program`]
+    /// never comes.
+    pub fn start_step(spec: ProcessSpec, step: Step, grace: Duration) -> Self {
+        Self::spawn(Work::Single { spec, step, grace })
+    }
+
+    fn spawn(work: Work) -> Self {
+        Self::spawn_with(work, Cancel::new())
+    }
+
+    fn spawn_with(work: Work, stop: Cancel) -> Self {
+        let (sender, events) = sync_channel(QUEUE);
+        let cancel = stop.clone();
+        let watch = Arc::new(OutputWatch::default());
+        let keeper_watch = watch.clone();
+        let (input, writer) = match work.reads_input() {
+            true => {
+                let (input, writer) = Input::channel();
+                (Some(input), Some(writer))
+            }
+            false => (None, None),
+        };
+        let keeper = thread::spawn(move || {
+            keep(work, &cancel, &sender, &keeper_watch, writer);
+            keeper_watch.end();
+        });
+        Self {
+            events,
+            backlog: Mutex::new(VecDeque::new()),
+            stop,
+            keeper: Some(keeper),
+            watch,
+            input,
+        }
+    }
+
+    /// Whether the program of the console reads its standard input from here. A build
+    /// step has its input closed, so nothing is typed into it.
+    pub fn takes_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Sends a line to the program with the line break that Enter adds. The write happens
+    /// on a thread of its own, so the window never waits for the pipe.
+    pub fn send_line(&self, line: &str) {
+        if let Some(input) = &self.input {
+            input.send_line(line);
+        }
+    }
+
+    /// The program sees the end of its input, as Send EOF of the console does.
+    pub fn send_eof(&self) {
+        if let Some(input) = &self.input {
+            input.send_eof();
+        }
+    }
+
+    /// What went wrong with the input since the last call, for a line in the console.
+    pub fn take_input_error(&self) -> Option<String> {
+        self.input
+            .as_ref()
+            .and_then(Input::take_error)
+            .map(|reason| format!("Cannot send input to the program: {reason}"))
+    }
+
+    pub fn events(&self) -> ConsoleEvents<'_> {
+        ConsoleEvents {
+            events: &self.events,
+            backlog: &self.backlog,
+        }
+    }
+
+    /// Waits until the output contains `marker`. Events that arrive meanwhile are kept
+    /// for [`Console::events`], so the reader of the program is not held up by the wait.
+    /// False when the plan ends, `stop` is cancelled, or the limit passes first.
+    pub fn wait_for_output(&self, marker: &str, limit: Duration, stop: &Cancel) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            self.drain_events();
+            if stop.is_cancelled() {
+                return false;
+            }
+            if self.watch.contains(marker) {
+                self.drain_events();
+                return true;
+            }
+            if self.watch.ended() {
+                self.drain_events();
+                return self.watch.contains(marker);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.drain_events();
+                return false;
+            }
+            self.watch
+                .wait_for(marker, left.min(Duration::from_millis(20)));
+        }
+    }
+
+    fn drain_events(&self) {
+        let mut backlog = self
+            .backlog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while let Ok(event) = self.events.try_recv() {
+            backlog.push_back(event);
+        }
+    }
+
+    /// Asks the plan to stop and returns at once. [`ConsoleEvent::Exited`] follows.
+    pub fn stop(&self) {
+        self.stop.cancel();
+    }
+}
+
+impl Drop for Console {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        // Reading no more: the queue must not keep the keeper from ending the program.
+        let (_, closed) = sync_channel(0);
+        self.events = closed;
+        if let Some(keeper) = self.keeper.take() {
+            let _ = keeper.join();
+        }
+    }
+}
+
+fn keep(
+    work: Work,
+    stop: &Cancel,
+    events: &SyncSender<ConsoleEvent>,
+    watch: &Arc<OutputWatch>,
+    input: Option<InputWriter>,
+) {
+    match work {
+        Work::Plan {
+            plan,
+            steps,
+            stop_before_start,
+        } => keep_plan(plan, steps, stop_before_start, stop, events, watch, input),
+        Work::Single { spec, step, grace } => {
+            let end = run_step(&spec, step, grace, stop, events, watch, None);
+            let _ = events.send(ConsoleEvent::Exited {
+                code: end.code,
+                step,
+            });
+            // The exit code is known; the output is read until the pipes close, so a
+            // program that writes through a child after it ended is not cut off.
+            end.drain(stop, None);
+            let _ = events.send(ConsoleEvent::Closed);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keep_plan(
+    plan: RunPlan,
+    steps: Vec<ProcessSpec>,
+    stop_before_start: bool,
+    stop: &Cancel,
+    events: &SyncSender<ConsoleEvent>,
+    watch: &Arc<OutputWatch>,
+    input: Option<InputWriter>,
+) {
+    // Stop asked before the plan began: no step starts, not even for a moment.
+    if stop_before_start && stop.is_cancelled() {
+        let _ = events.send(ConsoleEvent::Closed);
+        return;
+    }
+    let mut before = steps.into_iter().chain(plan.before).collect::<Vec<_>>();
+    let had_steps = !before.is_empty();
+    for step in before.drain(..) {
+        let end = run_step(&step, Step::Before, plan.grace, stop, events, watch, None);
+        if end.code != Some(0) || stop.is_cancelled() {
+            let code = end.code;
+            let step = Step::Before;
+            let _ = events.send(ConsoleEvent::Exited { code, step });
+            end.drain(stop, Some(DRAIN));
+            let _ = events.send(ConsoleEvent::Closed);
+            return;
+        }
+        // A build that left a daemon behind must not hold the program back.
+        end.drain(stop, Some(DRAIN));
+    }
+    if had_steps && stop.is_cancelled() {
+        let _ = events.send(ConsoleEvent::Closed);
+        return;
+    }
+    let end = run_step(
+        &plan.program,
+        Step::Program,
+        plan.grace,
+        stop,
+        events,
+        watch,
+        input,
+    );
+    let step = Step::Program;
+    let _ = events.send(ConsoleEvent::Exited {
+        code: end.code,
+        step,
+    });
+    end.drain(stop, None);
+    let _ = events.send(ConsoleEvent::Closed);
+}
+
+/// A step whose process ended and whose readers may still be seeing output.
+struct StepEnd {
+    code: Option<i32>,
+    /// Kept alive while the readers wait: dropping it closes the job of the program.
+    _process: Option<Process>,
+    readers: Vec<thread::JoinHandle<()>>,
+}
+
+impl StepEnd {
+    /// Waits for the readers to see the end of their pipes. `limit` bounds a step that must
+    /// not hold the next one back; the program itself waits as long as the pipes live, and
+    /// Stop ends the wait.
+    fn drain(self, stop: &Cancel, limit: Option<Duration>) {
+        let start = Instant::now();
+        while !self.readers.iter().all(thread::JoinHandle::is_finished) {
+            if stop.is_cancelled() {
+                return;
+            }
+            if limit.is_some_and(|limit| start.elapsed() >= limit) {
+                return;
+            }
+            sleep(POLL);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_step(
+    spec: &ProcessSpec,
+    step: Step,
+    grace: Duration,
+    stop: &Cancel,
+    events: &SyncSender<ConsoleEvent>,
+    watch: &Arc<OutputWatch>,
+    input: Option<InputWriter>,
+) -> StepEnd {
+    let mut process = match spec.start() {
+        Ok(process) => process,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = events.send(ConsoleEvent::Failed { message });
+            return StepEnd {
+                code: None,
+                _process: None,
+                readers: Vec::new(),
+            };
+        }
+    };
+    let pid = process.pid();
+    let _ = events.send(ConsoleEvent::Started { pid, step });
+    match input.and_then(|writer| process.take_stdin().map(|stdin| (writer, stdin))) {
+        Some((writer, stdin)) => writer.start(stdin),
+        // A build, a test or a program that reads nothing: the pipe closes at once.
+        None => drop(process.take_stdin()),
+    }
+    let readers = vec![
+        read_pipe(
+            process.take_stdout(),
+            pid,
+            Stream::Stdout,
+            events.clone(),
+            watch.clone(),
+        ),
+        read_pipe(
+            process.take_stderr(),
+            pid,
+            Stream::Stderr,
+            events.clone(),
+            watch.clone(),
+        ),
+    ];
+    let result = wait(&mut process, grace, stop);
+    // With the whole tree gone the pipes are closed and the readers reach their end, however
+    // late a busy machine runs them. A server the program left behind may hold the pipes
+    // open, so then the readers only get a moment. The tree is asked again on every poll:
+    // the console host of a windowless program stays in the job for a moment after the
+    // program, and one look at that moment would cut the readers short.
+    let start = Instant::now();
+    while !readers.iter().all(thread::JoinHandle::is_finished) {
+        let tree_gone = process.tree().is_ok_and(|tree| tree.is_empty());
+        let patience = if tree_gone { TAIL } else { DRAIN };
+        if start.elapsed() >= patience {
+            break;
+        }
+        sleep(POLL);
+    }
+    let code = match result {
+        Ok(code) => code,
+        Err(message) => {
+            let _ = events.send(ConsoleEvent::Failed { message });
+            None
+        }
+    };
+    StepEnd {
+        code,
+        _process: Some(process),
+        readers,
+    }
+}
+
+fn wait(process: &mut Process, grace: Duration, stop: &Cancel) -> Result<Option<i32>, String> {
+    loop {
+        if stop.is_cancelled() {
+            let status = process
+                .shut_down(grace)
+                .map_err(|error| error.to_string())?;
+            return Ok(status.code());
+        }
+        match process.try_wait() {
+            Ok(Some(status)) => return Ok(status.code()),
+            Ok(None) => sleep(POLL),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn read_pipe(
+    pipe: Option<impl Read + Send + 'static>,
+    process: u32,
+    stream: Stream,
+    events: SyncSender<ConsoleEvent>,
+    watch: Arc<OutputWatch>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0; 8192];
+        let mut decoder = Utf8Decoder::default();
+        while let Ok(count @ 1..) = pipe.read(&mut chunk) {
+            let text = decoder.push(&chunk[..count]);
+            if !text.is_empty() {
+                watch.observe(&text);
+                if !deliver(&events, process, stream, text) {
+                    return;
+                }
+            }
+        }
+        let text = decoder.finish();
+        if !text.is_empty() {
+            watch.observe(&text);
+            deliver(&events, process, stream, text);
+        }
+    })
+}
+
+/// False when nobody reads any more.
+fn deliver(events: &SyncSender<ConsoleEvent>, process: u32, stream: Stream, text: String) -> bool {
+    let event = ConsoleEvent::Output {
+        process,
+        stream,
+        text,
+    };
+    match events.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full(event)) => events.send(event).is_ok(),
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// A read may end in the middle of a character, which must not turn into garbage.
+#[derive(Default)]
+struct Utf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8Decoder {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let complete = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => self.pending.len(),
+        };
+        let text = String::from_utf8_lossy(&self.pending[..complete]).into_owned();
+        self.pending.drain(..complete);
+        text
+    }
+
+    fn finish(&mut self) -> String {
+        let text = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    #[cfg(windows)]
+    fn shell(line: &str) -> ProcessSpec {
+        ProcessSpec::new("cmd.exe").args(["/d", "/c", line])
+    }
+
+    #[cfg(windows)]
+    fn long_program() -> ProcessSpec {
+        ProcessSpec::new("ping.exe")
+            .args(["-n", "120", "127.0.0.1"])
+            .ctrl_helper("no-such-helper.exe")
+    }
+
+    fn plan(before: Option<ProcessSpec>, program: ProcessSpec) -> RunPlan {
+        RunPlan {
+            before,
+            program,
+            grace: Duration::ZERO,
+        }
+    }
+
+    fn to_end(console: &Console) -> (String, Option<i32>, Step) {
+        let mut text = String::new();
+        loop {
+            match console.events().recv_timeout(PATIENCE).unwrap() {
+                ConsoleEvent::Output { text: part, .. } => text.push_str(&part),
+                ConsoleEvent::Exited { code, step } => return (text, code, step),
+                ConsoleEvent::Started { .. } | ConsoleEvent::Failed { .. } => {}
+                ConsoleEvent::Closed => {}
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_and_exit_code_arrive_in_order() {
+        let console = Console::start(plan(None, shell("echo hello& exit /b 3")));
+
+        let (text, code, step) = to_end(&console);
+
+        assert_eq!(text.trim(), "hello");
+        assert_eq!((code, step), (Some(3), Step::Program));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_program_follows_a_step_that_succeeded() {
+        let console = Console::start(plan(Some(shell("echo first")), shell("echo second")));
+
+        let (text, code, _) = to_end(&console);
+
+        assert_eq!(
+            text.split_whitespace().collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_step_that_failed_keeps_the_program_from_starting() {
+        let console = Console::start(plan(Some(shell("exit /b 7")), shell("echo second")));
+
+        let (text, code, step) = to_end(&console);
+
+        assert_eq!(text, "");
+        assert_eq!((code, step), (Some(7), Step::Before));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cancelled_plan_starts_nothing() {
+        let stop = Cancel::new();
+        stop.cancel();
+        let console = Console::start_with_steps(
+            plan(None, shell("echo second")),
+            vec![shell("echo first")],
+            stop,
+        );
+
+        let first = console.events().recv_timeout(PATIENCE).unwrap();
+
+        assert_eq!(first, ConsoleEvent::Closed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_steps_run_in_order_before_the_program() {
+        let console = Console::start_with_steps(
+            plan(None, shell("echo program")),
+            vec![shell("echo one"), shell("echo two")],
+            Cancel::new(),
+        );
+
+        let (text, code, _) = to_end(&console);
+
+        assert_eq!(
+            text.split_whitespace().collect::<Vec<_>>(),
+            ["one", "two", "program"]
+        );
+        assert_eq!(code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_step_keeps_the_next_ones_and_the_program_from_starting() {
+        let console = Console::start_with_steps(
+            plan(None, shell("echo program")),
+            vec![shell("exit /b 7"), shell("echo second")],
+            Cancel::new(),
+        );
+
+        let (text, code, step) = to_end(&console);
+
+        assert_eq!(text, "");
+        assert_eq!((code, step), (Some(7), Step::Before));
+    }
+
+    #[test]
+    fn a_program_that_cannot_start_is_reported() {
+        let console = Console::start(plan(None, ProcessSpec::new("no-such-program.exe")));
+
+        let first = console.events().recv_timeout(PATIENCE).unwrap();
+
+        assert!(matches!(first, ConsoleEvent::Failed { .. }), "{first:?}");
+        let (_, code, _) = to_end(&console);
+        assert_eq!(code, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_ends_the_program_and_reports_it() {
+        let console = Console::start(plan(None, long_program()));
+
+        console.stop();
+
+        let (_, code, _) = to_end(&console);
+        assert_eq!(code, Some(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_during_the_first_step_skips_the_program() {
+        let console = Console::start(plan(Some(long_program()), shell("echo second")));
+
+        console.stop();
+
+        let (text, _, step) = to_end(&console);
+        assert_eq!(step, Step::Before);
+        assert!(!text.contains("second"), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_the_console_ends_the_program() {
+        let console = Console::start(plan(None, long_program()));
+        let start = Instant::now();
+
+        drop(console);
+
+        assert!(start.elapsed() < PATIENCE);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_marker_in_the_output_is_seen_without_taking_events() {
+        let console = Console::start(plan(None, shell("echo ready-marker")));
+
+        assert!(console.wait_for_output("ready-marker", PATIENCE, &Cancel::new()));
+
+        let (text, code, _) = to_end(&console);
+        assert!(text.contains("ready-marker"), "{text}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_marker_that_never_comes_ends_with_the_plan() {
+        let console = Console::start(plan(None, shell("echo other")));
+
+        assert!(!console.wait_for_output("ready-marker", PATIENCE, &Cancel::new()));
+    }
+
+    /// The parent exits after starting a child that keeps its output pipe and writes
+    /// later, as a server started by a program does.
+    #[cfg(windows)]
+    fn late_writer() -> ProcessSpec {
+        ProcessSpec::new("powershell.exe").args([
+            "-NoProfile",
+            "-Command",
+            "Start-Process -FilePath cmd.exe -ArgumentList '/d','/c',\
+             'ping -n 2 127.0.0.1 >nul & echo late-output' -NoNewWindow",
+        ])
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_written_after_the_program_ended_is_still_read() {
+        let console = Console::start(plan(None, late_writer()));
+
+        let mut text = String::new();
+        let mut code = None;
+        loop {
+            match console.events().recv_timeout(PATIENCE).unwrap() {
+                ConsoleEvent::Output { text: part, .. } => text.push_str(&part),
+                ConsoleEvent::Exited { code: exit, .. } => code = exit,
+                ConsoleEvent::Closed => break,
+                ConsoleEvent::Started { .. } | ConsoleEvent::Failed { .. } => {}
+            }
+        }
+
+        assert_eq!(code, Some(0));
+        assert!(
+            text.contains("late-output"),
+            "the output after the exit was lost: {text:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_ends_the_wait_for_a_pipe_a_child_keeps_open() {
+        let console = Console::start(plan(None, late_writer()));
+        std::thread::sleep(Duration::from_millis(300));
+
+        console.stop();
+        let start = Instant::now();
+        loop {
+            if console.events().recv_timeout(PATIENCE).unwrap() == ConsoleEvent::Closed {
+                break;
+            }
+        }
+
+        assert!(start.elapsed() < PATIENCE);
+    }
+
+    /// A program that reads one line of its input and prints it back.
+    #[cfg(windows)]
+    fn echo_line() -> ProcessSpec {
+        ProcessSpec::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$line=[Console]::In.ReadLine(); Write-Output ('got:' + $line)",
+            ])
+            .input()
+    }
+
+    /// A program that reads its input to the end and says so.
+    #[cfg(windows)]
+    fn read_to_end() -> ProcessSpec {
+        ProcessSpec::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::In.ReadToEnd() | Out-Null; Write-Output 'input-ended'",
+            ])
+            .input()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_line_of_the_console_reaches_the_program() {
+        let console = Console::start(plan(None, echo_line()));
+        assert!(console.takes_input(), "the program reads its input");
+
+        console.send_line("hello");
+
+        let (text, code, _) = to_end(&console);
+        assert!(text.contains("got:hello"), "{text:?}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_end_of_input_closes_stdin_of_the_program() {
+        let console = Console::start(plan(None, read_to_end()));
+        assert!(console.takes_input(), "the program reads its input");
+
+        console.send_eof();
+
+        let (text, code, _) = to_end(&console);
+        assert!(text.contains("input-ended"), "{text:?}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_step_that_is_not_the_program_takes_no_input() {
+        let console = Console::start_step(shell("exit /b 0"), Step::Before, Duration::ZERO);
+
+        assert!(!console.takes_input(), "a build step reads nothing");
+        console.send_line("ignored");
+        console.send_eof();
+
+        let (_, code, step) = to_end(&console);
+        assert_eq!((code, step), (Some(0), Step::Before));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_line_sent_after_the_program_exited_is_a_line_not_a_panic() {
+        let console = Console::start(plan(None, shell("exit /b 0").input()));
+        let (_, code, _) = to_end(&console);
+        assert_eq!(code, Some(0));
+
+        console.send_line("too late");
+
+        let start = Instant::now();
+        let mut error = None;
+        while start.elapsed() < PATIENCE {
+            if let Some(message) = console.take_input_error() {
+                error = Some(message);
+                break;
+            }
+            sleep(POLL);
+        }
+        let error = error.expect("the write after the exit is reported");
+        assert!(error.contains("Cannot send input"), "{error}");
+    }
+
+    #[test]
+    fn a_character_split_by_a_read_stays_whole() {
+        let mut decoder = Utf8Decoder::default();
+        let bytes = "я".as_bytes();
+
+        assert_eq!(decoder.push(&bytes[..1]), "");
+        assert_eq!(decoder.push(&bytes[1..]), "я");
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_do_not_stop_the_output() {
+        let mut decoder = Utf8Decoder::default();
+
+        assert_eq!(decoder.push(b"a\xffb"), "a\u{fffd}b");
+        assert_eq!(decoder.push(b"\xd1"), "");
+        assert_eq!(decoder.finish(), "\u{fffd}");
+    }
+}

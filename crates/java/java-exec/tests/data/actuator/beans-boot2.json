@@ -1,0 +1,23 @@
+{
+  "contexts": {
+    "application": {
+      "beans": {
+        "ownerController": {
+          "aliases": [],
+          "scope": "singleton",
+          "type": "org.springframework.samples.petclinic.owner.OwnerController",
+          "resource": "file:target/classes/org/springframework/samples/petclinic/owner/OwnerController.class",
+          "dependencies": ["ownerRepository", "petRepository"]
+        },
+        "petRepository": {
+          "aliases": [],
+          "scope": "singleton",
+          "type": "org.springframework.samples.petclinic.owner.JdbcPetRepository",
+          "resource": "file:target/classes/org/springframework/samples/petclinic/owner/JdbcPetRepository.class",
+          "dependencies": []
+        }
+      },
+      "parentId": null
+    }
+  }
+}

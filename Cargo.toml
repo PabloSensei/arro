@@ -1,0 +1,113 @@
+[workspace]
+resolver = "3"
+# Not "tools/*": tools/corpus and tools/measure are not workspace crates.
+members = [
+    "crates/*/*",
+    "tools/xtask",
+    "tools/lang-fixture",
+    "tools/window-language",
+    "tools/test-support",
+]
+exclude = ["spikes", "vendor"]
+
+[workspace.package]
+version = "0.1.20"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+base = { path = "crates/foundation/base" }
+chardetng = "1"
+container = { path = "crates/services/container" }
+dap-client = { path = "crates/services/dap-client" }
+database = { path = "crates/services/database" }
+encoding_rs = "0.8"
+gpui-kit = "=0.9.0"
+gpui_windows = { package = "gpui-pre-windows", version = "=0.3.11" }
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+java-exec = { path = "crates/java/java-exec" }
+java-project = { path = "crates/java/java-project" }
+jdtls-adapter = { path = "crates/java/jdtls-adapter" }
+lang-api = { path = "crates/services/lang-api" }
+lsp-client = { path = "crates/services/lsp-client" }
+notify = "=9.0.0-rc.7"
+nucleo-matcher = "0.3"
+platform = { path = "crates/foundation/platform" }
+plugin-host = { path = "crates/services/plugin-host" }
+proc-sup = { path = "crates/foundation/proc-sup" }
+project-model = { path = "crates/services/project-model" }
+proptest = "1"
+regex = "1"
+repl = { path = "crates/services/repl" }
+ropey = "=2.0.0-beta.1"
+runner = { path = "crates/services/runner" }
+semantic-router = { path = "crates/services/semantic-router" }
+sidecar = { path = "crates/services/sidecar" }
+streaming-iterator = "0.1"
+terminal = { path = "crates/services/terminal" }
+tree-sitter = "0.27"
+tree-sitter-bash = "=0.25.1"
+tree-sitter-batch = "=0.11.1"
+tree-sitter-css = "=0.25.0"
+tree-sitter-dockerfile-updated = "=0.2.0"
+tree-sitter-groovy = "=0.1.2"
+tree-sitter-html = "=0.23.2"
+tree-sitter-java-orchard = "=0.5.23"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-json = "=0.24.8"
+tree-sitter-kotlin-ng = "=1.1.0"
+tree-sitter-md = "=0.5.4"
+tree-sitter-properties = "=0.3.0"
+tree-sitter-sequel = "=0.3.13"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-xml = "=0.7.0"
+tree-sitter-yaml = "=0.7.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-c-sharp = "=0.23.5"
+tree-sitter-go = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-scala = "=0.26.13"
+tree-sitter-php = "=0.25.1"
+tree-sitter-ruby = "=0.23.1"
+tree-sitter-swift = "=0.7.4"
+tree-sitter-lua = "=0.5.0"
+tree-sitter-powershell = "=0.26.6"
+tree-sitter-proto = "=0.6.0"
+tree-sitter-ini = "=1.4.0"
+tree-sitter-diff = "=0.1.0"
+tree-sitter-make = "=1.1.1"
+updater = { path = "crates/services/updater" }
+vcs = { path = "crates/services/vcs" }
+workspace-core = { path = "crates/services/workspace-core" }
+http-client = { path = "crates/services/http-client" }
+kube = { path = "crates/services/kube" }
+
+[patch.crates-io]
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+
+[profile.release]
+debug = "line-tables-only"
+
+# Every build folder holds the whole workspace with its tests, and full debug info made
+# each one tens of gigabytes. Line tables keep file:line in panics and backtraces; nobody
+# steps through Arro itself in a debugger, and the dependencies need no debug info at all.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# `xtask symbolize` reads file:line from the pdb of the test binary, and the environment
+# may build the dev profile without debug info. Both profiles need the same setting, or
+# `cargo test` cannot relink the `xtask.exe` of a running `cargo xtask`.
+[profile.dev.package.xtask]
+debug = "line-tables-only"
+
+[profile.test.package.xtask]
+debug = "line-tables-only"

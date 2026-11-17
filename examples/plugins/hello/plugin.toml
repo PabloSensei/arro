@@ -1,0 +1,15 @@
+# Copy this folder to %APPDATA%/Arro/plugins/hello and restart Arro.
+id = "hello"
+name = "Hello"
+version = "0.1.0"
+api = 1
+command = ["node", "main.js"]
+
+[[contributes.commands]]
+id = "upper-case"
+title = "Upper Case Selection"
+key = "ctrl-alt-shift-u"
+
+[[contributes.themes]]
+name = "Hello Dusk"
+file = "themes/dusk.toml"

@@ -1,0 +1,17 @@
+[package]
+name = "text-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chardetng.workspace = true
+encoding_rs.workspace = true
+regex.workspace = true
+ropey = { workspace = true, features = ["metric_lines_lf", "metric_utf16"] }
+roxmltree = "0.21"
+
+[dev-dependencies]
+platform = { path = "../../foundation/platform" }
+proptest.workspace = true
+test-support = { path = "../../../tools/test-support" }

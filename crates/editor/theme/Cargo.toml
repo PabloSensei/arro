@@ -1,0 +1,14 @@
+[package]
+name = "theme"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+roxmltree = "0.21"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+# Temporary folders of the tests: one folder per test, removed on drop.
+test-support = { path = "../../../tools/test-support" }

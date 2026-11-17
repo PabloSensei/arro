@@ -1,0 +1,11 @@
+[package]
+name = "ide-ctrl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+platform.workspace = true
+
+[dev-dependencies]
+proc-sup.workspace = true

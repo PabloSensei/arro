@@ -1,0 +1,13 @@
+[package]
+name = "ide-mcp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+mcp-server = { path = "../mcp-server" }
+tool-gateway = { path = "../tool-gateway" }
+agent-testkit = { path = "../agent-testkit" }

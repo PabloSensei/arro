@@ -1,0 +1,18 @@
+[package]
+name = "semantic-router"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base.workspace = true
+lang-api.workspace = true
+lsp-client.workspace = true
+serde = "1.0.228"
+serde_json = "1.0.154"
+sidecar.workspace = true
+tokio = { version = "1.54.1", features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio = { version = "1.54.1", features = ["io-util", "macros", "rt", "time"] }

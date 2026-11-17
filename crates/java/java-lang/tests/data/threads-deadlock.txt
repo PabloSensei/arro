@@ -1,0 +1,35 @@
+Full thread dump OpenJDK 64-Bit Server VM (21.0.2+13-LTS mixed mode):
+
+"Thread-0" #10 prio=5 os_prio=0 tid=0x0000021d0010 nid=0x2b3c waiting for monitor entry  [0x000000f3]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at com.example.Dead.run(Dead.java:20)
+	- waiting to lock <0x00000000aaaa> (a java.lang.Object)
+	- locked <0x00000000bbbb> (a java.lang.Object)
+
+"Thread-1" #11 prio=5 os_prio=0 tid=0x0000021d0011 nid=0x2b3d waiting for monitor entry  [0x000000f4]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at com.example.Dead.run(Dead.java:30)
+	- waiting to lock <0x00000000bbbb> (a java.lang.Object)
+	- locked <0x00000000aaaa> (a java.lang.Object)
+
+Found one Java-level deadlock:
+=============================
+"Thread-1":
+  waiting to lock monitor 0x00000000bbbb (object 0x00000000aaaa, a java.lang.Object),
+  which is held by "Thread-0"
+"Thread-0":
+  waiting to lock monitor 0x00000000aaaa (object 0x00000000bbbb, a java.lang.Object),
+  which is held by "Thread-1"
+
+Java stack information for the threads listed above:
+===================================================
+"Thread-1":
+	at com.example.Dead.run(Dead.java:30)
+	- waiting to lock <0x00000000bbbb> (a java.lang.Object)
+	- locked <0x00000000aaaa> (a java.lang.Object)
+"Thread-0":
+	at com.example.Dead.run(Dead.java:20)
+	- waiting to lock <0x00000000aaaa> (a java.lang.Object)
+	- locked <0x00000000bbbb> (a java.lang.Object)
+
+Found 1 deadlock.

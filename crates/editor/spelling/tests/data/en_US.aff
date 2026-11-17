@@ -1,0 +1,5 @@
+SET UTF-8
+SFX S Y 3
+SFX S 0 s [^sxzh]
+SFX S 0 es [sxzh]
+SFX S y ies [^aeiou]y

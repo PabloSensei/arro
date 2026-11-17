@@ -1,0 +1,6 @@
+<!-- Arro icon. Shape from Lucide play and bar-chart-2 (ISC), see LUCIDE-LICENSE.txt. -->
+<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" stroke="#a8a39a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M4 5.5a1.6 1.6 0 0 1 2.4-1.4l7 4a1.6 1.6 0 0 1 0 2.8l-7 4A1.6 1.6 0 0 1 4 13.5z" />
+  <path d="M16 14v6" />
+  <path d="M20 11v9" />
+</svg>

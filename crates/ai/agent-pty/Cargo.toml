@@ -1,0 +1,25 @@
+[package]
+name = "agent-pty"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+crossbeam-channel = "0.5"
+platform.workspace = true
+serde_json = "1"
+terminal.workspace = true
+
+[dev-dependencies]
+agent-testkit = { path = "../agent-testkit" }
+change-tracker = { path = "../change-tracker" }
+mcp-server = { path = "../mcp-server" }
+tool-gateway = { path = "../tool-gateway" }
+
+[[bin]]
+name = "tui-stub"
+path = "src/bin/tui_stub.rs"
+test = false
+
+

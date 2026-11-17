@@ -1,0 +1,13 @@
+[package]
+name = "spelling"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The spell checker of the operating system, where it has one.
+platform.workspace = true
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

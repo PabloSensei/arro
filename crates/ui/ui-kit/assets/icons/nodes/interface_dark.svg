@@ -1,0 +1,5 @@
+<!-- Arro icon, own drawing. -->
+<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="3" y="3" width="18" height="18" rx="4.5" fill="#12917a"/>
+  <path d="M12 8V16" stroke="#1c1b1a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

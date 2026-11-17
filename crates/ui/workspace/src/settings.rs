@@ -1,0 +1,903 @@
+//! What the user can change in Settings. One JSON file in the settings folder; a missing
+//! or damaged file gives the defaults, a new key an old file does not know gets its default.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use project_model::BuildTools;
+use serde::{Deserialize, Serialize};
+use ui_kit::*;
+
+use crate::layout::DockState;
+
+pub const SETTINGS_FILE: &str = "settings.json";
+pub const MIN_FONT_SIZE: f32 = 8.;
+pub const MAX_FONT_SIZE: f32 = 32.;
+const DEFAULT_FONT_SIZE: f32 = 13.;
+const DEFAULT_MEMORY_LOW_PERCENT: f32 = 5.;
+const DEFAULT_MEMORY_LOW_MEGABYTES: u32 = 512;
+/// The reach of Alt+Shift+= and Alt+Shift+-.
+pub const MIN_UI_SCALE: f32 = 0.8;
+pub const MAX_UI_SCALE: f32 = 2.;
+pub const UI_SCALE_STEP: f32 = 0.1;
+const DEFAULT_UI_SCALE: f32 = 1.;
+/// The distance between two lines of the editor, as a share of the font size.
+pub const MIN_LINE_SPACING: f32 = 1.;
+pub const MAX_LINE_SPACING: f32 = 2.;
+pub const LINE_SPACING_STEP: f32 = 0.1;
+const DEFAULT_LINE_SPACING: f32 = 1.;
+/// The widest tab or indentation step the Code Style page takes.
+pub const MAX_INDENT_SIZE: f32 = 16.;
+/// The longest wait before the completion list opens on its own, in milliseconds.
+pub const MAX_COMPLETION_DELAY_MS: u32 = 5000;
+/// The column of the right margin: the width of the centred text of Distraction Free
+/// Mode, in characters.
+pub const DEFAULT_RIGHT_MARGIN: u32 = 120;
+pub const MIN_RIGHT_MARGIN: u32 = 20;
+pub const MAX_RIGHT_MARGIN: u32 = 500;
+pub const RIGHT_MARGIN_STEP: u32 = 10;
+/// How long an HTTP request may take before it is stopped.
+pub const DEFAULT_HTTP_TIMEOUT_SECONDS: u32 = 60;
+/// The longest timeout the Settings window allows.
+pub const MAX_HTTP_TIMEOUT_SECONDS: u32 = 600;
+pub const COMPLETION_DELAY_STEP_MS: u32 = 100;
+/// The rows one page of a data tab reads when the user has not changed the setting.
+pub const DEFAULT_DATABASE_PAGE_ROWS: u32 = 500;
+/// The most rows one page of a data tab reads.
+pub const MAX_DATABASE_PAGE_ROWS: u32 = 10_000;
+
+/// What a save does with the spaces and tabs at the end of a line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrimTrailingWhitespace {
+    /// Keep every line as it is.
+    #[default]
+    None,
+    /// Only the lines changed since the file was read or saved.
+    Modified,
+    /// Every line of the file.
+    All,
+}
+
+impl TrimTrailingWhitespace {
+    pub fn label(self) -> &'static str {
+        match self {
+            TrimTrailingWhitespace::None => "None",
+            TrimTrailingWhitespace::Modified => "Modified lines",
+            TrimTrailingWhitespace::All => "All",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            TrimTrailingWhitespace::None => TrimTrailingWhitespace::Modified,
+            TrimTrailingWhitespace::Modified => TrimTrailingWhitespace::All,
+            TrimTrailingWhitespace::All => TrimTrailingWhitespace::None,
+        }
+    }
+}
+
+/// The part of a file Reformat Code changes on save.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReformatScope {
+    /// Every line of the file.
+    #[default]
+    WholeFile,
+    /// Only the lines that differ from the last commit, as the gutter marks them.
+    ChangedLines,
+}
+
+impl ReformatScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReformatScope::WholeFile => "Whole file",
+            ReformatScope::ChangedLines => "Changed lines",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            ReformatScope::WholeFile => ReformatScope::ChangedLines,
+            ReformatScope::ChangedLines => ReformatScope::WholeFile,
+        }
+    }
+}
+
+/// How the completion list compares the typed prefix with its entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionCase {
+    /// The case of the letters does not matter.
+    #[default]
+    None,
+    /// Only the first letter must match in case.
+    FirstLetter,
+    /// Every letter must match in case.
+    All,
+}
+
+impl CompletionCase {
+    pub fn label(self) -> &'static str {
+        match self {
+            CompletionCase::None => "None",
+            CompletionCase::FirstLetter => "First letter",
+            CompletionCase::All => "All",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            CompletionCase::None => CompletionCase::FirstLetter,
+            CompletionCase::FirstLetter => CompletionCase::All,
+            CompletionCase::All => CompletionCase::None,
+        }
+    }
+}
+
+/// The tool windows of the layout the user stores as their default: which are open and
+/// how wide they are.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DefaultLayout {
+    pub left: DockState,
+    pub right: DockState,
+    pub bottom: DockState,
+}
+
+/// Which parameter names the editor shows as hints: none, the ones before a literal or
+/// another argument whose meaning the name explains, or every one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InlayParameterNames {
+    None,
+    #[default]
+    Literals,
+    All,
+}
+
+impl InlayParameterNames {
+    pub fn label(self) -> &'static str {
+        match self {
+            InlayParameterNames::None => "None",
+            InlayParameterNames::Literals => "Literals",
+            InlayParameterNames::All => "All",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            InlayParameterNames::None => InlayParameterNames::Literals,
+            InlayParameterNames::Literals => InlayParameterNames::All,
+            InlayParameterNames::All => InlayParameterNames::None,
+        }
+    }
+}
+
+/// How Update Project brings the upstream of the current branch in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitUpdateMethod {
+    /// A merge commit joins the two histories.
+    #[default]
+    Merge,
+    /// The local commits move on top of the upstream.
+    Rebase,
+}
+
+impl GitUpdateMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            GitUpdateMethod::Merge => "Merge",
+            GitUpdateMethod::Rebase => "Rebase",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            GitUpdateMethod::Merge => GitUpdateMethod::Rebase,
+            GitUpdateMethod::Rebase => GitUpdateMethod::Merge,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// The theme follows the appearance of the system.
+    pub theme_sync_with_os: bool,
+    /// The theme the window uses while the system is light; the id of a theme of the
+    /// catalog.
+    pub theme_light: String,
+    /// The theme the window uses while the system is dark; the id of a theme of the
+    /// catalog.
+    pub theme_dark: String,
+    /// The theme of a window that does not follow the system; the id of any theme of the
+    /// catalog. Empty in a file written before themes became files: the window then takes
+    /// the base theme of the look.
+    pub theme: String,
+    /// The set of icons of the window: `arro`, `intellij`, or the name of a folder of the
+    /// `icons` folder of the settings.
+    pub icon_set: String,
+    /// Size of the text in the editor, in points.
+    pub font_size: f32,
+    /// Size of the text of the editors in Presentation Mode, in points.
+    pub presentation_font_size: f32,
+    /// Scale of the whole interface, 1 for the regular size.
+    pub ui_scale: f32,
+    /// Family of the editor text; `JetBrains Mono` by default.
+    pub editor_font_family: String,
+    /// Distance between two editor lines, as a share of the font size, from 1 to 2.
+    pub line_spacing: f32,
+    /// Long lines wrap at the edge of the editor. Kept for the editor; not drawn yet.
+    pub soft_wrap: bool,
+    /// Show spaces and tabs as marks. Kept for the editor; not drawn yet.
+    pub show_whitespace: bool,
+    /// The line numbers in the gutter of the editor.
+    pub show_line_numbers: bool,
+    /// The icons of the gutter: breakpoints, run marks, bookmarks and the fold arrows.
+    pub show_gutter_icons: bool,
+    /// The background of the line with the caret.
+    pub highlight_current_line: bool,
+    /// The values of the variables of the stopped frame after the lines that name them.
+    pub debug_show_values_inline: bool,
+    /// The frames of libraries are folded into one row of the stack.
+    pub debug_hide_library_frames: bool,
+    /// How values of some types are shown, one `type = display | children` rule per
+    /// semicolon.
+    pub debug_type_renderers: String,
+    /// The thin vertical lines at the steps of the indentation.
+    pub show_indent_guides: bool,
+    /// The declarations around the caret above the editor text.
+    pub show_breadcrumbs: bool,
+    /// The declarations that the top of the editor holds while the caret is in their body.
+    pub show_sticky_lines: bool,
+    /// The caret blinks while the editor has the focus.
+    pub caret_blink: bool,
+    /// What a save does with the spaces at the end of a line.
+    pub trim_trailing_whitespace: TrimTrailingWhitespace,
+    /// A save puts a line break after the last line when the file lacks one.
+    pub ensure_final_newline: bool,
+    /// A save formats the file through the language.
+    pub actions_on_save_reformat: bool,
+    /// What that formatting changes: the whole file or the lines of the last commit.
+    pub actions_on_save_reformat_scope: ReformatScope,
+    /// The files actions on save touch, as masks; `*` is every file.
+    pub actions_on_save_reformat_files: String,
+    /// A save organizes the imports through the language.
+    pub actions_on_save_optimize_imports: bool,
+    /// A save runs the safe fixes of the language over the file.
+    pub actions_on_save_cleanup: bool,
+    /// Ctrl+wheel changes the font size of the editor.
+    pub zoom_with_wheel: bool,
+    /// Columns a tab takes on screen; also the default step of the indentation.
+    pub tab_size: u32,
+    /// Columns of one indentation step in a new file.
+    pub indent_size: u32,
+    /// A new file indents with tabs rather than spaces.
+    pub use_tabs: bool,
+    /// How the completion list compares the typed prefix with its entries.
+    pub completion_case: CompletionCase,
+    /// The completion list opens while the user types.
+    pub completion_auto_popup: bool,
+    /// The wait before that list opens, in milliseconds.
+    pub completion_delay_ms: u32,
+    /// Which parameter names the language shows in the text.
+    pub inlay_parameter_names: InlayParameterNames,
+    /// The type hints of the language in the text.
+    pub inlay_type_hints: bool,
+    /// The number of usages of a declaration above it.
+    pub code_vision_usages: bool,
+    /// The implementations or inheritors of a declaration above it.
+    pub code_vision_implementations: bool,
+    /// Documentation comments show as rendered text in the editor.
+    pub render_doc_comments: bool,
+    /// The preview of a markdown file takes the pictures of an address of the internet.
+    pub markdown_images_from_internet: bool,
+    /// Unsaved files are written when the window loses the focus or the tab changes.
+    pub autosave: bool,
+    /// The first open of a project shows its README, rendered when it is markdown.
+    pub open_readme_on_first_open: bool,
+    /// The home of the runtime that runs the project; empty means the one found by the
+    /// environment.
+    pub runtime_home: String,
+    /// Where Capture Memory Snapshot writes its files; empty means `.arro/snapshots` of
+    /// the project. A relative folder is relative to the project root.
+    pub heap_snapshot_folder: String,
+    /// Memory below this share of the total and below `memory_low_megabytes` stops a
+    /// language server so that the machine does not run out. Zero turns the stop off.
+    pub memory_low_percent: f32,
+    /// The absolute floor of the same check, in megabytes.
+    pub memory_low_megabytes: u32,
+    /// Reformat File dialog: organize the imports as well.
+    pub reformat_optimize_imports: bool,
+    /// Reformat File dialog: only the lines changed since the last commit.
+    pub reformat_only_changed: bool,
+    /// Reformat File dialog: the selection rather than the whole file.
+    pub reformat_selection: bool,
+    /// The grouping rules of the Usages window.
+    pub usage_group_usage_type: bool,
+    pub usage_group_module: bool,
+    pub usage_group_directory: bool,
+    pub usage_group_directory_structure: bool,
+    pub usage_group_file_structure: bool,
+    /// Modules are one group instead of a tree of their parts.
+    pub usage_flatten_modules: bool,
+    /// The usage filters of the Usages window.
+    pub usage_show_read: bool,
+    pub usage_show_write: bool,
+    pub usage_show_imports: bool,
+    /// The grouping rules of the TODO window.
+    pub todo_group_packages: bool,
+    pub todo_group_modules: bool,
+    pub todo_flatten_packages: bool,
+    /// Looks for a newer release once a day after the window opens.
+    pub updates_check_automatically: bool,
+    /// The tool window layout Restore Default Layout goes back to; `None` is the layout
+    /// of a new window.
+    pub default_layout: Option<DefaultLayout>,
+    /// The column of the right margin, which also limits the width of the text of
+    /// Distraction Free Mode.
+    pub right_margin: u32,
+    /// The parts of the window that View | Appearance shows.
+    pub toolbar_visible: bool,
+    pub tool_window_bars_visible: bool,
+    pub status_bar_visible: bool,
+    pub navigation_bar_visible: bool,
+    /// The language server's semantic tokens colour the names over the syntax colours.
+    pub semantic_highlighting: bool,
+    /// The documentation popup opens under the pointer after a delay.
+    pub quick_doc_on_hover: bool,
+    /// How the build tools of the project start, in the order of their pages.
+    pub build_tools: BuildTools,
+    /// The sources of a class of a library are fetched as soon as the class opens.
+    pub download_sources_automatically: bool,
+    /// A build file shows the newer versions of its dependencies, and offers to update
+    /// them, when the repositories of the project can be asked.
+    pub check_dependency_updates: bool,
+    /// The program that runs Git; empty means the one on `PATH`.
+    pub git_path: String,
+    /// How Update Project brings the upstream in.
+    pub git_update_method: GitUpdateMethod,
+    /// A push the remote rejected fetches, updates and pushes again.
+    pub git_auto_update_on_reject: bool,
+    /// Update Project initializes and updates the submodules of the project.
+    pub git_update_submodules: bool,
+    /// A commit whose files carry CRLF line separators warns first.
+    pub git_warn_crlf: bool,
+    /// The commit window starts with code analysis.
+    pub git_analyze_before_commit: bool,
+    /// The shell of a new terminal; empty means the one found on this machine.
+    pub terminal_shell: String,
+    /// Where a new terminal starts; empty means the root of the project.
+    pub terminal_start_directory: String,
+    /// Variables of a new terminal, one `NAME=value` per line.
+    pub terminal_environment: String,
+    /// A paste of more than one line asks before it reaches the shell.
+    pub terminal_confirm_multiline_paste: bool,
+    /// The diff shows the two versions side by side rather than as one list.
+    pub diff_side_by_side: bool,
+    /// The branch popup groups local and remote branches by the folders of their names.
+    pub git_group_by_directory: bool,
+    /// How long an HTTP request may take before it is stopped, in seconds.
+    pub http_timeout_seconds: u32,
+    /// The program that talks to Kubernetes; empty means the one on `PATH`.
+    pub kubectl_path: String,
+    /// The kubeconfig the Kubernetes tool window reads; empty means `KUBECONFIG` or the
+    /// usual file of the user.
+    pub kubeconfig_path: String,
+    /// How many rows one page of a data tab reads from the table.
+    pub database_page_rows: u32,
+    /// The project tree selects the file of every tab that becomes active, as the Always
+    /// Select Opened File switch of its view options says.
+    pub project_always_select_opened_file: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme_sync_with_os: true,
+            theme_light: "light".to_owned(),
+            theme_dark: "dark".to_owned(),
+            theme: String::new(),
+            icon_set: "arro".to_owned(),
+            font_size: DEFAULT_FONT_SIZE,
+            presentation_font_size: crate::appearance::DEFAULT_PRESENTATION_FONT_SIZE,
+            ui_scale: DEFAULT_UI_SCALE,
+            editor_font_family: "JetBrains Mono".to_owned(),
+            line_spacing: DEFAULT_LINE_SPACING,
+            soft_wrap: false,
+            show_whitespace: false,
+            show_line_numbers: true,
+            show_gutter_icons: true,
+            highlight_current_line: true,
+            debug_show_values_inline: true,
+            debug_hide_library_frames: true,
+            debug_type_renderers: String::new(),
+            show_indent_guides: true,
+            show_breadcrumbs: true,
+            show_sticky_lines: true,
+            caret_blink: true,
+            trim_trailing_whitespace: TrimTrailingWhitespace::None,
+            ensure_final_newline: false,
+            actions_on_save_reformat: false,
+            actions_on_save_reformat_scope: ReformatScope::WholeFile,
+            actions_on_save_reformat_files: "*".to_owned(),
+            actions_on_save_optimize_imports: false,
+            actions_on_save_cleanup: false,
+            zoom_with_wheel: true,
+            tab_size: 4,
+            indent_size: 4,
+            use_tabs: false,
+            completion_case: CompletionCase::None,
+            completion_auto_popup: true,
+            completion_delay_ms: 0,
+            inlay_parameter_names: InlayParameterNames::Literals,
+            inlay_type_hints: false,
+            code_vision_usages: true,
+            code_vision_implementations: true,
+            render_doc_comments: false,
+            markdown_images_from_internet: true,
+            autosave: true,
+            open_readme_on_first_open: true,
+            runtime_home: String::new(),
+            heap_snapshot_folder: String::new(),
+            memory_low_percent: DEFAULT_MEMORY_LOW_PERCENT,
+            memory_low_megabytes: DEFAULT_MEMORY_LOW_MEGABYTES,
+            reformat_optimize_imports: false,
+            reformat_only_changed: false,
+            reformat_selection: false,
+            usage_group_usage_type: false,
+            usage_group_module: false,
+            usage_group_directory: false,
+            usage_group_directory_structure: false,
+            usage_group_file_structure: false,
+            usage_flatten_modules: false,
+            usage_show_read: true,
+            usage_show_write: true,
+            usage_show_imports: true,
+            todo_group_packages: false,
+            todo_group_modules: false,
+            todo_flatten_packages: false,
+            updates_check_automatically: true,
+            default_layout: None,
+            right_margin: DEFAULT_RIGHT_MARGIN,
+            toolbar_visible: true,
+            tool_window_bars_visible: true,
+            status_bar_visible: true,
+            navigation_bar_visible: true,
+            semantic_highlighting: true,
+            quick_doc_on_hover: true,
+            build_tools: BuildTools::default(),
+            download_sources_automatically: false,
+            check_dependency_updates: true,
+            git_path: String::new(),
+            git_update_method: GitUpdateMethod::Merge,
+            git_auto_update_on_reject: false,
+            git_update_submodules: true,
+            git_warn_crlf: true,
+            git_analyze_before_commit: false,
+            terminal_shell: String::new(),
+            terminal_start_directory: String::new(),
+            terminal_environment: String::new(),
+            terminal_confirm_multiline_paste: true,
+            diff_side_by_side: true,
+            git_group_by_directory: true,
+            http_timeout_seconds: DEFAULT_HTTP_TIMEOUT_SECONDS,
+            kubectl_path: String::new(),
+            kubeconfig_path: String::new(),
+            database_page_rows: DEFAULT_DATABASE_PAGE_ROWS,
+            project_always_select_opened_file: false,
+        }
+    }
+}
+
+impl Global for Settings {}
+
+impl Settings {
+    /// A damaged or missing file is not an error: the defaults come back.
+    pub fn load(path: &Path) -> Self {
+        Self::load_with_theme_choice(path, false)
+    }
+
+    /// Reads the file. A file written before Sync with OS existed keeps the theme of an
+    /// installation that already chose one: the sync stays off there. A file without an
+    /// explicit value in an installation without a chosen theme follows the system, as a
+    /// new one does.
+    pub fn load_with_theme_choice(path: &Path, theme_chosen: bool) -> Self {
+        let text = std::fs::read_to_string(path).ok();
+        let parsed: Option<Self> = text
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok());
+        let mut settings = parsed.map_or_else(Self::default, Self::clamped);
+        if theme_chosen && text.as_deref().is_none_or(|text| !names_sync_with_os(text)) {
+            settings.theme_sync_with_os = false;
+        }
+        settings
+    }
+
+    /// The saved name of the theme the system appearance asks for.
+    pub fn theme_for(&self, system_dark: bool) -> &str {
+        if system_dark {
+            &self.theme_dark
+        } else {
+            &self.theme_light
+        }
+    }
+
+    /// Writes the file, creating its folder. The new text goes to a file beside the old
+    /// one and takes its place, so a stop in the middle leaves the old file whole.
+    /// Blocks: not for the UI thread.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let temp = temp_path(path);
+        std::fs::write(&temp, text)?;
+        if let Err(error) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Takes over the leaves of `draft` that differ from `saved`. A field that another
+    /// part of the window changed while the dialog was open keeps its newer value, even
+    /// inside a nested object.
+    pub fn merge_draft(&mut self, saved: &Settings, draft: &Settings) {
+        let (Ok(saved), Ok(draft), Ok(mut current)) = (
+            serde_json::to_value(saved),
+            serde_json::to_value(draft),
+            serde_json::to_value(&*self),
+        ) else {
+            return;
+        };
+        merge_changed(&mut current, &saved, &draft);
+        if let Ok(merged) = serde_json::from_value(current) {
+            *self = merged;
+        }
+    }
+
+    fn clamped(mut self) -> Self {
+        if !self.font_size.is_finite() {
+            self.font_size = DEFAULT_FONT_SIZE;
+        }
+        self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if !self.presentation_font_size.is_finite() {
+            self.presentation_font_size = crate::appearance::DEFAULT_PRESENTATION_FONT_SIZE;
+        }
+        self.presentation_font_size = self.presentation_font_size.clamp(
+            crate::appearance::MIN_PRESENTATION_FONT_SIZE,
+            crate::appearance::MAX_PRESENTATION_FONT_SIZE,
+        );
+        if !self.memory_low_percent.is_finite() {
+            self.memory_low_percent = DEFAULT_MEMORY_LOW_PERCENT;
+        }
+        self.memory_low_percent = self.memory_low_percent.clamp(0., 100.);
+        self.memory_low_megabytes = self.memory_low_megabytes.min(1024 * 1024);
+        if !self.ui_scale.is_finite() {
+            self.ui_scale = DEFAULT_UI_SCALE;
+        }
+        self.ui_scale = self.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+        if self.editor_font_family.trim().is_empty() {
+            self.editor_font_family = "JetBrains Mono".to_owned();
+        }
+        if self.icon_set.trim().is_empty() {
+            self.icon_set = "arro".to_owned();
+        }
+        if !self.line_spacing.is_finite() {
+            self.line_spacing = DEFAULT_LINE_SPACING;
+        }
+        self.line_spacing = self.line_spacing.clamp(MIN_LINE_SPACING, MAX_LINE_SPACING);
+        self.tab_size = self.tab_size.clamp(1, MAX_INDENT_SIZE as u32);
+        self.indent_size = self.indent_size.clamp(1, MAX_INDENT_SIZE as u32);
+        self.right_margin = self.right_margin.clamp(MIN_RIGHT_MARGIN, MAX_RIGHT_MARGIN);
+        self.completion_delay_ms = self.completion_delay_ms.min(MAX_COMPLETION_DELAY_MS);
+        self.http_timeout_seconds = self.http_timeout_seconds.clamp(1, MAX_HTTP_TIMEOUT_SECONDS);
+        self
+    }
+
+    /// One step bigger or smaller, inside the limits.
+    pub fn with_font_step(&self, step: f32) -> Self {
+        Self {
+            font_size: self.font_size + step,
+            ..self.clone()
+        }
+        .clamped()
+    }
+
+    /// One step of the font of Presentation Mode, inside the limits.
+    pub fn with_presentation_font_step(&self, step: f32) -> Self {
+        Self {
+            presentation_font_size: self.presentation_font_size + step,
+            ..self.clone()
+        }
+        .clamped()
+    }
+
+    /// One step of the interface scale, rounded so that the steps do not drift.
+    pub fn with_ui_scale_step(&self, step: f32) -> Self {
+        let scale = ((self.ui_scale + step) * 100.).round() / 100.;
+        Self {
+            ui_scale: scale,
+            ..self.clone()
+        }
+        .clamped()
+    }
+
+    /// The regular scale of the interface.
+    pub fn with_ui_scale(&self, scale: f32) -> Self {
+        Self {
+            ui_scale: scale,
+            ..self.clone()
+        }
+        .clamped()
+    }
+
+    /// One step of the editor line spacing, rounded so that the steps do not drift.
+    pub fn with_line_spacing_step(&self, step: f32) -> Self {
+        let spacing = ((self.line_spacing + step) * 100.).round() / 100.;
+        Self {
+            line_spacing: spacing,
+            ..self.clone()
+        }
+        .clamped()
+    }
+}
+
+/// Whether a settings file names the switch of Sync with OS. A file of an older release
+/// does not, and its theme choice has to stand.
+fn names_sync_with_os(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .is_some_and(|value| value.get("theme_sync_with_os").is_some())
+}
+
+/// A name beside `path` that a save of this process has not taken yet.
+fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map_or_else(|| "settings".into(), |name| name.to_os_string());
+    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Copies the changed leaves of `draft` over `target`, one key of an object at a time.
+fn merge_changed(
+    target: &mut serde_json::Value,
+    saved: &serde_json::Value,
+    draft: &serde_json::Value,
+) {
+    match (saved, draft) {
+        (serde_json::Value::Object(saved), serde_json::Value::Object(draft)) => {
+            let serde_json::Value::Object(target) = target else {
+                return;
+            };
+            for (key, draft_value) in draft {
+                let saved_value = saved.get(key).unwrap_or(&serde_json::Value::Null);
+                if saved_value == draft_value {
+                    continue;
+                }
+                match target.get_mut(key) {
+                    Some(target_value) => merge_changed(target_value, saved_value, draft_value),
+                    None => {
+                        target.insert(key.clone(), draft_value.clone());
+                    }
+                }
+            }
+        }
+        _ if saved != draft => *target = draft.clone(),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CompletionCase, MAX_COMPLETION_DELAY_MS, MAX_INDENT_SIZE, MIN_LINE_SPACING, Settings,
+        TrimTrailingWhitespace,
+    };
+
+    #[test]
+    fn an_old_settings_file_keeps_the_theme_the_installation_chose() {
+        let dir = test_support::scratch("settings-theme");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"font_size": 15.0}"#).unwrap();
+
+        let old = Settings::load_with_theme_choice(&file, true);
+        assert!(
+            !old.theme_sync_with_os,
+            "a theme chosen before Sync with OS existed keeps the sync off"
+        );
+        assert_eq!(old.font_size, 15.);
+        assert_eq!(old.theme_light, "light");
+        assert_eq!(old.theme_dark, "dark");
+        assert!(
+            Settings::load_with_theme_choice(&file, false).theme_sync_with_os,
+            "an installation without a chosen theme follows the system"
+        );
+
+        std::fs::write(&file, r#"{"theme_sync_with_os": true}"#).unwrap();
+        assert!(
+            Settings::load_with_theme_choice(&file, true).theme_sync_with_os,
+            "a file that names the switch keeps its value"
+        );
+        assert!(
+            !Settings::load_with_theme_choice(&dir.join("missing.json"), true).theme_sync_with_os,
+            "a start without a settings file keeps the chosen theme too"
+        );
+    }
+
+    #[test]
+    fn the_project_always_select_switch_is_saved_and_read_back() {
+        let dir = test_support::scratch("settings-always-select");
+        let file = dir.join("settings.json");
+        let on = Settings {
+            project_always_select_opened_file: true,
+            ..Settings::default()
+        };
+        on.save(&file).unwrap();
+        assert!(Settings::load(&file).project_always_select_opened_file);
+        assert!(!Settings::load(&dir.join("missing.json")).project_always_select_opened_file);
+    }
+
+    #[test]
+    fn a_missing_or_damaged_file_gives_the_defaults() {
+        let dir = test_support::scratch("settings");
+        let file = dir.join("settings.json");
+        assert_eq!(Settings::load(&file), Settings::default());
+        std::fs::write(&file, "{broken").unwrap();
+        assert_eq!(Settings::load(&file), Settings::default());
+    }
+
+    #[test]
+    fn settings_round_trip_and_a_partial_file_keeps_the_other_defaults() {
+        let dir = test_support::scratch("settings-rt");
+        let file = dir.join("ide").join("settings.json");
+        let settings = Settings {
+            font_size: 16.,
+            autosave: false,
+            runtime_home: "C:/runtime".into(),
+            ..Settings::default()
+        };
+        settings.save(&file).unwrap();
+        assert_eq!(Settings::load(&file), settings);
+
+        std::fs::write(&file, r#"{"soft_wrap": true, "future": 1}"#).unwrap();
+        let partial = Settings::load(&file);
+        assert!(partial.soft_wrap);
+        assert!(partial.autosave, "the default stays");
+    }
+
+    #[test]
+    fn the_font_size_stays_in_limits() {
+        let settings = Settings::default();
+        assert_eq!(settings.with_font_step(1.).font_size, 14.);
+        assert_eq!(settings.with_font_step(100.).font_size, 32.);
+        assert_eq!(settings.with_font_step(-100.).font_size, 8.);
+        let wild = Settings {
+            font_size: f32::NAN,
+            ..Settings::default()
+        };
+        assert_eq!(wild.with_font_step(0.).font_size, 13.);
+    }
+
+    #[test]
+    fn the_editor_settings_round_trip_and_an_old_file_gets_the_defaults() {
+        let dir = test_support::scratch("settings-editor");
+        let file = dir.join("settings.json");
+        let settings = Settings {
+            editor_font_family: "Consolas".into(),
+            line_spacing: 1.4,
+            show_line_numbers: false,
+            highlight_current_line: false,
+            show_indent_guides: false,
+            caret_blink: false,
+            trim_trailing_whitespace: TrimTrailingWhitespace::Modified,
+            ensure_final_newline: true,
+            zoom_with_wheel: false,
+            tab_size: 2,
+            indent_size: 2,
+            use_tabs: true,
+            completion_case: CompletionCase::All,
+            completion_auto_popup: false,
+            completion_delay_ms: 300,
+            ..Settings::default()
+        };
+        settings.save(&file).unwrap();
+        assert_eq!(Settings::load(&file), settings);
+
+        std::fs::write(&file, r#"{"soft_wrap": true}"#).unwrap();
+        let old = Settings::load(&file);
+        assert!(old.soft_wrap);
+        assert_eq!(old.editor_font_family, "JetBrains Mono");
+        assert_eq!(old.line_spacing, 1.);
+        assert!(old.show_line_numbers);
+        assert!(old.highlight_current_line);
+        assert!(old.show_indent_guides);
+        assert!(old.caret_blink);
+        assert_eq!(old.trim_trailing_whitespace, TrimTrailingWhitespace::None);
+        assert!(!old.ensure_final_newline);
+        assert!(old.zoom_with_wheel);
+        assert_eq!(old.tab_size, 4);
+        assert_eq!(old.indent_size, 4);
+        assert!(!old.use_tabs);
+        assert_eq!(old.completion_case, CompletionCase::None);
+        assert!(old.completion_auto_popup);
+        assert_eq!(old.completion_delay_ms, 0);
+    }
+
+    #[test]
+    fn the_new_numbers_stay_in_their_limits() {
+        let dir = test_support::scratch("settings-limits");
+        let file = dir.join("settings.json");
+        let settings = Settings {
+            line_spacing: 0.2,
+            tab_size: 0,
+            indent_size: 99,
+            completion_delay_ms: 99_999,
+            editor_font_family: "  ".into(),
+            ..Settings::default()
+        };
+        settings.save(&file).unwrap();
+        let clamped = Settings::load(&file);
+        assert_eq!(clamped.line_spacing, MIN_LINE_SPACING);
+        assert_eq!(clamped.tab_size, 1);
+        assert_eq!(clamped.indent_size, MAX_INDENT_SIZE as u32);
+        assert_eq!(clamped.completion_delay_ms, MAX_COMPLETION_DELAY_MS);
+        assert_eq!(clamped.editor_font_family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn a_nested_draft_field_keeps_the_neighbour_changed_outside() {
+        let saved = {
+            let mut settings = Settings::default();
+            settings.build_tools.first.home = "old home".into();
+            settings.build_tools.second.user_home = "old user home".into();
+            settings.git_path = "old git".into();
+            settings
+        };
+        let mut draft = saved.clone();
+        draft.build_tools.first.home = "new home".into();
+
+        let mut current = saved.clone();
+        current.build_tools.second.user_home = "changed outside".into();
+        current.git_path = "new git".into();
+        current.merge_draft(&saved, &draft);
+
+        assert_eq!(
+            current.build_tools.first.home, "new home",
+            "the field of the draft wins"
+        );
+        assert_eq!(
+            current.build_tools.second.user_home, "changed outside",
+            "a neighbour inside the same object keeps its newer value"
+        );
+        assert_eq!(
+            current.git_path, "new git",
+            "a field the draft did not touch keeps its newer value"
+        );
+    }
+
+    #[test]
+    fn the_save_leaves_no_temporary_file_behind() {
+        let dir = test_support::scratch("settings-atomic");
+        let file = dir.join("settings.json");
+        let settings = Settings {
+            font_size: 17.,
+            ..Settings::default()
+        };
+        settings.save(&file).unwrap();
+        settings.save(&file).unwrap();
+        assert_eq!(Settings::load(&file), settings);
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["settings.json"], "only the settings file stays");
+    }
+}

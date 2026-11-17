@@ -1,0 +1,23 @@
+{
+  "contexts": {
+    "application": {
+      "mappings": {
+        "dispatcherHandlers": {
+          "dispatcherServlet": [
+            {
+              "predicate": "{GET [/owners/{ownerId}]}",
+              "handler": "org.springframework.samples.petclinic.owner.OwnerController#showOwner(int)",
+              "details": {
+                "requestMappingConditions": {
+                  "methods": ["GET"],
+                  "patterns": ["/owners/{ownerId}"]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "parentId": null
+    }
+  }
+}

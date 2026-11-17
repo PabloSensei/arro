@@ -1,0 +1,290 @@
+# Builds the Linux and macOS archives, attaches them to the draft release that
+# team/release.sh made with the Windows archive, runs the Linux and macOS tests
+# (build.yml) unless team/gh-ci.sh ran them on the same tree before the release, checks
+# the whole set and only then publishes the release: nobody can download a release
+# without its archives or with failing tests.
+# Without a tag the run is a trial: the Linux archive becomes an artifact of the run.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag of the draft release, v0.1.12 for one; empty for a trial"
+        required: false
+        default: ""
+      tested_tree:
+        description: "The git tree that passed build.yml on the branch ci (team/gh-ci.sh); empty runs the tests here"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # The pinned language tools. `xtask dist` checks the SHA-256 of both files, so a
+  # different file stops the job instead of shipping another server.
+  JDTLS_ARCHIVE: jdt-language-server-1.63.0-202610191322.tar.gz
+  JDTLS_URL: https://download.eclipse.org/jdtls/snapshots/jdt-language-server-1.63.0-202610191322.tar.gz
+  DEBUG_ARCHIVE: vscjava.vscode-java-debug-0.60.0.vsix
+  DEBUG_URL: https://open-vsx.org/api/vscjava/vscode-java-debug/0.60.0/file/vscjava.vscode-java-debug-0.60.0.vsix
+  MAVEN_VERSION: "3.9.11"
+  JACOCO_VERSION: "0.8.15"
+  ASM_VERSION: "9.10.1"
+  MAVEN_CENTRAL: https://repo1.maven.org/maven2
+  TAG: ${{ inputs.tag }}
+  TESTED_TREE: ${{ inputs.tested_tree }}
+
+jobs:
+  # The tests of Linux and macOS run beside the archives and the release waits for them,
+  # unless team/gh-ci.sh already ran them on the very same tree before the release.
+  tests:
+    name: Tests
+    if: inputs.tested_tree == ''
+    uses: ./.github/workflows/build.yml
+
+  linux:
+    name: Linux archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Language tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/download-jdtls" "$RUNNER_TEMP/tools/download-java-debug"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-jdtls/$JDTLS_ARCHIVE" "$JDTLS_URL"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-java-debug/$DEBUG_ARCHIVE" "$DEBUG_URL"
+          # JaCoCo for Run with Coverage: `xtask dist` checks the SHA-256 of every jar.
+          jacoco="$RUNNER_TEMP/tools/download-jacoco"
+          mkdir -p "$jacoco/agent" "$jacoco/lib"
+          curl -fsSL --retry 3 -o "$jacoco/agent/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"
+          curl -fsSL --retry 3 -o "$jacoco/lib/org.jacoco.core-$JACOCO_VERSION.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.core/$JACOCO_VERSION/org.jacoco.core-$JACOCO_VERSION.jar"
+          for part in asm asm-commons asm-tree; do
+            curl -fsSL --retry 3 -o "$jacoco/lib/$part-$ASM_VERSION.jar"               "$MAVEN_CENTRAL/org/ow2/asm/$part/$ASM_VERSION/$part-$ASM_VERSION.jar"
+          done
+
+      # The binary links against the glibc of the system it is built on, and a newer
+      # glibc does not start on an older one. The archive is built in Ubuntu 22.04
+      # (glibc 2.35), so it runs on Ubuntu 22.04, Debian 12 and anything newer, whatever
+      # system the runner itself has.
+      - name: Archive and checksum
+        run: |
+          if [ -n "$TAG" ]; then
+            version="${TAG#v}"
+          else
+            version="trial-${GITHUB_SHA::7}"
+          fi
+          name="arro-$version-linux-x86_64"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/dist"
+          # The helper jars compile against the libraries of Maven 3.9; the runner has
+          # one, Ubuntu 22.04 only an older Maven, so the runner's goes in read-only.
+          maven_home=$(dirname "$(dirname "$(readlink -f "$(command -v mvn)")")")
+          echo "Maven of the runner: $maven_home"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP:/work" -w /src \
+            -v "$maven_home:/opt/maven:ro" -e MAVEN_HOME=/opt/maven \
+            -e NAME="$name" -e DEBIAN_FRONTEND=noninteractive \
+            ubuntu:22.04 bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                build-essential binutils ca-certificates cmake curl git pkg-config unzip \
+                openjdk-17-jdk-headless \
+                libfontconfig1-dev libwayland-dev libx11-dev libxcb1-dev \
+                libxkbcommon-dev libxkbcommon-x11-dev rpm > /dev/null
+              git config --global --add safe.directory /src
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+              . "$HOME/.cargo/env"
+              cargo run -q -p xtask -- dist --target linux \
+                --out "/work/dist/$NAME" --tools /work/tools --zip --deb --rpm
+              # The newest glibc the program asks for; anything past 2.35 would shut
+              # out the systems this build is for.
+              newest=$(objdump -T "/work/dist/$NAME/arro" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1)
+              echo "newest glibc symbol: $newest"
+              [ "$( { echo "$newest"; echo GLIBC_2.35; } | sort -V | tail -1)" = GLIBC_2.35 ]
+              chown -R "$(stat -c %u:%g /src)" /work/dist /src/target
+            '
+          cd "$RUNNER_TEMP/dist"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+          for package in arro_*_amd64.deb arro-*.x86_64.rpm; do
+            sha256sum "$package" > "$package.sha256"
+            cat "$package.sha256"
+          done
+
+      - name: Attach to the release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/dist/"arro-*.tar.gz \
+            "$RUNNER_TEMP/dist/"arro-*.tar.gz.sha256 \
+            "$RUNNER_TEMP/dist/"arro_*.deb \
+            "$RUNNER_TEMP/dist/"arro_*.deb.sha256 \
+            "$RUNNER_TEMP/dist/"arro-*.x86_64.rpm \
+            "$RUNNER_TEMP/dist/"arro-*.x86_64.rpm.sha256 \
+            --clobber
+
+      - name: Keep the trial archive
+        if: inputs.tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            ${{ runner.temp }}/dist/arro-*.tar.gz
+            ${{ runner.temp }}/dist/arro-*.tar.gz.sha256
+            ${{ runner.temp }}/dist/arro_*.deb
+            ${{ runner.temp }}/dist/arro_*.deb.sha256
+            ${{ runner.temp }}/dist/arro-*.x86_64.rpm
+            ${{ runner.temp }}/dist/arro-*.x86_64.rpm.sha256
+          retention-days: 7
+
+  macos:
+    name: macOS archive
+    # Only for a release: a trial run checks the Linux build alone.
+    if: inputs.tag != ''
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup show active-toolchain && cargo --version
+
+      - name: Language tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/download-jdtls" "$RUNNER_TEMP/tools/download-java-debug"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-jdtls/$JDTLS_ARCHIVE" "$JDTLS_URL"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tools/download-java-debug/$DEBUG_ARCHIVE" "$DEBUG_URL"
+          # JaCoCo for Run with Coverage: `xtask dist` checks the SHA-256 of every jar.
+          jacoco="$RUNNER_TEMP/tools/download-jacoco"
+          mkdir -p "$jacoco/agent" "$jacoco/lib"
+          curl -fsSL --retry 3 -o "$jacoco/agent/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"
+          curl -fsSL --retry 3 -o "$jacoco/lib/org.jacoco.core-$JACOCO_VERSION.jar"             "$MAVEN_CENTRAL/org/jacoco/org.jacoco.core/$JACOCO_VERSION/org.jacoco.core-$JACOCO_VERSION.jar"
+          for part in asm asm-commons asm-tree; do
+            curl -fsSL --retry 3 -o "$jacoco/lib/$part-$ASM_VERSION.jar"               "$MAVEN_CENTRAL/org/ow2/asm/$part/$ASM_VERSION/$part-$ASM_VERSION.jar"
+          done
+
+      # The Maven extension among the helpers compiles against Maven 3.9, which the
+      # macOS runner does not carry; the archive comes from Apache with its SHA-512.
+      - name: Maven 3.9
+        run: |
+          base="https://archive.apache.org/dist/maven/maven-3/$MAVEN_VERSION/binaries"
+          file="apache-maven-$MAVEN_VERSION-bin.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o "$file" "$base/$file"
+          curl -fsSL --retry 3 -o "$file.sha512" "$base/$file.sha512"
+          echo "$(cut -d' ' -f1 "$file.sha512")  $file" | shasum -a 512 -c -
+          tar -xzf "$file"
+          echo "MAVEN_HOME=$RUNNER_TEMP/apache-maven-$MAVEN_VERSION" >> "$GITHUB_ENV"
+
+      # The runner is Apple silicon. `xtask dist --target macos` names the archive after
+      # the machine it built on, `macos-aarch64` here and `macos-x86_64` on an Intel Mac.
+      - name: Archive and checksum
+        run: |
+          version="${TAG#v}"
+          case "$(uname -m)" in
+            arm64) platform=macos-aarch64 ;;
+            x86_64) platform=macos-x86_64 ;;
+            *) echo "no macOS release for $(uname -m)" >&2; exit 1 ;;
+          esac
+          out="$RUNNER_TEMP/dist"
+          mkdir -p "$out"
+          cargo run -q -p xtask -- dist --target macos --out "$out" \
+            --tools "$RUNNER_TEMP/tools" --zip --dmg
+          cd "$out"
+          for archive in "arro-$version-$platform.zip" "arro-$version-$platform.dmg"; do
+            shasum -a 256 "$archive" > "$archive.sha256"
+            cat "$archive.sha256"
+          done
+          hdiutil verify "arro-$version-$platform.dmg"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/dist/"arro-*.zip \
+            "$RUNNER_TEMP/dist/"arro-*.zip.sha256 \
+            "$RUNNER_TEMP/dist/"arro-*.dmg \
+            "$RUNNER_TEMP/dist/"arro-*.dmg.sha256 \
+            --clobber
+
+  # The draft becomes public only when every archive is there and matches its checksum,
+  # the Linux program asks for no glibc past 2.35 and each archive holds its program.
+  publish:
+    name: Check and publish
+    needs: [linux, macos, tests]
+    # Skipped tests (they passed before the release) do not hold the release back;
+    # failed or cancelled ones do.
+    if: inputs.tag != '' && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the tested tree
+        if: inputs.tested_tree != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          target=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json targetCommitish -q .targetCommitish)
+          tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" -q .commit.tree.sha)
+          echo "release tree: $tree, tested tree: $TESTED_TREE"
+          [ "$tree" = "$TESTED_TREE" ] || { echo "the release is not the tree that passed the tests"; exit 1; }
+
+      - name: Check the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p "$RUNNER_TEMP/check" && cd "$RUNNER_TEMP/check"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          for archive in \
+            "arro-$version-windows-x86_64.zip" \
+            "arro-$version-linux-x86_64.tar.gz" \
+            "arro-$version-macos-aarch64.zip" \
+            "arro-$version-macos-aarch64.dmg" \
+            "arro_${version}_amd64.deb" \
+            "arro-$version-1.x86_64.rpm"; do
+            [ -f "$archive" ] || { echo "missing $archive"; exit 1; }
+            [ -f "$archive.sha256" ] || { echo "missing $archive.sha256"; exit 1; }
+            expected=$(cut -d' ' -f1 "$archive.sha256")
+            actual=$(sha256sum "$archive" | cut -d' ' -f1)
+            [ "$expected" = "$actual" ] || { echo "the checksum of $archive differs"; exit 1; }
+            echo "ok $archive"
+          done
+          tar -xzf "arro-$version-linux-x86_64.tar.gz"
+          program="arro-$version-linux-x86_64/arro"
+          [ -x "$program" ] || { echo "the Linux archive has no arro"; exit 1; }
+          newest=$(objdump -T "$program" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1)
+          echo "newest glibc symbol: $newest"
+          [ "$( { echo "$newest"; echo GLIBC_2.35; } | sort -V | tail -1)" = GLIBC_2.35 ]
+          unzip -l "arro-$version-macos-aarch64.zip" | grep -q "Arro.app/Contents/MacOS/" \
+            || { echo "the macOS archive has no Arro.app"; exit 1; }
+          unzip -l "arro-$version-windows-x86_64.zip" | grep -q "arro.exe" \
+            || { echo "the Windows archive has no arro.exe"; exit 1; }
+          deb="arro_${version}_amd64.deb"
+          dpkg-deb --info "$deb" | grep -q "Version: $version" \
+            || { echo "the package has another version"; exit 1; }
+          contents=$(dpkg-deb --contents "$deb")
+          for path in ./opt/arro/arro ./usr/bin/arro ./usr/share/applications/arro.desktop; do
+            echo "$contents" | grep -q " $path" || { echo "the package has no $path"; exit 1; }
+          done
+          sudo apt-get install -y -qq rpm > /dev/null
+          rpm="arro-$version-1.x86_64.rpm"
+          [ "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$version" ] \
+            || { echo "the rpm has another version"; exit 1; }
+          files=$(rpm -qpl "$rpm")
+          for path in /opt/arro/arro /usr/bin/arro /usr/share/applications/arro.desktop; do
+            echo "$files" | grep -qx "$path" || { echo "the rpm has no $path"; exit 1; }
+          done
+          for path in /opt /usr /usr/bin /usr/share; do
+            ! echo "$files" | grep -qx "$path" || { echo "the rpm owns $path"; exit 1; }
+          done
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

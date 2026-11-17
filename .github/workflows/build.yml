@@ -1,0 +1,119 @@
+# Builds and tests Arro on Linux and macOS. No secrets, no publishing. The release
+# workflow calls it and publishes a release only when it passes, so a push of a
+# release snapshot does not run it a second time. Windows is tested on the
+# maintainer's machine (`xtask ci` in team/release.sh) before every release.
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Called from the release workflow, github.workflow names the caller: a release run
+# never cancels a run started by hand or by a pull request, nor the other way round.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GPUI draws through Wayland or X11 with fontconfig and xkbcommon, which the
+      # runner does not carry by default.
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      # Every window test watches its project folder, and one test process opens hundreds
+      # of windows; the runner allows 128 inotify instances per user.
+      - name: Linux inotify limits
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w fs.inotify.max_user_instances=8192
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+
+      # The toolchain, its components and its targets come from rust-toolchain.toml.
+      - name: Toolchain
+        run: rustup show active-toolchain && cargo --version
+
+      # The dependencies and GPUI come from the cache of the last run of this system;
+      # only the crates of the workspace compile again. Saved from main only.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --no-fail-fast
+
+  # A real language server and a real debug adapter that are neither the ones the
+  # product ships nor for its language: the neutral clients must not hide a dependency
+  # on it. Both packages are test tools, not part of the build.
+  boundary:
+    name: Boundary (real servers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup show active-toolchain && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: boundary
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The Python of the runner moves on (3.14 by now), and the pinned debugpy does not
+      # start a program on it; the version is pinned with the packages.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tools live in a folder of the job and disappear with it.
+      - name: Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/boundary-venv"
+          "$RUNNER_TEMP/boundary-venv/bin/pip" install --disable-pip-version-check \
+            "python-lsp-server[pyflakes]==1.12.0" \
+            "debugpy==1.8.14"
+
+      - name: Language server boundary
+        env:
+          ARRO_PYLSP: ${{ runner.temp }}/boundary-venv/bin/pylsp
+        run: cargo test -p lsp-client --test real_python -- --ignored
+
+      - name: Debug adapter boundary
+        env:
+          ARRO_DEBUGPY_PYTHON: ${{ runner.temp }}/boundary-venv/bin/python
+        run: cargo test -p dap-client --test real_debugpy -- --ignored

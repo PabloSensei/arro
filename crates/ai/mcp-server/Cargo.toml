@@ -1,0 +1,17 @@
+[package]
+name = "mcp-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+getrandom = "0.3"
+http = "1"
+rmcp = { version = "=3.9.0", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
+tool-gateway = { path = "../tool-gateway" }
