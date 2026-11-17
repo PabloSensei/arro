@@ -517,6 +517,7 @@ mod tests {
             grammar: || panic!("the merge tests do not parse"),
             indent_unit: "    ",
             receiver_prefixes: &[],
+            postfix: None,
             query: OnceLock::new(),
             declarations: None,
         })

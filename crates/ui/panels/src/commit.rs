@@ -281,10 +281,65 @@ struct PendingCommit {
     options: CommitOptions,
 }
 
+/// What the Commit window and the Local Changes tab of the Git window share: the message
+/// typed so far, the ticks of the files, Amend, the commit options and the change lists.
+/// The Commit window and the tab are two views of this one draft, so a message or a tick
+/// made in one of them is what the other shows, and the lists are saved from here alone.
+pub struct CommitDraft {
+    message: TextField,
+    /// Files the user took the tick off. A new file starts ticked.
+    unchecked: HashSet<String>,
+    /// Alt+M: the next commit rewrites the last one.
+    amend: bool,
+    /// The switches of the commit options popup.
+    sign_off: bool,
+    author: Option<String>,
+    /// Run Inspect Code over the chosen files before the commit.
+    analysis: bool,
+    lists: Changelists,
+    /// The store key of [`CommitDraft::lists`].
+    lists_key: String,
+    store: Option<std::sync::Arc<store::Store>>,
+}
+
+impl CommitDraft {
+    /// The one draft of the project: its change lists come from the store, the rest
+    /// starts empty.
+    pub fn create(
+        root: &Path,
+        store: Option<std::sync::Arc<store::Store>>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let lists_key = format!("changelists:{}", project_key(root));
+        let lists = Changelists::load(store.as_deref(), &lists_key);
+        let analysis = cx
+            .try_global::<Settings>()
+            .is_some_and(|settings| settings.git_analyze_before_commit);
+        cx.new(|_| Self {
+            message: TextField::default(),
+            unchecked: HashSet::new(),
+            amend: false,
+            sign_off: false,
+            author: None,
+            analysis,
+            lists,
+            lists_key,
+            store,
+        })
+    }
+
+    fn save_lists(&self) {
+        self.lists.save(self.store.as_deref(), &self.lists_key);
+    }
+}
+
 pub struct CommitPanel {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
+    /// The state both views share. The fields below are its last values, copied at every
+    /// change so that drawing reads them without a borrow of the draft.
+    draft: Entity<CommitDraft>,
     message: TextField,
     /// Files the user took the tick off. A new file starts ticked.
     unchecked: HashSet<String>,
@@ -304,9 +359,6 @@ pub struct CommitPanel {
     analysis: bool,
     tab: Tab,
     lists: Changelists,
-    /// The store key of [`CommitPanel::lists`].
-    lists_key: String,
-    store: Option<std::sync::Arc<store::Store>>,
     shelves: Vec<Shelf>,
     shelf_store: ShelfStore,
     shelf_selected: Option<usize>,
@@ -323,7 +375,11 @@ pub struct CommitPanel {
     window: AnyWindowHandle,
     row_bounds: Rc<std::cell::RefCell<HashMap<usize, Bounds<Pixels>>>>,
     root: PathBuf,
+    /// The panel stands in a tab of another window, such as Local Changes of the Git
+    /// window: its own header and tabs stay out of sight.
+    embedded: bool,
     _git: Subscription,
+    _draft: Subscription,
 }
 
 impl CommitPanel {
@@ -332,13 +388,11 @@ impl CommitPanel {
         workspace: WeakEntity<Workspace>,
         root: PathBuf,
         state_dir: PathBuf,
-        store: Option<std::sync::Arc<store::Store>>,
+        draft: Entity<CommitDraft>,
         window: &Window,
         cx: &mut App,
     ) -> Entity<Self> {
         bind_keys(cx);
-        let lists_key = format!("changelists:{}", project_key(&root));
-        let lists = Changelists::load(store.as_deref(), &lists_key);
         let shelf_store = ShelfStore::new(&state_dir, &root);
         let shelves = shelf_store.list();
         let window = window.window_handle();
@@ -348,28 +402,37 @@ impl CommitPanel {
                 this.status_changed(&status, cx);
                 cx.notify();
             });
+            let observe_draft = cx.observe(&draft, |this: &mut Self, _, cx| {
+                this.pull(cx);
+                cx.notify();
+            });
+            let shared = draft.read(cx);
+            let message = shared.message.clone();
+            let unchecked = shared.unchecked.clone();
+            let amend = shared.amend;
+            let sign_off = shared.sign_off;
+            let author = shared.author.clone();
+            let analysis = shared.analysis;
+            let lists = shared.lists.clone();
             Self {
                 git,
                 workspace,
                 focus: cx.focus_handle(),
-                message: TextField::default(),
-                unchecked: HashSet::new(),
+                draft,
+                message,
+                unchecked,
                 selected: None,
                 scroll_files: ScrollHandle::new(),
                 scroll_shelves: ScrollHandle::new(),
                 scroll_shelf_files: ScrollHandle::new(),
                 scroll_shelf_diff: ScrollHandle::new(),
                 files_focused: false,
-                amend: false,
-                sign_off: false,
-                author: None,
-                analysis: cx
-                    .try_global::<Settings>()
-                    .is_some_and(|settings| settings.git_analyze_before_commit),
+                amend,
+                sign_off,
+                author,
+                analysis,
                 tab: Tab::Commit,
                 lists,
-                lists_key,
-                store,
                 shelves,
                 shelf_store,
                 shelf_selected: None,
@@ -382,9 +445,47 @@ impl CommitPanel {
                 window,
                 row_bounds: Rc::new(std::cell::RefCell::new(HashMap::new())),
                 root,
+                embedded: false,
                 _git: observe,
+                _draft: observe_draft,
             }
         })
+    }
+
+    /// Makes the panel a tab of another window: the list, the message and the buttons
+    /// stay, the header and the tabs of the Commit window go away.
+    pub fn set_embedded(&mut self, embedded: bool) {
+        self.embedded = embedded;
+    }
+
+    /// Runs a change of the draft both views show. This view reads the draft back at
+    /// once; the other one reads it when the draft says it changed.
+    fn change<R>(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut CommitDraft) -> R) -> R {
+        let result = self.draft.update(cx, |draft, cx| {
+            let result = f(draft);
+            cx.notify();
+            result
+        });
+        self.pull(cx);
+        result
+    }
+
+    /// Copies the draft into the fields this view draws.
+    fn pull(&mut self, cx: &App) {
+        let draft = self.draft.read(cx);
+        self.message = draft.message.clone();
+        self.unchecked = draft.unchecked.clone();
+        self.amend = draft.amend;
+        self.sign_off = draft.sign_off;
+        self.author = draft.author.clone();
+        self.analysis = draft.analysis;
+        self.lists = draft.lists.clone();
+    }
+
+    /// The message field was edited: both views get the text with the caret.
+    fn flush_message(&mut self, cx: &mut Context<Self>) {
+        let message = self.message.clone();
+        self.change(cx, |draft| draft.message = message);
     }
 
     pub fn focus(&self) -> FocusHandle {
@@ -398,6 +499,12 @@ impl CommitPanel {
     /// The message typed so far, for scripts.
     pub fn message(&self) -> &str {
         &self.message.text
+    }
+
+    /// Whether the file carries a tick, for tests.
+    #[cfg(test)]
+    pub fn is_checked(&self, path: &str) -> bool {
+        !self.unchecked.contains(path)
     }
 
     /// Whether the next commit rewrites the last one, for scripts and tests.
@@ -474,25 +581,34 @@ impl CommitPanel {
     }
 
     pub fn set_message(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.message.text = text.to_string();
+        let text = text.to_string();
+        self.change(cx, |draft| draft.message.text = text);
         cx.notify();
     }
 
     pub fn set_checked(&mut self, path: &str, checked: bool, cx: &mut Context<Self>) {
-        if checked {
-            self.unchecked.remove(path);
-        } else {
-            self.unchecked.insert(path.to_string());
-        }
+        let path = path.to_string();
+        self.change(cx, |draft| {
+            if checked {
+                draft.unchecked.remove(&path);
+            } else {
+                draft.unchecked.insert(path);
+            }
+        });
         cx.notify();
     }
 
     /// Alt+M: the last commit is rewritten with the message of the field, which starts as
     /// the message of that commit.
     fn toggle_amend(&mut self, cx: &mut Context<Self>) {
-        self.amend = !self.amend;
-        if !self.amend {
-            self.message.text.clear();
+        let amend = !self.amend;
+        self.change(cx, |draft| {
+            draft.amend = amend;
+            if !amend {
+                draft.message.text.clear();
+            }
+        });
+        if !amend {
             cx.notify();
             return;
         }
@@ -512,7 +628,7 @@ impl CommitPanel {
                 if this.amend
                     && let Some(message) = message
                 {
-                    this.message.text = message;
+                    this.change(cx, |draft| draft.message.text = message);
                 }
                 cx.notify();
             })
@@ -655,17 +771,15 @@ impl CommitPanel {
 
     fn status_changed(&mut self, status: &vcs::Status, cx: &mut Context<Self>) {
         let paths: HashSet<String> = status.files.iter().map(|file| file.path.clone()).collect();
-        if self.lists.retain_paths(&paths) {
-            self.save_lists();
-        }
+        self.change(cx, |draft| {
+            if draft.lists.retain_paths(&paths) {
+                draft.save_lists();
+            }
+        });
         if self.selected.is_some() && !self.visible_files(cx).contains(&self.selected.unwrap_or(0))
         {
             self.selected = None;
         }
-    }
-
-    fn save_lists(&self) {
-        self.lists.save(self.store.as_deref(), &self.lists_key);
     }
 
     pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -792,10 +906,16 @@ impl CommitPanel {
     }
 
     fn add_changelist(&mut self, name: String, cx: &mut Context<Self>) {
-        if self.lists.add_list(&name) {
-            self.save_lists();
+        let added = self.change(cx, |draft| {
+            let added = draft.lists.add_list(&name);
+            if added {
+                draft.save_lists();
+                draft.unchecked.clear();
+            }
+            added
+        });
+        if added {
             self.selected = None;
-            self.unchecked.clear();
             cx.notify();
         } else {
             let name = name.trim().to_string();
@@ -828,10 +948,16 @@ impl CommitPanel {
     }
 
     fn set_active_list(&mut self, name: String, cx: &mut Context<Self>) {
-        if self.lists.set_active(&name) {
-            self.save_lists();
+        let changed = self.change(cx, |draft| {
+            let changed = draft.lists.set_active(&name);
+            if changed {
+                draft.save_lists();
+                draft.unchecked.clear();
+            }
+            changed
+        });
+        if changed {
             self.selected = None;
-            self.unchecked.clear();
             cx.notify();
         }
     }
@@ -850,8 +976,14 @@ impl CommitPanel {
                     &name,
                     move |name, cx| {
                         me.update(cx, |this, cx| {
-                            if this.lists.rename_active(&name) {
-                                this.save_lists();
+                            let renamed = this.change(cx, |draft| {
+                                let renamed = draft.lists.rename_active(&name);
+                                if renamed {
+                                    draft.save_lists();
+                                }
+                                renamed
+                            });
+                            if renamed {
                                 this.selected = None;
                                 cx.notify();
                             }
@@ -870,10 +1002,16 @@ impl CommitPanel {
         if self.tab == Tab::Shelf {
             return;
         }
-        if self.lists.delete_active() {
-            self.save_lists();
+        let deleted = self.change(cx, |draft| {
+            let deleted = draft.lists.delete_active();
+            if deleted {
+                draft.save_lists();
+                draft.unchecked.clear();
+            }
+            deleted
+        });
+        if deleted {
             self.selected = None;
-            self.unchecked.clear();
             cx.notify();
         } else {
             self.git.update(cx, |git, cx| {
@@ -894,8 +1032,10 @@ impl CommitPanel {
             });
             return;
         }
-        self.lists.move_paths(&paths, &list);
-        self.save_lists();
+        self.change(cx, |draft| {
+            draft.lists.move_paths(&paths, &list);
+            draft.save_lists();
+        });
         self.selected = None;
         let count = paths.len();
         self.git.update(cx, |git, cx| {
@@ -909,8 +1049,10 @@ impl CommitPanel {
     }
 
     fn set_grouping(&mut self, grouping: Grouping, cx: &mut Context<Self>) {
-        self.lists.grouping = grouping;
-        self.save_lists();
+        self.change(cx, |draft| {
+            draft.lists.grouping = grouping;
+            draft.save_lists();
+        });
         cx.notify();
     }
 
@@ -1032,7 +1174,7 @@ impl CommitPanel {
             let me = me.clone();
             entries.push(MenuEntry::new(sign_off, move |_, cx| {
                 me.update(cx, |this, cx| {
-                    this.sign_off = !this.sign_off;
+                    this.change(cx, |draft| draft.sign_off = !draft.sign_off);
                     cx.notify();
                 })
                 .ok();
@@ -1062,7 +1204,7 @@ impl CommitPanel {
             let me = me.clone();
             entries.push(MenuEntry::new(label, move |_, cx| {
                 me.update(cx, |this, cx| {
-                    this.analysis = !this.analysis;
+                    this.change(cx, |draft| draft.analysis = !draft.analysis);
                     cx.notify();
                 })
                 .ok();
@@ -1086,7 +1228,8 @@ impl CommitPanel {
                     move |author, cx| {
                         let author = author.trim().to_string();
                         me.update(cx, |this, cx| {
-                            this.author = (!author.is_empty()).then_some(author);
+                            let author = (!author.is_empty()).then_some(author);
+                            this.change(cx, |draft| draft.author = author);
                             cx.notify();
                         })
                         .ok();
@@ -1145,8 +1288,10 @@ impl CommitPanel {
                 move |git, (), cx| {
                     git.reload_everything_from_disk(cx);
                     me.update(cx, |this, cx| {
-                        this.message.text.clear();
-                        this.unchecked.clear();
+                        this.change(cx, |draft| {
+                            draft.message.text.clear();
+                            draft.unchecked.clear();
+                        });
                         this.reload_shelves(cx);
                     })
                     .ok();
@@ -1408,8 +1553,10 @@ impl CommitPanel {
                     };
                     git.tell("Commit", text, cx);
                     me.update(cx, |this, cx| {
-                        this.message.text.clear();
-                        this.amend = false;
+                        this.change(cx, |draft| {
+                            draft.message.text.clear();
+                            draft.amend = false;
+                        });
                         cx.notify();
                     })
                     .ok();
@@ -1672,6 +1819,7 @@ impl CommitPanel {
             }
         }
         if self.message.key_with_clipboard(event, true, cx) {
+            self.flush_message(cx);
             cx.stop_propagation();
             cx.notify();
         }
@@ -2528,7 +2676,18 @@ impl Render for CommitPanel {
                 .into_any_element()
         };
         island(&theme)
-            .id("commit-panel")
+            .id(if self.embedded {
+                "commit-panel-local"
+            } else {
+                "commit-panel"
+            })
+            .debug_selector(|| {
+                if self.embedded {
+                    "commit-panel-local".to_owned()
+                } else {
+                    "commit-panel".to_owned()
+                }
+            })
             .key_context("CommitPanel ToolWindow")
             .track_focus(&self.focus)
             .group(GROUP)
@@ -2566,11 +2725,11 @@ impl Render for CommitPanel {
             .on_action(cx.listener(|this, _: &Shelve, _, cx| this.shelve(cx)))
             .on_action(cx.listener(|this, _: &Unshelve, window, cx| this.ask_unshelve(window, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, window, cx| this.show_diff(window, cx)))
-            .child(
+            .children((!self.embedded).then(|| {
                 panel_header(title, GROUP, hide, &theme)
-                    .debug_selector(|| "commit-header".to_owned()),
-            )
-            .child(self.tab_row(&theme, cx))
+                    .debug_selector(|| "commit-header".to_owned())
+            }))
+            .children((!self.embedded).then(|| self.tab_row(&theme, cx)))
             .child(body)
     }
 }

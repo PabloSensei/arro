@@ -155,6 +155,73 @@ pub(crate) mod sec_status {
     }
 }
 
+/// What a store answered to a call that removes an entry, in the words of its platform:
+/// the exit code and the error stream of a program, or the status of the
+/// Security.framework. The `security` program of macOS reports a missing item with the
+/// exit code 44, but the IDE talks to the Keychain directly, so its answer is a status
+/// rather than a code.
+#[cfg(any(unix, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteAnswer {
+    /// The exit code of a store program and what it wrote to its error stream.
+    #[cfg(any(all(unix, not(target_os = "macos")), test))]
+    Program { code: Option<i32>, stderr: String },
+    /// The `OSStatus` of `SecItemDelete`.
+    #[cfg(any(target_os = "macos", test))]
+    Security(i32),
+}
+
+/// Whether a delete is done: the call succeeded, or the entry was already absent, which
+/// [`delete`] promises is not an error. Every other answer stays a failure with the text
+/// of the platform, so a locked store or a session without D-Bus is still reported.
+///
+/// The rule lives here rather than beside each platform, so the workspace tests it
+/// everywhere and each platform only supplies the numbers and the words it gets back.
+#[cfg(any(unix, test))]
+pub(crate) fn delete_is_done(answer: DeleteAnswer) -> bool {
+    match answer {
+        #[cfg(any(all(unix, not(target_os = "macos")), test))]
+        DeleteAnswer::Program { code, stderr } => {
+            code == Some(0) || program_says_absent(code, &stderr)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        DeleteAnswer::Security(status) => matches!(
+            sec_status::outcome(status),
+            sec_status::Outcome::Success | sec_status::Outcome::Missing
+        ),
+    }
+}
+
+/// The words with which a store program says that there is no entry to remove: the
+/// message of libsecret for an item that has gone, the message of D-Bus for a path that
+/// the service no longer has (the path of an item or a collection, never the root object
+/// of the service, whose absence is a real failure), and the message of `security` for an
+/// item that the Keychain does not hold. Every other text stays a failure: a locked store
+/// and a session without D-Bus have their own words.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+const ABSENT_TEXTS: [&str; 4] = [
+    "no such secret item",
+    "secret item was not found",
+    "no such object at path /org/freedesktop/secrets/",
+    "could not be found in the keychain",
+];
+
+/// Whether a failed call of a store program means that there was no entry to remove. The
+/// exit code alone cannot say it: `secret-tool` ends with 1 for every failure, so the
+/// words of its error stream are the sign, and only the known words of a missing entry
+/// count. The call asks the tool for the untranslated text of the C locale, so the words
+/// are the same on every machine.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn program_says_absent(code: Option<i32>, stderr: &str) -> bool {
+    /// The only failure code of `secret-tool`.
+    const FAILURE: i32 = 1;
+    if code != Some(FAILURE) {
+        return false;
+    }
+    let stderr = stderr.to_ascii_lowercase();
+    ABSENT_TEXTS.iter().any(|text| stderr.contains(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +296,65 @@ mod tests {
         assert_eq!(outcome(ERR_SEC_ITEM_NOT_FOUND), Outcome::Missing);
         assert_eq!(outcome(ERR_SEC_DUPLICATE_ITEM), Outcome::Duplicate);
         assert_eq!(outcome(-25308), Outcome::Other(-25308));
+    }
+
+    #[test]
+    fn a_delete_is_done_when_the_entry_is_gone_or_was_absent() {
+        assert!(delete_is_done(DeleteAnswer::Program {
+            code: Some(0),
+            stderr: String::new(),
+        }));
+        assert!(delete_is_done(DeleteAnswer::Program {
+            code: Some(1),
+            stderr:
+                "clear: No such secret item at path /org/freedesktop/secrets/collection/login/7\n"
+                    .to_owned(),
+        }));
+        assert!(delete_is_done(DeleteAnswer::Program {
+            code: Some(1),
+            stderr: "clear: The secret item was not found\n".to_owned(),
+        }));
+        assert!(delete_is_done(DeleteAnswer::Program {
+            code: Some(1),
+            stderr: "clear: No such object at path /org/freedesktop/secrets/collection/login/7\n"
+                .to_owned(),
+        }));
+        assert!(delete_is_done(DeleteAnswer::Security(ERR_SEC_SUCCESS)));
+        assert!(delete_is_done(DeleteAnswer::Security(
+            ERR_SEC_ITEM_NOT_FOUND
+        )));
+    }
+
+    #[test]
+    fn a_delete_that_failed_for_another_reason_is_not_done() {
+        for (code, stderr) in [
+            (Some(1), ""),
+            (
+                Some(1),
+                "clear: Cannot autolaunch D-Bus without X11 $DISPLAY",
+            ),
+            (Some(1), "clear: The secret service was not available"),
+            (
+                Some(1),
+                "clear: No such object at path /org/freedesktop/secrets",
+            ),
+            (
+                Some(2),
+                "clear: No such secret item at path /org/freedesktop/secrets/collection/login/7",
+            ),
+            (
+                None,
+                "clear: No such secret item at path /org/freedesktop/secrets/collection/login/7",
+            ),
+        ] {
+            assert!(
+                !delete_is_done(DeleteAnswer::Program {
+                    code,
+                    stderr: stderr.to_owned(),
+                }),
+                "code {code:?} with {stderr:?}"
+            );
+        }
+        assert!(!delete_is_done(DeleteAnswer::Security(-25308)));
     }
 }

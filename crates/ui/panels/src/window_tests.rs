@@ -397,7 +397,9 @@ pub(crate) fn click_gutter(
         "editor-body-1"
     };
     let bounds = bounds_of(cx, window, selector);
-    let x = bounds.left() + px(30.);
+    // The icon column of the gutter: a badge or a run mark owns its own small square,
+    // and everything right of it belongs to the number and the breakpoint.
+    let x = bounds.left() + px(6.);
     let y = bounds.top() + px(height * line as f32 + height / 2.);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_click(point(x, y), Modifiers::default());

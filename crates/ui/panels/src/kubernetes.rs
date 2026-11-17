@@ -2060,17 +2060,13 @@ pub(crate) fn refresh_marks(view: &mut EditorView, cx: &mut Context<EditorView>)
     let Some(text) = view.text() else {
         return;
     };
-    let suffix = if cx.global::<Theme>().dark {
-        "_dark"
-    } else {
-        ""
-    };
-    let color = cx.global::<Theme>().accent;
+    let theme = *cx.global::<Theme>();
+    let color = theme.accent;
     let marks = documents(&text)
         .into_iter()
         .map(|document| ActionMark {
             line: document.start_line,
-            icon: format!("icons/toolwindows/services{suffix}.svg").into(),
+            icon: ui_kit::icon_file(theme.icon_set(), "toolwindows/services", theme.dark, 13.),
             color,
             hint: format!("{} {}", document.kind_word, document.name).into(),
         })

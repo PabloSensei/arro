@@ -16,3 +16,7 @@ gpui-kit.workspace = true
 gpui_windows = { workspace = true, default-features = false }
 rust-embed = { version = "8.13.0", features = ["debug-embed"] }
 theme = { path = "../../editor/theme" }
+
+[dev-dependencies]
+# Temporary folders of the tests: one root and removal without help from a test.
+test-support = { path = "../../../tools/test-support" }

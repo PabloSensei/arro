@@ -80,6 +80,53 @@ impl fmt::Display for SearchError {
 
 impl std::error::Error for SearchError {}
 
+/// One pattern of a filter over single lines: the text of a field with its regex and case
+/// switches. The pattern is compiled once, so a list of many rows matches without
+/// building the expression for each of them. A broken regex matches its own text as a
+/// plain string instead of hiding every row.
+pub struct TextMatcher {
+    regex: Option<Regex>,
+    pattern: String,
+    regex_source: bool,
+    match_case: bool,
+}
+
+impl TextMatcher {
+    pub fn new(pattern: &str, regex: bool, match_case: bool) -> Self {
+        let source = if regex {
+            pattern.to_owned()
+        } else {
+            regex::escape(pattern)
+        };
+        let compiled = RegexBuilder::new(&source)
+            .case_insensitive(!match_case)
+            .build()
+            .ok();
+        Self {
+            regex: compiled,
+            pattern: pattern.to_owned(),
+            regex_source: regex,
+            match_case,
+        }
+    }
+
+    pub fn is_match(&self, text: &str) -> bool {
+        match &self.regex {
+            Some(regex) => regex.is_match(text),
+            None if self.regex_source => plain_match(&self.pattern, text, self.match_case),
+            None => false,
+        }
+    }
+}
+
+fn plain_match(pattern: &str, text: &str, match_case: bool) -> bool {
+    if match_case {
+        text.contains(pattern)
+    } else {
+        text.to_lowercase().contains(&pattern.to_lowercase())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineHit {
     /// 1-based.
@@ -309,5 +356,19 @@ mod tests {
             replace_edits(&query, "", "x"),
             Err(SearchError::Pattern(_))
         ));
+    }
+
+    #[test]
+    fn a_matcher_reads_plain_text_or_a_regex_with_its_case() {
+        let plain = TextMatcher::new("a.b", false, true);
+        assert!(plain.is_match("xa.by"));
+        assert!(!plain.is_match("axby"), "a plain dot is a literal");
+
+        let regex = TextMatcher::new("a.b", true, false);
+        assert!(regex.is_match("AxB"));
+        assert!(!regex.is_match("ab"), "the dot takes one character");
+
+        let broken = TextMatcher::new("(", true, true);
+        assert!(broken.is_match("a(b"), "a broken regex reads its own text");
     }
 }

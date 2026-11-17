@@ -4,10 +4,10 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{Secret, secret_from_lookup};
+use super::{DeleteAnswer, Secret, delete_is_done, secret_from_lookup};
 
 /// The program of `libsecret-tools`.
 const TOOL: &str = "secret-tool";
@@ -92,17 +92,51 @@ pub fn delete(service: &str, account: &str) -> Result<(), String> {
         "account".to_owned(),
         account.to_owned(),
     ];
-    run(&arguments, None)?;
-    Ok(())
+    let ended = execute(&arguments, None)?;
+    let answer = DeleteAnswer::Program {
+        code: ended.status.code(),
+        stderr: String::from_utf8_lossy(&ended.stderr).into_owned(),
+    };
+    if delete_is_done(answer) {
+        Ok(())
+    } else {
+        Err(ended.failure())
+    }
+}
+
+/// A call of the tool that ended, with what it wrote: the caller decides what a failure
+/// means, because `delete` treats one of them as done and no other call does.
+struct Ended {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl Ended {
+    /// The text of a call that failed: the code and the words of the tool, which name the
+    /// reason for the user. `secret-tool` never writes a secret to its error stream.
+    fn failure(&self) -> String {
+        let code = self.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            format!("The `secret-tool` program ended with code {code}.")
+        } else {
+            format!("The `secret-tool` program ended with code {code}: {stderr}")
+        }
+    }
 }
 
 /// Starts the tool, writes the secret to its standard input, and waits for it with a
 /// timeout. The output and the error of the tool are read on their own threads, so a
 /// program that writes more than a pipe holds cannot block this call.
-fn run(arguments: &[String], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+fn execute(arguments: &[String], input: Option<&[u8]>) -> Result<Ended, String> {
     let program = program().ok_or_else(|| missing("The `secret-tool` program is missing."))?;
     let mut child = Command::new(&program)
         .args(arguments)
+        // The caller tells a missing entry from a failure by the words of the error
+        // stream, so the tool is asked for the untranslated words of the C locale.
+        .env("LC_ALL", "C")
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -156,19 +190,26 @@ fn run(arguments: &[String], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
     if let Some(writer) = writer.flatten() {
         let _ = writer.join();
     }
-    let answer = stdout
+    let stdout = stdout
         .and_then(|reader| reader.join().ok())
         .unwrap_or_default();
-    if let Some(stderr) = stderr {
-        let _ = stderr.join();
-    }
-    if status.success() {
-        Ok(answer)
+    let stderr = stderr
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    Ok(Ended {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// A call of the tool that must succeed for the answer to matter.
+fn run(arguments: &[String], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let ended = execute(arguments, input)?;
+    if ended.status.success() {
+        Ok(ended.stdout)
     } else {
-        Err(missing(&format!(
-            "The `secret-tool` program ended with code {}.",
-            status.code().unwrap_or(-1)
-        )))
+        Err(ended.failure())
     }
 }
 
@@ -307,5 +348,114 @@ mod tests {
         let _tool = ToolPath::set(&folder.path().join("no-such-secret-tool"));
         let error = available().unwrap_err();
         assert!(error.contains("libsecret-tools"), "{error}");
+    }
+
+    /// Puts a folder first in `PATH` and clears the direct path of the tool, so `program`
+    /// has to find the stand-in through the search path. Both variables go back even when
+    /// an assertion fails.
+    #[cfg(target_os = "linux")]
+    struct SearchPath {
+        path: Option<std::ffi::OsString>,
+        tool: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SearchPath {
+        fn set(folder: &std::path::Path) -> Self {
+            let path = std::env::var_os("PATH");
+            let tool = std::env::var_os(TOOL_PATH);
+            let mut folders = vec![folder.to_path_buf()];
+            if let Some(value) = &path {
+                folders.extend(std::env::split_paths(value));
+            }
+            let search = std::env::join_paths(folders).expect("a search path of the test");
+            // SAFETY: the lock of this module keeps every test of the variables apart.
+            unsafe {
+                std::env::set_var("PATH", search);
+                std::env::remove_var(TOOL_PATH);
+            }
+            Self { path, tool }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SearchPath {
+        fn drop(&mut self) {
+            // SAFETY: the lock of this module keeps every test of the variables apart.
+            unsafe {
+                match self.path.take() {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+                if let Some(tool) = self.tool.take() {
+                    std::env::set_var(TOOL_PATH, tool);
+                }
+            }
+        }
+    }
+
+    /// A `secret-tool` that writes the locale of the call into a folder of the test and
+    /// ends with `code`, saying `stderr`. The script uses the builtins of the shell alone,
+    /// so the search path of the test may stay the one of the machine.
+    #[cfg(target_os = "linux")]
+    fn failing_stand_in(folder: &std::path::Path, code: i32, stderr: &str) -> PathBuf {
+        let script = folder.join(TOOL);
+        let locale = folder.join("locale");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' \"$LC_ALL\" > '{}'\n\
+                 printf '%s\\n' '{stderr}' >&2\n\
+                 exit {code}\n",
+                locale.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    /// `secret-tool clear` may end with a failure when the store has nothing to remove,
+    /// and the module promises that an absent entry is not an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clear_of_an_absent_entry_is_not_an_error() {
+        let _guard = lock();
+        let folder = test_support::TempDir::new("secret-tool-clear-absent");
+        failing_stand_in(
+            folder.path(),
+            1,
+            "clear: No such secret item at path /org/freedesktop/secrets/collection/login/7",
+        );
+        let _path = SearchPath::set(folder.path());
+
+        delete("Arro/database/owners", "sa").unwrap();
+
+        let locale = fs::read_to_string(folder.path().join("locale")).unwrap();
+        assert_eq!(locale, "C", "the words of the tool are read untranslated");
+    }
+
+    /// Every other failure of the tool stays an error and carries its own words.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clear_that_failed_for_another_reason_is_an_error() {
+        let _guard = lock();
+        let folder = test_support::TempDir::new("secret-tool-clear-failed");
+        failing_stand_in(
+            folder.path(),
+            1,
+            "clear: Cannot autolaunch D-Bus without X11 $DISPLAY",
+        );
+        let _path = SearchPath::set(folder.path());
+
+        let error = delete("Arro/database/owners", "sa").unwrap_err();
+        assert!(error.contains("code 1"), "{error}");
+        assert!(error.contains("Cannot autolaunch D-Bus"), "{error}");
     }
 }

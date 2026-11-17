@@ -59,9 +59,18 @@ fn cc0_passes_only_for_listed_crates() {
 }
 
 #[test]
-fn gpl_dependency_is_rejected() {
-    let fixture = app_with_dependency("deny-gpl", "bad-dep", "GPL-3.0-or-later");
-    assert_rejected(&fixture, "GPL-3.0-or-later");
+fn gpl3_dependency_passes_because_arro_is_gpl3() {
+    assert_accepted(&app_with_dependency(
+        "deny-gpl3",
+        "gpl-dep",
+        "GPL-3.0-or-later",
+    ));
+}
+
+#[test]
+fn gpl2_only_dependency_is_rejected() {
+    let fixture = app_with_dependency("deny-gpl2", "bad-dep", "GPL-2.0-only");
+    assert_rejected(&fixture, "GPL-2.0-only");
 }
 
 #[test]

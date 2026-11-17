@@ -157,6 +157,7 @@ pub enum Step {
     Commit(bool),
     Branch(String),
     NewBranch(String),
+    Branches,
     Diff(PathBuf),
     Idle,
     Until(String),
@@ -306,6 +307,7 @@ fn parse_step(step: &str) -> Result<Step, String> {
         "commit-push" => Step::Commit(true),
         "branch" => Step::Branch(value.into()),
         "new-branch" => Step::NewBranch(value.into()),
+        "branches" => Step::Branches,
         "diff" => Step::Diff(value.into()),
         "git-idle" => Step::Idle,
         "task" => Step::Task(value.into()),
@@ -587,6 +589,7 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
         Step::Search => workspace.show_search(window, cx),
         Step::Dismiss => workspace.dismiss(window, cx),
         Step::Show(tool) => workspace.show_tool(tool, window, cx),
+        Step::Branches => workspace.show_branches_under_title(window, cx),
         // A saved window may keep a tool window or a balloon open, so a scenario that
         // starts with this step always begins from the same window.
         Step::HideTools => {

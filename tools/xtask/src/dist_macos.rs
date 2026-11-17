@@ -79,6 +79,7 @@ pub fn run(root: &Path, out: &Path, tools: Option<&Path>, zip: bool, dmg: bool) 
     let mut text = notice::render(false);
     text.push_str(&macos_paths(&dist::java_notice(&java), &triple));
     dist::write_text(&resources.join("NOTICE.txt"), &text)?;
+    dist::write_text(&resources.join("LICENSE.txt"), dist::PROJECT_LICENSE)?;
     dist::write_text(
         &java.debug.join("extension").join("EPL-1.0.txt"),
         dist::EPL_1_0,

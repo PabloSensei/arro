@@ -53,8 +53,8 @@ enum Command {
 struct Base {
     repo: HiddenRepo,
     first: String,
-    /// Accepted texts by path, `None` for a file accepted as gone.
-    accepted: HashMap<String, Option<String>>,
+    /// Accepted texts or bytes by path, `None` for a file accepted as gone.
+    accepted: HashMap<String, Option<Vec<u8>>>,
 }
 
 impl Base {
@@ -62,14 +62,11 @@ impl Base {
         std::fs::read(self.repo.work_tree().join(path)).ok()
     }
 
-    /// Drops files whose accepted text is what the disk holds now.
+    /// Drops files whose accepted bytes are what the disk holds now.
     fn pending(&self, changes: Vec<ChangedFile>) -> Vec<ChangedFile> {
         let open = |change: &ChangedFile| match self.accepted.get(&change.path) {
             None => true,
-            Some(accepted) => {
-                let accepted = accepted.as_ref().map(|text| text.as_bytes().to_vec());
-                accepted != self.current(&change.path)
-            }
+            Some(accepted) => accepted != &self.current(&change.path),
         };
         let mut pending: Vec<ChangedFile> = changes.into_iter().filter(open).collect();
         // A file accepted as added and then deleted is modified against the new base.
@@ -133,7 +130,7 @@ impl ChangeTracker {
             .as_ref()
             .ok_or_else(|| io::Error::other("the first snapshot is not ready"))?;
         let before = match base.accepted.get(path) {
-            Some(accepted) => accepted.clone().map(String::into_bytes),
+            Some(accepted) => accepted.clone(),
             None => base.repo.read(&base.first, path)?,
         };
         Ok(FileReview::new(
@@ -145,8 +142,13 @@ impl ChangeTracker {
 
     /// Takes `text` as the new base of `path`, and the list follows.
     pub fn accept(&self, path: &str, text: Option<String>) {
+        self.accept_bytes(path, text.map(String::into_bytes));
+    }
+
+    /// Takes the bytes on disk as the new base of `path`, for a file that is not text.
+    pub fn accept_bytes(&self, path: &str, bytes: Option<Vec<u8>>) {
         if let Some(base) = self.base.lock().unwrap().as_mut() {
-            base.accepted.insert(path.to_string(), text);
+            base.accepted.insert(path.to_string(), bytes);
         }
         self.refresh();
     }

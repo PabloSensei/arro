@@ -1,5 +1,6 @@
 //! Tool windows and popups on top of the workspace.
 
+mod agent_hunk;
 mod agents;
 mod ai_review;
 mod annotate;
@@ -117,6 +118,10 @@ mod window_tests_actions_on_save;
 mod window_tests_actuator;
 #[cfg(test)]
 mod window_tests_ai;
+#[cfg(test)]
+mod window_tests_ai_review;
+#[cfg(test)]
+mod window_tests_ai_step2;
 #[cfg(test)]
 mod window_tests_annotate;
 #[cfg(test)]
@@ -268,6 +273,8 @@ mod window_tests_about;
 #[cfg(test)]
 mod window_tests_menu_bar;
 
+#[cfg(test)]
+mod window_tests_icon_sets;
 #[cfg(test)]
 mod window_tests_idle;
 
@@ -535,13 +542,39 @@ mod window_tests_window_frame;
 #[cfg(test)]
 mod window_tests_branches_idea;
 #[cfg(test)]
+mod window_tests_branches_place;
+#[cfg(test)]
+mod window_tests_completion_doc;
+#[cfg(test)]
 mod window_tests_editor_idea;
 #[cfg(test)]
+mod window_tests_editor_idea_details;
+#[cfg(test)]
+mod window_tests_git_window;
+#[cfg(test)]
 mod window_tests_live_fixes;
+#[cfg(test)]
+mod window_tests_markdown_readme;
+#[cfg(test)]
+mod window_tests_project_toolbar;
 #[cfg(test)]
 mod window_tests_source_languages;
 #[cfg(test)]
 mod window_tests_tab_move;
+#[cfg(test)]
+mod window_tests_theme_choice;
+
+#[cfg(test)]
+mod window_tests_markdown_blocks;
+#[cfg(test)]
+mod window_tests_panel_icons;
+
+#[cfg(test)]
+mod window_tests_build_tool_missing;
+#[cfg(test)]
+mod window_tests_git_log_labels;
+#[cfg(test)]
+mod window_tests_postfix;
 
 mod choice;
 mod invalidate;
@@ -976,33 +1009,14 @@ fn install(
     );
     project::bind_actions(panel.clone(), weak.clone(), window.window_handle(), cx);
     cx.set_global(project::ActiveProjectPanel(panel));
-    let log = git_log::GitLogPanel::create(git.clone(), weak.clone(), cx);
-    let focus = log.read(cx).focus();
-    workspace.set_dock(
-        DockSide::Bottom,
-        LOG_TOOL,
-        log.clone().into(),
-        Some(focus),
-        cx,
-    );
-    cx.set_global(git_log::ActiveGitLog(log));
-    let history = git_history::SelectionHistoryPanel::create(git.clone(), weak.clone(), cx);
-    let focus = history.read(cx).focus();
-    workspace.set_dock(
-        DockSide::Bottom,
-        SELECTION_HISTORY_TOOL,
-        history.clone().into(),
-        Some(focus),
-        cx,
-    );
-    cx.set_global(git_history::ActiveSelectionHistory(history));
     let root = workspace.root().to_path_buf();
+    let draft = commit::CommitDraft::create(&root, workspace.store(), cx);
     let commit = commit::CommitPanel::create(
-        git,
+        git.clone(),
         weak.clone(),
         root,
         workspace.state_dir().to_path_buf(),
-        workspace.store(),
+        draft.clone(),
         window,
         cx,
     );
@@ -1014,7 +1028,45 @@ fn install(
         Some(focus),
         cx,
     );
-    cx.set_global(script::ActiveCommitPanel(commit));
+    cx.set_global(script::ActiveCommitPanel(commit.clone()));
+    let embedded = commit::CommitPanel::create(
+        git.clone(),
+        weak.clone(),
+        workspace.root().to_path_buf(),
+        workspace.state_dir().to_path_buf(),
+        draft,
+        window,
+        cx,
+    );
+    embedded.update(cx, |commit, _| commit.set_embedded(true));
+    let log = git_log::GitLogPanel::create(git.clone(), weak.clone(), Some(embedded), cx);
+    let focus = log.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        LOG_TOOL,
+        log.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(git_log::ActiveGitLog(log.clone()));
+    let log_tab = log.clone();
+    workspace.set_tool_activator(Rc::new(move |id, cx| {
+        if id == LOG_TOOL {
+            log_tab.update(cx, |log, cx| log.show_log(cx))
+        } else {
+            false
+        }
+    }));
+    let history = git_history::SelectionHistoryPanel::create(git.clone(), weak.clone(), cx);
+    let focus = history.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        SELECTION_HISTORY_TOOL,
+        history.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(git_history::ActiveSelectionHistory(history));
     let structure = structure::StructurePanel::create(weak.clone(), cx);
     let focus = structure.read(cx).focus();
     workspace.set_dock(
@@ -1104,6 +1156,7 @@ fn install(
     );
     workspace.set_run_controls(run::RunPanel::controls(&runs));
     cx.set_global(script::ActiveRunPanel(runs.clone()));
+    run::bind_actions(workspace);
     services.update(cx, |services, cx| services.set_runs(runs.clone(), cx));
     let coverage_source = runs.clone();
     let profiler_source = runs.clone();
@@ -1160,6 +1213,7 @@ fn install(
         cx,
     );
     cx.set_global(agents::ActiveAgents(agent_panel));
+    agents::install(cx);
 
     let tasks = build::BuildPanel::create(runs, weak.clone(), cx);
     let focus = tasks.read(cx).focus();
@@ -1380,6 +1434,7 @@ fn install(
     });
     workspace.set_tab_listener(|path, cx| {
         cx.default_global::<Navigator>().activated(path);
+        project::follow_active_file(path, cx);
         let panel = cx.global::<structure::ActiveStructure>().0.clone();
         panel.update(cx, |panel, cx| panel.show(path.to_path_buf(), cx));
         let documentation = cx.global::<documentation::ActiveDocumentation>().0.clone();

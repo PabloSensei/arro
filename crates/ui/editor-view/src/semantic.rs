@@ -624,6 +624,17 @@ fn visible_entries(
     }
 }
 
+/// A postfix snippet of the server: its `filterText` names the expression it follows,
+/// `args.for` for one.
+fn is_postfix_snippet(entry: &CompletionEntry) -> bool {
+    entry.snippet
+        && !entry.label.contains('(')
+        && entry
+            .filter_text
+            .as_deref()
+            .is_some_and(|text| text.contains('.'))
+}
+
 /// The names a local template and a server entry share when they offer the same key. A
 /// postfix entry carries the expression it follows in `filterText` (`args.for`), so its
 /// last segment counts too.
@@ -1233,11 +1244,15 @@ impl DocRun {
 
 fn push_doc_block(block: DocBlock, code: bool, rows: &mut Vec<CompletionDocRow>) {
     match block {
-        DocBlock::Paragraph(inlines) => rows.push(CompletionDocRow {
-            runs: doc_runs(&inlines, code),
-            indent: 0,
-            code,
-        }),
+        DocBlock::Paragraph(inlines) => {
+            for line in doc_run_lines(doc_runs(&inlines, code)) {
+                rows.push(CompletionDocRow {
+                    runs: line,
+                    indent: 0,
+                    code,
+                });
+            }
+        }
         DocBlock::Heading { text, .. } => rows.push(CompletionDocRow {
             runs: doc_runs(&text, code)
                 .into_iter()
@@ -1253,6 +1268,7 @@ fn push_doc_block(block: DocBlock, code: bool, rows: &mut Vec<CompletionDocRow>)
             ordered,
             start,
             items,
+            ..
         } => {
             for (at, item) in items.iter().enumerate() {
                 let bullet = if ordered {
@@ -1260,13 +1276,17 @@ fn push_doc_block(block: DocBlock, code: bool, rows: &mut Vec<CompletionDocRow>)
                 } else {
                     "• ".to_owned()
                 };
-                let mut runs = vec![DocRun::text(&bullet)];
-                runs.extend(doc_runs(item, code));
-                rows.push(CompletionDocRow {
-                    runs,
-                    indent: 1,
-                    code,
-                });
+                for (line, mut runs) in doc_run_lines(doc_runs(item, code)).into_iter().enumerate()
+                {
+                    if line == 0 {
+                        runs.insert(0, DocRun::text(&bullet));
+                    }
+                    rows.push(CompletionDocRow {
+                        runs,
+                        indent: 1,
+                        code,
+                    });
+                }
             }
         }
         DocBlock::Code { text, .. } => {
@@ -1285,6 +1305,19 @@ fn push_doc_block(block: DocBlock, code: bool, rows: &mut Vec<CompletionDocRow>)
         DocBlock::Quote(blocks) => {
             for inner in blocks {
                 push_doc_block(inner, true, rows);
+            }
+        }
+        // A `<details>` block of a file reads as its summary and the blocks under it.
+        DocBlock::Details {
+            summary, blocks, ..
+        } => {
+            rows.push(CompletionDocRow {
+                runs: doc_runs(&summary, code),
+                indent: 0,
+                code,
+            });
+            for inner in blocks {
+                push_doc_block(inner, code, rows);
             }
         }
         DocBlock::Table {
@@ -1334,6 +1367,34 @@ fn doc_runs(inlines: &[DocInline], code: bool) -> Vec<DocRun> {
     let mut runs = Vec::new();
     push_doc_runs(inlines, code, false, false, &mut runs);
     runs
+}
+
+/// The runs of one paragraph or list item as lines of their own: a line break of the
+/// answer starts a new row under the row above, so the labels of a documentation comment
+/// (`Returns:`, `Params:`, `Specified by:`) stand under the text rather than beside it.
+/// Empty lines are left out.
+fn doc_run_lines(runs: Vec<DocRun>) -> Vec<Vec<DocRun>> {
+    let mut lines: Vec<Vec<DocRun>> = vec![Vec::new()];
+    for run in runs {
+        let parts: Vec<String> = run.text.split('\n').map(str::to_owned).collect();
+        for (at, part) in parts.into_iter().enumerate() {
+            if at > 0 {
+                lines.push(Vec::new());
+            }
+            let part = part.strip_suffix('\r').unwrap_or(&part);
+            if part.is_empty() {
+                continue;
+            }
+            lines.last_mut().expect("a line is open").push(DocRun {
+                text: part.to_owned(),
+                code: run.code,
+                strong: run.strong,
+                emphasis: run.emphasis,
+            });
+        }
+    }
+    lines.retain(|line| line.iter().any(|run| !run.text.trim().is_empty()));
+    lines
 }
 
 fn push_doc_runs(
@@ -2442,6 +2503,12 @@ impl EditorView {
         self.completion_task = None;
         self.completion_doc_task = None;
         let case = self.options.completion_case;
+        // A server that offers postfix snippets knows the types better than the local
+        // templates; they are a fallback for a language without such a server.
+        let server_postfix = self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.support.completion().is_some());
         let (Some(lsp), Some(state)) = (&mut self.lsp, &self.state) else {
             return;
         };
@@ -2451,7 +2518,7 @@ impl EditorView {
             .store()
             .line_to_offset(state.store().offset_to_line(caret));
         let before = state.store().slice(line_start..caret);
-        let local: Vec<CompletionEntry> = if mode == CompletionMode::All {
+        let mut local: Vec<CompletionEntry> = if mode == CompletionMode::All {
             cx.try_global::<CompletionSources>()
                 .map(|sources| sources.0.clone())
                 .unwrap_or_default()
@@ -2461,6 +2528,9 @@ impl EditorView {
         } else {
             Vec::new()
         };
+        if mode == CompletionMode::All && !server_postfix {
+            local.extend(self.live.postfix_completions(state));
+        }
         lsp.asked += 1;
         let asked = lsp.asked;
         lsp.parameter_walk = None;
@@ -2507,6 +2577,17 @@ impl EditorView {
                 let Some((list, confidence)) = answer else {
                     return;
                 };
+                // A server that sends no postfix snippets leaves that part of the list to
+                // the templates of the editor, which carry their descriptions.
+                let fallback = if mode == CompletionMode::All
+                    && !list.entries.iter().any(is_postfix_snippet)
+                {
+                    this.state
+                        .as_ref()
+                        .map_or_else(Vec::new, |state| this.live.postfix_completions(state))
+                } else {
+                    Vec::new()
+                };
                 let caret = this.spot().map(|(_, caret)| caret);
                 let (Some(lsp), Some(state), Some(caret)) = (&mut this.lsp, &this.state, caret)
                 else {
@@ -2521,6 +2602,8 @@ impl EditorView {
                         text: NO_ANSWER.into(),
                     });
                 }
+                let mut local = local;
+                local.extend(fallback);
                 let entries = visible_entries(list.entries, mode, expected.as_deref());
                 let entries = merge_completions(local, entries);
                 let completion = Completion::new(
@@ -3713,6 +3796,54 @@ mod tests {
             "{text:?}"
         );
         assert!(rows.len() <= super::COMPLETION_DOC_LINES);
+    }
+
+    #[test]
+    fn the_labels_of_the_documentation_get_their_own_lines() {
+        use crate::semantic::CompletionDoc;
+
+        // The comment comes as the plain text of the Javadoc, one line after another.
+        let doc = CompletionDoc::new(
+            0,
+            "Returns a string representation of this object.\nSpecified by:\ntoString in class Object\n\nOverrides:\ntoString in class Object",
+        );
+        let rows = completion_doc_rows(&doc);
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Returns a string representation of this object.",
+                "Specified by:",
+                "toString in class Object",
+                "Overrides:",
+                "toString in class Object",
+            ],
+            "every label stands under the text rather than beside it"
+        );
+    }
+
+    #[test]
+    fn a_long_line_of_the_documentation_stays_whole_for_the_popup_to_wrap() {
+        use crate::semantic::CompletionDoc;
+
+        let long = "The text of the comment, which the popup wraps by its own width, "
+            .repeat(8)
+            .trim_end()
+            .to_owned();
+        let doc = CompletionDoc::new(0, format!("Returns:\n{long}"));
+        let rows = completion_doc_rows(&doc);
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+            .collect();
+        assert_eq!(lines[0], "Returns:");
+        assert_eq!(
+            lines[1], long,
+            "the row keeps the whole line, so that the popup wraps it rather than cutting it"
+        );
     }
 
     #[test]

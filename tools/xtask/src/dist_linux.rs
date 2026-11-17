@@ -19,9 +19,9 @@ const DESKTOP: &str = include_str!("../../../dist/arro.desktop");
 const INSTALL: &str = include_str!("../../../dist/install.sh");
 /// Where the package puts the program and everything next to it.
 const OPT_DIR: &str = "/opt/arro";
-/// The license of the project, as `LICENSE.md` and the README name it. The packages
+/// The license of the project, as `LICENSE` and the README name it. The packages
 /// carry the same string.
-const LICENSE: &str = "FSL-1.1-ALv2";
+const LICENSE: &str = "GPL-3.0-or-later";
 /// The release number of a package: the first build of a version.
 const RELEASE: &str = "1";
 /// The architecture of the packages. Only x86-64 is built.
@@ -140,6 +140,7 @@ pub fn run(
     let mut text = notice::render(false);
     text.push_str(&linux_paths(&dist::java_notice(&java)));
     dist::write_unix_text(&out.join("NOTICE.txt"), &text)?;
+    dist::write_unix_text(&out.join("LICENSE.txt"), dist::PROJECT_LICENSE)?;
     dist::write_unix_text(
         &java.debug.join("extension").join("EPL-1.0.txt"),
         dist::EPL_1_0,
@@ -821,6 +822,7 @@ fn remove_old(out: &Path) -> Result {
         "README.txt",
         "THIRD-PARTY.txt",
         "NOTICE.txt",
+        "LICENSE.txt",
         "arro.desktop",
         "arro-256.png",
         "install.sh",

@@ -21,6 +21,32 @@ pub trait BuildSystem: Send + Sync {
     /// Asks the tool for the full model. May take a long time and blocks.
     fn sync(&self, root: &Path, cancel: &Cancel) -> Result<ProjectModel>;
 
+    /// What the window offers when [`BuildSystem::sync`] failed because the tool of the
+    /// project is not installed. `None` when the tool is there, so the failure has
+    /// another reason.
+    fn missing_tool(&self, root: &Path) -> Option<crate::ToolSetup> {
+        let _ = root;
+        None
+    }
+
+    /// Downloads and installs the missing tool of the project. Blocks; `progress` follows
+    /// the bytes, `cancel` stops the work. Returns the home of the installed tool.
+    fn install_tool(
+        &self,
+        _progress: &crate::ToolProgress,
+        _cancel: &Cancel,
+    ) -> Result<Option<PathBuf>> {
+        Err("this tool cannot be installed".into())
+    }
+
+    /// Uses `home` as the folder of the tool from now on, for this session.
+    fn use_home(&self, _home: &Path) {}
+
+    /// The folder of the programs of a tool the IDE downloaded, when it has one.
+    fn tool_bin(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// The command that makes the outputs of the project current.
     fn assemble(&self, root: &Path) -> Result<ProcessSpec>;
 

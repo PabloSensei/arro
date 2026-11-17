@@ -142,6 +142,7 @@ impl Transcript {
             AgentEvent::TurnEnded => {
                 self.running = false;
                 self.streaming = false;
+                self.clear_pending();
             }
             AgentEvent::Title(title) => self.title = Some(title.clone()),
             AgentEvent::Notification(text) => self.items.push(Item::Notice(text.clone())),
@@ -172,6 +173,18 @@ impl Transcript {
                 && id == wanted
             {
                 *answer = Some(reply);
+            }
+        }
+    }
+
+    /// The turn is over: no question of it waits for an answer any more. The agent runs no
+    /// step of it, so a question left on screen is shown as denied rather than kept.
+    pub fn clear_pending(&mut self) {
+        for item in &mut self.items {
+            if let Item::Permission { answer, .. } = item
+                && answer.is_none()
+            {
+                *answer = Some(PermissionReply::Deny);
             }
         }
     }

@@ -388,6 +388,7 @@ fn setup(cx: &mut TestAppContext, name: &str, text: &str) -> (PathBuf, WindowHan
         }],
         renames: Vec::new(),
         handle: None,
+        resolve: None,
     }]);
     let window = open_window_with(cx, root.clone(), language);
     cx.run_until_parked();
@@ -564,6 +565,7 @@ fn a_tab_switch_and_a_window_without_the_focus_close_alt_enter(cx: &mut TestAppC
         }],
         renames: Vec::new(),
         handle: None,
+        resolve: None,
     }]);
     let window = open_window_with(cx, root, language);
     cx.run_until_parked();

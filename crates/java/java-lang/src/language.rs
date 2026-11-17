@@ -395,6 +395,10 @@ impl LanguageSupport for JavaProject {
         Some(&self.java_messages)
     }
 
+    fn action_resolve(&self) -> Option<&lang_api::ActionResolveProvider> {
+        Some(self.providers.as_ref())
+    }
+
     fn action_parameters(&self) -> Option<&lang_api::ActionParametersProvider> {
         Some(&self.forms)
     }

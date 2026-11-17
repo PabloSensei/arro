@@ -5,10 +5,11 @@
 use std::ops::Range;
 
 use keymap::{Keystroke, editor as actions};
+use lang_api::{CompletionEntry, CompletionKind, CompletionLabelDetails, TextSpan};
 use templates::{
-    ExpandWith, Expansion, ExpansionSite, Kind, ResolvedTemplate, Session, Step, Template,
-    TemplateLanguage, Variables, context_at, declarations, expand_fields, postfix_at,
-    surround_fields, word_before,
+    ExpandWith, Expansion, ExpansionSite, Kind, Receiver, ResolvedTemplate, Session, Step,
+    Template, TemplateLanguage, Variables, context_at, declarations, expand_fields, postfix_typed,
+    snippet_expansion, snippet_of, surround_fields, word_before,
 };
 use text_core::{Change, Edit, EditKind, Selection, SelectionSet, TextStore};
 use ui_kit::metrics::*;
@@ -16,16 +17,22 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 
 use crate::element::TEXT_INSET;
+use crate::semantic::point_at;
 use crate::state::EditorState;
 use crate::view::{EditorView, TemplateSettings};
 
 const SHOWN: usize = 12;
 
-/// The list Ctrl+J or Ctrl+Alt+T opened.
+/// The list Ctrl+J or Ctrl+Alt+T opened, or the expressions a postfix template can
+/// follow when its type is not enough to choose one.
 pub struct TemplateList {
     pub kind: Kind,
     pub items: Vec<Template>,
     pub chosen: usize,
+    /// The expressions of a postfix key, longest first, when several fit.
+    pub expressions: Vec<Range<usize>>,
+    /// The postfix template the expressions belong to.
+    pub template: Option<Template>,
 }
 
 /// What a key did.
@@ -147,6 +154,60 @@ impl LiveTemplates {
         self.templates
             .iter()
             .filter(move |entry| entry.template.kind == kind && entry.template.fits(context))
+    }
+
+    /// The kind of the expression in `range`, as the language reads it.
+    fn receiver(&self, text: &str, tree: Option<&syntax::Tree>, range: Range<usize>) -> Receiver {
+        match self.language.and_then(|language| language.postfix) {
+            Some(rules) => (rules.receiver)(text, tree, range),
+            None => Receiver::default(),
+        }
+    }
+
+    /// Whether the language lets `template` follow an expression of this kind.
+    fn applies(&self, template: &Template, receiver: Receiver) -> bool {
+        self.language
+            .and_then(|language| language.postfix)
+            .is_none_or(|rules| (rules.applies)(template, receiver))
+    }
+
+    /// The expressions before a postfix key that `template` can follow, the longest
+    /// first, with the kind of each one.
+    fn postfix_expressions(
+        &self,
+        state: &EditorState,
+        line: &str,
+        line_start: usize,
+        template: &Template,
+    ) -> Vec<(Range<usize>, Receiver)> {
+        let Some(language) = self.language else {
+            return Vec::new();
+        };
+        let Some((receivers, _, _)) = postfix_typed(line, language.receiver_prefixes) else {
+            return Vec::new();
+        };
+        let text = state.text();
+        let tree = state.tree();
+        receivers
+            .into_iter()
+            .map(|range| line_start + range.start..line_start + range.end)
+            .map(|range| {
+                let kind = self.receiver(&text, tree, range.clone());
+                (range, kind)
+            })
+            .filter(|(_, kind)| self.applies(template, *kind))
+            .collect()
+    }
+
+    /// The expression to take when the caret stops after a postfix key: the only one, or
+    /// the longest when the language did not prove the kinds. `None` when several kinds
+    /// fit and the user has to choose.
+    fn chosen_expression(expressions: &[(Range<usize>, Receiver)]) -> Option<Range<usize>> {
+        if expressions.len() <= 1 {
+            return expressions.first().map(|(range, _)| range.clone());
+        }
+        let proven = expressions.iter().filter(|(_, kind)| kind.known).count();
+        (proven <= 1).then(|| expressions[0].0.clone())
     }
 
     pub fn list(&self) -> Option<&TemplateList> {
@@ -333,20 +394,23 @@ impl LiveTemplates {
         let indent = indent_of(&line).to_string();
         let unit = unit_for(&indent, state);
         if key == ExpandWith::Tab
-            && let Some((receiver, postfix_key)) = postfix_at(&line, language.receiver_prefixes)
+            && let Some((receivers, postfix_key, _)) =
+                postfix_typed(&line, language.receiver_prefixes)
+            && !postfix_key.is_empty()
         {
-            let place = context(language, state, start + receiver.start);
-            if let Some(entry) = self.find(Kind::Postfix, postfix_key, place) {
-                let expression = line[receiver.clone()].to_string();
-                let site = ExpansionSite {
-                    indent: &indent,
-                    unit: &unit,
-                    selection: None,
-                    expression: Some(&expression),
-                    variables: self.variables(state, caret, cx),
-                };
-                let expansion = expand_fields(&entry.template, &entry.fields, &site);
-                return Some(self.insert(state, start + receiver.start..caret, &expansion));
+            let place = context(language, state, start + receivers[0].start);
+            if let Some(entry) = self.find(Kind::Postfix, postfix_key, place).cloned() {
+                let expressions = self.postfix_expressions(state, &line, start, &entry.template);
+                if expressions.len() > 1 && Self::chosen_expression(&expressions).is_none() {
+                    self.open_expressions(
+                        entry.template,
+                        expressions.into_iter().map(|(range, _)| range).collect(),
+                    );
+                    return Some(None);
+                }
+                if let Some(receiver) = Self::chosen_expression(&expressions) {
+                    return Some(self.expand_postfix(state, &entry, receiver, cx));
+                }
             }
         }
         let word = word_before(&line)?;
@@ -381,11 +445,60 @@ impl LiveTemplates {
         self.expand_at_caret(language, state, key, Some(cx))
     }
 
+    /// Replaces the receiver of `receiver` and the postfix key with the expansion of
+    /// `entry`, as a snippet would.
+    fn expand_postfix(
+        &mut self,
+        state: &mut EditorState,
+        entry: &ResolvedTemplate,
+        receiver: Range<usize>,
+        cx: Option<&App>,
+    ) -> Option<Change> {
+        let caret = lone_caret(state)?;
+        let (line, _) = line_before(state, caret);
+        let indent = indent_of(&line).to_string();
+        let unit = unit_for(&indent, state);
+        let expression = state.store().slice(receiver.clone());
+        let site = ExpansionSite {
+            indent: &indent,
+            unit: &unit,
+            selection: None,
+            expression: Some(&expression),
+            variables: self.variables(state, caret, cx),
+        };
+        let expansion = expand_fields(&entry.template, &entry.fields, &site);
+        self.insert(state, receiver.start..caret, &expansion)
+    }
+
+    /// Expands the postfix template of an expression picked from the list.
+    fn apply_expression(
+        &mut self,
+        state: &mut EditorState,
+        template: &Template,
+        receiver: Range<usize>,
+        cx: Option<&App>,
+    ) -> Option<Change> {
+        let entry = self.entry(template)?.clone();
+        self.expand_postfix(state, &entry, receiver, cx)
+    }
+
     fn open(&mut self, kind: Kind, items: Vec<Template>) {
         self.list = (!items.is_empty()).then_some(TemplateList {
             kind,
             items,
             chosen: 0,
+            expressions: Vec::new(),
+            template: None,
+        });
+    }
+
+    fn open_expressions(&mut self, template: Template, expressions: Vec<Range<usize>>) {
+        self.list = Some(TemplateList {
+            kind: Kind::Postfix,
+            items: Vec::new(),
+            chosen: 0,
+            expressions,
+            template: Some(template),
         });
     }
 
@@ -422,6 +535,13 @@ impl LiveTemplates {
         let entry = self.entry(template)?;
         let entry = entry.clone();
         match template.kind {
+            Kind::Postfix => {
+                let caret = lone_caret(state)?;
+                let (line, start) = line_before(state, caret);
+                let expressions = self.postfix_expressions(state, &line, start, &entry.template);
+                let receiver = Self::chosen_expression(&expressions)?;
+                self.expand_postfix(state, &entry, receiver, cx)
+            }
             Kind::Surround | Kind::SurroundLive => {
                 let store = state.store();
                 let selection = state.selections().primary();
@@ -470,6 +590,28 @@ impl LiveTemplates {
     fn key_app(&mut self, state: &mut EditorState, stroke: &Keystroke, cx: Option<&App>) -> KeyUse {
         let plain = !stroke.ctrl && !stroke.alt;
         if let Some(list) = &mut self.list {
+            if !list.expressions.is_empty() {
+                let count = list.expressions.len().min(SHOWN);
+                match stroke.key.as_str() {
+                    "up" if plain => list.chosen = (list.chosen + count - 1) % count,
+                    "down" if plain => list.chosen = (list.chosen + 1) % count,
+                    "enter" | "tab" if plain && !stroke.shift => {
+                        let receiver = list.expressions[list.chosen].clone();
+                        let Some(template) = list.template else {
+                            self.list = None;
+                            return KeyUse::Unused;
+                        };
+                        self.list = None;
+                        return KeyUse::Used(self.apply_expression(state, &template, receiver, cx));
+                    }
+                    "escape" => self.list = None,
+                    _ => {
+                        self.list = None;
+                        return KeyUse::Unused;
+                    }
+                }
+                return KeyUse::Used(None);
+            }
             let count = list.items.len().min(SHOWN);
             match stroke.key.as_str() {
                 "up" if plain => list.chosen = (list.chosen + count - 1) % count,
@@ -551,6 +693,59 @@ impl LiveTemplates {
             session.follow_around(&change);
         }
         Some(change)
+    }
+
+    /// The postfix templates that fit after the expression before the caret, as entries
+    /// of the completion list. Each one replaces the expression and the typed key with
+    /// its expansion and carries the description and a preview of that expansion.
+    pub fn postfix_completions(&self, state: &EditorState) -> Vec<CompletionEntry> {
+        let Some(language) = self.language else {
+            return Vec::new();
+        };
+        let Some(caret) = lone_caret(state) else {
+            return Vec::new();
+        };
+        let (line, start) = line_before(state, caret);
+        let Some((receivers, typed, _)) = postfix_typed(&line, language.receiver_prefixes) else {
+            return Vec::new();
+        };
+        let place = context(language, state, start + receivers[0].start);
+        let mut entries = Vec::new();
+        for entry in self
+            .fitting(Kind::Postfix, place)
+            .filter(|entry| entry.template.key.starts_with(typed))
+        {
+            let expressions = self.postfix_expressions(state, &line, start, &entry.template);
+            let Some((receiver, _)) = expressions.first() else {
+                continue;
+            };
+            let expression = state.store().slice(receiver.clone());
+            let snippet = snippet_of(&entry.template, &expression);
+            let preview = snippet_expansion(&snippet, "", language.indent_unit).text;
+            entries.push(CompletionEntry {
+                label: entry.template.key.to_owned(),
+                label_details: Some(CompletionLabelDetails {
+                    detail: None,
+                    description: Some(entry.template.description.to_owned()),
+                }),
+                detail: None,
+                filter_text: Some(format!("{expression}.{}", entry.template.key)),
+                sort_text: None,
+                insert_text: Some(snippet),
+                span: Some(TextSpan {
+                    start: point_at(&state.store(), receiver.start),
+                    end: point_at(&state.store(), caret),
+                }),
+                snippet: true,
+                additional_edits: Vec::new(),
+                command: None,
+                resolve: None,
+                kind: CompletionKind::Snippet,
+                deprecated: false,
+                documentation: Some(format!("```\n{preview}\n```")),
+            });
+        }
+        entries
     }
 
     /// The templates that fit at the caret, for a completion list next to the server's
@@ -673,32 +868,71 @@ impl EditorView {
             .debug_selector(|| "template-popup".to_owned())
             .min_w(px(280.))
             .py(px(4.));
-        for (index, template) in list.items.iter().take(SHOWN).enumerate() {
-            let chosen = *template;
-            let row = div()
-                .id(("template", index))
-                .flex()
-                .gap(px(12.))
-                .px(px(10.))
-                .py(px(3.))
-                .when(index == list.chosen, |row| row.bg(theme.selection))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        let change = this.state.as_mut().and_then(|state| {
-                            this.live.list = None;
-                            this.live.apply_with(state, &chosen, cx)
-                        });
-                        this.changed(change, cx);
-                    }),
-                )
-                .child(div().text_color(theme.text).child(template.key))
-                .child(
-                    div()
-                        .text_color(theme.text_secondary)
-                        .child(template.description),
-                );
-            shown = shown.child(row);
+        if list.expressions.is_empty() {
+            for (index, template) in list.items.iter().take(SHOWN).enumerate() {
+                let chosen = *template;
+                let row = div()
+                    .id(("template", index))
+                    .flex()
+                    .gap(px(12.))
+                    .px(px(10.))
+                    .py(px(3.))
+                    .when(index == list.chosen, |row| row.bg(theme.selection))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let change = this.state.as_mut().and_then(|state| {
+                                this.live.list = None;
+                                this.live.apply_with(state, &chosen, cx)
+                            });
+                            this.changed(change, cx);
+                        }),
+                    )
+                    .child(div().text_color(theme.text).child(template.key))
+                    .child(
+                        div()
+                            .text_color(theme.text_secondary)
+                            .child(template.description),
+                    );
+                shown = shown.child(row);
+            }
+        } else {
+            for (index, receiver) in list.expressions.iter().take(SHOWN).enumerate() {
+                let receiver = receiver.clone();
+                let chosen = receiver.clone();
+                let template = list.template;
+                let expression = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.store().slice(receiver))
+                    .unwrap_or_default();
+                let row = div()
+                    .id(("template-expression", index))
+                    .debug_selector(move || format!("template-expression-{index}"))
+                    .flex()
+                    .gap(px(12.))
+                    .px(px(10.))
+                    .py(px(3.))
+                    .when(index == list.chosen, |row| row.bg(theme.selection))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let change = this.state.as_mut().and_then(|state| {
+                                this.live.list = None;
+                                let template = template?;
+                                this.live.apply_expression(
+                                    state,
+                                    &template,
+                                    chosen.clone(),
+                                    Some(cx),
+                                )
+                            });
+                            this.changed(change, cx);
+                        }),
+                    )
+                    .child(div().text_color(theme.text).child(expression));
+                shown = shown.child(row);
+            }
         }
         let placed = anchored()
             .position(position)

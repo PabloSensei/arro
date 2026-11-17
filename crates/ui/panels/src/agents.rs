@@ -1,8 +1,9 @@
 //! The AI sessions tool window: starts an agent in the project, switches between sessions, and
 //! shows the active one as a terminal or a chat, next to a review of the files it changed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use agent_acp::{AcpRuntime, Preset};
@@ -13,6 +14,7 @@ use agent_core::{
 use agent_pty::{Launch, PtyRuntime, input_box_visible};
 use change_tracker::{ChangeSet, ChangeTracker, GitRunner};
 use crossbeam_channel::Receiver;
+use editor_view::{EditorView, FileBar, GutterKind, GutterMark};
 use mcp_server::McpServer;
 use project_model::EnvironmentProvider;
 use store::TrustList;
@@ -21,10 +23,12 @@ use tool_gateway::{AuditLog, LanguageTools, SessionScope, ToolBackend, ToolGatew
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{ToggleAi, Workspace};
+use workspace::{AI_TOOL, ToggleAi, Workspace};
 
-use crate::ai_review::Review;
-use crate::composer::Composer;
+use crate::ai_review::{Action, Review};
+use crate::chat::text_button;
+use crate::composer::{Composer, Selection};
+use crate::outline::OpenEditors;
 use crate::term_grid::{every_frame, grid, scroll_lines, send_key};
 use crate::terminal_panel::message;
 use crate::transcript::Transcript;
@@ -32,6 +36,9 @@ use crate::trust::TrustDialog;
 
 pub(crate) const GROUP: &str = "right-panel";
 const FIRST_SIZE: (u16, u16) = (80, 24);
+
+/// The command of the editor menu and of Find Action: asks the agent about the selection.
+pub const ASK_AI: &str = "ai.ask_selection";
 
 /// What a mock run keeps alive: its home and its model API.
 type Kept = Box<dyn Send>;
@@ -152,6 +159,14 @@ pub(crate) enum Tab {
     Changes,
 }
 
+/// The unaccepted hunks of one file an agent changed, for the bar above its editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingFile {
+    /// Relative to the project, with forward slashes.
+    pub path: String,
+    pub hunks: usize,
+}
+
 pub struct AgentsPanel {
     pub(crate) root: PathBuf,
     options: AgentOptions,
@@ -165,6 +180,11 @@ pub struct AgentsPanel {
     starting: Option<AgentKind>,
     pub(crate) error: Option<SharedString>,
     pub(crate) changes: Arc<ChangeSet>,
+    /// The files with unaccepted agent hunks, by absolute path, for the bar above an
+    /// editor and for the marks of its gutter.
+    pub(crate) pending: HashMap<PathBuf, PendingFile>,
+    /// Numbers the reads of the hunks, so an older answer does not replace a newer one.
+    marks_generation: u64,
     trust: TrustList,
     pub(crate) focus: FocusHandle,
     pub(crate) workspace: WeakEntity<Workspace>,
@@ -394,6 +414,8 @@ impl AgentsPanel {
                 starting: None,
                 error: None,
                 changes: Arc::new(ChangeSet::default()),
+                pending: HashMap::new(),
+                marks_generation: 0,
                 focus: cx.focus_handle(),
                 workspace: weak,
                 version: 0,
@@ -410,6 +432,32 @@ impl AgentsPanel {
 
     pub fn focus(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// Ask AI from the editor: shows this tool window on the current session, or starts
+    /// a new one, puts `@selection` in the message box and focuses it. The message stays
+    /// unfinished: the user adds what to ask and sends it.
+    pub(crate) fn ask_ai(
+        &mut self,
+        selection: Selection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.keep_selection(selection);
+        self.composer.mention_selection();
+        // A note goes into the message box of a chat, not into the terminal of a TUI.
+        let chats = |kind: &AgentKind| matches!(kind, AgentKind::Acp(_));
+        let needs_session = self
+            .active_entry()
+            .is_none_or(|entry| entry.terminal.is_some());
+        if needs_session
+            && self.starting.is_none()
+            && let Some(kind) = self.kinds().into_iter().find(chats)
+        {
+            self.start(kind, window, cx);
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     /// Starts a session of `kind`, asking first when the project is not trusted yet.
@@ -552,6 +600,107 @@ impl AgentsPanel {
 
     pub(crate) fn tracker(&self) -> Option<&Arc<ChangeTracker>> {
         self.services.as_ref()?.tracker.as_ref().ok()
+    }
+
+    /// Reads the hunks of every open file a session changed, for the marks of its gutter
+    /// and the bar above it. Files with unsaved edits keep the bar but no marks: their
+    /// lines belong to the hunk ranges of the disk.
+    pub(crate) fn refresh_agent_changes(&mut self, cx: &mut Context<Self>) {
+        let editors = OpenEditors::all(cx);
+        self.marks_generation = self.marks_generation.wrapping_add(1);
+        let generation = self.marks_generation;
+        let clear = |view: &Entity<EditorView>, cx: &mut App| {
+            view.update(cx, |view, cx| view.set_agent_marks(Vec::new(), cx));
+        };
+        let session: HashSet<String> = self
+            .changes
+            .session
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        let mut targets = Vec::new();
+        for view in &editors {
+            let path = view.read(cx).path().to_path_buf();
+            let relative = crate::git::relative_of(&self.root, &path);
+            if session.contains(&relative) {
+                targets.push((path, relative));
+            } else {
+                clear(view, cx);
+            }
+        }
+        let Some(tracker) = self.tracker().cloned() else {
+            let had = !self.pending.is_empty();
+            self.pending.clear();
+            for view in &editors {
+                clear(view, cx);
+                if had {
+                    view.update(cx, |_, cx| cx.notify());
+                }
+            }
+            return;
+        };
+        if targets.is_empty() {
+            let had = !self.pending.is_empty();
+            self.pending.clear();
+            if had {
+                for view in &editors {
+                    view.update(cx, |_, cx| cx.notify());
+                }
+            }
+            return;
+        }
+        let job = cx.background_executor().spawn(async move {
+            targets
+                .into_iter()
+                .map(|(path, relative)| (path, tracker.review(&relative).ok()))
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let results = job.await;
+            this.update(cx, |this, cx| {
+                if this.marks_generation != generation {
+                    return;
+                }
+                let theme = *cx.global::<Theme>();
+                let mut pending = HashMap::new();
+                for (path, review) in results {
+                    let Some(view) = OpenEditors::get(cx, &path) else {
+                        continue;
+                    };
+                    let Some(review) = review else {
+                        clear(&view, cx);
+                        continue;
+                    };
+                    let hunks = if review.binary { 1 } else { review.hunks.len() };
+                    if hunks == 0 {
+                        clear(&view, cx);
+                        continue;
+                    }
+                    let relative = crate::git::relative_of(&this.root, &path);
+                    pending.insert(
+                        path,
+                        PendingFile {
+                            path: relative,
+                            hunks,
+                        },
+                    );
+                    if view.read(cx).is_dirty() {
+                        clear(&view, cx);
+                    } else {
+                        let marks = agent_marks(&review, theme.stripe_agent);
+                        view.update(cx, |view, cx| view.set_agent_marks(marks, cx));
+                    }
+                }
+                this.pending = pending;
+                // The bar above a file follows the pending list, so every editor of the
+                // window draws again even when its own marks stayed the same.
+                for view in OpenEditors::all(cx) {
+                    view.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -842,6 +991,193 @@ impl AgentsPanel {
             .child(tab("tab-session", session.into(), Tab::Session, cx))
             .child(tab("tab-changes", changes.into(), Tab::Changes, cx))
     }
+
+    /// Reads the hunks of `view` again and shows the window of the hunk that holds
+    /// `line`, off the UI thread.
+    pub(crate) fn open_agent_hunk(
+        &mut self,
+        view: Entity<EditorView>,
+        line: u32,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tracker) = self.tracker().cloned() else {
+            return;
+        };
+        let path = view.read(cx).path().to_path_buf();
+        let relative = crate::git::relative_of(&self.root, &path);
+        let job_relative = relative.clone();
+        let opened_tracker = tracker.clone();
+        let job = cx
+            .background_executor()
+            .spawn(async move { opened_tracker.review(&job_relative).ok() });
+        let workspace = self.workspace.clone();
+        let root = self.root.clone();
+        cx.spawn(async move |_this, cx| {
+            let Some(review) = job.await else {
+                return;
+            };
+            let Some(index) = hunk_at(&review, line) else {
+                return;
+            };
+            _this
+                .update(cx, |_, cx| {
+                    window
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    crate::agent_hunk::AgentHunkPopup::open(
+                                        workspace, window, cx, root, relative, view, tracker,
+                                        review, index,
+                                    )
+                                })
+                                .ok()
+                        })
+                        .ok();
+                })
+                .ok();
+        })
+        .detach();
+    }
+}
+
+/// The command of the editor menu and of Find Action. It runs only when the editor has a
+/// selection: without one there is nothing to ask about.
+pub(crate) fn ask_ai(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    // The command runs inside the update of the window, so the selection is read from the
+    // editor itself and not through the panel, which would ask the window again.
+    let Some(path) = workspace.active_path() else {
+        return;
+    };
+    let Some((first, last, text)) = OpenEditors::selection(&path, cx) else {
+        return;
+    };
+    let selection = (path, (first as u32, last as u32), text);
+    let Some(panel) = cx.try_global::<ActiveAgents>().map(|panel| panel.0.clone()) else {
+        return;
+    };
+    workspace.show_tool(AI_TOOL, window, cx);
+    panel.update(cx, |panel, cx| panel.ask_ai(selection, window, cx));
+}
+
+/// A file finished loading or was saved: it may show hunks an agent changed.
+pub(crate) fn refresh_marks(cx: &mut App) {
+    let Some(panel) = cx.try_global::<ActiveAgents>().map(|panel| panel.0.clone()) else {
+        return;
+    };
+    panel.update(cx, |panel, cx| panel.refresh_agent_changes(cx));
+}
+
+/// The marks of the hunks of an agent's review, in the colour of the theme.
+fn agent_marks(review: &change_tracker::FileReview, color: Hsla) -> Vec<GutterMark> {
+    review
+        .hunks
+        .iter()
+        .map(|hunk| {
+            let kind = if hunk.before.is_empty() {
+                GutterKind::Added
+            } else if hunk.after.is_empty() {
+                GutterKind::Deleted
+            } else {
+                GutterKind::Modified
+            };
+            GutterMark {
+                lines: hunk.after.clone(),
+                kind,
+                color,
+            }
+        })
+        .collect()
+}
+
+/// The line of the hunk that holds `line`; a removal belongs to the line it sits before.
+pub(crate) fn hunk_at(review: &change_tracker::FileReview, line: u32) -> Option<usize> {
+    review.hunks.iter().position(|hunk| {
+        if hunk.after.is_empty() {
+            hunk.after.start == line
+        } else {
+            hunk.after.contains(&line)
+        }
+    })
+}
+
+/// The bar above a file an agent changed: the number of its unaccepted hunks and the
+/// whole-file actions of the review.
+fn change_bar(
+    path: &Path,
+    _window: &mut Window,
+    cx: &mut Context<EditorView>,
+) -> Option<AnyElement> {
+    let panel = cx.try_global::<ActiveAgents>()?.0.clone();
+    let pending = panel.read_with(cx, |panel, _| panel.pending.get(path).cloned())?;
+    let theme = *cx.global::<Theme>();
+    let workspace = panel.read_with(cx, |panel, _| panel.workspace.clone());
+    let relative = pending.path;
+    let count = pending.hunks;
+    let word = if count == 1 { "change" } else { "changes" };
+    let label = format!("Agent changed this file: {count} {word}");
+    let accept = panel.clone();
+    let accept_path = relative.clone();
+    let accept = text_button("agent-bar-accept-all", "Accept All", &theme)
+        .debug_selector(|| "agent-bar-accept-all".to_owned())
+        .on_click(move |_, _, cx| {
+            accept.update(cx, |panel, cx| {
+                panel.act_on_file(accept_path.clone(), Action::AcceptFile, cx)
+            })
+        });
+    let reject = panel.clone();
+    let reject_path = relative.clone();
+    let reject = text_button("agent-bar-reject-all", "Reject All", &theme)
+        .debug_selector(|| "agent-bar-reject-all".to_owned())
+        .on_click(move |_, _, cx| {
+            reject.update(cx, |panel, cx| {
+                panel.act_on_file(reject_path.clone(), Action::RevertFile, cx)
+            })
+        });
+    let review = panel.clone();
+    let review_path = relative;
+    let review = text_button("agent-bar-review", "Review", &theme)
+        .debug_selector(|| "agent-bar-review".to_owned())
+        .on_click(move |_, window, cx| {
+            review.update(cx, |panel, cx| panel.review_file(review_path.clone(), cx));
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_tool(workspace::AI_TOOL, window, cx)
+                })
+                .ok();
+        });
+    Some(
+        div()
+            .id("agent-change-bar")
+            .debug_selector(|| "agent-change-bar".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(px(SPACE_S))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.stripe_agent.opacity(0.12))
+            .child(div().size(px(6.)).rounded_full().bg(theme.stripe_agent))
+            .child(div().flex_1().truncate().child(label))
+            .child(accept)
+            .child(reject)
+            .child(review)
+            .into_any_element(),
+    )
+}
+
+/// Puts the bar of an agent's changes over the bars of the application: a file without
+/// unaccepted hunks gets the row of whoever else asks for one.
+pub(crate) fn install(cx: &mut App) {
+    let previous = cx.try_global::<FileBar>().map(|bar| bar.0.clone());
+    cx.set_global(FileBar(Rc::new(
+        move |path: &Path, window: &mut Window, cx: &mut Context<EditorView>| {
+            change_bar(path, window, cx)
+                .or_else(|| previous.as_ref().and_then(|bar| bar(path, window, cx)))
+        },
+    )));
 }
 
 impl Render for AgentsPanel {

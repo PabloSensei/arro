@@ -48,23 +48,36 @@ impl Action {
     fn whole_session(self) -> bool {
         matches!(self, Self::RevertAll | Self::AcceptAll)
     }
+
+    /// The actions that work on a binary file, which has no hunks to review.
+    fn whole_file(self) -> bool {
+        matches!(
+            self,
+            Self::RevertFile | Self::AcceptFile | Self::RevertAll | Self::AcceptAll
+        )
+    }
 }
 
-/// Puts `text` on disk, or removes the file for `None`.
-fn write(root: &Path, path: &str, text: Option<String>) -> io::Result<()> {
+/// Puts `bytes` on disk, or removes the file for `None`.
+fn write_bytes(root: &Path, path: &str, bytes: Option<&[u8]>) -> io::Result<()> {
     let file = root.join(path);
-    match text {
-        Some(text) => {
+    match bytes {
+        Some(bytes) => {
             if let Some(parent) = file.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&file, text)
+            std::fs::write(&file, bytes)
         }
         None => match std::fs::remove_file(&file) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         },
     }
+}
+
+/// Puts `text` on disk, or removes the file for `None`.
+pub(crate) fn write(root: &Path, path: &str, text: Option<String>) -> io::Result<()> {
+    write_bytes(root, path, text.as_deref().map(str::as_bytes))
 }
 
 /// Does `action` to one file; true when the file on disk changed.
@@ -76,10 +89,14 @@ fn act_on(
 ) -> Result<bool, String> {
     let path = review.path.clone();
     let failed = |error: io::Error| format!("{path}: {error}");
-    if review.binary && !action.whole_session() {
+    if review.binary && !action.whole_file() {
         return Err(format!("{path}: a binary file has no hunks to review"));
     }
     let missing = || format!("{path}: the hunk is gone, look again");
+    let no_snapshot = || {
+        format!("{path}: the snapshot from before the agent's edit is gone, nothing to revert to")
+    };
+    let no_bytes = || format!("{path}: the review kept no bytes of the file");
     match action {
         Action::RevertHunk(index) => {
             let text = review.reverted_hunk(index).ok_or_else(missing)?;
@@ -92,11 +109,18 @@ fn act_on(
             Ok(false)
         }
         Action::RevertFile | Action::RevertAll if review.binary => {
-            Err(format!("{path}: a binary file is not reverted yet"))
+            let bytes = review.binary_bytes().ok_or_else(no_snapshot)?;
+            write_bytes(root, &path, bytes.base.as_deref()).map_err(failed)?;
+            Ok(true)
         }
         Action::RevertFile | Action::RevertAll => {
             write(root, &path, review.base).map_err(failed)?;
             Ok(true)
+        }
+        Action::AcceptFile | Action::AcceptAll if review.binary => {
+            let bytes = review.binary_bytes().ok_or_else(no_bytes)?;
+            tracker.accept_bytes(&path, bytes.current.clone());
+            Ok(false)
         }
         Action::AcceptFile | Action::AcceptAll => {
             tracker.accept(&path, review.current);
@@ -125,12 +149,34 @@ impl AgentsPanel {
         if self.review.selected.is_some() || self.tab == crate::agents::Tab::Changes {
             self.reload_review(cx);
         }
+        self.refresh_agent_changes(cx);
     }
 
     pub(crate) fn select_change(&mut self, path: String, cx: &mut Context<Self>) {
         self.review.selected = Some(path);
         self.review.notice = None;
         self.reload_review(cx);
+    }
+
+    /// Accepts or reverts one file, for the bar above its editor.
+    pub(crate) fn act_on_file(&mut self, path: String, action: Action, cx: &mut Context<Self>) {
+        self.review.selected = Some(path.clone());
+        if self
+            .review
+            .file
+            .as_ref()
+            .is_some_and(|file| file.path != path)
+        {
+            self.review.file = None;
+        }
+        self.act(action, cx);
+    }
+
+    /// Shows the review of one file, for the Review button of the bar above its editor.
+    pub(crate) fn review_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.tab = crate::agents::Tab::Changes;
+        self.select_change(path, cx);
+        cx.notify();
     }
 
     /// Reads the review of the selected file, or of the first changed one, off the UI thread.
@@ -336,14 +382,18 @@ impl AgentsPanel {
                             .child(header),
                     )
                     .child(
-                        text_button(("accept-hunk", index), "Accept", theme).on_click(cx.listener(
-                            move |this, _, _, cx| this.act(Action::AcceptHunk(index), cx),
-                        )),
+                        text_button(("accept-hunk", index), "Accept", theme)
+                            .debug_selector(move || format!("accept-hunk-{index}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.act(Action::AcceptHunk(index), cx)
+                            })),
                     )
                     .child(
-                        text_button(("revert-hunk", index), "Revert", theme).on_click(cx.listener(
-                            move |this, _, _, cx| this.act(Action::RevertHunk(index), cx),
-                        )),
+                        text_button(("revert-hunk", index), "Revert", theme)
+                            .debug_selector(move || format!("revert-hunk-{index}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.act(Action::RevertHunk(index), cx)
+                            })),
                     ),
             )
             .child(lines)
@@ -384,10 +434,12 @@ impl AgentsPanel {
             .gap(px(SPACE_S))
             .child(
                 text_button("accept-all", "Accept all", theme)
+                    .debug_selector(|| "accept-all".to_owned())
                     .on_click(cx.listener(|this, _, _, cx| this.act(Action::AcceptAll, cx))),
             )
             .child(
                 text_button("revert-all", "Revert all", theme)
+                    .debug_selector(|| "revert-all".to_owned())
                     .on_click(cx.listener(|this, _, _, cx| this.act(Action::RevertAll, cx))),
             );
         let mut view = view
@@ -405,10 +457,12 @@ impl AgentsPanel {
                 .child(div().flex_1().truncate().child(file.path.clone()))
                 .child(
                     text_button("accept-file", "Accept file", theme)
+                        .debug_selector(|| "accept-file".to_owned())
                         .on_click(cx.listener(|this, _, _, cx| this.act(Action::AcceptFile, cx))),
                 )
                 .child(
                     text_button("revert-file", "Revert file", theme)
+                        .debug_selector(|| "revert-file".to_owned())
                         .on_click(cx.listener(|this, _, _, cx| this.act(Action::RevertFile, cx))),
                 );
             view = view.child(actions);

@@ -71,6 +71,7 @@ fn test_language() -> &'static TemplateLanguage {
         grammar: || dockerfile_syntax::config().grammar,
         indent_unit: "    ",
         receiver_prefixes: &["new"],
+        postfix: None,
         query: OnceLock::new(),
         declarations: Some(|_, _, _, _| templates::Declarations {
             class_name: "Widget".to_owned(),

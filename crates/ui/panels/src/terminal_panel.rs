@@ -38,6 +38,14 @@ actions!(
 );
 
 const GROUP: &str = "bottom-panel";
+
+/// The `bin` folder of a build tool the IDE downloaded, which the terminals may put on
+/// their `PATH`. The window fills it when the tool is found, and a setting decides
+/// whether the next shell sees it.
+#[derive(Clone, Debug, Default)]
+pub struct ToolTerminalPath(pub Option<PathBuf>);
+
+impl Global for ToolTerminalPath {}
 /// How the two panes of a split share the room when the user splits a tab.
 const SPLIT_RATIO: f32 = 0.5;
 /// How near the middle a dragged divider may come, so that neither pane goes away.
@@ -186,6 +194,7 @@ fn shell_spec(
     shell: Option<&str>,
     variables: Vec<(String, String)>,
     settings: &Settings,
+    tool_path: Option<PathBuf>,
 ) -> SpawnSpec {
     let shell = match shell {
         Some(shell) if !shell.trim().is_empty() => shell.to_owned(),
@@ -218,6 +227,11 @@ fn shell_spec(
         env.retain(|(known, _)| !known.eq_ignore_ascii_case(&key));
         env.push((key, value));
     }
+    if settings.build_tools.first.terminal_path
+        && let Some(bin) = tool_path
+    {
+        prepend_path(&mut env, &bin);
+    }
     SpawnSpec {
         command_line: shell,
         cwd: Some(cwd),
@@ -225,6 +239,20 @@ fn shell_spec(
         cols: 120,
         rows: 12,
         shift_enter: ShiftEnter::default(),
+    }
+}
+
+/// Puts `bin` in front of the `PATH` of the shell, keeping the rest of it.
+fn prepend_path(env: &mut Vec<(String, String)>, bin: &Path) {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let bin = bin.display().to_string();
+    match env
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+    {
+        Some((_, value)) if value.is_empty() => *value = bin,
+        Some((_, value)) => *value = format!("{bin}{separator}{value}"),
+        None => env.push(("PATH".to_owned(), bin)),
     }
 }
 
@@ -372,6 +400,9 @@ impl TerminalPanel {
         let root = self.root.clone();
         let environment = self.environment.clone();
         let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let tool_path = cx
+            .try_global::<ToolTerminalPath>()
+            .and_then(|path| path.0.clone());
         let spawn = cx.background_executor().spawn(async move {
             let variables = environment
                 .map(|environment| environment.describe().variables)
@@ -382,6 +413,7 @@ impl TerminalPanel {
                 shell.as_deref(),
                 variables,
                 &settings,
+                tool_path,
             ))
         });
         cx.spawn(async move |this, cx| {

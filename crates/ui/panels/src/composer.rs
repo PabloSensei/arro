@@ -17,6 +17,8 @@ pub struct Composer {
     pub text: String,
     /// The highlighted row of the mention list.
     pub chosen: usize,
+    /// What Ask AI picked before the panel took the focus, for the next message.
+    selection: Option<Selection>,
 }
 
 fn relative(root: &Path, path: &Path) -> String {
@@ -37,7 +39,37 @@ impl Composer {
 
     pub fn take(&mut self) -> String {
         self.chosen = 0;
+        self.selection = None;
         std::mem::take(&mut self.text)
+    }
+
+    /// Keeps the selection of Ask AI for the next message, so that moving the caret in
+    /// the editor before sending does not change the snippet.
+    pub fn keep_selection(&mut self, selection: Selection) {
+        self.selection = Some(selection);
+    }
+
+    /// The selection kept for the next message, if any.
+    pub fn kept_selection(&self) -> Option<Selection> {
+        self.selection.clone()
+    }
+
+    /// Puts the mention of the selection in the box, once.
+    pub fn mention_selection(&mut self) {
+        if self
+            .text
+            .split_whitespace()
+            .any(|word| word.strip_prefix('@') == Some(SELECTION))
+        {
+            return;
+        }
+        if !self.text.is_empty() && !self.text.ends_with(' ') {
+            self.text.push(' ');
+        }
+        self.text.push('@');
+        self.text.push_str(SELECTION);
+        self.text.push(' ');
+        self.chosen = 0;
     }
 
     /// The word being typed after `@`, if the caret is in one.

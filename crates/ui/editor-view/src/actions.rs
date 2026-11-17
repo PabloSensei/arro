@@ -5,9 +5,9 @@ use std::ops::Range;
 use std::time::Duration;
 
 use lang_api::{
-    ActionEntry, ActionKind, ActionQuery, Confidence, DocumentEdit, DocumentSpot, GenerateKind,
-    SourceSpan, SuppressionQuery, SuppressionTarget, TextPoint, TextSpan, UnwrapEdit,
-    WorkspaceChange, ask,
+    ActionEntry, ActionKind, ActionQuery, ActionResolveQuery, Confidence, DocumentEdit,
+    DocumentSpot, GenerateKind, SourceSpan, SuppressionQuery, SuppressionTarget, TextPoint,
+    TextSpan, UnwrapEdit, WorkspaceChange, ask,
 };
 use text_core::{Edit, RopeStore, TextStore};
 use ui_kit::*;
@@ -179,6 +179,9 @@ pub(crate) struct ActionMenu {
     /// lists that have no sections.
     pub sections: Vec<MenuSection>,
     pub selected: usize,
+    /// The question for the preview of the selected row, while the language computes
+    /// the edit on resolve. Dropping it cancels the question.
+    pub preview_task: Option<Task<()>>,
 }
 
 impl ActionMenu {
@@ -477,6 +480,7 @@ impl EditorView {
                 rows,
                 sections: Vec::new(),
                 selected: 0,
+                preview_task: None,
             });
             cx.notify();
         }
@@ -603,7 +607,11 @@ impl EditorView {
                 let entries = without_duplicate_actions(entries);
                 let mut rows: Vec<(MenuSection, Pick)> = entries
                     .into_iter()
-                    .filter(|entry| !entry.edits.is_empty() || !entry.renames.is_empty())
+                    .filter(|entry| {
+                        !entry.edits.is_empty()
+                            || !entry.renames.is_empty()
+                            || entry.resolve.is_some()
+                    })
                     .map(|entry| (section_of(&entry), Pick::Action(entry)))
                     .collect();
                 rows.extend(own);
@@ -646,8 +654,10 @@ impl EditorView {
             rows,
             sections,
             selected: 0,
+            preview_task: None,
         });
         cx.notify();
+        self.request_action_preview(cx);
     }
 
     /// The change the selected row would make, in the current document, when the
@@ -687,6 +697,103 @@ impl EditorView {
             title: entry.title.clone(),
             lines,
         })
+    }
+
+    /// Asks the language for the edit of the selected row when the row has none: a
+    /// server that sends its code actions without edits fills them in on resolve. The
+    /// list does not wait; the preview appears when the answer comes.
+    fn request_action_preview(&mut self, cx: &mut Context<Self>) {
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return;
+        };
+        let Some(menu) = &lsp.actions else {
+            return;
+        };
+        let Some(Pick::Action(entry)) = menu.rows.get(menu.selected) else {
+            return;
+        };
+        if !entry.edits.is_empty() || !entry.renames.is_empty() {
+            return;
+        }
+        let Some(resolve) = entry.resolve.clone() else {
+            return;
+        };
+        let Some(provider) = lsp.support.action_resolve() else {
+            return;
+        };
+        let uri = lsp.uri.clone();
+        let version = state.version() as i32;
+        let title = entry.title.clone();
+        let replies = ask(
+            provider,
+            ActionResolveQuery {
+                uri,
+                version,
+                resolve,
+            },
+        );
+        let task = cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let Some((Some(resolved), _)) = answer else {
+                    return;
+                };
+                let Some(lsp) = &mut this.lsp else {
+                    return;
+                };
+                let Some(menu) = &mut lsp.actions else {
+                    return;
+                };
+                let Some(Pick::Action(entry)) = menu.rows.get_mut(menu.selected) else {
+                    return;
+                };
+                // The row may have changed while the answer was on its way.
+                if entry.title != title || !entry.edits.is_empty() {
+                    return;
+                }
+                *entry = resolved;
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(lsp) = &mut self.lsp
+            && let Some(menu) = &mut lsp.actions
+        {
+            menu.preview_task = Some(task);
+        }
+    }
+
+    /// Applies a row whose server computes the edit only on resolve, once the answer
+    /// comes. The text is checked against the version the list was opened on.
+    fn resolve_and_apply(&mut self, entry: ActionEntry, version: i32, cx: &mut Context<Self>) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let Some(resolve) = entry.resolve.clone() else {
+            return;
+        };
+        let Some(provider) = lsp.support.action_resolve() else {
+            return;
+        };
+        let uri = lsp.uri.clone();
+        let replies = ask(
+            provider,
+            ActionResolveQuery {
+                uri,
+                version,
+                resolve,
+            },
+        );
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                if let Some((Some(resolved), _)) = answer {
+                    this.apply_entry(version, resolved, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The rows of ALT+Enter that the window adds beside the language actions, such as
@@ -854,10 +961,12 @@ impl EditorView {
         match key {
             "up" => {
                 menu.selected = (menu.selected + rows - 1) % rows;
+                menu.preview_task = None;
                 moved = true;
             }
             "down" => {
                 menu.selected = (menu.selected + 1) % rows;
+                menu.preview_task = None;
                 moved = true;
             }
             "enter" | "tab" => {
@@ -868,7 +977,14 @@ impl EditorView {
                 let version = self.state.as_ref().map(|state| state.version() as i32);
                 match (picked, version) {
                     (Some(Pick::Action(entry)), Some(version)) => {
-                        self.apply_entry(version, entry, cx);
+                        if entry.edits.is_empty()
+                            && entry.renames.is_empty()
+                            && entry.resolve.is_some()
+                        {
+                            self.resolve_and_apply(entry, version, cx);
+                        } else {
+                            self.apply_entry(version, entry, cx);
+                        }
                     }
                     (Some(Pick::ChangeSignature { .. }), _) => self.change_signature(cx),
                     (Some(Pick::Refactor { own, .. }), _) => self.run_own(own, cx),
@@ -910,6 +1026,7 @@ impl EditorView {
         }
         if moved {
             self.highlight_action_row();
+            self.request_action_preview(cx);
         }
         cx.notify();
         true
@@ -1125,6 +1242,7 @@ fn without_duplicate_actions(entries: Vec<ActionEntry>) -> Vec<ActionEntry> {
         let duplicate = kept.iter().any(|known| {
             known.title == entry.title
                 && known.handle == entry.handle
+                && known.resolve == entry.resolve
                 && known.edits == entry.edits
                 && known.renames == entry.renames
         });
@@ -1178,6 +1296,7 @@ mod tests {
             edits: Vec::new(),
             renames: Vec::new(),
             handle: None,
+            resolve: None,
         };
         // The unused import comes back as a quick fix and as a source action, with the
         // same title and the same edit but a code of its own kind.
@@ -1206,6 +1325,7 @@ mod tests {
             edits: Vec::new(),
             renames: Vec::new(),
             handle: Some(text.to_owned()),
+            resolve: None,
         };
         let rows = without_duplicate_actions(vec![entry("first"), entry("first"), entry("second")]);
         assert_eq!(rows.len(), 2, "the same form is one row");

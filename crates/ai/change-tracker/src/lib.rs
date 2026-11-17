@@ -6,6 +6,6 @@ mod review;
 mod tracker;
 
 pub use hidden::{ChangeKind, ChangedFile, HiddenRepo};
-pub use review::{FileReview, ReviewHunk};
+pub use review::{BinaryBytes, FileReview, ReviewHunk};
 pub use tracker::{ChangeSet, ChangeTracker, TrackerState};
 pub use vcs::GitRunner;

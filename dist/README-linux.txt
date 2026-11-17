@@ -143,8 +143,9 @@ Report problems and ideas at https://github.com/PabloSensei/arro/issues.
 Licenses and third-party components
 -----------------------------------
 
-Arro is licensed under FSL-1.1-ALv2, the Functional Source License 1.1 with the
-Apache License 2.0 as the future license. THIRD-PARTY.txt lists the crates with their
+Arro is free software under the GNU General Public License, version 3 or later;
+LICENSE.txt holds its text, and the source is at https://github.com/PabloSensei/arro.
+THIRD-PARTY.txt lists the crates with their
 versions and licenses. The bundled tools/jdtls-1.63.0 (EPL-2.0) and
 tools/vscode-java-debug-0.60.0 (the plugin is EPL-1.0 and the extension is MIT, with
 commons-io, RxJava and Reactive Streams inside) are listed there with links to their

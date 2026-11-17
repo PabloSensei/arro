@@ -22,6 +22,9 @@ pub struct BuildEnv {
     pub build_tools: BuildTools,
     /// Where tools write their reports and the model cache lives.
     pub cache_root: Option<PathBuf>,
+    /// The data folder of Arro, where downloaded tools live. The folder of the user when
+    /// it is not set.
+    pub data_dir: Option<PathBuf>,
     /// Where `maven-ext.jar` lies, `helpers` next to the executable if not set.
     pub helpers: Option<PathBuf>,
     /// Where `ide-ctrl` lies, when it is not next to the executable.
@@ -33,6 +36,14 @@ pub struct BuildEnv {
 impl BuildEnv {
     pub fn cache_root(&self) -> PathBuf {
         self.cache_root.clone().unwrap_or_else(default_cache_root)
+    }
+
+    /// The folder Arro keeps its downloads in: `%LOCALAPPDATA%/Arro` by default, the
+    /// state folder of a run with `--state-dir`.
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir
+            .clone()
+            .unwrap_or_else(|| base::app::folder("LOCALAPPDATA"))
     }
 
     pub fn helpers_dir(&self) -> Result<PathBuf> {

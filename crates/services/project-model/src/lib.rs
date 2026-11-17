@@ -7,8 +7,9 @@ mod environment;
 mod model;
 mod open;
 pub mod scaffold;
+mod tool;
 
-pub use build_tools::{BuildToolSettings, BuildTools};
+pub use build_tools::{BuildToolSettings, BuildTools, ToolHome};
 pub use cache::{cache_file, default_cache_root};
 pub use environment::{
     EnvironmentDetail, EnvironmentProvider, LanguageLevelInfo, ProjectEnvironmentInfo, RuntimeInfo,
@@ -20,3 +21,4 @@ pub use model::{
     Unit,
 };
 pub use open::{BuildSystem, ProjectSession, RecordedTask, SyncEvent, TaskOptions, open_project};
+pub use tool::{ToolProgress, ToolSetup};

@@ -35,6 +35,17 @@ pub struct FileReview {
     pub hunks: Vec<ReviewHunk>,
     /// Not UTF-8: whole-file actions only.
     pub binary: bool,
+    /// The bytes of the two sides of a binary file, for the whole-file actions. A side
+    /// is `None` when the file did not exist there. Text reviews keep none of them.
+    pub bytes: BinaryBytes,
+}
+
+/// The bytes of a file that is not text. The hunks need text, so a binary file is
+/// accepted or reverted as a whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BinaryBytes {
+    pub base: Option<Vec<u8>>,
+    pub current: Option<Vec<u8>>,
 }
 
 fn lines(text: &str, range: &Range<u32>) -> Vec<String> {
@@ -56,34 +67,43 @@ fn absent_if_empty(text: String, existed: bool) -> Option<String> {
 
 impl FileReview {
     pub fn new(path: String, base: Option<Vec<u8>>, current: Option<Vec<u8>>) -> Self {
-        let decode = |bytes: Option<Vec<u8>>| bytes.map(String::from_utf8);
-        let (base, current) = (decode(base), decode(current));
-        let binary = matches!(base, Some(Err(_))) || matches!(current, Some(Err(_)));
-        let base = base.and_then(Result::ok);
-        let current = current.and_then(Result::ok);
-        let hunks = if binary {
-            Vec::new()
-        } else {
-            let (before, after) = (
-                base.as_deref().unwrap_or(""),
-                current.as_deref().unwrap_or(""),
-            );
-            line_hunks(before, after)
-                .into_iter()
-                .map(|hunk| ReviewHunk {
-                    removed: lines(before, &hunk.before),
-                    added: lines(after, &hunk.after),
-                    before: hunk.before,
-                    after: hunk.after,
-                })
-                .collect()
+        let not_text = |bytes: &Option<Vec<u8>>| {
+            bytes
+                .as_deref()
+                .is_some_and(|bytes| std::str::from_utf8(bytes).is_err())
         };
+        if not_text(&base) || not_text(&current) {
+            return Self {
+                path,
+                base: None,
+                current: None,
+                hunks: Vec::new(),
+                binary: true,
+                bytes: BinaryBytes { base, current },
+            };
+        }
+        let base = base.and_then(|bytes| String::from_utf8(bytes).ok());
+        let current = current.and_then(|bytes| String::from_utf8(bytes).ok());
+        let (before, after) = (
+            base.as_deref().unwrap_or(""),
+            current.as_deref().unwrap_or(""),
+        );
+        let hunks = line_hunks(before, after)
+            .into_iter()
+            .map(|hunk| ReviewHunk {
+                removed: lines(before, &hunk.before),
+                added: lines(after, &hunk.after),
+                before: hunk.before,
+                after: hunk.after,
+            })
+            .collect();
         Self {
             path,
             base,
             current,
             hunks,
-            binary,
+            binary: false,
+            bytes: BinaryBytes::default(),
         }
     }
 
@@ -111,6 +131,11 @@ impl FileReview {
         };
         let text = apply(before, &revert_hunk(after, before, &swapped));
         Some(absent_if_empty(text, self.current.is_some()))
+    }
+
+    /// The bytes of both sides of a binary file; `None` for a text review.
+    pub fn binary_bytes(&self) -> Option<&BinaryBytes> {
+        self.binary.then_some(&self.bytes)
     }
 }
 
@@ -181,5 +206,32 @@ mod tests {
 
         assert!(review.binary);
         assert!(review.hunks.is_empty());
+    }
+
+    #[test]
+    fn a_binary_review_keeps_the_bytes_of_both_sides() {
+        let review = FileReview::new("b.bin".to_string(), Some(vec![0xff, 0xfe]), Some(vec![1]));
+
+        let bytes = review.binary_bytes().unwrap();
+        assert_eq!(bytes.base.as_deref(), Some(&[0xff, 0xfe][..]));
+        assert_eq!(bytes.current.as_deref(), Some(&[1][..]));
+        assert!(review.reverted_hunk(0).is_none());
+        assert!(review.accepted_hunk(0).is_none());
+    }
+
+    #[test]
+    fn a_binary_file_added_by_the_agent_has_no_base_bytes() {
+        let review = FileReview::new("b.bin".to_string(), None, Some(vec![0xff]));
+
+        let bytes = review.binary_bytes().unwrap();
+        assert!(bytes.base.is_none());
+        assert_eq!(bytes.current.as_deref(), Some(&[0xff][..]));
+    }
+
+    #[test]
+    fn a_text_review_keeps_no_binary_bytes() {
+        let review = review(Some("a\n"), Some("b\n"));
+
+        assert!(review.binary_bytes().is_none());
     }
 }

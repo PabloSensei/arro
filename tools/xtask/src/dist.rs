@@ -19,6 +19,9 @@ const RUN_ARRO_TEMPLATE: &str = include_str!("../../../dist/run-arro.cmd");
 /// The Eclipse Public License 1.0 as published at https://www.eclipse.org/legal/epl-v10.html.
 /// The java-debug archive declares this license but carries no copy of it.
 pub(crate) const EPL_1_0: &str = include_str!("../../../dist/licenses/EPL-1.0.txt");
+/// The license of Arro itself, the GPL-3.0 text of `LICENSE`: every build carries it as
+/// `LICENSE.txt`, as the GPL asks of whoever distributes the program.
+pub(crate) const PROJECT_LICENSE: &str = include_str!("../../../LICENSE");
 
 /// The pinned archives of the language tools. The versions and hashes are part of
 /// the release, as they are for ConPTY; a different file is an error, not a warning.
@@ -147,6 +150,7 @@ pub fn run(
     let mut notice = notice::render(conpty);
     notice.push_str(&java_notice(&java_tools));
     write_text(&out.join("NOTICE.txt"), &notice)?;
+    write_text(&out.join("LICENSE.txt"), PROJECT_LICENSE)?;
     write_text(
         &java_tools.debug.join("extension").join("EPL-1.0.txt"),
         EPL_1_0,
@@ -207,6 +211,7 @@ fn remove_old(out: &Path) -> Result {
         "run-arro.cmd",
         "THIRD-PARTY.txt",
         "NOTICE.txt",
+        "LICENSE.txt",
         "conpty.dll",
         "OpenConsole.exe",
         PDB,
@@ -754,6 +759,7 @@ fn render_third_party(groups: &BTreeMap<String, Vec<String>>) -> String {
          \x20 Inter 4.1, SIL Open Font License 1.1;\n\
          \x20 JetBrains Mono 2.304, SIL Open Font License 1.1;\n\
          \x20 icons built from Lucide 1.70.0 and 1.43.0, ISC (in part MIT, from Feather);\n\
+         \x20 icons of the IntelliJ New UI set from JetBrains intellij-community (commit d5b79b00), Apache-2.0;\n\
          \x20 the default keymap from JetBrains intellij-community, Apache-2.0.\n\n\
          conpty.dll and OpenConsole.exe, when they are shipped next to arro.exe, come from\n\
          Microsoft Windows Terminal and are MIT-licensed; NOTICE.txt holds that text.\n\n\

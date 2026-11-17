@@ -21,7 +21,7 @@ use runner::{RunConfig, RunConfigProvider, RunPlan, TestSite};
 use syntax::LanguageConfig;
 use templates::TemplateLanguage;
 
-pub use java_lang::{BuildTools, NewProjectOptions};
+pub use java_lang::{BuildTools, NewProjectOptions, file_icons};
 pub use java_project::heap::read as read_heap_dump;
 pub use java_project::{BuildEnv, Gradle, Jdk, Maven};
 pub use jdtls_adapter::{self, settings_of};

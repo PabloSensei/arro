@@ -332,8 +332,7 @@ fn tree_command(
     }
     let state = panel.update(cx, |panel, cx| {
         match (id, node) {
-            (keys::EXPAND_ALL, _) => panel.expand_all_quiet(cx),
-            (keys::FULLY_EXPAND_TREE_NODE, _) => panel.expand_fully(cx),
+            (keys::EXPAND_ALL | keys::FULLY_EXPAND_TREE_NODE, _) => panel.expand_fully(cx),
             (keys::COLLAPSE_ALL, _) => panel.collapse_all_quiet(cx),
             (keys::EXPAND_TREE_NODE, _) => panel.expand_node_quiet(cx),
             _ => panel.collapse_node_quiet(cx),

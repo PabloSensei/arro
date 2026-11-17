@@ -32,18 +32,36 @@ pub(crate) enum Popup {
     Note,
 }
 
-/// The point of the corner of a popup of `height` that stands over the line whose top
-/// is `line_top`, with a small gap, inside `editor`. `None` when the line has no room
-/// over it, and the popup goes under the list that holds that side of the line.
-fn placement_over(
-    x: Pixels,
-    line_top: Pixels,
-    height: f32,
-    editor: Bounds<Pixels>,
-) -> Option<(Point<Pixels>, Anchor)> {
-    let gap = px(2.);
-    let bottom = line_top - gap;
-    (bottom - px(height) >= editor.top() + px(4.)).then(|| (point(x, bottom), Anchor::BottomLeft))
+/// The `(` of the call around `at`, when it is on the same line: Parameter Info stands
+/// at the opening bracket of the call rather than where the caret happens to be.
+fn call_open_paren(store: &text_core::RopeStore, at: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut offset = at.min(store.len());
+    while offset > 0 {
+        let previous = store.prev_boundary(offset);
+        let character = store.char_at(previous)?;
+        match character {
+            ')' | ']' | '}' => depth += 1,
+            '(' => {
+                if depth == 0 {
+                    return Some(previous);
+                }
+                depth -= 1;
+            }
+            '\n' | ';' | '{' => return None,
+            _ => {}
+        }
+        offset = previous;
+    }
+    None
+}
+
+/// Whether two rectangles of the window share at least a pixel.
+fn boxes_overlap(left: Bounds<Pixels>, right: Bounds<Pixels>) -> bool {
+    left.right() > right.left()
+        && right.right() > left.left()
+        && left.bottom() > right.top()
+        && right.bottom() > left.top()
 }
 
 /// The word around `offset`: a caret inside that range belongs to the same place.
@@ -371,39 +389,48 @@ impl EditorView {
         ))
     }
 
-    /// The place of Parameter Info. The completion list keeps its side of the line:
-    /// when the list stands under the line, Parameter Info goes over the line, and
-    /// under the list when the line has no room above it.
+    /// The place of Parameter Info. It stands over the line of the call, at its opening
+    /// bracket, and keeps that place while the completion list is open: the list opens
+    /// under the line, so the two do not meet. A line with no room above it puts the
+    /// window under the line, clear of the list.
     pub(crate) fn parameter_info_position(
         &self,
         at: usize,
         height: f32,
     ) -> Option<(Point<Pixels>, Anchor)> {
-        let (Some(list), Some((x, line_top))) = (self.completion_bounds(), self.popup_anchor(at))
-        else {
-            return self.popup_position(at, height);
-        };
-        let editor = self.layout.as_ref()?.bounds;
+        let (layout, state) = (self.layout.as_ref()?, self.state.as_ref()?);
+        let anchor = call_open_paren(&state.store(), at).unwrap_or(at);
+        let (x, line_top) = self.popup_anchor(anchor)?;
+        let editor = layout.bounds;
+        let gap = px(2.);
+        let limit = px(4.);
         let line_bottom = line_top + px(self.style.line_height);
-        if list.top() < line_bottom - px(1.) {
-            // The list holds the room over the line: Parameter Info takes the room under
-            // it, and stands over the list when the editor ends under the line.
-            let below = line_bottom + px(2.);
-            if below + px(height) <= editor.bottom() - px(4.) {
-                return Some((point(x, below), Anchor::TopLeft));
-            }
-            let above_list = list.top() - px(2.);
-            if above_list - px(height) >= editor.top() + px(4.) {
-                return Some((point(x, above_list), Anchor::BottomLeft));
-            }
-            return self.popup_position(at, height);
+        let list = self.completion_bounds();
+        let clear_of_list =
+            |bounds: Bounds<Pixels>| list.is_none_or(|list| !boxes_overlap(bounds, list));
+        let above = line_top - gap;
+        let above_bounds = Bounds::new(point(x, above - px(height)), size(px(1.), px(height)));
+        if above - px(height) >= editor.top() + limit && clear_of_list(above_bounds) {
+            return Some((point(x, above), Anchor::BottomLeft));
         }
-        if let Some(placement) = placement_over(x, line_top, height, editor) {
-            return Some(placement);
+        let below = line_bottom + gap;
+        let below_bounds = Bounds::new(point(x, below), size(px(1.), px(height)));
+        if below + px(height) <= editor.bottom() - limit && clear_of_list(below_bounds) {
+            return Some((point(x, below), Anchor::TopLeft));
         }
-        let bottom = list.bottom() + px(2.);
-        let limit = editor.bottom() - px(4.) - px(height);
-        let top = bottom.min(limit.max(editor.top() + px(4.)));
+        // Neither side of the line is clear: the list holds the room under it, so the
+        // window stands under or over the list rather than covering it.
+        if let Some(list) = list {
+            let under_list = list.bottom() + gap;
+            if under_list + px(height) <= editor.bottom() - limit {
+                return Some((point(x, under_list), Anchor::TopLeft));
+            }
+            let over_list = list.top() - gap;
+            if over_list - px(height) >= editor.top() + limit {
+                return Some((point(x, over_list), Anchor::BottomLeft));
+            }
+        }
+        let top = below.min((editor.bottom() - limit - px(height)).max(editor.top() + limit));
         Some((point(x, top), Anchor::TopLeft))
     }
 }

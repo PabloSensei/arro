@@ -7,7 +7,7 @@ use std::ptr::{addr_of, null, null_mut};
 use std::slice;
 
 use super::sec_status::{self, Outcome};
-use super::{Secret, secret_from_bytes};
+use super::{DeleteAnswer, Secret, delete_is_done, secret_from_bytes};
 
 type CFTypeRef = *const c_void;
 type CFStringRef = *const c_void;
@@ -193,9 +193,10 @@ pub fn delete(service: &str, account: &str) -> Result<(), String> {
     let account = string(account).ok_or_else(|| failure("delete", -1))?;
     let key = key(service.0, account.0).ok_or_else(|| failure("delete", -1))?;
     let status = unsafe { SecItemDelete(key.0) };
-    match sec_status::outcome(status) {
-        Outcome::Success | Outcome::Missing => Ok(()),
-        _ => Err(failure("delete", status)),
+    if delete_is_done(DeleteAnswer::Security(status)) {
+        Ok(())
+    } else {
+        Err(failure("delete", status))
     }
 }
 

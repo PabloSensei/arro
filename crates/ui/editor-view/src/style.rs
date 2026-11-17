@@ -8,6 +8,8 @@ use ui_kit::*;
 #[derive(Clone, Debug)]
 pub struct EditorStyle {
     pub dark: bool,
+    /// The set of the window the gutter icons come from.
+    pub icon_set: &'static str,
     pub background: Hsla,
     pub code: Hsla,
     pub keyword: Hsla,
@@ -64,6 +66,8 @@ pub struct EditorStyle {
     pub stripe_warning: Hsla,
     pub stripe_find: Hsla,
     pub stripe_caret: Hsla,
+    /// A hunk an agent changed that the user has not accepted.
+    pub stripe_agent: Hsla,
     pub font_family: SharedString,
     pub font_size: f32,
     pub line_height: f32,
@@ -82,6 +86,7 @@ impl EditorStyle {
     pub fn from_theme(theme: &Theme) -> Self {
         Self {
             dark: theme.dark,
+            icon_set: theme.icon_set(),
             background: theme.editor_bg,
             code: theme.code,
             keyword: theme.keyword,
@@ -139,6 +144,7 @@ impl EditorStyle {
             stripe_warning: theme.stripe_warning,
             stripe_find: theme.stripe_find,
             stripe_caret: theme.stripe_caret,
+            stripe_agent: theme.stripe_agent,
             font_family: MONO_FONT.into(),
             font_size: CODE_SIZE,
             line_height: CODE_LINE_HEIGHT,

@@ -203,7 +203,6 @@ pub struct BranchPopup {
     hovered: Option<usize>,
     hover_serial: usize,
     hover_task: Option<Task<()>>,
-    serial: usize,
 }
 
 impl BranchPopup {
@@ -249,7 +248,6 @@ impl BranchPopup {
                 hovered: None,
                 hover_serial: 0,
                 hover_task: None,
-                serial: 0,
             };
             popup.rebuild();
             popup
@@ -781,7 +779,6 @@ impl BranchPopup {
         self.submenu_entries = entries;
         self.submenu_state.clear();
         self.submenu_state.hover(&[0]);
-        self.serial += 1;
         cx.notify();
     }
 
@@ -791,7 +788,6 @@ impl BranchPopup {
         }
         self.submenu_entries.clear();
         self.submenu_state.clear();
-        self.serial += 1;
         cx.notify();
         true
     }
@@ -1590,7 +1586,7 @@ fn node_key_at(rows: &[Row], at: usize) -> Option<String> {
 
 /// One row of a folder tree, before it becomes a row of the popup.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum TreeRow {
+pub(crate) enum TreeRow {
     Folder {
         key: String,
         label: String,
@@ -1655,7 +1651,7 @@ impl FolderTree {
 }
 
 /// The rows of a folder tree over `(name, index)` entries.
-fn tree_rows(
+pub(crate) fn tree_rows(
     entries: &[(String, usize)],
     prefix: &str,
     depth: usize,
@@ -1672,7 +1668,10 @@ fn tree_rows(
 }
 
 /// The remote branches by their remote, then the rest of their names.
-fn remote_groups(branches: &[Branch], indexes: &[usize]) -> Vec<(String, Vec<(String, usize)>)> {
+pub(crate) fn remote_groups(
+    branches: &[Branch],
+    indexes: &[usize],
+) -> Vec<(String, Vec<(String, usize)>)> {
     let mut groups: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
     for index in indexes {
         let Some((remote, rest)) = branches[*index].name.split_once('/') else {
@@ -1692,7 +1691,7 @@ fn remote_groups(branches: &[Branch], indexes: &[usize]) -> Vec<(String, Vec<(St
 /// The indexes of `branches` the search keeps, in the order of the list. The pattern is
 /// fuzzy, as Search Everywhere finds a name, and a slash of a branch past a slash of the
 /// pattern.
-fn matching_branches(branches: &[Branch], query: &str) -> Vec<usize> {
+pub(crate) fn matching_branches(branches: &[Branch], query: &str) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {
         return (0..branches.len()).collect();
@@ -1705,7 +1704,10 @@ fn matching_branches(branches: &[Branch], query: &str) -> Vec<usize> {
 }
 
 /// The indexes of `names` the search keeps.
-fn matching_names<'a>(names: impl IntoIterator<Item = &'a str>, query: &str) -> Vec<usize> {
+pub(crate) fn matching_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    query: &str,
+) -> Vec<usize> {
     let query = query.trim();
     let names: Vec<&str> = names.into_iter().collect();
     if query.is_empty() {
@@ -1738,7 +1740,7 @@ fn matching(query: &str, commands: &[Command]) -> Vec<Command> {
 
 /// The branches of one group that are favourites, and the rest, both by name. The
 /// favourites stand above the folders of their group.
-fn split_favourites(
+pub(crate) fn split_favourites(
     indexes: &[usize],
     branches: &[Branch],
     favourites: &HashSet<String>,
@@ -2071,7 +2073,9 @@ impl Render for BranchPopup {
             anchored()
                 .position(point(left, top))
                 .snap_to_window_with_margin(px(SPACE_M))
-                .child(enter(("branches-enter", self.serial), body)),
+                // The fade runs once, when the popup opens. A key that changed with the
+                // submenu would fade the whole popup again on every hover.
+                .child(enter("branches-enter", body)),
         )
         .with_priority(1);
         div().absolute().size_full().child(backdrop).child(popup)

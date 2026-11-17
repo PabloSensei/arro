@@ -4,6 +4,24 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where the home of a build tool is taken from. `Auto` is the wrapper of the project,
+/// the home named below, the copy the IDE downloaded and then the program on `PATH`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolHome {
+    /// The wrapper of the project, the configured home, the downloaded copy, `PATH`.
+    #[default]
+    Auto,
+    /// The copy the IDE downloaded into its data folder.
+    Bundled,
+    /// The program on `PATH`.
+    Path,
+    /// The wrapper script of the project.
+    Wrapper,
+    /// The folder in [`BuildToolSettings::home`].
+    Custom,
+}
+
 /// The settings of one build tool.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -11,6 +29,11 @@ pub struct BuildToolSettings {
     /// Where the tool is installed. Empty means the wrapper of the project, or the
     /// program found on `PATH`.
     pub home: String,
+    /// Where the home of the tool comes from: the automatic order, the downloaded copy,
+    /// `PATH`, the wrapper or the folder above.
+    pub home_kind: ToolHome,
+    /// Adds the folder of the downloaded tool to `PATH` of the terminals of the window.
+    pub terminal_path: bool,
     /// The settings file the tool reads. Empty means the place the tool chooses.
     pub settings_file: String,
     /// The repository the settings file names. Read-only: it comes from that file.

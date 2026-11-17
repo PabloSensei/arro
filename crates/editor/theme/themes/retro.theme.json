@@ -37,6 +37,7 @@
     "stripe_warning": "#ffc93c",
     "stripe_find": "#ffd479",
     "stripe_caret": "#ffd479",
+    "stripe_agent": "#b79bff",
     "success": "#9fd68a",
     "info": "#ffcf7a",
     "error": "#ff6b5c"

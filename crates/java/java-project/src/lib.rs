@@ -14,6 +14,7 @@ pub mod initializr;
 mod jdk;
 mod lombok;
 mod maven;
+mod maven_download;
 mod migrations;
 mod pom;
 pub mod profile;
@@ -36,7 +37,9 @@ pub use lombok::{
     LOMBOK_ARTIFACT, LOMBOK_GROUP, LocalRepositories, Lombok, LombokDependency, find_lombok,
     find_lombok_in_build_files, resolve_lombok,
 };
-pub use maven::{Maven, find_maven};
+pub use maven::{
+    Maven, MavenHome, MavenOrigin, MissingMaven, bundled_home, find_maven, find_maven_home,
+};
 pub use migrations::{
     Action, ActionKind, CHANGED_MIGRATION, ChangeSet, Changelog, DUPLICATE_CHANGESET,
     DUPLICATE_VERSION, File, History, HistoryRows, INVALID_NAME, Include, Issue, Kind,

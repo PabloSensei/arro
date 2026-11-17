@@ -3,6 +3,7 @@
 //! HTML that documentation comments use; this module turns it into neutral blocks and
 //! draws them in the colours of the editor.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -13,7 +14,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use lang_api::{SourceSpan, TextPoint, TextSpan, ask};
 use markdown::mdast;
-use syntax::{DocumentId, HighlightSpan};
+use syntax::{DocumentId, HighlightSpan, LanguageConfig, SyntaxService};
 use text_core::{Change, RopeStore, TextStore};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -45,6 +46,9 @@ pub enum DocBlock {
         ordered: bool,
         start: u32,
         items: Vec<Vec<DocInline>>,
+        /// The blocks under each item after its line, such as a nested list: one entry per
+        /// item. An answer of a server keeps them in the line, so its entries are empty.
+        nested: Vec<Vec<DocBlock>>,
     },
     Code {
         language: Option<String>,
@@ -66,6 +70,15 @@ pub enum DocBlock {
     },
     /// A quoted part of the answer with the blocks it holds.
     Quote(Vec<DocBlock>),
+    /// A `<details>` block of a file: the summary line and the blocks under it. It is drawn
+    /// closed unless its tag says `open`. `id` numbers the blocks of this kind in the order of
+    /// the file, so that the choice of a reader stays with its block while the text changes.
+    Details {
+        id: usize,
+        open: bool,
+        summary: Vec<DocInline>,
+        blocks: Vec<DocBlock>,
+    },
     Divider,
 }
 
@@ -171,18 +184,29 @@ impl QuickDoc {
 /// HTML tags of documentation comments are read as markdown first, and other tags are
 /// dropped while their text stays.
 pub fn parse(text: &str) -> Vec<DocBlock> {
-    parse_blocks(text, true).0
+    parse_blocks(text, Reading::Answer).0
 }
 
 /// The blocks of a markdown file and the line each one starts on, counted from zero.
 /// HTML is left as it is, so the lines stay the lines of the file: a preview follows
 /// the scroll of the editor by them.
 pub(crate) fn parse_with_lines(text: &str) -> (Vec<DocBlock>, Vec<usize>) {
-    parse_blocks(text, false)
+    let (mut blocks, lines) = parse_blocks(text, Reading::File);
+    number_details(&mut blocks, &mut 0);
+    (blocks, lines)
 }
 
-fn parse_blocks(text: &str, html: bool) -> (Vec<DocBlock>, Vec<usize>) {
-    let normalized = html.then(|| html_to_markdown(text));
+/// How a text is read. An answer of a server keeps its line breaks, as the servers write
+/// them, and its HTML becomes markdown first. A file reads the way CommonMark does: a line
+/// break inside a paragraph is a space, and its HTML is read as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reading {
+    Answer,
+    File,
+}
+
+fn parse_blocks(text: &str, reading: Reading) -> (Vec<DocBlock>, Vec<usize>) {
+    let normalized = (reading == Reading::Answer).then(|| html_to_markdown(text));
     let source = normalized.as_deref().unwrap_or(text);
     let fallback = || {
         (
@@ -192,37 +216,60 @@ fn parse_blocks(text: &str, html: bool) -> (Vec<DocBlock>, Vec<usize>) {
             vec![0],
         )
     };
-    let Ok(root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
+    let Ok(mut root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
         return fallback();
     };
+    if reading == Reading::File {
+        resolve_references(&mut root);
+    }
     let mdast::Node::Root(root) = root else {
         return (Vec::new(), Vec::new());
     };
     let mut blocks = Vec::new();
     let mut lines = Vec::new();
-    push_blocks(&root.children, &mut blocks, &mut lines);
+    push_blocks(&root.children, &mut blocks, &mut lines, reading);
     (blocks, lines)
 }
 
-fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>, lines: &mut Vec<usize>) {
-    for node in nodes {
+fn push_blocks(
+    nodes: &[mdast::Node],
+    blocks: &mut Vec<DocBlock>,
+    lines: &mut Vec<usize>,
+    reading: Reading,
+) {
+    // The cursor is a node and a byte offset in its value: a `<details>` tag that closes in the
+    // middle of an HTML block leaves the rest of that block to the blocks after it.
+    let mut index = 0;
+    let mut offset = 0;
+    while let Some(node) = nodes.get(index) {
         let line = node
             .position()
             .map_or(0, |position| position.start.line.saturating_sub(1));
         let before = blocks.len();
+        if let Some(read) = (reading == Reading::File)
+            .then(|| details_at(nodes, index, offset))
+            .flatten()
+        {
+            blocks.push(read.block);
+            (index, offset) = read.resume;
+            for _ in before..blocks.len() {
+                lines.push(line);
+            }
+            continue;
+        }
         match node {
             mdast::Node::Paragraph(paragraph) => {
                 if let Some((alt, url)) = single_image(&paragraph.children) {
                     blocks.push(DocBlock::Image { alt, url });
                 } else {
-                    let inlines = inlines_of(&paragraph.children);
+                    let inlines = inlines_of(&paragraph.children, reading);
                     if !inlines.is_empty() {
                         blocks.push(DocBlock::Paragraph(inlines));
                     }
                 }
             }
             mdast::Node::Heading(heading) => {
-                let text = inlines_of(&heading.children);
+                let text = inlines_of(&heading.children, reading);
                 if !text.is_empty() {
                     blocks.push(DocBlock::Heading {
                         level: usize::from(heading.depth).clamp(1, 6),
@@ -232,14 +279,15 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>, lines: &mut Ve
             }
             mdast::Node::List(list) => {
                 let mut items = Vec::new();
+                let mut nested = Vec::new();
                 for child in &list.children {
                     let mdast::Node::ListItem(item) = child else {
                         continue;
                     };
-                    let mut inlines = Vec::new();
-                    collect_item(item, &mut inlines);
-                    if !inlines.is_empty() {
+                    let (inlines, below) = list_item(item, reading);
+                    if !inlines.is_empty() || !below.is_empty() {
                         items.push(inlines);
+                        nested.push(below);
                     }
                 }
                 if !items.is_empty() {
@@ -247,6 +295,7 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>, lines: &mut Ve
                         ordered: list.ordered,
                         start: list.start.unwrap_or(1),
                         items,
+                        nested,
                     });
                 }
             }
@@ -256,7 +305,7 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>, lines: &mut Ve
                 spans: Vec::new(),
             }),
             mdast::Node::Table(table) => {
-                if let Some(block) = table_block(table) {
+                if let Some(block) = table_block(table, reading) {
                     blocks.push(block);
                 }
             }
@@ -264,24 +313,309 @@ fn push_blocks(nodes: &[mdast::Node], blocks: &mut Vec<DocBlock>, lines: &mut Ve
             mdast::Node::Blockquote(quote) => {
                 let mut inner = Vec::new();
                 let mut inner_lines = Vec::new();
-                push_blocks(&quote.children, &mut inner, &mut inner_lines);
+                push_blocks(&quote.children, &mut inner, &mut inner_lines, reading);
                 if !inner.is_empty() {
                     blocks.push(DocBlock::Quote(inner));
                 }
             }
-            mdast::Node::Html(html) => {
-                let inlines = html_inlines(&html.value);
-                let inlines = trim_inlines(inlines);
-                if !inlines.is_empty() {
-                    blocks.push(DocBlock::Paragraph(inlines));
-                }
-            }
+            mdast::Node::Html(html) => html_blocks(&html.value[offset..], reading, blocks),
             _ => {}
         }
+        index += 1;
+        offset = 0;
         for _ in before..blocks.len() {
             lines.push(line);
         }
     }
+}
+
+/// The blocks of a piece of HTML that is not a `<details>` block: a rule, a heading, or the
+/// text of the piece as a paragraph.
+fn html_blocks(html: &str, reading: Reading, blocks: &mut Vec<DocBlock>) {
+    if is_rule(html) {
+        blocks.push(DocBlock::Divider);
+        return;
+    }
+    let (level, inner) =
+        html_heading(html).map_or((None, html), |(level, inner)| (Some(level), inner));
+    let inlines = trim_inlines(html_inlines(inner, reading));
+    if !inlines.is_empty() {
+        blocks.push(match level {
+            Some(level) => DocBlock::Heading {
+                level,
+                text: inlines,
+            },
+            None => DocBlock::Paragraph(inlines),
+        });
+    }
+}
+
+/// A `<details>` block that starts at `offset` in the HTML node `nodes[index]`.
+struct DetailsRead {
+    block: DocBlock,
+    /// Where the blocks after the block start: a node and a byte offset in its value.
+    resume: (usize, usize),
+}
+
+/// The `<details>` block that opens at `offset` in the HTML node `nodes[index]`, `None` when
+/// the text there does not open one. Its closing tag is the one that balances the opening
+/// tags after it, so a block that holds other blocks closes at its own tag.
+fn details_at(nodes: &[mdast::Node], index: usize, offset: usize) -> Option<DetailsRead> {
+    let mdast::Node::Html(opener) = nodes.get(index)? else {
+        return None;
+    };
+    let value = opener.value.as_str();
+    let from = &value[offset..];
+    let head = from.trim_start();
+    let start = offset + from.len() - head.len();
+    let after_name = head.strip_prefix("<details")?;
+    if !after_name.starts_with(|character: char| character == '>' || character.is_whitespace()) {
+        return None;
+    }
+    let open_end = start + "<details".len() + after_name.find('>')? + 1;
+    let open = has_word(&value[start..open_end], "open");
+    let closer = details_close(nodes, index, open_end);
+    let closer_node = closer.map(|(node, _, _)| node);
+    // The text of the opener after its tag, up to the closing tag when the tag is in it.
+    let opener_end = match closer {
+        Some((node, at, _)) if node == index => at,
+        _ => value.len(),
+    };
+    let first = &value[open_end..opener_end];
+    let mut body = Vec::new();
+    let mut summary = None;
+    let mut summary_node = None;
+    let mut middle = index + 1;
+    match split_summary(first) {
+        Some((text, rest)) => {
+            summary = Some(text);
+            push_text(&mut body, &rest);
+        }
+        None => {
+            // The summary may be the first line of the next HTML block.
+            let next = match nodes.get(index + 1) {
+                Some(mdast::Node::Html(next)) => Some(next.value.as_str()),
+                _ => None,
+            };
+            let next_end = match closer {
+                Some((node, at, _)) if node == index + 1 => at,
+                _ => next.map_or(0, str::len),
+            };
+            let split = next
+                .filter(|next| next.trim_start().starts_with("<summary"))
+                .and_then(|next| split_summary(&next[..next_end]));
+            match split {
+                Some((text, rest)) => {
+                    summary = Some(text);
+                    push_text(&mut body, &rest);
+                    summary_node = Some(index + 1);
+                    middle = index + 2;
+                }
+                None => push_text(&mut body, first),
+            }
+        }
+    }
+    let middle_end = closer_node.unwrap_or(nodes.len());
+    if middle < middle_end {
+        push_blocks(
+            &nodes[middle..middle_end],
+            &mut body,
+            &mut Vec::new(),
+            Reading::File,
+        );
+    }
+    if let Some((node, at, _)) = closer
+        && node > index
+        && Some(node) != summary_node
+        && let mdast::Node::Html(html) = &nodes[node]
+    {
+        push_text(&mut body, &html.value[..at]);
+    }
+    let mut summary = trim_inlines(html_inlines(summary.unwrap_or_default(), Reading::File));
+    if summary.is_empty() {
+        summary = vec![DocInline::Text("Details".to_owned())];
+    }
+    Some(DetailsRead {
+        block: DocBlock::Details {
+            id: 0,
+            open,
+            summary,
+            blocks: body,
+        },
+        resume: closer.map_or((nodes.len(), 0), |(node, _, end)| (node, end)),
+    })
+}
+
+/// The closing tag of a `<details>` block whose opening tag ends at `from` in the node
+/// `nodes[index]`: the node, the byte offsets of the tag and of its end. `None` when no tag
+/// closes the block.
+fn details_close(
+    nodes: &[mdast::Node],
+    index: usize,
+    from: usize,
+) -> Option<(usize, usize, usize)> {
+    let mut depth = 0usize;
+    for (node, found) in nodes.iter().enumerate().skip(index) {
+        let mdast::Node::Html(html) = found else {
+            continue;
+        };
+        let from = if node == index { from } else { 0 };
+        for (at, opens) in details_tags(&html.value, from) {
+            if opens {
+                depth += 1;
+            } else if depth > 0 {
+                depth -= 1;
+            } else {
+                let end = at + html.value[at..].find('>')? + 1;
+                return Some((node, at, end));
+            }
+        }
+    }
+    None
+}
+
+/// The tags of `<details>` and `</details>` in a piece of HTML from `from` on, in the order
+/// they come: the byte offset of each and whether it opens a block.
+fn details_tags(html: &str, from: usize) -> Vec<(usize, bool)> {
+    let mut tags: Vec<(usize, bool)> = html[from..]
+        .match_indices("<details")
+        .map(|(at, _)| (from + at, true))
+        .chain(
+            html[from..]
+                .match_indices("</details")
+                .map(|(at, _)| (from + at, false)),
+        )
+        .collect();
+    tags.sort_unstable();
+    tags
+}
+
+/// The text inside the `<summary>` tag of a piece of HTML, and the text around the tag.
+fn split_summary(text: &str) -> Option<(&str, String)> {
+    let start = text.find("<summary")?;
+    let inner_start = start + text[start..].find('>')? + 1;
+    let inner_end = inner_start + text[inner_start..].find("</summary>")?;
+    let rest = format!(
+        "{}{}",
+        &text[..start],
+        &text[inner_end + "</summary>".len()..]
+    );
+    Some((&text[inner_start..inner_end], rest))
+}
+
+/// Whether a tag has an attribute that is written without a value, such as `open`.
+fn has_word(tag: &str, word: &str) -> bool {
+    tag.trim_end_matches('>')
+        .split_whitespace()
+        .skip(1)
+        .any(|part| part.eq_ignore_ascii_case(word))
+}
+
+/// Adds the blocks of a fragment of markdown, such as the body of a `<details>` block that
+/// is written on the line of its tag.
+fn push_text(out: &mut Vec<DocBlock>, text: &str) {
+    if !text.trim().is_empty() {
+        out.extend(parse_blocks(text, Reading::File).0);
+    }
+}
+
+/// Gives each `<details>` block of a file its number, in the order the blocks open in the
+/// file, nested ones after the block they are in.
+fn number_details(blocks: &mut [DocBlock], next: &mut usize) {
+    for block in blocks {
+        match block {
+            DocBlock::Details { id, blocks, .. } => {
+                *id = *next;
+                *next += 1;
+                number_details(blocks, next);
+            }
+            DocBlock::Quote(inner) => number_details(inner, next),
+            DocBlock::List { nested, .. } => {
+                for blocks in nested {
+                    number_details(blocks, next);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Puts the address of each reference of a file in its place. A link or a picture that names
+/// a label takes the address of the definition of that label, which may be anywhere in the
+/// file. The definitions are not drawn: they are not blocks of the text.
+fn resolve_references(root: &mut mdast::Node) {
+    let mut definitions = HashMap::new();
+    collect_definitions(root, &mut definitions);
+    if !definitions.is_empty() {
+        rewrite_references(root, &definitions);
+    }
+}
+
+/// The address of each label of the file, by the normalized label. The first definition of a
+/// label is the one a reference takes, as in CommonMark.
+fn collect_definitions(node: &mdast::Node, out: &mut HashMap<String, String>) {
+    if let mdast::Node::Definition(definition) = node {
+        out.entry(definition.identifier.clone())
+            .or_insert_with(|| definition.url.clone());
+    }
+    for child in node.children().into_iter().flatten() {
+        collect_definitions(child, out);
+    }
+}
+
+fn rewrite_references(node: &mut mdast::Node, definitions: &HashMap<String, String>) {
+    let resolved = match node {
+        mdast::Node::LinkReference(reference) => {
+            definitions.get(&reference.identifier).map(|url| {
+                mdast::Node::Link(mdast::Link {
+                    children: std::mem::take(&mut reference.children),
+                    position: reference.position.take(),
+                    url: url.clone(),
+                    title: None,
+                })
+            })
+        }
+        mdast::Node::ImageReference(reference) => {
+            definitions.get(&reference.identifier).map(|url| {
+                mdast::Node::Image(mdast::Image {
+                    position: reference.position.take(),
+                    alt: reference.alt.clone(),
+                    url: url.clone(),
+                    title: None,
+                })
+            })
+        }
+        _ => None,
+    };
+    if let Some(resolved) = resolved {
+        *node = resolved;
+    }
+    for child in node.children_mut().into_iter().flatten() {
+        rewrite_references(child, definitions);
+    }
+}
+
+/// Whether an HTML block is a horizontal rule and nothing else, such as `<hr>`.
+fn is_rule(html: &str) -> bool {
+    let html = html.trim();
+    html.starts_with("<hr") && html.ends_with('>')
+}
+
+/// The level and the text of an HTML block that is one heading, such as
+/// `<h1 align="center">Title</h1>`.
+fn html_heading(html: &str) -> Option<(usize, &str)> {
+    let html = html.trim();
+    let level = html
+        .strip_prefix('<')?
+        .strip_prefix('h')?
+        .chars()
+        .next()?
+        .to_digit(10)?;
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let inner = html[html.find('>')? + 1..].strip_suffix(format!("</h{level}>").as_str())?;
+    Some((level as usize, inner))
 }
 
 /// The text and the address of the only picture of a paragraph.
@@ -294,7 +628,7 @@ fn single_image(nodes: &[mdast::Node]) -> Option<(String, String)> {
 
 /// A table of the answer: the first row is the header, the alignment of a column comes
 /// from the separators under it.
-fn table_block(table: &mdast::Table) -> Option<DocBlock> {
+fn table_block(table: &mdast::Table, reading: Reading) -> Option<DocBlock> {
     let mut rows = Vec::new();
     for child in &table.children {
         let mdast::Node::TableRow(row) = child else {
@@ -305,7 +639,7 @@ fn table_block(table: &mdast::Table) -> Option<DocBlock> {
             let mdast::Node::TableCell(cell) = cell else {
                 continue;
             };
-            cells.push(inlines_of(&cell.children));
+            cells.push(inlines_of(&cell.children, reading));
         }
         rows.push(cells);
     }
@@ -329,8 +663,34 @@ fn table_block(table: &mdast::Table) -> Option<DocBlock> {
     })
 }
 
-/// A list item whose child is not a paragraph, such as a nested list, keeps its text in
-/// the same line rather than making another block. A task item starts with its mark.
+/// The line of a list item and the blocks under it. A file keeps what is under the line
+/// as blocks, such as a nested list or a second paragraph; an answer keeps all of it in
+/// the line, as it always has.
+fn list_item(item: &mdast::ListItem, reading: Reading) -> (Vec<DocInline>, Vec<DocBlock>) {
+    if reading == Reading::Answer {
+        let mut inlines = Vec::new();
+        collect_item(item, &mut inlines);
+        return (inlines, Vec::new());
+    }
+    let mut inlines = Vec::new();
+    if let Some(checked) = item.checked {
+        let mark = if checked { "\u{2611} " } else { "\u{2610} " };
+        merge(&mut inlines, vec![DocInline::Text(mark.to_owned())]);
+    }
+    // The first paragraph is the line of the item. The blocks after it are read together, so
+    // that a `<details>` block can close in a later node of the item.
+    let mut rest = item.children.as_slice();
+    if let Some(mdast::Node::Paragraph(paragraph)) = rest.first() {
+        merge(&mut inlines, inlines_of(&paragraph.children, reading));
+        rest = &rest[1..];
+    }
+    let mut below = Vec::new();
+    push_blocks(rest, &mut below, &mut Vec::new(), reading);
+    (inlines, below)
+}
+
+/// A list item of an answer: its text in one line, the nested items included. A task item
+/// starts with its mark.
 fn collect_item(item: &mdast::ListItem, inlines: &mut Vec<DocInline>) {
     if let Some(checked) = item.checked {
         let mark = if checked { "\u{2611} " } else { "\u{2610} " };
@@ -338,7 +698,9 @@ fn collect_item(item: &mdast::ListItem, inlines: &mut Vec<DocInline>) {
     }
     for node in &item.children {
         match node {
-            mdast::Node::Paragraph(paragraph) => merge(inlines, inlines_of(&paragraph.children)),
+            mdast::Node::Paragraph(paragraph) => {
+                merge(inlines, inlines_of(&paragraph.children, Reading::Answer));
+            }
             mdast::Node::List(list) => {
                 for child in &list.children {
                     if let mdast::Node::ListItem(item) = child {
@@ -356,42 +718,59 @@ fn collect_item(item: &mdast::ListItem, inlines: &mut Vec<DocInline>) {
     }
 }
 
-fn inlines_of(nodes: &[mdast::Node]) -> Vec<DocInline> {
+fn inlines_of(nodes: &[mdast::Node], reading: Reading) -> Vec<DocInline> {
     let mut inlines = Vec::new();
     for node in nodes {
-        push_inline(node, &mut inlines);
+        push_inline(node, &mut inlines, reading);
     }
     inlines
 }
 
-fn push_inline(node: &mdast::Node, out: &mut Vec<DocInline>) {
+/// The text of a run as the reading shows it. A file's line break that is not a hard one
+/// is a space, so a paragraph runs on to the width of its place.
+fn text_run(value: &str, reading: Reading) -> String {
+    match reading {
+        Reading::Answer => value.to_owned(),
+        Reading::File => value.replace("\r\n", " ").replace(['\r', '\n'], " "),
+    }
+}
+
+fn push_inline(node: &mdast::Node, out: &mut Vec<DocInline>, reading: Reading) {
     match node {
-        mdast::Node::Text(text) => merge(out, vec![DocInline::Text(text.value.clone())]),
-        mdast::Node::Strong(strong) => {
-            merge(out, vec![DocInline::Strong(inlines_of(&strong.children))])
+        mdast::Node::Text(text) => {
+            merge(out, vec![DocInline::Text(text_run(&text.value, reading))]);
         }
+        mdast::Node::Strong(strong) => merge(
+            out,
+            vec![DocInline::Strong(inlines_of(&strong.children, reading))],
+        ),
         mdast::Node::Emphasis(emphasis) => merge(
             out,
-            vec![DocInline::Emphasis(inlines_of(&emphasis.children))],
+            vec![DocInline::Emphasis(inlines_of(&emphasis.children, reading))],
         ),
-        mdast::Node::Delete(delete) => {
-            merge(out, vec![DocInline::Emphasis(inlines_of(&delete.children))])
-        }
+        mdast::Node::Delete(delete) => merge(
+            out,
+            vec![DocInline::Emphasis(inlines_of(&delete.children, reading))],
+        ),
         mdast::Node::InlineCode(code) => merge(out, vec![DocInline::Code(code.value.clone())]),
         mdast::Node::Link(link) => merge(
             out,
             vec![DocInline::Link {
-                text: inlines_of(&link.children),
+                text: inlines_of(&link.children, reading),
                 url: link.url.clone(),
             }],
         ),
         mdast::Node::LinkReference(link) => merge(
             out,
             vec![DocInline::Link {
-                text: inlines_of(&link.children),
+                text: inlines_of(&link.children, reading),
                 url: String::new(),
             }],
         ),
+        // A picture by reference shows its text: the address is not in the line.
+        mdast::Node::ImageReference(image) => {
+            merge(out, vec![DocInline::Text(image.alt.clone())]);
+        }
         mdast::Node::Image(image) => {
             merge(
                 out,
@@ -404,7 +783,7 @@ fn push_inline(node: &mdast::Node, out: &mut Vec<DocInline>) {
             );
         }
         mdast::Node::Break(_) => merge(out, vec![DocInline::Text("\n".to_owned())]),
-        mdast::Node::Html(html) => merge(out, html_inlines(&html.value)),
+        mdast::Node::Html(html) => merge(out, html_inlines(&html.value, reading)),
         other => {
             let text = plain_node(other);
             if !text.is_empty() {
@@ -434,6 +813,24 @@ fn merge(out: &mut Vec<DocInline>, more: Vec<DocInline>) {
     }
 }
 
+/// Reads `text` with the grammar of `language` on the syntax thread and returns the colours
+/// of its parts, `None` when the grammar gives no answer.
+pub(crate) async fn highlight_source(
+    syntax: SyntaxService,
+    language: LanguageConfig,
+    text: String,
+) -> Option<Vec<HighlightSpan>> {
+    let id = DocumentId(NEXT_SOURCE.fetch_add(1, Ordering::Relaxed));
+    let (sender, mut receiver) = futures_channel::mpsc::unbounded();
+    syntax.open(id, language, move |snapshot| {
+        sender.unbounded_send(snapshot).ok();
+    });
+    syntax.update(id, 1, RopeStore::from_text(&text), &Change::default());
+    let snapshot = receiver.next().await;
+    syntax.close(id);
+    snapshot.map(|snapshot| snapshot.highlights)
+}
+
 /// The plain text of the answer, for the copy button and for tests.
 pub(crate) fn plain_text(doc: &QuickDoc) -> String {
     let mut out = String::new();
@@ -455,11 +852,12 @@ pub fn display_text(blocks: &[DocBlock], diagnostic: Option<&str>) -> String {
         out.push_str(diagnostic);
         out.push_str("\n\n");
     }
-    display_blocks(&mut out, blocks);
+    display_blocks(&mut out, blocks, 0);
     out
 }
 
-fn display_blocks(out: &mut String, blocks: &[DocBlock]) {
+/// The text of the blocks, `depth` lists deep: the mark of an item depends on its list.
+fn display_blocks(out: &mut String, blocks: &[DocBlock], depth: usize) {
     for block in blocks {
         match block {
             DocBlock::Paragraph(inlines) => {
@@ -474,12 +872,16 @@ fn display_blocks(out: &mut String, blocks: &[DocBlock]) {
                 ordered,
                 start,
                 items,
+                nested,
             } => {
                 for (index, item) in items.iter().enumerate() {
-                    out.push_str(&bullet_of(*ordered, *start, index));
+                    out.push_str(&bullet_of(*ordered, *start, index, depth));
                     out.push(' ');
                     out.push_str(&plain_inlines(item));
                     out.push('\n');
+                    for block in nested.get(index).into_iter().flatten() {
+                        display_blocks(out, std::slice::from_ref(block), depth + 1);
+                    }
                 }
             }
             DocBlock::Code { text, .. } => {
@@ -510,7 +912,14 @@ fn display_blocks(out: &mut String, blocks: &[DocBlock]) {
                 out.push_str(alt);
                 out.push('\n');
             }
-            DocBlock::Quote(inner) => display_blocks(out, inner),
+            DocBlock::Details {
+                summary, blocks, ..
+            } => {
+                out.push_str(&plain_inlines(summary));
+                out.push('\n');
+                display_blocks(out, blocks, depth);
+            }
+            DocBlock::Quote(inner) => display_blocks(out, inner, depth),
             DocBlock::Divider => out.push('\n'),
         }
     }
@@ -528,11 +937,14 @@ fn plain_block(out: &mut String, block: &DocBlock) {
             out.push_str(&plain_inlines(text));
             out.push('\n');
         }
-        DocBlock::List { items, .. } => {
-            for item in items {
+        DocBlock::List { items, nested, .. } => {
+            for (index, item) in items.iter().enumerate() {
                 out.push_str("- ");
                 out.push_str(&plain_inlines(item));
                 out.push('\n');
+                for block in nested.get(index).into_iter().flatten() {
+                    plain_block(out, block);
+                }
             }
         }
         DocBlock::Code { text, .. } => {
@@ -568,15 +980,26 @@ fn plain_block(out: &mut String, block: &DocBlock) {
                 plain_block(out, block);
             }
         }
+        DocBlock::Details {
+            summary, blocks, ..
+        } => {
+            out.push_str(&plain_inlines(summary));
+            out.push('\n');
+            for block in blocks {
+                plain_block(out, block);
+            }
+        }
         DocBlock::Divider => out.push('\n'),
     }
 }
 
-fn bullet_of(ordered: bool, start: u32, index: usize) -> String {
+/// The mark of an item of a list: its number in an ordered list, and in a bulleted one a dot
+/// that changes with the depth of the list, as the IDEA preview draws them.
+fn bullet_of(ordered: bool, start: u32, index: usize, depth: usize) -> String {
     if ordered {
         format!("{}.", start + index as u32)
     } else {
-        "\u{2022}".to_owned()
+        ["\u{2022}", "\u{25e6}", "\u{25aa}"][depth % 3].to_owned()
     }
 }
 
@@ -615,35 +1038,133 @@ pub(crate) fn plain_inlines(inlines: &[DocInline]) -> String {
     out
 }
 
-/// A piece of HTML as the runs of an answer: the pictures it holds in place and the text
-/// around them. A piece without pictures is the text with its tags dropped, as before.
-fn html_inlines(html: &str) -> Vec<DocInline> {
-    let mut out: Vec<DocInline> = Vec::new();
-    let mut text = String::new();
+/// A piece of HTML as the runs of a line: the pictures it holds in place, the text around
+/// them, and the emphasis and the links of its simple tags. A comment is not drawn, and a
+/// line break tag starts a new line. A tag that is not known is dropped and its text stays.
+fn html_inlines(html: &str, reading: Reading) -> Vec<DocInline> {
+    let mut frames = vec![HtmlFrame::default()];
     let mut at = 0;
-    while let Some(open) = html[at..].find('<') {
-        text.push_str(&html[at..at + open]);
-        let Some(close) = html[at + open..].find('>') else {
+    while let Some(found) = html[at..].find('<') {
+        let start = at + found;
+        push_html_text(&mut frames, &html[at..start], reading);
+        if html[start..].starts_with("<!--") {
+            // A comment ends at its own mark, whatever tags it names inside.
+            at = html[start..]
+                .find("-->")
+                .map_or(html.len(), |end| start + end + 3);
+            continue;
+        }
+        let Some(close) = html[start..].find('>') else {
             at = html.len();
             break;
         };
-        let end = at + open + close + 1;
-        let tag = &html[at + open + 1..end - 1];
-        if tag_name(tag) == "img"
-            && let Some(image) = html_image(tag)
-        {
-            if !text.is_empty() {
-                merge(&mut out, vec![DocInline::Text(std::mem::take(&mut text))]);
-            }
-            merge(&mut out, vec![DocInline::Image(image)]);
-        }
-        at = end;
+        at = start + close + 1;
+        apply_html_tag(&mut frames, &html[start + 1..at - 1]);
     }
-    text.push_str(&html[at..]);
+    push_html_text(&mut frames, &html[at..], reading);
+    while frames.len() > 1 {
+        close_html_frame(&mut frames);
+    }
+    frames.pop().map(|root| root.runs).unwrap_or_default()
+}
+
+/// A tag of a piece of HTML that is open, with the runs it holds so far.
+#[derive(Default)]
+struct HtmlFrame {
+    name: String,
+    /// The address of an anchor.
+    href: Option<String>,
+    runs: Vec<DocInline>,
+}
+
+fn top_frame(frames: &mut [HtmlFrame]) -> &mut HtmlFrame {
+    frames.last_mut().expect("the root frame is never closed")
+}
+
+fn push_html_text(frames: &mut [HtmlFrame], text: &str, reading: Reading) {
     if !text.is_empty() {
-        merge(&mut out, vec![DocInline::Text(text)]);
+        let run = DocInline::Text(html_text(text, reading));
+        merge(&mut top_frame(frames).runs, vec![run]);
     }
-    out
+}
+
+/// The text between two HTML tags as the reading shows it. A file decodes the names of the
+/// characters that HTML writes most, since the markdown parser leaves HTML as it is.
+fn html_text(text: &str, reading: Reading) -> String {
+    match reading {
+        Reading::Answer => text.to_owned(),
+        Reading::File => text_run(text, reading)
+            .replace("&nbsp;", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&"),
+    }
+}
+
+/// Applies one tag of a piece of HTML: a picture or a line break is added to the runs,
+/// and an anchor, an emphasis or a strong tag opens a run that its end tag closes.
+fn apply_html_tag(frames: &mut Vec<HtmlFrame>, tag: &str) {
+    let name = tag_name(tag);
+    let opens_run = matches!(name.as_str(), "a" | "b" | "strong" | "i" | "em" | "summary");
+    if tag.trim_start().starts_with('/') {
+        if opens_run {
+            close_html_tag(frames, &name);
+        }
+    } else if opens_run {
+        let href = if name == "a" {
+            attribute(tag, "href")
+        } else {
+            None
+        };
+        frames.push(HtmlFrame {
+            name,
+            href,
+            runs: Vec::new(),
+        });
+    } else if name == "img" {
+        if let Some(image) = html_image(tag) {
+            merge(&mut top_frame(frames).runs, vec![DocInline::Image(image)]);
+        }
+    } else if name == "br" {
+        merge(
+            &mut top_frame(frames).runs,
+            vec![DocInline::Text("\n".to_owned())],
+        );
+    }
+}
+
+/// Closes the innermost open tag of this name, and every tag opened after it, so that a tag
+/// which is never closed does not take the rest of the line with it.
+fn close_html_tag(frames: &mut Vec<HtmlFrame>, name: &str) {
+    let Some(index) = (1..frames.len())
+        .rev()
+        .find(|&index| frames[index].name == name)
+    else {
+        return;
+    };
+    while frames.len() > index {
+        close_html_frame(frames);
+    }
+}
+
+/// Closes the innermost open tag: its runs become a link, an emphasis or a strong run in
+/// the tag around it. An anchor without an address keeps its words only.
+fn close_html_frame(frames: &mut Vec<HtmlFrame>) {
+    let Some(HtmlFrame { name, href, runs }) = frames.pop() else {
+        return;
+    };
+    let pieces = match (name.as_str(), href) {
+        ("a", Some(url)) => vec![DocInline::Link { text: runs, url }],
+        ("a", None) => runs,
+        ("i" | "em", _) => vec![DocInline::Emphasis(runs)],
+        _ => vec![DocInline::Strong(runs)],
+    };
+    let parent = top_frame(frames);
+    for piece in pieces {
+        merge(&mut parent.runs, vec![piece]);
+    }
 }
 
 /// Drops the spaces at the two ends of a run of HTML the markdown parser kept whole.
@@ -1078,15 +1599,9 @@ impl EditorView {
         let syntax = self.syntax.clone();
         cx.spawn(async move |this, cx| {
             for (index, text) in code {
-                let id = DocumentId(NEXT_SOURCE.fetch_add(1, Ordering::Relaxed));
-                let (sender, mut receiver) = futures_channel::mpsc::unbounded();
-                syntax.open(id, language.clone(), move |snapshot| {
-                    sender.unbounded_send(snapshot).ok();
-                });
-                syntax.update(id, 1, RopeStore::from_text(&text), &Change::default());
-                let snapshot = receiver.next().await;
-                syntax.close(id);
-                let Some(snapshot) = snapshot else {
+                let Some(highlights) =
+                    highlight_source(syntax.clone(), language.clone(), text.clone()).await
+                else {
                     continue;
                 };
                 this.update(cx, |this, cx| {
@@ -1105,7 +1620,7 @@ impl EditorView {
                         return;
                     };
                     if *current == text {
-                        *spans = snapshot.highlights;
+                        *spans = highlights;
                         cx.notify();
                     }
                 })
@@ -1118,6 +1633,39 @@ impl EditorView {
     /// The plain text of the open popup, for the copy button and for tests.
     pub fn quick_doc_text(&self) -> Option<String> {
         self.lsp.as_ref()?.quick.as_ref().map(plain_text)
+    }
+
+    /// How far the open popup is scrolled, for a test of the wheel and the keys.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn quick_doc_scroll(&self) -> Option<f32> {
+        let doc = self.lsp.as_ref()?.quick.as_ref()?;
+        Some(-f32::from(doc.scroll.offset().y))
+    }
+
+    /// A key for an open documentation popup: the arrows, the pages, Home and End scroll
+    /// it and stay out of the editor; `false` for every other key.
+    pub(crate) fn quick_doc_scroll_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(doc) = self.lsp.as_mut().and_then(|lsp| lsp.quick.as_mut()) else {
+            return false;
+        };
+        let page = f32::from(doc.scroll.bounds().size.height).max(1.);
+        let line = self.style.line_height;
+        let offset = doc.scroll.offset();
+        let current = -f32::from(offset.y);
+        let max = f32::from(doc.scroll.max_offset().y).max(0.);
+        let next = match key {
+            "up" => current - line,
+            "down" => current + line,
+            "pageup" => current - page * 0.9,
+            "pagedown" => current + page * 0.9,
+            "home" => 0.,
+            "end" => max,
+            _ => return false,
+        }
+        .clamp(0., max);
+        doc.scroll.set_offset(point(offset.x, -px(next)));
+        cx.notify();
+        true
     }
 
     /// Drops an open question of the pointer and its answer.
@@ -1557,12 +2105,13 @@ impl EditorView {
         .on_click(cx.listener(|this, _, _, cx| this.pin_quick_doc(cx)));
         let copy = icon_button("quick-doc-copy", "general/copy", "Copy", None, &theme)
             .on_click(cx.listener(|this, _, _, cx| this.copy_quick_doc(cx)));
+        let width = estimate_width(doc, style.font_size);
         let frame = surface(&theme)
             .id("quick-doc-frame")
             .debug_selector(|| "quick-doc".to_owned())
             .occlude()
             .relative()
-            .w(px(MAX_WIDTH))
+            .w(px(width))
             .min_w(px(MIN_WIDTH))
             .max_w(px(MAX_WIDTH))
             .max_h(px(half))
@@ -1616,6 +2165,8 @@ impl EditorView {
 pub type DocLinkHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
 /// How a character of an answer starts, moves or ends a selection.
 pub type DocSelectHandler = Rc<dyn Fn(DocSelectEvent, &mut Window, &mut App)>;
+/// Opens or closes the `<details>` block with this id in the file that shows it.
+pub(crate) type DocToggleHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// What a rendered answer asks of the place that shows it: where a link goes and how a
 /// character of the text starts, moves or ends a selection. `base` is the folder of the
@@ -1718,19 +2269,30 @@ impl<'a> DocRenderer<'a> {
             word: 0,
             pictures: None,
             picture_count: 0,
+            document: false,
+            list_depth: 0,
+            toggled: None,
+            on_toggle: None,
         })
     }
 
-    /// The same renderer for a place that found the pictures of the answer itself: a
-    /// picture missing from `pictures` is shown by its text.
-    pub(crate) fn with_pictures(
+    /// The renderer of a markdown file: the place found the pictures of the file itself, so
+    /// a picture missing from `pictures` is shown by its text, and the blocks take the
+    /// spacing of a page. `toggled` holds the `<details>` blocks the reader has turned away
+    /// from their default state, and `on_toggle` turns one of them.
+    pub(crate) fn for_document(
         style: &'a EditorStyle,
         theme: &'a Theme,
         host: &'a DocHost,
-        pictures: &'a std::collections::HashMap<String, DocPicture>,
+        pictures: &'a HashMap<String, DocPicture>,
+        toggled: &'a HashSet<usize>,
+        on_toggle: DocToggleHandler,
     ) -> Self {
         let mut renderer = Self::new(style, theme, host);
         renderer.0.pictures = Some(pictures);
+        renderer.0.toggled = Some(toggled);
+        renderer.0.on_toggle = Some(on_toggle);
+        renderer.0.document = true;
         renderer
     }
 
@@ -1771,6 +2333,14 @@ struct DocRender<'a> {
     pictures: Option<&'a std::collections::HashMap<String, DocPicture>>,
     /// How many pictures have been placed, for a selector.
     picture_count: usize,
+    /// Whether the blocks are those of a markdown file, drawn with the spacing of a page.
+    document: bool,
+    /// How many lists the block being drawn is in: the marks of their items depend on it.
+    list_depth: usize,
+    /// The `<details>` blocks the reader has turned away from their default state, by id.
+    toggled: Option<&'a HashSet<usize>>,
+    /// Turns the `<details>` block with an id open or closed.
+    on_toggle: Option<DocToggleHandler>,
 }
 
 impl DocRender<'_> {
@@ -1786,25 +2356,57 @@ impl DocRender<'_> {
                 element
             }
             DocBlock::Heading { level, text } => {
-                let size = heading_size(*level);
+                let size = if self.document {
+                    document_heading_size(*level)
+                } else {
+                    heading_size(*level)
+                };
                 let element = self
                     .inlines(text, size, theme.text, true, true)
                     .font_weight(FontWeight::SEMIBOLD)
                     .into_any_element();
                 self.cursor += 1;
+                if self.document {
+                    let (above, below) = document_heading_space(*level);
+                    return div()
+                        .w_full()
+                        .pt(px(above))
+                        .pb(px(below))
+                        .child(element)
+                        .into_any_element();
+                }
                 element
             }
             DocBlock::List {
                 ordered,
                 start,
                 items,
+                nested,
             } => {
                 let mut list = div().flex().flex_col().gap(px(SPACE_XS)).w_full();
                 for (index, item) in items.iter().enumerate() {
-                    let bullet = bullet_of(*ordered, *start, index);
+                    let bullet = bullet_of(*ordered, *start, index, self.list_depth);
                     let bullet =
                         self.plain_run(&format!("{bullet} "), UI_SIZE, theme.text_secondary);
                     let row = self.inlines(item, UI_SIZE, theme.code, false, true);
+                    // The blocks under the line stand in the column of its text.
+                    let content = match nested.get(index).filter(|blocks| !blocks.is_empty()) {
+                        None => row.into_any_element(),
+                        Some(blocks) => {
+                            let mut column = div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(SPACE_XS))
+                                .w_full()
+                                .child(row);
+                            self.list_depth += 1;
+                            for block in blocks {
+                                column = column.child(self.block(block, window, cx));
+                            }
+                            self.list_depth -= 1;
+                            column.into_any_element()
+                        }
+                    };
                     list = list.child(
                         div()
                             .flex()
@@ -1812,7 +2414,7 @@ impl DocRender<'_> {
                             .gap(px(SPACE_S))
                             .w_full()
                             .child(bullet)
-                            .child(div().flex_1().min_w_0().child(row)),
+                            .child(div().flex_1().min_w_0().child(content)),
                     );
                     self.cursor += 1;
                 }
@@ -1823,13 +2425,14 @@ impl DocRender<'_> {
                 spans,
                 language,
             } => {
+                let padding = if self.document { SPACE_M } else { SPACE_S };
                 let mut column = div()
                     .flex()
                     .flex_col()
                     .w_full()
                     .rounded(px(4.))
                     .bg(theme.selection_muted)
-                    .p(px(SPACE_S))
+                    .p(px(padding))
                     .font_family(style.font_family.clone())
                     .text_size(px(style.font_size));
                 if language.as_deref().is_some_and(|name| !name.is_empty()) {
@@ -1873,7 +2476,19 @@ impl DocRender<'_> {
                 alignments,
                 header,
                 rows,
-            } => self.table(alignments, header, rows, window, cx),
+            } => {
+                if self.document {
+                    self.document_table(alignments, header, rows)
+                } else {
+                    self.table(alignments, header, rows, window, cx)
+                }
+            }
+            DocBlock::Details {
+                id,
+                open,
+                summary,
+                blocks,
+            } => self.details(*id, *open, summary, blocks, window, cx),
             DocBlock::Image { alt, url } => {
                 self.cursor += 1;
                 let image = DocImage {
@@ -1900,7 +2515,12 @@ impl DocRender<'_> {
             }
             DocBlock::Divider => {
                 self.cursor += 1;
-                div().w_full().h(px(1.)).bg(theme.border).into_any_element()
+                let rule = div().w_full().h(px(1.)).bg(theme.border);
+                if self.document {
+                    rule.my(px(SPACE_M)).into_any_element()
+                } else {
+                    rule.into_any_element()
+                }
             }
         }
     }
@@ -2004,6 +2624,131 @@ impl DocRender<'_> {
         )
         .h(px(row_height * count as f32))
         .into_any_element()
+    }
+
+    /// A table of a markdown file. Each column is as wide as its text needs, and the text of
+    /// a cell wraps when the table is wider than its place. The grid lines are thin and the
+    /// head is bold on a background.
+    fn document_table(
+        &mut self,
+        alignments: &[DocAlign],
+        header: &[Vec<DocInline>],
+        rows: &[Vec<Vec<DocInline>>],
+    ) -> AnyElement {
+        let theme = self.theme;
+        let columns = table_columns(alignments, header, rows);
+        let index = self.table;
+        self.table += 1;
+        let name = self.host.name.clone();
+        let mut grid = div()
+            .grid()
+            .grid_cols_max_content(u16::try_from(columns.max(1)).unwrap_or(u16::MAX))
+            .min_w_0()
+            .border_t_1()
+            .border_l_1()
+            .border_color(theme.border)
+            .debug_selector({
+                let name = name.clone();
+                move || format!("{name}-table-{index}")
+            });
+        for (row_index, cells) in std::iter::once(header)
+            .chain(rows.iter().map(Vec::as_slice))
+            .enumerate()
+        {
+            let header_row = row_index == 0;
+            for column in 0..columns {
+                let alignment = alignments.get(column).copied().unwrap_or_default();
+                let content = match cells.get(column) {
+                    Some(cell) => self
+                        .table_text(cell, theme.text, header_row, alignment)
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                };
+                let selector = format!("{name}-table-{index}-cell-{row_index}-{column}");
+                let mut cell = div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .px(px(SPACE_S))
+                    .py(px(SPACE_XS))
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .debug_selector(move || selector.clone())
+                    .child(content);
+                if header_row {
+                    cell = cell.bg(theme.selection_muted);
+                }
+                grid = grid.child(cell);
+                if column + 1 < columns {
+                    self.cursor += 3;
+                }
+            }
+            self.cursor += 1;
+        }
+        div().flex().w_full().child(grid).into_any_element()
+    }
+
+    /// A `<details>` block of a file: its summary line with an arrow, and under it the blocks
+    /// while it is open. A click on the summary opens the block or closes it.
+    fn details(
+        &mut self,
+        id: usize,
+        default_open: bool,
+        summary: &[DocInline],
+        blocks: &[DocBlock],
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let open = default_open != self.toggled.is_some_and(|toggled| toggled.contains(&id));
+        let name = self.host.name.clone();
+        let arrow = icon_sized(
+            if open {
+                "general/chevronDown"
+            } else {
+                "general/chevronRight"
+            },
+            10.,
+            theme,
+        );
+        let text = self.inlines(summary, UI_SIZE, theme.text, false, true);
+        let selector = format!("{name}-details-summary-{id}");
+        let mut header = div()
+            .id(ElementId::Name(selector.clone().into()))
+            .flex()
+            .items_start()
+            .gap(px(SPACE_XS))
+            .w_full()
+            .cursor_pointer()
+            .debug_selector(move || selector.clone())
+            .child(arrow)
+            .child(div().flex_1().min_w_0().child(text));
+        if let Some(on_toggle) = self.on_toggle.clone() {
+            header = header.on_click(move |_, window, cx| on_toggle(id, window, cx));
+        }
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(SPACE_XS))
+            .child(header);
+        if open {
+            let selector = format!("{name}-details-body-{id}");
+            let mut body = div()
+                .debug_selector(move || selector.clone())
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap(px(SPACE_S))
+                .pl(px(SPACE_M))
+                .border_l_1()
+                .border_color(theme.border);
+            for block in blocks {
+                body = body.child(self.block(block, window, cx));
+            }
+            column = column.child(body);
+        }
+        column.into_any_element()
     }
 
     /// A picture of the text: drawn where the caller found it, the text of it in a frame
@@ -2129,14 +2874,16 @@ impl DocRender<'_> {
         frame.child(text).into_any_element()
     }
 
-    fn inlines(
+    /// The elements of the runs, one row for each line of the text: a line break starts a row,
+    /// and the words of a row wrap when the caller asks for it.
+    fn lines_of(
         &mut self,
         inlines: &[DocInline],
         size: f32,
         color: Hsla,
         bold: bool,
         wrap: bool,
-    ) -> Div {
+    ) -> Vec<Vec<AnyElement>> {
         let theme = self.theme;
         let mut pieces = Vec::new();
         let base = InlineStyle {
@@ -2239,8 +2986,19 @@ impl DocRender<'_> {
                 }
             }
         }
+        lines
+    }
+
+    fn inlines(
+        &mut self,
+        inlines: &[DocInline],
+        size: f32,
+        color: Hsla,
+        bold: bool,
+        wrap: bool,
+    ) -> Div {
         let mut column = div().flex().flex_col().w_full();
-        for line in lines {
+        for line in self.lines_of(inlines, size, color, bold, wrap) {
             if line.is_empty() {
                 continue;
             }
@@ -2249,6 +3007,31 @@ impl DocRender<'_> {
             } else {
                 div().flex().whitespace_nowrap().children(line)
             });
+        }
+        column
+    }
+
+    /// The text of a table cell: its words wrap in the width of the cell, and each line sits
+    /// where the alignment of its column puts it.
+    fn table_text(
+        &mut self,
+        inlines: &[DocInline],
+        color: Hsla,
+        bold: bool,
+        alignment: DocAlign,
+    ) -> Div {
+        let mut column = div().flex().flex_col().w_full();
+        for line in self.lines_of(inlines, UI_SIZE, color, bold, true) {
+            if line.is_empty() {
+                continue;
+            }
+            let row = div().flex().flex_wrap().w_full();
+            let row = match alignment {
+                DocAlign::Left => row.justify_start(),
+                DocAlign::Center => row.justify_center(),
+                DocAlign::Right => row.justify_end(),
+            };
+            column = column.child(row.children(line));
         }
         column
     }
@@ -2348,6 +3131,26 @@ fn heading_size(level: usize) -> f32 {
     }
 }
 
+/// The size of a heading in a markdown file: the first two levels stand out of the text.
+fn document_heading_size(level: usize) -> f32 {
+    match level {
+        1 => 26.,
+        2 => 21.,
+        3 => 17.,
+        4 => 15.,
+        _ => 13.,
+    }
+}
+
+/// The space above and below a heading in a markdown file.
+fn document_heading_space(level: usize) -> (f32, f32) {
+    if level <= 2 {
+        (SPACE_XL, SPACE_M)
+    } else {
+        (SPACE_L, SPACE_S)
+    }
+}
+
 fn ordered_range(first: usize, second: usize) -> Range<usize> {
     if first <= second {
         first..second
@@ -2396,6 +3199,20 @@ fn paragraph_range(text: &str, offset: usize) -> Range<usize> {
     start..end
 }
 
+/// A rough width of the popup before layout, so that a short answer gets a narrow window
+/// and a long one stops at the widest of the set. The window keeps the room of its
+/// buttons on the right.
+fn estimate_width(doc: &QuickDoc, font_size: f32) -> f32 {
+    let character = font_size * 0.62;
+    let longest = doc
+        .text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0) as f32;
+    (longest * character + 2. * SPACE_M + ICON_BUTTON * 2.).clamp(MIN_WIDTH, MAX_WIDTH)
+}
+
 /// A rough height of the popup before layout, for placing it above or below the line.
 fn estimate_height(doc: &QuickDoc, line_height: f32) -> f32 {
     let mut rows = 0.;
@@ -2416,11 +3233,14 @@ fn block_rows(block: &DocBlock) -> f32 {
             (1 + text.len() / 70) as f32
         }
         DocBlock::Heading { .. } => 1.5,
-        DocBlock::List { items, .. } => items.len() as f32,
+        DocBlock::List { items, nested, .. } => {
+            items.len() as f32 + nested.iter().flatten().map(block_rows).sum::<f32>()
+        }
         DocBlock::Code { text, .. } => text.lines().count().max(1) as f32,
         DocBlock::Table { header, rows, .. } => (header.len().max(1) + rows.len()) as f32 * 1.6,
         DocBlock::Image { .. } => 6.,
         DocBlock::Quote(inner) => inner.iter().map(block_rows).sum(),
+        DocBlock::Details { blocks, .. } => 1. + blocks.iter().map(block_rows).sum::<f32>(),
         DocBlock::Divider => 1.,
     }
 }
@@ -2450,8 +3270,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DocBlock, DocInline, heading_size, parse, parse_with_lines, plain_inlines,
-        split_line_fragment,
+        DocAlign, DocBlock, DocInline, display_text, heading_size, parse, parse_with_lines,
+        plain_inlines, split_line_fragment,
     };
 
     const HOVER: &str = "```text\npublic static String format(String format, Object... args)\n```\n\nReturns a formatted string with the **format** string and the `args` that follow it.\n\n**Parameters:**\n`format` - a [pattern](https://example.com/pattern) with `%s`\n`args` - the values\n\n**Returns:**\nthe text\n\n**Throws:**\n`IllegalState` - when the pattern is wrong\n\n<p>See <code>Formatter</code> for the rules.</p>\n\n- one\n- two\n\n---\n";
@@ -2697,5 +3517,322 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "a 5000-line file took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_comment_with_tags_inside_is_not_drawn() {
+        let (blocks, _) = parse_with_lines(
+            "<!--\n | <groupId>1.2</groupId> | math |\n +========+\n --->\n# Title\n\nText <!-- hidden --> here.\n",
+        );
+        let text = super::display_text(&blocks, None);
+        assert!(
+            !text.contains("math") && !text.contains("<groupId>") && !text.contains("hidden"),
+            "the comments stay out of the text: {text:?}"
+        );
+        assert!(
+            matches!(&blocks[0], DocBlock::Heading { level: 1, .. }),
+            "the heading after the comment is the first block: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn badges_on_consecutive_lines_stay_in_one_paragraph() {
+        let (blocks, _) = parse_with_lines(
+            "[![CI](https://example.com/ci.svg)](https://example.com/ci)\n[![Docs](https://example.com/docs.svg)](https://example.com/docs)\n",
+        );
+        assert_eq!(blocks.len(), 1, "one paragraph: {blocks:?}");
+        let DocBlock::Paragraph(inlines) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        let badges = inlines
+            .iter()
+            .filter(|inline| {
+                matches!(
+                    inline,
+                    DocInline::Link { text, .. } if matches!(text.as_slice(), [DocInline::Image(_)])
+                )
+            })
+            .count();
+        assert_eq!(badges, 2, "both badges are runs of the line: {inlines:?}");
+        assert!(
+            !plain_inlines(inlines).contains('\n'),
+            "no line break between the badges: {inlines:?}"
+        );
+    }
+
+    #[test]
+    fn a_soft_line_break_is_a_space_and_a_hard_one_is_a_new_line() {
+        let (blocks, _) = parse_with_lines("First line\nsecond line\n\nthree  \nfour\\\nfive\n");
+        let DocBlock::Paragraph(first) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        assert_eq!(plain_inlines(first), "First line second line");
+        let DocBlock::Paragraph(second) = &blocks[1] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        assert_eq!(plain_inlines(second), "three\nfour\nfive");
+    }
+
+    #[test]
+    fn windows_line_ends_read_like_unix_ones() {
+        let (blocks, _) = parse_with_lines("First line\r\nsecond line\r\n\r\n# Next\r\n");
+        let DocBlock::Paragraph(first) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        assert_eq!(plain_inlines(first), "First line second line");
+        assert!(
+            matches!(&blocks[1], DocBlock::Heading { level: 1, .. }),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_list_stays_under_the_line_it_belongs_to() {
+        let (blocks, _) = parse_with_lines("- one\n  - inner\n  - more\n- two\n");
+        let DocBlock::List { items, nested, .. } = &blocks[0] else {
+            panic!("a list: {blocks:?}");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(plain_inlines(&items[0]), "one");
+        assert_eq!(plain_inlines(&items[1]), "two");
+        let DocBlock::List { items: inner, .. } = &nested[0][0] else {
+            panic!("the nested list is under the first item: {nested:?}");
+        };
+        assert_eq!(inner.len(), 2);
+        assert_eq!(plain_inlines(&inner[1]), "more");
+        assert!(nested[1].is_empty());
+    }
+
+    #[test]
+    fn a_code_block_keeps_the_language_it_names() {
+        let (blocks, _) = parse_with_lines("```xml\n<a/>\n```\n");
+        let DocBlock::Code { language, .. } = &blocks[0] else {
+            panic!("a code block: {blocks:?}");
+        };
+        assert_eq!(language.as_deref(), Some("xml"));
+    }
+
+    #[test]
+    fn a_line_break_tag_is_a_new_line() {
+        let (blocks, _) = parse_with_lines("one<br>two\n");
+        let DocBlock::Paragraph(first) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        assert_eq!(plain_inlines(first), "one\ntwo");
+    }
+
+    #[test]
+    fn a_details_tag_is_a_block_that_opens_and_closes() {
+        let (blocks, lines) = parse_with_lines(
+            "<details>\n<summary>More</summary>\n\nHidden **words**\n\n</details>\n\nAfter\n",
+        );
+        assert_eq!(blocks.len(), lines.len());
+        let DocBlock::Details {
+            id,
+            open,
+            summary,
+            blocks: body,
+        } = &blocks[0]
+        else {
+            panic!("a details block: {blocks:?}");
+        };
+        assert_eq!((*id, *open), (0, false), "the first block is closed");
+        assert_eq!(plain_inlines(summary), "More");
+        assert_eq!(plain_inlines_of(&body[0]), "Hidden words");
+        assert_eq!(plain_inlines_of(&blocks[1]), "After");
+        assert_eq!(lines, [0, 7], "the block after it keeps its line");
+    }
+
+    #[test]
+    fn a_details_tag_on_one_line_holds_its_text_and_may_start_open() {
+        let (blocks, _) = parse_with_lines(
+            "<details open><summary>Open</summary>Body text</details>\n\n<details>\n<summary>Closed</summary>\n\nLater text\n\n</details>\n",
+        );
+        let DocBlock::Details {
+            open,
+            blocks: first,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("a details block: {blocks:?}");
+        };
+        assert!(*open, "the open attribute opens the block");
+        assert_eq!(plain_inlines_of(&first[0]), "Body text");
+        let DocBlock::Details {
+            id,
+            open,
+            blocks: second,
+            ..
+        } = &blocks[1]
+        else {
+            panic!("a second details block: {blocks:?}");
+        };
+        assert_eq!((*id, *open), (1, false));
+        assert_eq!(plain_inlines_of(&second[0]), "Later text");
+    }
+
+    #[test]
+    fn a_closing_tag_and_the_next_opening_tag_can_share_an_html_block() {
+        let (blocks, lines) = parse_with_lines(
+            "<details>\n<summary>A</summary>\n\none\n\n</details>\n<details>\n<summary>B</summary>\n\ntwo\n\n</details>\n",
+        );
+        assert_eq!(blocks.len(), 2, "two blocks: {blocks:?}");
+        assert_eq!(lines, [0, 5]);
+        let DocBlock::Details {
+            summary: first,
+            blocks: first_body,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("the first block: {blocks:?}");
+        };
+        assert_eq!(plain_inlines(first), "A");
+        assert_eq!(plain_inlines_of(&first_body[0]), "one");
+        let DocBlock::Details {
+            id,
+            summary: second,
+            blocks: second_body,
+            ..
+        } = &blocks[1]
+        else {
+            panic!("the second block: {blocks:?}");
+        };
+        assert_eq!(*id, 1);
+        assert_eq!(plain_inlines(second), "B");
+        assert_eq!(plain_inlines_of(&second_body[0]), "two");
+    }
+
+    #[test]
+    fn a_reference_takes_the_address_of_its_definition_and_the_definition_is_not_drawn() {
+        let (blocks, _) = parse_with_lines(
+            "See [the manual][REF], [home][] and [docs] and ![logo][Logo].\n\n[ref]: https://example.com/manual \"Title\"\n[home]: https://example.com/home\n[docs]: https://example.com/docs\n[logo]: logo.png\n",
+        );
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the definitions are not blocks: {blocks:?}"
+        );
+        let DocBlock::Paragraph(inlines) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        let urls: Vec<&str> = inlines
+            .iter()
+            .filter_map(|inline| match inline {
+                DocInline::Link { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/manual",
+                "https://example.com/home",
+                "https://example.com/docs"
+            ]
+        );
+        assert!(
+            inlines
+                .iter()
+                .any(|inline| matches!(inline, DocInline::Image(image) if image.url == "logo.png")),
+            "the picture takes the address too: {inlines:?}"
+        );
+        assert!(
+            !plain_inlines(inlines).contains("example.com"),
+            "the addresses are not drawn: {inlines:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_keeps_the_alignment_of_each_column_and_the_markup_of_its_cells() {
+        let (blocks, _) = parse_with_lines(
+            "| Name | Count | Note | Plain |\n| :--- | :---: | ---: | --- |\n| `code` | **bold** | [site](https://example.com) | text |\n",
+        );
+        let DocBlock::Table {
+            alignments,
+            header,
+            rows,
+        } = &blocks[0]
+        else {
+            panic!("a table: {blocks:?}");
+        };
+        assert_eq!(
+            alignments.as_slice(),
+            &[
+                DocAlign::Left,
+                DocAlign::Center,
+                DocAlign::Right,
+                DocAlign::Left
+            ]
+        );
+        assert_eq!(plain_inlines(&header[1]), "Count");
+        let row = &rows[0];
+        assert!(matches!(row[0].as_slice(), [DocInline::Code(code)] if code == "code"));
+        assert!(matches!(row[1].as_slice(), [DocInline::Strong(_)]));
+        assert!(
+            matches!(row[2].as_slice(), [DocInline::Link { url, .. }] if url == "https://example.com")
+        );
+    }
+
+    #[test]
+    fn a_bulleted_item_takes_the_mark_of_its_depth_and_a_number_keeps_its_start() {
+        let (blocks, _) = parse_with_lines("- one\n  - two\n    - three\n\n3. third\n4. fourth\n");
+        assert_eq!(
+            display_text(&blocks, None),
+            "\u{2022} one\n\u{25e6} two\n\u{25aa} three\n3. third\n4. fourth\n"
+        );
+        let DocBlock::List { ordered, start, .. } = &blocks[1] else {
+            panic!("the numbered list: {blocks:?}");
+        };
+        assert!(*ordered);
+        assert_eq!(*start, 3);
+    }
+
+    #[test]
+    fn a_horizontal_rule_tag_is_a_divider() {
+        let (blocks, _) = parse_with_lines("above\n\n<hr>\n\nbelow\n");
+        assert!(
+            matches!(blocks[1], DocBlock::Divider),
+            "the rule is a divider: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn an_html_heading_is_a_heading_and_its_entities_are_decoded() {
+        let (blocks, _) = parse_with_lines("<h2 align=\"center\">Title &amp; more</h2>\n");
+        let DocBlock::Heading { level, text } = &blocks[0] else {
+            panic!("a heading: {blocks:?}");
+        };
+        assert_eq!(*level, 2);
+        assert_eq!(plain_inlines(text), "Title & more");
+    }
+
+    #[test]
+    fn an_anchor_around_a_picture_is_a_link() {
+        let (blocks, _) = parse_with_lines(
+            "<p align=\"center\"><a href=\"https://example.com/a\"><img src=\"a.svg\" alt=\"A\"></a> <a href=\"https://example.com/b\"><img src=\"b.svg\" alt=\"B\"></a></p>\n",
+        );
+        let DocBlock::Paragraph(inlines) = &blocks[0] else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        let urls: Vec<&str> = inlines
+            .iter()
+            .filter_map(|inline| match inline {
+                DocInline::Link { text, url }
+                    if matches!(text.as_slice(), [DocInline::Image(_)]) =>
+                {
+                    Some(url.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, ["https://example.com/a", "https://example.com/b"]);
+    }
+
+    /// The plain text of a paragraph block, for the tests of the blocks after the first.
+    fn plain_inlines_of(block: &DocBlock) -> String {
+        match block {
+            DocBlock::Paragraph(inlines) => plain_inlines(inlines),
+            other => panic!("a paragraph: {other:?}"),
+        }
     }
 }

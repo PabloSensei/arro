@@ -60,6 +60,7 @@ fn test_language() -> &'static TemplateLanguage {
         grammar: || dockerfile_syntax::config().grammar,
         indent_unit: "    ",
         receiver_prefixes: &["new"],
+        postfix: None,
         query: OnceLock::new(),
         declarations: None,
     })

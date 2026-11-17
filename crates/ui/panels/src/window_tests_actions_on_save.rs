@@ -270,6 +270,7 @@ fn action_of(kind: ActionKind, uri: &str, edits: Vec<DocumentEdit>) -> ActionEnt
         }],
         renames: Vec::new(),
         handle: None,
+        resolve: None,
     }
 }
 

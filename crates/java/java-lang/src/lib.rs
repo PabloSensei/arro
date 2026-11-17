@@ -88,6 +88,13 @@ pub fn language_for(path: &Path) -> Option<LanguageConfig> {
     (is_source(path) || is_console(path)).then(java_syntax::config)
 }
 
+/// The icons of the files around a Java project that the neutral icon set does not know:
+/// a Gradle build script is Groovy. The application adds these to the icons of its file
+/// tree, so the word of the build tool stays out of the neutral crates.
+pub fn file_icons() -> &'static [(&'static str, &'static str)] {
+    &[("gradle", "fileTypes/groovy")]
+}
+
 pub fn symbols_for(path: &Path) -> Option<&'static dyn SymbolProvider> {
     is_source(path).then(|| java_syntax::java_symbols() as &dyn SymbolProvider)
 }
@@ -130,14 +137,17 @@ pub fn test_sites(source: &str, path: &Path) -> Vec<TestSite> {
 }
 
 /// The build tool of the project in `root` and the provider of its run configurations.
-/// `cache_root` moves the model cache, the default is the user cache.
+/// `cache_root` moves the model cache, the default is the user cache; `data_dir` moves
+/// the downloaded tools, the default is the data folder of Arro.
 pub fn project_build(
     root: &Path,
     cache_root: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     build_tools: project_model::BuildTools,
 ) -> ProjectBuild {
     let env = BuildEnv {
         cache_root,
+        data_dir,
         build_tools,
         ..BuildEnv::default()
     };

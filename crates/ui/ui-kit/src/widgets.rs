@@ -15,13 +15,13 @@ pub fn icon(name: &str, theme: &Theme) -> Img {
 }
 
 pub fn icon_sized(name: &str, size: f32, theme: &Theme) -> Img {
-    let suffix = if theme.dark && name != "fileTypes/gitignore" {
-        "_dark"
-    } else {
-        ""
-    };
-    let path: SharedString = format!("icons/{name}{suffix}.svg").into();
-    img(path).size(px(size)).flex_none()
+    let path = crate::icon_file(theme.icon_set(), name, theme.dark, size);
+    #[cfg(any(test, feature = "test-support"))]
+    let selector = path.to_string();
+    let image = img(path).size(px(size)).flex_none();
+    #[cfg(any(test, feature = "test-support"))]
+    let image = image.debug_selector(move || selector.clone());
+    image
 }
 
 /// A checkbox: an accent square with a check mark when `on`.
@@ -52,7 +52,21 @@ pub fn icon_button(
     shortcut: Option<SharedString>,
     theme: &Theme,
 ) -> Stateful<Div> {
-    button_frame(id, label, shortcut, theme).child(icon(name, theme))
+    icon_button_with_occlusion(id, name, label, shortcut, true, theme)
+}
+
+/// The icon button of a panel header keeps the hover of its panel: an occluding hitbox
+/// would take the group hover away from the panel, and the tools would hide under the
+/// pointer that found them.
+fn icon_button_with_occlusion(
+    id: impl Into<ElementId>,
+    name: &str,
+    label: impl Into<SharedString>,
+    shortcut: Option<SharedString>,
+    occlude: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    button_frame_with_occlusion(id, label, shortcut, occlude, theme).child(icon(name, theme))
 }
 
 /// The same button with the larger icons of the main toolbar.
@@ -74,6 +88,16 @@ pub fn button_frame(
     shortcut: Option<SharedString>,
     theme: &Theme,
 ) -> Stateful<Div> {
+    button_frame_with_occlusion(id, label, shortcut, true, theme)
+}
+
+fn button_frame_with_occlusion(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    shortcut: Option<SharedString>,
+    occlude: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
     let (hover, pressed) = (theme.hover, theme.pressed);
     let label = label.into();
     let id = id.into();
@@ -86,7 +110,7 @@ pub fn button_frame(
         .justify_center()
         .size(px(ICON_BUTTON))
         .rounded(px(CONTROL_RADIUS))
-        .occlude()
+        .when(occlude, |this| this.occlude())
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .tooltip(move |_, cx| tooltip(label.clone(), shortcut.clone(), cx))
@@ -137,8 +161,7 @@ pub fn window_button(
     danger: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let path: SharedString =
-        format!("icons/{name}{}.svg", if theme.dark { "_dark" } else { "" }).into();
+    let path = crate::icon_file(theme.icon_set(), name, theme.dark, ICON);
     let label = label.into();
     let hover = if danger {
         theme.close_hover
@@ -236,12 +259,14 @@ pub fn panel_tools(
         .items_center()
         .invisible()
         .group_hover(group, |style| style.visible())
+        .debug_selector(move || format!("{group}-tools"))
         .child(
-            icon_button(
+            icon_button_with_occlusion(
                 SharedString::from(format!("{group}-hide")),
                 "general/hide",
                 "Hide",
                 Some("Shift+Escape".into()),
+                false,
                 theme,
             )
             .on_click(on_hide),

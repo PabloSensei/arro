@@ -11,7 +11,9 @@ use lang_api::MigrationModel;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{DockSide, FileIcons, PROJECT_TOOL, Workspace};
+use workspace::{
+    DockSide, FileIcons, PROJECT_TOOL, Settings, Workspace, checked_label, window_key,
+};
 
 use crate::file_tree::{Child, FileTree, read_folder};
 use crate::prompt::Prompt;
@@ -55,10 +57,11 @@ const SEARCH_TIMEOUT: Duration = Duration::from_millis(1000);
 pub(crate) const MIGRATIONS_LABEL: &str = "Migrations";
 /// The New menu row that writes the next versioned migration of the project.
 const FLYWAY_LABEL: &str = "Flyway Migration";
-/// Fully Expand reads this many folder levels from the root.
+/// Expand All reads this many folder levels from the root. A folder deeper than that stays
+/// closed.
 pub(crate) const FULL_EXPAND_MAX_DEPTH: usize = 8;
-/// Fully Expand reads no more folders than this, so a folder with many children cannot
-/// hold the window with thousands of reads.
+/// Expand All reads no more folders than this, so a folder with many children cannot
+/// hold the window with thousands of reads. A folder past the limit stays closed.
 pub(crate) const FULL_EXPAND_MAX_FOLDERS: usize = 256;
 
 /// A row on its way to another folder by the pointer.
@@ -186,8 +189,8 @@ fn copy_path(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Reads the folders fully expand opens, in breadth-first order, and stops at the
-/// depth and folder limits. Runs off the window thread.
+/// Reads the folders Expand All opens, in breadth-first order, and stops at the depth and
+/// folder limits. Runs off the window thread.
 fn read_tree_fully(root: &Path) -> Vec<(PathBuf, Vec<Child>)> {
     let mut listings = Vec::new();
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
@@ -236,6 +239,44 @@ pub fn bind_actions(
                 .ok();
         });
     });
+}
+
+/// A tab became active. A tree that follows the editor selects its file, once the window is
+/// free: the tab changed inside an update of the window.
+pub(crate) fn follow_active_file(path: &Path, cx: &mut App) {
+    let follows = cx
+        .try_global::<Settings>()
+        .is_some_and(|settings| settings.project_always_select_opened_file);
+    if !follows {
+        return;
+    }
+    let Some(panel) = cx
+        .try_global::<ActiveProjectPanel>()
+        .map(|panel| panel.0.clone())
+    else {
+        return;
+    };
+    let path = path.to_path_buf();
+    cx.defer(move |cx| {
+        panel.update(cx, |panel, cx| panel.follow_opened_file(&path, cx));
+    });
+}
+
+/// The shortcut of a window action as a tooltip writes it, `Alt+F1`.
+fn window_hint(action: &str) -> Option<String> {
+    let platform = keymap::platform();
+    window_key(action, platform).map(|keys| keymap::shortcut_label(keys, platform))
+}
+
+/// A button of the toolbar of the tree: an icon button with its name as a debug selector.
+fn tool_button(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    shortcut: Option<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    icon_button(id, icon, label, shortcut, theme).debug_selector(move || id.to_owned())
 }
 
 /// The panel of the window, for scripts.
@@ -827,9 +868,9 @@ impl ProjectPanel {
         self.extend_selection(next as usize, cx);
     }
 
-    /// NumPad * and Shift+NumPad +: every folder opens, level by level, down to
-    /// [`FULL_EXPAND_MAX_DEPTH`] and no more than [`FULL_EXPAND_MAX_FOLDERS`] folders.
-    /// The disk is read in the background; a folder with many children cannot block the
+    /// Expand All, NumPad * and Shift+NumPad +: every folder opens, down to
+    /// [`FULL_EXPAND_MAX_DEPTH`] and no more than [`FULL_EXPAND_MAX_FOLDERS`] folders, in one
+    /// go. The disk is read in the background; a folder with many children cannot block the
     /// window.
     pub fn expand_fully(&mut self, cx: &mut Context<Self>) {
         let root = self.tree.root().to_path_buf();
@@ -846,38 +887,6 @@ impl ProjectPanel {
             .ok();
         })
         .detach();
-    }
-
-    /// Ctrl+Equal: every folder opens, the files keep their places.
-    pub fn expand_all(&mut self, cx: &mut Context<Self>) {
-        let folders: Vec<PathBuf> = self
-            .tree
-            .rows()
-            .iter()
-            .filter(|row| row.folder)
-            .map(|row| row.path.clone())
-            .collect();
-        for folder in folders {
-            self.tree.set_expanded(&folder, true);
-        }
-        self.state_changed(cx);
-    }
-
-    /// The same commands from the window, whose own update is already running: they
-    /// change the tree and leave saving the layout to the caller.
-    pub fn expand_all_quiet(&mut self, cx: &mut Context<Self>) {
-        let folders: Vec<PathBuf> = self
-            .tree
-            .rows()
-            .iter()
-            .filter(|row| row.folder)
-            .map(|row| row.path.clone())
-            .collect();
-        for folder in folders {
-            self.tree.set_expanded(&folder, true);
-        }
-        self.read_pending(cx);
-        cx.notify();
     }
 
     pub fn collapse_all_quiet(&mut self, cx: &mut Context<Self>) {
@@ -1348,6 +1357,71 @@ impl ProjectPanel {
                 self.anchor = None;
                 self.pending_select = Some(path.to_path_buf());
             }
+        }
+    }
+
+    /// The Select Opened File button: the tree shows the file of the active tab.
+    fn select_opened_file(&mut self, cx: &mut Context<Self>) {
+        let active = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_editor());
+        if let Some((path, _)) = active {
+            self.select_path(&path, cx);
+        }
+    }
+
+    /// The View Options button: the options of the tree, as a menu at `position`.
+    fn show_view_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let panel = cx.weak_entity();
+        let on = self.always_select_opened_file(cx);
+        let always_select = MenuEntry::new(
+            checked_label("Always Select Opened File", on),
+            move |window, cx| {
+                let toggle = |this: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
+                    this.toggle_always_select(cx)
+                };
+                Self::later(window, panel.clone(), cx, toggle);
+            },
+        );
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![always_select], cx)
+            })
+            .ok();
+    }
+
+    /// Always Select Opened File: the switch is a setting, and the settings file keeps it.
+    /// Switching it on selects the file of the active tab at once.
+    fn toggle_always_select(&mut self, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.update_settings(
+                    |settings| {
+                        settings.project_always_select_opened_file =
+                            !settings.project_always_select_opened_file;
+                    },
+                    cx,
+                )
+            })
+            .ok();
+        if self.always_select_opened_file(cx) {
+            self.select_opened_file(cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether the tree selects the file of every tab that becomes active.
+    fn always_select_opened_file(&self, cx: &App) -> bool {
+        cx.try_global::<Settings>()
+            .is_some_and(|settings| settings.project_always_select_opened_file)
+    }
+
+    /// A tab became active and the tree follows the editor: its file is selected when the
+    /// tree can show it. A file outside the project root is not in the tree.
+    fn follow_opened_file(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if path.starts_with(self.tree.root()) {
+            self.select_path(path, cx);
         }
     }
 
@@ -1954,6 +2028,11 @@ impl ProjectPanel {
 
     /// Alt+Insert: the New menu for the selection, at the top of the tree.
     fn show_new_menu(&mut self, cx: &mut Context<Self>) {
+        self.show_new_menu_at(point(px(160.), px(120.)), cx);
+    }
+
+    /// The New menu for the selection, shown at `position` of the window.
+    fn show_new_menu_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let selected = self.selected_row_path();
         let folder = target_folder(
             &self.root_path(),
@@ -1962,7 +2041,6 @@ impl ProjectPanel {
                 .map(|(path, folder)| (path.as_path(), *folder)),
         );
         let entries = self.new_entries(folder, cx);
-        let position = point(px(160.), px(120.));
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.show_menu(position, entries, cx)
@@ -2209,6 +2287,98 @@ impl ProjectPanel {
         }
     }
 
+    /// The title of the window and its toolbar, as the Project window of IDEA shows them:
+    /// New, Select Opened File, Expand All, Collapse All and the view options. Hide comes
+    /// from the shared panel tools, which show it under the pointer like every tool window.
+    fn header(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let workspace = self.workspace.clone();
+        let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.toggle_panel(DockSide::Left, window, cx)
+                })
+                .ok();
+        };
+        let tools = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .child(
+                tool_button(
+                    "project-new",
+                    "general/add",
+                    "New",
+                    Self::key_hint("project_panel::NewItem").map(Into::into),
+                    theme,
+                )
+                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                    this.show_new_menu_at(event.position(), cx)
+                })),
+            )
+            .child(
+                tool_button(
+                    "project-select-opened",
+                    "general/locate",
+                    "Select Opened File",
+                    window_hint("workspace::SelectInProject").map(Into::into),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.select_opened_file(cx))),
+            )
+            .child(
+                tool_button(
+                    "project-expand-all",
+                    "general/expandAll",
+                    "Expand All",
+                    Self::key_hint("project_panel::ExpandAllRows").map(Into::into),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.expand_fully(cx))),
+            )
+            .child(
+                tool_button(
+                    "project-collapse-all",
+                    "general/collapseAll",
+                    "Collapse All",
+                    Self::key_hint("project_panel::CollapseAllRows").map(Into::into),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
+            )
+            .child(
+                tool_button(
+                    "project-view-options",
+                    "general/moreVertical",
+                    "View Options",
+                    None,
+                    theme,
+                )
+                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                    this.show_view_menu(event.position(), cx)
+                })),
+            )
+            .child(panel_tools("left-panel", hide, theme));
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .pl(px(SPACE_M))
+            .pr(px(SPACE_S))
+            .text_size(px(UI_SIZE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Project"),
+            )
+            .child(tools)
+            .debug_selector(|| "project-header".to_owned())
+    }
+
     fn rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<Div> {
         let theme = *cx.global::<Theme>();
         let coverage = cx
@@ -2306,14 +2476,6 @@ impl Render for ProjectPanel {
         workspace::note_view_render(cx, "project");
         let theme = *cx.global::<Theme>();
         let count = self.tree.rows().len();
-        let workspace = self.workspace.clone();
-        let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.toggle_panel(DockSide::Left, window, cx)
-                })
-                .ok();
-        };
         island(&theme)
             .id("project-panel")
             .key_context("ProjectPanel ToolWindow")
@@ -2354,7 +2516,7 @@ impl Render for ProjectPanel {
             .on_action(cx.listener(|this, _: &CopyRows, _, cx| this.copy_rows(false, cx)))
             .on_action(cx.listener(|this, _: &PasteRows, window, cx| this.paste_rows(window, cx)))
             .on_action(cx.listener(|this, _: &CopyPaths, _, cx| this.copy_paths(cx)))
-            .on_action(cx.listener(|this, _: &ExpandAllRows, _, cx| this.expand_all(cx)))
+            .on_action(cx.listener(|this, _: &ExpandAllRows, _, cx| this.expand_fully(cx)))
             .on_action(cx.listener(|this, _: &CollapseAllRows, _, cx| this.collapse_all(cx)))
             .on_action(cx.listener(|this, _: &ExpandNode, _, cx| this.expand_or_descend(cx)))
             .on_action(cx.listener(|this, _: &CollapseNode, _, cx| this.collapse_or_ascend(cx)))
@@ -2370,10 +2532,7 @@ impl Render for ProjectPanel {
                 }
             }))
             .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
-            .child(
-                panel_header("Project", "left-panel", hide, &theme)
-                    .debug_selector(|| "project-header".to_owned()),
-            )
+            .child(self.header(&theme, cx))
             .child(
                 scrollable(
                     "project-tree",

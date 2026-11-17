@@ -108,6 +108,7 @@ fn action(
         }],
         renames: Vec::new(),
         handle: None,
+        resolve: None,
     }
 }
 

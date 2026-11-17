@@ -15,6 +15,9 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(data) = crate::icon_sets::custom_asset(path) {
+            return Ok(Some(Cow::Owned(data)));
+        }
         Ok(Embedded::get(path).map(|file| file.data))
     }
 
@@ -46,9 +49,21 @@ fn load_fonts(cx: &App) {
         .expect("embedded fonts load");
 }
 
+/// The data of an asset of the binary, for the resolver of the icon sets.
+pub(crate) fn embedded_asset(path: &str) -> Option<Cow<'static, [u8]>> {
+    Embedded::get(path).map(|file| file.data)
+}
+
+/// Adds the file of a set of the settings to the assets of the process.
+pub(crate) fn register_asset(path: String, data: Vec<u8>) {
+    crate::icon_sets::register_custom_asset(path, data);
+}
+
 /// Decodes every icon up front: the first theme switch must not show empty icons.
 fn preload_icons(cx: &mut App) {
-    for name in Embedded::iter().filter(|name| name.starts_with("icons/")) {
+    for name in Embedded::iter().filter(|name| {
+        name.ends_with(".svg") && (name.starts_with("icons/") || name.starts_with("icon-sets/"))
+    }) {
         cx.fetch_asset::<ImgResourceLoader>(&Resource::Embedded(name.to_string().into()));
     }
 }

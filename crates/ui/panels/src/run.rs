@@ -6,8 +6,10 @@ use std::path::Path as StdPath;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::base::Cancel;
 use dap_client::ReloadOutcome;
@@ -17,7 +19,7 @@ use lang_api::{DumpQuery, ask};
 use proc_sup::ProcessSpec;
 use project_model::{
     BuildModule, BuildSystem, EnvironmentProvider, ProjectModel, ProjectSession, SyncEvent,
-    TaskOptions, open_project,
+    TaskOptions, ToolHome, ToolProgress, ToolSetup, open_project,
 };
 use runner::{
     BeforeLaunchStep, Console, ConsoleEvent, CoverageOwner, FindTests, LiveApplication,
@@ -161,6 +163,10 @@ pub struct RunPanel {
     waiting: bool,
     /// What went wrong, kept for the console and for scripts.
     problems: Vec<String>,
+    /// What the window offers while the build tool of the project is not installed.
+    tool_setup: Option<ToolSetup>,
+    /// The download of the missing build tool, until it ends.
+    tool_download: Option<ToolDownload>,
     title: SharedString,
     lines: VecDeque<Line>,
     /// The unfinished lines of the writers of the main console, each process and stream
@@ -314,6 +320,82 @@ struct DrainingConsole {
     running: bool,
 }
 
+/// The answer of a download of the missing build tool: the home it installed, or why it
+/// did not.
+type ToolDownloadAnswer = Result<Option<PathBuf>, String>;
+
+/// A download of the missing build tool: the worker writes the bytes, the panel reads
+/// them for the status line and the notification, and Stop cancels the transfer.
+struct ToolDownload {
+    name: String,
+    progress: Arc<ToolProgress>,
+    cancel: Cancel,
+    done: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<ToolDownloadAnswer>>>,
+    /// When the text of the notification was drawn last, so a fast network does not
+    /// redraw it on every poll.
+    drawn: Instant,
+}
+
+/// The text of a running download: the percentage when the server named the size, the
+/// bytes otherwise.
+fn download_text(name: &str, progress: &ToolProgress) -> String {
+    match progress.total() {
+        Some(total) if total > 0 => {
+            let percent = (progress.written().saturating_mul(100) / total).min(100);
+            format!("Downloading {name}: {percent}%")
+        }
+        _ => format!("Downloading {name}: {} KB", progress.written() / 1024),
+    }
+}
+
+/// The commands behind the notification of a missing build tool. The buttons of the
+/// balloon run them; they find the panel through the globals of the window.
+pub(crate) fn bind_actions(workspace: &mut Workspace) {
+    workspace.register_command(
+        "build_tool.install",
+        "Download Build Tool",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<crate::script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.download_tool(cx));
+            }
+        },
+    );
+    workspace.register_command(
+        "build_tool.cancel",
+        "Cancel Build Tool Download",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<crate::script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.cancel_tool_download(cx));
+            }
+        },
+    );
+    workspace.register_command(
+        "build_tool.choose",
+        "Choose Build Tool Home...",
+        |_workspace, window, cx| {
+            if let Some(panel) = cx.try_global::<crate::script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.choose_tool_home(window, cx));
+            }
+        },
+    );
+    workspace.register_command(
+        "settings.build_tools",
+        "Build Tools Settings",
+        |workspace, window, cx| {
+            crate::settings::SettingsView::show_at(
+                workspace,
+                window,
+                cx,
+                Some("build_tool_first_home"),
+            );
+        },
+    );
+}
+
 impl RunPanel {
     pub fn create(
         root: PathBuf,
@@ -366,6 +448,8 @@ impl RunPanel {
                 .ok();
             })
             .detach();
+            let tool_bin = setup.tool.as_ref().and_then(|tool| tool.tool_bin());
+            cx.set_global(crate::terminal_panel::ToolTerminalPath(tool_bin));
             Self {
                 workspace,
                 focus: cx.focus_handle(),
@@ -393,6 +477,8 @@ impl RunPanel {
                 rerun: false,
                 waiting: false,
                 problems: Vec::new(),
+                tool_setup: None,
+                tool_download: None,
                 title: "Run".into(),
                 lines: VecDeque::new(),
                 output: OutputBuffers::default(),
@@ -3084,6 +3170,7 @@ impl RunPanel {
         self.show_notice(cx);
         self.drain_debug_live(cx);
         let mut changed = self.poll_sync(cx);
+        changed |= self.poll_tool_download(cx);
         let mut done = Vec::new();
         // The test console of a debug run shows the lines the parser has completed, so a
         // piece of a line held back here is not cut in two there.
@@ -3428,6 +3515,7 @@ impl RunPanel {
                 }
                 Delivery::Event(SyncEvent::Synced) => {
                     self.loading = false;
+                    self.tool_setup = None;
                     discover = true;
                     model_changed = true;
                     start_waiting = true;
@@ -3435,7 +3523,20 @@ impl RunPanel {
                 Delivery::Event(SyncEvent::Failed(message)) => {
                     self.loading = false;
                     self.problems.push(message.clone());
-                    self.tell("Project sync failed", message, cx);
+                    match self
+                        .tool
+                        .as_ref()
+                        .and_then(|tool| tool.missing_tool(&self.root))
+                    {
+                        Some(setup) => {
+                            self.tool_setup = Some(setup.clone());
+                            self.show_tool_setup(&setup, cx);
+                        }
+                        None => {
+                            self.tool_setup = None;
+                            self.tell("Project sync failed", message, cx);
+                        }
+                    }
                     start_waiting = true;
                 }
             }
@@ -3455,6 +3556,223 @@ impl RunPanel {
             self.start(cx);
         }
         changed
+    }
+
+    /// The notification of a missing build tool: its buttons run commands of the window,
+    /// which reach this panel through the globals of the application.
+    fn show_tool_setup(&self, setup: &ToolSetup, cx: &mut Context<Self>) {
+        let mut buttons = Vec::new();
+        if let Some(label) = &setup.download {
+            buttons.push(("download", label.clone().into(), "build_tool.install"));
+        }
+        if let Some(label) = &setup.choose {
+            buttons.push(("choose", label.clone().into(), "build_tool.choose"));
+        }
+        if let Some((label, _)) = &setup.settings {
+            buttons.push(("settings", label.clone().into(), "settings.build_tools"));
+        }
+        let _ = self.workspace.update(cx, |workspace, cx| {
+            workspace.notify_user_with_commands(
+                setup.title.clone(),
+                setup.text.clone(),
+                buttons,
+                cx,
+            );
+        });
+    }
+
+    /// Downloads the missing build tool in a background thread. The status line and the
+    /// notification follow its bytes, and Cancel stops it; the sync follows when it ends.
+    pub(crate) fn download_tool(&mut self, cx: &mut Context<Self>) {
+        if self.tool_download.is_some() {
+            return;
+        }
+        let Some(setup) = self.tool_setup.clone() else {
+            return;
+        };
+        let Some(tool) = self.tool.clone() else {
+            return;
+        };
+        let progress = Arc::new(ToolProgress::new());
+        let cancel = Cancel::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let result: Arc<Mutex<Option<ToolDownloadAnswer>>> = Arc::new(Mutex::new(None));
+        let job_progress = progress.clone();
+        let job_cancel = cancel.clone();
+        let job_done = done.clone();
+        let job_result = result.clone();
+        // The transfer blocks, so it lives on a background thread; the panel watches the
+        // flag rather than the task.
+        cx.background_executor()
+            .spawn(async move {
+                let answer = tool
+                    .install_tool(&job_progress, &job_cancel)
+                    .map_err(|error| error.to_string());
+                if let Ok(mut slot) = job_result.lock() {
+                    *slot = Some(answer);
+                }
+                job_done.store(true, Ordering::Release);
+            })
+            .detach();
+        self.tool_download = Some(ToolDownload {
+            name: setup.name.clone(),
+            progress,
+            cancel,
+            done,
+            result,
+            drawn: Instant::now(),
+        });
+        self.tell_tool_download(&setup.name, cx);
+    }
+
+    /// Stops the transfer between its pieces. The job removes the half file it leaves.
+    pub(crate) fn cancel_tool_download(&mut self, cx: &mut Context<Self>) {
+        if let Some(job) = &self.tool_download {
+            job.cancel.cancel();
+            cx.notify();
+        }
+    }
+
+    /// Asks the user for the home folder of the build tool and uses it from now on.
+    pub(crate) fn choose_tool_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let chosen = paths
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .and_then(|mut paths| paths.pop());
+            let Some(folder) = chosen else {
+                return;
+            };
+            this.update(cx, |this, cx| this.apply_tool_home(folder, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn apply_tool_home(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        let display = folder.display().to_string();
+        let _ = self.workspace.update(cx, |workspace, cx| {
+            workspace.update_settings(
+                |settings| {
+                    settings.build_tools.first.home = display;
+                    settings.build_tools.first.home_kind = ToolHome::Custom;
+                },
+                cx,
+            );
+        });
+        if let Some(tool) = &self.tool {
+            tool.use_home(&folder);
+        }
+        self.tool_setup = None;
+        self.reload_project(cx);
+    }
+
+    /// Writes the bytes of the transfer into the status line and the notification.
+    fn tell_tool_download(&self, name: &str, cx: &mut Context<Self>) {
+        let text = match &self.tool_download {
+            Some(job) => download_text(name, &job.progress),
+            None => return,
+        };
+        let title = format!("Downloading {name}");
+        let workspace = self.workspace.clone();
+        // A button of the notification reaches here while the workspace is being updated,
+        // so the write waits for the end of that update.
+        cx.defer(move |cx| {
+            let shown = text.clone();
+            let _ = workspace.update(cx, |workspace, cx| {
+                workspace.notify_user_with_commands(
+                    title,
+                    shown.clone(),
+                    vec![("cancel", "Cancel".into(), "build_tool.cancel")],
+                    cx,
+                );
+                workspace.set_language_status(Some(shown.into()), cx);
+            });
+        });
+    }
+
+    /// Follows the transfer: redraws its text now and then, and finishes it once. True
+    /// when the window changed.
+    fn poll_tool_download(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(job) = self.tool_download.as_ref() else {
+            return false;
+        };
+        if !job.done.load(Ordering::Acquire) {
+            if job.drawn.elapsed() < Duration::from_millis(200) {
+                return false;
+            }
+            let name = job.name.clone();
+            if let Some(job) = self.tool_download.as_mut() {
+                job.drawn = Instant::now();
+            }
+            self.tell_tool_download(&name, cx);
+            return true;
+        }
+        let job = self.tool_download.take().expect("the job was checked");
+        let answer = job.result.lock().ok().and_then(|mut slot| slot.take());
+        let name = job.name;
+        match answer {
+            Some(Ok(home)) => {
+                self.tool_setup = None;
+                if let Some(home) = home
+                    && let Some(tool) = &self.tool
+                {
+                    tool.use_home(&home);
+                }
+                if let Some(bin) = self.tool.as_ref().and_then(|tool| tool.tool_bin()) {
+                    cx.set_global(crate::terminal_panel::ToolTerminalPath(Some(bin)));
+                }
+                let _ = self.workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .set_language_status(Some(format!("{name} was downloaded").into()), cx);
+                    workspace.notify_user(
+                        "Build tool",
+                        format!("{name} was downloaded. The project syncs again."),
+                        cx,
+                    );
+                });
+                self.reload_project(cx);
+            }
+            Some(Err(_)) if job.cancel.is_cancelled() => {
+                let _ = self.workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .set_language_status(Some(format!("{name} download cancelled").into()), cx);
+                });
+                if let Some(setup) = self.tool_setup.clone() {
+                    self.show_tool_setup(&setup, cx);
+                }
+            }
+            Some(Err(text)) => {
+                let setup = self.tool_setup.clone();
+                let mut buttons = Vec::new();
+                if setup.as_ref().is_some_and(|setup| setup.download.is_some()) {
+                    buttons.push(("retry", "Try again".into(), "build_tool.install"));
+                }
+                if let Some((label, _)) = setup.as_ref().and_then(|setup| setup.settings.clone()) {
+                    buttons.push(("settings", label.into(), "settings.build_tools"));
+                }
+                let _ = self.workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .set_language_status(Some(format!("{name} was not downloaded").into()), cx);
+                    workspace.notify_user_with_commands(
+                        format!("{name} download failed"),
+                        text,
+                        buttons,
+                        cx,
+                    );
+                });
+            }
+            None => {}
+        }
+        true
     }
 
     /// The class folders of the project, where a build writes.

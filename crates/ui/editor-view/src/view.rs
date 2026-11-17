@@ -659,6 +659,9 @@ pub enum EditorEvent {
     /// The pointer came to a change mark of the gutter, or left the marks: the line of
     /// the mark, from zero, and `None` when no mark is under the pointer.
     ChangeMarkHover(Option<u32>),
+    /// A mark of an agent's change was clicked: the line of the mark, from zero. The
+    /// window shows the old text of the hunk and takes it in or puts it back.
+    AgentMarkClick(u32),
     /// A blame label was clicked: the window shows this commit in the history.
     BlameCommit(String),
     /// Ctrl+Shift+V: the window shows what was copied, [`EditorView::paste_text`] takes the pick.
@@ -985,6 +988,9 @@ pub struct EditorView {
     /// Buffer lines of the field watchpoints, painted as an eye.
     pub(crate) field_watchpoints: Vec<u32>,
     pub(crate) gutter_marks: Vec<GutterMark>,
+    /// The hunks an agent changed and the user has not accepted yet. The caller paints
+    /// them with a colour of its own and opens its own window for them.
+    pub(crate) agent_marks: Vec<GutterMark>,
     selecting: bool,
     /// How a drag that began with a double or a triple click grows the selection.
     drag: Option<DragUnit>,
@@ -1547,6 +1553,7 @@ impl EditorView {
             function_breakpoints: Vec::new(),
             field_watchpoints: Vec::new(),
             gutter_marks: Vec::new(),
+            agent_marks: Vec::new(),
             selecting: false,
             drag: None,
             was_dirty: false,
@@ -1825,6 +1832,11 @@ impl EditorView {
         &self.gutter_marks
     }
 
+    /// The marks of an agent's changes the user has not accepted yet.
+    pub fn agent_marks(&self) -> &[GutterMark] {
+        &self.agent_marks
+    }
+
     /// The diagnostics of the language for the text, in buffer order: the same marks
     /// the text and the gutter paint.
     pub fn diagnostic_marks(&self) -> Vec<(Severity, std::ops::Range<usize>)> {
@@ -1893,15 +1905,33 @@ impl EditorView {
 
     /// Where the change mark of the gutter stands, for a click in a test.
     pub fn change_mark_bounds(&self, line: usize) -> Option<Bounds<Pixels>> {
+        self.mark_bounds(&self.gutter_marks, line)
+    }
+
+    /// Where the mark of an agent's change stands, for a click in a test.
+    pub fn agent_mark_bounds(&self, line: usize) -> Option<Bounds<Pixels>> {
+        self.mark_bounds(&self.agent_marks, line)
+    }
+
+    fn mark_bounds(&self, marks: &[GutterMark], line: usize) -> Option<Bounds<Pixels>> {
         let layout = self.layout.as_ref()?;
         let shown = layout
             .rows
             .iter()
             .find(|row| !row.is_block && row.buffer_line == line)?;
+        let kind = marks
+            .iter()
+            .find(|mark| match mark.kind {
+                GutterKind::Deleted => mark.lines.start == line as u32,
+                _ => mark.lines.contains(&(line as u32)),
+            })?
+            .kind;
         let right = layout.bounds.left() + px(self.gutter_width);
-        Some(Bounds::new(
-            point(right - px(9.), shown.y),
-            size(px(10.), px(self.style.line_height)),
+        Some(crate::element::change_mark_bounds(
+            right,
+            shown.y,
+            px(self.style.line_height),
+            kind == GutterKind::Deleted,
         ))
     }
 
@@ -2335,6 +2365,14 @@ impl EditorView {
     pub fn set_gutter_marks(&mut self, marks: Vec<GutterMark>, cx: &mut Context<Self>) {
         if self.gutter_marks != marks {
             self.gutter_marks = marks;
+            cx.notify();
+        }
+    }
+
+    /// Replaces the marks of an agent's changes beside the line numbers.
+    pub fn set_agent_marks(&mut self, marks: Vec<GutterMark>, cx: &mut Context<Self>) {
+        if self.agent_marks != marks {
+            self.agent_marks = marks;
             cx.notify();
         }
     }
@@ -3779,15 +3817,36 @@ impl EditorView {
                 _ => {}
             }
         }
+        // The documentation keeps its place for the keys that scroll it; Escape and a
+        // typed letter close it, and a click in the editor or a tab switch as well.
+        if self.quick_doc_open()
+            && !stroke.ctrl
+            && !stroke.alt
+            && !stroke.shift
+            && self.quick_doc_scroll_key(&stroke.key, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if !quick_key {
             self.cancel_hover();
         }
+        // The documentation outlives the keys that do not change the text: Escape closes
+        // it, a key that types or edits closes it and reaches the editor, and so does a
+        // click outside or a tab switch, as in IDEA.
         if self.quick_doc_open() && !quick_key {
             let escape = stroke.key == "escape" && !stroke.ctrl && !stroke.alt && !stroke.shift;
-            self.close_quick_doc(cx);
-            if escape {
-                cx.stop_propagation();
-                return;
+            let edits_text = event.keystroke.key_char.is_some()
+                || matches!(
+                    stroke.key.as_str(),
+                    "backspace" | "delete" | "enter" | "tab"
+                );
+            if escape || edits_text {
+                self.close_quick_doc(cx);
+                if escape {
+                    cx.stop_propagation();
+                    return;
+                }
             }
         }
         // Any key other than Alt+Q itself closes Context Info; Alt+Q opens it again.
@@ -4397,16 +4456,24 @@ impl EditorView {
     }
 
     /// The change mark of the gutter under `position`: its line, from zero. The marks
-    /// stand against the right edge of the number column, where the text begins.
+    /// stand against the right edge of the number column, where the text begins, and a
+    /// click anywhere on the mark of a line opens it.
     fn change_mark_at(&self, position: Point<Pixels>) -> Option<u32> {
+        self.mark_at(&self.gutter_marks, position)
+    }
+
+    /// The mark of an agent's change under `position`, if there is one. The marks of
+    /// agents and of the version control may share a line: the agent's mark wins, so a
+    /// click reaches the hunk the user has not accepted yet.
+    fn agent_mark_at(&self, position: Point<Pixels>) -> Option<u32> {
+        self.mark_at(&self.agent_marks, position)
+    }
+
+    fn mark_at(&self, marks: &[GutterMark], position: Point<Pixels>) -> Option<u32> {
         if !self.options.gutter_icons || self.options.centered_text {
             return None;
         }
         let layout = self.layout.as_ref()?;
-        let right = layout.bounds.left() + px(self.gutter_width);
-        if position.x < right - px(9.) || position.x > right + px(1.) {
-            return None;
-        }
         let line_height = px(self.style.line_height);
         let shown = layout.rows.iter().find(|row| {
             !row.is_block
@@ -4415,13 +4482,18 @@ impl EditorView {
                 && position.y < row.y + line_height
         })?;
         let line = shown.buffer_line as u32;
-        self.gutter_marks
-            .iter()
-            .any(|mark| match mark.kind {
-                GutterKind::Deleted => mark.lines.start == line,
-                _ => mark.lines.contains(&line),
-            })
-            .then_some(line)
+        let mark = marks.iter().find(|mark| match mark.kind {
+            GutterKind::Deleted => mark.lines.start == line,
+            _ => mark.lines.contains(&line),
+        })?;
+        let right = layout.bounds.left() + px(self.gutter_width);
+        let bounds = crate::element::change_mark_bounds(
+            right,
+            shown.y,
+            line_height,
+            mark.kind == GutterKind::Deleted,
+        );
+        inside(bounds, position).then_some(line)
     }
 
     /// The hint of the coverage stripe under the pointer, when the pointer is in the
@@ -4624,12 +4696,15 @@ impl EditorView {
             .state
             .as_ref()
             .map(|state| state.store().offset_to_line(line.start_offset));
+        // A mark of the left column owns only its own icon; the number beside it still
+        // places a breakpoint, as it does on a line without a mark.
+        let over_mark_icon =
+            event.position.x - layout.bounds.left() < px(crate::element::GUTTER_MARK);
         if self.options.gutter_icons
             && let Some(buffer_line) = run_line
             && !line.continuation
         {
-            let left_of_fold = event.position.x - layout.bounds.left() < px(self.fold_x());
-            if left_of_fold
+            if over_mark_icon
                 && !self.debug_mark_on_line(buffer_line as u32)
                 && self
                     .place_marks
@@ -4639,7 +4714,7 @@ impl EditorView {
                 cx.emit(EditorEvent::PlaceMark(buffer_line as u32));
                 return;
             }
-            if left_of_fold
+            if over_mark_icon
                 && !self.debug_mark_on_line(buffer_line as u32)
                 && self
                     .action_marks
@@ -4649,7 +4724,7 @@ impl EditorView {
                 cx.emit(EditorEvent::ActionMark(buffer_line as u32));
                 return;
             }
-            if left_of_fold
+            if over_mark_icon
                 && !self.debug_mark_on_line(buffer_line as u32)
                 && self
                     .endpoint_marks
@@ -4663,7 +4738,7 @@ impl EditorView {
         if self.options.gutter_icons
             && let Some(buffer_line) = run_line
             && !line.continuation
-            && event.position.x - layout.bounds.left() < px(self.fold_x())
+            && over_mark_icon
             && self
                 .run_marks
                 .iter()
@@ -4690,6 +4765,12 @@ impl EditorView {
                 return;
             }
         }
+        // A mark of an agent's change opens its own window, and the version control
+        // marks open theirs.
+        if let Some(mark) = self.agent_mark_at(event.position) {
+            cx.emit(EditorEvent::AgentMarkClick(mark));
+            return;
+        }
         // A change mark opens the window of the hunk, not a breakpoint.
         if let Some(mark) = self.change_mark_at(event.position) {
             self.change_mark_hovered = Some(mark);
@@ -4699,12 +4780,7 @@ impl EditorView {
         let in_gutter = self.in_gutter(event.position);
         self.catch_up(cx);
         if self.options.gutter_icons
-            && position_in_fold_column(
-                event.position,
-                layout.bounds,
-                self.fold_x(),
-                self.gutter_width,
-            )
+            && position_in_fold_column(event.position, layout.bounds, self.fold_x())
             && let Some(state) = &mut self.state
         {
             state.toggle_fold_at_line(state.store().offset_to_line(line.start_offset));
@@ -4851,6 +4927,7 @@ impl EditorView {
                         None => match mark.kind {
                             StripeKind::Find => "Search match".to_owned(),
                             StripeKind::Vcs => "Changed line".to_owned(),
+                            StripeKind::Agent => "Agent change".to_owned(),
                             StripeKind::Caret => "Caret line".to_owned(),
                             StripeKind::Error | StripeKind::Warning => String::new(),
                         },
@@ -4882,7 +4959,11 @@ impl EditorView {
             cx.notify();
         }
 
-        let change_mark = self.change_mark_at(event.position);
+        let change_mark = if self.agent_mark_at(event.position).is_some() {
+            None
+        } else {
+            self.change_mark_at(event.position)
+        };
         if change_mark != self.change_mark_hovered {
             self.change_mark_hovered = change_mark;
             cx.emit(EditorEvent::ChangeMarkHover(change_mark));
@@ -5073,14 +5154,12 @@ fn nearest_word(text: &str, word: &str, offset: usize) -> Option<usize> {
     best.map(|(start, _)| start)
 }
 
-fn position_in_fold_column(
-    position: Point<Pixels>,
-    bounds: Bounds<Pixels>,
-    fold_x: f32,
-    gutter: f32,
-) -> bool {
+fn position_in_fold_column(position: Point<Pixels>, bounds: Bounds<Pixels>, fold_x: f32) -> bool {
+    // The arrow is a square; a little room around it makes it easier to hit, but the
+    // rest of the column still places a breakpoint.
+    const MARGIN: f32 = 2.;
     let x = position.x - bounds.left();
-    x >= px(fold_x) && x < px(gutter)
+    x >= px((fold_x - MARGIN).max(0.)) && x <= px(fold_x + crate::element::FOLD_SIZE + MARGIN)
 }
 
 /// Whether `position` is inside `area`, edges of the left and top included.
@@ -5435,31 +5514,39 @@ impl EditorView {
                 .filter(|doc| completion.shown.get(completion.selected) == Some(&doc.entry))
                 .map(|doc| {
                     let font = self.style.font_family.clone();
-                    let rows = completion_doc_rows(doc).into_iter().map(|row| {
-                        let font = font.clone();
-                        let code = row.code;
-                        let runs = row.runs.into_iter().map(|run| {
-                            div()
-                                .child(run.text)
-                                .when(run.code, |this| {
-                                    this.font_family(font.clone())
-                                        .bg(theme.pressed)
-                                        .px(px(2.))
-                                        .rounded(px(2.))
-                                })
-                                .when(run.strong, |this| this.font_weight(FontWeight::MEDIUM))
-                                .when(run.emphasis, |this| this.italic())
-                        });
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(2.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .when(code, |this| this.text_color(theme.text))
-                            .pl(px(row.indent as f32 * SPACE_S))
-                            .children(runs)
-                    });
+                    let rows =
+                        completion_doc_rows(doc)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, row)| {
+                                let font = font.clone();
+                                let code = row.code;
+                                let runs = row.runs.into_iter().map(|run| {
+                                    div()
+                                        .min_w_0()
+                                        .child(run.text)
+                                        .when(run.code, |this| {
+                                            this.font_family(font.clone())
+                                                .bg(theme.pressed)
+                                                .px(px(2.))
+                                                .rounded(px(2.))
+                                        })
+                                        .when(run.strong, |this| {
+                                            this.font_weight(FontWeight::MEDIUM)
+                                        })
+                                        .when(run.emphasis, |this| this.italic())
+                                });
+                                div()
+                                    .debug_selector(move || format!("completion-doc-row-{index}"))
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .overflow_hidden()
+                                    .when(code, |this| this.text_color(theme.text))
+                                    .pl(px(row.indent as f32 * SPACE_S))
+                                    .children(runs)
+                            });
                     div()
                         .debug_selector(|| "completion-doc".to_owned())
                         .flex()

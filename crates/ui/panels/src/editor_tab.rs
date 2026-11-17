@@ -277,6 +277,7 @@ fn open(
                             });
                         }
                         crate::http::file_opened(&view, cx);
+                        crate::agents::refresh_marks(cx);
                     }
                     view.update(cx, marks::refresh);
                     view.update(cx, crate::kubernetes::refresh_marks);
@@ -696,6 +697,22 @@ fn open(
                     let view = view.clone();
                     git.update(cx, |git, cx| git.change_mark_clicked(view, line, cx));
                 }
+                EditorEvent::AgentMarkClick(line) => {
+                    let Some(panel) = cx.try_global::<crate::agents::ActiveAgents>() else {
+                        return;
+                    };
+                    let panel = panel.0.clone();
+                    let line = *line;
+                    let view = view.clone();
+                    let handle = window.window_handle();
+                    // The event comes from the update of the editor: the window of the
+                    // hunk opens after it is over.
+                    cx.defer(move |cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.open_agent_hunk(view.clone(), line, handle, cx)
+                        });
+                    });
+                }
                 EditorEvent::ChangeMarkHover(line) => {
                     let Some(git) = cx.try_global::<crate::git::ActiveGit>() else {
                         return;
@@ -891,6 +908,7 @@ fn open(
             let path = view.read(cx).path().to_path_buf();
             crate::history::snapshot_file(&path, local_history::Cause::Saved, cx);
             crate::endpoints::editor_changed(&view, cx);
+            crate::agents::refresh_marks(cx);
             if let Some(panel) = cx
                 .try_global::<ActiveRunPanel>()
                 .map(|panel| panel.0.clone())

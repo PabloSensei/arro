@@ -1528,11 +1528,7 @@ impl SettingsView {
                     .filter(|definition| definition.dark == dark)
                     .map(|definition| {
                         let preview = Theme::from_definition(definition);
-                        let chosen = if dark {
-                            self.draft.theme_dark == definition.id
-                        } else {
-                            self.draft.theme_light == definition.id
-                        };
+                        let chosen = self.theme_card_chosen(&definition.id, dark, theme);
                         let id = definition.id.clone();
                         let debug = format!("theme-card-{}", definition.id);
                         let hover = theme.selection_hover;
@@ -1626,6 +1622,115 @@ impl SettingsView {
             }));
         rows.push(div().pt(px(SPACE_S)).child(import));
         rows
+    }
+
+    /// The icon sets of the Appearance page: every built-in set and every folder of the
+    /// `icons` folder of the settings. A click applies the set at once.
+    fn icon_section(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
+        let mut rows = vec![
+            heading("Icons", theme),
+            note(
+                "An icon set is a folder in the icons folder of the settings. Changes on this page apply at once.",
+                theme,
+            ),
+        ];
+        let sets = IconCatalog::sets_of(cx).to_vec();
+        let cards: Vec<AnyElement> = sets
+            .into_iter()
+            .enumerate()
+            .map(|(index, set)| {
+                let IconSet { id, name } = set;
+                let chosen = self.draft.icon_set == id;
+                let debug = format!("settings-icon-set-{id}");
+                let hover = theme.selection_hover;
+                div()
+                    .id(("icon-set", index))
+                    .debug_selector({
+                        let debug = debug.clone();
+                        move || debug.clone()
+                    })
+                    .min_w(px(120.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_L))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(if chosen {
+                        theme.tab_selected_border
+                    } else {
+                        theme.popup_border
+                    })
+                    .bg(if chosen {
+                        theme.tab_selected
+                    } else {
+                        theme.popup_bg
+                    })
+                    .hover(move |style| style.bg(hover))
+                    .child(div().text_color(theme.text).child(name))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.draft.icon_set.clone_from(&id);
+                        this.workspace
+                            .update(cx, |workspace, cx| workspace.assign_icon_set(&id, cx))
+                            .ok();
+                        this.search_editing = false;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        rows.push(div().flex().flex_wrap().gap(px(SPACE_M)).children(cards));
+        rows
+    }
+
+    /// Whether the card of a theme is the one the page marks as chosen: the theme of the
+    /// window while it does not follow the system, and the theme of the card's look while
+    /// it does.
+    pub(crate) fn theme_card_chosen(&self, id: &str, dark: bool, theme: &Theme) -> bool {
+        settings_catalog::chosen_theme(&self.draft, dark, theme.id()) == id
+    }
+
+    /// The text of the Theme row.
+    pub(crate) fn theme_label(&self, theme: &Theme) -> String {
+        settings_catalog::theme_label(&self.draft, theme.dark, theme.id())
+    }
+
+    /// A click on the Theme row: with Sync with OS on the row shows the theme of the other
+    /// look, as it always has; a window that does not follow the system goes to the next
+    /// theme of the list.
+    fn next_theme(&mut self, theme: &Theme, cx: &mut Context<Self>) {
+        self.search_editing = false;
+        if self.draft.theme_sync_with_os {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.toggle_theme(cx))
+                .ok();
+            // The window no longer follows the system: the draft takes the theme the
+            // click chose, so the row does not keep the name of the old one.
+            if let Some(current) = cx.try_global::<Settings>() {
+                self.draft.theme_sync_with_os = current.theme_sync_with_os;
+                self.draft.theme.clone_from(&current.theme);
+            }
+            cx.notify();
+            return;
+        }
+        let next = {
+            let themes = ThemeCatalog::library_of(cx).themes();
+            if themes.is_empty() {
+                return;
+            }
+            let chosen = settings_catalog::chosen_theme(&self.draft, theme.dark, theme.id());
+            let at = themes
+                .iter()
+                .position(|definition| definition.id == chosen)
+                .unwrap_or(0);
+            themes[(at + 1) % themes.len()].id.clone()
+        };
+        self.draft.theme.clone_from(&next);
+        self.workspace
+            .update(cx, |workspace, cx| workspace.choose_theme(&next, cx))
+            .ok();
+        cx.notify();
     }
 
     /// A card of a theme takes the slot of its look: Sync with OS keeps choosing between
@@ -1785,7 +1890,7 @@ impl Render for SettingsView {
                     content.push(note("The project SDK applies at once.", &theme));
                 }
                 if self.page == SettingsPage::Appearance {
-                    content.push(note("The theme applies at once.", &theme));
+                    content.push(note("The theme and the icons apply at once.", &theme));
                     content.extend(self.theme_section(&theme, cx));
                 }
                 if self.page == SettingsPage::Debugger {
@@ -1802,6 +1907,11 @@ impl Render for SettingsView {
                     .iter()
                     .filter(|entry| entry.page == self.page)
                 {
+                    if entry.field == SettingField::IconSet {
+                        // The Icons section above draws the choices as cards, as the
+                        // themes are drawn: a click applies the set at once.
+                        continue;
+                    }
                     let section = settings_catalog::section_of(entry.id);
                     if let Some(section) = section
                         && section != last_section.unwrap_or_default()
@@ -1812,14 +1922,11 @@ impl Render for SettingsView {
                     let control = match entry.kind {
                         SettingKind::Choice => {
                             if entry.field == SettingField::Theme {
-                                let dark = theme.dark;
-                                let label = if dark { "Dark" } else { "Light" };
-                                pill("theme", label, true, &theme)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.search_editing = false;
-                                        this.workspace
-                                            .update(cx, |workspace, cx| workspace.toggle_theme(cx))
-                                            .ok();
+                                let label = self.theme_label(&theme);
+                                pill("theme", &label, true, &theme)
+                                    .debug_selector(|| "settings-theme".to_owned())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.next_theme(&theme, cx)
                                     }))
                                     .into_any_element()
                             } else {
@@ -1935,6 +2042,9 @@ impl Render for SettingsView {
                         self.highlight == Some(entry.id),
                         &theme,
                     ));
+                }
+                if self.page == SettingsPage::Appearance {
+                    content.extend(self.icon_section(&theme, cx));
                 }
             }
         }

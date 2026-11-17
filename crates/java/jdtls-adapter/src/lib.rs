@@ -915,8 +915,9 @@ fn capabilities() -> ClientCapabilities {
                         ],
                     },
                 },
-                // No resolveSupport: the editor applies an action as soon as it is picked,
-                // so the edits come with the list.
+                // The server may send an action without its edit and fill it in on
+                // `codeAction/resolve`, when the row is shown.
+                "resolveSupport": {"properties": ["edit"]},
                 "dataSupport": true,
             },
         },

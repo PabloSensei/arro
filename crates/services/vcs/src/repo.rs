@@ -11,7 +11,7 @@ use crate::{
 
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
-pub(crate) const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1e";
+pub(crate) const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%cn%x1e";
 const BRANCH_FORMAT: &str =
     "--format=%(HEAD)%1f%(refname)%1f%(objectname)%1f%(upstream:short)%1f%(upstream:track)%1e";
 const LABEL_FORMAT: &str = "--format=%(HEAD)%1f%(refname)%1f%(objectname)%1f%(*objectname)%1e";
@@ -38,6 +38,19 @@ pub struct Commit {
     /// Seconds since 1970.
     pub time: i64,
     pub subject: String,
+    /// The name of the person who made the commit, which differs from the author after
+    /// an amend or a rebase by another person.
+    pub committer: String,
+}
+
+/// What the details pane of the log shows about one commit besides the fields of
+/// [`Commit`]: the whole message and the branches the commit belongs to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitDetails {
+    /// The message without its trailing line ends.
+    pub message: String,
+    /// The local and remote branches whose history contains the commit.
+    pub branches: Vec<String>,
 }
 
 /// A reference the log shows as a label: a local branch, a remote branch or a tag.
@@ -1058,6 +1071,50 @@ impl Repository {
         Ok(commits_of(&String::from_utf8_lossy(&output)))
     }
 
+    /// The log of one branch or tag, newest first, `skip` for the next page.
+    pub fn log_ref(&self, revision: &str, limit: usize, skip: usize) -> io::Result<Vec<Commit>> {
+        let limit = format!("--max-count={limit}");
+        let skip = format!("--skip={skip}");
+        let output = self.run(["log", LOG_FORMAT, "--topo-order", &limit, &skip, revision])?;
+        Ok(commits_of(&output))
+    }
+
+    /// The whole message of a commit and the branches whose history contains it, for the
+    /// details pane of the log.
+    pub fn commit_details(&self, commit: &str) -> io::Result<CommitDetails> {
+        let message = self.run(["show", "-s", "--format=%B", commit])?;
+        let branches = self.run([
+            "branch",
+            "--all",
+            "--contains",
+            commit,
+            "--format=%(refname:short)",
+        ])?;
+        let mut branches: Vec<String> = branches
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !name.ends_with("/HEAD"))
+            .map(str::to_owned)
+            .collect();
+        branches.sort();
+        branches.dedup();
+        Ok(CommitDetails {
+            message: message.trim_end_matches(['\r', '\n']).to_owned(),
+            branches,
+        })
+    }
+
+    /// Puts the named files back as `revision` has them, in the index and the working
+    /// tree, for Revert of the files of a commit.
+    pub fn restore_paths_from(&self, revision: &str, paths: &[String]) -> io::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["checkout", revision, "--"];
+        args.extend(paths.iter().map(String::as_str));
+        self.git.run(&self.root, &args).map(drop)
+    }
+
     /// The commits of a revision range such as `main..feature`, newest first.
     pub fn commits_in(&self, range: &str, limit: usize) -> io::Result<Vec<Commit>> {
         let limit = format!("--max-count={limit}");
@@ -1303,6 +1360,12 @@ pub(crate) fn commits_of(output: &str) -> Vec<Commit> {
                 email: fields.next()?.to_owned(),
                 time: fields.next()?.parse().ok()?,
                 subject: fields.next()?.to_owned(),
+                committer: fields
+                    .next()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_default()
+                    .to_owned(),
             })
         })
         .collect()

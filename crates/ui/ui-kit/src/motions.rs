@@ -47,6 +47,13 @@ impl Slide {
         }
         true
     }
+
+    /// Puts the value at the target at once. The test platform has no real frames of the
+    /// motion, so a test that opens a tool window sees its settled place.
+    pub fn finish(&mut self) {
+        self.value = if self.open { 1. } else { 0. };
+        self.started = None;
+    }
 }
 
 pub fn smoothstep(t: f32) -> f32 {

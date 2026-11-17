@@ -104,7 +104,7 @@ pub fn start_context(state_dir: &std::path::Path, settings_dir: &std::path::Path
     } else {
         settings.theme.clone()
     };
-    let shown = Theme::from_library(themes.library(), &id);
+    let shown = Theme::from_library(themes.library(), &id).with_icon_set(&settings.icon_set);
     StartContext {
         dark: theme.dark,
         theme: shown,

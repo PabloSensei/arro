@@ -504,17 +504,6 @@ impl Workspace {
                         )
                         .on_click(toggle(COMMIT_TOOL)),
                     )
-                    .child(
-                        button(
-                            "s-log",
-                            "general/vcs",
-                            "Git Log",
-                            Some("workspace::ToggleLog"),
-                            log_open,
-                            theme,
-                        )
-                        .on_click(toggle(LOG_TOOL)),
-                    )
                     .child(separator())
                     .child(
                         button(
@@ -595,13 +584,24 @@ impl Workspace {
                     .child(
                         button(
                             "s-todo",
-                            "status/info",
+                            "toolwindows/todo",
                             "TODO",
                             Some("workspace::ToggleTodo"),
                             self.tool_open(TODO_TOOL),
                             theme,
                         )
                         .on_click(toggle(TODO_TOOL)),
+                    )
+                    .child(
+                        button(
+                            "s-log",
+                            "general/vcs",
+                            "Git Log",
+                            Some("workspace::ToggleLog"),
+                            log_open,
+                            theme,
+                        )
+                        .on_click(toggle(LOG_TOOL)),
                     )
                     .child(
                         button(
@@ -942,12 +942,9 @@ impl Workspace {
                 .debug_selector(|| "t-branch".to_owned())
                 .relative()
                 .child(self.t_branch_anchor.canvas())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if let Some(anchor) = this.t_branch_anchor.bounds() {
-                        this.set_action_menu_anchor(anchor);
-                    }
-                    window.dispatch_action(Box::new(ShowBranches), cx);
-                }))
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.show_branches_under_title(window, cx)),
+                )
         });
         let search = toolbar_button(
             "t-search",
@@ -3054,11 +3051,14 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleCommit, window, cx| {
                 this.toggle_tool(COMMIT_TOOL, window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &ToggleLog, window, cx| {
-                    this.toggle_tool(LOG_TOOL, window, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &ToggleLog, window, cx| {
+                let moved = this.activate_tool(LOG_TOOL, cx);
+                if this.tool_open(LOG_TOOL) && !moved {
+                    this.toggle_tool(LOG_TOOL, window, cx);
+                } else {
+                    this.show_tool(LOG_TOOL, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleStructure, window, cx| {
                 this.toggle_tool(STRUCTURE_TOOL, window, cx)
             }))

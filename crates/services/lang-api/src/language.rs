@@ -190,6 +190,11 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The edits of an action the server computes only on resolve.
+    fn action_resolve(&self) -> Option<&crate::ActionResolveProvider> {
+        None
+    }
+
     /// The form of an action that needs values before its server computes the edits.
     fn action_parameters(&self) -> Option<&crate::ActionParametersProvider> {
         None

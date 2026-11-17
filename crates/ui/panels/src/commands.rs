@@ -9,6 +9,7 @@ use search::Tab;
 use ui_kit::*;
 use workspace::{DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, RUN_TOOL, Workspace};
 
+use crate::agents::ASK_AI;
 use crate::choice::{ChoiceDialog, DialogChoice};
 use crate::debug::ActiveDebug;
 use crate::diff_view::DiffView;
@@ -333,6 +334,11 @@ pub fn register(
         workspace.register_command(id, title, move |workspace, window, cx| {
             workspace.toggle_panel(side, window, cx)
         });
+    }
+    // Ask AI about the selection: a key of its own, clear of the IDEA keymap.
+    workspace.register_command(ASK_AI, "Ask AI...", crate::agents::ask_ai);
+    if let Err(error) = workspace.bind_command("ctrl-alt-shift-a", ASK_AI) {
+        eprintln!("keymap: {ASK_AI}: {error}");
     }
     workspace.register_command(
         "window.show_performance",

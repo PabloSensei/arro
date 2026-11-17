@@ -593,6 +593,9 @@ type ConfigChooseHook = Rc<dyn Fn(bool, &mut Workspace, &mut Window, &mut Contex
 /// What a command does. Commands are found by id: from the keymap, from Find Action
 /// and from scripts.
 pub type CommandFn = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+/// Chooses the tab of a tool window with tabs when an action opens it. The answer says
+/// whether the tab moved.
+pub type ToolActivator = Rc<dyn Fn(&str, &mut App) -> bool>;
 
 /// Told which file became the active tab.
 pub type TabListener = Rc<dyn Fn(&Path, &mut Context<Workspace>)>;
@@ -696,6 +699,9 @@ pub struct Workspace {
     editor_factory: Option<EditorFactory>,
     search: Option<SearchHook>,
     config_choose: Option<ConfigChooseHook>,
+    /// Runs when a tool window opens, so that a window with tabs shows the tab the action
+    /// asks for: the Git window shows Log on Alt+9. The answer says whether the tab moved.
+    tool_activator: Option<ToolActivator>,
     /// The state of the language server, shown in the status bar.
     pub(crate) language_status: Option<SharedString>,
     /// The explanation behind the language status line, for the balloon of a click.
@@ -715,6 +721,9 @@ pub struct Workspace {
     theme_fade: Option<ThemeFade>,
     /// The themes this window offers: the built-in ones and the files of the settings.
     themes: ThemeCatalog,
+    /// The icon sets this window offers: the built-in ones and the folders of the
+    /// settings.
+    icon_sets: IconCatalog,
     keymap: Keymap,
     /// The actions the keymap knows: the default ones and the plugin commands.
     keymap_actions: ActionRegistry,
@@ -751,6 +760,12 @@ pub struct Workspace {
     /// The window closes without writing its unsaved text.
     skip_save_on_close: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The icon set of the settings, or `arro` before the settings are in force.
+fn chosen_icon_set(cx: &App) -> String {
+    cx.try_global::<Settings>()
+        .map_or_else(|| ARRO.to_owned(), |settings| settings.icon_set.clone())
 }
 
 /// Whether leaving a tab or the window writes unsaved text by itself.
@@ -991,6 +1006,8 @@ impl Workspace {
 
         let themes = ThemeCatalog::load(&settings_dir);
         cx.set_global(themes.clone());
+        let icon_sets = IconCatalog::load(&settings_dir);
+        cx.set_global(icon_sets.clone());
 
         let keymap_path = settings_dir.join(KEYMAP_FILE);
         let (keymap_actions, keymap) = keymap::default_keymap();
@@ -1059,6 +1076,7 @@ impl Workspace {
             editor_factory: None,
             search: None,
             config_choose: None,
+            tool_activator: None,
             language_status: None,
             language_details: None,
             language_download: None,
@@ -1070,6 +1088,7 @@ impl Workspace {
             installing_update: false,
             theme_fade: None,
             themes,
+            icon_sets,
             keymap,
             keymap_actions,
             keymap_file: KeymapFile::default(),
@@ -1553,6 +1572,20 @@ impl Workspace {
 
     pub fn set_editor_factory(&mut self, factory: EditorFactory) {
         self.editor_factory = Some(factory);
+    }
+
+    /// Sets what runs when a tool window opens, so that a window with tabs shows the tab
+    /// the action that opened it asks for.
+    pub fn set_tool_activator(&mut self, activator: ToolActivator) {
+        self.tool_activator = Some(activator);
+    }
+
+    /// Lets the tool window with tabs choose the tab an action asks for. The answer says
+    /// whether the tab moved.
+    pub fn activate_tool(&self, id: &str, cx: &mut App) -> bool {
+        self.tool_activator
+            .as_ref()
+            .is_some_and(|activate| activate(id, cx))
     }
 
     /// Makes the status bar and the tabs follow the window after it was built. The
@@ -2113,12 +2146,17 @@ impl Workspace {
         let Some((side, index)) = self.find_tool(id) else {
             return;
         };
+        if let Some(activate) = self.tool_activator.clone() {
+            let _ = activate(id, cx);
+        }
         self.last_tool = Some(side);
         let dock = self.dock_mut(side);
         dock.active = index;
         if !dock.slide.is_open() {
             dock.slide.toggle();
         }
+        #[cfg(any(test, feature = "test-support"))]
+        dock.slide.finish();
         match dock.tools[index].focus.clone() {
             Some(focus) => window.focus(&focus, cx),
             None => self.focus_active(window, cx),
@@ -2667,13 +2705,14 @@ impl Workspace {
             .filter(|theme| theme.dark != from.dark)
             .unwrap_or_else(|| {
                 Theme::from_library(library, if from.dark { "light" } else { "dark" })
-            });
+            })
+            .with_icon_set(&settings.icon_set);
         self.set_theme(to, cx);
     }
 
     /// The theme of the catalog called `id` becomes the theme of the window.
     pub fn choose_theme(&mut self, id: &str, cx: &mut Context<Self>) {
-        let to = self.themes.theme(id);
+        let to = self.themes.theme(id).with_icon_set(&chosen_icon_set(cx));
         self.set_theme(to, cx);
     }
 
@@ -2708,9 +2747,20 @@ impl Workspace {
         }
     }
 
+    /// The icon set of the settings becomes the set of the window at once.
+    pub fn assign_icon_set(&mut self, id: &str, cx: &mut Context<Self>) {
+        let id = id.to_owned();
+        self.update_settings(
+            move |settings| {
+                settings.icon_set.clone_from(&id);
+            },
+            cx,
+        );
+    }
+
     /// Fades to the theme of `id` without touching the settings.
     pub fn show_theme(&mut self, id: &str, cx: &mut Context<Self>) {
-        let to = self.themes.theme(id);
+        let to = self.themes.theme(id).with_icon_set(&chosen_icon_set(cx));
         self.fade_to_theme(to, cx);
     }
 
@@ -2718,10 +2768,10 @@ impl Workspace {
     /// Enter keeps it through [`Workspace::set_theme`], Esc brings the old one back
     /// through [`Workspace::restore_theme`].
     pub fn preview_theme(&mut self, id: &str, cx: &mut Context<Self>) {
-        let to = self.themes.theme(id);
+        let to = self.themes.theme(id).with_icon_set(&chosen_icon_set(cx));
         if cx
             .try_global::<Theme>()
-            .is_some_and(|current| current.id() == to.id())
+            .is_some_and(|current| current.id() == to.id() && current.icon_set() == to.icon_set())
         {
             return;
         }
@@ -2747,6 +2797,18 @@ impl Workspace {
         self.themes.reload();
         cx.set_global(self.themes.clone());
         cx.notify();
+    }
+
+    /// Reads the `icons` folder again, after the user added or removed a set.
+    pub fn reload_icon_sets(&mut self, cx: &mut Context<Self>) {
+        self.icon_sets.reload();
+        cx.set_global(self.icon_sets.clone());
+        cx.notify();
+    }
+
+    /// The icon sets of the window.
+    pub fn icon_sets(&self) -> &IconCatalog {
+        &self.icon_sets
     }
 
     /// A theme chosen by hand fades in and becomes the theme of the window: the choice
@@ -3052,6 +3114,7 @@ impl Workspace {
     ) {
         self.active_pane = pane;
         self.panes[pane].active = index;
+        self.reveal_tab(pane, index);
         self.tab_serial += 1;
         self.hide_other_tabs((pane, index), cx);
         self.focus_active(window, cx);
@@ -3242,6 +3305,7 @@ impl Workspace {
     fn store_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let before = cx.try_global::<Settings>().cloned().unwrap_or_default();
         let scale_changed = (before.ui_scale - settings.ui_scale).abs() > f32::EPSILON;
+        let icon_set_changed = before.icon_set != settings.icon_set;
         let follow_system = settings.theme_sync_with_os
             && (!before.theme_sync_with_os
                 || before.theme_light != settings.theme_light
@@ -3251,6 +3315,14 @@ impl Workspace {
         cx.set_global(settings.clone());
         if scale_changed {
             self.apply_ui_scale(ui_scale, cx);
+        }
+        // The icons change at once, like the theme: the frame on screen takes the new set.
+        if icon_set_changed {
+            let here = *cx.global::<Theme>();
+            cx.set_global(here.with_icon_set(&settings.icon_set));
+            if let Some(fade) = &mut self.theme_fade {
+                fade.to = fade.to.with_icon_set(&settings.icon_set);
+            }
         }
         // The font of Presentation Mode follows the settings while the mode is on.
         self.publish_editor_appearance(cx);
@@ -3518,6 +3590,13 @@ impl Workspace {
         .detach();
     }
 
+    /// Scrolls the strip of a group so that its tab is in view. The strip does it while it
+    /// is drawn, once the tab has its place in the strip, so a tab that is just opened is
+    /// in view on the first frame that shows it.
+    fn reveal_tab(&self, pane: usize, index: usize) {
+        self.panes[pane].scroll.scroll_to_item(index);
+    }
+
     pub(crate) fn select_tab(
         &mut self,
         pane: usize,
@@ -3531,6 +3610,7 @@ impl Workspace {
         }
         self.active_pane = pane;
         self.panes[pane].active = index;
+        self.reveal_tab(pane, index);
         self.tab_serial += 1;
         self.hide_other_tabs((pane, index), cx);
         self.focus_active(window, cx);
@@ -4352,6 +4432,20 @@ impl Workspace {
         self.action_menu_anchor.borrow_mut().take()
     }
 
+    /// The area of the branch name in the title bar, where the branch popup opens.
+    pub fn title_branch_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.t_branch_anchor.bounds()
+    }
+
+    /// Opens the branch popup as a click on the branch name of the title bar does: the
+    /// action places it under that name.
+    pub fn show_branches_under_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(anchor) = self.title_branch_bounds() {
+            self.set_action_menu_anchor(anchor);
+        }
+        window.dispatch_action(Box::new(ShowBranches), cx);
+    }
+
     /// A menu that also answers keys of its own, such as the branch popup.
     pub fn show_menu_with_keys(
         &mut self,
@@ -4734,15 +4828,29 @@ impl Workspace {
         command: &'static str,
         cx: &mut Context<Self>,
     ) {
+        self.notify_user_with_commands(title, text, vec![("command", button.into(), command)], cx);
+    }
+
+    /// A notification with several buttons that run commands of the window, in order.
+    pub fn notify_user_with_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
         self.balloon = Some(Balloon {
             title: title.into(),
             text: text.into(),
             action: None,
-            buttons: vec![BalloonButton {
-                id: "command",
-                label: button.into(),
-                action: BalloonAction::Command(command),
-            }],
+            buttons: buttons
+                .into_iter()
+                .map(|(id, label, command)| BalloonButton {
+                    id,
+                    label,
+                    action: BalloonAction::Command(command),
+                })
+                .collect(),
         });
         self.balloon_visible = true;
         self.balloon_serial += 1;

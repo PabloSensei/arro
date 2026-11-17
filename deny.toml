@@ -3,13 +3,19 @@ targets = ["x86_64-pc-windows-msvc"]
 all-features = true
 
 [licenses]
-# GPL and AGPL stay out because the list is an allowlist: anything unlisted fails.
+# Arro is GPL-3.0-or-later, so GPL-3 and LGPL dependencies fit. GPL-2.0-only and AGPL stay
+# out because the list is an allowlist: anything unlisted fails.
 allow = [
     "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
     "ISC",
     "MIT",
     "Unicode-3.0",
@@ -35,6 +41,7 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste, through GPUI" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser, through GPUI" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz, through GPUI" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono, through gpui-base and rmcp; not used directly" },
 ]
 
 [bans]

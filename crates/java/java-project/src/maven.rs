@@ -1,6 +1,8 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use base::program::cmd_script;
 use base::{Cancel, Result};
@@ -8,7 +10,7 @@ use proc_sup::ProcessSpec;
 use project_model::{
     BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, MAIN_UNIT, Module,
     ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TEST_UNIT, TaskOptions,
-    Unit, cache_file,
+    ToolHome, ToolProgress, ToolSetup, Unit, cache_file,
 };
 use serde::Deserialize;
 
@@ -16,6 +18,7 @@ use crate::BuildEnv;
 use crate::dependencies::{ReportTrees, exclude_in_pom};
 use crate::env::{fresh_directory, run_tool};
 use crate::fingerprint::{BuildStamp, has_classes};
+use crate::maven_download;
 use crate::pom::scan_poms;
 
 const EXTENSION: &str = "maven-ext.jar";
@@ -29,19 +32,140 @@ const PHASES: &[&str] = &[
     "clean", "validate", "compile", "test", "package", "verify", "install",
 ];
 
-/// `mvnw` of the project first: it pins the version the project was written for.
+/// `mvnw` of the project first: it pins the version the project was written for. The
+/// homes the settings name, the bundled copy and `PATH` are tried after it.
 pub fn find_maven(root: &Path) -> Option<PathBuf> {
     let wrapper = root.join(cmd_script("mvnw"));
     if wrapper.is_file() {
         return Some(wrapper);
     }
+    on_path(env::var_os("PATH").as_deref()).map(|found| found.program)
+}
+
+/// Where a Maven home came from, for the messages of the settings and of a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MavenOrigin {
+    /// The wrapper script of the project.
+    Wrapper,
+    /// The home of the settings or the folder the user chose.
+    Configured,
+    /// The copy Arro downloaded.
+    Bundled,
+    /// The program on `PATH`.
+    Path,
+}
+
+/// The home of the Maven a project runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MavenHome {
+    /// The program the build starts.
+    pub program: PathBuf,
+    pub home: PathBuf,
+    pub origin: MavenOrigin,
+}
+
+/// Why no Maven home was found, in the words the status line and the notification use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingMaven {
+    root: PathBuf,
+    home: Option<PathBuf>,
+    kind: ToolHome,
+}
+
+impl std::fmt::Display for MissingMaven {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let program = cmd_script("mvn");
+        match self.kind {
+            ToolHome::Wrapper => write!(
+                formatter,
+                "no {} in {}",
+                cmd_script("mvnw"),
+                self.root.display()
+            ),
+            ToolHome::Custom => match &self.home {
+                Some(home) => write!(
+                    formatter,
+                    "no {} in {}",
+                    program,
+                    home.join("bin").display()
+                ),
+                None => write!(formatter, "no Maven home is chosen in the settings"),
+            },
+            ToolHome::Bundled => formatter
+                .write_str("no Maven was downloaded yet; download it or choose another Maven home"),
+            ToolHome::Path => write!(formatter, "no {program} in PATH"),
+            ToolHome::Auto => write!(
+                formatter,
+                "no {} in {}, no Maven home in the settings, no bundled Maven and no {program} in PATH",
+                cmd_script("mvnw"),
+                self.root.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MissingMaven {}
+
+/// The order of the automatic search: the wrapper of the project, the home of the
+/// settings, the copy the IDE downloaded, and then `PATH`. The other kinds name one
+/// source only. `path` is the search path; `None` means the machine has no `PATH`.
+pub fn find_maven_home(
+    root: &Path,
+    configured: Option<&Path>,
+    data_dir: &Path,
+    path: Option<&OsStr>,
+    kind: ToolHome,
+) -> std::result::Result<MavenHome, MissingMaven> {
+    let wrapper = wrapper_at(root);
+    let configured_path = configured;
+    let configured = configured.and_then(|home| home_at(home, MavenOrigin::Configured));
+    let bundled = bundled_home(data_dir).and_then(|home| home_at(&home, MavenOrigin::Bundled));
+    let on_path = on_path(path);
+
+    let found = match kind {
+        ToolHome::Auto => wrapper.or(configured).or(bundled).or(on_path),
+        ToolHome::Wrapper => wrapper,
+        ToolHome::Custom => configured,
+        ToolHome::Bundled => bundled,
+        ToolHome::Path => on_path,
+    };
+    found.ok_or_else(|| MissingMaven {
+        root: root.to_path_buf(),
+        home: match kind {
+            ToolHome::Custom => configured_path.map(Path::to_path_buf),
+            _ => None,
+        },
+        kind,
+    })
+}
+
+fn wrapper_at(root: &Path) -> Option<MavenHome> {
+    let wrapper = root.join(cmd_script("mvnw"));
+    wrapper.is_file().then(|| MavenHome {
+        program: wrapper,
+        home: root.to_path_buf(),
+        origin: MavenOrigin::Wrapper,
+    })
+}
+
+/// The program of a home: `bin/mvn.cmd` on Windows, `bin/mvn` elsewhere.
+fn home_at(home: &Path, origin: MavenOrigin) -> Option<MavenHome> {
+    let program = home.join("bin").join(cmd_script("mvn"));
+    program.is_file().then(|| MavenHome {
+        program,
+        home: home.to_path_buf(),
+        origin,
+    })
+}
+
+fn on_path(path: Option<&OsStr>) -> Option<MavenHome> {
     let names: &[&str] = if cfg!(windows) {
         &["mvn.cmd", "mvn.bat"]
     } else {
         &["mvn"]
     };
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
+    let path = path?;
+    env::split_paths(path)
         .flat_map(|directory| {
             names
                 .iter()
@@ -49,12 +173,58 @@ pub fn find_maven(root: &Path) -> Option<PathBuf> {
                 .collect::<Vec<_>>()
         })
         .find(|file| file.is_file())
+        .map(|program| MavenHome {
+            home: program
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(Path::new(""))
+                .to_path_buf(),
+            program,
+            origin: MavenOrigin::Path,
+        })
+}
+
+/// The newest copy of Maven the IDE downloaded, `<data>/tools/maven/<version>`, when it
+/// carries the program.
+pub fn bundled_home(data_dir: &Path) -> Option<PathBuf> {
+    let root = data_dir.join("tools").join("maven");
+    let mut versions: Vec<String> = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    versions.sort_by(|left, right| compare_versions(right, left));
+    versions.into_iter().find_map(|version| {
+        let home = data_dir.join("tools").join("maven").join(&version);
+        home_at(&home, MavenOrigin::Bundled).map(|found| found.home)
+    })
+}
+
+/// The order of two version folders: `3.9.10` is newer than `3.9.9`.
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left: Vec<&str> = left.split(['.', '-', '_']).collect();
+    let right: Vec<&str> = right.split(['.', '-', '_']).collect();
+    for (left, right) in left.iter().zip(right.iter()) {
+        let order = match (left.parse::<u64>(), right.parse::<u64>()) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+            (Err(_), Err(_)) => left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()),
+        };
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 pub struct Maven {
     pub(crate) env: BuildEnv,
     /// The inputs of a build that started and has not reported success yet.
     stamp: BuildStamp,
+    /// The home the user chose in this session, which wins over the settings file.
+    chosen: Mutex<Option<PathBuf>>,
 }
 
 impl Maven {
@@ -62,27 +232,34 @@ impl Maven {
         Self {
             env,
             stamp: BuildStamp::new(),
+            chosen: Mutex::new(None),
         }
+    }
+
+    /// The home of the Maven of this project, in the order the settings name.
+    pub fn resolve(&self, root: &Path) -> std::result::Result<MavenHome, MissingMaven> {
+        let settings = &self.env.build_tools.first;
+        let chosen = self
+            .chosen
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let (kind, configured) = match &chosen {
+            Some(home) => (ToolHome::Custom, Some(home.as_path())),
+            None => (settings.home_kind, settings.home_path().map(Path::new)),
+        };
+        find_maven_home(
+            root,
+            configured,
+            &self.env.data_dir(),
+            env::var_os("PATH").as_deref(),
+            kind,
+        )
     }
 
     pub(crate) fn command(&self, root: &Path) -> Result<ProcessSpec> {
         let settings = &self.env.build_tools.first;
-        let maven = match settings.home_path() {
-            Some(home) => {
-                let program = Path::new(home).join("bin").join(cmd_script("mvn"));
-                if !program.is_file() {
-                    return Err(format!("no {} in {}", cmd_script("mvn"), program.display()).into());
-                }
-                program
-            }
-            None => find_maven(root).ok_or_else(|| {
-                format!(
-                    "no {} in {} and no mvn in PATH",
-                    cmd_script("mvnw"),
-                    root.display()
-                )
-            })?,
-        };
+        let maven = self.resolve(root)?.program;
         let jdk = self.env.project_jdk(root)?;
         let mut spec = ProcessSpec::new(maven)
             .cwd(root)
@@ -132,6 +309,42 @@ impl BuildSystem for Maven {
             .arg(MODEL_PHASE);
         run_tool(&spec, cancel)?;
         parse_report(&fs::read(&report)?, root)
+    }
+
+    fn missing_tool(&self, root: &Path) -> Option<ToolSetup> {
+        let missing = self.resolve(root).err()?;
+        Some(ToolSetup {
+            name: "Maven".into(),
+            title: "Maven not found".into(),
+            text: format!(
+                "{missing}. Download Apache Maven from Maven Central or choose a Maven home folder."
+            ),
+            download: Some("Download Maven".into()),
+            choose: Some("Choose Maven home\u{2026}".into()),
+            settings: Some(("Build Tools \u{2192} Maven".into(), "build_tool_first_home")),
+        })
+    }
+
+    fn install_tool(&self, progress: &ToolProgress, cancel: &Cancel) -> Result<Option<PathBuf>> {
+        let home = maven_download::download(
+            maven_download::REPOSITORY,
+            &self.env.data_dir(),
+            None,
+            progress,
+            cancel,
+        )?;
+        Ok(Some(home))
+    }
+
+    fn use_home(&self, home: &Path) {
+        *self
+            .chosen
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(home.to_path_buf());
+    }
+
+    fn tool_bin(&self) -> Option<PathBuf> {
+        bundled_home(&self.env.data_dir()).map(|home| home.join("bin"))
     }
 
     fn assemble(&self, root: &Path) -> Result<ProcessSpec> {
@@ -884,5 +1097,170 @@ mod tests {
             Some(format!("-DargLine=@{{argLine}} {flag}").as_str())
         );
         assert_eq!(profile_argument("compile", flag, false), None);
+    }
+
+    fn write_program(home: &Path) {
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join(cmd_script("mvn")), b"@echo off\n").unwrap();
+    }
+
+    /// A program on `PATH`: a folder whose own file the search finds.
+    fn write_program_file(directory: &Path) {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join(cmd_script("mvn")), b"@echo off\n").unwrap();
+    }
+
+    fn search_path(directory: &Path) -> std::ffi::OsString {
+        env::join_paths([directory]).unwrap()
+    }
+
+    #[test]
+    fn the_wrapper_of_the_project_comes_before_every_other_home() {
+        let root = test_support::TempDir::new("maven-order-wrapper");
+        let data = test_support::TempDir::new("maven-order-data");
+        let path = test_support::TempDir::new("maven-order-path");
+        fs::write(root.path().join(cmd_script("mvnw")), b"@echo off\n").unwrap();
+        let configured = root.path().join("configured");
+        write_program(&configured);
+        write_program(&data.path().join("tools/maven/3.9.9"));
+        write_program_file(path.path());
+
+        let found = find_maven_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search_path(path.path())),
+            ToolHome::Auto,
+        )
+        .expect("a wrapper is there");
+
+        assert_eq!(found.origin, MavenOrigin::Wrapper);
+        assert_eq!(found.program, root.path().join(cmd_script("mvnw")));
+    }
+
+    #[test]
+    fn the_configured_home_comes_next_then_the_bundled_copy_then_path() {
+        let root = test_support::TempDir::new("maven-order-configured");
+        let data = test_support::TempDir::new("maven-order-bundled");
+        let path = test_support::TempDir::new("maven-order-path-only");
+        let configured = root.path().join("configured");
+        let bundled = data.path().join("tools/maven/3.9.10");
+        write_program(&configured);
+        write_program(&bundled);
+        write_program_file(path.path());
+        let search = search_path(path.path());
+
+        let found = find_maven_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Auto,
+        )
+        .unwrap();
+        assert_eq!(found.origin, MavenOrigin::Configured);
+        assert_eq!(found.home, configured);
+
+        fs::remove_dir_all(&configured).unwrap();
+        let found = find_maven_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Auto,
+        )
+        .unwrap();
+        assert_eq!(found.origin, MavenOrigin::Bundled);
+        assert_eq!(found.home, bundled, "the newest downloaded version wins");
+
+        fs::remove_dir_all(data.path().join("tools")).unwrap();
+        let found = find_maven_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Auto,
+        )
+        .unwrap();
+        assert_eq!(found.origin, MavenOrigin::Path);
+        assert_eq!(found.program, path.path().join(cmd_script("mvn")));
+    }
+
+    #[test]
+    fn a_missing_maven_offers_a_download_and_the_settings() {
+        let root = test_support::TempDir::new("maven-missing");
+        let data = test_support::TempDir::new("maven-missing-data");
+        let mut env = BuildEnv {
+            data_dir: Some(data.path().to_path_buf()),
+            ..BuildEnv::default()
+        };
+        env.build_tools.first.home_kind = ToolHome::Custom;
+        let tool = Maven::new(env);
+
+        let setup = tool
+            .missing_tool(root.path())
+            .expect("no home is chosen, so Maven is missing");
+
+        assert_eq!(setup.name, "Maven");
+        assert_eq!(setup.title, "Maven not found");
+        assert_eq!(setup.download.as_deref(), Some("Download Maven"));
+        assert_eq!(setup.choose.as_deref(), Some("Choose Maven home\u{2026}"));
+        assert_eq!(
+            setup.settings.as_ref().map(|(_, id)| *id),
+            Some("build_tool_first_home")
+        );
+        assert!(
+            setup.text.contains("no Maven home is chosen"),
+            "{}",
+            setup.text
+        );
+    }
+
+    #[test]
+    fn an_explicit_kind_ignores_the_other_homes() {
+        let root = test_support::TempDir::new("maven-kind");
+        let data = test_support::TempDir::new("maven-kind-data");
+        let path = test_support::TempDir::new("maven-kind-path");
+        let configured = root.path().join("configured");
+        write_program(&configured);
+        write_program(&data.path().join("tools/maven/3.9.9"));
+        write_program_file(path.path());
+        let search = search_path(path.path());
+
+        let bundled = find_maven_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Bundled,
+        )
+        .unwrap();
+        assert_eq!(bundled.origin, MavenOrigin::Bundled);
+        assert_eq!(bundled.home, data.path().join("tools/maven/3.9.9"));
+
+        let on_path = find_maven_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Path,
+        )
+        .unwrap();
+        assert_eq!(on_path.origin, MavenOrigin::Path);
+        assert_eq!(on_path.program, path.path().join(cmd_script("mvn")));
+
+        let missing = find_maven_home(
+            root.path(),
+            Some(&root.path().join("nowhere")),
+            data.path(),
+            Some(&search),
+            ToolHome::Custom,
+        )
+        .expect_err("the chosen folder has no program");
+        assert!(
+            missing.to_string().contains(&cmd_script("mvn")),
+            "{missing}"
+        );
     }
 }

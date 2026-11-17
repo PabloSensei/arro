@@ -63,7 +63,7 @@ fn about_shows_the_version_and_copies_a_bug_report_line(cx: &mut TestAppContext)
         "About does not say the code is written with AI: {text}"
     );
     assert!(
-        text.contains("FSL-1.1-ALv2"),
+        text.contains("GNU GPL, version 3 or later"),
         "About has no license: {text}"
     );
 

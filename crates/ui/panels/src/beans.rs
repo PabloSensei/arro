@@ -536,17 +536,13 @@ fn apply(view: &mut EditorView, model: &BeanModel, cx: &mut Context<EditorView>)
     let Some(text) = view.text() else {
         return;
     };
-    let suffix = if cx.global::<Theme>().dark {
-        "_dark"
-    } else {
-        ""
-    };
-    let color = cx.global::<Theme>().accent;
+    let theme = *cx.global::<Theme>();
+    let color = theme.accent;
     let mut marks = Vec::new();
     for bean in model.beans_of(&path) {
         marks.push(PlaceMark {
             line: bean.line,
-            icon: format!("icons/nodes/class{suffix}.svg").into(),
+            icon: ui_kit::icon_file(theme.icon_set(), "nodes/class", theme.dark, 13.),
             color,
             hint: BEAN_HINT.into(),
             list: true,
@@ -559,7 +555,7 @@ fn apply(view: &mut EditorView, model: &BeanModel, cx: &mut Context<EditorView>)
         }
         marks.push(PlaceMark {
             line: point.line,
-            icon: format!("icons/general/locate{suffix}.svg").into(),
+            icon: ui_kit::icon_file(theme.icon_set(), "general/locate", theme.dark, 13.),
             color,
             hint: POINT_HINT.into(),
             list: false,

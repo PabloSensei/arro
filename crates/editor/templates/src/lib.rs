@@ -13,7 +13,7 @@ mod text;
 mod variables;
 
 pub use context::context_at;
-pub use expand::{Expansion, Field, expand, surround};
+pub use expand::{Expansion, Field, expand, snippet_of, surround};
 pub use expand::{ExpansionSite, expand_fields, surround_fields};
 pub use file::{
     FILE_TEMPLATE_VARIABLES, FileTemplateDefinition, render_file_template, today, user_name,
@@ -25,8 +25,8 @@ pub use overrides::{
 };
 pub use session::{Session, Step};
 pub use snippet::snippet_expansion;
-pub use template::{ANY, Kind, Template, TemplateLanguage};
-pub use text::{postfix_at, receiver_start, word_before};
+pub use template::{ANY, Kind, PostfixRules, Receiver, Template, TemplateLanguage};
+pub use text::{postfix_at, postfix_typed, receiver_start, word_before};
 pub use variables::{
     Declarations, DeclarationsProvider, EXPRESSIONS, Variables, declarations, expression_warning,
 };

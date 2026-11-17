@@ -3,19 +3,21 @@
 //! is parsed off the window thread after a pause and follows the scroll of the editor by
 //! the block that starts on its top line.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use syntax::{HighlightSpan, LanguageConfig};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
 use crate::quick_doc::{
-    DocBlock, DocHost, DocImage, DocInline, DocLinkHandler, DocPicture, DocRenderer, display_text,
-    image_path, parse_with_lines, plain_inlines, split_line_fragment,
+    DocBlock, DocHost, DocImage, DocInline, DocLinkHandler, DocPicture, DocRenderer,
+    DocToggleHandler, display_text, highlight_source, image_path, parse_with_lines, plain_inlines,
+    split_line_fragment,
 };
 use crate::view::EditorView;
 
@@ -74,6 +76,9 @@ pub(crate) struct MarkdownPreview {
     parsed: Option<u64>,
     /// The version of the parse on its way, so the text is asked for once.
     pending: Option<u64>,
+    /// The `<details>` blocks the reader has turned away from their default state, by id.
+    /// The parse keeps no state of its own, so the choice survives every new parse.
+    toggled_details: HashSet<usize>,
 }
 
 impl MarkdownPreview {
@@ -87,6 +92,7 @@ impl MarkdownPreview {
             pictures: HashMap::new(),
             parsed: None,
             pending: None,
+            toggled_details: HashSet::new(),
         }
     }
 
@@ -138,9 +144,12 @@ fn pictures_of(blocks: &[DocBlock], out: &mut Vec<DocImage>) {
         match block {
             DocBlock::Paragraph(inlines) => pictures_in(inlines, out),
             DocBlock::Heading { text, .. } => pictures_in(text, out),
-            DocBlock::List { items, .. } => {
+            DocBlock::List { items, nested, .. } => {
                 for item in items {
                     pictures_in(item, out);
+                }
+                for blocks in nested {
+                    pictures_of(blocks, out);
                 }
             }
             DocBlock::Table { header, rows, .. } => {
@@ -153,6 +162,12 @@ fn pictures_of(blocks: &[DocBlock], out: &mut Vec<DocImage>) {
                     }
                 }
             }
+            DocBlock::Details {
+                summary, blocks, ..
+            } => {
+                pictures_in(summary, out);
+                pictures_of(blocks, out);
+            }
             DocBlock::Image { alt, url } => out.push(DocImage {
                 alt: alt.clone(),
                 url: url.clone(),
@@ -163,6 +178,56 @@ fn pictures_of(blocks: &[DocBlock], out: &mut Vec<DocImage>) {
             DocBlock::Code { .. } | DocBlock::Divider => {}
         }
     }
+}
+
+/// Calls `visit` for each code block of the blocks, in the order they are drawn.
+fn for_each_code<'a>(blocks: &'a [DocBlock], visit: &mut impl FnMut(&'a DocBlock)) {
+    for block in blocks {
+        match block {
+            DocBlock::Code { .. } => visit(block),
+            DocBlock::List { nested, .. } => {
+                for blocks in nested {
+                    for_each_code(blocks, visit);
+                }
+            }
+            DocBlock::Quote(inner) => for_each_code(inner, visit),
+            DocBlock::Details { blocks, .. } => for_each_code(blocks, visit),
+            _ => {}
+        }
+    }
+}
+
+/// Puts the colours of each code block in place. The code blocks are counted in the order
+/// [`for_each_code`] visits them, and `colours` holds the index of each block it colours.
+fn paint_code(blocks: &mut [DocBlock], colours: &[(usize, Vec<HighlightSpan>)], next: &mut usize) {
+    for block in blocks {
+        match block {
+            DocBlock::Code { spans, .. } => {
+                if let Some((_, found)) = colours.iter().find(|(index, _)| *index == *next) {
+                    *spans = found.clone();
+                }
+                *next += 1;
+            }
+            DocBlock::List { nested, .. } => {
+                for blocks in nested {
+                    paint_code(blocks, colours, next);
+                }
+            }
+            DocBlock::Quote(inner) => paint_code(inner, colours, next),
+            DocBlock::Details { blocks, .. } => paint_code(blocks, colours, next),
+            _ => {}
+        }
+    }
+}
+
+/// The grammar a name of a fenced block stands for. The markdown language of the file holds
+/// the resolver of its fences, the same one the editor uses for the fences of its text.
+fn fence_language(markdown: &LanguageConfig, name: &str) -> Option<LanguageConfig> {
+    let resolve = markdown
+        .injections
+        .iter()
+        .find_map(|injection| injection.resolve)?;
+    resolve(name)
 }
 
 /// The pictures of a run of a line, in the order the document names them.
@@ -194,6 +259,19 @@ impl EditorView {
     /// The block the panel was last scrolled to, for the tests.
     pub fn preview_block(&self) -> Option<usize> {
         self.preview.as_ref()?.target
+    }
+
+    /// The number of colours of each code block of the preview, for the tests.
+    pub fn preview_code_spans(&self) -> Vec<usize> {
+        let mut counts = Vec::new();
+        if let Some(preview) = &self.preview {
+            for_each_code(&preview.blocks, &mut |block| {
+                if let DocBlock::Code { spans, .. } = block {
+                    counts.push(spans.len());
+                }
+            });
+        }
+        counts
     }
 
     /// The folder the preview keeps the pictures it takes from the internet, so that a
@@ -307,6 +385,75 @@ impl EditorView {
         preview.lines = lines;
         preview.parsed = Some(version);
         self.prepare_pictures(cx);
+        self.highlight_preview_code(version, cx);
+        cx.notify();
+    }
+
+    /// Asks the syntax service for the colours of the code blocks of the preview that name a
+    /// language. The colours come back to the text they were read from, see
+    /// [`Self::accept_colours`].
+    fn highlight_preview_code(&mut self, version: u64, cx: &mut Context<Self>) {
+        let Some(markdown) = self
+            .state
+            .as_ref()
+            .and_then(|state| state.language())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(preview) = &self.preview else {
+            return;
+        };
+        let mut code = Vec::new();
+        for_each_code(&preview.blocks, &mut |block| {
+            if let DocBlock::Code { language, text, .. } = block {
+                code.push((language.clone(), text.clone()));
+            }
+        });
+        let jobs: Vec<(usize, LanguageConfig, String)> = code
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (name, text))| {
+                let language = fence_language(&markdown, name?.as_str())?;
+                Some((index, language, text))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let syntax = self.syntax.clone();
+        cx.spawn(async move |this, cx| {
+            let mut colours = Vec::new();
+            for (index, language, text) in jobs {
+                if let Some(spans) = highlight_source(syntax.clone(), language, text).await {
+                    colours.push((index, spans));
+                }
+            }
+            this.update(cx, |this, cx| this.accept_colours(version, colours, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Puts the colours of the code blocks in place, when the text they were read from is
+    /// still the text of the preview: a newer text drops them.
+    fn accept_colours(
+        &mut self,
+        version: u64,
+        colours: Vec<(usize, Vec<HighlightSpan>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.as_ref().map(crate::state::EditorState::version) != Some(version) {
+            return;
+        }
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        if preview.parsed != Some(version) {
+            return;
+        }
+        let mut next = 0;
+        paint_code(&mut preview.blocks, &colours, &mut next);
         cx.notify();
     }
 
@@ -393,6 +540,18 @@ impl EditorView {
             .pictures
             .retain(|url, _| !crate::markdown_images::is_remote(url));
         self.prepare_pictures(cx);
+        cx.notify();
+    }
+
+    /// Opens a `<details>` block of the preview that is closed, or closes one that is open.
+    /// The choice stays while the file is open.
+    pub(crate) fn toggle_details(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        if !preview.toggled_details.remove(&id) {
+            preview.toggled_details.insert(id);
+        }
         cx.notify();
     }
 
@@ -508,17 +667,27 @@ impl EditorView {
                     .map_or_else(PathBuf::new, Path::to_path_buf),
             ),
         };
+        let toggle = cx.entity();
+        let on_toggle: DocToggleHandler = Rc::new(move |id, _window, cx| {
+            toggle.update(cx, |this, cx| this.toggle_details(id, cx));
+        });
         let Some(preview) = &self.preview else {
             return editor;
         };
-        let mut renderer =
-            DocRenderer::with_pictures(&self.style, &theme, &host, &preview.pictures);
+        let mut renderer = DocRenderer::for_document(
+            &self.style,
+            &theme,
+            &host,
+            &preview.pictures,
+            &preview.toggled_details,
+            on_toggle,
+        );
         let mut content = div()
             .id("markdown-preview-scroll")
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(SPACE_S))
+            .gap(px(SPACE_L))
             .p(px(SPACE_M))
             .overflow_y_scroll()
             .track_scroll(&preview.scroll);

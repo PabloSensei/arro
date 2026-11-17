@@ -143,7 +143,11 @@ pub(crate) fn show_project(cx: &mut TestAppContext, window: WindowHandle<Workspa
 
 /// Clicks the row of the open menu with `label`: the separators move the index of every
 /// row below them, so the tests name the row instead of counting.
-fn click_menu_row(cx: &mut TestAppContext, window: WindowHandle<Workspace>, label: &str) {
+pub(crate) fn click_menu_row(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    label: &str,
+) {
     let index = window
         .read_with(cx, |workspace, _| {
             workspace
@@ -348,6 +352,7 @@ fn the_problems_menu_jumps_shows_fixes_copies_and_survives_an_empty_window(
         }],
         renames: Vec::new(),
         handle: None,
+        resolve: None,
     }]);
     let window = open_language_window(cx, root.clone(), language);
     cx.run_until_parked();

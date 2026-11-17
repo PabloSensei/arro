@@ -71,7 +71,7 @@ pub fn follow_system_theme(window: &Window, cx: &mut App) {
     let theme = theme_of(settings, appearance.dark, cx);
     if cx
         .try_global::<Theme>()
-        .is_some_and(|current| current.id() == theme.id())
+        .is_some_and(|current| current.id() == theme.id() && current.icon_set() == theme.icon_set())
     {
         return;
     }
@@ -89,7 +89,7 @@ pub fn apply_saved_theme(window: &Window, cx: &mut App) {
     let theme = theme_of(settings, appearance.dark, cx);
     if cx
         .try_global::<Theme>()
-        .is_some_and(|current| current.id() == theme.id())
+        .is_some_and(|current| current.id() == theme.id() && current.icon_set() == theme.icon_set())
     {
         return;
     }
@@ -108,7 +108,7 @@ pub fn theme_of(settings: &Settings, system_dark: bool, cx: &App) -> Theme {
     } else {
         settings.theme.as_str()
     };
-    Theme::from_library(library, id)
+    Theme::from_library(library, id).with_icon_set(&settings.icon_set)
 }
 
 /// The appearance a settings change follows: the one the window reported last, or the one

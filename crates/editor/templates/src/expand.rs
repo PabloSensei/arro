@@ -227,6 +227,61 @@ pub fn expand_fields(
     Expansion { text, fields, end }
 }
 
+/// Appends `text` to `out` with the escapes of a snippet.
+fn push_snippet_text(out: &mut String, text: &str) {
+    for character in text.chars() {
+        if matches!(character, '\\' | '$' | '}') {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+}
+
+/// The snippet of a postfix template for `expression`, in the syntax of the language
+/// server protocol: `$EXPR$` is the expression, `$END$` is `$0`, and every other field is
+/// a numbered placeholder with its default. Tab visits the fields in the order of the
+/// body, so that the editor can put a postfix template in as an ordinary snippet.
+pub fn snippet_of(template: &Template, expression: &str) -> String {
+    let mut out = String::new();
+    let mut numbers: Vec<(String, usize)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for piece in pieces(template.body) {
+        match piece {
+            Piece::Text(text) => push_snippet_text(&mut out, text),
+            Piece::Variable(EXPR) => push_snippet_text(&mut out, expression),
+            Piece::Variable(END) => out.push_str("$0"),
+            Piece::Variable(SELECTION) => {}
+            Piece::Variable(name) => {
+                let number = match numbers.iter().find(|(known, _)| known == name) {
+                    Some((_, number)) => *number,
+                    None => {
+                        let number = numbers.len() + 1;
+                        numbers.push((name.to_owned(), number));
+                        number
+                    }
+                };
+                if seen.iter().any(|known| known == name) {
+                    out.push('$');
+                    out.push_str(&number.to_string());
+                } else {
+                    seen.push(name.to_owned());
+                    let default = template
+                        .fields
+                        .iter()
+                        .find(|(field, _)| *field == name)
+                        .map_or("", |(_, default)| *default);
+                    out.push_str("${");
+                    out.push_str(&number.to_string());
+                    out.push(':');
+                    push_snippet_text(&mut out, default);
+                    out.push('}');
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The common indentation of the non-blank lines.
 fn common_indent(lines: &str) -> &str {
     let mut common: Option<&str> = None;
@@ -356,6 +411,38 @@ mod tests {
         );
         assert_eq!(expansion.fields[0].ranges, vec![8..8]);
         assert_eq!(expansion.end, expansion.text.len());
+    }
+
+    #[test]
+    fn a_postfix_template_becomes_a_snippet_with_its_expression_and_fields() {
+        let var = Template {
+            key: "var",
+            description: "",
+            kind: Kind::Postfix,
+            body: "var $NAME$ = $EXPR$;$END$",
+            fields: &[("NAME", "value")],
+            contexts: &[ANY],
+        };
+        assert_eq!(
+            snippet_of(&var, "get(\"a$}\")"),
+            "var ${1:value} = get(\"a\\$\\}\");$0"
+        );
+
+        let fori = Template {
+            key: "fori",
+            description: "",
+            kind: Kind::Postfix,
+            body: "for (int $INDEX$ = 0; $INDEX$ < $EXPR$; $INDEX$++) {\n\t$END$\n}",
+            fields: &[("INDEX", "i")],
+            contexts: &[ANY],
+        };
+        assert_eq!(
+            snippet_of(&fori, "size"),
+            "for (int ${1:i} = 0; $1 < size; $1++) {\n\t$0\n\\}"
+        );
+        let expansion = crate::snippet_expansion(&snippet_of(&fori, "size"), "", "    ");
+        assert_eq!(expansion.text, "for (int i = 0; i < size; i++) {\n    \n}");
+        assert_eq!(expansion.fields[0].ranges.len(), 3);
     }
 
     #[test]

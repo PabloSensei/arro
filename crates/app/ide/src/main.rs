@@ -34,7 +34,7 @@ mod panic_log;
 type FileContent = fn(&Path, &Path, &str) -> String;
 
 fn file_icons() -> FileIcons {
-    FileIcons {
+    let mut icons = FileIcons {
         by_name: vec![
             (".gitignore", "fileTypes/gitignore"),
             ("java", "nodes/class"),
@@ -43,7 +43,9 @@ fn file_icons() -> FileIcons {
         ],
         fallback: "fileTypes/text",
     }
-    .with_languages()
+    .with_languages();
+    icons.by_name.extend(java_lang::file_icons());
+    icons
 }
 
 /// What a file is: Java first, then the languages around a project.
@@ -180,6 +182,7 @@ fn project_setup(root: &Path, state_dir: Option<&Path>, build_tools: &BuildTools
     let build = java_lang::project_build(
         root,
         state_dir.map(|dir| dir.join("projects")),
+        state_dir.map(PathBuf::from),
         build_tools.clone(),
     );
     ProjectSetup {

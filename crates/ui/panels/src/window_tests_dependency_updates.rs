@@ -405,6 +405,7 @@ fn fix(
         }],
         renames: Vec::new(),
         handle: None,
+        resolve: None,
     }
 }
 

@@ -918,6 +918,7 @@ impl MessageBundles {
             edits: vec![SourceEdit { uri, edits }],
             renames: Vec::new(),
             handle: None,
+            resolve: None,
         }]
     }
 

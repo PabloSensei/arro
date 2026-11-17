@@ -128,6 +128,7 @@ mod tests {
             email: "test@example.com".to_owned(),
             time: 0,
             subject: id.to_owned(),
+            committer: "Test".to_owned(),
         }
     }
 
@@ -316,6 +317,7 @@ mod tests {
                 email: "test@example.com".to_owned(),
                 time: 0,
                 subject: String::new(),
+                committer: "Test".to_owned(),
             });
         }
         let started = Instant::now();

@@ -1,8 +1,9 @@
 //! What a language declares: its templates and where in the tree each kind fits.
 
+use std::ops::Range;
 use std::sync::OnceLock;
 
-use tree_sitter::{Language, Query};
+use tree_sitter::{Language, Query, Tree};
 
 /// A context that every place fits.
 pub const ANY: &str = "any";
@@ -46,6 +47,34 @@ impl Template {
     }
 }
 
+/// What the language knows about the expression in front of a postfix key. An unknown
+/// kind never hides a template: only a proven one can.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Receiver {
+    /// The language proved the kind.
+    pub known: bool,
+    /// The value is a reference, so it can be null.
+    pub reference: bool,
+    /// The value is a boolean.
+    pub boolean: bool,
+    /// The value is an array or a collection of elements.
+    pub sequence: bool,
+    /// The value is text.
+    pub text: bool,
+    /// The value is a number.
+    pub number: bool,
+}
+
+/// How a language reads the expression a postfix template follows and decides whether
+/// the template fits it.
+#[derive(Clone, Copy)]
+pub struct PostfixRules {
+    /// The kind of the expression in `range` of `text`, or an unknown one.
+    pub receiver: fn(&str, Option<&Tree>, Range<usize>) -> Receiver,
+    /// Whether `template` expands an expression of this kind.
+    pub applies: fn(&Template, Receiver) -> bool,
+}
+
 /// The templates of one language.
 pub struct TemplateLanguage {
     pub templates: &'static [Template],
@@ -58,6 +87,9 @@ pub struct TemplateLanguage {
     /// Words that belong to the expression in front of a postfix key, like a keyword that
     /// creates an object.
     pub receiver_prefixes: &'static [&'static str],
+    /// The kinds of the expressions before postfix keys and the templates that fit them;
+    /// `None` offers every postfix template everywhere.
+    pub postfix: Option<PostfixRules>,
     pub query: OnceLock<Option<Query>>,
     /// Reads the names around the caret that `className()`, `methodName()` and
     /// `packageName()` give; `None` leaves them empty.

@@ -17,8 +17,8 @@ mod providers;
 use lsp_client::lsp_types::notification::{Notification, PublishDiagnostics};
 use lsp_client::lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
-    CodeActionRequest, CodeLensRefresh, CodeLensRequest, CodeLensResolve, Completion,
-    DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
+    CodeActionRequest, CodeActionResolveRequest, CodeLensRefresh, CodeLensRequest, CodeLensResolve,
+    Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
     GotoImplementation, GotoImplementationParams, GotoTypeDefinition, GotoTypeDefinitionParams,
     HoverRequest, InlayHintRefreshRequest, InlayHintRequest, RangeFormatting, References, Rename,
     Request, SemanticTokensFullRequest, SemanticTokensRangeRequest, SignatureHelpRequest,
@@ -26,7 +26,7 @@ use lsp_client::lsp_types::request::{
 };
 use lsp_client::lsp_types::{
     CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyOutgoingCallsParams,
-    CallHierarchyPrepareParams, CodeActionContext, CodeActionKind, CodeActionParams,
+    CallHierarchyPrepareParams, CodeAction, CodeActionContext, CodeActionKind, CodeActionParams,
     CodeActionResponse, CodeLens, CodeLensParams, CompletionParams, CompletionResponse, Diagnostic,
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams,
     DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions,
@@ -804,6 +804,15 @@ impl Router {
         self.ask::<CodeActionRequest>(&place, params).await
     }
 
+    /// The edits of an action the server fills in only on resolve.
+    pub async fn code_action_resolve(
+        &self,
+        place: Place,
+        action: CodeAction,
+    ) -> Result<CodeAction, RouteError> {
+        self.ask::<CodeActionResolveRequest>(&place, action).await
+    }
+
     pub async fn document_highlight(
         &self,
         place: Place,
@@ -1000,6 +1009,7 @@ fn request_metric(method: &str) -> &'static str {
         "textDocument/rename" => "lsp.rename",
         "textDocument/formatting" => "lsp.formatting",
         "textDocument/codeAction" => "lsp.code_action",
+        "codeAction/resolve" => "lsp.code_action_resolve",
         "textDocument/codeLens" => "lsp.code_lens",
         "codeLens/resolve" => "lsp.code_lens_resolve",
         "textDocument/documentHighlight" => "lsp.document_highlight",

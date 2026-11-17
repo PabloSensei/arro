@@ -217,11 +217,12 @@ tokens! {
     fold_bg;
     fold_text;
     // The marks on the editor scrollbar: errors, warnings, find matches and the caret
-    // line.
+    // line. A hunk an agent changed and the user has not accepted keeps its own colour.
     stripe_error;
     stripe_warning;
     stripe_find;
     stripe_caret;
+    stripe_agent;
     // What the user typed into a console, as IDEA colours its input line.
     console_input;
     // The states of the rest of the window: a test that passed, a change of the version

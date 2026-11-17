@@ -47,6 +47,7 @@ impl MenuModel {
             workspace_keys::ROLLBACK_CHANGED_LINES,
             workspace_keys::NEXT_CHANGE,
             workspace_keys::PREVIOUS_CHANGE,
+            crate::agents::ASK_AI,
             "workspace::Run",
             "workspace::Debug",
             "workspace::ShowCommit",
@@ -419,6 +420,9 @@ fn build(
         }
     }
 
+    // Ask AI needs the window after the row of the requests takes the workspace.
+    let ask_runner = workspace.clone();
+
     if model.gutter && ::http_client::is_request_file(&path) {
         entries.push(MenuEntry::separator());
         let clicked = view.clone();
@@ -433,6 +437,29 @@ fn build(
             .icon("run/run"),
         );
     }
+
+    // Ask AI: the row is dead without a selection, because there is no snippet to send.
+    entries.push(MenuEntry::separator());
+    let selected = view
+        .read(cx)
+        .selection()
+        .is_some_and(|(range, _)| !range.is_empty());
+    let runner = ask_runner;
+    let ask_ai = if selected {
+        MenuEntry::new("Ask AI...", move |window, cx| {
+            runner
+                .update(cx, |workspace, cx| {
+                    workspace.run_command(crate::agents::ASK_AI, window, cx)
+                })
+                .ok();
+        })
+    } else {
+        MenuEntry::disabled("Ask AI...")
+    };
+    entries.push(match model.key(crate::agents::ASK_AI) {
+        Some(shortcut) => ask_ai.shortcut(shortcut),
+        None => ask_ai,
+    });
 
     entries
 }

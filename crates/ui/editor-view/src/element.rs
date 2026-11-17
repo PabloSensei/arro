@@ -20,7 +20,7 @@ use crate::view::{
 
 pub(crate) const GUTTER_WIDTH: f32 = 64.;
 /// The width of the marks left of the numbers: a breakpoint, a run mark or a bookmark.
-const GUTTER_MARK: f32 = 16.;
+pub(crate) const GUTTER_MARK: f32 = 16.;
 /// The gap between the marks, the numbers and the fold button.
 const GUTTER_GAP: f32 = 2.;
 /// The square of the fold button and the inset after it, before the text.
@@ -152,6 +152,7 @@ pub enum StripeKind {
     Warning,
     Find,
     Vcs,
+    Agent,
     Caret,
 }
 
@@ -229,6 +230,21 @@ impl EditorElement {
     }
 }
 
+/// Where the change mark of a line of `height` stands: a thin bar against the right edge
+/// of the gutter, or a short dash for a deleted line.
+pub(crate) fn change_mark_bounds(
+    gutter_right: Pixels,
+    y: Pixels,
+    height: Pixels,
+    deleted: bool,
+) -> Bounds<Pixels> {
+    if deleted {
+        Bounds::new(point(gutter_right - px(7.), y), size(px(6.), px(2.)))
+    } else {
+        Bounds::new(point(gutter_right - px(5.), y), size(px(3.), height))
+    }
+}
+
 /// Thin bars between the numbers and the text for lines that differ from the base.
 fn paint_marks(
     rows: &[LaidOutRow],
@@ -246,11 +262,13 @@ fn paint_marks(
             GutterKind::Deleted => mark.lines.start == line,
             _ => mark.lines.contains(&line),
         }) {
-            let (x, y, w, h) = match mark.kind {
-                GutterKind::Deleted => (gutter_right - px(7.), shown.y, px(6.), px(2.)),
-                _ => (gutter_right - px(5.), shown.y, px(3.), height),
-            };
-            window.paint_quad(fill(Bounds::new(point(x, y), size(w, h)), mark.color));
+            let bounds = change_mark_bounds(
+                gutter_right,
+                shown.y,
+                height,
+                mark.kind == GutterKind::Deleted,
+            );
+            window.paint_quad(fill(bounds, mark.color));
         }
     }
 }
@@ -1684,6 +1702,25 @@ impl Element for EditorElement {
                         message: None,
                     });
                 }
+                for mark in &view.agent_marks {
+                    let line = mark.lines.start as usize;
+                    let end = mark.lines.end.saturating_sub(1).max(mark.lines.start) as usize;
+                    let start_row = display.line_to_row(line);
+                    let end_row = display.line_to_row(end);
+                    let top = bar.track_start + start_row as f32 / row_count as f32 * bar.track_len;
+                    let bottom =
+                        bar.track_start + (end_row + 1) as f32 / row_count as f32 * bar.track_len;
+                    stripes.push(StripeMark {
+                        kind: StripeKind::Agent,
+                        line,
+                        bounds: Bounds::new(
+                            point(px(x), px(top)),
+                            size(px(width), px((bottom - top).max(2.))),
+                        ),
+                        color: Some(mark.color),
+                        message: None,
+                    });
+                }
                 if let Some(find) = &view.bar
                     && find.kind != crate::bar::BarKind::Goto
                 {
@@ -1841,6 +1878,7 @@ impl Element for EditorElement {
         window.set_cursor_style(CursorStyle::IBeam, &prepaint.text_hitbox);
         let annotate = self.view.read(cx).annotation_width();
         let marks = self.view.read(cx).gutter_marks.clone();
+        let agent_marks = self.view.read(cx).agent_marks.clone();
         let coverage = self.view.read(cx).coverage.clone();
         let breakpoints = self.view.read(cx).breakpoints.clone();
         let muted_breakpoints = self.view.read(cx).muted_breakpoints.clone();
@@ -1988,13 +2026,16 @@ impl Element for EditorElement {
                 if options.gutter_icons && !shown.is_doc && function_breakpoints.contains(&line) {
                     // A method breakpoint is a diamond, not a filled dot.
                     icon_taken = true;
-                    let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(RUN_X), shown.y + px(3.)),
                         size(px(13.), px(13.)),
                     );
-                    let path: SharedString =
-                        format!("icons/debug/functionBreakpoint{suffix}.svg").into();
+                    let path = ui_kit::icon_file(
+                        style.icon_set,
+                        "debug/functionBreakpoint",
+                        style.dark,
+                        13.,
+                    );
                     window
                         .paint_svg(
                             mark,
@@ -2009,13 +2050,12 @@ impl Element for EditorElement {
                 {
                     // A field watchpoint is an eye.
                     icon_taken = true;
-                    let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(RUN_X), shown.y + px(3.)),
                         size(px(13.), px(13.)),
                     );
-                    let path: SharedString =
-                        format!("icons/debug/fieldWatchpoint{suffix}.svg").into();
+                    let path =
+                        ui_kit::icon_file(style.icon_set, "debug/fieldWatchpoint", style.dark, 13.);
                     window
                         .paint_svg(
                             mark,
@@ -2030,13 +2070,16 @@ impl Element for EditorElement {
                     icon_taken = true;
                     if muted_breakpoints.contains(&line) {
                         // A point that does not stop the program is a muted point.
-                        let suffix = if style.dark { "_dark" } else { "" };
                         let mark = Bounds::new(
                             point(bounds.left() + px(RUN_X), shown.y + px(3.)),
                             size(px(13.), px(13.)),
                         );
-                        let path: SharedString =
-                            format!("icons/debug/breakpointMuted{suffix}.svg").into();
+                        let path = ui_kit::icon_file(
+                            style.icon_set,
+                            "debug/breakpointMuted",
+                            style.dark,
+                            13.,
+                        );
                         window
                             .paint_svg(
                                 mark,
@@ -2067,23 +2110,21 @@ impl Element for EditorElement {
                 if options.gutter_icons
                     && let Some((_, color)) = shown.run
                 {
-                    let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(RUN_X), shown.y + px(3.)),
                         size(px(16.), px(16.)),
                     );
-                    let path: SharedString = format!("icons/run/run{suffix}.svg").into();
+                    let path = ui_kit::icon_file(style.icon_set, "run/run", style.dark, 16.);
                     window
                         .paint_svg(mark, path, None, TransformationMatrix::unit(), color, cx)
                         .ok();
                 } else if options.gutter_icons && shown.bookmark {
-                    let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(RUN_X), shown.y + px(3.)),
                         size(px(16.), px(16.)),
                     );
-                    let path: SharedString =
-                        format!("icons/toolwindows/bookmarks{suffix}.svg").into();
+                    let path =
+                        ui_kit::icon_file(style.icon_set, "toolwindows/bookmarks", style.dark, 16.);
                     window
                         .paint_svg(
                             mark,
@@ -2149,13 +2190,12 @@ impl Element for EditorElement {
                     && options.gutter_icons
                     && let Some(color) = shown.endpoint
                 {
-                    let suffix = if style.dark { "_dark" } else { "" };
                     let mark = Bounds::new(
                         point(bounds.left() + px(ENDPOINT_X), shown.y + px(3.)),
                         size(px(13.), px(13.)),
                     );
-                    let path: SharedString =
-                        format!("icons/toolwindows/services{suffix}.svg").into();
+                    let path =
+                        ui_kit::icon_file(style.icon_set, "toolwindows/services", style.dark, 13.);
                     window
                         .paint_svg(mark, path, None, TransformationMatrix::unit(), color, cx)
                         .ok();
@@ -2164,12 +2204,16 @@ impl Element for EditorElement {
                     && let Some(rendered) = shown.doc_icon
                 {
                     let name = if rendered { "hide" } else { "show" };
-                    let suffix = if style.dark { "_dark" } else { "" };
                     let icon = Bounds::new(
                         point(bounds.left() + px(folds_left), shown.y + px(3.)),
                         size(px(16.), px(16.)),
                     );
-                    let path: SharedString = format!("icons/general/{name}{suffix}.svg").into();
+                    let path = ui_kit::icon_file(
+                        style.icon_set,
+                        &format!("general/{name}"),
+                        style.dark,
+                        16.,
+                    );
                     window
                         .paint_svg(
                             icon,
@@ -2189,12 +2233,16 @@ impl Element for EditorElement {
                     } else {
                         "chevronDown"
                     };
-                    let suffix = if style.dark { "_dark" } else { "" };
                     let chevron = Bounds::new(
                         point(bounds.left() + px(folds_left), shown.y + px(3.)),
                         size(px(16.), px(16.)),
                     );
-                    let path: SharedString = format!("icons/general/{name}{suffix}.svg").into();
+                    let path = ui_kit::icon_file(
+                        style.icon_set,
+                        &format!("general/{name}"),
+                        style.dark,
+                        16.,
+                    );
                     window
                         .paint_svg(
                             chevron,
@@ -2246,6 +2294,13 @@ impl Element for EditorElement {
                     }
                 }
                 paint_marks(&prepaint.layout.rows, &marks, gutter_right, height, window);
+                paint_marks(
+                    &prepaint.layout.rows,
+                    &agent_marks,
+                    gutter_right,
+                    height,
+                    window,
+                );
             }
 
             let text_mask = prepaint.text_mask;
@@ -2535,6 +2590,7 @@ fn paint_scrollbars(prepaint: &EditorPrepaint, style: &EditorStyle, window: &mut
                 StripeKind::Find => style.stripe_find,
                 StripeKind::Caret => style.stripe_caret,
                 StripeKind::Vcs => mark.color.unwrap_or(style.stripe_caret),
+                StripeKind::Agent => mark.color.unwrap_or(style.stripe_agent),
             };
             window.paint_quad(fill(mark.bounds, color).corner_radii(px(1.)));
         }

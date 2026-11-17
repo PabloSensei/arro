@@ -513,6 +513,20 @@ pub struct ActionEntry {
     /// The provider's own token of an action that needs a form before it runs, passed
     /// back in [`ActionParametersQuery`]. `None` when the edits are all it needs.
     pub handle: Option<String>,
+    /// The provider's own token of an action whose server computes the edits only on
+    /// resolve, passed back in [`ActionResolveQuery`]. `None` when the entry already
+    /// carries its edits.
+    pub resolve: Option<String>,
+}
+
+/// An action the server described without its edits, asked for them on resolve. The
+/// answer is the same action with its edits, or `None` when the server refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionResolveQuery {
+    pub uri: String,
+    pub version: i32,
+    /// The token of the [`ActionEntry`] being resolved.
+    pub resolve: String,
 }
 
 /// What an action needs from the user before it runs. The window draws a small form
@@ -793,6 +807,9 @@ pub type FormatProvider = dyn Provider<FormatQuery, Vec<DocumentEdit>>;
 /// A range of a document formatted on its own.
 pub type RangeFormatProvider = dyn Provider<RangeFormatQuery, Vec<DocumentEdit>>;
 pub type ActionProvider = dyn Provider<ActionQuery, Vec<ActionEntry>>;
+/// The edits of an action the server computes only on resolve, as the provider token of
+/// its [`ActionEntry`] names it.
+pub type ActionResolveProvider = dyn Provider<ActionResolveQuery, Option<ActionEntry>>;
 /// The form of an action whose server computes its edits only from the values the
 /// user picks, as the provider token of its [`ActionEntry`] names it.
 pub type ActionParametersProvider = dyn Provider<ActionParametersQuery, Option<ActionParameters>>;

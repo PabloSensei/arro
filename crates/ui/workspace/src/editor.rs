@@ -180,6 +180,9 @@ impl FileIcons {
 /// the business of the application.
 const LANGUAGE_ICONS: &[(&str, &str)] = &[
     ("Dockerfile", "fileTypes/dockerfile"),
+    ("Makefile", "fileTypes/makefile"),
+    ("mk", "fileTypes/makefile"),
+    ("ini", "fileTypes/ini"),
     ("Gemfile", "fileTypes/ruby"),
     ("Rakefile", "fileTypes/ruby"),
     (".bashrc", "fileTypes/shell"),

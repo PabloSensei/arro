@@ -4,7 +4,8 @@
 
 use std::sync::OnceLock;
 
-use ui_kit::Theme;
+use project_model::ToolHome;
+use ui_kit::{ARRO, INTELLIJ, IconCatalog, Theme};
 use workspace::{MAX_COMPLETION_DELAY_MS, MAX_INDENT_SIZE, Settings};
 
 /// One page of the Settings window.
@@ -272,6 +273,12 @@ pub enum SettingField {
     ThemeSyncWithOs,
     ThemeLight,
     ThemeDark,
+    IconSet,
+    ProjectAlwaysSelectOpenedFile,
+    /// Where the home of the first build tool comes from.
+    BuildToolFirstHomeKind,
+    /// Whether the terminals put the downloaded first build tool on their `PATH`.
+    BuildToolFirstTerminalPath,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -960,6 +967,38 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::DatabasePageRows,
         keywords: "database table rows page grid data editor",
     },
+    Setting {
+        id: "icon_set",
+        title: "Icons",
+        page: SettingsPage::Appearance,
+        kind: SettingKind::Choice,
+        field: SettingField::IconSet,
+        keywords: "icons icon set appearance arro intellij",
+    },
+    Setting {
+        id: "project_always_select_opened_file",
+        title: "Always Select Opened File",
+        page: SettingsPage::Project,
+        kind: SettingKind::Toggle,
+        field: SettingField::ProjectAlwaysSelectOpenedFile,
+        keywords: "project tree select opened file autoscroll source follow editor tab",
+    },
+    Setting {
+        id: "build_tool_first_home_kind",
+        title: "Home source",
+        page: SettingsPage::BuildToolsFirst,
+        kind: SettingKind::Choice,
+        field: SettingField::BuildToolFirstHomeKind,
+        keywords: "home source bundled downloaded path wrapper automatic install location build tools",
+    },
+    Setting {
+        id: "build_tool_first_terminal_path",
+        title: "Add the downloaded tool to the PATH of terminals",
+        page: SettingsPage::BuildToolsFirst,
+        kind: SettingKind::Toggle,
+        field: SettingField::BuildToolFirstTerminalPath,
+        keywords: "terminal path environment downloaded bundled build tools",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1043,6 +1082,9 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::SoftWrap => Some(settings.soft_wrap),
         SettingField::ShowWhitespace => Some(settings.show_whitespace),
         SettingField::ShowLineNumbers => Some(settings.show_line_numbers),
+        SettingField::ProjectAlwaysSelectOpenedFile => {
+            Some(settings.project_always_select_opened_file)
+        }
         SettingField::HighlightCurrentLine => Some(settings.highlight_current_line),
         SettingField::ShowIndentGuides => Some(settings.show_indent_guides),
         SettingField::CaretBlink => Some(settings.caret_blink),
@@ -1067,6 +1109,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::DiffSideBySide => Some(settings.diff_side_by_side),
         SettingField::GitGroupByDirectory => Some(settings.git_group_by_directory),
         SettingField::BuildToolFirstOffline => Some(settings.build_tools.first.offline),
+        SettingField::BuildToolFirstTerminalPath => Some(settings.build_tools.first.terminal_path),
         SettingField::BuildToolFirstUpdateSnapshots => {
             Some(settings.build_tools.first.update_snapshots)
         }
@@ -1104,6 +1147,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::CompletionDelay
         | SettingField::InlayParameterNames
         | SettingField::BuildToolFirstHome
+        | SettingField::BuildToolFirstHomeKind
         | SettingField::BuildToolFirstSettingsFile
         | SettingField::BuildToolFirstRepository
         | SettingField::BuildToolFirstVmOptions
@@ -1124,7 +1168,8 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::KubeconfigPath
         | SettingField::DatabasePageRows
         | SettingField::ThemeLight
-        | SettingField::ThemeDark => None,
+        | SettingField::ThemeDark
+        | SettingField::IconSet => None,
     }
 }
 
@@ -1135,6 +1180,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             settings.theme_sync_with_os = !settings.theme_sync_with_os;
         }
         Some(SettingField::SoftWrap) => settings.soft_wrap = !settings.soft_wrap,
+        Some(SettingField::ProjectAlwaysSelectOpenedFile) => {
+            settings.project_always_select_opened_file =
+                !settings.project_always_select_opened_file;
+        }
         Some(SettingField::ShowWhitespace) => {
             settings.show_whitespace = !settings.show_whitespace;
         }
@@ -1205,6 +1254,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             settings.build_tools.first.update_snapshots =
                 !settings.build_tools.first.update_snapshots;
         }
+        Some(SettingField::BuildToolFirstTerminalPath) => {
+            settings.build_tools.first.terminal_path = !settings.build_tools.first.terminal_path;
+        }
         Some(SettingField::BuildToolSecondOffline) => {
             settings.build_tools.second.offline = !settings.build_tools.second.offline;
         }
@@ -1270,6 +1322,7 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::CompletionDelay
             | SettingField::InlayParameterNames
             | SettingField::BuildToolFirstHome
+            | SettingField::BuildToolFirstHomeKind
             | SettingField::BuildToolFirstSettingsFile
             | SettingField::BuildToolFirstRepository
             | SettingField::BuildToolFirstVmOptions
@@ -1290,7 +1343,8 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::KubeconfigPath
             | SettingField::DatabasePageRows
             | SettingField::ThemeLight
-            | SettingField::ThemeDark,
+            | SettingField::ThemeDark
+            | SettingField::IconSet,
         )
         | None => {
             return false;
@@ -1471,6 +1525,37 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
     })
 }
 
+/// The id of the theme the Appearance page marks as chosen: the theme of the window while
+/// Sync with OS is off, and the theme of the system look while it is on. A settings file
+/// that names no theme takes `on_screen`, the theme the window shows.
+pub fn chosen_theme<'a>(settings: &'a Settings, dark: bool, on_screen: &'a str) -> &'a str {
+    if settings.theme_sync_with_os {
+        if dark {
+            &settings.theme_dark
+        } else {
+            &settings.theme_light
+        }
+    } else if settings.theme.is_empty() {
+        on_screen
+    } else {
+        &settings.theme
+    }
+}
+
+/// The text of the Theme row: the name of the chosen theme, or the look the system picks
+/// while Sync with OS is on, as the row has always written it.
+pub fn theme_label(settings: &Settings, system_dark: bool, on_screen: &str) -> String {
+    if settings.theme_sync_with_os {
+        if system_dark {
+            "Dark".to_owned()
+        } else {
+            "Light".to_owned()
+        }
+    } else {
+        Theme::label(chosen_theme(settings, system_dark, on_screen))
+    }
+}
+
 /// The chosen name of a setting with named choices, for the window to show.
 pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
     let label = match find(id)?.field {
@@ -1486,9 +1571,24 @@ pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
         SettingField::GitUpdateMethod => settings.git_update_method.label().to_owned(),
         SettingField::ThemeLight => Theme::label(&settings.theme_light),
         SettingField::ThemeDark => Theme::label(&settings.theme_dark),
+        SettingField::IconSet => IconCatalog::label(&settings.icon_set),
+        SettingField::BuildToolFirstHomeKind => {
+            home_kind_label(settings.build_tools.first.home_kind).to_owned()
+        }
         _ => return None,
     };
     Some(label)
+}
+
+/// The name of a way to find the home of the first build tool.
+fn home_kind_label(kind: ToolHome) -> &'static str {
+    match kind {
+        ToolHome::Auto => "Automatic",
+        ToolHome::Bundled => "Bundled",
+        ToolHome::Path => "PATH",
+        ToolHome::Wrapper => "Project wrapper",
+        ToolHome::Custom => "Folder",
+    }
 }
 
 /// The next choice of a setting with named choices. False when it has none.
@@ -1513,6 +1613,22 @@ pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::ThemeLight) => settings.theme_light = next_theme(&settings.theme_light),
         Some(SettingField::ThemeDark) => settings.theme_dark = next_theme(&settings.theme_dark),
+        Some(SettingField::IconSet) => {
+            settings.icon_set = if settings.icon_set == INTELLIJ {
+                ARRO.to_owned()
+            } else {
+                INTELLIJ.to_owned()
+            };
+        }
+        Some(SettingField::BuildToolFirstHomeKind) => {
+            settings.build_tools.first.home_kind = match settings.build_tools.first.home_kind {
+                ToolHome::Auto => ToolHome::Bundled,
+                ToolHome::Bundled => ToolHome::Path,
+                ToolHome::Path => ToolHome::Wrapper,
+                ToolHome::Wrapper => ToolHome::Custom,
+                ToolHome::Custom => ToolHome::Auto,
+            };
+        }
         _ => return false,
     }
     true
@@ -1594,5 +1710,34 @@ mod tests {
             find("font_size").map(|setting| setting.kind),
             Some(SettingKind::Number)
         );
+    }
+
+    #[test]
+    fn the_appearance_page_marks_the_theme_the_window_shows() {
+        let mut settings = Settings {
+            theme_sync_with_os: false,
+            theme: "mocha".to_owned(),
+            theme_light: "paper".to_owned(),
+            theme_dark: "nord".to_owned(),
+            ..Settings::default()
+        };
+        assert_eq!(super::chosen_theme(&settings, true, "dark"), "mocha");
+        assert_eq!(super::chosen_theme(&settings, false, "dark"), "mocha");
+        assert_eq!(super::theme_label(&settings, true, "dark"), "Mocha");
+        assert_eq!(super::theme_label(&settings, false, "dark"), "Mocha");
+
+        // A file written before themes became files names no theme: the look of the
+        // window is the one the page marks.
+        settings.theme.clear();
+        assert_eq!(super::chosen_theme(&settings, true, "dark"), "dark");
+        assert_eq!(super::chosen_theme(&settings, false, "light"), "light");
+
+        // Sync with OS marks the theme of each system look instead.
+        settings.theme = "mocha".to_owned();
+        settings.theme_sync_with_os = true;
+        assert_eq!(super::chosen_theme(&settings, true, "mocha"), "nord");
+        assert_eq!(super::chosen_theme(&settings, false, "mocha"), "paper");
+        assert_eq!(super::theme_label(&settings, true, "mocha"), "Dark");
+        assert_eq!(super::theme_label(&settings, false, "mocha"), "Light");
     }
 }

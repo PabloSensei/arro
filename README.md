@@ -5,7 +5,7 @@
 <h1 align="center">Arro</h1>
 
 <p align="center">
-  <b>A native Java IDE written in Rust.</b><br>
+  <b>A fast, native, open-source Java IDE written in Rust.</b><br>
   IntelliJ-style workflow and shortcuts, a GPU-rendered UI, and a fraction of the memory.
 </p>
 
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="https://github.com/PabloSensei/arro/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/PabloSensei/arro?include_prereleases&label=release&color=EA580C"></a>
   <a href="https://github.com/PabloSensei/arro/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/PabloSensei/arro/total?color=EA580C"></a>
-  <a href="LICENSE.md"><img alt="License: FSL-1.1-ALv2" src="https://img.shields.io/badge/license-FSL--1.1--ALv2-1F1F23"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-1F1F23"></a>
   <img alt="Platform: Windows 11, Linux x86-64, macOS" src="https://img.shields.io/badge/platform-Windows%2011%20%C2%B7%20Linux%20%C2%B7%20macOS-1F1F23">
   <a href="https://github.com/sponsors/PabloSensei"><img alt="Sponsor" src="https://img.shields.io/badge/sponsor-%E2%99%A5-EA580C"></a>
 </p>
@@ -225,6 +225,6 @@ Arro stands on the work of others: [GPUI](https://github.com/zed-industries/zed)
 
 ## License
 
-Arro is licensed under the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE.md) (FSL-1.1-ALv2). You may use, modify and share it for any purpose except offering a competing commercial product. Two years after each version is released, that version also becomes available under the Apache License 2.0.
+Arro is free software, licensed under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later). You may use it for any purpose, including at work, study and change it, and share it, changed or not; whoever shares a changed version shares its source under the same license. This covers every released version of Arro. Plugins run as separate processes and talk to Arro over its plugin protocol, so they may use any license.
 
 Third-party components keep their own licenses; `THIRD-PARTY.txt` and `NOTICE.txt` in every build list them, and [`vendor/gpui-pre-windows/NOTICE-ARRO.md`](vendor/gpui-pre-windows/NOTICE-ARRO.md) lists the changes to the vendored GPUI platform crate.

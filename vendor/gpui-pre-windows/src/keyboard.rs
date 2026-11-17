@@ -365,14 +365,26 @@ const CANDIDATE_VKEYS: &[VIRTUAL_KEY] = &[
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+
     use crate::WindowsKeyboardMapper;
     use gpui::{Keystroke, Modifiers, PlatformKeyboardMapper};
 
+    /// The low word of the layout handle of the thread is its language id, `0x0409` for
+    /// English (United States). The test only reads the layout: activating another one
+    /// would switch the layout of the whole system for the person at the machine and
+    /// could install a layout they do not have.
+    fn us_layout_is_active() -> bool {
+        let layout = unsafe { GetKeyboardLayout(0) };
+        layout.0 as usize & 0xFFFF == 0x0409
+    }
+
     #[test]
     fn test_keyboard_mapper() {
+        let us_layout = us_layout_is_active();
         let mapper = WindowsKeyboardMapper::new();
 
-        // Normal case
+        // Normal case; a Latin letter maps to itself on every layout
         let keystroke = Keystroke {
             modifiers: Modifiers::control(),
             key: "a".to_string(),
@@ -382,6 +394,15 @@ mod tests {
         assert_eq!(*mapped.inner(), keystroke);
         assert_eq!(mapped.key(), "a");
         assert_eq!(*mapped.modifiers(), Modifiers::control());
+
+        // Shift+4 types another character on other layouts (`;` on Russian), and the
+        // test must not switch the layout of the machine to ask for the US one.
+        if !us_layout {
+            eprintln!(
+                "test_keyboard_mapper: skipped the shifted keys, the layout of the thread is not English (United States)"
+            );
+            return;
+        }
 
         // Shifted case, ctrl-$
         let keystroke = Keystroke {

@@ -68,6 +68,7 @@ fn parse_record(record: &str) -> Option<LineHistory> {
         email,
         time,
         subject,
+        committer: String::new(),
     };
     let mut path = None;
     let mut previous = None;

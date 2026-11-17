@@ -577,6 +577,7 @@ mod tests {
             grammar: || panic!("the declarations test does not parse"),
             indent_unit: "    ",
             receiver_prefixes: &[],
+            postfix: None,
             query: OnceLock::new(),
             declarations: Some(|_, _, _, _| Declarations {
                 class_name: "Widget".to_owned(),

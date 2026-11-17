@@ -31,7 +31,10 @@ impl AgentsPanel {
         if text.is_empty() {
             return;
         }
-        let selection = self.editor_selection(cx);
+        let selection = self
+            .composer
+            .kept_selection()
+            .or_else(|| self.editor_selection(cx));
         let parts = Composer::parts(&text, &self.root, selection);
         let Some(entry) = self.active_entry_mut() else {
             return;
@@ -61,9 +64,14 @@ impl AgentsPanel {
     }
 
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
-        let cancelled = self.active_entry().map(|entry| entry.session.cancel());
-        if let Some(Err(error)) = cancelled {
-            self.error = Some(format!("The turn is not stopped: {error}").into());
+        let Some(entry) = self.active_entry_mut() else {
+            return;
+        };
+        match entry.session.cancel() {
+            // The question of a stopped turn will never be answered: the buttons go away,
+            // so that their answer cannot reach a later question of the session.
+            Ok(()) => entry.transcript.clear_pending(),
+            Err(error) => self.error = Some(format!("The turn is not stopped: {error}").into()),
         }
         cx.notify();
     }

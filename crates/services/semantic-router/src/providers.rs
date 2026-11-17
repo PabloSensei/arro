@@ -12,19 +12,19 @@ use std::time::Duration;
 
 use base::Cancel;
 use lang_api::{
-    ActionEntry, ActionKind, ActionQuery, AddOverridableMethodsRequest, Answer, CallDirection,
-    CallHierarchyItem, CallHierarchyQuery, CallParameter, CallSignature, ChangeSignatureInfo,
-    ChangeSignatureOutcome, ChangeSignatureRequest, CodeLensCommand, CodeLensEntry, CodeLensQuery,
-    CodeLensResolveQuery, CommandQuery, CompletionCommand, CompletionEntry, CompletionKind,
-    CompletionLabelDetails, CompletionList, Confidence, DiagnosticEntry, DiagnosticNote,
-    DiagnosticsQuery, DocumentEdit, DocumentSpot, ExpectedType, ExternalDoc, FileDiagnostics,
-    FileRename, FormatQuery, GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateQuery,
-    Generation, HierarchyDirection, HierarchyQuery, HoverText, InlayHintEntry, InlayHintKind,
-    InlayHintQuery, MethodSignature, MoveDestination, MoveKind, MoveOutcome, MoveQuery,
-    MoveRequest, NavigationKind, NavigationQuery, OverridableMethod, OverridableMethods,
-    OverridableMethodsQuery, Provider, RangeFormatQuery, RenameQuery, Reply, SemanticServer,
-    SemanticToken, SemanticTokenKind, SemanticTokenModifiers, SemanticTokensQuery, Severity,
-    SignatureException, SignatureHelp, SignatureParameter, SignatureQuery, SignatureText,
+    ActionEntry, ActionKind, ActionQuery, ActionResolveQuery, AddOverridableMethodsRequest, Answer,
+    CallDirection, CallHierarchyItem, CallHierarchyQuery, CallParameter, CallSignature,
+    ChangeSignatureInfo, ChangeSignatureOutcome, ChangeSignatureRequest, CodeLensCommand,
+    CodeLensEntry, CodeLensQuery, CodeLensResolveQuery, CommandQuery, CompletionCommand,
+    CompletionEntry, CompletionKind, CompletionLabelDetails, CompletionList, Confidence,
+    DiagnosticEntry, DiagnosticNote, DiagnosticsQuery, DocumentEdit, DocumentSpot, ExpectedType,
+    ExternalDoc, FileDiagnostics, FileRename, FormatQuery, GenerateApplyRequest, GenerateChoice,
+    GenerateKind, GenerateQuery, Generation, HierarchyDirection, HierarchyQuery, HoverText,
+    InlayHintEntry, InlayHintKind, InlayHintQuery, MethodSignature, MoveDestination, MoveKind,
+    MoveOutcome, MoveQuery, MoveRequest, NavigationKind, NavigationQuery, OverridableMethod,
+    OverridableMethods, OverridableMethodsQuery, Provider, RangeFormatQuery, RenameQuery, Reply,
+    SemanticServer, SemanticToken, SemanticTokenKind, SemanticTokenModifiers, SemanticTokensQuery,
+    Severity, SignatureException, SignatureHelp, SignatureParameter, SignatureQuery, SignatureText,
     SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery, TextPoint, TextSpan, UsageEntry,
     UsageKind, WorkspaceChange, WorkspaceDiagnosticsQuery, offset_in,
 };
@@ -346,16 +346,20 @@ fn action_entry(
     edit_command: Option<&str>,
     refactor_action: Option<&str>,
 ) -> Option<ActionEntry> {
-    let (title, code, preferred, edit, command) = match action {
-        lsp::CodeActionOrCommand::Command(command) => {
-            (command.title.clone(), None, false, None, Some(command))
-        }
+    let (title, code, preferred, edit, command) = match &action {
+        lsp::CodeActionOrCommand::Command(command) => (
+            command.title.clone(),
+            None,
+            false,
+            None,
+            Some(command.clone()),
+        ),
         lsp::CodeActionOrCommand::CodeAction(action) => (
-            action.title,
-            action.kind,
+            action.title.clone(),
+            action.kind.clone(),
             action.is_preferred.unwrap_or(false),
-            action.edit,
-            action.command,
+            action.edit.clone(),
+            action.command.clone(),
         ),
     };
     let kind = code.as_ref().and_then(action_kind);
@@ -373,13 +377,14 @@ fn action_entry(
             edits: Vec::new(),
             renames: Vec::new(),
             handle: None,
+            resolve: None,
         });
     }
-    let (edit, handle) = match (edit, command) {
-        (Some(edit), _) => (edit, None),
+    let (edit, handle, resolve) = match (edit, command) {
+        (Some(edit), _) => (edit, None, None),
         (None, Some(command)) if Some(command.command.as_str()) == edit_command => {
             let argument = command.arguments?.into_iter().next()?;
-            (serde_json::from_value(argument).ok()?, None)
+            (serde_json::from_value(argument).ok()?, None, None)
         }
         // The editor asks for the edits later: a form of the user or a picker comes
         // first. The handle is the command and the title of its row, as opaque as the
@@ -387,9 +392,24 @@ fn action_entry(
         (None, Some(command)) if Some(command.command.as_str()) == refactor_action => {
             let arguments = command.arguments.unwrap_or_default();
             let handle = serde_json::json!({"title": title, "arguments": arguments});
-            (lsp::WorkspaceEdit::default(), Some(handle.to_string()))
+            (
+                lsp::WorkspaceEdit::default(),
+                Some(handle.to_string()),
+                None,
+            )
         }
-        _ => return None,
+        // A code action the server fills in only on resolve keeps its whole shape as
+        // the token: the editor asks for the edit when the row is shown.
+        (None, _) => {
+            let lsp::CodeActionOrCommand::CodeAction(action) = &action else {
+                return None;
+            };
+            (
+                lsp::WorkspaceEdit::default(),
+                None,
+                Some(serde_json::to_string(action).ok()?),
+            )
+        }
     };
     let change = workspace_change(edit);
     Some(ActionEntry {
@@ -400,6 +420,7 @@ fn action_entry(
         edits: change.edits,
         renames: change.renames,
         handle,
+        resolve,
     })
 }
 
@@ -619,6 +640,7 @@ async fn prompt_entry(
         edits: change.edits,
         renames: change.renames,
         handle: None,
+        resolve: None,
     })
 }
 
@@ -1596,6 +1618,28 @@ impl Provider<FormatQuery, Vec<DocumentEdit>> for LspProviders {
             };
             let edits = router.formatting(place, options).await;
             Some(edits.map(|edits| edits.into_iter().flatten().map(document_edit).collect()))
+        });
+    }
+}
+
+impl Provider<ActionResolveQuery, Option<ActionEntry>> for LspProviders {
+    fn start(&self, query: ActionResolveQuery, cancel: Cancel, reply: Reply<Option<ActionEntry>>) {
+        let router = self.router.clone();
+        let edit_command = self.edit_command;
+        self.answer(cancel, reply, async move {
+            let uri = Uri::from_str(&query.uri).ok()?;
+            let action: lsp::CodeAction = serde_json::from_str(&query.resolve).ok()?;
+            let place = Place {
+                uri: uri.clone(),
+                version: query.version,
+                position: Position::new(0, 0),
+            };
+            let action = router.code_action_resolve(place, action).await.ok()?;
+            Some(Ok(action_entry(
+                lsp::CodeActionOrCommand::CodeAction(action),
+                edit_command,
+                None,
+            )))
         });
     }
 }

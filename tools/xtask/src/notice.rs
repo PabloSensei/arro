@@ -252,6 +252,18 @@ pub(crate) fn render(conpty: bool) -> String {
     );
     text.push_str(LUCIDE_LICENSE);
     text.push_str("\n\n");
+    text.push_str(
+        "The IntelliJ New UI icon set is copied from JetBrains intellij-community,\n\
+         https://github.com/JetBrains/intellij-community, path\n\
+         platform/icons/src/expui, commit d5b79b0022b004b719c1d733975856ad7ec7779b.\n\
+         Copyright 2000-2023 JetBrains s.r.o. and contributors. Licensed under the\n\
+         Apache License, Version 2.0. The NOTICE of that repository follows:\n\n\
+         This software includes code from IntelliJ IDEA\n\
+         Copyright (C) JetBrains s.r.o.\n\
+         https://www.jetbrains.com/idea/\n\n\
+         The set keeps the files of the source and their copyright line; the logos of\n\
+         JetBrains products are not part of it.\n\n",
+    );
     text.push_str("Keymap\n------\n\n");
     text.push_str(
         "The default keymap comes from JetBrains intellij-community,\n\
@@ -300,6 +312,8 @@ mod tests {
         let text = render(false);
         assert!(text.contains("intellij-community"));
         assert!(text.contains("Apache License, Version 2.0"));
+        assert!(text.contains("IntelliJ New UI icon set"));
+        assert!(text.contains("This software includes code from IntelliJ IDEA"));
         assert!(text.contains("SIL OPEN FONT LICENSE"));
         assert!(text.contains("Inter"));
         assert!(text.contains("JetBrains Mono"));

@@ -227,7 +227,7 @@ const TOOLS: [(&str, &str, &str); 17] = [
     (TERMINAL_TOOL, "Terminal", "toolwindows/terminal"),
     (SERVICES_TOOL, "Services", "toolwindows/services"),
     (DATABASE_TOOL, "Database", "toolwindows/database"),
-    (TODO_TOOL, "TODO", "status/info"),
+    (TODO_TOOL, "TODO", "toolwindows/todo"),
     (PROBLEMS_TOOL, "Problems", "toolwindows/problems"),
     (USAGES_TOOL, "Usages", "codeInsight/search"),
     (AI_TOOL, "AI Sessions", "own/aiSessions"),

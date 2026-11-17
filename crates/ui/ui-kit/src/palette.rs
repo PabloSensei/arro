@@ -47,6 +47,7 @@ fn intern(id: &str) -> &'static str {
 pub struct Theme {
     tokens: Tokens<Hsla>,
     id: &'static str,
+    icon_set: &'static str,
 }
 
 impl Deref for Theme {
@@ -87,7 +88,20 @@ impl Theme {
         Self {
             tokens: definition.tokens.map(hsla_of),
             id: intern(&definition.id),
+            icon_set: crate::ARRO,
         }
+    }
+
+    /// The same theme with another set of icons: the choice of the settings, which the
+    /// windows apply to the theme on screen at once.
+    pub fn with_icon_set(mut self, name: &str) -> Self {
+        self.icon_set = intern(name);
+        self
+    }
+
+    /// The set of icons the theme draws with.
+    pub fn icon_set(self) -> &'static str {
+        self.icon_set
     }
 
     /// The theme of the catalog called `id`, or the dark one when it is not there.
@@ -133,6 +147,7 @@ impl Theme {
             Self {
                 tokens: tokens.map(hsla_of),
                 id,
+                icon_set: crate::ARRO,
             },
             unknown,
         )
@@ -145,6 +160,7 @@ impl Theme {
         Self {
             tokens,
             id: if t < 0.5 { from.id } else { to.id },
+            icon_set: if t < 0.5 { from.icon_set } else { to.icon_set },
         }
     }
 }

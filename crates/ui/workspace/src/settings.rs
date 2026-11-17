@@ -215,6 +215,9 @@ pub struct Settings {
     /// catalog. Empty in a file written before themes became files: the window then takes
     /// the base theme of the look.
     pub theme: String,
+    /// The set of icons of the window: `arro`, `intellij`, or the name of a folder of the
+    /// `icons` folder of the settings.
+    pub icon_set: String,
     /// Size of the text in the editor, in points.
     pub font_size: f32,
     /// Size of the text of the editors in Presentation Mode, in points.
@@ -384,6 +387,9 @@ pub struct Settings {
     pub kubeconfig_path: String,
     /// How many rows one page of a data tab reads from the table.
     pub database_page_rows: u32,
+    /// The project tree selects the file of every tab that becomes active, as the Always
+    /// Select Opened File switch of its view options says.
+    pub project_always_select_opened_file: bool,
 }
 
 impl Default for Settings {
@@ -393,6 +399,7 @@ impl Default for Settings {
             theme_light: "light".to_owned(),
             theme_dark: "dark".to_owned(),
             theme: String::new(),
+            icon_set: "arro".to_owned(),
             font_size: DEFAULT_FONT_SIZE,
             presentation_font_size: crate::appearance::DEFAULT_PRESENTATION_FONT_SIZE,
             ui_scale: DEFAULT_UI_SCALE,
@@ -479,6 +486,7 @@ impl Default for Settings {
             kubectl_path: String::new(),
             kubeconfig_path: String::new(),
             database_page_rows: DEFAULT_DATABASE_PAGE_ROWS,
+            project_always_select_opened_file: false,
         }
     }
 }
@@ -573,6 +581,9 @@ impl Settings {
         self.ui_scale = self.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
         if self.editor_font_family.trim().is_empty() {
             self.editor_font_family = "JetBrains Mono".to_owned();
+        }
+        if self.icon_set.trim().is_empty() {
+            self.icon_set = "arro".to_owned();
         }
         if !self.line_spacing.is_finite() {
             self.line_spacing = DEFAULT_LINE_SPACING;
@@ -717,6 +728,19 @@ mod tests {
             !Settings::load_with_theme_choice(&dir.join("missing.json"), true).theme_sync_with_os,
             "a start without a settings file keeps the chosen theme too"
         );
+    }
+
+    #[test]
+    fn the_project_always_select_switch_is_saved_and_read_back() {
+        let dir = test_support::scratch("settings-always-select");
+        let file = dir.join("settings.json");
+        let on = Settings {
+            project_always_select_opened_file: true,
+            ..Settings::default()
+        };
+        on.save(&file).unwrap();
+        assert!(Settings::load(&file).project_always_select_opened_file);
+        assert!(!Settings::load(&dir.join("missing.json")).project_always_select_opened_file);
     }
 
     #[test]

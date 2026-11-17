@@ -341,6 +341,17 @@ impl GitState {
         )
     }
 
+    /// The place under the branch name of the title bar, where IDEA opens the branch popup
+    /// from the menu of VCS. None while the title bar has not been drawn yet.
+    fn title_branch_position(&self, cx: &App) -> Option<Point<Pixels>> {
+        let workspace = self.workspace.upgrade()?;
+        let anchor = workspace.read(cx).title_branch_bounds()?;
+        Some(point(
+            anchor.left(),
+            anchor.bottom() + px(ui_kit::metrics::SPACE_XS),
+        ))
+    }
+
     pub fn busy(&self) -> Option<&'static str> {
         self.busy
     }
@@ -1998,10 +2009,13 @@ impl GitState {
         );
         entries.push(MenuEntry::separator());
         let branches = me.clone();
+        // The popup of the branches opens under the branch name of the title bar, not at the
+        // caret where this list was opened.
+        let at_branch = self.title_branch_position(cx).unwrap_or(position);
         entries.push(
             MenuEntry::new("Branches...", move |_, cx| {
                 branches
-                    .update(cx, |this, cx| this.show_branches(position, cx))
+                    .update(cx, |this, cx| this.show_branches(at_branch, cx))
                     .ok();
             })
             .icon("general/vcs"),

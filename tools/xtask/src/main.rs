@@ -9,6 +9,7 @@ mod dist_linux;
 mod dist_macos;
 mod fields;
 mod helpers;
+mod icon_sets;
 mod icons;
 mod idea_keymap;
 mod layers;
@@ -33,7 +34,8 @@ const USAGE: &str = "usage: cargo xtask <command>
 
 commands:
   ci                         fmt, clippy, tests, cargo deny, check-layers, check-budgets,
-                             check-spacing, check-tooltips, check-scrollbars, check-fields
+                             check-spacing, check-tooltips, check-scrollbars, check-fields,
+                             check-icon-sets
   ci-linux                   clippy, tests and check-layers, for a Unix machine
   check-layers [--root DIR]  dependency graph and forbidden words, ARCHITECTURE.md section 4
   check-budgets              budgets.toml structure
@@ -41,6 +43,7 @@ commands:
   check-tooltips             every icon-only button in the UI crates names itself in a tooltip
   check-scrollbars           every scrolled area in the UI crates has scrollbars or is exempt
   check-fields               every TextField in the UI crates is drawn with its caret and selection
+  check-icon-sets            the bundled icon sets keep their licence and have no product logos
   affected [--base REF] [--run test|clippy|both] [--list]
                              the workspace crates a change touches and their dependents,
                              REF is main by default; prints `-p` names or runs the checks
@@ -83,6 +86,7 @@ fn main() -> ExitCode {
         ["check-tooltips"] => tooltips::run(&root),
         ["check-scrollbars"] => scrollbars::run(&root),
         ["check-fields"] => fields::run(&root),
+        ["check-icon-sets"] => icon_sets::run(&root),
         ["affected", args @ ..] => affected_command(&root, args),
         ["fetch-conpty"] => conpty::fetch(&root),
         ["idea-keymap", xml, json] => idea_keymap::run(Path::new(xml), Path::new(json)),

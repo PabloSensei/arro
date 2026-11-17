@@ -8,6 +8,7 @@ pub use gpui_kit::*;
 pub use ::theme::{metrics, motion, snapped_code_size};
 
 mod embedded;
+pub mod icon_sets;
 mod motions;
 mod palette;
 mod popups;
@@ -21,6 +22,7 @@ mod text_field;
 mod widgets;
 
 pub use embedded::{Assets, app, init};
+pub use icon_sets::{ARRO, INTELLIJ, IconCatalog, IconSet, icon_file};
 pub use motions::{Slide, smoothstep};
 pub use palette::{
     Theme, ThemeCatalog, ThemeDefinition, ThemeError, ThemeFile, ThemeLibrary, from_icls, slug,

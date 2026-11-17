@@ -1447,6 +1447,7 @@ fn empty_language() -> &'static TemplateLanguage {
         grammar: || panic!("there is no grammar without a language"),
         indent_unit: "    ",
         receiver_prefixes: &[],
+        postfix: None,
         query: std::sync::OnceLock::new(),
         declarations: None,
     })
