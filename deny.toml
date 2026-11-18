@@ -35,6 +35,10 @@ exceptions = [
 ignore = true
 
 [advisories]
+# An "unmaintained" notice fails the check only for our direct dependencies: one for a
+# crate deep inside GPUI or rmcp stopped a release (chrono, 2026-11-17) though nothing could
+# be done about it that day. Vulnerabilities still fail for every crate.
+unmaintained = "workspace"
 # Crates GPUI pulls in that nobody maintains now. No known vulnerability in any of them.
 ignore = [
     { id = "RUSTSEC-2024-0384", reason = "instant, through GPUI" },

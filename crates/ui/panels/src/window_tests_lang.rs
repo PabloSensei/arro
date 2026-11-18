@@ -281,7 +281,7 @@ impl FakeLanguage {
     }
 
     /// A file the server changes without it being open in a tab.
-    fn set_closed(&self, path: PathBuf) {
+    pub(crate) fn set_closed(&self, path: PathBuf) {
         *self.closed.lock().unwrap() = Some(path);
     }
 

@@ -32,6 +32,9 @@ pub const STOPPED_BY_USER: &str = "stopped by the user";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestRequest {
     pub module: Option<String>,
+    /// A package of tests: every suite in it, when no suite is named.
+    #[serde(default)]
+    pub package: Option<String>,
     /// A class or file of tests, in the terms of the provider.
     pub suite: Option<String>,
     /// One test of the suite.

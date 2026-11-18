@@ -8,15 +8,17 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::base::Cancel;
 use database::{
-    Column, Command, Dialect, DownloadProgress, Driver, DriverKind, Event, MAX_RESULT_BYTES,
-    MAX_RESULT_ROWS, PasswordStore, ResultSet, Secret, Session, Source, SourceId, SourceStore,
-    Suggestion, Support, SystemPasswords, Table, Value, VendorTemplate,
+    Column, Command, Dialect, DownloadProgress, Driver, DriverKind, Event, ExplainNode,
+    ExplainPlan, ExportFormat, Exporter, MAX_RESULT_BYTES, MAX_RESULT_ROWS, Param, PasswordStore,
+    ResultSet, Secret, Session, Source, SourceId, SourceStore, Suggestion, Support,
+    SystemPasswords, Table, TableRef, Value, VendorTemplate, asked_parameters, bind_parameters,
 };
 use editor_view::{EditorView, RunFiles};
 use lang_api::{
@@ -26,7 +28,7 @@ use lang_api::{
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{DATABASE_TOOL, Settings, Workspace};
+use workspace::{DATABASE_TOOL, Settings, Stop, Workspace};
 
 use crate::database_data::DatabaseDataView;
 
@@ -255,6 +257,104 @@ impl Dialog {
 /// A statement the window sends, with the row limit that goes with it.
 type SentQuery = (String, Option<usize>);
 
+/// The command and the key of Explain Plan. The key is clear of the IDEA keymap: Ctrl+Shift+E
+/// is Recent Locations there.
+pub const EXPLAIN_PLAN: &str = "database.explain_plan";
+pub const EXPLAIN_KEY: &str = "alt-shift-e";
+
+/// What the console asks before it runs a statement with placeholders: the value of each
+/// name, with the last value of the console already in its field.
+struct AskParameters {
+    source: SourceId,
+    sql: String,
+    max_rows: Option<usize>,
+    fields: Vec<AskField>,
+    focused: usize,
+}
+
+/// One statement of the console that waits for its turn.
+struct QueuedStatement {
+    source: SourceId,
+    sql: String,
+    max_rows: Option<usize>,
+    /// The values of the placeholders, once the user gave them; `None` asks first.
+    params: Option<Vec<Param>>,
+}
+
+struct AskField {
+    key: String,
+    label: String,
+    value: TextField,
+}
+
+/// One value a statement asks for and the field of the dialog.
+impl AskParameters {
+    fn answered(&self) -> HashMap<String, String> {
+        self.fields
+            .iter()
+            .map(|field| (field.key.clone(), field.value.text.clone()))
+            .collect()
+    }
+}
+
+/// A transaction command the helper has not answered yet, and what waits for it.
+struct TransactionCommand {
+    source: SourceId,
+    kind: Transaction,
+    after: Option<PendingAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transaction {
+    AutoCommit(bool),
+    Commit,
+    Rollback,
+}
+
+/// What happens once the user decided the open transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingAction {
+    CloseConsole(PathBuf),
+    Disconnect(SourceId),
+    RemoveSource(SourceId),
+}
+
+/// The question of a close or a disconnect with a transaction still open. It stands over
+/// the console until the user commits, rolls back or cancels.
+struct PendingQuestion {
+    source: SourceId,
+    action: PendingAction,
+}
+
+/// The form behind the Export button of a result tab.
+struct ExportDialog {
+    tab_id: u64,
+    format: ExportFormat,
+    /// The table of the INSERT statements. A result of one table fills it, and a result
+    /// of no table leaves the field for the user.
+    table: TextField,
+    /// The result named its table, so the form does not ask for it.
+    known_table: bool,
+}
+
+/// Where an export goes: a file the user picked, or the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExportTarget {
+    File(PathBuf),
+    Clipboard,
+}
+
+/// An export in flight: the statement runs again without a row limit, and its rows become
+/// the text of the format while they arrive.
+struct ExportJob {
+    tab_id: u64,
+    source: SourceId,
+    /// The id of the query that fills the text.
+    id: u64,
+    exporter: Exporter,
+    target: ExportTarget,
+}
+
 /// What a data tab asked the connection for, so that the answer lands in the right place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DataRequest {
@@ -313,6 +413,9 @@ pub(crate) enum ScriptedCommand {
     Cancel,
 }
 
+/// A statement of the console and the values that went with it, for the window tests.
+type ParamQuery = (String, Vec<Param>);
+
 /// A connection of the window tests: no process, the answers are known in advance.
 struct Scripted {
     source: SourceId,
@@ -321,10 +424,219 @@ struct Scripted {
     closed: Arc<AtomicBool>,
     /// The statements the window would send.
     queries: Arc<Mutex<Vec<SentQuery>>>,
+    /// The values sent with the statements of the console, in order.
+    param_queries: Arc<Mutex<Vec<ParamQuery>>>,
     /// The answers of the data tab, one per request; an empty queue answers with `rows`.
     replies: VecDeque<ScriptedReply>,
+    /// The answers of the console, one per statement; an empty queue answers with `rows`.
+    console_replies: VecDeque<ResultSet>,
     /// Every request of the window, with the transaction commands of a data tab.
     commands: Arc<Mutex<Vec<ScriptedCommand>>>,
+    /// The statement runs until the window stops it, as a long query does.
+    hangs: bool,
+    /// The count the connection answers a count of a console result with.
+    count: Option<u64>,
+}
+
+/// One statement of the console and the tab of its result, under the console.
+pub(crate) struct ConsoleResult {
+    /// The id of the tab; the query that fills it carries its own one.
+    pub id: u64,
+    pub statement: String,
+    pub source: SourceId,
+    pub result: Option<ResultSet>,
+    pub error: Option<String>,
+    /// When the statement was sent, so its tab shows how long it ran.
+    pub started: Instant,
+    pub elapsed: Option<Duration>,
+    pub cancelled: bool,
+    /// The row limit of the last run; `None` when the statement asked for every row.
+    pub limit: Option<usize>,
+    /// The tab shows less than the statement returned.
+    pub truncated: bool,
+    /// The rows of the whole statement, when the user asked for their count.
+    pub total: Option<u64>,
+    /// The count of the statement runs: its tab shows an indicator and Stop stops it.
+    pub counting: bool,
+    /// A count may be asked for this statement: it yields rows and does not write, so
+    /// asking never runs a write twice.
+    pub rows_countable: bool,
+    /// The bytes of the rows read so far, so a wide result stops before the window holds
+    /// too much of it.
+    pub bytes: usize,
+    /// The tab explains a statement: its answer becomes a plan instead of a grid.
+    pub explain: bool,
+    /// The plan of an explained statement, once its answer is read.
+    pub plan: Option<ExplainPlan>,
+}
+
+impl ConsoleResult {
+    fn new(id: u64, statement: String, source: SourceId, limit: Option<usize>) -> Self {
+        Self {
+            id,
+            statement,
+            source,
+            result: None,
+            error: None,
+            started: Instant::now(),
+            elapsed: None,
+            cancelled: false,
+            limit,
+            truncated: false,
+            total: None,
+            counting: false,
+            rows_countable: false,
+            bytes: 0,
+            explain: false,
+            plan: None,
+        }
+    }
+
+    /// The tab of an explained statement, whose answer becomes a plan.
+    fn explain(id: u64, statement: String, source: SourceId) -> Self {
+        Self {
+            explain: true,
+            ..Self::new(id, statement, source, None)
+        }
+    }
+
+    /// Marks the result complete: a portion of a limited statement is truncated even when
+    /// the driver does not say so, and the tab says whether the user may ask for its count.
+    fn settle(&mut self, driver_truncated: bool, cancelled: bool) {
+        self.cancelled |= cancelled;
+        let limit = self.limit;
+        let statement = self.statement.as_str();
+        let Some(result) = &mut self.result else {
+            self.truncated = false;
+            self.rows_countable = false;
+            return;
+        };
+        result.truncated |= driver_truncated || cancelled;
+        // The driver cuts a limited statement without saying so: a portion is exactly the
+        // limit, unless the statement changed rows.
+        let portion = result.update_count.is_none()
+            && !result.columns.is_empty()
+            && limit.is_some_and(|limit| limit > 0 && result.rows.len() >= limit);
+        self.truncated = result.truncated || portion;
+        self.rows_countable =
+            !cancelled && self.truncated && database::countable_statement(statement);
+    }
+
+    /// Whether the footer offers a count of the rows of the whole statement.
+    pub(crate) fn countable(&self) -> bool {
+        self.rows_countable
+            && self.total.is_none()
+            && !self.counting
+            && !self.cancelled
+            && self.error.is_none()
+    }
+
+    /// The name of the tab: the head of the statement, as a console tab names it.
+    pub(crate) fn title(&self) -> String {
+        let flat = self
+            .statement
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut title: String = flat.chars().take(28).collect();
+        if flat.chars().count() > 28 {
+            title.push('…');
+        }
+        if title.is_empty() {
+            return if self.explain {
+                "Plan".to_owned()
+            } else {
+                "Statement".to_owned()
+            };
+        }
+        if self.explain {
+            format!("Plan: {title}")
+        } else {
+            title
+        }
+    }
+
+    /// Whether the footer offers Export: the statement only reads, so running it again
+    /// gives the same rows, and a plan has nothing to export.
+    pub(crate) fn can_export(&self) -> bool {
+        !self.explain
+            && self.error.is_none()
+            && !self.cancelled
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|result| !result.columns.is_empty())
+            && database::countable_statement(&self.statement)
+    }
+
+    fn running(&self) -> bool {
+        self.elapsed.is_none() && self.error.is_none()
+    }
+
+    /// How many rows the tab read, or the count the driver changed.
+    pub(crate) fn rows_text(&self) -> String {
+        if self.running() {
+            return "Running…".to_owned();
+        }
+        if self.error.is_some() {
+            return "Failed".to_owned();
+        }
+        let Some(result) = &self.result else {
+            return String::new();
+        };
+        if let Some(count) = result.update_count {
+            return format!("{count} rows affected");
+        }
+        let rows = result.rows.len();
+        let noun = if rows == 1 { "row" } else { "rows" };
+        match self.total {
+            Some(total) if total as usize > rows => {
+                format!("{rows} {noun} of {}", group_digits(total))
+            }
+            _ if self.truncated => format!("{rows}+ {noun}"),
+            _ => format!("{rows} {noun}"),
+        }
+    }
+
+    /// The time and the rows of the tab, as the row under its grid shows them.
+    pub(crate) fn summary(&self) -> String {
+        let rows = self.rows_text();
+        match self.elapsed {
+            Some(elapsed) => format!("{} ms · {rows}", elapsed.as_millis()),
+            None => rows,
+        }
+    }
+}
+
+/// The statements of a source that wait for Commit or Rollback, as the console says them.
+fn pending_text(pending: u32) -> String {
+    match pending {
+        0 => "No pending changes".to_owned(),
+        1 => "1 pending statement".to_owned(),
+        count => format!("{count} pending statements"),
+    }
+}
+
+/// The steps of a plan as the rows of a tree: each one with how deep it is.
+fn plan_rows(node: &ExplainNode, depth: usize, rows: &mut Vec<(usize, String)>) {
+    rows.push((depth, node.label.clone()));
+    for child in &node.children {
+        plan_rows(child, depth + 1, rows);
+    }
+}
+
+/// A number with a thin space between the groups of three, as the row count of a
+/// result reads: `12 840`.
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push('\u{a0}');
+        }
+        grouped.push(character);
+    }
+    grouped
 }
 
 /// The answer of a download: the version and the jar, or the reason it failed.
@@ -361,12 +673,39 @@ pub struct DatabasePanel {
     expanded: HashSet<(SourceId, String, String)>,
     errors: HashMap<SourceId, String>,
     schema_loading: HashSet<SourceId>,
-    result: Option<ResultSet>,
-    result_source: Option<SourceId>,
-    result_bytes: usize,
+    /// The tabs of the statements of the console, oldest first.
+    results: Vec<ConsoleResult>,
+    /// The tab the grid shows.
+    active_result: Option<u64>,
+    /// The tab of each query in flight, by the id of the query.
+    tabs_by_query: HashMap<u64, u64>,
+    /// The tab of each count in flight, by the id of the count query.
+    count_ids: HashMap<u64, u64>,
+    /// The schema the console of a source resolves bare names against, chosen in its
+    /// toolbar. A source without one uses the first schema of its tree.
+    default_schemas: HashMap<SourceId, String>,
+    /// The statements the user ran, newest first, for the history of the console.
+    console_history: Vec<String>,
     sort: Option<(usize, bool)>,
     selected_cell: Option<(usize, usize)>,
-    auto_commit: bool,
+    /// The sources whose console is in Manual: a statement waits for Commit or Rollback.
+    manual: HashMap<SourceId, bool>,
+    /// The statements that changed rows of each source since its last Commit or Rollback.
+    pending: HashMap<SourceId, u32>,
+    /// The transaction commands the helper has not answered yet.
+    transaction_ids: HashMap<u64, TransactionCommand>,
+    /// The question of a close or a disconnect with a transaction still open.
+    question: Option<PendingQuestion>,
+    /// The values the console asks before running a statement with placeholders.
+    params_ask: Option<AskParameters>,
+    /// The last value of each name of a placeholder, per source.
+    param_values: HashMap<(SourceId, String), String>,
+    /// The form behind the Export button of a result tab.
+    export_dialog: Option<ExportDialog>,
+    /// The export in flight, if any.
+    export: Option<ExportJob>,
+    /// The window of the tab: a console closes itself once its transaction is decided.
+    window: Option<WindowHandle<Workspace>>,
     /// The quote of each connected driver, from its `connected` answer.
     quotes: HashMap<SourceId, String>,
     sessions: HashMap<SourceId, Session>,
@@ -376,7 +715,7 @@ pub struct DatabasePanel {
     /// The sources whose driver the helper could not load, so the window offers the
     /// download even when a jar is present.
     driver_failed: HashSet<SourceId>,
-    queue: VecDeque<(SourceId, String, Option<usize>)>,
+    queue: VecDeque<QueuedStatement>,
     next_id: u64,
     passwords: HashMap<SourceId, Secret>,
     password: TextField,
@@ -448,12 +787,23 @@ impl DatabasePanel {
                 expanded: HashSet::new(),
                 errors: HashMap::new(),
                 schema_loading: HashSet::new(),
-                result: None,
-                result_source: None,
-                result_bytes: 0,
+                results: Vec::new(),
+                active_result: None,
+                tabs_by_query: HashMap::new(),
+                count_ids: HashMap::new(),
+                default_schemas: HashMap::new(),
+                console_history: Vec::new(),
                 sort: None,
                 selected_cell: None,
-                auto_commit: true,
+                manual: HashMap::new(),
+                pending: HashMap::new(),
+                transaction_ids: HashMap::new(),
+                question: None,
+                params_ask: None,
+                param_values: HashMap::new(),
+                export_dialog: None,
+                export: None,
+                window: None,
                 quotes: HashMap::new(),
                 sessions: HashMap::new(),
                 query_ids: HashMap::new(),
@@ -543,9 +893,26 @@ impl DatabasePanel {
         self.tables.get(source).cloned().unwrap_or_default()
     }
 
-    /// The last result of the console or of a double-clicked table.
+    /// The last result of the console or of a double-clicked table: the tab the grid
+    /// shows.
     pub fn result(&self) -> Option<ResultSet> {
-        self.result.clone()
+        self.active().and_then(|tab| tab.result.as_ref()).cloned()
+    }
+
+    fn active(&self) -> Option<&ConsoleResult> {
+        let id = self.active_result?;
+        self.results.iter().find(|tab| tab.id == id)
+    }
+
+    fn active_mut(&mut self) -> Option<&mut ConsoleResult> {
+        let id = self.active_result?;
+        self.results.iter_mut().find(|tab| tab.id == id)
+    }
+
+    /// The tab of a query in flight.
+    fn tab_of(&self, query: u64) -> Option<usize> {
+        let tab = *self.tabs_by_query.get(&query)?;
+        self.results.iter().position(|known| known.id == tab)
     }
 
     /// The error of the last statement, as the driver wrote it.
@@ -643,6 +1010,7 @@ impl DatabasePanel {
                 sql: history.sql,
                 timeout: None,
                 max_rows: None,
+                params: Vec::new(),
             })
             .is_ok()
         {
@@ -790,15 +1158,108 @@ impl DatabasePanel {
             *flag = Some(closed.clone());
         }
         self.scripted = Some(Scripted {
-            source: id,
+            source: id.clone(),
             rows,
             error,
             closed,
             queries: Arc::new(Mutex::new(Vec::new())),
+            param_queries: Arc::new(Mutex::new(Vec::new())),
             replies: VecDeque::new(),
+            console_replies: VecDeque::new(),
             commands: Arc::new(Mutex::new(Vec::new())),
+            hangs: false,
+            count: None,
         });
+        self.sync_schema(&id, cx);
         cx.notify();
+    }
+
+    /// The count a scripted connection answers with, for the window tests of Count rows.
+    #[cfg(test)]
+    pub(crate) fn scripted_count_for_test(&mut self, count: u64) {
+        if let Some(scripted) = &mut self.scripted {
+            scripted.count = Some(count);
+        }
+    }
+
+    /// A scripted connection whose statement runs until the window stops it, for the
+    /// window tests of the Stop button.
+    #[cfg(test)]
+    pub(crate) fn scripted_hangs_for_test(&mut self, hangs: bool) {
+        if let Some(scripted) = &mut self.scripted {
+            scripted.hangs = hangs;
+        }
+    }
+
+    /// The answers a scripted connection gives the console, one per statement.
+    #[cfg(test)]
+    pub(crate) fn scripted_console_replies_for_test(&mut self, replies: Vec<ResultSet>) {
+        if let Some(scripted) = &mut self.scripted {
+            scripted.console_replies = replies.into();
+        }
+    }
+
+    /// The values the window sent with the statements of its console, in order.
+    #[cfg(test)]
+    pub(crate) fn parameter_queries_for_test(&self) -> Vec<(String, Vec<Param>)> {
+        self.scripted
+            .as_ref()
+            .and_then(|scripted| scripted.param_queries.lock().ok().map(|sent| sent.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The names of the placeholders the console asks for.
+    #[cfg(test)]
+    pub(crate) fn asked_parameters_for_test(&self) -> Vec<String> {
+        self.params_ask
+            .as_ref()
+            .map(|ask| ask.fields.iter().map(|field| field.key.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the console asks Commit, Rollback or Cancel before it goes on.
+    #[cfg(test)]
+    pub(crate) fn transaction_question_for_test(&self) -> Option<String> {
+        self.question
+            .as_ref()
+            .map(|question| question.source.to_string())
+    }
+
+    /// The plans of the result tabs, for the window tests of Explain Plan.
+    #[cfg(test)]
+    pub(crate) fn plans_for_test(&self) -> Vec<(String, Option<ExplainPlan>)> {
+        self.results
+            .iter()
+            .filter(|tab| tab.explain)
+            .map(|tab| (tab.statement.clone(), tab.plan.clone()))
+            .collect()
+    }
+
+    /// Whether the Export form of a result tab is open, and its format.
+    #[cfg(test)]
+    pub(crate) fn export_dialog_for_test(&self) -> Option<ExportFormat> {
+        self.export_dialog.as_ref().map(|dialog| dialog.format)
+    }
+
+    /// The tabs of the statements of the console, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn results_for_test(&self) -> Vec<(String, String, Option<String>)> {
+        self.results
+            .iter()
+            .map(|tab| (tab.title(), tab.summary(), tab.error.clone()))
+            .collect()
+    }
+
+    /// The statements the console remembers, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn console_history_for_test(&self) -> Vec<String> {
+        self.console_history.clone()
+    }
+
+    /// Whether a statement of the selected source still runs, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn running_for_test(&self) -> bool {
+        !self.query_ids.is_empty()
     }
 
     /// The language side of the window, for the window tests: the application puts one
@@ -966,7 +1427,11 @@ impl DatabasePanel {
         cx.spawn(async move |this, cx| {
             let store = job.await;
             this.update(cx, |this, cx| {
-                this.sources = store.sources;
+                // A window test hands its source to a scripted connection before the file
+                // of the project arrives; the file then has nothing to say about it.
+                if this.scripted.is_none() {
+                    this.sources = store.sources;
+                }
                 if this.selected.is_none() {
                     this.selected = this.sources.first().map(|source| source.id.clone());
                 }
@@ -1143,6 +1608,15 @@ impl DatabasePanel {
         if self.data_event(&source, event.clone(), cx) {
             return;
         }
+        if self.export_event(&source, &event, cx) {
+            return;
+        }
+        if self.count_event(&event, cx) {
+            return;
+        }
+        if self.transaction_event(&source, &event, cx) {
+            return;
+        }
         match event {
             Event::Ready { .. } => {}
             Event::Connected {
@@ -1153,53 +1627,67 @@ impl DatabasePanel {
             } => {
                 self.connect_ids.remove(&source);
                 self.driver_failed.remove(&source);
-                self.auto_commit = auto_commit;
+                // A connection starts in the mode the driver reports; a source opened in
+                // Manual keeps it across a reconnect.
+                self.manual.entry(source.clone()).or_insert(!auto_commit);
+                self.pending.remove(&source);
                 self.quotes.insert(source.clone(), quote);
                 self.status = Some(format!("Connected to {product}"));
                 self.request_history(source.clone(), cx);
                 self.request_schema(source, cx);
             }
             Event::Columns { id, columns } => {
-                if self.query_ids.get(&source) == Some(&id) {
-                    self.result = Some(ResultSet {
+                if let Some(index) = self.tab_of(id) {
+                    let tab = &mut self.results[index];
+                    tab.result = Some(ResultSet {
                         columns,
                         rows: Vec::new(),
                         update_count: None,
                         truncated: false,
                     });
-                    self.result_source = Some(source.clone());
-                    self.result_bytes = 0;
-                    self.selected_cell = None;
+                    tab.bytes = 0;
+                    tab.error = None;
+                    tab.elapsed = None;
+                    if self.active_result != Some(tab.id) {
+                        self.active_result = Some(tab.id);
+                        self.selected_cell = None;
+                    }
                     cx.notify();
                 }
             }
             Event::Rows { id, rows } => {
-                if self.query_ids.get(&source) == Some(&id) {
-                    self.add_rows(source, id, rows, cx);
-                }
+                self.add_rows(source, id, rows, cx);
             }
             Event::Done {
                 id,
                 update_count,
                 truncated,
                 cancelled,
-                ..
+                elapsed,
             } => {
-                if self.query_ids.get(&source) == Some(&id) {
-                    self.query_ids.remove(&source);
-                    if let Some(result) = &mut self.result {
-                        result.truncated |= truncated;
-                        if cancelled {
-                            result.truncated = true;
+                if let Some(index) = self.tab_of(id) {
+                    {
+                        let tab = &mut self.results[index];
+                        tab.elapsed = Some(tab.started.elapsed().max(elapsed));
+                        if let Some(count) = update_count {
+                            match &mut tab.result {
+                                Some(result) => result.update_count = Some(count),
+                                None => {
+                                    tab.result = Some(ResultSet {
+                                        update_count: Some(count),
+                                        ..ResultSet::default()
+                                    })
+                                }
+                            }
                         }
-                    } else if update_count.is_some() {
-                        self.result = Some(ResultSet {
-                            columns: Vec::new(),
-                            rows: Vec::new(),
-                            update_count,
-                            truncated,
-                        });
-                        self.result_source = Some(source.clone());
+                        tab.total = None;
+                        tab.counting = false;
+                        tab.settle(truncated, cancelled);
+                    }
+                    self.finish_statement(index, &source, cx);
+                    self.tabs_by_query.remove(&id);
+                    if self.query_ids.get(&source) == Some(&id) {
+                        self.query_ids.remove(&source);
                     }
                     cx.notify();
                     self.run_next(cx);
@@ -1226,15 +1714,22 @@ impl DatabasePanel {
                     cx.notify();
                     return;
                 }
-                if self.query_ids.get(&source) == Some(&id) {
-                    self.query_ids.remove(&source);
+                if let Some(index) = self.tab_of(id) {
                     let text = if cancelled {
                         "The statement was cancelled.".to_owned()
                     } else {
                         message
                     };
+                    let tab = &mut self.results[index];
+                    tab.elapsed = Some(tab.started.elapsed());
+                    tab.cancelled = cancelled;
+                    tab.error = Some(text.clone());
+                    tab.result = None;
+                    self.tabs_by_query.remove(&id);
+                    if self.query_ids.get(&source) == Some(&id) {
+                        self.query_ids.remove(&source);
+                    }
                     self.errors.insert(source.clone(), text);
-                    self.result = None;
                     cx.notify();
                     self.run_next(cx);
                 }
@@ -1255,6 +1750,7 @@ impl DatabasePanel {
                 truncated, partial, ..
             } => {
                 self.schema_loading.remove(&source);
+                self.sync_schema(&source, cx);
                 if truncated || partial {
                     self.status = Some(if truncated {
                         "The schema is longer than the window reads.".to_owned()
@@ -1292,16 +1788,20 @@ impl DatabasePanel {
         rows: Vec<Vec<Value>>,
         cx: &mut Context<Self>,
     ) {
-        let Some(result) = &mut self.result else {
+        let Some(index) = self.tab_of(id) else {
+            return;
+        };
+        let tab = &mut self.results[index];
+        let Some(result) = &mut tab.result else {
             return;
         };
         let mut truncated = result.truncated;
         for row in rows {
-            if result.rows.len() >= MAX_RESULT_ROWS || self.result_bytes >= MAX_RESULT_BYTES {
+            if result.rows.len() >= MAX_RESULT_ROWS || tab.bytes >= MAX_RESULT_BYTES {
                 truncated = true;
                 break;
             }
-            self.result_bytes += row.iter().map(value_bytes).sum::<usize>();
+            tab.bytes += row.iter().map(value_bytes).sum::<usize>();
             result.rows.push(row);
         }
         result.truncated |= truncated;
@@ -1320,6 +1820,176 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    /// Counts the rows of a limited statement when the user asks for it, as DataGrip
+    /// counts on a click: the statement itself ran once, and its count runs here with the
+    /// indicator and Stop of the console.
+    fn count_rows(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.results.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if !tab.countable() {
+            return;
+        }
+        let source = tab.source.clone();
+        let Some(sql) = count_statement(&tab.statement) else {
+            return;
+        };
+        // One statement per source runs at a time, and the tab of its answer is one.
+        if self.query_ids.contains_key(&source) {
+            return;
+        }
+        let scripted = self.scripted.as_ref().map(|scripted| {
+            (
+                scripted.source.clone(),
+                scripted.hangs,
+                scripted.count,
+                scripted.queries.clone(),
+            )
+        });
+        if let Some((known, hangs, count, queries)) = scripted {
+            if known != source {
+                return;
+            }
+            if let Ok(mut queries) = queries.lock() {
+                queries.push((sql.clone(), None));
+            }
+            if hangs {
+                let id = self.next();
+                self.count_ids.insert(id, tab_id);
+                self.query_ids.insert(source, id);
+                self.mark_counting(tab_id, true, cx);
+                return;
+            }
+            // A scripted connection knows its answer: the window test reads the count.
+            if let Some(count) = count
+                && let Some(tab) = self.results.iter_mut().find(|tab| tab.id == tab_id)
+            {
+                tab.total = Some(count);
+            }
+            cx.notify();
+            return;
+        }
+        let id = self.next();
+        let Some(session) = self.sessions.get(&source) else {
+            return;
+        };
+        if session
+            .send(Command::Query {
+                id,
+                sql,
+                timeout: None,
+                max_rows: None,
+                params: Vec::new(),
+            })
+            .is_ok()
+        {
+            self.count_ids.insert(id, tab_id);
+            self.query_ids.insert(source, id);
+            self.mark_counting(tab_id, true, cx);
+        }
+    }
+
+    /// Shows or clears the indicator of a count in flight on the tab that asked.
+    fn mark_counting(&mut self, tab_id: u64, counting: bool, cx: &mut Context<Self>) {
+        if let Some(tab) = self.results.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.counting = counting;
+        }
+        cx.notify();
+    }
+
+    /// The answer of a count query: the first cell is the number of rows.
+    fn count_event(&mut self, event: &Event, cx: &mut Context<Self>) -> bool {
+        let id = match event {
+            Event::Columns { id, .. }
+            | Event::Rows { id, .. }
+            | Event::Done { id, .. }
+            | Event::Error { id, .. } => *id,
+            _ => return false,
+        };
+        let Some(tab_id) = self.count_ids.get(&id).copied() else {
+            return false;
+        };
+        match event {
+            Event::Rows { rows, .. } => {
+                let count = rows.first().and_then(|row| row.first()).and_then(count_of);
+                if let Some(count) = count
+                    && let Some(tab) = self.results.iter_mut().find(|tab| tab.id == tab_id)
+                {
+                    tab.total = Some(count);
+                    tab.counting = false;
+                    cx.notify();
+                }
+            }
+            Event::Done { .. } | Event::Error { .. } => {
+                self.count_ids.remove(&id);
+                self.query_ids.retain(|_, active| *active != id);
+                self.mark_counting(tab_id, false, cx);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Hands the loaded schema of a source to the language of its console, so a keystroke
+    /// completes and checks against it without asking the database.
+    fn sync_schema(&self, source: &SourceId, cx: &App) {
+        let Some(language) = crate::database_console::language_for(&self.state_dir, cx) else {
+            return;
+        };
+        let Some(known) = self.sources.iter().find(|known| &known.id == source) else {
+            return;
+        };
+        let tables = self.tables.get(source).cloned().unwrap_or_default();
+        let default = self.default_schemas.get(source).cloned().or_else(|| {
+            tables
+                .iter()
+                .find(|table| !table.schema.is_empty())
+                .map(|table| table.schema.clone())
+        });
+        language.set_source(source.clone(), tables, Dialect::of(known.kind), default);
+    }
+
+    /// The schemas of the loaded tree of a source, as the toolbar offers them.
+    fn schemas_of(&self, source: &SourceId) -> Vec<String> {
+        let mut schemas: Vec<String> = Vec::new();
+        for table in self.tables.get(source).into_iter().flatten() {
+            if !table.schema.is_empty()
+                && !schemas
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&table.schema))
+            {
+                schemas.push(table.schema.clone());
+            }
+        }
+        schemas.sort();
+        schemas
+    }
+
+    /// The default schema of a source: the one the user chose, or the first of its tree.
+    fn default_schema(&self, source: &SourceId) -> Option<String> {
+        self.default_schemas
+            .get(source)
+            .cloned()
+            .or_else(|| self.schemas_of(source).into_iter().next())
+    }
+
+    /// Records a statement the user ran, newest first, for the history of the console.
+    fn remember_statement(&mut self, sql: &str) {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return;
+        }
+        if self
+            .console_history
+            .first()
+            .is_some_and(|known| known == sql)
+        {
+            return;
+        }
+        self.console_history.insert(0, sql.to_owned());
+        self.console_history.truncate(50);
+    }
+
     fn request_schema(&mut self, source: SourceId, cx: &mut Context<Self>) {
         if !self.sessions.contains_key(&source) {
             return;
@@ -1329,7 +1999,10 @@ impl DatabasePanel {
             && session.send(Command::Schema { id }).is_ok()
         {
             self.schema_loading.insert(source.clone());
-            self.tables.insert(source, Vec::new());
+            self.tables.insert(source.clone(), Vec::new());
+            // The tree is being read again: the console completes nothing until the
+            // new schema arrives, so it never offers a table that is gone.
+            self.sync_schema(&source, cx);
         }
         cx.notify();
     }
@@ -1673,16 +2346,63 @@ impl DatabasePanel {
         }
     }
 
+    /// Disconnects a source as its toolbar button does: an open transaction asks first.
+    fn disconnect_source(&mut self, source: SourceId, cx: &mut Context<Self>) {
+        if self.pending_count(&source) > 0 {
+            self.question = Some(PendingQuestion {
+                source: source.clone(),
+                action: PendingAction::Disconnect(source),
+            });
+            cx.notify();
+            return;
+        }
+        self.disconnect(source, cx);
+    }
+
+    /// Removes a source as its menu does: an open transaction asks first, because the
+    /// connection goes away and the database rolls it back.
+    fn remove_source_asked(&mut self, source: SourceId, cx: &mut Context<Self>) {
+        if self.pending_count(&source) > 0 {
+            self.question = Some(PendingQuestion {
+                source: source.clone(),
+                action: PendingAction::RemoveSource(source),
+            });
+            cx.notify();
+            return;
+        }
+        self.remove_source(source, cx);
+    }
+
     fn disconnect(&mut self, source: SourceId, cx: &mut Context<Self>) {
         self.sessions.remove(&source);
         self.query_ids.remove(&source);
         self.connect_ids.remove(&source);
         self.quotes.remove(&source);
         self.schema_loading.remove(&source);
+        // The connection is gone, so its transaction is over: the database rolled it
+        // back when the helper ended.
+        self.pending.remove(&source);
+        self.transaction_ids
+            .retain(|_, command| command.source != source);
+        if self.export.as_ref().is_some_and(|job| job.source == source) {
+            self.export = None;
+        }
         self.history_queue.clear();
         self.history_pending = None;
         self.history_collected.clear();
         self.history_read = false;
+        // A statement of the closed connection will not answer: its tab says so.
+        for tab in &mut self.results {
+            if tab.source == source && tab.running() {
+                tab.elapsed = Some(tab.started.elapsed());
+                tab.error = Some("The connection is closed.".to_owned());
+            }
+        }
+        self.tabs_by_query.clear();
+        self.count_ids.clear();
+        if let Some(language) = crate::database_console::language_for(&self.state_dir, cx) {
+            language.clear_source(&source);
+        }
         cx.notify();
     }
 
@@ -1720,76 +2440,666 @@ impl DatabasePanel {
         max_rows: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(scripted) = &self.scripted {
-            if scripted.source != source {
+        let scripted_source = self
+            .scripted
+            .as_ref()
+            .is_some_and(|scripted| scripted.source == source);
+        if self.scripted.is_some() && !scripted_source {
+            return;
+        }
+        if self.scripted.is_none() {
+            if let Some(session) = self.sessions.get(&source) {
+                if let Some(active) = self.query_ids.get(&source).copied() {
+                    let _ = session.send(Command::Cancel { id: active });
+                }
+            } else {
+                self.errors.insert(
+                    source.clone(),
+                    "Connect the source before running its console.".into(),
+                );
+                cx.notify();
                 return;
             }
-            if let Ok(mut queries) = scripted.queries.lock() {
-                queries.push((text.clone(), max_rows));
-            }
-            match &scripted.error {
-                Some(error) => {
-                    self.errors.insert(source, error.clone());
-                    self.result = None;
-                }
-                None => {
-                    self.errors.remove(&source);
-                    self.result = Some(scripted.rows.clone());
-                    self.result_source = Some(scripted.source.clone());
-                    self.result_bytes = 0;
-                    self.selected_cell = None;
-                }
-            }
-            cx.notify();
-            return;
-        }
-        if let Some(session) = self.sessions.get(&source) {
-            if let Some(active) = self.query_ids.get(&source).copied() {
-                let _ = session.send(Command::Cancel { id: active });
-            }
-        } else {
-            self.errors.insert(
-                source.clone(),
-                "Connect the source before running its console.".into(),
-            );
-            cx.notify();
-            return;
         }
         let statements = database::split_statements(&text);
+        if statements.is_empty() {
+            return;
+        }
         self.queue.clear();
         for statement in statements {
-            self.queue.push_back((source.clone(), statement, max_rows));
+            self.queue.push_back(QueuedStatement {
+                source: source.clone(),
+                sql: statement,
+                max_rows,
+                params: None,
+            });
         }
         self.run_next(cx);
     }
 
+    /// Runs the next statement of the queue. A statement with placeholders is not sent
+    /// until the user gave their values: the dialog opens and the queue waits.
     fn run_next(&mut self, cx: &mut Context<Self>) {
-        while let Some((source, sql, max_rows)) = self.queue.pop_front() {
-            if !self.sessions.contains_key(&source) {
+        while let Some(mut queued) = self.queue.pop_front() {
+            if self.scripted.is_none() && !self.sessions.contains_key(&queued.source) {
                 continue;
             }
-            let id = self.next();
-            let Some(session) = self.sessions.get(&source) else {
-                continue;
-            };
-            self.errors.remove(&source);
-            self.result = None;
-            self.result_source = Some(source.clone());
-            self.result_bytes = 0;
-            self.selected_cell = None;
-            if session
-                .send(Command::Query {
-                    id,
-                    sql,
-                    timeout: None,
-                    max_rows,
-                })
-                .is_ok()
-            {
-                self.query_ids.insert(source, id);
-                cx.notify();
+            if queued.params.is_none() {
+                let asked = asked_parameters(&queued.sql);
+                if !asked.is_empty() {
+                    self.ask_parameters(queued, asked, cx);
+                    return;
+                }
+                queued.params = Some(self.remembered_params(&queued.source, &queued.sql));
+            }
+            let params = queued.params.unwrap_or_default();
+            if !self.start_statement(
+                queued.source,
+                queued.sql,
+                queued.max_rows,
+                params,
+                false,
+                cx,
+            ) {
                 return;
             }
+        }
+    }
+
+    /// Sets up the tab of one statement and sends it to the helper. The answer is `false`
+    /// when the statement runs and the console waits for it.
+    fn start_statement(
+        &mut self,
+        source: SourceId,
+        sql: String,
+        max_rows: Option<usize>,
+        params: Vec<Param>,
+        explain: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let id = self.next();
+        let tab = if explain {
+            ConsoleResult::explain(id, sql.clone(), source.clone())
+        } else {
+            ConsoleResult::new(id, sql.clone(), source.clone(), max_rows)
+        };
+        let tab_id = tab.id;
+        self.results.push(tab);
+        self.active_result = Some(tab_id);
+        self.selected_cell = None;
+        self.sort = None;
+        self.errors.remove(&source);
+        if !explain {
+            self.remember_statement(&sql);
+        }
+        self.tabs_by_query.insert(id, tab_id);
+        if self.scripted.is_some() {
+            let rows = {
+                let Some(scripted) = self.scripted.as_mut() else {
+                    return true;
+                };
+                if let Ok(mut queries) = scripted.queries.lock() {
+                    queries.push((sql.clone(), max_rows));
+                }
+                if let Ok(mut sent) = scripted.param_queries.lock() {
+                    sent.push((sql.clone(), params.clone()));
+                }
+                if scripted.hangs {
+                    self.query_ids.insert(source.clone(), id);
+                    cx.notify();
+                    return false;
+                }
+                let error = scripted.error.clone();
+                let rows = scripted
+                    .console_replies
+                    .pop_front()
+                    .unwrap_or_else(|| scripted.rows.clone());
+                (error, rows)
+            };
+            let index = self.results.len() - 1;
+            let tab = &mut self.results[index];
+            tab.elapsed = Some(tab.started.elapsed());
+            match rows.0 {
+                Some(error) => {
+                    tab.error = Some(error.clone());
+                    self.errors.insert(source.clone(), error);
+                }
+                None => {
+                    tab.result = Some(rows.1);
+                    tab.bytes = 0;
+                    tab.settle(false, false);
+                }
+            }
+            self.finish_statement(index, &source, cx);
+            self.tabs_by_query.remove(&id);
+            return true;
+        }
+        let Some(session) = self.sessions.get(&source) else {
+            self.tabs_by_query.remove(&id);
+            return true;
+        };
+        if session
+            .send(Command::Query {
+                id,
+                sql,
+                timeout: None,
+                max_rows,
+                params,
+            })
+            .is_ok()
+        {
+            self.query_ids.insert(source, id);
+            cx.notify();
+            return false;
+        }
+        self.tabs_by_query.remove(&id);
+        true
+    }
+
+    /// The last thing a statement does with its tab: a plan becomes a tree, and a change
+    /// of a source in Manual has to be committed or rolled back.
+    fn finish_statement(&mut self, index: usize, source: &SourceId, cx: &mut Context<Self>) {
+        let Some(tab) = self.results.get(index) else {
+            return;
+        };
+        let explain = tab.explain;
+        let changed = tab
+            .result
+            .as_ref()
+            .and_then(|result| result.update_count)
+            .is_some();
+        if explain {
+            self.build_plan(index);
+        }
+        if changed && !self.auto_commit(source) {
+            *self.pending.entry(source.clone()).or_insert(0) += 1;
+        }
+        cx.notify();
+    }
+
+    /// Turns the rows of an explained statement into the plan of its tab.
+    fn build_plan(&mut self, index: usize) {
+        let Some(tab) = self.results.get(index) else {
+            return;
+        };
+        if !tab.explain {
+            return;
+        }
+        let dialect = self.dialect_of(&tab.source);
+        let (columns, rows) = match &tab.result {
+            Some(result) => (result.columns.clone(), result.rows.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        let plan: ExplainPlan = database::plan_of(dialect, &columns, &rows);
+        if let Some(tab) = self.results.get_mut(index) {
+            tab.plan = Some(plan);
+        }
+    }
+
+    /// The dialect of the kind of a source.
+    fn dialect_of(&self, source: &SourceId) -> Dialect {
+        self.sources
+            .iter()
+            .find(|known| &known.id == source)
+            .map(|known| Dialect::of(known.kind))
+            .unwrap_or_default()
+    }
+
+    /// The values the console remembers for the placeholders of a source.
+    fn remembered_values(&self, source: &SourceId) -> HashMap<String, String> {
+        self.param_values
+            .iter()
+            .filter(|((known, _), _)| known == source)
+            .map(|((_, key), value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// The remembered values as the driver binds them, for a statement that is sent
+    /// without a question: Explain Plan of a statement with placeholders.
+    fn remembered_params(&self, source: &SourceId, sql: &str) -> Vec<Param> {
+        bind_parameters(sql, &self.remembered_values(source))
+    }
+
+    /// Asks for the values of a statement before it runs, with the last values in place.
+    fn ask_parameters(
+        &mut self,
+        queued: QueuedStatement,
+        asked: Vec<database::Parameter>,
+        cx: &mut Context<Self>,
+    ) {
+        let remembered = self.remembered_values(&queued.source);
+        let fields = asked
+            .into_iter()
+            .map(|parameter| AskField {
+                value: TextField::from_text(
+                    remembered.get(&parameter.key).cloned().unwrap_or_default(),
+                ),
+                label: parameter.label,
+                key: parameter.key,
+            })
+            .collect();
+        self.params_ask = Some(AskParameters {
+            source: queued.source,
+            sql: queued.sql,
+            max_rows: queued.max_rows,
+            fields,
+            focused: 0,
+        });
+        // The fields take the keys at once, as a dialog of the console does.
+        if let Some(window) = self.window {
+            let focus = self.focus.clone();
+            cx.defer(move |cx| {
+                window
+                    .update(cx, |_, window, cx| window.focus(&focus, cx))
+                    .ok();
+            });
+        }
+        cx.notify();
+    }
+
+    /// Runs the statement that waited for its values, or drops the run when the user
+    /// cancelled.
+    fn answer_parameters(&mut self, run: bool, cx: &mut Context<Self>) {
+        let Some(ask) = self.params_ask.take() else {
+            return;
+        };
+        if !run {
+            self.queue.clear();
+            cx.notify();
+            return;
+        }
+        let values = ask.answered();
+        for (key, value) in &values {
+            self.param_values
+                .insert((ask.source.clone(), key.clone()), value.clone());
+        }
+        // The statement is answered: it joins the queue with its values, so it does not
+        // ask again on the way to the helper.
+        let params = bind_parameters(&ask.sql, &values);
+        self.queue.push_front(QueuedStatement {
+            source: ask.source,
+            sql: ask.sql,
+            max_rows: ask.max_rows,
+            params: Some(params),
+        });
+        self.run_next(cx);
+    }
+
+    /// Explains the statement of a console: its plan opens as a tab of the console.
+    pub(crate) fn explain(&mut self, source: SourceId, statement: String, cx: &mut Context<Self>) {
+        let Some(sql) = database::split_statements(&statement).into_iter().next() else {
+            return;
+        };
+        if self.scripted.is_none() && !self.sessions.contains_key(&source) {
+            self.errors.insert(
+                source.clone(),
+                "Connect the source before explaining its console.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        let params = self.remembered_params(&source, &sql);
+        let query = database::explain_statement(self.dialect_of(&source), &sql);
+        self.start_statement(source, query, None, params, true, cx);
+    }
+
+    /// Opens the Export form of a result tab. The statement is not run again here: an
+    /// export is a command of the user, and a statement that writes has no export.
+    fn open_export(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.results.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if !tab.can_export() {
+            return;
+        }
+        let table = database::single_table(&tab.statement);
+        self.export_dialog = Some(ExportDialog {
+            tab_id,
+            format: ExportFormat::Csv,
+            table: TextField::from_text(
+                table
+                    .as_ref()
+                    .map(|table| table.name.clone())
+                    .unwrap_or_default(),
+            ),
+            known_table: table.is_some(),
+        });
+        cx.notify();
+    }
+
+    /// Starts the export the form asked for: the statement runs again in full, and the
+    /// rows become the text of the format while they arrive.
+    fn start_export(&mut self, target: ExportTarget, cx: &mut Context<Self>) {
+        let Some(dialog) = self.export_dialog.take() else {
+            return;
+        };
+        let Some(tab) = self.results.iter().find(|tab| tab.id == dialog.tab_id) else {
+            return;
+        };
+        let source = tab.source.clone();
+        let statement = tab.statement.clone();
+        let table = if dialog.known_table {
+            database::single_table(&statement).unwrap_or_default()
+        } else {
+            TableRef::new("", dialog.table.text.trim())
+        };
+        if dialog.format == ExportFormat::SqlInsert && table.name.is_empty() {
+            self.status = Some("Name the table of the INSERT statements.".to_owned());
+            self.export_dialog = Some(dialog);
+            cx.notify();
+            return;
+        }
+        if self.scripted.is_none() && !self.sessions.contains_key(&source) {
+            self.status = Some("Connect the source before exporting its result.".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.query_ids.contains_key(&source) {
+            self.status = Some("A statement of this source still runs.".to_owned());
+            cx.notify();
+            return;
+        }
+        let mut exporter = Exporter::new(dialog.format, self.dialect_of(&source), table);
+        if let Some(scripted) = self.scripted.as_mut() {
+            if scripted.source != source {
+                return;
+            }
+            if let Ok(mut queries) = scripted.queries.lock() {
+                queries.push((statement.clone(), None));
+            }
+            let answer = scripted
+                .console_replies
+                .pop_front()
+                .unwrap_or_else(|| scripted.rows.clone());
+            exporter.start(&answer.columns);
+            for row in &answer.rows {
+                exporter.push(row);
+            }
+            self.finish_export(exporter, target, cx);
+            return;
+        }
+        let id = self.next();
+        let params = self.remembered_params(&source, &statement);
+        let Some(session) = self.sessions.get(&source) else {
+            return;
+        };
+        let sent = session
+            .send(Command::Query {
+                id,
+                sql: statement,
+                timeout: None,
+                max_rows: None,
+                params,
+            })
+            .is_ok();
+        if sent {
+            self.export = Some(ExportJob {
+                tab_id: dialog.tab_id,
+                source: source.clone(),
+                id,
+                exporter,
+                target,
+            });
+            self.query_ids.insert(source, id);
+            cx.notify();
+        }
+    }
+
+    /// Writes the text of a finished export to its file or its clipboard.
+    fn finish_export(&mut self, exporter: Exporter, target: ExportTarget, cx: &mut Context<Self>) {
+        let rows = exporter.rows();
+        let text = exporter.finish();
+        match target {
+            ExportTarget::Clipboard => {
+                cx.write_to_clipboard(ui_kit::ClipboardItem::new_string(text));
+                self.status = Some(format!("{rows} rows copied."));
+                cx.notify();
+            }
+            ExportTarget::File(path) => {
+                let job = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::write(&path, text) });
+                cx.spawn(async move |this, cx| {
+                    let result = job.await;
+                    this.update(cx, |this, cx| {
+                        this.status = Some(match &result {
+                            Ok(()) => format!("{rows} rows exported."),
+                            Err(error) => format!("The export failed: {error}"),
+                        });
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// The answers of an export: its columns, its rows and its end.
+    fn export_event(&mut self, source: &SourceId, event: &Event, cx: &mut Context<Self>) -> bool {
+        let id = match event {
+            Event::Columns { id, .. }
+            | Event::Rows { id, .. }
+            | Event::Done { id, .. }
+            | Event::Error { id, .. } => *id,
+            _ => return false,
+        };
+        let Some(job) = self.export.as_ref().filter(|job| job.id == id) else {
+            return false;
+        };
+        if &job.source != source {
+            return false;
+        }
+        match event {
+            Event::Columns { columns, .. } => {
+                if let Some(job) = &mut self.export {
+                    job.exporter.start(columns);
+                }
+                cx.notify();
+            }
+            Event::Rows { rows, .. } => {
+                if let Some(job) = &mut self.export {
+                    for row in rows {
+                        job.exporter.push(row);
+                    }
+                }
+                if let Some(session) = self.sessions.get(source) {
+                    // A full batch waits for a fetch, as it does for a console result.
+                    let _ = session.send(Command::Fetch { id });
+                }
+                cx.notify();
+            }
+            Event::Done {
+                cancelled: true, ..
+            } => {
+                let rows = self.export.take().map_or(0, |job| job.exporter.rows());
+                self.query_ids.remove(source);
+                self.status = Some(format!("The export was stopped after {rows} rows."));
+                cx.notify();
+            }
+            Event::Done { .. } => {
+                let Some(job) = self.export.take() else {
+                    return true;
+                };
+                self.query_ids.remove(source);
+                self.finish_export(job.exporter, job.target, cx);
+            }
+            Event::Error {
+                message, cancelled, ..
+            } => {
+                self.export = None;
+                self.query_ids.remove(source);
+                self.status = Some(if *cancelled {
+                    "The export was stopped.".to_owned()
+                } else {
+                    format!("The export failed: {message}")
+                });
+                cx.notify();
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// The tab an export was made for: the form and the progress name it.
+    fn export_title(&self, tab_id: u64) -> Option<String> {
+        self.results
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(ConsoleResult::title)
+    }
+
+    /// Runs the statement or the selection of the open console of a source, as its
+    /// toolbar Execute button does.
+    fn execute_console(&mut self, source: SourceId, cx: &mut Context<Self>) {
+        let Some(path) = self.console_path(&source) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let view = workspace
+            .read(cx)
+            .view_of(&path)
+            .and_then(|view| view.downcast::<EditorView>().ok());
+        let Some(view) = view else {
+            // No tab of the console is open: the file still holds the statements the
+            // button runs.
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                self.run_sql(source, text, Some(self.console_rows(cx)), cx);
+            }
+            return;
+        };
+        let selection = view.read(cx).selected_text();
+        let text = selection.or_else(|| {
+            let caret = view.read(cx).caret().0;
+            view.read(cx)
+                .text()
+                .and_then(|text| database::statement_at(&text, caret))
+        });
+        if let Some(text) = text {
+            self.run_sql(source, text, Some(self.console_rows(cx)), cx);
+        }
+    }
+
+    /// The rows a console statement reads at a time.
+    fn console_rows(&self, cx: &App) -> usize {
+        cx.try_global::<Settings>()
+            .map_or(workspace::DEFAULT_DATABASE_PAGE_ROWS, |settings| {
+                settings.database_page_rows
+            }) as usize
+    }
+
+    /// Stops the statement of the selected source: the helper calls `cancel` on it and
+    /// answers the tab, while the window keeps drawing.
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.clone() else {
+            return;
+        };
+        let Some(id) = self.query_ids.get(&source).copied() else {
+            return;
+        };
+        if let Some(scripted) = &self.scripted {
+            if let Ok(mut commands) = scripted.commands.lock() {
+                commands.push(ScriptedCommand::Cancel);
+            }
+            self.finish_cancelled(&source, id, cx);
+            return;
+        }
+        if let Some(session) = self.sessions.get(&source) {
+            let _ = session.send(Command::Cancel { id });
+        }
+        self.status = Some("Stopping the statement…".to_owned());
+        cx.notify();
+    }
+
+    /// The answer of a stopped statement that has no helper, as a scripted connection.
+    fn finish_cancelled(&mut self, source: &SourceId, id: u64, cx: &mut Context<Self>) {
+        // An export has no tab of its own: what it read so far stays unwritten.
+        if self.export.as_ref().is_some_and(|job| job.id == id) {
+            let rows = self.export.take().map_or(0, |job| job.exporter.rows());
+            self.query_ids.remove(source);
+            self.status = Some(format!("The export was stopped after {rows} rows."));
+            cx.notify();
+            return;
+        }
+        // A count has no tab of its own: the tab that asked shows its indicator again.
+        if let Some(tab_id) = self.count_ids.remove(&id) {
+            self.query_ids.retain(|_, active| *active != id);
+            self.status = Some("The count was stopped.".to_owned());
+            self.mark_counting(tab_id, false, cx);
+            self.run_next(cx);
+            return;
+        }
+        let Some(index) = self.tab_of(id) else {
+            return;
+        };
+        let tab = &mut self.results[index];
+        tab.elapsed = Some(tab.started.elapsed());
+        tab.cancelled = true;
+        tab.error = Some("The statement was cancelled.".to_owned());
+        tab.result = None;
+        self.tabs_by_query.remove(&id);
+        if self.query_ids.get(source) == Some(&id) {
+            self.query_ids.remove(source);
+        }
+        self.errors
+            .insert(source.clone(), "The statement was cancelled.".to_owned());
+        cx.notify();
+        self.run_next(cx);
+    }
+
+    /// Runs the statement of a result tab again with a larger limit: the tab then shows
+    /// more of it in place.
+    fn load_more(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.results.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let source = tab.source.clone();
+        let statement = tab.statement.clone();
+        let shown = tab.result.as_ref().map_or(0, |result| result.rows.len());
+        let step = self.console_rows(cx);
+        let limit = shown.max(step) + step;
+        if self.scripted.is_some() {
+            // The scripted answer never grows; the tab still shows how many rows it read.
+            return;
+        }
+        let params = self.remembered_params(&source, &statement);
+        let id = self.next();
+        if let Some(index) = self.results.iter().position(|tab| tab.id == tab_id) {
+            let tab = &mut self.results[index];
+            tab.limit = Some(limit);
+            tab.elapsed = None;
+            tab.error = None;
+            tab.total = None;
+            tab.truncated = false;
+            tab.bytes = 0;
+            tab.started = Instant::now();
+            let result = tab.result.take().unwrap_or_default();
+            tab.result = Some(ResultSet {
+                columns: result.columns,
+                rows: Vec::new(),
+                update_count: None,
+                truncated: false,
+            });
+        }
+        let sent = self.sessions.get(&source).is_some_and(|session| {
+            session
+                .send(Command::Query {
+                    id,
+                    sql: statement,
+                    timeout: None,
+                    max_rows: Some(limit),
+                    params,
+                })
+                .is_ok()
+        });
+        if sent {
+            self.tabs_by_query.insert(id, tab_id);
+            self.query_ids.insert(source, id);
+            self.active_result = Some(tab_id);
+            self.selected_cell = None;
+            cx.notify();
         }
     }
 
@@ -1895,7 +3205,7 @@ impl DatabasePanel {
             }),
             MenuEntry::new("Remove", move |_, cx| {
                 remove.update(cx, |panel, cx| {
-                    panel.remove_source(remove_source.clone(), cx)
+                    panel.remove_source_asked(remove_source.clone(), cx)
                 });
             }),
         ];
@@ -1996,6 +3306,7 @@ impl DatabasePanel {
             sql,
             timeout: None,
             max_rows,
+            params: Vec::new(),
         };
         if let Err(error) = session.send(command) {
             self.answer_error(reader, ticket, error.to_string(), cx);
@@ -2014,8 +3325,16 @@ impl DatabasePanel {
         reader: Entity<DatabaseDataView>,
         cx: &mut Context<Self>,
     ) {
-        if let DataCommand::AutoCommit(on) = command {
-            self.auto_commit = on;
+        match command {
+            // The data tab and the console share the one connection of a source: its
+            // transaction commands end the pending changes of both.
+            DataCommand::AutoCommit(on) => {
+                self.manual.insert(source.clone(), !on);
+                self.pending.remove(&source);
+            }
+            DataCommand::Commit | DataCommand::Rollback => {
+                self.pending.remove(&source);
+            }
         }
         if let Some(scripted) = &self.scripted {
             if scripted.source != source {
@@ -2198,37 +3517,114 @@ impl DatabasePanel {
         let Some(handle) = window.window_handle().downcast::<Workspace>() else {
             return;
         };
+        self.window = Some(handle);
+        let guard = cx.entity().downgrade();
+        let guard_source = source.clone();
         cx.spawn(async move |_, cx| {
             let Ok(path) = job.await else {
                 return;
             };
+            let guard_path = path.clone();
+            let guard_file = guard_path.clone();
             handle
                 .update(cx, |workspace, window, cx| {
                     workspace.open_file(path, window, cx);
+                    // A close with a transaction still open asks before it drops it.
+                    workspace.set_tab_can_close(
+                        &guard_path,
+                        Rc::new(move |cx| {
+                            guard
+                                .update(cx, |panel, cx| {
+                                    panel.ask_console_close(
+                                        guard_source.clone(),
+                                        guard_file.clone(),
+                                        cx,
+                                    )
+                                })
+                                .unwrap_or(true)
+                        }),
+                    );
                 })
                 .ok();
         })
         .detach();
     }
 
-    fn toggle_auto_commit(&mut self, on: bool, cx: &mut Context<Self>) {
-        let Some(source) = self.selected.clone() else {
+    /// Whether the console of a source runs its statements at once.
+    fn auto_commit(&self, source: &SourceId) -> bool {
+        !self.manual.get(source).copied().unwrap_or(false)
+    }
+
+    /// The statements of a source that wait for Commit or Rollback.
+    pub(crate) fn pending_count(&self, source: &SourceId) -> u32 {
+        self.pending.get(source).copied().unwrap_or(0)
+    }
+
+    /// Switches the console of a source between Auto-commit and Manual. A driver that
+    /// turns auto-commit back on commits the transaction it finds, as the driver does.
+    fn set_auto_commit(&mut self, source: SourceId, on: bool, cx: &mut Context<Self>) {
+        if self.auto_commit(&source) == on {
             return;
-        };
+        }
+        self.manual.insert(source.clone(), !on);
+        if on {
+            self.pending.remove(&source);
+        }
+        if let Some(scripted) = &self.scripted {
+            if scripted.source != source {
+                return;
+            }
+            if let Ok(mut commands) = scripted.commands.lock() {
+                commands.push(ScriptedCommand::AutoCommit(on));
+            }
+            cx.notify();
+            return;
+        }
         let id = self.next();
         let Some(session) = self.sessions.get(&source) else {
+            cx.notify();
             return;
         };
         if session.send(Command::AutoCommit { id, on }).is_ok() {
-            self.auto_commit = on;
-            cx.notify();
+            self.transaction_ids.insert(
+                id,
+                TransactionCommand {
+                    source,
+                    kind: Transaction::AutoCommit(on),
+                    after: None,
+                },
+            );
         }
+        cx.notify();
     }
 
-    fn commit(&mut self, rollback: bool, cx: &mut Context<Self>) {
-        let Some(source) = self.selected.clone() else {
+    /// Commits or rolls back the transaction of a source, then does `after`. The answer
+    /// of the helper decides: a commit that fails keeps the transaction and says why.
+    fn decide_transaction(
+        &mut self,
+        source: SourceId,
+        rollback: bool,
+        after: Option<PendingAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(scripted) = &self.scripted {
+            if scripted.source != source {
+                return;
+            }
+            if let Ok(mut commands) = scripted.commands.lock() {
+                commands.push(if rollback {
+                    ScriptedCommand::Rollback
+                } else {
+                    ScriptedCommand::Commit
+                });
+            }
+            self.pending.remove(&source);
+            if let Some(action) = after {
+                self.perform(action, cx);
+            }
+            cx.notify();
             return;
-        };
+        }
         let id = self.next();
         let Some(session) = self.sessions.get(&source) else {
             return;
@@ -2238,8 +3634,104 @@ impl DatabasePanel {
         } else {
             Command::Commit { id }
         };
-        let _ = session.send(command);
+        if session.send(command).is_err() {
+            self.status = Some("The connection is closed.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.transaction_ids.insert(
+            id,
+            TransactionCommand {
+                source,
+                kind: if rollback {
+                    Transaction::Rollback
+                } else {
+                    Transaction::Commit
+                },
+                after,
+            },
+        );
         cx.notify();
+    }
+
+    /// The answer of a transaction command: the pending changes are over, or the reason
+    /// the driver gave stays in place.
+    fn transaction_event(
+        &mut self,
+        source: &SourceId,
+        event: &Event,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let id = match event {
+            Event::Done { id, .. } | Event::Error { id, .. } => *id,
+            _ => return false,
+        };
+        let Some(command) = self.transaction_ids.remove(&id) else {
+            return false;
+        };
+        if command.source != *source {
+            return false;
+        }
+        match event {
+            Event::Done { .. } => {
+                if !matches!(command.kind, Transaction::AutoCommit(false)) {
+                    self.pending.remove(source);
+                }
+                if let Some(action) = command.after {
+                    self.perform(action, cx);
+                }
+            }
+            Event::Error { message, .. } => {
+                self.errors
+                    .insert(source.clone(), format!("The transaction failed: {message}"));
+                self.status = Some("The transaction of the console is still open.".to_owned());
+            }
+            _ => {}
+        }
+        cx.notify();
+        true
+    }
+
+    /// Does what waited for the user to decide the transaction of a source.
+    fn perform(&mut self, action: PendingAction, cx: &mut Context<Self>) {
+        match action {
+            PendingAction::CloseConsole(path) => self.close_console(&path, cx),
+            PendingAction::Disconnect(source) => self.disconnect(source, cx),
+            PendingAction::RemoveSource(source) => self.remove_source(source, cx),
+        }
+    }
+
+    /// The guard of a console tab: a transaction still open asks Commit, Rollback or
+    /// Cancel before the tab goes.
+    pub(crate) fn ask_console_close(
+        &mut self,
+        source: SourceId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.pending_count(&source) == 0 {
+            return true;
+        }
+        self.question = Some(PendingQuestion {
+            source,
+            action: PendingAction::CloseConsole(path),
+        });
+        cx.notify();
+        false
+    }
+
+    /// Closes the console tab of `path`, once no transaction waits for its answer.
+    fn close_console(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let path = path.to_path_buf();
+        // The guard of the tab asks again, and this time nothing waits.
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |workspace, window, cx| {
+                workspace.close_tab_of(&path, window, cx);
+            });
+        });
     }
 
     fn add_source(&mut self, cx: &mut Context<Self>) {
@@ -2357,7 +3849,7 @@ impl DatabasePanel {
         let Some((row, column)) = self.selected_cell else {
             return;
         };
-        let Some(result) = &self.result else {
+        let Some(result) = self.active().and_then(|tab| tab.result.as_ref()) else {
             return;
         };
         let Some(value) = result.rows.get(row).and_then(|row| row.get(column)) else {
@@ -2370,7 +3862,7 @@ impl DatabasePanel {
         let Some((row, _)) = self.selected_cell else {
             return;
         };
-        let Some(result) = &self.result else {
+        let Some(result) = self.active().and_then(|tab| tab.result.as_ref()) else {
             return;
         };
         let Some(values) = result.rows.get(row) else {
@@ -2381,10 +3873,10 @@ impl DatabasePanel {
     }
 
     fn sort_by(&mut self, column: usize, cx: &mut Context<Self>) {
-        let Some(result) = &mut self.result else {
+        let ascending = !matches!(self.sort, Some((sorted, true)) if sorted == column);
+        let Some(result) = self.active_mut().and_then(|tab| tab.result.as_mut()) else {
             return;
         };
-        let ascending = !matches!(self.sort, Some((sorted, true)) if sorted == column);
         result.rows.sort_by(|left, right| {
             let left = left.get(column);
             let right = right.get(column);
@@ -2396,6 +3888,51 @@ impl DatabasePanel {
     }
 
     fn key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.params_ask.is_some() {
+            let stroke = &event.keystroke;
+            if stroke.key == "escape" {
+                self.answer_parameters(false, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if stroke.key == "enter" {
+                self.answer_parameters(true, cx);
+                cx.stop_propagation();
+                return;
+            }
+            let mut changed = false;
+            if let Some(ask) = &mut self.params_ask {
+                if stroke.key == "tab" && !ask.fields.is_empty() {
+                    ask.focused = (ask.focused + 1) % ask.fields.len();
+                    changed = true;
+                } else if let Some(field) = ask.fields.get_mut(ask.focused) {
+                    changed = field.value.key(event, false);
+                }
+            }
+            if changed {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(dialog) = &mut self.export_dialog {
+            let stroke = &event.keystroke;
+            if stroke.key == "escape" {
+                self.export_dialog = None;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            // The name of the table is the only field of the form; the buttons take the
+            // pointer.
+            if !dialog.known_table && dialog.format == ExportFormat::SqlInsert {
+                if dialog.table.key(event, false) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                return;
+            }
+        }
         if let Some(dialog) = &mut self.dialog {
             let stroke = &event.keystroke;
             if stroke.key == "escape" {
@@ -2430,6 +3967,11 @@ impl DatabasePanel {
             return;
         }
         let stroke = &event.keystroke;
+        if (stroke.modifiers.control || stroke.modifiers.platform) && stroke.key == "f2" {
+            self.stop(cx);
+            cx.stop_propagation();
+            return;
+        }
         if (stroke.modifiers.control || stroke.modifiers.platform) && stroke.key == "c" {
             self.copy_cell(cx);
             cx.stop_propagation();
@@ -2770,13 +4312,358 @@ impl DatabasePanel {
         rows
     }
 
+    /// The statements of the console as tabs: the one the grid shows is under the caret.
+    fn result_tabs(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut strip = div()
+            .id("database-result-tabs")
+            .debug_selector(|| "database-result-tabs".to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .border_b_1()
+            .border_color(theme.border);
+        if self.results.is_empty() {
+            return div().into_any_element();
+        }
+        let mut close = Vec::new();
+        for (index, tab) in self.results.iter().enumerate() {
+            let id = tab.id;
+            let active = self.active_result == Some(id);
+            let running = tab.running();
+            let title = tab.title();
+            let button = div()
+                .id(("database-result-tab", index))
+                .debug_selector({
+                    let name = format!("database-result-tab-{index}");
+                    move || name.clone()
+                })
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_S))
+                .rounded(px(CONTROL_RADIUS))
+                .when(active, |this| this.bg(theme.tab_selected))
+                .cursor_pointer()
+                .child(if running {
+                    icon_sized("general/refresh", TEXT_SMALL, theme)
+                } else {
+                    icon_sized("toolwindows/database", TEXT_SMALL, theme)
+                })
+                .child(div().overflow_hidden().child(title))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active_result = Some(id);
+                    this.sort = None;
+                    this.selected_cell = None;
+                    cx.notify();
+                }));
+            strip = strip.child(button);
+            close.push(
+                icon_button(
+                    ("database-result-close", index),
+                    "general/closeSmall",
+                    "Close Result",
+                    None,
+                    theme,
+                )
+                .debug_selector({
+                    let name = format!("database-result-close-{index}");
+                    move || name.clone()
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let was_active = this.active_result == Some(id);
+                    this.results.retain(|tab| tab.id != id);
+                    this.tabs_by_query.retain(|_, tab| *tab != id);
+                    if was_active {
+                        this.active_result = this.results.last().map(|tab| tab.id);
+                        this.sort = None;
+                        this.selected_cell = None;
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        strip.children(close).into_any_element()
+    }
+
+    /// The row above the results: Execute, Stop, the default schema and the history of
+    /// the statements of the console of the selected source.
+    fn console_toolbar(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut bar = div()
+            .id("database-console-toolbar")
+            .debug_selector(|| "database-console-toolbar".to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .border_b_1()
+            .border_color(theme.border);
+        let selected = self.selected.clone();
+        let running = selected
+            .as_ref()
+            .is_some_and(|source| self.query_ids.contains_key(source));
+        let connected = selected
+            .as_ref()
+            .is_some_and(|source| self.scripted.is_some() || self.sessions.contains_key(source));
+        if let Some(source) = &selected {
+            let id = source.clone();
+            bar = bar.child(
+                icon_button(
+                    "database-console-execute",
+                    "run/run",
+                    "Execute",
+                    Some("Ctrl+Enter".into()),
+                    theme,
+                )
+                .debug_selector(|| "database-console-execute".to_owned())
+                .when(connected, |this| {
+                    this.on_click(
+                        cx.listener(move |this, _, _, cx| this.execute_console(id.clone(), cx)),
+                    )
+                }),
+            );
+        }
+        bar = bar.child(
+            icon_button(
+                "database-console-stop",
+                "run/stop",
+                "Stop",
+                Some("Ctrl+F2".into()),
+                theme,
+            )
+            .debug_selector(|| "database-console-stop".to_owned())
+            .when(running, |this| {
+                this.on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+            }),
+        );
+        if let Some(source) = &selected {
+            let id = source.clone();
+            let manual = !self.auto_commit(source);
+            let pending = self.pending_count(source);
+            let auto_id = id.clone();
+            let manual_id = id.clone();
+            let commit_id = id.clone();
+            let rollback_id = id.clone();
+            bar = bar.child(
+                small_button("database-console-auto-commit", "Auto-commit", theme)
+                    .debug_selector(|| "database-console-auto-commit".to_owned())
+                    .when(!manual, |this| this.bg(theme.tab_selected))
+                    .when(connected, |this| {
+                        this.on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_auto_commit(auto_id.clone(), true, cx)
+                        }))
+                    }),
+            );
+            bar = bar.child(
+                small_button("database-console-manual", "Manual", theme)
+                    .debug_selector(|| "database-console-manual".to_owned())
+                    .when(manual, |this| this.bg(theme.tab_selected))
+                    .when(connected, |this| {
+                        this.on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_auto_commit(manual_id.clone(), false, cx)
+                        }))
+                    }),
+            );
+            if manual {
+                bar = bar.child(
+                    small_button("database-console-commit", "Commit", theme)
+                        .debug_selector(|| "database-console-commit".to_owned())
+                        .when(connected, |this| {
+                            this.on_click(cx.listener(move |this, _, _, cx| {
+                                this.decide_transaction(commit_id.clone(), false, None, cx)
+                            }))
+                        }),
+                );
+                bar = bar.child(
+                    small_button("database-console-rollback", "Rollback", theme)
+                        .debug_selector(|| "database-console-rollback".to_owned())
+                        .when(connected, |this| {
+                            this.on_click(cx.listener(move |this, _, _, cx| {
+                                this.decide_transaction(rollback_id.clone(), true, None, cx)
+                            }))
+                        }),
+                );
+                bar = bar.child(
+                    div()
+                        .debug_selector(|| "database-console-pending".to_owned())
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_muted)
+                        .child(pending_text(pending)),
+                );
+            }
+            bar = bar.child(
+                small_button("database-console-explain", "Explain Plan", theme)
+                    .debug_selector(|| "database-console-explain".to_owned())
+                    .when(connected, |this| {
+                        this.on_click(
+                            cx.listener(move |this, _, _, cx| this.explain_console(id.clone(), cx)),
+                        )
+                    }),
+            );
+        }
+        if let Some(source) = &selected {
+            let schema = self
+                .default_schema(source)
+                .unwrap_or_else(|| "default".to_owned());
+            let schema_source = source.clone();
+            let history_source = source.clone();
+            bar = bar.child(
+                small_button("database-console-schema", &schema, theme)
+                    .debug_selector(|| "database-console-schema".to_owned())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.schema_menu(schema_source.clone(), event.position, cx)
+                        }),
+                    ),
+            );
+            bar = bar.child(
+                small_button("database-console-history", "History", theme)
+                    .debug_selector(|| "database-console-history".to_owned())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.history_menu(history_source.clone(), event.position, cx)
+                        }),
+                    ),
+            );
+        }
+        if let Some(job) = &self.export {
+            let title = self
+                .export_title(job.tab_id)
+                .unwrap_or_else(|| "Result".to_owned());
+            bar = bar.child(
+                div()
+                    .debug_selector(|| "database-export-progress".to_owned())
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_muted)
+                    .child(format!("Exporting {title}… {} rows", job.exporter.rows())),
+            );
+        } else if running {
+            bar = bar.child(
+                div()
+                    .debug_selector(|| "database-console-running".to_owned())
+                    .text_color(theme.text_muted)
+                    .child("Running…"),
+            );
+        }
+        let _ = window;
+        bar.into_any_element()
+    }
+
+    /// Explains the statement at the caret of the open console, as the toolbar button
+    /// does.
+    fn explain_console(&mut self, source: SourceId, cx: &mut Context<Self>) {
+        let Some(path) = self.console_path(&source) else {
+            return;
+        };
+        let view = self.workspace.upgrade().and_then(|workspace| {
+            workspace
+                .read(cx)
+                .view_of(&path)
+                .and_then(|view| view.downcast::<EditorView>().ok())
+        });
+        let statement = match view {
+            Some(view) => {
+                let selection = view.read(cx).selected_text();
+                selection.or_else(|| {
+                    let caret = view.read(cx).caret().0;
+                    view.read(cx)
+                        .text()
+                        .and_then(|text| database::statement_at(&text, caret))
+                })
+            }
+            None => std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| database::statement_at(&text, 0)),
+        };
+        if let Some(statement) = statement {
+            self.explain(source, statement, cx);
+        }
+    }
+
+    /// The schemas of the tree as a menu: the console resolves bare names against the
+    /// schema the user picks.
+    fn schema_menu(&mut self, source: SourceId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let schemas = self.schemas_of(&source);
+        if schemas.is_empty() {
+            return;
+        }
+        let panel = cx.entity();
+        let entries: Vec<MenuEntry> = schemas
+            .into_iter()
+            .map(|schema| {
+                let panel = panel.clone();
+                let source = source.clone();
+                let chosen = schema.clone();
+                MenuEntry::new(schema, move |_, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.default_schemas.insert(source.clone(), chosen.clone());
+                        panel.sync_schema(&source, cx);
+                        cx.notify();
+                    });
+                })
+            })
+            .collect();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_menu(position, entries, cx)
+        });
+    }
+
+    /// The statements the user ran as a menu: Enter on an entry runs it again.
+    fn history_menu(&mut self, source: SourceId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.console_history.is_empty() {
+            return;
+        }
+        let rows = cx
+            .try_global::<Settings>()
+            .map_or(workspace::DEFAULT_DATABASE_PAGE_ROWS, |settings| {
+                settings.database_page_rows
+            }) as usize;
+        let panel = cx.entity();
+        let entries: Vec<MenuEntry> = self
+            .console_history
+            .iter()
+            .take(20)
+            .cloned()
+            .map(|sql| {
+                let panel = panel.clone();
+                let source = source.clone();
+                let run = sql.clone();
+                MenuEntry::new(sql, move |_, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.run_sql(source.clone(), run.clone(), Some(rows), cx)
+                    });
+                })
+                .shortcut("Enter")
+            })
+            .collect();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_menu(position, entries, cx)
+        });
+    }
+
     fn result_table(
         &mut self,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(result) = self.result.clone() else {
+        let Some(tab) = self.active() else {
             let hint = if self.selected.is_some() {
                 "Run a statement in the console. Ctrl+Enter takes the statement at the caret."
             } else {
@@ -2789,14 +4676,145 @@ impl DatabasePanel {
                 .child(hint)
                 .into_any_element();
         };
+        let result = tab.result.clone();
+        let error = tab.error.clone();
+        let summary = tab.summary();
+        let plan = tab.plan.clone();
+        let tab_id = tab.id;
+        let cancelled = tab.cancelled;
+        let counting = tab.counting;
+        let count = tab.countable() && !self.query_ids.contains_key(&tab.source);
+        let exportable = tab.can_export() && self.export.is_none();
+        let load_more = tab.truncated
+            && !cancelled
+            && error.is_none()
+            && self.scripted.is_none()
+            && result
+                .as_ref()
+                .is_some_and(|result| !result.columns.is_empty());
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .text_size(px(TEXT_SMALL))
+            .text_color(theme.text_muted)
+            .child(
+                div()
+                    .debug_selector(|| "database-result-summary".to_owned())
+                    .child(summary),
+            )
+            .children(count.then(|| {
+                small_button("database-result-count", "Count rows", theme)
+                    .debug_selector(|| "database-result-count".to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| this.count_rows(tab_id, cx)))
+            }))
+            .children(counting.then(|| {
+                div()
+                    .debug_selector(|| "database-result-counting".to_owned())
+                    .child("Counting…")
+            }))
+            .children(load_more.then(|| {
+                small_button("database-result-load-more", "Load More", theme)
+                    .debug_selector(|| "database-result-load-more".to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| this.load_more(tab_id, cx)))
+            }))
+            .children(exportable.then(|| {
+                small_button("database-result-export", "Export", theme)
+                    .debug_selector(|| "database-result-export".to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_export(tab_id, cx)))
+            }));
+        if let Some(error) = error {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .debug_selector(|| "database-result-error".to_owned())
+                        .p(px(SPACE_L))
+                        .text_color(theme.stripe_error)
+                        .child(error),
+                )
+                .child(footer)
+                .into_any_element();
+        }
+        let Some(result) = result else {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .p(px(SPACE_L))
+                        .text_color(theme.text_muted)
+                        .child("Running…"),
+                )
+                .child(footer)
+                .into_any_element();
+        };
+        if let Some(plan) = plan {
+            let mut body = div().id("database-result-plan").flex().flex_col().w_full();
+            if plan.is_tree() {
+                let mut rows = Vec::new();
+                for node in &plan.nodes {
+                    plan_rows(node, 0, &mut rows);
+                }
+                for (depth, label) in rows {
+                    body = body.child(
+                        div()
+                            .debug_selector(|| "database-result-plan-row".to_owned())
+                            .pl(px(SPACE_S + SPACE_S * depth as f32))
+                            .py(px(SPACE_XS))
+                            .child(label),
+                    );
+                }
+            } else {
+                body = body.child(
+                    div()
+                        .debug_selector(|| "database-result-plan-text".to_owned())
+                        .p(px(SPACE_S))
+                        .child(plan.text),
+                );
+            }
+            let grid = scrollable(
+                "database-result-plan-scroll",
+                &self.result_scroll,
+                body.overflow_x_scroll().overflow_y_scroll().min_h_0(),
+                theme,
+                window,
+                cx,
+            )
+            .flex_1()
+            .min_h_0();
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(grid)
+                .child(footer)
+                .into_any_element();
+        }
         if result.columns.is_empty() {
             return div()
+                .flex()
+                .flex_col()
                 .flex_1()
-                .p(px(SPACE_L))
-                .child(format!(
-                    "{} row(s) changed.",
-                    result.update_count.unwrap_or_default()
-                ))
+                .min_h_0()
+                .child(
+                    div()
+                        .debug_selector(|| "database-result-affected".to_owned())
+                        .p(px(SPACE_L))
+                        .child(format!(
+                            "{} row(s) changed.",
+                            result.update_count.unwrap_or_default()
+                        )),
+                )
+                .child(footer)
                 .into_any_element();
         }
         let mut header = div()
@@ -2865,15 +4883,7 @@ impl DatabasePanel {
             }
             body = body.child(line);
         }
-        let footer = if result.truncated {
-            Some(div().text_color(theme.text_muted).child(format!(
-                "Showing the beginning of the result, up to {} rows.",
-                MAX_RESULT_ROWS
-            )))
-        } else {
-            None
-        };
-        scrollable(
+        let grid = scrollable(
             "database-result",
             &self.result_scroll,
             div()
@@ -2886,15 +4896,21 @@ impl DatabasePanel {
                 .overflow_y_scroll()
                 .track_scroll(&self.result_scroll)
                 .child(header)
-                .child(body)
-                .children(footer),
+                .child(body),
             theme,
             window,
             cx,
         )
         .flex_1()
-        .min_h_0()
-        .into_any_element()
+        .min_h_0();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(grid)
+            .child(footer)
+            .into_any_element()
     }
 
     /// The error of the selected source and, when it has no driver, the way to download
@@ -2980,6 +4996,319 @@ impl DatabasePanel {
             );
         }
         Some(block.into_any_element())
+    }
+
+    /// The question of a console close or a disconnect with a transaction still open.
+    fn transaction_band(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(question) = &self.question else {
+            return div().into_any_element();
+        };
+        let pending = self.pending_count(&question.source);
+        let name = self
+            .sources
+            .iter()
+            .find(|source| source.id == question.source)
+            .map_or_else(|| question.source.to_string(), |source| source.name.clone());
+        let text = format!(
+            "{name} has {}. Commit them before it closes?",
+            pending_text(pending)
+        );
+        let commit = small_button("database-transaction-commit", "Commit", theme)
+            .debug_selector(|| "database-transaction-commit".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| {
+                let Some(question) = this.question.take() else {
+                    return;
+                };
+                this.decide_transaction(question.source, false, Some(question.action), cx);
+            }));
+        let rollback = small_button("database-transaction-rollback", "Rollback", theme)
+            .debug_selector(|| "database-transaction-rollback".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| {
+                let Some(question) = this.question.take() else {
+                    return;
+                };
+                this.decide_transaction(question.source, true, Some(question.action), cx);
+            }));
+        let cancel = small_button("database-transaction-cancel", "Cancel", theme)
+            .debug_selector(|| "database-transaction-cancel".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.question = None;
+                cx.notify();
+            }));
+        div()
+            .id("database-transaction-question")
+            .debug_selector(|| "database-transaction-question".to_owned())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(SPACE_M))
+            .px(px(DIALOG_PADDING))
+            .py(px(SPACE_S))
+            .flex_none()
+            .bg(theme.hover)
+            .child(div().child(text))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .child(commit)
+                    .child(rollback)
+                    .child(cancel),
+            )
+            .into_any_element()
+    }
+
+    /// The fields of the values a statement asks for.
+    fn params_band(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(ask) = &self.params_ask else {
+            return div().into_any_element();
+        };
+        let focused = ask.focused;
+        let mut fields = Vec::new();
+        for (index, field) in ask.fields.iter().enumerate() {
+            let mut shown = TextField::from_text(field.value.text.clone());
+            shown.set_caret(shown.text.len());
+            let active = index == focused;
+            fields.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .flex_none()
+                            .text_color(theme.text_muted)
+                            .child(field.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(("database-parameter", index))
+                            .debug_selector({
+                                let name = format!("database-parameter-{index}");
+                                move || name.clone()
+                            })
+                            .flex()
+                            .items_center()
+                            .flex_1()
+                            .h(px(FIELD_HEIGHT))
+                            .px(px(SPACE_M))
+                            .rounded(px(CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(if active {
+                                theme.accent
+                            } else {
+                                theme.control_border
+                            })
+                            .overflow_hidden()
+                            .cursor_text()
+                            .children(text_field_children(
+                                &shown,
+                                theme.text,
+                                theme.text,
+                                theme.selection,
+                                theme.caret,
+                                TEXT_SMALL,
+                                active,
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    if let Some(ask) = &mut this.params_ask {
+                                        ask.focused = index;
+                                    }
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            );
+        }
+        div()
+            .id("database-parameters")
+            .debug_selector(|| "database-parameters".to_owned())
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(DIALOG_PADDING))
+            .flex_none()
+            .bg(theme.hover)
+            .child("Values of the statement")
+            .children(fields)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(SPACE_S))
+                    .child(
+                        small_button("database-parameters-run", "Run", theme)
+                            .debug_selector(|| "database-parameters-run".to_owned())
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.answer_parameters(true, cx)),
+                            ),
+                    )
+                    .child(
+                        small_button("database-parameters-cancel", "Cancel", theme)
+                            .debug_selector(|| "database-parameters-cancel".to_owned())
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.answer_parameters(false, cx)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The form behind Export: the format, the table of the INSERT statements and where
+    /// the text goes.
+    fn export_band(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = &self.export_dialog else {
+            return div().into_any_element();
+        };
+        let title = self
+            .export_title(dialog.tab_id)
+            .unwrap_or_else(|| "the result".to_owned());
+        let format = dialog.format;
+        let known_table = dialog.known_table;
+        let table = dialog.table.text.clone();
+        let mut formats = div().flex().items_center().gap(px(SPACE_XS));
+        for choice in ExportFormat::all() {
+            formats = formats.child(
+                small_button(
+                    ("database-export-format", choice as usize),
+                    choice.title(),
+                    theme,
+                )
+                .debug_selector({
+                    let name = format!("database-export-format-{}", choice.extension());
+                    move || name.clone()
+                })
+                .when(choice == format, |this| this.bg(theme.tab_selected))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(dialog) = &mut this.export_dialog {
+                        dialog.format = choice;
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        let mut body = div()
+            .id("database-export")
+            .debug_selector(|| "database-export".to_owned())
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(DIALOG_PADDING))
+            .flex_none()
+            .bg(theme.hover)
+            .child(format!("Export {title}"));
+        if format == ExportFormat::SqlInsert && known_table {
+            body = body.child(
+                div()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_muted)
+                    .child(format!("INSERT INTO {table}")),
+            );
+        }
+        body = body.child(formats);
+        if format == ExportFormat::SqlInsert && !known_table {
+            let mut shown = TextField::from_text(table);
+            shown.set_caret(shown.text.len());
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .flex_none()
+                            .text_color(theme.text_muted)
+                            .child("Table"),
+                    )
+                    .child(
+                        div()
+                            .id("database-export-table")
+                            .debug_selector(|| "database-export-table".to_owned())
+                            .flex()
+                            .items_center()
+                            .flex_1()
+                            .h(px(FIELD_HEIGHT))
+                            .px(px(SPACE_M))
+                            .rounded(px(CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(theme.control_border)
+                            .overflow_hidden()
+                            .cursor_text()
+                            .children(text_field_children(
+                                &shown,
+                                theme.text,
+                                theme.text,
+                                theme.selection,
+                                theme.caret,
+                                TEXT_SMALL,
+                                false,
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            );
+        }
+        body = body.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(SPACE_S))
+                .child(
+                    small_button("database-export-save", "Save…", theme)
+                        .debug_selector(|| "database-export-save".to_owned())
+                        .on_click(cx.listener(|this, _, window, cx| this.save_export(window, cx))),
+                )
+                .child(
+                    small_button("database-export-copy", "Copy", theme)
+                        .debug_selector(|| "database-export-copy".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_export(ExportTarget::Clipboard, cx)
+                        })),
+                )
+                .child(
+                    small_button("database-export-cancel", "Cancel", theme)
+                        .debug_selector(|| "database-export-cancel".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.export_dialog = None;
+                            cx.notify();
+                        })),
+                ),
+        );
+        body.into_any_element()
+    }
+
+    /// Asks the user for the file of the export, then starts it.
+    fn save_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(dialog) = &self.export_dialog else {
+            return;
+        };
+        let directory = workspace.read(cx).root().to_path_buf();
+        let name = format!("result.{}", dialog.format.extension());
+        let chosen = cx.prompt_for_new_path(&directory, Some(&name));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.start_export(ExportTarget::File(path), cx)
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn dialog(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -3471,6 +5800,7 @@ impl DatabasePanel {
                         None,
                         theme,
                     )
+                    .debug_selector(|| "database-console".to_owned())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_console(id.clone(), window, cx)
                     })),
@@ -3481,35 +5811,11 @@ impl DatabasePanel {
                 icon_button("database-disconnect", "run/stop", "Disconnect", None, theme).on_click(
                     cx.listener(|this, _, _, cx| {
                         if let Some(source) = this.selected.clone() {
-                            this.disconnect(source, cx);
+                            this.disconnect_source(source, cx);
                         }
                     }),
                 ),
             );
-            bar = bar.child(
-                small_button(
-                    "database-autocommit",
-                    &format!(
-                        "Auto-commit: {}",
-                        if self.auto_commit { "on" } else { "off" }
-                    ),
-                    theme,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let on = !this.auto_commit;
-                    this.toggle_auto_commit(on, cx);
-                })),
-            );
-            if !self.auto_commit {
-                bar = bar.child(
-                    small_button("database-commit", "Commit", theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.commit(false, cx))),
-                );
-                bar = bar.child(
-                    small_button("database-rollback", "Rollback", theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.commit(true, cx))),
-                );
-            }
         } else if let Some(source) = &source {
             let id = source.id.clone();
             bar = bar.child(
@@ -3623,6 +5929,7 @@ impl Drop for DatabasePanel {
 impl Render for DatabasePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        self.window = window.window_handle().downcast::<Workspace>();
         let workspace = self.workspace.clone();
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
@@ -3633,6 +5940,11 @@ impl Render for DatabasePanel {
         };
         let toolbar = self.toolbar(&theme, window, cx);
         let tree = self.tree(&theme, window, cx);
+        let question = self.transaction_band(&theme, cx);
+        let parameters = self.params_band(&theme, cx);
+        let export = self.export_band(&theme, cx);
+        let console = self.console_toolbar(&theme, window, cx);
+        let tabs = self.result_tabs(&theme, cx);
         let result = self.result_table(&theme, window, cx);
         let notice = self.notice(&theme, cx);
         let dialog = self.dialog(&theme, cx);
@@ -3654,6 +5966,11 @@ impl Render for DatabasePanel {
             .min_w_0()
             .h_full()
             .children(notice)
+            .child(question)
+            .child(parameters)
+            .child(export)
+            .child(console)
+            .child(tabs)
             .child(result);
         island(&theme)
             .id("database-panel")
@@ -3661,6 +5978,7 @@ impl Render for DatabasePanel {
             .key_context("Database ToolWindow")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &Stop, _, cx| this.stop(cx)))
             .flex()
             .flex_col()
             .h_full()
@@ -3672,12 +5990,60 @@ impl Render for DatabasePanel {
     }
 }
 
+/// Alt+Shift+E: explains the statement at the caret of the open console in a tab of its
+/// own. The key is clear of the IDEA keymap, where Ctrl+Shift+E is Recent Locations.
+pub(crate) fn explain_plan(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let path = match workspace.active_path() {
+        Some(path) => path,
+        None => return,
+    };
+    let Some(root) = cx
+        .try_global::<DatabaseConsoleRoot>()
+        .map(|root| root.0.clone())
+    else {
+        return;
+    };
+    let Some(source) = database::source_of_console(&root, &path) else {
+        return;
+    };
+    let Some(view) = workspace
+        .active_view()
+        .and_then(|view| view.downcast::<EditorView>().ok())
+    else {
+        return;
+    };
+    let selection = view.read(cx).selected_text();
+    let text = selection.or_else(|| {
+        let caret = view.read(cx).caret().0;
+        view.read(cx)
+            .text()
+            .and_then(|text| database::statement_at(&text, caret))
+    });
+    let Some(text) = text else {
+        return;
+    };
+    let Some(panel) = cx
+        .try_global::<ActiveDatabase>()
+        .map(|panel| panel.0.clone())
+    else {
+        return;
+    };
+    workspace.show_tool(DATABASE_TOOL, window, cx);
+    panel.update(cx, |panel, cx| panel.explain(source, text, cx));
+}
+
 /// The plain syntax of a console file: no grammar, but Ctrl+Enter belongs to the window.
 pub(crate) fn install(state_dir: PathBuf, cx: &mut App) {
     cx.set_global(DatabaseConsoleRoot(state_dir.clone()));
+    let console_dir = state_dir.clone();
     cx.set_global(RunFiles(Arc::new(move |path: &Path| {
-        database::source_of_console(&state_dir, path).is_some()
+        database::source_of_console(&console_dir, path).is_some()
     })));
+    crate::database_console::install(state_dir, cx);
 }
 
 /// Runs the selection or the statement at `line` of a `.sql` console. The answer is
@@ -3712,9 +6078,46 @@ pub(crate) fn run_line(
         return false;
     };
     workspace.show_tool(DATABASE_TOOL, window, cx);
+    // The console keeps the focus: the next statement is typed where the last one was
+    // written, as in a console that runs what its editor holds.
+    let focus = view.read(cx).focus_handle(cx);
+    window.focus(&focus, cx);
     if let Some(text) = text {
-        panel.update(cx, |panel, cx| panel.run_sql(source, text, None, cx));
+        let rows = cx
+            .try_global::<Settings>()
+            .map_or(workspace::DEFAULT_DATABASE_PAGE_ROWS, |settings| {
+                settings.database_page_rows
+            }) as usize;
+        panel.update(cx, |panel, cx| panel.run_sql(source, text, Some(rows), cx));
     }
+    true
+}
+
+/// Stops the statement of the console of `view`, as Ctrl+F2 does. The answer is `false`
+/// when the file is not a console, so another tool may take the key.
+pub(crate) fn stop_line(
+    view: &Entity<EditorView>,
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let path = view.read(cx).path().to_path_buf();
+    let Some(root) = cx
+        .try_global::<DatabaseConsoleRoot>()
+        .map(|root| root.0.clone())
+    else {
+        return false;
+    };
+    let Some(_source) = database::source_of_console(&root, &path) else {
+        return false;
+    };
+    let Some(panel) = cx
+        .try_global::<ActiveDatabase>()
+        .map(|panel| panel.0.clone())
+    else {
+        return false;
+    };
+    let _ = workspace;
+    panel.update(cx, |panel, cx| panel.stop(cx));
     true
 }
 
@@ -3831,6 +6234,27 @@ fn value_bytes(value: &Value) -> usize {
     }
 }
 
+/// A `COUNT(*)` of a limited statement, so its tab can say how many rows it has in all
+/// when the user asks. Only a statement that yields rows is counted, and only a plain
+/// derived table is asked, which every dialect here understands. A `WITH` that writes is
+/// left alone: the count would run its `INSERT`, `UPDATE` or `DELETE` a second time.
+fn count_statement(statement: &str) -> Option<String> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    if !database::countable_statement(trimmed) {
+        return None;
+    }
+    Some(format!("SELECT COUNT(*) FROM (\n{trimmed}\n) arro_count"))
+}
+
+/// The number a count row carries.
+fn count_of(value: &Value) -> Option<u64> {
+    match value {
+        Value::Integer(count) => u64::try_from(*count).ok(),
+        Value::Decimal(text) | Value::Text(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 fn compare_values(
     left: Option<&Value>,
     right: Option<&Value>,
@@ -3906,9 +6330,10 @@ fn slug(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DriverKind, Source, SourceId, Value, compare_values, driver_message, driver_refused, slug,
-        source_name,
+        Column, ConsoleResult, DriverKind, ResultSet, Source, SourceId, Value, compare_values,
+        count_statement, driver_message, driver_refused, group_digits, slug, source_name,
     };
+    use std::time::Duration;
 
     #[test]
     fn a_source_name_comes_from_the_address() {
@@ -3984,5 +6409,73 @@ mod tests {
         };
         let text = serde_json::to_string(&source).unwrap();
         assert!(!text.contains("password"));
+    }
+
+    fn finished(update_count: Option<u64>, rows: usize, total: Option<u64>) -> ConsoleResult {
+        let mut tab =
+            ConsoleResult::new(1, "SELECT ID FROM OWNERS".into(), SourceId::new("s"), None);
+        tab.elapsed = Some(Duration::from_millis(12));
+        tab.total = total;
+        tab.result = Some(ResultSet {
+            columns: vec![Column::default()],
+            rows: vec![vec![Value::Null]; rows],
+            update_count,
+            truncated: false,
+        });
+        tab
+    }
+
+    #[test]
+    fn a_tab_says_how_many_rows_it_changed_or_read() {
+        let changed = finished(Some(3), 0, None);
+        assert_eq!(changed.rows_text(), "3 rows affected");
+        assert_eq!(changed.summary(), "12 ms · 3 rows affected");
+
+        let read = finished(None, 1, None);
+        assert_eq!(read.rows_text(), "1 row");
+
+        let portion = finished(None, 500, Some(12_840));
+        assert_eq!(portion.rows_text(), "500 rows of 12\u{a0}840");
+
+        // Until the user asks for the count, the tab only says that there is more.
+        let mut limited = ConsoleResult::new(
+            1,
+            "SELECT ID FROM OWNERS".into(),
+            SourceId::new("s"),
+            Some(500),
+        );
+        limited.result = Some(ResultSet {
+            columns: vec![Column::default()],
+            rows: vec![vec![Value::Null]; 500],
+            update_count: None,
+            truncated: false,
+        });
+        limited.settle(false, false);
+        limited.elapsed = Some(Duration::from_millis(12));
+        assert_eq!(limited.rows_text(), "500+ rows");
+        assert!(limited.countable());
+    }
+
+    #[test]
+    fn a_limited_select_is_countable_and_an_update_is_not() {
+        assert_eq!(
+            count_statement("SELECT ID FROM OWNERS;\n").as_deref(),
+            Some("SELECT COUNT(*) FROM (\nSELECT ID FROM OWNERS\n) arro_count")
+        );
+        assert!(count_statement("WITH o AS (SELECT 1) SELECT * FROM o").is_some());
+        // A CTE that writes would run its write again inside the count.
+        assert_eq!(
+            count_statement("WITH moved AS (DELETE FROM OWNERS RETURNING ID) SELECT * FROM moved"),
+            None
+        );
+        assert_eq!(count_statement("UPDATE OWNERS SET NAME = 'x'"), None);
+        assert_eq!(count_statement("   "), None);
+    }
+
+    #[test]
+    fn a_row_count_groups_its_digits() {
+        assert_eq!(group_digits(1), "1");
+        assert_eq!(group_digits(12_840), "12\u{a0}840");
+        assert_eq!(group_digits(1_234_567), "1\u{a0}234\u{a0}567");
     }
 }

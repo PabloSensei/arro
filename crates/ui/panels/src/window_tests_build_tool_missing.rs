@@ -22,14 +22,14 @@ use crate::window_tests::{click, open_window_with, sample_project, scratch};
 use crate::window_tests_run::{run_panel, wait_for};
 
 /// A repository of the test: it answers every request with the same bytes.
-struct Server {
-    base: String,
+pub(crate) struct Server {
+    pub(crate) base: String,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Server {
-    fn start(payload: &'static [u8]) -> Self {
+    pub(crate) fn start(payload: &'static [u8]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
         let address = listener.local_addr().expect("the address of the listener");
         listener

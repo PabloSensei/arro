@@ -340,6 +340,18 @@ pub fn register(
     if let Err(error) = workspace.bind_command("ctrl-alt-shift-a", ASK_AI) {
         eprintln!("keymap: {ASK_AI}: {error}");
     }
+    // Explain Plan of the SQL console: Ctrl+Shift+E is Recent Locations in the keymap.
+    workspace.register_command(
+        crate::database_panel::EXPLAIN_PLAN,
+        "Explain Plan",
+        crate::database_panel::explain_plan,
+    );
+    if let Err(error) = workspace.bind_command(
+        crate::database_panel::EXPLAIN_KEY,
+        crate::database_panel::EXPLAIN_PLAN,
+    ) {
+        eprintln!("keymap: {}: {error}", crate::database_panel::EXPLAIN_PLAN);
+    }
     workspace.register_command(
         "window.show_performance",
         "Show Performance Monitor",
@@ -1529,6 +1541,17 @@ fn register_git_commands(workspace: &mut Workspace) {
         workspace.show_tool(workspace::LOG_TOOL, window, cx);
         panel.update(cx, |panel, cx| panel.show_root(cx));
     });
+    workspace.register_command(
+        crate::git::SHOW_CONSOLE_COMMAND,
+        "Show in Console",
+        |workspace, window, cx| {
+            let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+                return;
+            };
+            workspace.show_tool(workspace::LOG_TOOL, window, cx);
+            panel.update(cx, |panel, cx| panel.show_console(cx));
+        },
+    );
     workspace.register_command(
         "git.show_file_history",
         "Show History",

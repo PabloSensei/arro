@@ -1,0 +1,15 @@
+[package]
+name = "claude-bridge"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.22"
+getrandom = "0.3"
+platform.workspace = true
+serde_json = "1"
+sha1_smol = "1"
+
+[dev-dependencies]
+test-support = { path = "../../../tools/test-support" }

@@ -1234,6 +1234,7 @@ fn text_hint(field: SettingField) -> &'static str {
         SettingField::TerminalEnvironment => "NAME=value per line",
         SettingField::KubectlPath => "Found on PATH",
         SettingField::KubeconfigPath => "~/.kube/config",
+        SettingField::McpBinary => "Next to Arro",
         _ => "",
     }
 }
@@ -1751,6 +1752,61 @@ impl SettingsView {
         self.search_editing = false;
         cx.notify();
     }
+
+    /// The three strings that point a client outside the window at this one. Arro only
+    /// copies them: it runs none of them.
+    fn mcp_section(&self, settings: &Settings, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
+        let lines = settings_catalog::mcp_lines(settings);
+        let rows: [(&'static str, &'static str, String); 3] = [
+            ("claude", "Claude Code", lines[0].clone()),
+            ("codex", "Codex (config.toml)", lines[1].clone()),
+            ("json", "Any MCP client (JSON)", lines[2].clone()),
+        ];
+        let mut content = vec![
+            note(
+                "Changes on this page apply at once. Copy a line into your client; Arro \
+                 only copies it.",
+                theme,
+            ),
+            heading("Use Arro from another program", theme),
+        ];
+        for (id, title, text) in rows {
+            let selector = format!("settings-mcp-copy-{id}");
+            let button = icon_button(
+                SharedString::from(selector.clone()),
+                "general/copy",
+                format!("Copy for {title}"),
+                None,
+                theme,
+            )
+            .debug_selector(move || selector.clone());
+            let copied = text.clone();
+            let button = button.on_click(cx.listener(move |_, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+            }));
+            let line = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(TEXT_SMALL))
+                .text_color(theme.text)
+                .children(text.lines().map(|part| div().child(part.to_owned())))
+                .debug_selector(move || format!("settings-mcp-line-{id}"));
+            content.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .px(px(ROW_PADDING_X))
+                    .py(px(SPACE_XS))
+                    .child(div().w(px(150.)).flex_none().child(title))
+                    .child(line)
+                    .child(button),
+            );
+        }
+        content
+    }
 }
 
 /// One colour of the strip a theme card shows: its background, its text and its accent.
@@ -2045,6 +2101,9 @@ impl Render for SettingsView {
                 }
                 if self.page == SettingsPage::Appearance {
                     content.extend(self.icon_section(&theme, cx));
+                }
+                if self.page == SettingsPage::Mcp {
+                    content.extend(self.mcp_section(&settings, &theme, cx));
                 }
             }
         }

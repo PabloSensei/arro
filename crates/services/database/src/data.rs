@@ -4,9 +4,11 @@
 //! the statements of [`Plan`]. Both are plain functions of the schema and the dialect, so
 //! the window decides when to read or write and this module decides what the text is.
 //!
-//! No statement carries a parameter: the protocol has none, so every value becomes a
-//! literal that the dialect can read back.
+//! The statements of Submit carry no parameter: every value becomes a literal that the
+//! dialect can read back. Only the placeholders of a console statement keep their values
+//! as parameters, and the driver binds them.
 
+use crate::export::csv_field;
 use crate::protocol::Value;
 use crate::schema::{Column, ColumnKind};
 use crate::sources::DriverKind;
@@ -794,14 +796,6 @@ pub fn csv(columns: &[Column], rows: &[Vec<Value>]) -> String {
         text.push('\n');
     }
     text
-}
-
-fn csv_field(text: &str) -> String {
-    if text.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", text.replace('"', "\"\""))
-    } else {
-        text.to_owned()
-    }
 }
 
 /// Selected cells of a grid as tab-separated text, one line per row.

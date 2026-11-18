@@ -184,6 +184,34 @@ pub enum GitUpdateMethod {
     Rebase,
 }
 
+/// Whether a tool of the MCP server may build, test and run the project without a
+/// question first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpExecutePermission {
+    /// Every call of the class `Execute` asks the user in the window.
+    #[default]
+    AlwaysAsk,
+    /// A project the user trusted runs without a question; another one still asks.
+    TrustedProjects,
+}
+
+impl McpExecutePermission {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AlwaysAsk => "Always ask",
+            Self::TrustedProjects => "Allow for trusted projects",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::AlwaysAsk => Self::TrustedProjects,
+            Self::TrustedProjects => Self::AlwaysAsk,
+        }
+    }
+}
+
 impl GitUpdateMethod {
     pub fn label(self) -> &'static str {
         match self {
@@ -390,6 +418,14 @@ pub struct Settings {
     /// The project tree selects the file of every tab that becomes active, as the Always
     /// Select Opened File switch of its view options says.
     pub project_always_select_opened_file: bool,
+    /// The window shares its MCP server with the agents outside it while the project is
+    /// open. The sessions of AI Sessions work either way.
+    pub mcp_enabled: bool,
+    /// The program a client outside the window starts; empty means `arro-mcp` next to the
+    /// program of the window.
+    pub mcp_binary: String,
+    /// Whether a tool that builds, tests or runs the project asks first.
+    pub mcp_execute_permission: McpExecutePermission,
 }
 
 impl Default for Settings {
@@ -487,6 +523,9 @@ impl Default for Settings {
             kubeconfig_path: String::new(),
             database_page_rows: DEFAULT_DATABASE_PAGE_ROWS,
             project_always_select_opened_file: false,
+            mcp_enabled: true,
+            mcp_binary: String::new(),
+            mcp_execute_permission: McpExecutePermission::AlwaysAsk,
         }
     }
 }

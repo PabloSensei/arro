@@ -74,10 +74,15 @@ impl ServerHandler for Handler {
             return Err(ErrorData::invalid_request("no session", None));
         };
         let gateway = self.gateway.clone();
+        // The name the client gave itself in `initialize` names it in the audit log.
+        let client = context
+            .peer
+            .peer_info()
+            .map(|info| info.client_info.name.to_string());
         let name = request.name.into_owned();
         let input = Value::Object(request.arguments.unwrap_or_default());
         // A service may take its time, and the transport threads have other sessions to serve.
-        let work = move || gateway.call(&scope, &name, &input);
+        let work = move || gateway.call_from(client.as_deref(), &scope, &name, &input);
         let result = tokio::task::spawn_blocking(work).await;
         let result = result.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         let answer = match result {

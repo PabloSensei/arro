@@ -118,6 +118,11 @@ pub fn run(
     dist::make_executable(&program)?;
     split_debug_info(&program, &dist::default_symbols_dir(&out))?;
     println!("{}", program.display());
+    let shim = dist::mcp_binary(&root)?;
+    let copied = out.join(dist::mcp_file_name());
+    fs::copy(&shim, &copied)?;
+    dist::make_executable(&copied)?;
+    println!("{}", copied.display());
 
     let jacoco = dist::jacoco_lib(&tools)?;
     helpers::run_with(&root, &out.join("helpers"), None, Some(&jacoco))?;
@@ -819,6 +824,7 @@ fn split_debug_info(program: &Path, symbols: &Path) -> Result {
 fn remove_old(out: &Path) -> Result {
     for name in [
         BINARY,
+        "arro-mcp",
         "README.txt",
         "THIRD-PARTY.txt",
         "NOTICE.txt",

@@ -9,9 +9,33 @@ and settings and data may move between versions. Most of Arro's code is written 
 and reviewed by a human.
 
 This folder holds Arro.app, this file, THIRD-PARTY.txt and NOTICE.txt. Inside the
-bundle, Contents/MacOS/arro is the program and Contents/Resources holds the language
-tools, the notices, this file and the icon. There is no installer: drag Arro.app into
-the Applications folder, or run it from where it is unpacked.
+bundle, Contents/MacOS/arro is the program, Contents/Resources/arro-mcp is the tool of
+an agent outside the window, and Contents/Resources holds the language tools, the
+notices, this file and the icon. There is no installer: drag Arro.app into the
+Applications folder, or run it from where it is unpacked.
+
+Using Arro from another program
+-------------------------------
+
+While a project is open, Arro shares the tools of its window with MCP clients. Settings,
+Tools, AI, MCP Server shows the strings below with a copy button; Arro copies them and
+runs none of them. Claude Code, in a terminal outside Arro:
+
+  claude mcp add arro -- "/Applications/Arro.app/Contents/Resources/arro-mcp"
+
+Codex, in ~/.codex/config.toml:
+
+  [mcp_servers.arro]
+  command = "/Applications/Arro.app/Contents/Resources/arro-mcp"
+
+Any other MCP client, as its JSON configuration:
+
+  {"mcpServers": {"arro": {"command": "/Applications/Arro.app/Contents/Resources/arro-mcp"}}}
+
+The client starts arro-mcp in the folder of the project, and the shim finds the window
+whose project root holds that folder. Arro leaves the entry point in
+~/Library/Application Support/Arro/mcp and removes it when the window closes; only the
+user may read it. An entry of a window that is no longer running is ignored.
 
 The first start of a build without a signature of an Apple developer
 --------------------------------------------------------------------

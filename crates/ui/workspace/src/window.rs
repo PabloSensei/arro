@@ -5027,6 +5027,19 @@ impl Workspace {
         self.handlers.insert(id, Rc::new(handler));
     }
 
+    /// Adds a command that runs by id but is not listed in Find Action or Search
+    /// Everywhere: the buttons of a notification, which make no sense on their own.
+    pub fn register_hidden_command(
+        &mut self,
+        id: &'static str,
+        title: impl Into<String>,
+        handler: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
+        self.commands
+            .register_hidden(id, title, keymap::workspace::CONTEXT);
+        self.handlers.insert(id, Rc::new(handler));
+    }
+
     /// Binds `key`, `ctrl-alt-u` or a chord, to a registered command on top of the keymap.
     /// A later binding of the same key wins.
     pub fn bind_command(&mut self, key: &str, id: &'static str) -> Result<(), String> {

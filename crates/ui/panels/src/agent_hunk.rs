@@ -12,7 +12,18 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::Workspace;
 
+use crate::agents::AgentsPanel;
 use crate::chat::text_button;
+
+/// Who answers Accept and Reject: the change tracker of a session, or the file a client
+/// proposes and waits on.
+pub(crate) enum Owner {
+    Tracker(Arc<ChangeTracker>),
+    Proposal {
+        id: u64,
+        panel: WeakEntity<AgentsPanel>,
+    },
+}
 
 const WIDTH: f32 = 460.;
 /// A hunk longer than this keeps the rest out of the window.
@@ -33,7 +44,8 @@ pub struct AgentHunkPopup {
     /// Relative to the project, with forward slashes.
     path: String,
     editor: Entity<EditorView>,
-    tracker: Arc<ChangeTracker>,
+    tracker: Option<Arc<ChangeTracker>>,
+    proposal: Option<(u64, WeakEntity<AgentsPanel>)>,
     review: FileReview,
     /// The hunk the window shows.
     index: usize,
@@ -51,13 +63,17 @@ impl AgentHunkPopup {
         root: PathBuf,
         path: String,
         editor: Entity<EditorView>,
-        tracker: Arc<ChangeTracker>,
+        owner: Owner,
         review: FileReview,
         index: usize,
     ) -> Option<Entity<Self>> {
         review.hunks.get(index)?;
         let weak = cx.weak_entity();
         let handle = window.window_handle();
+        let (tracker, proposal) = match owner {
+            Owner::Tracker(tracker) => (Some(tracker), None),
+            Owner::Proposal { id, panel } => (None, Some((id, panel))),
+        };
         let view = cx.new(|cx| Self {
             workspace: weak,
             window: handle,
@@ -66,6 +82,7 @@ impl AgentHunkPopup {
             path,
             editor,
             tracker,
+            proposal,
             review,
             index,
             notice: None,
@@ -90,6 +107,18 @@ impl AgentHunkPopup {
 
     /// Takes the new text as the base of the session, so the hunk leaves the review.
     pub(crate) fn accept(&mut self, cx: &mut Context<Self>) {
+        if let Some((id, panel)) = self.proposal.clone() {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.decide_proposal_hunk(id, self.index, true, cx)
+                })
+                .ok();
+            self.close(cx);
+            return;
+        }
+        let Some(tracker) = self.tracker.clone() else {
+            return;
+        };
         if !self.text_is_current(cx) {
             self.notice = Some("The file changed, look at it again.".into());
             cx.notify();
@@ -100,13 +129,25 @@ impl AgentHunkPopup {
             cx.notify();
             return;
         };
-        self.tracker.accept(&self.path, base);
+        tracker.accept(&self.path, base);
         self.close(cx);
     }
 
     /// Puts the old text of the hunk back on disk as one step the undo of the editor takes
     /// back, as the review panel does.
     pub(crate) fn reject(&mut self, cx: &mut Context<Self>) {
+        if let Some((id, panel)) = self.proposal.clone() {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.decide_proposal_hunk(id, self.index, false, cx)
+                })
+                .ok();
+            self.close(cx);
+            return;
+        }
+        let Some(tracker) = self.tracker.clone() else {
+            return;
+        };
         if self.editor.read(cx).is_dirty() {
             self.notice =
                 Some("Not reverted: the editor has unsaved edits. Save or undo them first.".into());
@@ -132,7 +173,7 @@ impl AgentHunkPopup {
             let result = job.await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
-                    this.tracker.refresh();
+                    tracker.refresh();
                     this.editor.update(cx, |view, cx| view.reload(cx));
                     this.close(cx);
                 }
@@ -152,12 +193,24 @@ impl AgentHunkPopup {
     }
 
     fn reveal(&mut self, cx: &mut Context<Self>) {
-        let Some(hunk) = self.review.hunks.get(self.index) else {
+        if self.review.hunks.get(self.index).is_none() {
             return;
-        };
-        let line = hunk.after.start as usize;
+        }
+        let line = self.hunk_lines().start as usize;
         self.editor
             .update(cx, |editor, cx| editor.go_to_line(line, cx));
+    }
+
+    /// The lines of the hunk in the editor on screen: the old ones of a proposed file,
+    /// which is what the disk holds until the user decides, and the new ones of a change
+    /// the agent already wrote.
+    fn hunk_lines(&self) -> std::ops::Range<u32> {
+        let hunk = &self.review.hunks[self.index];
+        if self.proposal.is_some() {
+            hunk.before.clone()
+        } else {
+            hunk.after.clone()
+        }
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
@@ -178,9 +231,9 @@ impl AgentHunkPopup {
         let editor = self.editor.read(cx);
         let bounds = editor.editor_bounds();
         let line_height = editor.line_height().max(1.);
-        let hunk = &self.review.hunks[self.index];
-        let first = hunk.after.start as usize;
-        let last = hunk.after.end.saturating_sub(1).max(hunk.after.start) as usize;
+        let lines = self.hunk_lines();
+        let first = lines.start as usize;
+        let last = lines.end.saturating_sub(1).max(lines.start) as usize;
         let visible = editor.shown_lines();
         let in_hunk = |line: &usize| *line >= first && *line <= last;
         let shown = |line: &usize| {

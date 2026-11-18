@@ -33,6 +33,9 @@ pub enum Command {
         /// The most rows the driver returns for the statement. `None` leaves it
         /// unlimited, so the address itself carries no row clause.
         max_rows: Option<usize>,
+        /// The values of the placeholders of the statement, in their order. The driver
+        /// binds them; the text of the statement is never changed for them.
+        params: Vec<Param>,
     },
     /// Asks for the next batch of the result of `id`.
     Fetch {
@@ -89,6 +92,7 @@ impl Command {
                 sql,
                 timeout,
                 max_rows,
+                params,
             } => {
                 object.insert("type".into(), json!("query"));
                 object.insert("id".into(), json!(id));
@@ -98,6 +102,10 @@ impl Command {
                 }
                 if let Some(max_rows) = max_rows {
                     object.insert("maxRows".into(), json!(max_rows));
+                }
+                if !params.is_empty() {
+                    let values: Vec<Json> = params.iter().map(Param::json).collect();
+                    object.insert("params".into(), Json::Array(values));
                 }
             }
             Self::Fetch { id } => {
@@ -113,7 +121,7 @@ impl Command {
                 object.insert("id".into(), json!(id));
             }
             Self::AutoCommit { id, on } => {
-                object.insert("type".into(), json!("autocommit"));
+                object.insert("type".into(), json!("setAutoCommit"));
                 object.insert("id".into(), json!(id));
                 object.insert("on".into(), json!(on));
             }
@@ -131,6 +139,53 @@ impl Command {
             }
         }
         Json::Object(object).to_string()
+    }
+}
+
+/// One value of a statement that asked for it before running. The dialog collects text;
+/// a whole number, a decimal, a boolean and the word `NULL` keep the kind the driver
+/// expects.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Param {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Boolean(bool),
+    Text(String),
+}
+
+impl Param {
+    /// Reads the text of a parameter field as the value the driver binds. Text that is not
+    /// a number, a boolean or `NULL` stays text, unchanged.
+    pub fn parse_text(text: &str) -> Self {
+        let trimmed = text.trim();
+        if trimmed.eq_ignore_ascii_case("null") {
+            return Self::Null;
+        }
+        if let Ok(integer) = trimmed.parse::<i64>() {
+            return Self::Integer(integer);
+        }
+        if let Ok(real) = trimmed.parse::<f64>()
+            && real.is_finite()
+        {
+            return Self::Real(real);
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "true" => Self::Boolean(true),
+            "false" => Self::Boolean(false),
+            _ => Self::Text(text.to_owned()),
+        }
+    }
+
+    /// The value as the helper reads it: a JSON null, number, boolean or string.
+    pub fn json(&self) -> Json {
+        match self {
+            Self::Null => Json::Null,
+            Self::Integer(integer) => json!(integer),
+            Self::Real(real) => json!(real),
+            Self::Boolean(boolean) => json!(boolean),
+            Self::Text(text) => json!(text),
+        }
     }
 }
 
@@ -522,6 +577,7 @@ mod tests {
             sql: "SELECT * FROM \"PUBLIC\".\"OWNERS\"".into(),
             timeout: None,
             max_rows: Some(500),
+            params: Vec::new(),
         }
         .encode();
         let value: Json = serde_json::from_str(&line).unwrap();
@@ -530,6 +586,7 @@ mod tests {
         assert_eq!(value["sql"], "SELECT * FROM \"PUBLIC\".\"OWNERS\"");
         assert_eq!(value["maxRows"], 500);
         assert!(value.get("timeoutMs").is_none());
+        assert!(value.get("params").is_none());
 
         // A console statement has no limit of its own: the address holds it, if any.
         let line = Command::Query {
@@ -537,10 +594,32 @@ mod tests {
             sql: "SELECT ID FROM OWNERS".into(),
             timeout: None,
             max_rows: None,
+            params: Vec::new(),
         }
         .encode();
         let value: Json = serde_json::from_str(&line).unwrap();
         assert!(value.get("maxRows").is_none());
+    }
+
+    #[test]
+    fn a_query_carries_the_values_of_its_placeholders() {
+        let line = Command::Query {
+            id: 6,
+            sql: "SELECT NAME FROM OWNERS WHERE ID = ? AND NAME = ?".into(),
+            timeout: None,
+            max_rows: None,
+            params: vec![Param::Integer(7), Param::Text("Ann".into())],
+        }
+        .encode();
+        let value: Json = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["params"], json!([7, "Ann"]));
+        assert_eq!(Param::parse_text(" 12 "), Param::Integer(12));
+        assert_eq!(Param::parse_text("1.5"), Param::Real(1.5));
+        assert_eq!(Param::parse_text("null"), Param::Null);
+        assert_eq!(Param::parse_text("true"), Param::Boolean(true));
+        assert_eq!(Param::parse_text(" Ann "), Param::Text(" Ann ".into()));
+        assert_eq!(Param::parse_text("NaN"), Param::Text("NaN".into()));
     }
 
     #[test]

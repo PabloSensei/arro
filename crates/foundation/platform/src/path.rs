@@ -58,18 +58,33 @@ pub fn path_key(path: &Path) -> PathBuf {
     PathBuf::from(normal_form(&path.to_string_lossy()).to_lowercase())
 }
 
-/// The path a `file://` URL names, as `open` of the Finder and an internet browser hand
-/// it over: `file:///C:/dir/a%20b.txt` and `file://server/share/a.txt`.
-pub fn file_url_path(url: &str) -> Option<PathBuf> {
-    let rest = url.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+/// The path a `file:` URI names, the reverse of [`CanonPath::to_uri`]:
+/// `file:///C:/dir/a%20b.txt` for a local file and `file://server/share/a.txt` for a
+/// share. `None` for any other scheme.
+pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
+    let rest = crate::url::file_rest(uri)?;
     let text = String::from_utf8(crate::url::percent_decode(rest)?).ok()?;
-    let path = if let Some(local) = text.strip_prefix('/') {
-        local.replace('/', "\\")
-    } else {
-        format!(r"\\{}", text.replace('/', "\\"))
+    let path = match text.strip_prefix('/') {
+        Some(local) => match local.split_at_checked(2) {
+            Some((drive, tail)) if is_drive(drive) => {
+                format!("{}{}", drive.to_ascii_uppercase(), tail.replace('/', "\\"))
+            }
+            _ => format!(r"\{}", local.replace('/', "\\")),
+        },
+        None => format!(r"\\{}", text.replace('/', "\\")),
     };
     Some(PathBuf::from(path))
+}
+
+fn is_drive(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// A `file://` URL as `open` of the Finder and an internet browser hand it over, the
+/// same path [`path_from_uri`] gives.
+pub fn file_url_path(url: &str) -> Option<PathBuf> {
+    path_from_uri(url)
 }
 
 fn normal_form(path: &str) -> String {
@@ -152,19 +167,33 @@ mod tests {
     }
 
     #[test]
-    fn a_file_url_is_a_path() {
+    fn a_file_uri_is_a_path() {
         assert_eq!(
-            file_url_path("file:///C:/dir/a%20b.txt"),
+            path_from_uri("file:///C:/dir/a%20b.txt"),
             Some(PathBuf::from(r"C:\dir\a b.txt"))
         );
         assert_eq!(
-            file_url_path("file://localhost/C:/%D0%BF%D1%80/A.txt"),
+            path_from_uri("file://localhost/C:/%D0%BF%D1%80/A.txt"),
             Some(PathBuf::from(r"C:\пр\A.txt"))
         );
         assert_eq!(
-            file_url_path("file://server/share/a.txt"),
+            path_from_uri("file://server/share/a.txt"),
             Some(PathBuf::from(r"\\server\share\a.txt"))
         );
-        assert_eq!(file_url_path("https://example.com/a"), None);
+        assert_eq!(path_from_uri("https://example.com/a"), None);
+        assert_eq!(path_from_uri("lib://contents/core/Text.class"), None);
+    }
+
+    #[test]
+    fn a_path_survives_the_way_to_a_uri_and_back() {
+        for path in [
+            r"C:\work\A.txt",
+            r"C:\work files\A b.txt",
+            r"C:\проект\A.txt",
+            r"\\server\share\a b.txt",
+        ] {
+            let uri = uri_of(path);
+            assert_eq!(path_from_uri(&uri), Some(PathBuf::from(path)), "{uri}");
+        }
     }
 }

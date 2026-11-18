@@ -84,6 +84,13 @@ impl ProblemsState {
         self.files.get(path).map_or(&[], Vec::as_slice)
     }
 
+    /// Every file that has problems, for the IDE protocol.
+    pub fn files(&self) -> impl Iterator<Item = (&PathBuf, &[Problem])> {
+        self.files
+            .iter()
+            .map(|(path, problems)| (path, problems.as_slice()))
+    }
+
     /// The error or warning after (or before) a place of the file, going round at the end.
     pub fn step(&self, path: &Path, line: usize, column: usize, forward: bool) -> Option<&Problem> {
         let mut stops = self.of_file(path).iter().filter(|problem| problem.counts());
@@ -288,6 +295,11 @@ impl ProblemsHub {
 
     /// Shows the current problems in the window.
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        let files = self
+            .state
+            .files()
+            .map(|(path, problems)| (path.clone(), problems.to_vec()));
+        crate::claude_ide::publish_problems(cx, files);
         let (errors, warnings) = self.state.totals();
         let items = self.state.items(&self.root);
         let title = format!("Problems ({errors} errors, {warnings} warnings)");

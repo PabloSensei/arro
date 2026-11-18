@@ -17,6 +17,7 @@ agent-pty = { path = "../../ai/agent-pty" }
 agent-testkit = { path = "../../ai/agent-testkit", optional = true }
 base.workspace = true
 change-tracker = { path = "../../ai/change-tracker" }
+claude-bridge = { path = "../../ai/claude-bridge" }
 container.workspace = true
 kube.workspace = true
 crossbeam-channel = "0.5"
@@ -28,6 +29,7 @@ http-client.workspace = true
 keymap = { path = "../../editor/keymap" }
 lang-api.workspace = true
 local-history = { path = "../../services/local-history" }
+mcp-discovery = { path = "../../ai/mcp-discovery" }
 mcp-server = { path = "../../ai/mcp-server" }
 platform.workspace = true
 proc-sup.workspace = true

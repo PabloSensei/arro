@@ -1,7 +1,8 @@
 # Builds the Linux and macOS archives, attaches them to the draft release that
 # team/release.sh made with the Windows archive, runs the Linux and macOS tests
-# (build.yml), checks the whole set and only then publishes the release: nobody can
-# download a release without its archives or with failing tests.
+# (build.yml) unless team/gh-ci.sh ran them on the same tree before the release, checks
+# the whole set and only then publishes the release: nobody can download a release
+# without its archives or with failing tests.
 # Without a tag the run is a trial: the Linux archive becomes an artifact of the run.
 name: release
 
@@ -10,6 +11,10 @@ on:
     inputs:
       tag:
         description: "The tag of the draft release, v0.1.12 for one; empty for a trial"
+        required: false
+        default: ""
+      tested_tree:
+        description: "The git tree that passed build.yml on the branch ci (team/gh-ci.sh); empty runs the tests here"
         required: false
         default: ""
 
@@ -32,11 +37,14 @@ env:
   ASM_VERSION: "9.10.1"
   MAVEN_CENTRAL: https://repo1.maven.org/maven2
   TAG: ${{ inputs.tag }}
+  TESTED_TREE: ${{ inputs.tested_tree }}
 
 jobs:
-  # The tests of Linux and macOS run beside the archives; the release waits for them.
+  # The tests of Linux and macOS run beside the archives and the release waits for them,
+  # unless team/gh-ci.sh already ran them on the very same tree before the release.
   tests:
     name: Tests
+    if: inputs.tested_tree == ''
     uses: ./.github/workflows/build.yml
 
   linux:
@@ -211,9 +219,21 @@ jobs:
   publish:
     name: Check and publish
     needs: [linux, macos, tests]
-    if: inputs.tag != ''
+    # Skipped tests (they passed before the release) do not hold the release back;
+    # failed or cancelled ones do.
+    if: inputs.tag != '' && !failure() && !cancelled()
     runs-on: ubuntu-latest
     steps:
+      - name: Check the tested tree
+        if: inputs.tested_tree != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          target=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json targetCommitish -q .targetCommitish)
+          tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" -q .commit.tree.sha)
+          echo "release tree: $tree, tested tree: $TESTED_TREE"
+          [ "$tree" = "$TESTED_TREE" ] || { echo "the release is not the tree that passed the tests"; exit 1; }
+
       - name: Check the archives
         env:
           GH_TOKEN: ${{ github.token }}

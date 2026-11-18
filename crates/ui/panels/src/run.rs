@@ -26,6 +26,10 @@ use runner::{
     ProfileOwner, RunConfig, RunConfigProvider, RunPlan, STOPPED_BY_USER, ServiceRun, ServiceState,
     Step, Stream, TestProvider, TestRequest, TestRun,
 };
+use tool_gateway::{
+    BuildOutcome, BuildRequest, RunConfiguration, RunOutput, TestCase, TestOutcome, TestsOutcome,
+    TestsRequest,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -34,6 +38,7 @@ use workspace_core::Delivery;
 
 use crate::ansi::{Line, OutputBuffers, Style};
 use crate::console_input::{ConsoleInput, ConsoleKey};
+use crate::mcp_runs::{Answer, Job, Request as ToolRequest, RunBridge};
 use crate::stack_traces::ActiveStackTrace;
 
 mod tests;
@@ -272,6 +277,35 @@ pub struct RunPanel {
     test_history: Vec<runner::TestHistoryRun>,
     /// The list of earlier runs is open in the test window.
     history_open: bool,
+    /// The queue the MCP tools of the window leave their jobs in.
+    tool_runs: Option<Arc<crate::mcp_runs::RunBridge>>,
+    /// The build or test run an MCP tool asked for and still waits for.
+    tool_job: Option<ToolJob>,
+    /// The id of the output the window fills now or filled last, and whether it is a
+    /// program rather than a build or a test run.
+    tool_output: Option<(String, bool)>,
+    /// The output of the runs an MCP tool asked for, the newest last, for `get_run_output`
+    /// after the run has ended.
+    tool_outputs: VecDeque<(String, tool_gateway::RunOutput)>,
+    /// The exit code of the last process of a job an MCP tool asked for.
+    tool_exit: Option<Option<i32>>,
+}
+
+/// The build or test run a tool of the MCP server asked for.
+struct ToolJob {
+    /// The id `get_run_output` reads this run by.
+    output: String,
+    kind: ToolJobKind,
+    started: Instant,
+    /// Whether the console of the job ever appeared; a plan that failed leaves none.
+    saw_console: bool,
+    /// The tool that waits for the end of this run.
+    reply: std::sync::mpsc::Sender<Result<Answer, String>>,
+}
+
+enum ToolJobKind {
+    Build,
+    Tests,
 }
 
 /// The name of a recording file, for the list of several.
@@ -394,6 +428,18 @@ pub(crate) fn bind_actions(workspace: &mut Workspace) {
             );
         },
     );
+    workspace.register_command(
+        "settings.build_tool_second",
+        "Second Build Tool Settings",
+        |workspace, window, cx| {
+            crate::settings::SettingsView::show_at(
+                workspace,
+                window,
+                cx,
+                Some("build_tool_second_home"),
+            );
+        },
+    );
 }
 
 impl RunPanel {
@@ -448,7 +494,11 @@ impl RunPanel {
                 .ok();
             })
             .detach();
-            let tool_bin = setup.tool.as_ref().and_then(|tool| tool.tool_bin());
+            let tool_bin = setup
+                .tool
+                .as_ref()
+                .filter(|tool| tool.terminal_path())
+                .and_then(|tool| tool.tool_bin());
             cx.set_global(crate::terminal_panel::ToolTerminalPath(tool_bin));
             Self {
                 workspace,
@@ -529,6 +579,11 @@ impl RunPanel {
                 auto_pending: false,
                 test_history: Vec::new(),
                 history_open: false,
+                tool_runs: None,
+                tool_job: None,
+                tool_output: None,
+                tool_outputs: VecDeque::new(),
+                tool_exit: None,
             }
         })
     }
@@ -2556,6 +2611,416 @@ impl RunPanel {
         }
     }
 
+    /// Connects the tools of the MCP server to this window: their builds, tests and runs
+    /// go through the same buttons, consoles and trees as the ones of the user.
+    pub(crate) fn set_tool_runs(&mut self, runs: Arc<RunBridge>) {
+        self.tool_runs = Some(runs);
+    }
+
+    /// Takes the jobs the MCP tools left, starts them, and answers the ones that ended.
+    fn poll_tool_jobs(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = self.refresh_tool_output();
+        changed |= self.complete_tool_job();
+        let Some(bridge) = self.tool_runs.clone() else {
+            return changed;
+        };
+        while let Some(job) = bridge.take_job() {
+            changed = true;
+            self.take_tool_job(&bridge, job, cx);
+        }
+        changed
+    }
+
+    fn take_tool_job(&mut self, bridge: &Arc<RunBridge>, job: Job, cx: &mut Context<Self>) {
+        match job.request.clone() {
+            ToolRequest::Configurations => {
+                let configurations = self
+                    .configs
+                    .iter()
+                    .map(|config| RunConfiguration {
+                        name: config.name.clone(),
+                        kind: config.provider.clone(),
+                    })
+                    .collect();
+                let _ = job.reply.send(Ok(Answer::Configurations(configurations)));
+            }
+            ToolRequest::Output(id) => {
+                self.refresh_tool_output();
+                match self.tool_outputs.iter().find(|(known, _)| *known == id) {
+                    Some((_, output)) => {
+                        let _ = job.reply.send(Ok(Answer::Output(output.clone())));
+                    }
+                    None => {
+                        let _ = job.reply.send(Err(format!("no run has the id {id}")));
+                    }
+                }
+            }
+            ToolRequest::Stop(id) => {
+                let active = self.tool_job.as_ref().is_some_and(|job| job.output == id)
+                    || self
+                        .tool_output
+                        .as_ref()
+                        .is_some_and(|(active, _)| *active == id);
+                if active {
+                    self.stop(cx);
+                    let _ = job.reply.send(Ok(Answer::Stopped));
+                } else {
+                    let _ = job
+                        .reply
+                        .send(Err(format!("no run with the id {id} is running")));
+                }
+            }
+            ToolRequest::Build(request) => self.start_tool_build(bridge, job, request, cx),
+            ToolRequest::Tests(request) => self.start_tool_tests(bridge, job, request, cx),
+            ToolRequest::Start(name) => self.start_tool_run(bridge, job, &name, cx),
+        }
+    }
+
+    fn refuse_tool_job(&mut self, bridge: &Arc<RunBridge>, job: Job, message: impl Into<String>) {
+        let _ = job.reply.send(Err(message.into()));
+        bridge.release();
+    }
+
+    fn start_tool_build(
+        &mut self,
+        bridge: &Arc<RunBridge>,
+        job: Job,
+        request: BuildRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if self.starting || self.busy() {
+            return self.refuse_tool_job(bridge, job, "the Run window is busy");
+        }
+        let Some(tool) = self.tool.clone() else {
+            return self.refuse_tool_job(bridge, job, "the project has no build tool");
+        };
+        let module = match &request.module {
+            Some(name) => {
+                let model = self.session.as_ref().and_then(ProjectSession::model);
+                match model.and_then(|model| {
+                    model
+                        .modules
+                        .iter()
+                        .find(|module| &module.name == name || &module.id == name)
+                        .cloned()
+                }) {
+                    Some(module) => Some(module),
+                    None => {
+                        return self.refuse_tool_job(
+                            bridge,
+                            job,
+                            format!("the project has no module {name}"),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+        let output = job.output_id();
+        self.tool_exit = None;
+        self.tool_job = Some(ToolJob {
+            output: output.clone(),
+            kind: ToolJobKind::Build,
+            started: Instant::now(),
+            saw_console: false,
+            reply: job.reply.clone(),
+        });
+        self.tool_output = Some((output, false));
+        match module {
+            Some(module) => {
+                let (root, title) = (self.root.clone(), format!("{} Compile", self.tool_title()));
+                self.building_project = true;
+                self.launch(title, None, cx, move || {
+                    let program = tool
+                        .compile(&root, Some(&module))
+                        .map_err(|error| error.to_string())?;
+                    Ok((
+                        RunPlan {
+                            before: None,
+                            program,
+                            grace: TASK_GRACE,
+                        },
+                        None,
+                    ))
+                });
+            }
+            None => self.build_project(cx),
+        }
+        if !(self.starting || self.console.is_some()) {
+            self.tool_job = None;
+            self.tool_output = None;
+            return self.refuse_tool_job(bridge, job, "the build did not start");
+        }
+        self.note_tool_client(job.client.as_deref());
+    }
+
+    fn start_tool_tests(
+        &mut self,
+        bridge: &Arc<RunBridge>,
+        job: Job,
+        request: TestsRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if self.starting || self.busy() {
+            return self.refuse_tool_job(bridge, job, "the Run window is busy");
+        }
+        if self.test_provider.is_none() {
+            return self.refuse_tool_job(bridge, job, "the project has no test runner");
+        }
+        let output = job.output_id();
+        self.tool_exit = None;
+        self.tool_job = Some(ToolJob {
+            output: output.clone(),
+            kind: ToolJobKind::Tests,
+            started: Instant::now(),
+            saw_console: false,
+            reply: job.reply.clone(),
+        });
+        self.tool_output = Some((output, false));
+        let request = TestRequest {
+            module: request.module,
+            package: request.package,
+            suite: request.suite,
+            case: request.case,
+            cases: Vec::new(),
+        };
+        self.run_tests(request, cx);
+        let started = self.starting || self.waiting_tests.is_some() || self.tests.run.is_some();
+        if !started {
+            self.tool_job = None;
+            self.tool_output = None;
+            return self.refuse_tool_job(bridge, job, "the tests did not start");
+        }
+        self.note_tool_client(job.client.as_deref());
+    }
+
+    fn start_tool_run(
+        &mut self,
+        bridge: &Arc<RunBridge>,
+        job: Job,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.starting || self.busy() {
+            return self.refuse_tool_job(bridge, job, "the Run window is busy");
+        }
+        let Some(config) = self
+            .configs
+            .iter()
+            .find(|config| config.name == name)
+            .cloned()
+        else {
+            return self.refuse_tool_job(
+                bridge,
+                job,
+                format!("the project has no run configuration {name}"),
+            );
+        };
+        let output = job.output_id();
+        self.tool_exit = None;
+        self.tool_output = Some((output.clone(), true));
+        self.choose_configuration(config, cx);
+        self.run(cx);
+        if !(self.starting || self.waiting || self.console.is_some()) {
+            self.tool_output = None;
+            return self.refuse_tool_job(bridge, job, "the configuration did not start");
+        }
+        self.note_tool_client(job.client.as_deref());
+        let _ = job.reply.send(Ok(Answer::Started(output)));
+        bridge.release();
+    }
+
+    /// Names the client of the MCP server in the title and in the console of the run.
+    fn note_tool_client(&mut self, client: Option<&str>) {
+        let Some(client) = client else {
+            return;
+        };
+        let title = self.title.to_string();
+        self.title = format!("{title} · {client}").into();
+        self.note(&format!("Started by {client}"), false);
+    }
+
+    fn line_tail(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .rev()
+            .take(tool_gateway::OUTPUT_TAIL)
+            .rev()
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
+    /// Keeps the output of a job an MCP tool asked for up to date, so `get_run_output`
+    /// sees the lines as they come.
+    fn refresh_tool_output(&mut self) -> bool {
+        let Some((id, program)) = self.tool_output.clone() else {
+            return false;
+        };
+        let running = self.starting
+            || self.waiting
+            || self.console_running
+            || self.tests.running()
+            || (self.build_console.is_some() && self.build_running);
+        let exit = if program {
+            match self.run_service.state() {
+                ServiceState::Stopped { code } if !running => *code,
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let output = RunOutput {
+            id: id.clone(),
+            running,
+            exit_code: exit,
+            lines: self.line_tail(),
+        };
+        self.store_tool_output(output);
+        if program && !running {
+            self.tool_output = None;
+        }
+        true
+    }
+
+    fn store_tool_output(&mut self, output: RunOutput) {
+        if let Some((_, known)) = self
+            .tool_outputs
+            .iter_mut()
+            .find(|(id, _)| id == &output.id)
+        {
+            *known = output;
+            return;
+        }
+        self.tool_outputs.push_back((output.id.clone(), output));
+        while self.tool_outputs.len() > 8 {
+            self.tool_outputs.pop_front();
+        }
+    }
+
+    /// Answers the build or test run of a job once the console is closed and every event
+    /// is in.
+    fn complete_tool_job(&mut self) -> bool {
+        if let Some(job) = &mut self.tool_job
+            && (self.starting
+                || self.console.is_some()
+                || self.tests.run.is_some()
+                || self.waiting_tests.is_some())
+        {
+            job.saw_console = true;
+        }
+        let done = self.tool_job.as_ref().is_some_and(|job| match job.kind {
+            ToolJobKind::Build => !self.starting && self.console.is_none() && !self.console_running,
+            ToolJobKind::Tests => {
+                !self.starting && self.waiting_tests.is_none() && self.tests.run.is_none()
+            }
+        });
+        if !done {
+            return false;
+        }
+        let Some(job) = self.tool_job.take() else {
+            return false;
+        };
+        let Some(bridge) = self.tool_runs.clone() else {
+            return false;
+        };
+        let duration_ms = job.started.elapsed().as_millis() as u64;
+        if !job.saw_console {
+            let last = self
+                .lines
+                .back()
+                .map(|line| line.text.clone())
+                .unwrap_or_default();
+            let message = match last.is_empty() {
+                true => "the run did not start".to_string(),
+                false => format!("the run did not start: {last}"),
+            };
+            let _ = job.reply.send(Err(message));
+            self.tool_output = None;
+            self.tool_exit = None;
+            bridge.release();
+            return true;
+        }
+        match job.kind {
+            ToolJobKind::Build => {
+                let exit = self.tool_exit.flatten();
+                let success = exit == Some(0);
+                let text: Vec<String> = self.lines.iter().map(|line| line.text.clone()).collect();
+                let problems = tool_gateway::build_problems(&text, &self.root);
+                self.store_tool_output(RunOutput {
+                    id: job.output.clone(),
+                    running: false,
+                    exit_code: Some(if success { 0 } else { 1 }),
+                    lines: self.line_tail(),
+                });
+                let outcome = BuildOutcome {
+                    success,
+                    problems,
+                    duration_ms,
+                    output: job.output.clone(),
+                };
+                let _ = job.reply.send(Ok(Answer::Build(outcome)));
+            }
+            ToolJobKind::Tests => {
+                let counts = self.tests.tree.counts();
+                let cases = self
+                    .tests
+                    .tree
+                    .cases()
+                    .filter_map(|node| {
+                        let outcome = match &node.state {
+                            runner::TestState::Passed => TestOutcome::Passed,
+                            runner::TestState::Failed { .. } => TestOutcome::Failed,
+                            runner::TestState::Aborted { .. }
+                            | runner::TestState::Skipped { .. } => TestOutcome::Skipped,
+                            runner::TestState::Running => return None,
+                        };
+                        let (message, trace) = match &node.state {
+                            runner::TestState::Failed { message, trace } => (
+                                message.clone(),
+                                trace
+                                    .as_deref()
+                                    .map(|trace| {
+                                        trace.lines().take(5).map(str::to_string).collect()
+                                    })
+                                    .unwrap_or_default(),
+                            ),
+                            runner::TestState::Aborted { message } => (message.clone(), Vec::new()),
+                            _ => (None, Vec::new()),
+                        };
+                        Some(TestCase {
+                            suite: node.node.suite.clone().unwrap_or_default(),
+                            case: node.node.case.clone(),
+                            outcome,
+                            message,
+                            trace,
+                            duration_ms: node.duration_ms,
+                        })
+                    })
+                    .collect();
+                let failed = counts.failed;
+                self.store_tool_output(RunOutput {
+                    id: job.output.clone(),
+                    running: false,
+                    exit_code: Some(if failed > 0 { 1 } else { 0 }),
+                    lines: self.line_tail(),
+                });
+                let outcome = TestsOutcome {
+                    passed: counts.passed,
+                    failed,
+                    skipped: counts.skipped + counts.aborted,
+                    cases,
+                    duration_ms,
+                    output: job.output.clone(),
+                };
+                let _ = job.reply.send(Ok(Answer::Tests(outcome)));
+            }
+        }
+        self.tool_output = None;
+        self.tool_exit = None;
+        bridge.release();
+        true
+    }
+
     /// Whether the console in front reads what the user types. The program of a run does;
     /// a build step, a test run and an old console tab do not.
     pub(crate) fn takes_input(&self) -> bool {
@@ -3409,6 +3874,11 @@ impl RunPanel {
         if exited.is_some() && !main_console {
             self.tests.exited = Some(std::time::Instant::now());
         }
+        if let Some(code) = exited
+            && self.tool_job.is_some()
+        {
+            self.tool_exit = Some(code);
+        }
         if built {
             self.mark_built();
         }
@@ -3464,6 +3934,7 @@ impl RunPanel {
                 changed = true;
             }
         }
+        changed |= self.poll_tool_jobs(cx);
         if changed {
             // The console waits for a line below the last one, so that row is in view too.
             let last = self.lines.len() + usize::from(self.takes_input());
@@ -3568,8 +4039,14 @@ impl RunPanel {
         if let Some(label) = &setup.choose {
             buttons.push(("choose", label.clone().into(), "build_tool.choose"));
         }
-        if let Some((label, _)) = &setup.settings {
-            buttons.push(("settings", label.clone().into(), "settings.build_tools"));
+        if let Some((label, row)) = &setup.settings {
+            // A tool may live on the second page of Settings: its notification opens the
+            // row of that page and not the first one.
+            let command = match *row {
+                "build_tool_second_home" => "settings.build_tool_second",
+                _ => "settings.build_tools",
+            };
+            buttons.push(("settings", label.clone().into(), command));
         }
         let _ = self.workspace.update(cx, |workspace, cx| {
             workspace.notify_user_with_commands(
@@ -3727,7 +4204,12 @@ impl RunPanel {
                 {
                     tool.use_home(&home);
                 }
-                if let Some(bin) = self.tool.as_ref().and_then(|tool| tool.tool_bin()) {
+                if let Some(bin) = self
+                    .tool
+                    .as_ref()
+                    .filter(|tool| tool.terminal_path())
+                    .and_then(|tool| tool.tool_bin())
+                {
                     cx.set_global(crate::terminal_panel::ToolTerminalPath(Some(bin)));
                 }
                 let _ = self.workspace.update(cx, |workspace, cx| {

@@ -17,6 +17,8 @@ use workspace::{Launch, Layout, Settings, Workspace};
 use crate::window_tests::wait_for_signal;
 use crate::window_tests::{press, project_setup, scratch};
 use crate::window_tests_git::{git_state, repository_with_origin, wait_for};
+#[cfg(windows)]
+use crate::window_tests_journal::{journal_of, journal_writer};
 use crate::{AgentOptions, LanguageServer, SearchSetup};
 
 /// The same window as `window_tests::open_window_with`, with the settings the test needs
@@ -358,13 +360,14 @@ fn the_second_build_tool_command_takes_the_offline_flag_and_the_user_home() {
 fn the_git_path_of_the_settings_runs_the_git_of_the_window(cx: &mut TestAppContext) {
     install_names();
     let root = scratch("settings-git-path");
-    let log = root.join("git-arguments.txt");
+    let journal = root.join("git-calls");
+    let writer = journal_writer(&journal);
     let script = root.join("fake-git.cmd");
     fs::write(
         &script,
         format!(
-            "@echo off\r\necho %*>>\"{}\"\r\necho {}\r\n",
-            log.display(),
+            "@echo off\r\nsetlocal EnableExtensions\r\n{}\r\necho {}\r\n",
+            writer.replace('\n', "\r\n"),
             root.display()
         ),
     )
@@ -377,9 +380,9 @@ fn the_git_path_of_the_settings_runs_the_git_of_the_window(cx: &mut TestAppConte
     cx.run_until_parked();
 
     wait_for_signal(cx, "the stand-in Git to answer", |_| {
-        fs::read_to_string(&log).is_ok_and(|text| text.contains("rev-parse --show-toplevel"))
+        journal_of(&journal).contains("rev-parse --show-toplevel")
     });
-    let text = fs::read_to_string(&log).unwrap();
+    let text = journal_of(&journal);
     assert!(text.contains("--no-optional-locks"), "{text}");
     assert!(text.contains("rev-parse --show-toplevel"), "{text}");
 }

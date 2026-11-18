@@ -2,7 +2,9 @@
 //! line from stdin goes to the HTTP endpoint of the session, every answer comes back on stdout.
 //!
 //! `IDE_MCP_URL` names the endpoint, `IDE_MCP_TOKEN` carries the session token, both set by the
-//! IDE for the harness it starts. The token never appears on a command line or in a file.
+//! IDE for the harness it starts. Without them the shim takes the window whose project root
+//! holds the current folder, from the entry point the window left in the state folder of Arro.
+//! A token never appears on a command line.
 
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
@@ -133,27 +135,21 @@ impl Endpoint {
 
     /// Forwards one message and returns what goes back to the harness.
     fn forward(&mut self, message: &Value) -> Vec<Value> {
-        let id = message.get("id").cloned();
-        let failure = |text: String| match &id {
-            Some(id) if message.get("method").is_some() => vec![json!({
-                "jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": text},
-            })],
-            _ => Vec::new(),
-        };
         let reply = match self.post(&message.to_string()) {
             Ok(reply) => reply,
-            Err(error) => return failure(format!("the IDE is not reachable: {error}")),
+            Err(error) => {
+                return failure(message, format!("the IDE is not reachable: {error}"));
+            }
         };
         if let Some(session) = reply.header("mcp-session-id") {
             self.session = Some(session.to_string());
         }
         if !(200..300).contains(&reply.status) {
             let text = String::from_utf8_lossy(&reply.body).into_owned();
-            return failure(format!(
-                "the IDE answered {}: {}",
-                reply.status,
-                text.trim()
-            ));
+            return failure(
+                message,
+                format!("the IDE answered {}: {}", reply.status, text.trim()),
+            );
         }
         let answers = messages(&reply);
         if message["method"] == json!("initialize") {
@@ -166,18 +162,49 @@ impl Endpoint {
     }
 }
 
-fn run() -> Result<(), String> {
-    let url = std::env::var(URL_VARIABLE).map_err(|_| format!("{URL_VARIABLE} is not set"))?;
-    let token =
-        std::env::var(TOKEN_VARIABLE).map_err(|_| format!("{TOKEN_VARIABLE} is not set"))?;
+/// The answer to a request that never reached the IDE. A notification gets nothing.
+fn failure(message: &Value, text: String) -> Vec<Value> {
+    let Some(id) = message.get("id") else {
+        return Vec::new();
+    };
+    if message.get("method").is_none() {
+        return Vec::new();
+    }
+    vec![json!({
+        "jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": text},
+    })]
+}
+
+/// The endpoint of the IDE: the variables of a harness Arro started win over the entry
+/// point of the window that holds the current folder.
+fn find_endpoint() -> Result<Endpoint, String> {
+    let url = std::env::var(URL_VARIABLE).ok();
+    let token = std::env::var(TOKEN_VARIABLE).ok();
+    let (url, token) = match (url, token) {
+        (Some(url), Some(token)) => (url, token),
+        (None, None) => {
+            let folder = std::env::current_dir().map_err(|error| error.to_string())?;
+            let entry = mcp_discovery::find(&mcp_discovery::state_folder(), &folder)
+                .ok_or_else(|| format!("Arro is not running for {}", folder.display()))?;
+            (entry.url, entry.token)
+        }
+        (Some(_), None) => return Err(format!("{TOKEN_VARIABLE} is not set")),
+        (None, Some(_)) => return Err(format!("{URL_VARIABLE} is not set")),
+    };
     let (address, path) = parse_url(&url)?;
-    let mut endpoint = Endpoint {
+    Ok(Endpoint {
         address,
         path,
         token,
         session: None,
         protocol: None,
-    };
+    })
+}
+
+fn run() -> Result<(), String> {
+    let endpoint = find_endpoint();
+    let missing = endpoint.as_ref().err().cloned();
+    let mut endpoint = endpoint.ok();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {
@@ -190,7 +217,14 @@ fn run() -> Result<(), String> {
             writeln!(stdout, "{error}").map_err(|error| error.to_string())?;
             continue;
         };
-        for answer in endpoint.forward(&message) {
+        let answers = match &mut endpoint {
+            Some(endpoint) => endpoint.forward(&message),
+            None => {
+                let text = missing.clone().unwrap_or_default();
+                failure(&message, text)
+            }
+        };
+        for answer in answers {
             writeln!(stdout, "{answer}").map_err(|error| error.to_string())?;
         }
         stdout.flush().map_err(|error| error.to_string())?;

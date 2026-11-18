@@ -5,67 +5,15 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use lsp_types::Uri;
-use platform::CanonPath;
+use platform::{CanonPath, path_from_uri};
 
 pub fn file_uri(path: &CanonPath) -> Option<Uri> {
     Uri::from_str(&path.to_uri()).ok()
 }
 
-fn hex(byte: u8) -> Option<u8> {
-    (byte as char).to_digit(16).map(|digit| digit as u8)
-}
-
-fn decode(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at] == b'%' {
-            let high = hex(*bytes.get(at + 1)?)?;
-            let low = hex(*bytes.get(at + 2)?)?;
-            out.push(high << 4 | low);
-            at += 3;
-        } else {
-            out.push(bytes[at]);
-            at += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-#[cfg(windows)]
-fn is_drive(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-}
-
 /// The path of a URI from a server, `None` for any scheme but `file:`.
-#[cfg(windows)]
 pub fn file_path(uri: &Uri) -> Option<PathBuf> {
-    let rest = uri.as_str().strip_prefix("file://")?;
-    let rest = decode(rest)?;
-    let path = rest.strip_prefix('/').map_or_else(
-        || format!(r"\\{}", rest.replace('/', "\\")),
-        |local| {
-            let (drive, tail) = local.split_at_checked(2).unwrap_or((local, ""));
-            if is_drive(drive) {
-                format!("{}{}", drive.to_ascii_uppercase(), tail.replace('/', "\\"))
-            } else {
-                format!(r"\{}", local.replace('/', "\\"))
-            }
-        },
-    );
-    Some(PathBuf::from(path))
-}
-
-/// The path of a URI from a server, `None` for any scheme but `file:`. A Unix path starts
-/// at the root, so everything after `file://` belongs to it; a server that names a host
-/// still has a path from the root.
-#[cfg(unix)]
-pub fn file_path(uri: &Uri) -> Option<PathBuf> {
-    let rest = uri.as_str().strip_prefix("file://")?;
-    let rest = decode(rest)?;
-    Some(PathBuf::from(format!("/{}", rest.trim_start_matches('/'))))
+    path_from_uri(uri.as_str())
 }
 
 #[cfg(test)]

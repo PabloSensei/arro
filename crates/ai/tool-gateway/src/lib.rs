@@ -3,6 +3,7 @@
 
 mod audit;
 mod backend;
+mod edit;
 mod gateway;
 mod hint;
 mod language;
@@ -11,11 +12,20 @@ mod tools;
 
 pub use audit::{AuditEntry, AuditLog};
 pub use backend::{
-    Confidence, DebugSnapshotSource, DebugStateQuery, Diagnostic, DiagnosticsPage,
-    DiagnosticsQuery, EditorContext, Location, Position, SessionScope, Severity, SymbolHit,
-    SymbolInfo, SymbolPage, SymbolQuery, ToolBackend, ToolError, Unavailable,
+    BuildOutcome, BuildProblem, BuildRequest, CallHierarchy, CallHierarchyQuery, Confidence,
+    DebugSnapshotSource, DebugStateQuery, Diagnostic, DiagnosticsPage, DiagnosticsQuery,
+    EditOutcome, EditorContext, FileActionOutcome, FileActionQuery, FileText, HierarchyNode,
+    Location, OUTPUT_TAIL, Position, ProjectModule, ProjectRunner, ProjectStructure,
+    ProjectStructureQuery, ProposeEditQuery, ProposedEdit, READ_LINE_LIMIT, ReadFileQuery,
+    RenameSymbolQuery, RenamedSymbol, RunConfiguration, RunId, RunOutput, SearchHit, SearchPage,
+    SearchQuery, SessionScope, Severity, StartRunRequest, SymbolHit, SymbolInfo, SymbolPage,
+    SymbolQuery, TestCase, TestOutcome, TestsOutcome, TestsRequest, TextReplacement, ToolBackend,
+    ToolError, TypeHierarchy, TypeHierarchyQuery, Unavailable, Usage, UsagePage, UsagesQuery,
+    VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
 };
-pub use gateway::{Decision, Policy, ToolGateway};
+pub use edit::apply_replacements;
+pub use gateway::{Approval, ApprovalAnswer, ApprovalRequest, Decision, Policy, ToolGateway};
 pub use hint::{agents_md_section, with_agents_md_section};
 pub use language::LanguageTools;
+pub use render::build_problems;
 pub use tools::{TOOL_NAMES, ToolClass, ToolSpec};

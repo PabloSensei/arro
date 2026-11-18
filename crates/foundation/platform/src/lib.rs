@@ -75,9 +75,9 @@ mod waiter;
 pub use crash::{install as install_crash_handler, module_of};
 pub use job::Job;
 pub use memory::{MemoryPressure, MemoryState, MemoryThresholds, physical_memory};
-pub use mode::{make_executable, mode, set_mode};
+pub use mode::{make_executable, mode, private_file, set_mode};
 pub use os::version as os_version;
-pub use path::{CanonPath, file_url_path, path_key};
+pub use path::{CanonPath, file_url_path, path_from_uri, path_key};
 pub use process::{
     ConsoleSignal, NO_WINDOW, SUSPENDED_NO_WINDOW, allow_ctrl_c_in_children, resume_process,
     signal_console_of,

@@ -128,6 +128,7 @@ fn execute(
             sql: sql.to_owned(),
             timeout: None,
             max_rows,
+            params: Vec::new(),
         })
         .expect("the query request is written");
     let mut rows = Vec::new();

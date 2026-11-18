@@ -160,6 +160,14 @@ impl AgentsPanel {
 
     /// Accepts or reverts one file, for the bar above its editor.
     pub(crate) fn act_on_file(&mut self, path: String, action: Action, cx: &mut Context<Self>) {
+        if let Some(position) = self
+            .proposals
+            .iter()
+            .position(|proposal| proposal.relative == path)
+        {
+            self.act_on_proposal(position, action, cx);
+            return;
+        }
         self.review.selected = Some(path.clone());
         if self
             .review
@@ -181,6 +189,24 @@ impl AgentsPanel {
 
     /// Reads the review of the selected file, or of the first changed one, off the UI thread.
     pub(crate) fn reload_review(&mut self, cx: &mut Context<Self>) {
+        let proposal = self.review.selected.as_deref().and_then(|path| {
+            self.proposals
+                .iter()
+                .position(|proposal| proposal.relative == path)
+        });
+        if let Some(position) = proposal {
+            self.review.file = Some(self.proposals[position].view());
+            cx.notify();
+            return;
+        }
+        if self.review.selected.is_none()
+            && let Some(proposal) = self.proposals.first()
+        {
+            self.review.selected = Some(proposal.relative.clone());
+            self.review.file = Some(proposal.view());
+            cx.notify();
+            return;
+        }
         let session = &self.changes.session;
         let listed = |path: &String| session.iter().any(|change| &change.path == path);
         if !self.review.selected.as_ref().is_some_and(listed) {
@@ -219,6 +245,14 @@ impl AgentsPanel {
 
     /// Accepts or reverts. Files with unsaved edits in an editor are not reverted.
     pub(crate) fn act(&mut self, action: Action, cx: &mut Context<Self>) {
+        if let Some(position) = self.review.selected.as_deref().and_then(|path| {
+            self.proposals
+                .iter()
+                .position(|proposal| proposal.relative == path)
+        }) {
+            self.act_on_proposal(position, action, cx);
+            return;
+        }
         let Some(tracker) = self.tracker().cloned() else {
             return;
         };
@@ -306,14 +340,27 @@ impl AgentsPanel {
 
     fn file_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let mut list = div().flex().flex_col().flex_none();
-        for (index, change) in self.changes.session.iter().enumerate() {
-            let selected = self.review.selected.as_ref() == Some(&change.path);
-            let path = change.path.clone();
-            let kind = match change.kind {
-                change_tracker::ChangeKind::Added => "A",
-                change_tracker::ChangeKind::Modified => "M",
-                change_tracker::ChangeKind::Deleted => "D",
-            };
+        let mut paths: Vec<(String, &'static str)> = self
+            .changes
+            .session
+            .iter()
+            .map(|change| {
+                let kind = match change.kind {
+                    change_tracker::ChangeKind::Added => "A",
+                    change_tracker::ChangeKind::Modified => "M",
+                    change_tracker::ChangeKind::Deleted => "D",
+                };
+                (change.path.clone(), kind)
+            })
+            .collect();
+        for proposal in &self.proposals {
+            if !paths.iter().any(|(path, _)| path == &proposal.relative) {
+                paths.push((proposal.relative.clone(), "P"));
+            }
+        }
+        for (index, (path, kind)) in paths.into_iter().enumerate() {
+            let selected = self.review.selected.as_ref() == Some(&path);
+            let shown = path.clone();
             let hover = theme.selection_hover;
             let row = div()
                 .id(("change-row", index))
@@ -332,7 +379,7 @@ impl AgentsPanel {
                         .text_color(theme.text_secondary)
                         .child(kind),
                 )
-                .child(div().flex_1().truncate().child(change.path.clone()));
+                .child(div().flex_1().truncate().child(shown));
             list = list.child(row);
         }
         list
@@ -406,15 +453,19 @@ impl AgentsPanel {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let view = div().flex().flex_col().gap(px(SPACE_S)).p(px(SPACE_M));
-        let state = match &self.services {
-            None => Some("Changes show up once a session runs".to_string()),
-            Some(services) => match &services.tracker {
-                Err(error) => Some(format!("Changes are not tracked: {error}")),
-                Ok(_) if self.changes.session.is_empty() => {
-                    Some("The sessions have not changed any file".to_string())
-                }
-                Ok(_) => None,
-            },
+        let state = if !self.proposals.is_empty() {
+            None
+        } else {
+            match &self.services {
+                None => Some("Changes show up once a session runs".to_string()),
+                Some(services) => match &services.tracker {
+                    Err(error) => Some(format!("Changes are not tracked: {error}")),
+                    Ok(_) if self.changes.session.is_empty() => {
+                        Some("The sessions have not changed any file".to_string())
+                    }
+                    Ok(_) => None,
+                },
+            }
         };
         let notice = self.review.notice.clone().map(|notice| {
             div()
