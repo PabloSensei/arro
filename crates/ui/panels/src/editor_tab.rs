@@ -813,6 +813,13 @@ fn open(
                         })
                         .ok();
                 }
+                EditorEvent::StopRequest => {
+                    runner
+                        .update(cx, |workspace, cx| {
+                            crate::database_panel::stop_line(&view, workspace, cx);
+                        })
+                        .ok();
+                }
                 EditorEvent::ContextMenu(position) => {
                     let gutter = view.read(cx).gutter_menu_at(*position);
                     let model = runner

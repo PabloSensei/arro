@@ -1,6 +1,7 @@
 //! Tools answered by the language layer through `lang-api`. Languages register when their server
 //! is up; a file of no registered language gets a plain error, never an invented answer.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -9,15 +10,21 @@ use std::time::{Duration, Instant};
 
 use futures_core::Stream;
 use lang_api::{
-    Answer, DiagnosticsQuery as LangDiagnostics, DocumentSpot, LanguageSupport, NavigationKind,
-    NavigationQuery, Replies, TextPoint,
+    ActionKind, ActionQuery, Answer, CallDirection, CallHierarchyItem,
+    CallHierarchyQuery as LangCallHierarchy, DiagnosticsQuery as LangDiagnostics, DocumentEdit,
+    DocumentSpot, FormatQuery, HierarchyDirection, HierarchyQuery, LanguageSupport, NavigationKind,
+    NavigationQuery, RenameQuery, Replies, SourceEdit, SourceSpan, SymbolQuery as LangSymbolQuery,
+    TextPoint, TextSpan, WorkspaceChange,
 };
-use platform::CanonPath;
+use platform::{CanonPath, path_from_uri};
 
 use crate::backend::{
-    Confidence, DebugSnapshotSource, Diagnostic, DiagnosticsPage, DiagnosticsQuery, EditorContext,
-    Location, Position, SessionScope, Severity, SymbolInfo, SymbolPage, SymbolQuery, ToolBackend,
-    ToolError,
+    BuildOutcome, BuildRequest, CallHierarchy, CallHierarchyQuery, Confidence, DebugSnapshotSource,
+    Diagnostic, DiagnosticsPage, DiagnosticsQuery, EditorContext, FileText, HierarchyNode,
+    Location, Position, ProjectRunner, READ_LINE_LIMIT, ReadFileQuery, RenameSymbolQuery,
+    RunConfiguration, RunOutput, SessionScope, Severity, StartRunRequest, SymbolInfo, SymbolPage,
+    SymbolQuery, TestsOutcome, TestsRequest, ToolBackend, ToolError, TypeHierarchy,
+    TypeHierarchyQuery, Usage, UsagePage, UsagesQuery,
 };
 
 /// How long a tool waits for the first answer of the server.
@@ -78,23 +85,6 @@ fn uri_of(path: &Path) -> Result<String, ToolError> {
     Ok(canonical.to_uri())
 }
 
-/// A `file:` URI back to a path, `None` for sources that are not files, `jdt:` ones for example.
-fn path_of_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file:///")?;
-    let mut bytes = Vec::with_capacity(rest.len());
-    let mut input = rest.bytes();
-    while let Some(byte) = input.next() {
-        if byte != b'%' {
-            bytes.push(byte);
-            continue;
-        }
-        let high = (input.next()? as char).to_digit(16)?;
-        let low = (input.next()? as char).to_digit(16)?;
-        bytes.push((high * 16 + low) as u8);
-    }
-    Some(PathBuf::from(String::from_utf8(bytes).ok()?))
-}
-
 fn line_text(path: &Path, line: u32) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let found = text.lines().nth(line as usize)?;
@@ -139,6 +129,23 @@ fn word_at(line: &str, column: u32) -> Option<String> {
     Some(chars[start..=end].iter().collect())
 }
 
+/// The span of the whole text, the shape Organize Imports asks about.
+fn whole_span(text: &str) -> TextSpan {
+    let point = |offset: usize| {
+        let before = &text[..offset.min(text.len())];
+        let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let start = before.rfind('\n').map_or(0, |index| index + 1);
+        TextPoint {
+            line,
+            character: before[start..].encode_utf16().count() as u32,
+        }
+    };
+    TextSpan {
+        start: point(0),
+        end: point(text.len()),
+    }
+}
+
 /// The first line of the first code block of hover Markdown, which servers fill with the
 /// declaration.
 fn signature_of(markdown: &str) -> Option<String> {
@@ -159,11 +166,15 @@ fn severity_of(severity: lang_api::Severity) -> Severity {
 
 const NOT_CONNECTED: &str = "not connected yet";
 
+/// More nodes than this would not fit an answer; the rest is reported as clipped.
+const MAX_NODES: usize = 200;
+
 /// The languages whose servers are up, looked up by the file a tool asks about.
 #[derive(Default)]
 pub struct LanguageTools {
     languages: RwLock<Vec<Arc<dyn LanguageSupport>>>,
     debug: RwLock<Vec<(PathBuf, Arc<dyn DebugSnapshotSource>)>>,
+    projects: RwLock<Vec<(PathBuf, Arc<dyn ProjectRunner>)>>,
     wait: Option<Duration>,
 }
 
@@ -235,6 +246,43 @@ impl LanguageTools {
             .map(|(_, source)| source.clone())
     }
 
+    /// Makes the tools that run the project reach the Run window of this project.
+    /// Replaces an earlier runner of the same project.
+    pub fn register_project(&self, project: PathBuf, runner: Arc<dyn ProjectRunner>) {
+        let mut projects = self
+            .projects
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        projects.retain(|(known, _)| !same_project(known, &project));
+        projects.push((project, runner));
+    }
+
+    pub fn unregister_project(&self, project: &Path) {
+        let mut projects = self
+            .projects
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        projects.retain(|(known, _)| !same_project(known, project));
+    }
+
+    fn project_for(&self, project: &Path) -> Result<Arc<dyn ProjectRunner>, ToolError> {
+        let projects = self
+            .projects
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        projects
+            .iter()
+            .rev()
+            .find(|(known, _)| same_project(known, project))
+            .map(|(_, runner)| runner.clone())
+            .ok_or_else(|| {
+                ToolError::Failed(format!(
+                    "the Run window of {} is not connected yet",
+                    project.display()
+                ))
+            })
+    }
+
     fn language_for(&self, path: &Path) -> Result<Arc<dyn LanguageSupport>, ToolError> {
         let languages = self
             .languages
@@ -249,6 +297,145 @@ impl LanguageTools {
 
     fn wait(&self) -> Duration {
         self.wait.unwrap_or(ANSWER_WAIT)
+    }
+
+    /// The place the language server was told about, with the text of its line.
+    fn spot_of(
+        &self,
+        language: &dyn LanguageSupport,
+        path: &Path,
+        line: u32,
+        column: u32,
+    ) -> Result<(DocumentSpot, String), ToolError> {
+        let uri = uri_of(path)?;
+        let version = Self::open_version(language, &uri, path)?;
+        let content = line_text(path, line - 1).unwrap_or_default();
+        let spot = DocumentSpot {
+            uri,
+            version,
+            point: TextPoint {
+                line: line - 1,
+                character: utf16_of(&content, column),
+            },
+        };
+        Ok((spot, content))
+    }
+
+    /// A place of a language server, which may be a source that is not a file, such as a
+    /// class of a library.
+    fn location_of(&self, span: &SourceSpan) -> Location {
+        let line = span.span.start.line;
+        match path_from_uri(&span.uri) {
+            Some(path) => Location {
+                content: line_text(&path, line).unwrap_or_default(),
+                path,
+                line: line + 1,
+            },
+            None => Location {
+                path: PathBuf::from(span.uri.clone()),
+                line: line + 1,
+                content: String::new(),
+            },
+        }
+    }
+
+    /// The language that can look a name up in the project.
+    fn language_with_symbols(&self) -> Result<Arc<dyn LanguageSupport>, ToolError> {
+        let languages = self
+            .languages
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        languages
+            .iter()
+            .find(|language| language.workspace_symbols().is_some())
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::Failed(
+                    "no language looks symbols up by name, pass a file, a line and a column"
+                        .to_string(),
+                )
+            })
+    }
+
+    /// The place of the named declaration, found through the symbol search of the server.
+    fn declaration_spot(
+        &self,
+        language: &dyn LanguageSupport,
+        name: &str,
+    ) -> Result<DocumentSpot, ToolError> {
+        let provider = language
+            .workspace_symbols()
+            .ok_or_else(|| missing("symbol search"))?;
+        let outcome = first_answer(
+            lang_api::ask(provider, LangSymbolQuery(name.to_string())),
+            self.wait(),
+        );
+        let (entries, _, _) = value_of(outcome, "symbol search")?;
+        let found = entries
+            .into_iter()
+            .find(|entry| entry.name == name && entry.place.is_some());
+        let Some(place) = found.and_then(|entry| entry.place) else {
+            return Err(ToolError::Failed(format!(
+                "no declaration named {name} was found, pass a file, a line and a column"
+            )));
+        };
+        let server = language
+            .server()
+            .ok_or_else(|| missing("language server"))?;
+        let version = server.version(&place.uri).ok_or_else(|| {
+            ToolError::Failed(format!(
+                "the declaration of {name} is at {}, which is not open in the editor",
+                place.uri
+            ))
+        })?;
+        Ok(DocumentSpot {
+            uri: place.uri,
+            version,
+            point: place.span.start,
+        })
+    }
+
+    /// The lines of `query` from a text, as the editor would show them.
+    fn range_of(&self, path: &Path, text: &str, query: &ReadFileQuery) -> FileText {
+        let mut lines: Vec<&str> = if text.is_empty() {
+            Vec::new()
+        } else {
+            text.split('\n').collect()
+        };
+        if text.ends_with('\n') {
+            lines.pop();
+        }
+        let total = lines.len() as u32;
+        let requested_start = query.start_line.unwrap_or(1).max(1);
+        let requested_end = query
+            .end_line
+            .unwrap_or(requested_start.saturating_add(READ_LINE_LIMIT - 1));
+        if total == 0 {
+            return FileText {
+                path: path.to_path_buf(),
+                text: String::new(),
+                start_line: 1,
+                end_line: 0,
+                total_lines: 0,
+                dirty: false,
+                clipped: false,
+            };
+        }
+        let start = requested_start.min(total).max(1);
+        let last = requested_end
+            .min(total)
+            .min(start.saturating_add(READ_LINE_LIMIT - 1));
+        let end = last.max(start);
+        let text = lines[start as usize - 1..end as usize].join("\n");
+        FileText {
+            path: path.to_path_buf(),
+            text,
+            start_line: start,
+            end_line: end,
+            total_lines: total,
+            dirty: false,
+            clipped: start != requested_start || end < requested_end,
+        }
     }
 
     /// The version the server has of an open file, the only text it can answer about.
@@ -280,19 +467,66 @@ impl LanguageTools {
             return None;
         };
         let span = answer.value.into_iter().next()?;
-        let line = span.span.start.line;
-        Some(match path_of_uri(&span.uri) {
-            Some(path) => Location {
-                content: line_text(&path, line).unwrap_or_default(),
-                path,
-                line: line + 1,
-            },
-            None => Location {
-                path: PathBuf::from(span.uri),
-                line: line + 1,
-                content: String::new(),
-            },
-        })
+        Some(self.location_of(&span))
+    }
+
+    /// The edits a rename of the symbol at a place makes, through the server of the
+    /// language of the file. Nothing is written here.
+    pub fn rename_change(&self, query: &RenameSymbolQuery) -> Result<WorkspaceChange, ToolError> {
+        let language = self.language_for(&query.path)?;
+        let (spot, _) = self.spot_of(language.as_ref(), &query.path, query.line, query.column)?;
+        let provider = language.rename().ok_or_else(|| missing("rename"))?;
+        let asked = RenameQuery {
+            spot,
+            new_name: query.new_name.clone(),
+        };
+        let outcome = first_answer(lang_api::ask(provider, asked), self.wait());
+        let (change, _, _) = value_of(outcome, "rename")?;
+        Ok(change)
+    }
+
+    /// The edits that format a file, through the server of its language. The file has to
+    /// be open: a server answers about the documents it holds.
+    pub fn format_edits(&self, path: &Path) -> Result<Vec<DocumentEdit>, ToolError> {
+        let language = self.language_for(path)?;
+        let uri = uri_of(path)?;
+        let version = Self::open_version(language.as_ref(), &uri, path)?;
+        let provider = language.format().ok_or_else(|| missing("formatting"))?;
+        let asked = FormatQuery {
+            uri,
+            version,
+            tab_size: 4,
+            insert_spaces: true,
+        };
+        let outcome = first_answer(lang_api::ask(provider, asked), self.wait());
+        let (edits, _, _) = value_of(outcome, "formatting")?;
+        Ok(edits)
+    }
+
+    /// The edits of Organize Imports for a file, through the server of its language.
+    /// `text` is the text of the document the server holds, which the span covers.
+    pub fn organize_imports_edits(
+        &self,
+        path: &Path,
+        text: &str,
+    ) -> Result<Vec<SourceEdit>, ToolError> {
+        let language = self.language_for(path)?;
+        let uri = uri_of(path)?;
+        let version = Self::open_version(language.as_ref(), &uri, path)?;
+        let provider = language.actions().ok_or_else(|| missing("actions"))?;
+        let asked = ActionQuery {
+            uri,
+            version,
+            span: whole_span(text),
+            only: Some(ActionKind::OrganizeImports),
+        };
+        let outcome = first_answer(lang_api::ask(provider, asked), self.wait());
+        let (entries, _, _) = value_of(outcome, "organize imports")?;
+        Ok(entries
+            .into_iter()
+            .next()
+            .map(|entry| entry.edits)
+            .unwrap_or_default())
     }
 }
 
@@ -326,17 +560,12 @@ impl ToolBackend for LanguageTools {
 
     fn symbol_info(&self, _: &SessionScope, position: &Position) -> Result<SymbolInfo, ToolError> {
         let language = self.language_for(&position.path)?;
-        let uri = uri_of(&position.path)?;
-        let version = Self::open_version(language.as_ref(), &uri, &position.path)?;
-        let line = line_text(&position.path, position.line - 1).unwrap_or_default();
-        let spot = DocumentSpot {
-            uri,
-            version,
-            point: TextPoint {
-                line: position.line - 1,
-                character: utf16_of(&line, position.column),
-            },
-        };
+        let (spot, line) = self.spot_of(
+            language.as_ref(),
+            &position.path,
+            position.line,
+            position.column,
+        )?;
         let hover = language.hover().ok_or_else(|| missing("hover"))?;
         let outcome = first_answer(lang_api::ask(hover, spot.clone()), self.wait());
         let (text, confidence, source) = value_of(outcome, "hover")?;
@@ -414,12 +643,242 @@ impl ToolBackend for LanguageTools {
         self.debug_source(&scope.project)
             .and_then(|source| source.snapshot())
     }
+
+    fn find_usages(&self, _: &SessionScope, query: &UsagesQuery) -> Result<UsagePage, ToolError> {
+        let (language, spot) = match query.position() {
+            Some((path, line, column)) => {
+                let language = self.language_for(path)?;
+                let (spot, _) = self.spot_of(language.as_ref(), path, line, column)?;
+                (language, spot)
+            }
+            None => {
+                let name = query
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| ToolError::BadInput("pass a place or a name".to_string()))?;
+                let language = self.language_with_symbols()?;
+                let spot = self.declaration_spot(language.as_ref(), name)?;
+                (language, spot)
+            }
+        };
+        let provider = language.references().ok_or_else(|| missing("references"))?;
+        let outcome = first_answer(lang_api::ask(provider, spot), self.wait());
+        let (spans, confidence, source) = value_of(outcome, "references")?;
+        let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
+        let mut items: Vec<Usage> = spans
+            .into_iter()
+            .filter_map(|span| {
+                let path = path_from_uri(&span.uri)?;
+                let line = span.span.start.line;
+                let text = texts
+                    .entry(path.clone())
+                    .or_insert_with(|| std::fs::read_to_string(&path).ok());
+                let content = text
+                    .as_deref()?
+                    .lines()
+                    .nth(line as usize)?
+                    .trim_end_matches('\r')
+                    .to_string();
+                Some(Usage {
+                    path,
+                    line: line + 1,
+                    column: column_of(&content, span.span.start.character),
+                    content,
+                })
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+        });
+        items.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.column == right.column
+        });
+        let total = items.len();
+        let limit = query.limit.max(1);
+        let clipped = total > limit;
+        items.truncate(limit);
+        Ok(UsagePage {
+            items,
+            total,
+            clipped,
+            source,
+            confidence,
+        })
+    }
+
+    fn type_hierarchy(
+        &self,
+        _: &SessionScope,
+        query: &TypeHierarchyQuery,
+    ) -> Result<TypeHierarchy, ToolError> {
+        let language = self.language_for(&query.path)?;
+        let (spot, _) = self.spot_of(language.as_ref(), &query.path, query.line, query.column)?;
+        let provider = language
+            .hierarchy()
+            .ok_or_else(|| missing("type hierarchy"))?;
+        let read = |direction: HierarchyDirection| {
+            let query = HierarchyQuery {
+                spot: spot.clone(),
+                direction,
+            };
+            let outcome = first_answer(lang_api::ask(provider, query), self.wait());
+            value_of(outcome, "type hierarchy")
+        };
+        let (supertypes, confidence, source) = read(HierarchyDirection::Supertypes)?;
+        let (subtypes, _, _) = read(HierarchyDirection::Subtypes)?;
+        let mut clipped = false;
+        let supertypes = self.hierarchy_nodes(supertypes, &mut clipped);
+        let subtypes = self.hierarchy_nodes(subtypes, &mut clipped);
+        Ok(TypeHierarchy {
+            supertypes,
+            subtypes,
+            source,
+            confidence,
+            clipped,
+        })
+    }
+
+    fn call_hierarchy(
+        &self,
+        _: &SessionScope,
+        query: &CallHierarchyQuery,
+    ) -> Result<CallHierarchy, ToolError> {
+        let language = self.language_for(&query.path)?;
+        let (spot, _) = self.spot_of(language.as_ref(), &query.path, query.line, query.column)?;
+        let provider = language
+            .call_hierarchy()
+            .ok_or_else(|| missing("call hierarchy"))?;
+        let outcome = first_answer(
+            lang_api::ask(provider, LangCallHierarchy::Roots(spot)),
+            self.wait(),
+        );
+        let (roots, confidence, source) = value_of(outcome, "call hierarchy")?;
+        let mut callers = Vec::new();
+        let mut clipped = false;
+        for root in roots {
+            self.collect_callers(provider, root, query.depth, 0, &mut callers, &mut clipped)?;
+        }
+        Ok(CallHierarchy {
+            callers,
+            source,
+            confidence,
+            clipped,
+        })
+    }
+
+    fn read_file(&self, _: &SessionScope, query: &ReadFileQuery) -> Result<FileText, ToolError> {
+        let text = std::fs::read_to_string(&query.path).map_err(|error| {
+            let shown = query.path.display();
+            ToolError::Failed(format!("could not read {shown}: {error}"))
+        })?;
+        Ok(self.range_of(&query.path, &text, query))
+    }
+
+    fn build_project(
+        &self,
+        scope: &SessionScope,
+        request: &BuildRequest,
+    ) -> Result<BuildOutcome, ToolError> {
+        self.project_for(&scope.project)?.build(scope, request)
+    }
+
+    fn run_tests(
+        &self,
+        scope: &SessionScope,
+        request: &TestsRequest,
+    ) -> Result<TestsOutcome, ToolError> {
+        self.project_for(&scope.project)?.test(scope, request)
+    }
+
+    fn run_configurations(&self, scope: &SessionScope) -> Result<Vec<RunConfiguration>, ToolError> {
+        self.project_for(&scope.project)?.configurations(scope)
+    }
+
+    fn start_run(
+        &self,
+        scope: &SessionScope,
+        request: &StartRunRequest,
+        client: Option<&str>,
+    ) -> Result<String, ToolError> {
+        self.project_for(&scope.project)?
+            .start(scope, request, client)
+    }
+
+    fn run_output(&self, scope: &SessionScope, id: &str) -> Result<RunOutput, ToolError> {
+        self.project_for(&scope.project)?.output(scope, id)
+    }
+
+    fn stop_run(&self, scope: &SessionScope, id: &str) -> Result<(), ToolError> {
+        self.project_for(&scope.project)?.stop(scope, id)
+    }
+}
+
+impl LanguageTools {
+    fn hierarchy_nodes(
+        &self,
+        entries: Vec<lang_api::SymbolEntry>,
+        clipped: &mut bool,
+    ) -> Vec<HierarchyNode> {
+        let mut nodes: Vec<HierarchyNode> = entries
+            .into_iter()
+            .map(|entry| HierarchyNode {
+                name: entry.name,
+                detail: entry.container,
+                location: entry.place.as_ref().map(|place| self.location_of(place)),
+                depth: 1,
+            })
+            .collect();
+        if nodes.len() > MAX_NODES {
+            *clipped = true;
+            nodes.truncate(MAX_NODES);
+        }
+        nodes
+    }
+
+    /// The callers of one item, then the callers of those callers, down to `remaining`
+    /// levels. A short answer stops at [`MAX_NODES`] and says so.
+    fn collect_callers(
+        &self,
+        provider: &dyn lang_api::Provider<LangCallHierarchy, Vec<CallHierarchyItem>>,
+        item: CallHierarchyItem,
+        remaining: usize,
+        level: u32,
+        out: &mut Vec<HierarchyNode>,
+        clipped: &mut bool,
+    ) -> Result<(), ToolError> {
+        if remaining == 0 {
+            return Ok(());
+        }
+        if out.len() >= MAX_NODES {
+            *clipped = true;
+            return Ok(());
+        }
+        let query = LangCallHierarchy::Calls {
+            item,
+            direction: CallDirection::Incoming,
+        };
+        let outcome = first_answer(lang_api::ask(provider, query), self.wait());
+        let (items, _, _) = value_of(outcome, "call hierarchy")?;
+        for child in items {
+            if out.len() >= MAX_NODES {
+                *clipped = true;
+                return Ok(());
+            }
+            out.push(HierarchyNode {
+                name: child.name.clone(),
+                detail: child.detail.clone(),
+                location: child.place.as_ref().map(|place| self.location_of(place)),
+                depth: level + 1,
+            });
+            self.collect_callers(provider, child, remaining - 1, level + 1, out, clipped)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{column_of, path_of_uri, signature_of, utf16_of, word_at};
-    use std::path::PathBuf;
+    use super::{column_of, signature_of, utf16_of, word_at};
 
     #[test]
     fn columns_and_utf16_units_convert_both_ways() {
@@ -431,12 +890,22 @@ mod tests {
     }
 
     #[test]
-    fn file_uris_turn_back_into_paths() {
+    fn a_file_uri_gives_an_absolute_path() {
+        let uri = if cfg!(windows) {
+            "file:///C:/work/a%20b/Foo.src"
+        } else {
+            "file:///tmp/a%20b/Foo.src"
+        };
+        let path = platform::path_from_uri(uri).expect("a file uri");
+        assert!(path.is_absolute(), "{}", path.display());
         assert_eq!(
-            path_of_uri("file:///C:/work/a%20b/Foo.src"),
-            Some(PathBuf::from("C:/work/a b/Foo.src"))
+            path.parent().and_then(|parent| parent.file_name()),
+            Some(std::ffi::OsStr::new("a b"))
         );
-        assert_eq!(path_of_uri("lib://contents/core/Text.class"), None);
+        assert_eq!(
+            platform::path_from_uri("lib://contents/core/Text.class"),
+            None
+        );
     }
 
     #[test]

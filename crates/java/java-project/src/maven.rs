@@ -4,7 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use base::program::cmd_script;
 use base::{Cancel, Result};
 use proc_sup::ProcessSpec;
 use project_model::{
@@ -20,6 +19,12 @@ use crate::env::{fresh_directory, run_tool};
 use crate::fingerprint::{BuildStamp, has_classes};
 use crate::maven_download;
 use crate::pom::scan_poms;
+use crate::tool_download;
+use crate::tool_home::{self, Tool};
+
+pub use crate::tool_home::{
+    MissingTool as MissingMaven, ToolLocation as MavenHome, ToolOrigin as MavenOrigin,
+};
 
 const EXTENSION: &str = "maven-ext.jar";
 /// The earliest phase with no plugin bound to it: the extension does its work before any
@@ -32,79 +37,37 @@ const PHASES: &[&str] = &[
     "clean", "validate", "compile", "test", "package", "verify", "install",
 ];
 
+/// The folder of the downloaded copies under the data folder of the IDE.
+const MAVEN: &str = "maven";
+
+#[cfg(windows)]
+const WRAPPERS: &[&str] = &["mvnw.cmd", "mvnw.bat"];
+#[cfg(not(windows))]
+const WRAPPERS: &[&str] = &["mvnw"];
+#[cfg(windows)]
+const PROGRAMS: &[&str] = &["mvn.cmd", "mvn.bat"];
+#[cfg(not(windows))]
+const PROGRAMS: &[&str] = &["mvn"];
+
+/// The names of the scripts and the folder of the downloaded copies of Maven.
+const TOOL: Tool = Tool {
+    folder: MAVEN,
+    label: "Maven",
+    wrappers: WRAPPERS,
+    programs: PROGRAMS,
+};
+
 /// `mvnw` of the project first: it pins the version the project was written for. The
 /// homes the settings name, the bundled copy and `PATH` are tried after it.
 pub fn find_maven(root: &Path) -> Option<PathBuf> {
-    let wrapper = root.join(cmd_script("mvnw"));
-    if wrapper.is_file() {
-        return Some(wrapper);
-    }
-    on_path(env::var_os("PATH").as_deref()).map(|found| found.program)
+    TOOL.wrappers
+        .iter()
+        .map(|name| root.join(name))
+        .find(|wrapper| wrapper.is_file())
+        .or_else(|| {
+            tool_home::on_path(env::var_os("PATH").as_deref(), &TOOL).map(|found| found.program)
+        })
 }
-
-/// Where a Maven home came from, for the messages of the settings and of a failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MavenOrigin {
-    /// The wrapper script of the project.
-    Wrapper,
-    /// The home of the settings or the folder the user chose.
-    Configured,
-    /// The copy Arro downloaded.
-    Bundled,
-    /// The program on `PATH`.
-    Path,
-}
-
-/// The home of the Maven a project runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MavenHome {
-    /// The program the build starts.
-    pub program: PathBuf,
-    pub home: PathBuf,
-    pub origin: MavenOrigin,
-}
-
-/// Why no Maven home was found, in the words the status line and the notification use.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MissingMaven {
-    root: PathBuf,
-    home: Option<PathBuf>,
-    kind: ToolHome,
-}
-
-impl std::fmt::Display for MissingMaven {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let program = cmd_script("mvn");
-        match self.kind {
-            ToolHome::Wrapper => write!(
-                formatter,
-                "no {} in {}",
-                cmd_script("mvnw"),
-                self.root.display()
-            ),
-            ToolHome::Custom => match &self.home {
-                Some(home) => write!(
-                    formatter,
-                    "no {} in {}",
-                    program,
-                    home.join("bin").display()
-                ),
-                None => write!(formatter, "no Maven home is chosen in the settings"),
-            },
-            ToolHome::Bundled => formatter
-                .write_str("no Maven was downloaded yet; download it or choose another Maven home"),
-            ToolHome::Path => write!(formatter, "no {program} in PATH"),
-            ToolHome::Auto => write!(
-                formatter,
-                "no {} in {}, no Maven home in the settings, no bundled Maven and no {program} in PATH",
-                cmd_script("mvnw"),
-                self.root.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MissingMaven {}
 
 /// The order of the automatic search: the wrapper of the project, the home of the
 /// settings, the copy the IDE downloaded, and then `PATH`. The other kinds name one
@@ -116,107 +79,13 @@ pub fn find_maven_home(
     path: Option<&OsStr>,
     kind: ToolHome,
 ) -> std::result::Result<MavenHome, MissingMaven> {
-    let wrapper = wrapper_at(root);
-    let configured_path = configured;
-    let configured = configured.and_then(|home| home_at(home, MavenOrigin::Configured));
-    let bundled = bundled_home(data_dir).and_then(|home| home_at(&home, MavenOrigin::Bundled));
-    let on_path = on_path(path);
-
-    let found = match kind {
-        ToolHome::Auto => wrapper.or(configured).or(bundled).or(on_path),
-        ToolHome::Wrapper => wrapper,
-        ToolHome::Custom => configured,
-        ToolHome::Bundled => bundled,
-        ToolHome::Path => on_path,
-    };
-    found.ok_or_else(|| MissingMaven {
-        root: root.to_path_buf(),
-        home: match kind {
-            ToolHome::Custom => configured_path.map(Path::to_path_buf),
-            _ => None,
-        },
-        kind,
-    })
-}
-
-fn wrapper_at(root: &Path) -> Option<MavenHome> {
-    let wrapper = root.join(cmd_script("mvnw"));
-    wrapper.is_file().then(|| MavenHome {
-        program: wrapper,
-        home: root.to_path_buf(),
-        origin: MavenOrigin::Wrapper,
-    })
-}
-
-/// The program of a home: `bin/mvn.cmd` on Windows, `bin/mvn` elsewhere.
-fn home_at(home: &Path, origin: MavenOrigin) -> Option<MavenHome> {
-    let program = home.join("bin").join(cmd_script("mvn"));
-    program.is_file().then(|| MavenHome {
-        program,
-        home: home.to_path_buf(),
-        origin,
-    })
-}
-
-fn on_path(path: Option<&OsStr>) -> Option<MavenHome> {
-    let names: &[&str] = if cfg!(windows) {
-        &["mvn.cmd", "mvn.bat"]
-    } else {
-        &["mvn"]
-    };
-    let path = path?;
-    env::split_paths(path)
-        .flat_map(|directory| {
-            names
-                .iter()
-                .map(move |name| directory.join(name))
-                .collect::<Vec<_>>()
-        })
-        .find(|file| file.is_file())
-        .map(|program| MavenHome {
-            home: program
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(Path::new(""))
-                .to_path_buf(),
-            program,
-            origin: MavenOrigin::Path,
-        })
+    tool_home::find(&TOOL, root, configured, data_dir, path, kind)
 }
 
 /// The newest copy of Maven the IDE downloaded, `<data>/tools/maven/<version>`, when it
 /// carries the program.
 pub fn bundled_home(data_dir: &Path) -> Option<PathBuf> {
-    let root = data_dir.join("tools").join("maven");
-    let mut versions: Vec<String> = fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect();
-    versions.sort_by(|left, right| compare_versions(right, left));
-    versions.into_iter().find_map(|version| {
-        let home = data_dir.join("tools").join("maven").join(&version);
-        home_at(&home, MavenOrigin::Bundled).map(|found| found.home)
-    })
-}
-
-/// The order of two version folders: `3.9.10` is newer than `3.9.9`.
-fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let left: Vec<&str> = left.split(['.', '-', '_']).collect();
-    let right: Vec<&str> = right.split(['.', '-', '_']).collect();
-    for (left, right) in left.iter().zip(right.iter()) {
-        let order = match (left.parse::<u64>(), right.parse::<u64>()) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-            (Err(_), Err(_)) => left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()),
-        };
-        if order != std::cmp::Ordering::Equal {
-            return order;
-        }
-    }
-    left.len().cmp(&right.len())
+    tool_download::newest_home(data_dir, MAVEN, PROGRAMS)
 }
 
 pub struct Maven {
@@ -345,6 +214,10 @@ impl BuildSystem for Maven {
 
     fn tool_bin(&self) -> Option<PathBuf> {
         bundled_home(&self.env.data_dir()).map(|home| home.join("bin"))
+    }
+
+    fn terminal_path(&self) -> bool {
+        self.env.build_tools.first.terminal_path
     }
 
     fn assemble(&self, root: &Path) -> Result<ProcessSpec> {
@@ -765,6 +638,7 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
 mod tests {
     use super::*;
     use crate::fingerprint::{fingerprint, read_stamp};
+    use base::program::cmd_script;
 
     const REPORT: &str = r#"{
       "schema": 1, "tool": "maven", "toolVersion": "3.9.16", "javaVersion": "17",

@@ -28,6 +28,8 @@ pub struct TestSelection {
     /// A binary class name, `demo.Outer$Inner`.
     pub class: Option<String>,
     pub method: Option<String>,
+    /// Every test of this package, when no class is named.
+    pub package: Option<String>,
     /// `(class, method)` pairs, run instead of `class` and `method` when not empty.
     pub cases: Vec<(String, String)>,
 }
@@ -253,6 +255,9 @@ fn surefire_pattern(selection: &TestSelection) -> Option<String> {
                 .join(","),
         );
     }
+    if let Some(package) = &selection.package {
+        return Some(format!("{package}.*"));
+    }
     let class = selection.class.as_ref()?;
     Some(match &selection.method {
         Some(method) => format!("{class}#{method}"),
@@ -357,6 +362,13 @@ impl Gradle {
                 None => class.clone(),
             };
             spec = spec.arg("--tests").arg(pattern);
+        }
+        if let (Some(package), true, true) = (
+            &selection.package,
+            selection.cases.is_empty(),
+            selection.class.is_none(),
+        ) {
+            spec = spec.arg("--tests").arg(format!("{package}.*"));
         }
         Ok((spec, None))
     }
@@ -474,6 +486,20 @@ mod tests {
         assert_eq!(
             surefire_pattern(&selection).as_deref(),
             Some("demo.A#x,demo.B$Inner#y")
+        );
+    }
+
+    #[test]
+    fn a_package_selects_every_class_in_it() {
+        let selection = TestSelection {
+            package: Some("demo.vet".into()),
+            ..TestSelection::default()
+        };
+
+        assert_eq!(
+            surefire_pattern(&selection).as_deref(),
+            Some("demo.vet.*"),
+            "the package goes to the tool as a pattern"
         );
     }
 }

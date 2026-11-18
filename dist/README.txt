@@ -8,7 +8,7 @@ An early preview for Windows 11 x86-64. Arro is not ready for everyday work yet:
 features change, and settings and data may move between versions. Most of Arro's
 code is written by AI and reviewed by a human.
 
-This folder holds arro.exe, helpers/, tools/, run-arro.cmd, this file,
+This folder holds arro.exe, arro-mcp.exe, helpers/, tools/, run-arro.cmd, this file,
 THIRD-PARTY.txt and NOTICE.txt. There is no installer: unpack the folder anywhere.
 Arro keeps its settings, plugins, state, caches and logs outside this folder, in
 %APPDATA%\Arro and %LOCALAPPDATA%\Arro.
@@ -17,12 +17,39 @@ What is in the folder
 ---------------------
 
   arro.exe         the Arro program; it finds the JDK, jdtls and java-debug itself;
+  arro-mcp.exe     the tools of Arro for an agent outside the window, over MCP;
   helpers/         jar files for the project's JVM: maven-ext.jar and ide-test-listener.jar;
   tools/           jdtls 1.63.0 and java-debug 0.60.0, ready to use;
   run-arro.cmd     an optional starter that sets the same paths as variables;
   README.txt       this file;
   THIRD-PARTY.txt  the third-party crates and their licenses;
   NOTICE.txt       notices and license texts of third-party components.
+
+Using Arro from another program
+-------------------------------
+
+While a project is open, Arro shares the tools of its window with MCP clients: the file
+of the editor, the symbols, the diagnostics and the debug state. Settings, Tools, AI,
+MCP Server shows the strings below with a copy button; Arro copies them and runs none of
+them. Claude Code, in a terminal outside Arro:
+
+  claude mcp add arro -- "<this folder>\arro-mcp.exe"
+
+Codex, in ~/.codex/config.toml (the backslashes are escaped there):
+
+  [mcp_servers.arro]
+  command = "<this folder>\\arro-mcp.exe"
+
+Any other MCP client, as its JSON configuration:
+
+  {"mcpServers": {"arro": {"command": "<this folder>\\arro-mcp.exe"}}}
+
+The client starts arro-mcp.exe in the folder of the project, and the shim finds the
+window whose project root holds that folder. Arro leaves the entry point in
+%LOCALAPPDATA%\Arro\mcp and removes it when the window closes; only the user may read
+it. An entry of a window that is no longer running is ignored. `arro-mcp` speaks stdio
+to the client and the loopback to Arro, and it needs no variable when it starts in the
+project folder.
 
 When conpty.dll and OpenConsole.exe sit next to arro.exe and match the pinned hashes
 (conpty.lock in the sources), the terminal uses that ConPTY; otherwise it uses the

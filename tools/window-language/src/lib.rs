@@ -297,6 +297,20 @@ pub fn project_model(root: &Path, cache: &Path, settings: &Path) -> Result<Proje
         .map_err(|error| error.to_string())
 }
 
+/// What the build tool reads from the project files alone, without running it. A test
+/// that only needs the modules and their roots does not need the helper jars.
+pub fn scanned_project_model(root: &Path, cache: &Path) -> Result<ProjectModel, String> {
+    let environment = Jdk::at(&corpus().join("jdk").join("17"));
+    let env = BuildEnv {
+        jdk: environment,
+        cache_root: Some(cache.to_path_buf()),
+        ..BuildEnv::default()
+    };
+    let tool = java_project::detect_build_system(root, &env)
+        .ok_or_else(|| "the project has no build tool".to_owned())?;
+    tool.scan(root).map_err(|error| error.to_string())
+}
+
 fn helpers_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("IDE_HELPERS_DIR") {
         return Some(PathBuf::from(dir));

@@ -306,7 +306,7 @@ impl Palette {
     ) {
         let actions = workspace
             .commands()
-            .all()
+            .visible()
             .map(|command| ActionEntry {
                 id: command.id,
                 title: command.title.clone(),

@@ -184,6 +184,8 @@ pub struct TerminalPanel {
     dragging_split: Option<SplitDrag>,
     /// The area of the panel on screen, for the questions that stand over it.
     bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// Whether a harness held the IDE protocol when the panel last looked.
+    ide_connected: bool,
 }
 
 /// The shell sees what the user sees in any console, plus the terminal variables and the
@@ -193,6 +195,7 @@ fn shell_spec(
     directory: PathBuf,
     shell: Option<&str>,
     variables: Vec<(String, String)>,
+    ide: Vec<(String, String)>,
     settings: &Settings,
     tool_path: Option<PathBuf>,
 ) -> SpawnSpec {
@@ -223,13 +226,17 @@ fn shell_spec(
         env.retain(|(known, _)| !known.eq_ignore_ascii_case(&key));
         env.push((key, value));
     }
+    for (key, value) in ide {
+        env.retain(|(known, _)| !known.eq_ignore_ascii_case(&key));
+        env.push((key, value));
+    }
     for (key, value) in terminal_environment(&settings.terminal_environment) {
         env.retain(|(known, _)| !known.eq_ignore_ascii_case(&key));
         env.push((key, value));
     }
-    if settings.build_tools.first.terminal_path
-        && let Some(bin) = tool_path
-    {
+    // The run panel names the folder of the downloaded tool only when its settings page
+    // asks for it, so the switch lives there and not here.
+    if let Some(bin) = tool_path {
         prepend_path(&mut env, &bin);
     }
     SpawnSpec {
@@ -346,6 +353,7 @@ impl TerminalPanel {
                 rename_focus: cx.focus_handle(),
                 dragging_split: None,
                 bounds: Rc::new(RefCell::new(None)),
+                ide_connected: false,
             };
             for tab in 0..panel.tabs.len() {
                 for pane in 0..panel.tabs[tab].panes.len() {
@@ -403,6 +411,10 @@ impl TerminalPanel {
         let tool_path = cx
             .try_global::<ToolTerminalPath>()
             .and_then(|path| path.0.clone());
+        let ide = cx
+            .try_global::<crate::claude_ide::ActiveClaude>()
+            .map(crate::claude_ide::ActiveClaude::environment)
+            .unwrap_or_default();
         let spawn = cx.background_executor().spawn(async move {
             let variables = environment
                 .map(|environment| environment.describe().variables)
@@ -412,6 +424,7 @@ impl TerminalPanel {
                 directory,
                 shell.as_deref(),
                 variables,
+                ide,
                 &settings,
                 tool_path,
             ))
@@ -443,6 +456,13 @@ impl TerminalPanel {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        let connected = cx
+            .try_global::<crate::claude_ide::ActiveClaude>()
+            .is_some_and(|active| active.connected());
+        if connected != self.ide_connected {
+            self.ide_connected = connected;
+            changed = true;
+        }
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
                 let Some(session) = pane.session().cloned() else {
@@ -1513,6 +1533,22 @@ impl TerminalPanel {
         .on_click(
             cx.listener(|this, event: &ClickEvent, _, cx| this.shells_menu(event.position(), cx)),
         );
+        if let Some((text, error)) = crate::claude_ide::status(cx) {
+            let color = if error {
+                theme.close_hover
+            } else {
+                theme.success
+            };
+            row = row.child(div().flex_1()).child(
+                div()
+                    .debug_selector(|| "terminal-ide-status".to_owned())
+                    .flex_none()
+                    .px(px(SPACE_S))
+                    .text_size(px(UI_SIZE))
+                    .text_color(color)
+                    .child(text),
+            );
+        }
         row.child(new_tab).child(shells).into_any_element()
     }
 

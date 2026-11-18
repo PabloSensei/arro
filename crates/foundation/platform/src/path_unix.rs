@@ -59,15 +59,23 @@ pub fn path_key(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// The path a `file://` URL names, as `open` of the Finder hands it over:
-/// `file:///home/user/a%20b.txt`.
-pub fn file_url_path(url: &str) -> Option<PathBuf> {
+/// The path a `file:` URI names, the reverse of [`CanonPath::to_uri`]:
+/// `file:///home/user/a%20b.txt`. `None` for any other scheme. A URI that names a host
+/// keeps it in the path, because a path of Unix starts at the root.
+pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 
-    let rest = url.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    let bytes = crate::url::percent_decode(rest)?;
+    let rest = crate::url::file_rest(uri)?;
+    let mut bytes = crate::url::percent_decode(rest)?;
+    if !bytes.starts_with(b"/") {
+        bytes.insert(0, b'/');
+    }
     Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+/// A `file://` URL as the Finder hands it over, the same path [`path_from_uri`] gives.
+pub fn file_url_path(url: &str) -> Option<PathBuf> {
+    path_from_uri(url)
 }
 
 #[cfg(test)]
@@ -128,15 +136,39 @@ mod tests {
     }
 
     #[test]
-    fn a_file_url_is_a_path() {
+    fn a_file_uri_is_a_path() {
         assert_eq!(
-            file_url_path("file:///home/user/a%20b.txt"),
+            path_from_uri("file:///home/user/a%20b.txt"),
             Some(PathBuf::from("/home/user/a b.txt"))
         );
         assert_eq!(
-            file_url_path("file://localhost/home/user/%D0%BF%D1%80/A.txt"),
+            path_from_uri("file://localhost/home/user/%D0%BF%D1%80/A.txt"),
             Some(PathBuf::from("/home/user/пр/A.txt"))
         );
-        assert_eq!(file_url_path("https://example.com/a"), None);
+        assert_eq!(
+            path_from_uri("file://host/home/user/A.txt"),
+            Some(PathBuf::from("/host/home/user/A.txt"))
+        );
+        assert_eq!(path_from_uri("https://example.com/a"), None);
+        assert_eq!(path_from_uri("lib://contents/core/Text.class"), None);
+    }
+
+    #[test]
+    fn a_path_survives_the_way_to_a_uri_and_back() {
+        for path in [
+            "/home/user/A.txt",
+            "/home/user/My Files/a b.txt",
+            "/home/user/проект/A.txt",
+        ] {
+            let uri = uri_of(path);
+            assert_eq!(path_from_uri(&uri), Some(PathBuf::from(path)), "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_path_from_a_uri_starts_at_the_root() {
+        let path = path_from_uri("file:///tmp/a%20b.txt").unwrap();
+        assert!(path.is_absolute(), "{}", path.display());
+        assert_eq!(path, PathBuf::from("/tmp/a b.txt"));
     }
 }

@@ -8,12 +8,35 @@ An early preview for Linux x86-64. Arro is not ready for everyday work yet: feat
 change, and settings and data may move between versions. Most of Arro's code is written
 by AI and reviewed by a human.
 
-This folder holds arro, helpers/, tools/, arro.desktop, arro-256.png, install.sh, this
-file, THIRD-PARTY.txt and NOTICE.txt. Unpack the archive anywhere and either start
-./arro in place or run ./install.sh, which copies the folder into the home directory,
-links arro in ~/.local/bin and puts the entry in the application menu. Arro keeps its
-settings, state, caches and logs outside the program folder, in ~/.config/Arro and
-~/.local/share/Arro.
+This folder holds arro, arro-mcp, helpers/, tools/, arro.desktop, arro-256.png,
+install.sh, this file, THIRD-PARTY.txt and NOTICE.txt. Unpack the archive anywhere and
+either start ./arro in place or run ./install.sh, which copies the folder into the home
+directory, links arro in ~/.local/bin and puts the entry in the application menu. Arro
+keeps its settings, state, caches and logs outside the program folder, in ~/.config/Arro
+and ~/.local/share/Arro.
+
+Using Arro from another program
+-------------------------------
+
+While a project is open, Arro shares the tools of its window with MCP clients. Settings,
+Tools, AI, MCP Server shows the strings below with a copy button; Arro copies them and
+runs none of them. Claude Code, in a terminal outside Arro:
+
+  claude mcp add arro -- "<this folder>/arro-mcp"
+
+Codex, in ~/.codex/config.toml:
+
+  [mcp_servers.arro]
+  command = "<this folder>/arro-mcp"
+
+Any other MCP client, as its JSON configuration:
+
+  {"mcpServers": {"arro": {"command": "<this folder>/arro-mcp"}}}
+
+The client starts arro-mcp in the folder of the project, and the shim finds the window
+whose project root holds that folder. Arro leaves the entry point in
+~/.local/share/Arro/mcp and removes it when the window closes; only the user may read
+it. An entry of a window that is no longer running is ignored.
 
 The application menu
 --------------------

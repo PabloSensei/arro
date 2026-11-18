@@ -1,6 +1,7 @@
 //! Tool windows and popups on top of the workspace.
 
 mod agent_hunk;
+mod agent_tools;
 mod agents;
 mod ai_review;
 mod annotate;
@@ -14,6 +15,7 @@ mod change_signature;
 mod changelists;
 mod changes;
 mod chat;
+mod claude_ide;
 mod clipboard;
 mod commands;
 mod commit;
@@ -24,6 +26,7 @@ mod console_input;
 mod copy_class;
 mod coverage;
 mod create_test;
+mod database_console;
 pub mod database_data;
 pub mod database_panel;
 mod debug;
@@ -57,6 +60,9 @@ mod kubernetes;
 mod library_sources;
 mod live_panel;
 mod marks;
+mod mcp_approval;
+mod mcp_edits;
+mod mcp_runs;
 mod merge_view;
 mod method_hierarchy;
 mod navigation;
@@ -72,6 +78,7 @@ mod project;
 mod project_state;
 mod project_structure;
 mod prompt;
+mod proposal;
 mod refactor_form;
 mod reformat;
 mod run;
@@ -217,11 +224,15 @@ mod window_tests_window;
 #[cfg(test)]
 mod window_tests_database;
 #[cfg(test)]
+mod window_tests_database_console;
+#[cfg(test)]
 mod window_tests_database_data;
 #[cfg(test)]
 mod window_tests_database_driver;
 #[cfg(test)]
 mod window_tests_database_passwords;
+#[cfg(test)]
+mod window_tests_database_step2;
 
 #[cfg(test)]
 mod window_tests_jshell;
@@ -418,12 +429,19 @@ mod window_tests_cached_views;
 
 #[cfg(test)]
 mod window_tests_keys_macos;
+
 #[cfg(test)]
 mod window_tests_markdown_inline;
 #[cfg(test)]
 mod window_tests_markdown_preview;
 #[cfg(test)]
 mod window_tests_mask_hint;
+#[cfg(test)]
+mod window_tests_mcp;
+#[cfg(test)]
+mod window_tests_mcp_approval;
+#[cfg(test)]
+mod window_tests_mcp_runs;
 
 #[cfg(test)]
 mod window_tests_release;
@@ -570,11 +588,26 @@ mod window_tests_markdown_blocks;
 mod window_tests_panel_icons;
 
 #[cfg(test)]
+mod window_tests_ai_tools;
+#[cfg(test)]
 mod window_tests_build_tool_missing;
+#[cfg(test)]
+mod window_tests_claude_ide;
+#[cfg(test)]
+mod window_tests_git_console;
 #[cfg(test)]
 mod window_tests_git_log_labels;
 #[cfg(test)]
+mod window_tests_gradle_missing;
+#[cfg(test)]
+mod window_tests_kubernetes_journal;
+#[cfg(test)]
+mod window_tests_mcp_edits;
+#[cfg(test)]
 mod window_tests_postfix;
+
+#[cfg(test)]
+mod window_tests_journal;
 
 mod choice;
 mod invalidate;
@@ -600,6 +633,7 @@ use workspace::{
 use crate::index::{IndexEvent, ProjectIndex};
 use crate::navigation::Navigator;
 
+pub use agent_tools::AgentTools;
 pub use agents::{AgentLanguages, AgentOptions};
 pub use coverage::{ActiveCoverage, CoverageColumn};
 pub use database_data::DatabaseDataView;
@@ -711,7 +745,15 @@ pub fn run_with_setup(
         state_dir: launch.state_dir.clone(),
         mock: mock_agents,
     };
+    // The harness of the IDE protocol looks in the configuration folder of the user, and
+    // a scripted run has no user in front of it and leaves that folder alone.
+    let claude = claude_ide::config_for(
+        script.is_some(),
+        std::env::var_os(claude_bridge::CONFIG_VARIABLE).map(std::path::PathBuf::from),
+        ::base::program::home_dir(),
+    );
     workspace::run(launch, requests, move |workspace, window, cx| {
+        cx.set_global(claude);
         cx.set_global(languages);
         cx.set_global(editor_view::CodeStyleLanguages(code_style_language));
         cx.set_global(cache);
@@ -1078,6 +1120,16 @@ fn install(
     );
     cx.set_global(structure::ActiveStructure(structure));
 
+    // The terminal starts under the IDE protocol of the window, so a harness run from it
+    // finds the diagnostics and the diff view of the project. A window no application
+    // built, such as a test, keeps the lock file in its own state folder.
+    let claude = cx
+        .try_global::<claude_ide::ClaudeConfig>()
+        .cloned()
+        .unwrap_or_else(|| {
+            claude_ide::ClaudeConfig::Folder(Some(workspace.state_dir().join("claude-home")))
+        });
+    claude_ide::start(workspace.root(), claude, cx);
     let terminal = terminal_panel::TerminalPanel::create(
         weak.clone(),
         workspace.root().to_path_buf(),
@@ -1192,16 +1244,31 @@ fn install(
 
     let hub = Arc::new(debug::DebugHub::default());
     let languages = Arc::new(LanguageTools::new());
-    languages.register_debug(workspace.root().to_path_buf(), hub.clone());
+    let project_root = workspace.root().to_path_buf();
+    languages.register_debug(project_root.clone(), hub.clone());
+    let run_tools = crate::mcp_runs::RunBridge::new();
+    runs.update(cx, |panel, _| panel.set_tool_runs(run_tools.clone()));
+    languages.register_project(project_root, run_tools);
     cx.set_global(debug::ActiveDebugHub(hub));
+    let edits = mcp_edits::EditRequests::new();
+    let tools = Arc::new(agent_tools::WindowTools::new(
+        languages.clone(),
+        workspace.root().to_path_buf(),
+        project.environment.clone(),
+        edits,
+    ));
+    cx.set_global(agent_tools::AgentTools(tools));
     cx.set_global(AgentLanguages(languages));
     let files = cx.new(|_| Arc::new(Vec::new()));
+    let close_state_dir = agents.state_dir.clone();
+    let close_root = workspace.root().to_path_buf();
     let agent_panel = agents::AgentsPanel::create(
         workspace,
         weak.clone(),
         agents,
         files.clone(),
         project.environment.clone(),
+        window.window_handle(),
         cx,
     );
     let focus = agent_panel.read(cx).focus();
@@ -1214,6 +1281,12 @@ fn install(
     );
     cx.set_global(agents::ActiveAgents(agent_panel));
     agents::install(cx);
+    mcp_approval::bind_actions(workspace);
+    mcp_edits::bind_actions(workspace);
+    // The entry point of the project goes away with the window, as the server does.
+    let entry_state = close_state_dir;
+    let entry_root = close_root;
+    workspace.on_close(move || mcp_discovery::EntryPoint::remove(&entry_state, &entry_root));
 
     let tasks = build::BuildPanel::create(runs, weak.clone(), cx);
     let focus = tasks.read(cx).focus();

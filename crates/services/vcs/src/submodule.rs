@@ -65,6 +65,9 @@ pub struct RootsUpdate {
     pub report: UpdateReport,
     /// The roots that failed, each line naming the root.
     pub errors: Vec<String>,
+    /// The command of the journal that failed last, when one of the errors is its answer,
+    /// so a notification opens the Console on it.
+    pub failed_command: Option<u64>,
 }
 
 impl Repository {
@@ -168,9 +171,12 @@ impl Repository {
         for (prefix, repository) in self.roots()? {
             match repository.update_with(mode) {
                 Ok(report) => merge_report(&mut update.report, report, &prefix),
-                Err(error) => update
-                    .errors
-                    .push(format!("{}: {error}", label_of(&prefix))),
+                Err(error) => {
+                    update.failed_command = crate::command_id(&error).or(update.failed_command);
+                    update
+                        .errors
+                        .push(format!("{}: {error}", label_of(&prefix)));
+                }
             }
         }
         if submodules
@@ -178,6 +184,7 @@ impl Repository {
                 .git
                 .run(&self.root, ["submodule", "update", "--init", "--recursive"])
         {
+            update.failed_command = crate::command_id(&error).or(update.failed_command);
             update.errors.push(error.to_string());
         }
         Ok(update)

@@ -9,6 +9,7 @@ mod environment;
 mod fingerprint;
 mod frameworks;
 mod gradle;
+mod gradle_download;
 pub mod heap;
 pub mod initializr;
 mod jdk;
@@ -20,6 +21,8 @@ mod pom;
 pub mod profile;
 mod sources;
 mod test_runs;
+mod tool_download;
+mod tool_home;
 pub mod updates;
 mod wrapper;
 
@@ -31,7 +34,10 @@ pub use environment::{
     resolve_environment, resolve_with, runtime_info, save_settings, settings_file,
 };
 pub use frameworks::{Framework, FrameworkLookup, Frameworks, frameworks_of};
-pub use gradle::{Gradle, gradle_supports, wrapper_version};
+pub use gradle::{
+    Gradle, GradleHome, GradleOrigin, MissingGradle, bundled_home as bundled_gradle, find_gradle,
+    find_gradle_home, gradle_supports, wrapper_version,
+};
 pub use jdk::{Jdk, Requested, choose_jdk, feature_of, find_jdks, requested_jdk};
 pub use lombok::{
     LOMBOK_ARTIFACT, LOMBOK_GROUP, LocalRepositories, Lombok, LombokDependency, find_lombok,

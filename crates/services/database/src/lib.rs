@@ -6,21 +6,32 @@
 //! the caller's thread. The helper and the search for a driver belong to the language
 //! layer, which hands this crate a [`Launch`].
 
+mod complete;
 mod console;
 mod data;
+mod explain;
+mod export;
 mod passwords;
 mod protocol;
 mod schema;
 mod session;
 mod sources;
 
-pub use console::{split_statements, statement_at};
+pub use complete::{
+    SqlContext, SqlProblem, SqlSuggestion, SuggestionKind, TableUse, complete, context,
+    countable_statement, problems, single_table,
+};
+pub use console::{
+    Parameter, asked_parameters, bind_parameters, parameters, split_statements, statement_at,
+};
 pub use data::{
     Cell, DataModel, DataRow, Dialect, PageQuery, Plan, RowKind, Statement, TableRef, csv,
     insert_literal, tsv,
 };
+pub use explain::{ExplainNode, ExplainPlan, explain_statement, plan_of};
+pub use export::{ExportFormat, Exporter};
 pub use passwords::{PasswordStore, SystemPasswords, service_of};
-pub use protocol::{Command, Event, PROTOCOL, Value};
+pub use protocol::{Command, Event, PROTOCOL, Param, Value};
 pub use schema::{Column, ColumnKind, ForeignKey, Index, ResultSet, Schema, Table, TableKind};
 pub use session::{Launch, Session, explain_output};
 pub use sources::{

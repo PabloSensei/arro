@@ -9,15 +9,17 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::graph;
 use vcs::{
-    Branch, Commit, CommitDetails, RebaseAction, RebasePlan, RefKind, RefLabel, Repository,
-    ResetMode,
+    Branch, CommandRecord, Commit, CommitDetails, RebaseAction, RebasePlan, RefKind, RefLabel,
+    Repository, ResetMode,
 };
 use workspace::{LOG_TOOL, Workspace};
 
+use crate::ansi::AnsiParser;
 use crate::commit::CommitPanel;
 use crate::diff_view::DiffView;
 use crate::git::{GitState, relative_of, short_commit};
 use crate::prompt::{Prompt, TextField};
+use crate::run::wrapped_line_element;
 
 /// The commits one read of the log brings. A long history grows as the pointer goes down.
 const PAGE: usize = 500;
@@ -59,6 +61,8 @@ const FILES_MAX: f32 = 640.;
 const CENTER_MIN: f32 = 320.;
 /// The grip between two panes, wider than its line so that the pointer finds it.
 const SPLIT_WIDTH: f32 = 5.;
+/// How close to the bottom of the Console the view has to be to follow a new command.
+const CONSOLE_FOLLOW_MARGIN: f32 = 32.;
 
 actions!(
     git_log_panel,
@@ -73,6 +77,8 @@ pub enum GitTab {
     /// The branches, the commits and the details of one of them.
     #[default]
     Log,
+    /// The git commands the IDE ran, with their output.
+    Console,
 }
 
 /// The Time filter of the log.
@@ -309,6 +315,13 @@ pub struct GitLogPanel {
     scroll_commits: ScrollHandle,
     scroll_files: ScrollHandle,
     scroll_details: ScrollHandle,
+    scroll_console: ScrollHandle,
+    /// The revision of the journal of git commands the Console followed last.
+    console_revision: u64,
+    /// The user asked for the commands the IDE runs on its own, such as `status`.
+    console_background: bool,
+    /// The id of the command the user picked in the Console, for Copy.
+    console_selected: Option<u64>,
     _git: Subscription,
 }
 
@@ -334,6 +347,11 @@ impl GitLogPanel {
                     this.head = head;
                     this.revision = revision;
                     this.reload(cx);
+                }
+                // Commands of the ide itself change no branch, so the Console follows the
+                // journal instead.
+                if this.tab == GitTab::Console && this.console_changed() {
+                    cx.notify();
                 }
             });
             Self {
@@ -386,6 +404,10 @@ impl GitLogPanel {
                 scroll_commits: ScrollHandle::new(),
                 scroll_files: ScrollHandle::new(),
                 scroll_details: ScrollHandle::new(),
+                scroll_console: ScrollHandle::new(),
+                console_revision: vcs::command_console().revision(),
+                console_background: false,
+                console_selected: None,
                 _git: observe,
             }
         });
@@ -421,6 +443,51 @@ impl GitLogPanel {
         let moved = self.tab != GitTab::Log;
         self.set_tab(GitTab::Log, cx);
         moved
+    }
+
+    /// Opens the Console tab on the command of the last failure, as Show in Console of a
+    /// notification does. A parallel command of the IDE can fail too, so the number the
+    /// failure carries wins; without it the last command of the project that the user
+    /// asked for is shown. The Console of one window shows the commands of its own
+    /// project, never those of another one that the process runs at the same time.
+    pub fn show_console(&mut self, cx: &mut Context<Self>) {
+        self.set_tab(GitTab::Console, cx);
+        let wanted = self.git.read(cx).last_failure();
+        let entries = self.console_project_entries(cx);
+        let chosen = wanted
+            .and_then(|id| entries.iter().find(|entry| entry.id == id))
+            .or_else(|| entries.iter().rev().find(|entry| !entry.background))
+            .or_else(|| entries.iter().rev().find(|entry| entry.failed()))
+            .or_else(|| entries.last());
+        let Some(chosen) = chosen.cloned() else {
+            cx.notify();
+            return;
+        };
+        if chosen.background {
+            self.console_background = true;
+        }
+        self.console_selected = Some(chosen.id);
+        self.console_revision = vcs::command_console().revision();
+        let index = self
+            .console_rows(cx)
+            .iter()
+            .position(|entry| entry.id == chosen.id);
+        if let Some(index) = index {
+            self.scroll_console.scroll_to_item(index);
+        }
+        cx.notify();
+    }
+
+    /// The id of the command the Console shows as picked, for tests.
+    #[cfg(test)]
+    pub fn console_selected(&self) -> Option<u64> {
+        self.console_selected
+    }
+
+    /// The commands the Console shows, as the tab draws them.
+    #[cfg(test)]
+    pub fn console_entries(&self, cx: &App) -> Vec<CommandRecord> {
+        self.console_rows(cx)
     }
 
     /// The whole branch again, and no filter.
@@ -1658,7 +1725,11 @@ impl GitLogPanel {
             return;
         }
         if stroke.modifiers.control && !stroke.modifiers.alt && stroke.key == "c" {
-            self.copy_selected(cx);
+            if self.tab == GitTab::Console {
+                self.copy_console(cx);
+            } else {
+                self.copy_selected(cx);
+            }
             cx.stop_propagation();
             return;
         }
@@ -2819,6 +2890,277 @@ impl GitLogPanel {
             .ok();
     }
 
+    /// The commands of the Console tab: the commands of the IDE itself only when the user
+    /// asked for them. The journal of the process holds them, so the tab reads it as it
+    /// draws.
+    fn console_rows(&self, cx: &App) -> Vec<CommandRecord> {
+        self.console_project_entries(cx)
+            .into_iter()
+            .filter(|entry| self.console_background || !entry.background)
+            .collect()
+    }
+
+    /// The commands of this project: the working directories inside the root, which is
+    /// the repository and its checked-out submodules. Commands of another project that
+    /// the process runs at the same time stay out of the Console of this window.
+    fn console_project_entries(&self, cx: &App) -> Vec<CommandRecord> {
+        match self.project_root(cx) {
+            Some(root) => vcs::command_console().entries_under(&root),
+            None => Vec::new(),
+        }
+    }
+
+    /// The root of the repository of the window.
+    fn project_root(&self, cx: &App) -> Option<PathBuf> {
+        self.git
+            .read(cx)
+            .repo()
+            .map(|repo| repo.root().to_path_buf())
+    }
+
+    /// Notices the commands that ran since the tab read the journal last. The answer says
+    /// whether there are new ones.
+    fn console_changed(&mut self) -> bool {
+        let revision = vcs::command_console().revision();
+        if revision == self.console_revision {
+            return false;
+        }
+        self.console_revision = revision;
+        if self.console_at_bottom() {
+            self.scroll_console.scroll_to_bottom();
+        }
+        true
+    }
+
+    /// Whether the view is at the bottom of the Console, so a new command scrolls it
+    /// down; a reader who scrolled up keeps the command in sight.
+    fn console_at_bottom(&self) -> bool {
+        let max = self.scroll_console.max_offset().y;
+        max <= px(0.) || self.scroll_console.offset().y <= -max + px(CONSOLE_FOLLOW_MARGIN)
+    }
+
+    /// Clear: drops the commands of this project from the journal. The commands of
+    /// another project of the same process stay, as they belong to its own Console.
+    fn clear_console(&mut self, cx: &mut Context<Self>) {
+        if let Some(root) = self.project_root(cx) {
+            vcs::command_console().clear_under(&root);
+        }
+        self.console_selected = None;
+        self.console_revision = vcs::command_console().revision();
+        cx.notify();
+    }
+
+    /// Ctrl+C and Copy of the toolbar: the picked command, or every command the tab shows.
+    fn copy_console(&mut self, cx: &mut Context<Self>) {
+        let rows = self.console_rows(cx);
+        let text = match self.console_selected {
+            Some(id) => rows
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(CommandRecord::text)
+                .unwrap_or_default(),
+            None => rows
+                .iter()
+                .map(CommandRecord::text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// The Console tab: the tools over the commands, in the order they ran.
+    fn console_panel(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.console_changed();
+        let theme = *theme;
+        let rows = self.console_rows(cx);
+        let empty = rows.is_empty();
+        let list = scrollable(
+            "git-console",
+            &self.scroll_console,
+            div()
+                .id("git-console")
+                .debug_selector(|| "git-console".to_owned())
+                .flex()
+                .flex_col()
+                .gap(px(SPACE_S))
+                .p(px(SPACE_M))
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_console)
+                .font_family(MONO_FONT)
+                .text_size(px(CODE_SIZE))
+                .text_color(theme.text)
+                .children(
+                    rows.iter()
+                        .enumerate()
+                        .map(|(index, entry)| self.console_row(index, entry, &theme, cx)),
+                )
+                .when(empty, |this| {
+                    this.items_center()
+                        .justify_center()
+                        .py(px(SPACE_M))
+                        .text_color(theme.text_secondary)
+                        .child("No git commands yet")
+                }),
+            &theme,
+            window,
+            cx,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(self.console_toolbar(&theme, cx))
+            .child(list.flex_1().min_h_0())
+            .into_any_element()
+    }
+
+    /// Show background commands, Copy and Clear of the Console.
+    fn console_toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let background = self.console_background;
+        let (hover, pressed) = (theme.hover, theme.pressed);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .border_b_1()
+            .border_color(theme.toolbar_border)
+            .child(
+                div()
+                    .id("git-console-background")
+                    .debug_selector(|| "git-console-background".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .flex_none()
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
+                    .text_size(px(TEXT_SMALL))
+                    .when(background, |this| this.bg(pressed))
+                    .when(!background, |this| this.hover(move |style| style.bg(hover)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.console_background = !this.console_background;
+                        this.console_selected = None;
+                        cx.notify();
+                    }))
+                    .child(checkbox(background, theme))
+                    .child("Show background commands"),
+            )
+            .child(div().flex_1())
+            .child(
+                icon_button("git-console-copy", "general/copy", "Copy", None, theme)
+                    .debug_selector(|| "git-console-copy".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_console(cx))),
+            )
+            .child(
+                icon_button("git-console-clear", "general/clear", "Clear", None, theme)
+                    .debug_selector(|| "git-console-clear".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_console(cx))),
+            )
+            .into_any_element()
+    }
+
+    /// One command of the Console: when it ran, its line and its output. A command that
+    /// failed, and what came from stderr, are red.
+    fn console_row(
+        &self,
+        index: usize,
+        entry: &CommandRecord,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let failed = entry.failed();
+        let color = if failed { theme.error } else { theme.text };
+        let selected = self.console_selected == Some(entry.id);
+        let row = format!("git-console-{index}");
+        let error = format!("git-console-error-{index}");
+        let id = entry.id;
+        let time = time_of((entry.time / 1_000) as i64);
+        let duration = format!("{} ms", entry.duration.as_millis());
+        let code = match entry.code {
+            Some(code) => format!("exit {code}"),
+            None => "not started".to_owned(),
+        };
+        let mut output: Vec<AnyElement> = Vec::new();
+        for line in output_lines(&entry.stdout, false) {
+            output.push(wrapped_line_element(&line, theme));
+        }
+        for line in output_lines(&entry.stderr, true) {
+            output.push(wrapped_line_element(&line, theme));
+        }
+        div()
+            .id(("git-console-row", index))
+            .debug_selector(move || row.clone())
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_XS))
+            .p(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .when(selected, |this| this.bg(theme.selection))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    window.focus(&this.focus, cx);
+                    this.console_selected = Some(id);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(TEXT_SMALL))
+                            .text_color(theme.text_muted)
+                            .child(time),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(MONO_FONT)
+                            .text_size(px(CODE_SIZE))
+                            .whitespace_normal()
+                            .text_color(color)
+                            .when(failed, |this| this.debug_selector(move || error.clone()))
+                            .child(entry.line()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(TEXT_SMALL))
+                            .text_color(theme.text_muted)
+                            .child(duration),
+                    )
+                    .when(failed, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(TEXT_SMALL))
+                                .text_color(theme.error)
+                                .child(code),
+                        )
+                    }),
+            )
+            .children(output)
+            .into_any_element()
+    }
+
     /// The tab strip of the Git window.
     fn tab_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let tab = |id: &'static str, label: &'static str, target: GitTab, theme: &Theme| {
@@ -2861,6 +3203,7 @@ impl GitLogPanel {
                 theme,
             ))
             .child(tab("git-tab-log", "Log", GitTab::Log, theme))
+            .child(tab("git-tab-console", "Console", GitTab::Console, theme))
             .into_any_element()
     }
 
@@ -4179,7 +4522,9 @@ impl Render for GitLogPanel {
         };
         let busy = self.loading || self.files_loading;
         let tabs = self.tab_strip(&theme, cx);
-        let body: AnyElement = if self.tab == GitTab::LocalChanges {
+        let body: AnyElement = if self.tab == GitTab::Console {
+            self.console_panel(&theme, window, cx)
+        } else if self.tab == GitTab::LocalChanges {
             self.commit.clone().map_or_else(
                 || {
                     div()
@@ -4357,6 +4702,15 @@ impl Render for GitLogPanel {
             .child(tabs)
             .child(body)
     }
+}
+
+/// The lines of one stream of a git command, the output of stderr in red.
+fn output_lines(text: &str, error: bool) -> Vec<crate::ansi::Line> {
+    let mut parser = AnsiParser::default();
+    let mut lines = Vec::new();
+    parser.push(text, error, &mut lines);
+    parser.finish(&mut lines);
+    lines
 }
 
 /// Show History of one commit: opens the log and selects `id` with its files, as a click

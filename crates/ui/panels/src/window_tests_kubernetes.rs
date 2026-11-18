@@ -9,7 +9,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use ui_kit::gpui;
 use ui_kit::gpui::{TestAppContext, WindowHandle};
@@ -19,7 +18,9 @@ use crate::docker::{ActiveDocker, DockerPanel};
 use crate::kubernetes::TestCli;
 use crate::window_tests::{
     click, click_gutter, draw, open_path, open_window, sample_project, scratch, type_text,
+    wait_for_process,
 };
+use crate::window_tests_journal::journal_writer;
 use crate::window_tests_services::{menu_labels, right_click};
 use crate::window_tests_ui::{ENV, wait_for};
 
@@ -33,20 +34,22 @@ const RESOURCES: &str = r#"{"apiVersion":"v1","kind":"List","items":[
 ]}"#;
 
 /// A `kubectl.cmd` that answers the calls of the node from the constants above and writes
-/// every call to `calls.txt` next to itself.
+/// every call to a folder of its own under `calls/` next to itself.
+///
+/// The panel asks the watch, an action and a live log at the same time, so several copies
+/// of this script run together. [`journal_writer`] gives every copy a file of its own, so
+/// no call loses its line because another one writes its journal at the same moment.
 pub(crate) fn fake_kubectl(name: &str) -> (PathBuf, PathBuf) {
     let folder = scratch(name);
     let script = folder.join("kubectl.cmd");
-    let calls = folder.join("calls.txt");
+    let journal = folder.join("calls");
+    let writer = journal_writer(&journal);
     let resources = folder.join("resources.json");
     fs::write(&resources, RESOURCES).unwrap();
     let text = format!(
         r#"@echo off
 setlocal EnableExtensions
-set "calls={calls}"
-:record
-echo %~1 %~2 %~3 %~4 >>"%calls%"
-:recorded
+{writer}
 if "%~1"=="--context" shift
 if "%~1"=="--context" shift
 if "%~1"=="--kubeconfig" shift
@@ -115,11 +118,11 @@ exit /b 2
 :end
 endlocal
 "#,
-        calls = calls.display(),
+        writer = writer,
         resources = resources.display(),
     );
     fs::write(&script, text.replace('\n', "\r\n")).unwrap();
-    (script, calls)
+    (script, journal)
 }
 
 /// Opens the window on the stand-in `kubectl`, shows Services and waits for the resources
@@ -134,9 +137,11 @@ fn open_kubernetes(
     PathBuf,
 ) {
     let root = sample_project(name);
-    let (script, calls) = fake_kubectl(&format!("{name}-cli"));
+    let (script, journal) = fake_kubectl(&format!("{name}-cli"));
     let window = open_with_cli(cx, root, &script);
-    wait_for(cx, "the resources of the stand-in cluster", |cx| {
+    // The watch of the panel answers from a real process, so the snapshot it delivers is
+    // the signal; the limit only keeps a broken test from hanging the run.
+    wait_for_process(cx, |cx| {
         let docker = cx.update(|cx| cx.global::<ActiveDocker>().0.clone());
         docker.read_with(cx, |panel, _| {
             panel
@@ -150,7 +155,7 @@ fn open_kubernetes(
     click(cx, window, "docker-toolbar-collapse");
     draw(cx, window);
     let docker = cx.update(|cx| cx.global::<ActiveDocker>().0.clone());
-    (window, docker, calls, script)
+    (window, docker, journal, script)
 }
 
 fn open_with_cli(cx: &mut TestAppContext, root: PathBuf, script: &Path) -> WindowHandle<Workspace> {
@@ -176,16 +181,24 @@ fn open_with_cli(cx: &mut TestAppContext, root: PathBuf, script: &Path) -> Windo
     window
 }
 
-fn calls_of(path: &Path) -> String {
-    for _ in 0..20 {
-        match fs::read_to_string(path) {
-            Ok(text) => return text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return String::new(),
-            Err(_) => std::thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    String::new()
+/// Waits until the panel says that its call of the CLI has ended. The end of the process is
+/// the signal of the test; the limit of [`wait_for_process`] only keeps a broken test from
+/// hanging the run.
+fn wait_for_call(cx: &mut TestAppContext, docker: &gpui::Entity<DockerPanel>, label: &str) {
+    let started = format!("kube console {label}: started");
+    let ended = format!("kube console {label}:");
+    wait_for_process(cx, |cx| {
+        docker.read_with(cx, |panel, _| {
+            panel
+                .report()
+                .iter()
+                .any(|line| line.starts_with(&ended) && line.as_str() != started.as_str())
+        })
+    });
 }
+
+/// The journal of the stand-in `kubectl`, read after the call of the test has ended.
+pub(crate) use crate::window_tests_journal::journal_of;
 
 fn click_menu(cx: &mut TestAppContext, window: WindowHandle<Workspace>, label: &str) {
     let labels = menu_labels(cx, window);
@@ -296,7 +309,7 @@ fn the_node_lists_contexts_namespaces_resources_and_their_state(cx: &mut TestApp
     crate::window_tests::bounds_of(cx, window, "kube-resource-pods-web-0");
     click(cx, window, "kube-resource-pods-web-0");
     draw(cx, window);
-    wait_for(cx, "the log of the Pod", |cx| {
+    wait_for_process(cx, |cx| {
         docker.read_with(cx, |panel, _| {
             panel.report().iter().any(|line| line == "kube log ready")
         })
@@ -323,7 +336,7 @@ fn a_hidden_tool_window_stops_the_watch(cx: &mut TestAppContext) {
 
 #[ui_kit::gpui::test]
 fn delete_asks_first_and_then_reaches_the_cli(cx: &mut TestAppContext) {
-    let (window, _, calls, _) = open_kubernetes(cx, "kube-delete");
+    let (window, docker, journal, _) = open_kubernetes(cx, "kube-delete");
 
     reveal(cx, window, "kube-resource-pods-web-0");
     right_click(cx, window, "kube-resource-pods-web-0");
@@ -337,14 +350,19 @@ fn delete_asks_first_and_then_reaches_the_cli(cx: &mut TestAppContext) {
     click(cx, window, "prompt");
     crate::window_tests::press(cx, window, "enter");
 
-    wait_for(cx, "the delete call of the stand-in kubectl", |_| {
-        calls_of(&calls).contains("delete pods web-0")
-    });
+    // The end of the delete process is the signal: the journal is read after the CLI
+    // closed it, not polled while the watch may write it.
+    wait_for_call(cx, &docker, "delete web-0");
+    let journal = journal_of(&journal);
+    assert!(
+        journal.contains("delete pods web-0"),
+        "the stand-in kubectl recorded the delete: {journal:?}"
+    );
 }
 
 #[ui_kit::gpui::test]
 fn scale_asks_for_the_number_and_reaches_the_cli(cx: &mut TestAppContext) {
-    let (window, _, calls, _) = open_kubernetes(cx, "kube-scale");
+    let (window, docker, journal, _) = open_kubernetes(cx, "kube-scale");
 
     reveal(cx, window, "kube-resource-deployments-web");
     click(cx, window, "kube-resource-deployments-web");
@@ -357,14 +375,17 @@ fn scale_asks_for_the_number_and_reaches_the_cli(cx: &mut TestAppContext) {
     type_text(cx, window, "3");
     crate::window_tests::press(cx, window, "enter");
 
-    wait_for(cx, "the scale call of the stand-in kubectl", |_| {
-        calls_of(&calls).contains("scale deployments/web --replicas 3")
-    });
+    wait_for_call(cx, &docker, "scale web");
+    let journal = journal_of(&journal);
+    assert!(
+        journal.contains("scale deployments/web --replicas 3"),
+        "the stand-in kubectl recorded the scale: {journal:?}"
+    );
 }
 
 #[ui_kit::gpui::test]
 fn a_secret_stays_hidden_until_show_value(cx: &mut TestAppContext) {
-    let (window, docker, calls, _) = open_kubernetes(cx, "kube-secret");
+    let (window, docker, journal, _) = open_kubernetes(cx, "kube-secret");
 
     reveal(cx, window, "kube-resource-secrets-db");
     click(cx, window, "kube-resource-secrets-db");
@@ -395,12 +416,15 @@ fn a_secret_stays_hidden_until_show_value(cx: &mut TestAppContext) {
     );
     click_menu(cx, window, "Show Value");
 
-    wait_for(cx, "the value of the Secret", |cx| {
+    // The value arrives after the process of the CLI ended, so the journal is complete.
+    wait_for_process(cx, |cx| {
         docker.read_with(cx, |panel, _| panel.kube.revealed_value() == Some("s3cr3t"))
     });
-    wait_for(cx, "the value call of the stand-in kubectl", |_| {
-        calls_of(&calls).contains("get secret/db -o json")
-    });
+    let journal = journal_of(&journal);
+    assert!(
+        journal.contains("get secret/db -o json"),
+        "the stand-in kubectl recorded the value call: {journal:?}"
+    );
     let report = docker.read_with(cx, |panel, _| panel.report());
     assert!(
         !report.iter().any(|line| line.contains("s3cr3t")),
@@ -443,7 +467,7 @@ fn apply_from_the_gutter_of_a_yaml_document_reaches_the_cluster(cx: &mut TestApp
         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: web\n",
     )
     .unwrap();
-    let (script, calls) = fake_kubectl("kube-gutter-cli");
+    let (script, journal) = fake_kubectl("kube-gutter-cli");
     let window = open_with_cli(cx, root, &script);
     open_path(cx, window, &path);
     wait_for(cx, "the badges of the two documents", |cx| {
@@ -463,13 +487,34 @@ fn apply_from_the_gutter_of_a_yaml_document_reaches_the_cluster(cx: &mut TestApp
             .iter()
             .any(|label| label == "Apply to Cluster")
     });
+    let before = window
+        .read_with(cx, |workspace, _| workspace.notification_serial())
+        .unwrap();
     click_menu(cx, window, "Apply to Cluster");
 
-    wait_for(cx, "the apply call of the stand-in kubectl", |_| {
-        calls_of(&calls)
-            .lines()
-            .any(|line| line.starts_with("apply -f "))
+    // The notification carries the answer of the CLI and arrives after its process ended;
+    // the journal is read then, not polled while the watch may write it.
+    wait_for_process(cx, |cx| {
+        window
+            .read_with(cx, |workspace, _| {
+                workspace.notification_serial() > before
+                    && workspace
+                        .last_notification()
+                        .is_some_and(|(title, _)| title.as_ref() == "Apply to Cluster")
+            })
+            .unwrap_or(false)
     });
+    let (title, text) = window
+        .read_with(cx, |workspace, _| workspace.last_notification())
+        .unwrap()
+        .expect("the window shows the answer of the apply");
+    assert_eq!(title.as_ref(), "Apply to Cluster");
+    assert_eq!(text.as_ref(), "ok");
+    let journal = journal_of(&journal);
+    assert!(
+        journal.lines().any(|line| line.starts_with("apply -f ")),
+        "the stand-in kubectl recorded the apply: {journal:?}"
+    );
 
     // The menu of the second document offers the same actions, and Delete asks first.
     click_gutter(cx, window, 0, 6);

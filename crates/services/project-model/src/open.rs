@@ -47,6 +47,12 @@ pub trait BuildSystem: Send + Sync {
         None
     }
 
+    /// Whether the folder of the downloaded copy goes to the `PATH` of the terminals of
+    /// the window, as the settings page of this tool asks.
+    fn terminal_path(&self) -> bool {
+        false
+    }
+
     /// The command that makes the outputs of the project current.
     fn assemble(&self, root: &Path) -> Result<ProcessSpec>;
 

@@ -36,6 +36,31 @@ pub fn make_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Creates or replaces a file that its owner alone may read and write: `0600` on a
+/// system with permission bits, the attributes of the folder on Windows.
+pub fn private_file(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    // The mode of an existing file is kept by `open`, so it is set again.
+    set_mode(path, 0o600)?;
+    Ok(file)
+}
+
 /// The permission bits of `path`, or `0` on a system without them.
 #[cfg(unix)]
 pub fn mode(path: &Path) -> io::Result<u32> {

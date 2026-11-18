@@ -143,6 +143,7 @@ fn execute(session: &Session, id: u64, sql: &str) -> Result<ResultSet, String> {
             sql: sql.to_owned(),
             timeout: None,
             max_rows: None,
+            params: Vec::new(),
         })
         .expect("the query request is written");
     let mut columns = Vec::new();
@@ -310,6 +311,7 @@ fn h2_cancel_stops_a_long_query() {
             sql: "SELECT SUM(X) FROM SYSTEM_RANGE(1, 1000000000)".into(),
             timeout: None,
             max_rows: None,
+            params: Vec::new(),
         })
         .expect("the query request is written");
     let running = wait(&session, |event| {

@@ -135,7 +135,7 @@ public final class Helper {
                     } else {
                         SchemaReader.read(connection, id);
                     }
-                } else if ("autocommit".equals(type)) {
+                } else if ("setAutoCommit".equals(type)) {
                     connection.setAutoCommit(booleanValue(request, "on"));
                     emitDone(id, null, false, false, 0);
                 } else if ("commit".equals(type)) {
@@ -224,6 +224,7 @@ public final class Helper {
         running = statement;
         boolean described = false;
         try {
+            bind(statement, request.get("params"));
             if (timeoutMs > 0) {
                 statement.setQueryTimeout((int) Math.max(1, timeoutMs / 1000));
             }
@@ -261,6 +262,21 @@ public final class Helper {
                 running = null;
             }
             closeQuietly(statement);
+        }
+    }
+
+    /**
+     * Binds the values the window collected for the placeholders of the statement. The
+     * text of the statement keeps its placeholders: the driver carries the values.
+     */
+    private static void bind(PreparedStatement statement, Object values) throws SQLException {
+        if (!(values instanceof List)) {
+            return;
+        }
+        int index = 1;
+        for (Object value : (List<?>) values) {
+            statement.setObject(index, value);
+            index++;
         }
     }
 

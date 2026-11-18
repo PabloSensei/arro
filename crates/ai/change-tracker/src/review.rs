@@ -137,6 +137,46 @@ impl FileReview {
     pub fn binary_bytes(&self) -> Option<&BinaryBytes> {
         self.binary.then_some(&self.bytes)
     }
+
+    /// The text of the file when the hunks marked in `accepted` keep their new lines and
+    /// the rest keep the old ones. `None`: the file should not exist.
+    pub fn text_with(&self, accepted: &[bool]) -> Option<String> {
+        let base = self.base.as_deref().unwrap_or("");
+        let current = self.current.as_deref().unwrap_or("");
+        let base_lines: Vec<&str> = base.split_inclusive('\n').collect();
+        let current_lines: Vec<&str> = current.split_inclusive('\n').collect();
+        let keep = |index: usize| accepted.get(index).copied().unwrap_or(false);
+        if self.hunks.iter().enumerate().all(|(index, _)| keep(index)) && self.current.is_none() {
+            return None;
+        }
+        if self.hunks.iter().enumerate().all(|(index, _)| !keep(index)) && self.base.is_none() {
+            return None;
+        }
+        let mut text = String::new();
+        let mut at = 0usize;
+        for (index, hunk) in self.hunks.iter().enumerate() {
+            let start = hunk.before.start as usize;
+            let end = hunk.before.end as usize;
+            if start > at {
+                text.push_str(&base_lines[at..start].concat());
+            }
+            if keep(index) {
+                let from = hunk.after.start as usize;
+                let to = hunk.after.end as usize;
+                text.push_str(
+                    &current_lines[from.min(current_lines.len())..to.min(current_lines.len())]
+                        .concat(),
+                );
+            } else {
+                text.push_str(&base_lines[start..end].concat());
+            }
+            at = end;
+        }
+        if at < base_lines.len() {
+            text.push_str(&base_lines[at..].concat());
+        }
+        Some(text)
+    }
 }
 
 #[cfg(test)]
@@ -233,5 +273,43 @@ mod tests {
         let review = review(Some("a\n"), Some("b\n"));
 
         assert!(review.binary_bytes().is_none());
+    }
+
+    #[test]
+    fn a_part_of_the_hunks_makes_the_text_the_user_kept() {
+        let review = review(Some("a\nb\nc\nd\n"), Some("a\nB\nc\nd\ne\n"));
+
+        assert_eq!(
+            review.text_with(&[true, false]).as_deref(),
+            Some("a\nB\nc\nd\n")
+        );
+        assert_eq!(
+            review.text_with(&[false, true]).as_deref(),
+            Some("a\nb\nc\nd\ne\n")
+        );
+        assert_eq!(
+            review.text_with(&[true, true]).as_deref(),
+            Some("a\nB\nc\nd\ne\n")
+        );
+        assert_eq!(
+            review.text_with(&[false, false]).as_deref(),
+            Some("a\nb\nc\nd\n")
+        );
+    }
+
+    #[test]
+    fn a_new_file_exists_only_with_a_kept_hunk() {
+        let added = review(None, Some("x\n"));
+
+        assert_eq!(added.text_with(&[false]), None);
+        assert_eq!(added.text_with(&[true]).as_deref(), Some("x\n"));
+    }
+
+    #[test]
+    fn a_deleted_file_goes_when_its_only_hunk_is_kept() {
+        let deleted = review(Some("a\nb\n"), None);
+
+        assert_eq!(deleted.text_with(&[false]).as_deref(), Some("a\nb\n"));
+        assert_eq!(deleted.text_with(&[true]), None);
     }
 }

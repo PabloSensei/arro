@@ -2,7 +2,7 @@
 //! implement this when they exist, tests use a fake.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -173,6 +173,414 @@ pub struct DiagnosticsPage {
     pub next: Option<String>,
 }
 
+/// How many lines `read_file` shows at most, so that one answer fits a context window.
+pub const READ_LINE_LIMIT: u32 = 2_000;
+
+/// A place where a symbol is used, as `find_usages` shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    /// 1-based, in characters.
+    pub column: u32,
+    /// The text of that line.
+    pub content: String,
+}
+
+/// The uses of one symbol. `total` counts every use the service knows, `items` holds the
+/// page the caller asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsagePage {
+    pub items: Vec<Usage>,
+    pub total: usize,
+    pub clipped: bool,
+    pub source: String,
+    pub confidence: Confidence,
+}
+
+/// The symbol whose uses the agent wants, by a place or by a name.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsagesQuery {
+    /// A file of the project, relative to its root or absolute.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub column: Option<u32>,
+    /// The name of a declaration, when no place is given.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_page")]
+    pub limit: usize,
+}
+
+fn default_page() -> usize {
+    50
+}
+
+impl UsagesQuery {
+    pub fn clipped(mut self) -> Self {
+        self.limit = self.limit.clamp(1, 200);
+        self
+    }
+
+    /// The place the query asks about, `None` for a query by name.
+    pub fn position(&self) -> Option<(&Path, u32, u32)> {
+        let (path, line, column) = (self.path.as_deref()?, self.line?, self.column?);
+        Some((path, line, column))
+    }
+}
+
+/// One type of a hierarchy: its name, what the service says about it and where it stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HierarchyNode {
+    pub name: String,
+    pub detail: Option<String>,
+    pub location: Option<Location>,
+    /// 1 for a direct parent or child, more for the levels above or below it.
+    pub depth: u32,
+}
+
+/// The types above and below the one at a place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeHierarchy {
+    pub supertypes: Vec<HierarchyNode>,
+    pub subtypes: Vec<HierarchyNode>,
+    pub source: String,
+    pub confidence: Confidence,
+    pub clipped: bool,
+}
+
+/// The calls that reach the method at a place, one level per requested depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallHierarchy {
+    pub callers: Vec<HierarchyNode>,
+    pub source: String,
+    pub confidence: Confidence,
+    pub clipped: bool,
+}
+
+/// The place of the type or method whose hierarchy the agent wants.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypeHierarchyQuery {
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    /// 1-based, in characters.
+    pub column: u32,
+}
+
+/// The place of the method and how many levels of callers to follow.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallHierarchyQuery {
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    /// 1-based, in characters.
+    pub column: u32,
+    #[serde(default = "default_depth")]
+    pub depth: usize,
+}
+
+fn default_depth() -> usize {
+    1
+}
+
+impl CallHierarchyQuery {
+    pub fn clipped(mut self) -> Self {
+        self.depth = self.depth.clamp(1, 5);
+        self
+    }
+}
+
+/// One module of the project as `get_project_structure` shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectModule {
+    pub name: String,
+    /// Relative to the project root when it is inside it.
+    pub path: PathBuf,
+    pub source_roots: Vec<PathBuf>,
+    pub test_roots: Vec<PathBuf>,
+    /// `group:artifact:version` of the libraries the module uses.
+    pub dependencies: Vec<String>,
+    pub dependencies_clipped: bool,
+}
+
+/// The modules of the project, the build system and the environment it builds with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectStructure {
+    pub modules: Vec<ProjectModule>,
+    pub total_modules: usize,
+    pub clipped: bool,
+    /// The name of the build system, such as the tool that reads the project.
+    pub build_system: String,
+    pub build_system_version: Option<String>,
+    /// Whether the build system resolved the dependencies or only scanned the files.
+    pub resolved: bool,
+    /// The runtime the project builds and runs with.
+    pub runtime: Option<String>,
+    /// The language level of the build.
+    pub language_level: Option<String>,
+    /// What the build system could not read, if anything.
+    pub problems: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectStructureQuery {
+    /// How many modules to show, 50 by default.
+    #[serde(default = "default_page")]
+    pub limit: usize,
+}
+
+impl ProjectStructureQuery {
+    pub fn clipped(mut self) -> Self {
+        self.limit = self.limit.clamp(1, 500);
+        self
+    }
+}
+
+/// One line a text search found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    /// 1-based, in characters, of the first match in the line.
+    pub column: u32,
+    /// The text of the line.
+    pub content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchPage {
+    pub items: Vec<SearchHit>,
+    pub total: usize,
+    pub clipped: bool,
+    /// How many files the hits come from.
+    pub files: usize,
+}
+
+/// A search over the project as Find in Files does it: the index of the project decides
+/// which files are read, so the exclusions of the project stay in force.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub pattern: String,
+    /// Treat the pattern as a regular expression instead of plain text.
+    #[serde(default)]
+    pub regex: bool,
+    /// File patterns, as Find in Files takes them: `*.txt` or `!*Test.txt`.
+    #[serde(default)]
+    pub mask: Option<String>,
+    #[serde(default = "default_page")]
+    pub limit: usize,
+}
+
+impl SearchQuery {
+    pub fn clipped(mut self) -> Self {
+        self.limit = self.limit.clamp(1, 500);
+        self
+    }
+}
+
+/// What `read_file` shows: the lines the editor has, unsaved edits included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileText {
+    pub path: PathBuf,
+    /// The lines without their line ends, joined by `\n`.
+    pub text: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub total_lines: u32,
+    /// The editor holds edits that are not on disk.
+    pub dirty: bool,
+    /// The range was cut short by the size of an answer or by the end of the file.
+    pub clipped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadFileQuery {
+    pub path: PathBuf,
+    /// 1-based, 1 by default.
+    #[serde(default)]
+    pub start_line: Option<u32>,
+    /// 1-based and inclusive, [`READ_LINE_LIMIT`] lines by default.
+    #[serde(default)]
+    pub end_line: Option<u32>,
+}
+
+impl ReadFileQuery {
+    /// Fills the range and keeps it inside what one answer may carry.
+    pub fn clipped(mut self) -> Self {
+        let start = self.start_line.unwrap_or(1).max(1);
+        let last = start.saturating_add(READ_LINE_LIMIT - 1);
+        let end = self.end_line.unwrap_or(last).max(start).min(last);
+        self.start_line = Some(start);
+        self.end_line = Some(end);
+        self
+    }
+}
+
+/// One changed file of the repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VcsFile {
+    /// Relative to the project root, with `/`, when the file is inside it.
+    pub path: String,
+    /// `modified`, `added`, `deleted`, `renamed`, `untracked` or `conflicted`.
+    pub status: String,
+    /// The old path of a rename.
+    pub original: Option<String>,
+}
+
+/// A range of a file the change touches: `before` and `after` are 0-based line ranges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VcsHunk {
+    pub before: (u32, u32),
+    pub after: (u32, u32),
+    pub removed: Vec<String>,
+    pub added: Vec<String>,
+}
+
+/// One file against `HEAD`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VcsDiff {
+    pub path: String,
+    pub hunks: Vec<VcsHunk>,
+    pub clipped: bool,
+}
+
+/// One replacement of `propose_edit`: the exact text to find and what takes its place.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextReplacement {
+    pub old_text: String,
+    pub new_text: String,
+}
+
+/// A file the agent offers to change: its whole new text, or replacements of the text it
+/// has. Exactly one of the two is given.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposeEditQuery {
+    /// A file of the project, relative to its root or absolute.
+    pub path: PathBuf,
+    /// The text the file should have after the edit.
+    #[serde(default)]
+    pub new_text: Option<String>,
+    /// Replacements of the text on disk, applied one after another.
+    #[serde(default)]
+    pub replacements: Vec<TextReplacement>,
+}
+
+/// How the user took a proposed edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditOutcome {
+    /// Every hunk was kept.
+    Accepted,
+    /// No hunk was kept, and the file is as it was.
+    Rejected,
+    /// Some hunks were kept and some were not.
+    Partial,
+    /// The user did not decide in time, and nothing was written.
+    NoDecision,
+}
+
+impl EditOutcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Partial => "partial",
+            Self::NoDecision => "no decision",
+        }
+    }
+}
+
+/// What became of a proposed edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposedEdit {
+    pub path: PathBuf,
+    pub outcome: EditOutcome,
+    /// The text of the file after the decision, `None` when the user did not decide.
+    pub text: Option<String>,
+    pub hunks: usize,
+    pub kept: usize,
+}
+
+/// A symbol to rename, by the place of its name and the name it should get.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameSymbolQuery {
+    /// A file of the project, relative to its root or absolute.
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    /// 1-based, in characters.
+    pub column: u32,
+    pub new_name: String,
+}
+
+/// The files a confirmed rename changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenamedSymbol {
+    /// Relative to the project, with forward slashes.
+    pub files: Vec<PathBuf>,
+    pub edits: usize,
+}
+
+/// One file an action of the IDE works on.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileActionQuery {
+    /// A file of the project, relative to its root or absolute.
+    pub path: PathBuf,
+}
+
+/// What an action of the IDE did to a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileActionOutcome {
+    pub path: PathBuf,
+    /// Whether the text of the file changed.
+    pub changed: bool,
+    pub edits: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VcsChanges {
+    pub files: Vec<VcsFile>,
+    pub total: usize,
+    pub clipped: bool,
+    pub branch: Option<String>,
+    /// The diff of the requested file, when the query asked for it.
+    pub diff: Option<VcsDiff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VcsQuery {
+    /// One file of the project to diff against the last commit.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// How many changed files to show, 50 by default.
+    #[serde(default = "default_page")]
+    pub limit: usize,
+}
+
+impl VcsQuery {
+    pub fn clipped(mut self) -> Self {
+        self.limit = self.limit.clamp(1, 500);
+        self
+    }
+}
+
 /// How much of a stopped debug session `debug_get_state` shows.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -240,6 +648,171 @@ pub trait ToolBackend: Send + Sync {
     fn debug_snapshot(&self, _scope: &SessionScope) -> Option<Arc<dap_client::Snapshot>> {
         None
     }
+
+    /// The uses of a symbol, by a place or by a name.
+    fn find_usages(
+        &self,
+        _scope: &SessionScope,
+        _query: &UsagesQuery,
+    ) -> Result<UsagePage, ToolError> {
+        Err(not_connected("the symbol index"))
+    }
+
+    /// The types above and below the one at a place.
+    fn type_hierarchy(
+        &self,
+        _scope: &SessionScope,
+        _query: &TypeHierarchyQuery,
+    ) -> Result<TypeHierarchy, ToolError> {
+        Err(not_connected("the language server"))
+    }
+
+    /// The calls that reach the method at a place.
+    fn call_hierarchy(
+        &self,
+        _scope: &SessionScope,
+        _query: &CallHierarchyQuery,
+    ) -> Result<CallHierarchy, ToolError> {
+        Err(not_connected("the language server"))
+    }
+
+    /// The modules, roots, build system and runtime of the project.
+    fn project_structure(
+        &self,
+        _scope: &SessionScope,
+        _query: &ProjectStructureQuery,
+    ) -> Result<ProjectStructure, ToolError> {
+        Err(not_connected("the project model"))
+    }
+
+    /// A text search over the files the project index holds.
+    fn search_text(
+        &self,
+        _scope: &SessionScope,
+        _query: &SearchQuery,
+    ) -> Result<SearchPage, ToolError> {
+        Err(not_connected("the project index"))
+    }
+
+    /// The text of a file as the editor sees it, unsaved edits included.
+    fn read_file(
+        &self,
+        _scope: &SessionScope,
+        _query: &ReadFileQuery,
+    ) -> Result<FileText, ToolError> {
+        Err(not_connected("the editor"))
+    }
+
+    /// The changed files of the repository and the diff of one of them.
+    fn vcs_changes(
+        &self,
+        _scope: &SessionScope,
+        _query: &VcsQuery,
+    ) -> Result<VcsChanges, ToolError> {
+        Err(not_connected("the version control"))
+    }
+
+    /// Offers an edit of a file to the user and waits for the decision. The file is not
+    /// written while the user has not decided.
+    fn propose_edit(
+        &self,
+        _scope: &SessionScope,
+        _query: &ProposeEditQuery,
+    ) -> Result<ProposedEdit, ToolError> {
+        Err(not_connected("the editor"))
+    }
+
+    /// Renames the symbol at a place through the language service, after the user
+    /// confirms the change.
+    fn rename_symbol(
+        &self,
+        _scope: &SessionScope,
+        _query: &RenameSymbolQuery,
+    ) -> Result<RenamedSymbol, ToolError> {
+        Err(not_connected("the language server"))
+    }
+
+    /// Sorts and removes the imports of a file as the language service says.
+    fn organize_imports(
+        &self,
+        _scope: &SessionScope,
+        _query: &FileActionQuery,
+    ) -> Result<FileActionOutcome, ToolError> {
+        Err(not_connected("the language server"))
+    }
+
+    /// Formats a file as the language service says.
+    fn format_file(
+        &self,
+        _scope: &SessionScope,
+        _query: &FileActionQuery,
+    ) -> Result<FileActionOutcome, ToolError> {
+        Err(not_connected("the language server"))
+    }
+
+    /// Builds the project with its own build tool and answers what the build said.
+    fn build_project(
+        &self,
+        _scope: &SessionScope,
+        _request: &BuildRequest,
+    ) -> Result<BuildOutcome, ToolError> {
+        Err(ToolError::Failed(
+            "the run window of this project is not connected yet".to_string(),
+        ))
+    }
+
+    /// Runs tests of the project and answers their results.
+    fn run_tests(
+        &self,
+        _scope: &SessionScope,
+        _request: &TestsRequest,
+    ) -> Result<TestsOutcome, ToolError> {
+        Err(ToolError::Failed(
+            "the run window of this project is not connected yet".to_string(),
+        ))
+    }
+
+    /// The run configurations of the project the user can start.
+    fn run_configurations(
+        &self,
+        _scope: &SessionScope,
+    ) -> Result<Vec<RunConfiguration>, ToolError> {
+        Err(ToolError::Failed(
+            "the run window of this project is not connected yet".to_string(),
+        ))
+    }
+
+    /// Starts a run configuration and answers the id of the run.
+    fn start_run(
+        &self,
+        _scope: &SessionScope,
+        _request: &StartRunRequest,
+        _client: Option<&str>,
+    ) -> Result<String, ToolError> {
+        Err(ToolError::Failed(
+            "the run window of this project is not connected yet".to_string(),
+        ))
+    }
+
+    /// The latest lines of a run and its exit code.
+    fn run_output(&self, _scope: &SessionScope, id: &str) -> Result<RunOutput, ToolError> {
+        let _ = id;
+        Err(ToolError::Failed(
+            "the run window of this project is not connected yet".to_string(),
+        ))
+    }
+
+    /// Stops the program of a run.
+    fn stop_run(&self, _scope: &SessionScope, id: &str) -> Result<(), ToolError> {
+        let _ = id;
+        Err(ToolError::Failed(
+            "the run window of this project is not connected yet".to_string(),
+        ))
+    }
+}
+
+fn not_connected(what: &str) -> ToolError {
+    ToolError::Failed(format!("{what} is not connected yet"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +838,147 @@ impl std::error::Error for ToolError {}
 
 /// Until the editor and the language layer answer, a call says so instead of making things up.
 pub struct Unavailable;
+
+/// What a build covers: the whole project, or one module of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuildRequest {
+    pub module: Option<String>,
+}
+
+/// One error the build tool reported, with the place in the sources it named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildProblem {
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    pub message: String,
+}
+
+/// The end of a build: its verdict, what it complained about and how long it took.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildOutcome {
+    pub success: bool,
+    pub problems: Vec<BuildProblem>,
+    pub duration_ms: u64,
+    /// The id `run_output` reads the whole log by.
+    pub output: String,
+}
+
+/// The tests to run: one case, its suite, a package of suites, or all of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestsRequest {
+    pub module: Option<String>,
+    /// The package or folder of the suites.
+    pub package: Option<String>,
+    /// A suite: a class or a file of tests, in the terms of the project.
+    pub suite: Option<String>,
+    /// One test of the suite.
+    pub case: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestOutcome {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+impl TestOutcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// One test as the run left it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestCase {
+    pub suite: String,
+    pub case: Option<String>,
+    pub outcome: TestOutcome,
+    pub message: Option<String>,
+    /// The first lines of the stack of a failure.
+    pub trace: Vec<String>,
+    pub duration_ms: u64,
+}
+
+/// The end of a test run: the counts, the cases and the id of its output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestsOutcome {
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub cases: Vec<TestCase>,
+    pub duration_ms: u64,
+    /// The id `run_output` reads the whole log by.
+    pub output: String,
+}
+
+/// One configuration the user can start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunConfiguration {
+    pub name: String,
+    /// What kind of run it is: a program, a task, several configurations at once.
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartRunRequest {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunId {
+    pub id: String,
+}
+
+/// How many of the last lines of a run an answer carries.
+pub const OUTPUT_TAIL: usize = 200;
+
+/// The state of a run and the tail of what it printed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOutput {
+    pub id: String,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub lines: Vec<String>,
+}
+
+/// What the run window of a project offers: the build tool, the tests and the stored
+/// configurations. A window registers one when its Run panel opens; the gateway asks
+/// before it reaches it, so the panel never blocks on a call that waits for a user.
+pub trait ProjectRunner: Send + Sync {
+    fn build(
+        &self,
+        scope: &SessionScope,
+        request: &BuildRequest,
+    ) -> Result<BuildOutcome, ToolError>;
+
+    fn test(&self, scope: &SessionScope, request: &TestsRequest)
+    -> Result<TestsOutcome, ToolError>;
+
+    /// The configurations the user can start.
+    fn configurations(&self, scope: &SessionScope) -> Result<Vec<RunConfiguration>, ToolError>;
+
+    fn start(
+        &self,
+        scope: &SessionScope,
+        request: &StartRunRequest,
+        client: Option<&str>,
+    ) -> Result<String, ToolError>;
+
+    fn output(&self, scope: &SessionScope, id: &str) -> Result<RunOutput, ToolError>;
+
+    fn stop(&self, scope: &SessionScope, id: &str) -> Result<(), ToolError>;
+}
 
 impl ToolBackend for Unavailable {
     fn editor_context(&self, _: &SessionScope) -> Result<EditorContext, ToolError> {

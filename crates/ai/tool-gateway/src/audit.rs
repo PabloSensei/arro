@@ -16,6 +16,9 @@ const RECENT: usize = 256;
 pub struct AuditEntry {
     pub time_ms: u64,
     pub session: String,
+    /// The name an MCP client gave itself in `initialize`; `None` for a session the IDE
+    /// started itself.
+    pub client: Option<String>,
     pub tool: String,
     pub class: &'static str,
     pub decision: &'static str,
@@ -52,6 +55,7 @@ impl AuditLog {
     pub(crate) fn record(
         &self,
         session: &str,
+        client: Option<&str>,
         tool: &str,
         class: &'static str,
         decision: &'static str,
@@ -61,6 +65,7 @@ impl AuditLog {
         let entry = AuditEntry {
             time_ms: since_epoch.map_or(0, |time| time.as_millis() as u64),
             session: session.to_string(),
+            client: client.map(str::to_string),
             tool: tool.to_string(),
             class,
             decision,

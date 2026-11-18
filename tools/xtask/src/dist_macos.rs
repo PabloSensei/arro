@@ -49,6 +49,13 @@ pub fn run(root: &Path, out: &Path, tools: Option<&Path>, zip: bool, dmg: bool) 
     fs::copy(&binary, &program)?;
     make_executable(&program)?;
     println!("{}", program.display());
+    // The shim of MCP for the agents outside the window: Contents/Resources/arro-mcp,
+    // the folder `resources_dir` names for a program of a bundle.
+    let shim = dist::mcp_binary(&root)?;
+    let copied = resources.join(dist::mcp_file_name());
+    fs::copy(&shim, &copied)?;
+    make_executable(&copied)?;
+    println!("{}", copied.display());
 
     let version = env!("CARGO_PKG_VERSION");
     let commit = git(&root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());

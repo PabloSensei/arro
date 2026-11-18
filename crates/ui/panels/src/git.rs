@@ -13,7 +13,7 @@ use ui_kit::*;
 use vcs::{
     BlameLine, Change, CommitOptions, CommitRequest, ConflictSide, FileStatus, GitRunner, Hunk,
     LineChangeKind, Operation, RebasePlan, RebaseReport, RefKind, Repository, ResetMode,
-    RootsUpdate, Stash, Status, UpdateMode, UpdateReport,
+    RootsUpdate, Stash, Status, UpdateMode, UpdateReport, command_id,
 };
 use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
@@ -62,6 +62,9 @@ pub const RESTORE_BRANCH_COMMAND: &str = "git.restore_deleted_branch";
 /// The command of the button a rebase stopped for an edit shows: it continues the rebase
 /// with the message git wrote.
 pub const CONTINUE_REBASE_COMMAND: &str = "git.rebase_continue";
+
+/// The command of the Show in Console button of a notification about a failed command.
+pub const SHOW_CONSOLE_COMMAND: &str = "git.show_console";
 
 /// The command of the gutter menu that puts the blame of a file before its text, and the
 /// one that takes the column away.
@@ -140,6 +143,9 @@ pub struct GitState {
     busy: Option<&'static str>,
     /// The last failure of an action, for the commit window and scripts.
     last_error: Option<String>,
+    /// The command of the Console the last failure was, so the Show in Console button of
+    /// its notification opens that command.
+    last_failure: Option<u64>,
     /// A merge or a rebase git waits to end.
     operation: Operation,
     /// Git holds local changes and puts them back when the operation ends.
@@ -212,6 +218,7 @@ impl GitState {
             refreshing: false,
             busy: None,
             last_error: None,
+            last_failure: None,
             operation: Operation::None,
             autostash: false,
             merge_message: String::new(),
@@ -358,6 +365,11 @@ impl GitState {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// The command of the Console the last failure was, for Show in Console.
+    pub fn last_failure(&self) -> Option<u64> {
+        self.last_failure
     }
 
     pub fn operation(&self) -> Operation {
@@ -760,10 +772,53 @@ impl GitState {
 
     pub fn report(&mut self, title: &str, message: String, cx: &mut Context<Self>) {
         self.last_error = Some(message.clone());
+        self.last_failure = None;
         let title = title.to_string();
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.notify_user(title, message, cx)
+            })
+            .ok();
+    }
+
+    /// A git command that failed: the notification opens the Console on it.
+    fn report_command(
+        &mut self,
+        title: &str,
+        message: String,
+        command: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_error = Some(message.clone());
+        self.last_failure = command;
+        let title = title.to_string();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user_with_command(
+                    title,
+                    message,
+                    "Show in Console",
+                    SHOW_CONSOLE_COMMAND,
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    /// What a git command left that the user has to look at, such as the conflicts of a
+    /// Pull: the notification opens the Console on the command.
+    fn tell_command(&mut self, title: &str, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.last_failure = None;
+        let (title, text) = (title.to_string(), text.into());
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user_with_command(
+                    title,
+                    text,
+                    "Show in Console",
+                    SHOW_CONSOLE_COMMAND,
+                    cx,
+                )
             })
             .ok();
     }
@@ -790,16 +845,16 @@ impl GitState {
         self.busy = Some(what);
         self.last_error = None;
         cx.notify();
-        let job = cx
-            .background_executor()
-            .spawn(async move { work(&repo).map_err(|error| error.to_string()) });
+        let job = cx.background_executor().spawn(async move {
+            work(&repo).map_err(|error| (error.to_string(), command_id(&error)))
+        });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| {
                 this.busy = None;
                 match result {
                     Ok(value) => done(this, value, cx),
-                    Err(message) => this.report(what, message, cx),
+                    Err((message, command)) => this.report_command(what, message, command, cx),
                 }
                 this.revision = this.revision.wrapping_add(1);
                 this.refresh(cx);
@@ -903,7 +958,9 @@ impl GitState {
                             );
                         }
                     }
-                    Err(error) => this.report("Commit", error.to_string(), cx),
+                    Err(error) => {
+                        this.report_command("Commit", error.to_string(), command_id(&error), cx)
+                    }
                 }
                 this.revision = this.revision.wrapping_add(1);
                 this.refresh(cx);
@@ -1192,15 +1249,25 @@ impl GitState {
         self.merge_message = report.merge_message;
         self.reload_everything_from_disk(cx);
         if !update.errors.is_empty() {
-            self.report("Update", update.errors.join("\n"), cx);
+            self.report_command(
+                "Update",
+                update.errors.join("\n"),
+                update.failed_command,
+                cx,
+            );
         } else if let Some(stash) = &report.stash {
             self.report("Update", stash_left_message(stash), cx);
         } else if !report.conflicts.is_empty() {
-            self.tell(
-                "Update",
-                format!("{} file(s) in conflict", report.conflicts.len()),
-                cx,
-            );
+            // The Conflicts window below shows the same files, so a notification over it
+            // would only cover it. Without a window to open, the notification is the
+            // only telling.
+            if self.window.is_none() {
+                self.tell_command(
+                    "Update",
+                    format!("{} file(s) in conflict", report.conflicts.len()),
+                    cx,
+                );
+            }
         } else if report.operation == Operation::None {
             self.tell("Update", "The project is up to date", cx);
         }
@@ -1617,11 +1684,15 @@ impl GitState {
         if let Some(stash) = &report.stash {
             self.report(what, stash_left_message(stash), cx);
         } else if !report.conflicts.is_empty() {
-            self.tell(
-                what,
-                format!("{} file(s) in conflict", report.conflicts.len()),
-                cx,
-            );
+            // The Conflicts window shows the same files; without a window to open, the
+            // notification is the only telling.
+            if self.window.is_none() {
+                self.tell(
+                    what,
+                    format!("{} file(s) in conflict", report.conflicts.len()),
+                    cx,
+                );
+            }
         } else if report.operation == Operation::None {
             self.tell(what, done, cx);
         }
@@ -1654,11 +1725,15 @@ impl GitState {
         if let Some(stash) = &report.stash {
             self.report("Rebase", stash_left_message(stash), cx);
         } else if !report.conflicts.is_empty() {
-            self.tell(
-                "Rebase",
-                format!("{} file(s) in conflict", report.conflicts.len()),
-                cx,
-            );
+            // The Conflicts window shows the same files; without a window to open, the
+            // notification is the only telling.
+            if self.window.is_none() {
+                self.tell(
+                    "Rebase",
+                    format!("{} file(s) in conflict", report.conflicts.len()),
+                    cx,
+                );
+            }
         } else if let Some(id) = stopped {
             let text = format!("Rebase stopped at {} for editing", short_commit(&id));
             self.workspace
@@ -1691,24 +1766,21 @@ impl GitState {
         };
         let job_name = name.clone();
         let job = cx.background_executor().spawn(async move {
-            let head = repo
-                .branch_head(&job_name)
-                .map_err(|error| error.to_string())?;
-            let merged = repo
-                .is_branch_merged(&job_name)
-                .map_err(|error| error.to_string())?;
+            let head = repo.branch_head(&job_name)?;
+            let merged = repo.is_branch_merged(&job_name)?;
             if merged {
-                repo.delete_branch(&job_name)
-                    .map_err(|error| error.to_string())?;
+                repo.delete_branch(&job_name)?;
             }
-            Ok((head, merged))
+            Ok::<_, std::io::Error>((head, merged))
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| match result {
                 Ok((head, true)) => this.finish_delete(name, head, cx),
                 Ok((_, false)) => this.ask_force_delete(name, cx),
-                Err(message) => this.report("Delete Branch", message, cx),
+                Err(error) => {
+                    this.report_command("Delete Branch", error.to_string(), command_id(&error), cx)
+                }
             })
             .ok();
         })

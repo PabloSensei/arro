@@ -1099,7 +1099,7 @@ pub(crate) fn project_mask(files: &[std::path::PathBuf], cx: &App) -> String {
 
 /// Whether a file passes the mask: positive patterns keep a file, `!` patterns drop it.
 /// The name is the file name; a pattern with a slash matches the whole path.
-fn accepts_mask(mask: &str, path: &std::path::Path) -> bool {
+pub(crate) fn accepts_mask(mask: &str, path: &std::path::Path) -> bool {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

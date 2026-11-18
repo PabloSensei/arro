@@ -127,6 +127,10 @@ pub fn run(
     let copied = out.join(EXE);
     fs::copy(&exe, &copied)?;
     println!("{}", copied.display());
+    let shim = mcp_binary(&root)?;
+    let copied = out.join(mcp_file_name());
+    fs::copy(&shim, &copied)?;
+    println!("{}", copied.display());
 
     let conpty = conpty::install(&root, &out)?;
 
@@ -207,6 +211,7 @@ pub(crate) fn absolute(path: &Path) -> Result<PathBuf> {
 fn remove_old(out: &Path) -> Result {
     for name in [
         EXE,
+        "arro-mcp.exe",
         "README.txt",
         "run-arro.cmd",
         "THIRD-PARTY.txt",
@@ -510,10 +515,43 @@ fn is_license_file(name: &str) -> bool {
 
 pub(crate) fn build_release(root: &Path) -> Result {
     let mut command = Command::new(cargo());
+    // The stdio shim goes with the program, as `arro-mcp`: it is the way an agent
+    // outside the window reaches the tools of the project.
     command
-        .args(["build", "--release", "--package", "ide"])
+        .args([
+            "build",
+            "--release",
+            "--package",
+            "ide",
+            "--package",
+            "ide-mcp",
+        ])
         .current_dir(root);
     check(&mut command)
+}
+
+/// The name of the shim in a release: the crate builds `ide-mcp`, a release calls it
+/// `arro-mcp`.
+pub(crate) fn mcp_file_name() -> &'static str {
+    if cfg!(windows) {
+        "arro-mcp.exe"
+    } else {
+        "arro-mcp"
+    }
+}
+
+/// The built shim that a release copies under [`mcp_file_name`].
+pub(crate) fn mcp_binary(root: &Path) -> Result<PathBuf> {
+    let name = if cfg!(windows) {
+        "ide-mcp.exe"
+    } else {
+        "ide-mcp"
+    };
+    let path = target_directory(root)?.join("release").join(name);
+    if !path.is_file() {
+        return Err(format!("{} was not built", path.display()).into());
+    }
+    Ok(path)
 }
 
 pub(crate) fn target_directory(root: &Path) -> Result<PathBuf> {

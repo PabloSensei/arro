@@ -1,10 +1,15 @@
 //! Answers carry their context: an agent that gets locations alone has to read every file again.
 
 use std::fmt::Write;
+use std::path::Path;
 
 use crate::backend::{
-    DebugStateQuery, DiagnosticsPage, DiagnosticsQuery, EditorContext, SymbolHit, SymbolInfo,
-    SymbolPage, SymbolQuery,
+    BuildOutcome, BuildProblem, BuildRequest, CallHierarchy, CallHierarchyQuery, DebugStateQuery,
+    DiagnosticsPage, DiagnosticsQuery, EditorContext, FileActionOutcome, FileText, HierarchyNode,
+    ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol, RunConfiguration,
+    RunOutput, SearchPage, SearchQuery, SymbolHit, SymbolInfo, SymbolPage, SymbolQuery,
+    TestOutcome, TestsOutcome, TestsRequest, TypeHierarchy, TypeHierarchyQuery, UsagePage,
+    UsagesQuery, VcsChanges, VcsQuery,
 };
 
 const CONTEXT_LINES: usize = 2;
@@ -133,6 +138,324 @@ pub(crate) fn diagnostics(query: &DiagnosticsQuery, page: &DiagnosticsPage) -> S
     }
     if let Some(next) = next {
         let _ = write!(text, "\ntruncated, pass after=\"{next}\" for more\n");
+    }
+    text
+}
+
+pub(crate) fn usages(query: &UsagesQuery, page: &UsagePage) -> String {
+    let UsagePage {
+        items,
+        total,
+        clipped,
+        source,
+        confidence,
+    } = page;
+    let what = match query.name.as_deref() {
+        Some(name) => name.to_string(),
+        None => match query.position() {
+            Some((path, line, column)) => format!("{}:{line}:{column}", path.display()),
+            None => "the symbol".to_string(),
+        },
+    };
+    let mut text = format!("{total} usages of {what}\n");
+    let _ = writeln!(text, "source: {source}, confidence: {}", confidence.name());
+    for item in items {
+        let path = item.path.display();
+        let _ = writeln!(
+            text,
+            "{path}:{}:{}: {}",
+            item.line, item.column, item.content
+        );
+    }
+    if *clipped {
+        let shown = items.len();
+        let _ = write!(
+            text,
+            "\nclipped: showing {shown} of {total}, raise the limit for more\n"
+        );
+    }
+    text
+}
+
+fn hierarchy_node(text: &mut String, node: &HierarchyNode) {
+    let indent = "  ".repeat(node.depth as usize);
+    let detail = node
+        .detail
+        .as_deref()
+        .map(|detail| format!(" ({detail})"))
+        .unwrap_or_default();
+    match &node.location {
+        Some(found) => {
+            let path = found.path.display();
+            let _ = writeln!(
+                text,
+                "{indent}{}{detail} at {path}:{}:{}",
+                node.name, found.line, found.content
+            );
+        }
+        None => {
+            let _ = writeln!(text, "{indent}{}{detail}", node.name);
+        }
+    }
+}
+
+pub(crate) fn type_hierarchy(query: &TypeHierarchyQuery, hierarchy: &TypeHierarchy) -> String {
+    let TypeHierarchy {
+        supertypes,
+        subtypes,
+        source,
+        confidence,
+        clipped,
+    } = hierarchy;
+    let path = query.path.display();
+    let mut text = format!("type hierarchy at {path}:{}:{}\n", query.line, query.column);
+    let _ = writeln!(text, "source: {source}, confidence: {}", confidence.name());
+    if supertypes.is_empty() {
+        text.push_str("supertypes: none\n");
+    } else {
+        let _ = writeln!(text, "supertypes ({}):", supertypes.len());
+        for node in supertypes {
+            hierarchy_node(&mut text, node);
+        }
+    }
+    if subtypes.is_empty() {
+        text.push_str("subtypes: none\n");
+    } else {
+        let _ = writeln!(text, "subtypes ({}):", subtypes.len());
+        for node in subtypes {
+            hierarchy_node(&mut text, node);
+        }
+    }
+    if *clipped {
+        text.push_str("clipped: not every type is shown\n");
+    }
+    text
+}
+
+pub(crate) fn call_hierarchy(query: &CallHierarchyQuery, hierarchy: &CallHierarchy) -> String {
+    let CallHierarchy {
+        callers,
+        source,
+        confidence,
+        clipped,
+    } = hierarchy;
+    let path = query.path.display();
+    let mut text = format!(
+        "call hierarchy at {path}:{}:{}, {} levels\n",
+        query.line, query.column, query.depth
+    );
+    let _ = writeln!(text, "source: {source}, confidence: {}", confidence.name());
+    if callers.is_empty() {
+        text.push_str("callers: none\n");
+    } else {
+        let _ = writeln!(text, "callers ({}):", callers.len());
+        for node in callers {
+            hierarchy_node(&mut text, node);
+        }
+    }
+    if *clipped {
+        text.push_str("clipped: not every caller is shown\n");
+    }
+    text
+}
+
+pub(crate) fn project_structure(
+    _query: &ProjectStructureQuery,
+    structure: &ProjectStructure,
+) -> String {
+    let ProjectStructure {
+        modules,
+        total_modules,
+        clipped,
+        build_system,
+        build_system_version,
+        resolved,
+        runtime,
+        language_level,
+        problems,
+    } = structure;
+    let tool = match build_system_version {
+        Some(version) => format!("{build_system} {version}"),
+        None => build_system.clone(),
+    };
+    let resolved = if *resolved {
+        "resolved"
+    } else {
+        "scanned only"
+    };
+    let mut text = format!("project: {tool}, {resolved}, {total_modules} modules\n");
+    let mut environment = Vec::new();
+    if let Some(runtime) = runtime {
+        environment.push(format!("runtime: {runtime}"));
+    }
+    if let Some(level) = language_level {
+        environment.push(format!("language level: {level}"));
+    }
+    if !environment.is_empty() {
+        let _ = writeln!(text, "{}", environment.join(", "));
+    }
+    if !problems.is_empty() {
+        let _ = writeln!(text, "problems ({}):", problems.len());
+        for problem in problems {
+            let _ = writeln!(text, "  {problem}");
+        }
+    }
+    let _ = writeln!(text, "modules ({}):", modules.len());
+    for module in modules {
+        let path = module.path.display();
+        let _ = writeln!(text, "  {} at {path}", module.name);
+        if !module.source_roots.is_empty() {
+            let roots: Vec<String> = module
+                .source_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect();
+            let _ = writeln!(text, "    sources: {}", roots.join(", "));
+        }
+        if !module.test_roots.is_empty() {
+            let roots: Vec<String> = module
+                .test_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect();
+            let _ = writeln!(text, "    tests: {}", roots.join(", "));
+        }
+        if !module.dependencies.is_empty() {
+            let more = if module.dependencies_clipped {
+                ", more"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                text,
+                "    dependencies: {}{more}",
+                module.dependencies.join(", ")
+            );
+        }
+    }
+    if *clipped {
+        let shown = modules.len();
+        let _ = write!(
+            text,
+            "\nclipped: showing {shown} of {total_modules} modules\n"
+        );
+    }
+    text
+}
+
+pub(crate) fn search(query: &SearchQuery, page: &SearchPage) -> String {
+    let SearchPage {
+        items,
+        total,
+        clipped,
+        files,
+    } = page;
+    let pattern = &query.pattern;
+    let how = if query.regex { "regex" } else { "text" };
+    let mut text = if *total == 0 {
+        format!("no matches for {how} \"{pattern}\"\n")
+    } else {
+        format!("{total} matches in {files} files for {how} \"{pattern}\"\n")
+    };
+    for item in items {
+        let path = item.path.display();
+        let _ = writeln!(
+            text,
+            "{path}:{}:{}: {}",
+            item.line, item.column, item.content
+        );
+    }
+    if *clipped {
+        let shown = items.len();
+        let _ = write!(
+            text,
+            "\nclipped: showing {shown} of {total}, raise the limit or narrow the mask\n"
+        );
+    }
+    text
+}
+
+pub(crate) fn file_text(file: &FileText) -> String {
+    let path = file.path.display();
+    if file.total_lines == 0 {
+        let mut text = format!("{path}, empty file");
+        if file.dirty {
+            text.push_str(", unsaved changes");
+        }
+        text.push('\n');
+        return text;
+    }
+    let mut text = format!(
+        "{path}, lines {}-{} of {}",
+        file.start_line, file.end_line, file.total_lines
+    );
+    if file.dirty {
+        text.push_str(", unsaved changes");
+    }
+    if file.clipped {
+        text.push_str(", clipped");
+    }
+    text.push('\n');
+    for (index, line) in file.text.split('\n').enumerate() {
+        let number = file.start_line as usize + index;
+        let _ = writeln!(text, "{number}|{line}");
+    }
+    text
+}
+
+pub(crate) fn vcs_changes(_query: &VcsQuery, changes: &VcsChanges) -> String {
+    let VcsChanges {
+        files,
+        total,
+        clipped,
+        branch,
+        diff,
+    } = changes;
+    let branch = branch
+        .as_deref()
+        .map(|branch| format!("branch {branch}, "))
+        .unwrap_or_default();
+    let word = if *total == 1 { "file" } else { "files" };
+    let mut text = format!("git: {branch}{total} changed {word}\n");
+    for file in files {
+        let original = file
+            .original
+            .as_deref()
+            .map(|original| format!(" (from {original})"))
+            .unwrap_or_default();
+        let _ = writeln!(text, "{}: {}{original}", file.status, file.path);
+    }
+    if *clipped {
+        let shown = files.len();
+        let _ = write!(
+            text,
+            "\nclipped: showing {shown} of {total}, raise the limit for more\n"
+        );
+    }
+    if let Some(diff) = diff {
+        let _ = write!(text, "\ndiff {}:\n", diff.path);
+        if diff.hunks.is_empty() {
+            text.push_str("no changes against HEAD\n");
+        }
+        for hunk in &diff.hunks {
+            let _ = writeln!(
+                text,
+                "@@ -{},{} +{},{} @@",
+                hunk.before.0,
+                hunk.before.1.saturating_sub(hunk.before.0),
+                hunk.after.0,
+                hunk.after.1.saturating_sub(hunk.after.0)
+            );
+            for line in &hunk.removed {
+                let _ = writeln!(text, "-{line}");
+            }
+            for line in &hunk.added {
+                let _ = writeln!(text, "+{line}");
+            }
+        }
+        if diff.clipped {
+            text.push_str("clipped: not every change is shown\n");
+        }
     }
     text
 }
@@ -292,12 +615,264 @@ pub(crate) fn debug_state(
     text
 }
 
+/// What the user decided about a proposed edit, with the text the file has after it.
+pub(crate) fn proposed_edit(edit: &ProposedEdit) -> String {
+    let path = edit.path.display();
+    let mut text = match edit.outcome {
+        crate::backend::EditOutcome::NoDecision => {
+            format!("{path}: no decision, the file is unchanged\n")
+        }
+        crate::backend::EditOutcome::Rejected => {
+            format!("{path}: rejected, the file is unchanged\n")
+        }
+        outcome => {
+            let word = if edit.hunks == 1 { "hunk" } else { "hunks" };
+            format!(
+                "{path}: {}, {} of {} {word} kept\n",
+                outcome.name(),
+                edit.kept,
+                edit.hunks
+            )
+        }
+    };
+    if let Some(body) = &edit.text {
+        text.push_str("text:\n");
+        text.push_str(body);
+        if !body.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// The files a rename changed, with the number of edits.
+pub(crate) fn renamed_symbol(rename: &RenamedSymbol) -> String {
+    if rename.files.is_empty() {
+        return "rename: no changes\n".to_string();
+    }
+    let files = if rename.files.len() == 1 {
+        "file".to_string()
+    } else {
+        format!("{} files", rename.files.len())
+    };
+    let edits = if rename.edits == 1 {
+        "1 change".to_string()
+    } else {
+        format!("{} changes", rename.edits)
+    };
+    let mut text = format!("rename: {edits} in {files}\n");
+    for file in &rename.files {
+        let _ = writeln!(text, "  {}", file.display());
+    }
+    text
+}
+
+/// Whether an action of the IDE changed a file.
+pub(crate) fn file_action(outcome: &FileActionOutcome) -> String {
+    let path = outcome.path.display();
+    if outcome.changed {
+        let edits = if outcome.edits == 1 {
+            "1 change".to_string()
+        } else {
+            format!("{} changes", outcome.edits)
+        };
+        format!("{path}: changed, {edits}\n")
+    } else {
+        format!("{path}: unchanged\n")
+    }
+}
+
+/// A build tool writes its errors as `path:line: message` or `path:[line,column] message`.
+/// This reads those lines without knowing which tool wrote them; a line without a place
+/// in the sources stays out of the list.
+pub fn build_problems(lines: &[String], root: &Path) -> Vec<BuildProblem> {
+    let mut problems: Vec<BuildProblem> = Vec::new();
+    for line in lines {
+        let text = line.trim().strip_prefix("[ERROR]").unwrap_or(line.trim());
+        let Some((path, number, message)) = split_problem(text.trim()) else {
+            continue;
+        };
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let message = message.trim().to_string();
+        if message.is_empty()
+            || problems
+                .iter()
+                .any(|known| known.path == path && known.line == number && known.message == message)
+        {
+            continue;
+        }
+        problems.push(BuildProblem {
+            path,
+            line: number,
+            message,
+        });
+        if problems.len() >= 50 {
+            break;
+        }
+    }
+    problems
+}
+
+fn split_problem(text: &str) -> Option<(&str, u32, &str)> {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b':' {
+            continue;
+        }
+        let path = text[..index].trim();
+        if !(path.contains('/') || path.contains('\\')) || path.ends_with(']') {
+            continue;
+        }
+        let mut at = index + 1;
+        if bytes.get(at) == Some(&b'[') {
+            at += 1;
+        }
+        let start = at;
+        while bytes.get(at).is_some_and(|byte| byte.is_ascii_digit()) {
+            at += 1;
+        }
+        if at == start {
+            continue;
+        }
+        let number: u32 = text[start..at].parse().ok()?;
+        let mut rest = &text[at..];
+        if rest.starts_with(',') {
+            // The `[line,column]` form of a build tool.
+            let close = rest.find(']')?;
+            rest = &rest[close + 1..];
+        }
+        let message = rest.trim_start_matches([':', ' ', ']']).trim();
+        if message.is_empty() {
+            continue;
+        }
+        return Some((path, number, message));
+    }
+    None
+}
+
+fn duration_text(milliseconds: u64) -> String {
+    if milliseconds >= 1000 {
+        format!("{:.1} s", milliseconds as f64 / 1000.)
+    } else {
+        format!("{milliseconds} ms")
+    }
+}
+
+pub(crate) fn build(request: &BuildRequest, outcome: &BuildOutcome) -> String {
+    let scope = match &request.module {
+        Some(module) => format!("module {module}"),
+        None => "the project".to_string(),
+    };
+    let verdict = if outcome.success {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let took = duration_text(outcome.duration_ms);
+    let mut text = format!("build of {scope} {verdict} in {took}\n");
+    let _ = writeln!(text, "output: {}", outcome.output);
+    if outcome.problems.is_empty() {
+        return text;
+    }
+    let count = outcome.problems.len();
+    let _ = writeln!(text, "{count} compile errors:");
+    for problem in &outcome.problems {
+        let path = problem.path.display();
+        let _ = writeln!(text, "{path}:{}: {}", problem.line, problem.message);
+    }
+    text
+}
+
+pub(crate) fn tests(request: &TestsRequest, outcome: &TestsOutcome) -> String {
+    let scope = match (&request.suite, &request.case, &request.package) {
+        (Some(suite), Some(case), _) => format!("{suite}.{case}"),
+        (Some(suite), None, _) => suite.clone(),
+        (None, _, Some(package)) => package.clone(),
+        _ => "all tests".to_string(),
+    };
+    let took = duration_text(outcome.duration_ms);
+    let mut text = format!(
+        "tests of {scope}: {} passed, {} failed, {} skipped in {took}\n",
+        outcome.passed, outcome.failed, outcome.skipped
+    );
+    let _ = writeln!(text, "output: {}", outcome.output);
+    let failed: Vec<&crate::backend::TestCase> = outcome
+        .cases
+        .iter()
+        .filter(|case| case.outcome == TestOutcome::Failed)
+        .collect();
+    if !failed.is_empty() {
+        text.push_str("failed:\n");
+    }
+    for case in failed {
+        let name = match &case.case {
+            Some(name) if !case.suite.is_empty() => format!("{}.{name}", case.suite),
+            Some(name) => name.clone(),
+            None => case.suite.clone(),
+        };
+        let _ = writeln!(text, "{name}");
+        if let Some(message) = &case.message {
+            let _ = writeln!(text, "  {message}");
+        }
+        for line in case.trace.iter().take(3) {
+            let _ = writeln!(text, "  {line}");
+        }
+    }
+    text
+}
+
+pub(crate) fn run_configurations(configurations: &[RunConfiguration]) -> String {
+    if configurations.is_empty() {
+        return "no run configurations\n".to_string();
+    }
+    let count = configurations.len();
+    let mut text = format!("{count} run configurations:\n");
+    for configuration in configurations {
+        let _ = writeln!(text, "{} ({})", configuration.name, configuration.kind);
+    }
+    text
+}
+
+pub(crate) fn run_started(name: &str, id: &str) -> String {
+    format!("started {name}: {id}\n")
+}
+
+pub(crate) fn run_output(output: &RunOutput) -> String {
+    let state = if output.running {
+        "running".to_string()
+    } else {
+        match output.exit_code {
+            Some(code) => format!("finished, exit code {code}"),
+            None => "stopped".to_string(),
+        }
+    };
+    let mut text = format!("{}: {state}\n", output.id);
+    if output.lines.is_empty() {
+        text.push_str("no output\n");
+        return text;
+    }
+    let _ = writeln!(text, "last {} lines:", output.lines.len());
+    for line in &output.lines {
+        let _ = writeln!(text, "{line}");
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::backend::{Confidence, Diagnostic, Location, Severity};
+    use crate::backend::{
+        CallHierarchy, CallHierarchyQuery, Confidence, Diagnostic, FileText, HierarchyNode,
+        Location, ProjectModule, ProjectStructure, ProjectStructureQuery, SearchHit, SearchPage,
+        SearchQuery, Severity, TestCase, TypeHierarchy, TypeHierarchyQuery, Usage, UsagePage,
+        UsagesQuery, VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
+    };
 
     use super::*;
-
     fn query() -> SymbolQuery {
         SymbolQuery {
             query: "Foo".to_string(),
@@ -414,5 +989,339 @@ mod tests {
         let text = editor_context(&EditorContext::default());
 
         assert!(text.starts_with("active: none\n"));
+    }
+
+    #[test]
+    fn usages_count_every_place_and_say_what_was_cut() {
+        let query = UsagesQuery {
+            path: Some("src/Foo.txt".into()),
+            line: Some(1),
+            column: Some(1),
+            name: None,
+            limit: 1,
+        };
+        let page = UsagePage {
+            items: vec![Usage {
+                path: "src/Bar.txt".into(),
+                line: 3,
+                column: 5,
+                content: "foo();".to_string(),
+            }],
+            total: 7,
+            clipped: true,
+            source: "lsp".to_string(),
+            confidence: Confidence::Certain,
+        };
+
+        let text = usages(&query, &page);
+
+        assert!(text.starts_with("7 usages of src/Foo.txt:1:1\n"), "{text}");
+        assert!(text.contains("src/Bar.txt:3:5: foo();\n"), "{text}");
+        assert!(text.contains("showing 1 of 7"), "{text}");
+    }
+
+    #[test]
+    fn hierarchies_indent_their_levels_and_name_the_place() {
+        let query = TypeHierarchyQuery {
+            path: "src/Foo.txt".into(),
+            line: 4,
+            column: 7,
+        };
+        let hierarchy = TypeHierarchy {
+            supertypes: vec![HierarchyNode {
+                name: "Base".to_string(),
+                detail: None,
+                location: Some(Location {
+                    path: "src/Base.txt".into(),
+                    line: 1,
+                    content: "class Base {}".to_string(),
+                }),
+                depth: 1,
+            }],
+            subtypes: Vec::new(),
+            source: "lsp".to_string(),
+            confidence: Confidence::Likely,
+            clipped: false,
+        };
+
+        let text = type_hierarchy(&query, &hierarchy);
+
+        assert!(
+            text.starts_with("type hierarchy at src/Foo.txt:4:7\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("supertypes (1):\n  Base at src/Base.txt:1:class Base {}"),
+            "{text}"
+        );
+        assert!(text.ends_with("subtypes: none\n"), "{text}");
+
+        let calls = CallHierarchy {
+            callers: vec![HierarchyNode {
+                name: "main".to_string(),
+                detail: Some("void main()".to_string()),
+                location: None,
+                depth: 1,
+            }],
+            source: "lsp".to_string(),
+            confidence: Confidence::Certain,
+            clipped: true,
+        };
+        let query = CallHierarchyQuery {
+            path: "src/Foo.txt".into(),
+            line: 4,
+            column: 7,
+            depth: 1,
+        };
+        let text = call_hierarchy(&query, &calls);
+        assert!(
+            text.contains("callers (1):\n  main (void main())\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("clipped: not every caller is shown"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_project_structure_nests_roots_under_their_module() {
+        let query = ProjectStructureQuery { limit: 1 };
+        let structure = ProjectStructure {
+            modules: vec![ProjectModule {
+                name: "app".to_string(),
+                path: ".".into(),
+                source_roots: vec!["src/main".into()],
+                test_roots: vec!["src/test".into()],
+                dependencies: vec!["group:lib:1".to_string()],
+                dependencies_clipped: false,
+            }],
+            total_modules: 2,
+            clipped: true,
+            build_system: "Tool".to_string(),
+            build_system_version: Some("1.0".to_string()),
+            resolved: true,
+            runtime: Some("21".to_string()),
+            language_level: Some("21".to_string()),
+            problems: Vec::new(),
+        };
+
+        let text = project_structure(&query, &structure);
+
+        assert!(
+            text.starts_with("project: Tool 1.0, resolved, 2 modules\n"),
+            "{text}"
+        );
+        assert!(text.contains("runtime: 21, language level: 21\n"), "{text}");
+        assert!(
+            text.contains("  app at .\n    sources: src/main\n    tests: src/test\n"),
+            "{text}"
+        );
+        assert!(text.contains("dependencies: group:lib:1\n"), "{text}");
+        assert!(text.contains("showing 1 of 2 modules"), "{text}");
+    }
+
+    #[test]
+    fn a_text_search_shows_a_line_for_each_match() {
+        let query = SearchQuery {
+            pattern: "foo".to_string(),
+            regex: false,
+            mask: None,
+            limit: 1,
+        };
+        let page = SearchPage {
+            items: vec![SearchHit {
+                path: "src/Foo.txt".into(),
+                line: 2,
+                column: 4,
+                content: "  foo();".to_string(),
+            }],
+            total: 3,
+            clipped: true,
+            files: 2,
+        };
+
+        let text = search(&query, &page);
+
+        assert!(
+            text.starts_with("3 matches in 2 files for text \"foo\"\n"),
+            "{text}"
+        );
+        assert!(text.contains("src/Foo.txt:2:4:   foo();\n"), "{text}");
+        assert!(text.contains("showing 1 of 3"), "{text}");
+    }
+
+    #[test]
+    fn a_file_keeps_the_numbers_of_its_lines() {
+        let file = FileText {
+            path: "src/Foo.txt".into(),
+            text: "one\ntwo".to_string(),
+            start_line: 5,
+            end_line: 6,
+            total_lines: 9,
+            dirty: true,
+            clipped: false,
+        };
+
+        let text = file_text(&file);
+
+        assert_eq!(
+            text,
+            "src/Foo.txt, lines 5-6 of 9, unsaved changes\n5|one\n6|two\n"
+        );
+    }
+
+    #[test]
+    fn build_errors_come_from_the_lines_of_the_tool() {
+        let lines = vec![
+            "[INFO] Building demo".to_string(),
+            "[ERROR] C:\\work\\demo\\src\\Main.txt:[12,5] cannot find symbol".to_string(),
+            "[ERROR] src\\other\\Moved.txt:3: error: package does not exist".to_string(),
+            "[ERROR] C:\\work\\demo\\src\\Main.txt:[12,5] cannot find symbol".to_string(),
+        ];
+
+        let problems = build_problems(&lines, std::path::Path::new("C:\\work\\demo"));
+
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(problems[0].line, 12);
+        assert_eq!(problems[0].message, "cannot find symbol");
+        assert_eq!(problems[1].line, 3);
+        assert_eq!(problems[1].message, "error: package does not exist");
+        assert_eq!(
+            problems[1].path,
+            std::path::Path::new("C:\\work\\demo").join("src\\other\\Moved.txt")
+        );
+    }
+
+    #[test]
+    fn a_diff_names_the_file_and_each_range() {
+        let query = VcsQuery {
+            path: Some("src/Foo.txt".into()),
+            limit: 10,
+        };
+        let changes = VcsChanges {
+            files: vec![VcsFile {
+                path: "src/Foo.txt".to_string(),
+                status: "modified".to_string(),
+                original: None,
+            }],
+            total: 1,
+            clipped: false,
+            branch: Some("main".to_string()),
+            diff: Some(VcsDiff {
+                path: "src/Foo.txt".to_string(),
+                hunks: vec![VcsHunk {
+                    before: (2, 3),
+                    after: (2, 4),
+                    removed: vec!["old".to_string()],
+                    added: vec!["new".to_string()],
+                }],
+                clipped: false,
+            }),
+        };
+
+        let text = vcs_changes(&query, &changes);
+
+        assert!(
+            text.starts_with("git: branch main, 1 changed file\n"),
+            "{text}"
+        );
+        assert!(text.contains("modified: src/Foo.txt\n"), "{text}");
+        assert!(text.contains("@@ -2,1 +2,2 @@\n-old\n+new\n"), "{text}");
+    }
+
+    #[test]
+    fn a_build_answer_names_the_verdict_the_errors_and_the_time() {
+        let request = BuildRequest::default();
+        let outcome = BuildOutcome {
+            success: false,
+            problems: vec![BuildProblem {
+                path: "src/Foo.txt".into(),
+                line: 4,
+                message: "cannot find symbol".to_string(),
+            }],
+            duration_ms: 1250,
+            output: "tool-1".to_string(),
+        };
+
+        let text = build(&request, &outcome);
+
+        assert!(
+            text.starts_with("build of the project failed in 1.2 s\n"),
+            "{text}"
+        );
+        assert!(text.contains("output: tool-1"), "{text}");
+        assert!(text.contains("1 compile errors:"), "{text}");
+        assert!(text.contains("src/Foo.txt:4: cannot find symbol"), "{text}");
+    }
+
+    #[test]
+    fn a_test_answer_counts_and_names_every_failure() {
+        let request = TestsRequest {
+            suite: Some("demo.Vitest".to_string()),
+            ..TestsRequest::default()
+        };
+        let outcome = TestsOutcome {
+            passed: 1,
+            failed: 1,
+            skipped: 0,
+            cases: vec![
+                TestCase {
+                    suite: "demo.Vitest".to_string(),
+                    case: Some("passes".to_string()),
+                    outcome: TestOutcome::Passed,
+                    message: None,
+                    trace: Vec::new(),
+                    duration_ms: 2,
+                },
+                TestCase {
+                    suite: "demo.Vitest".to_string(),
+                    case: Some("fails".to_string()),
+                    outcome: TestOutcome::Failed,
+                    message: Some("expected 1, got 2".to_string()),
+                    trace: vec!["at demo.Vitest.fails(Vitest.code:2)".to_string()],
+                    duration_ms: 3,
+                },
+            ],
+            duration_ms: 900,
+            output: "tool-2".to_string(),
+        };
+
+        let text = tests(&request, &outcome);
+
+        assert!(
+            text.starts_with("tests of demo.Vitest: 1 passed, 1 failed, 0 skipped in 900 ms\n"),
+            "{text}"
+        );
+        assert!(text.contains("demo.Vitest.fails\n"), "{text}");
+        assert!(text.contains("  expected 1, got 2\n"), "{text}");
+        assert!(text.contains("at demo.Vitest.fails"), "{text}");
+        assert!(!text.contains("passes"), "a passed case stays out: {text}");
+    }
+
+    #[test]
+    fn a_run_answer_has_its_state_its_code_and_the_tail() {
+        let output = RunOutput {
+            id: "run-3".to_string(),
+            running: false,
+            exit_code: Some(0),
+            lines: vec!["hello from run".to_string()],
+        };
+
+        let text = run_output(&output);
+
+        assert!(text.starts_with("run-3: finished, exit code 0\n"), "{text}");
+        assert!(text.contains("\nhello from run\n"), "{text}");
+
+        let empty = run_output(&RunOutput {
+            id: "run-4".to_string(),
+            running: true,
+            exit_code: None,
+            lines: Vec::new(),
+        });
+        assert!(
+            empty.contains("running") && empty.contains("no output"),
+            "{empty}"
+        );
     }
 }

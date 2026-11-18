@@ -37,6 +37,7 @@ struct FakeLanguage {
     open: bool,
     confidence: Confidence,
     asked: Mutex<Vec<DocumentSpot>>,
+    references: Mutex<Vec<SourceSpan>>,
 }
 
 impl FakeLanguage {
@@ -46,11 +47,16 @@ impl FakeLanguage {
             open,
             confidence,
             asked: Mutex::new(Vec::new()),
+            references: Mutex::new(Vec::new()),
         })
     }
 
     fn answer<T>(&self, value: T) -> Answer<T> {
         Answer::new(value, self.confidence, SOURCE)
+    }
+
+    fn set_references(&self, spans: Vec<SourceSpan>) {
+        *self.references.lock().unwrap() = spans;
     }
 }
 
@@ -117,6 +123,13 @@ impl Provider<DiagnosticsQuery, Vec<DiagnosticEntry>> for FakeLanguage {
     }
 }
 
+impl Provider<DocumentSpot, Vec<SourceSpan>> for FakeLanguage {
+    fn start(&self, _: DocumentSpot, _: base::Cancel, mut reply: Reply<Vec<SourceSpan>>) {
+        let spans = self.references.lock().unwrap().clone();
+        let _ = reply.send(self.answer(spans));
+    }
+}
+
 impl LanguageSupport for FakeLanguage {
     fn id(&self) -> LanguageId {
         LanguageId("fake")
@@ -146,6 +159,10 @@ impl LanguageSupport for FakeLanguage {
     fn diagnostics(&self) -> Option<&lang_api::DiagnosticsProvider> {
         Some(self)
     }
+
+    fn references(&self) -> Option<&lang_api::ReferencesProvider> {
+        Some(self)
+    }
 }
 
 struct Fixture {
@@ -161,6 +178,7 @@ impl Fixture {
             "void greet(String name) {}\n  😀greet();\n",
         )
         .unwrap();
+        std::fs::write(project.join("Other.fake"), "greet();\n").unwrap();
         let tools = LanguageTools::with_wait(Duration::from_secs(2));
         if let Some(language) = language {
             tools.register(language);
@@ -247,6 +265,48 @@ fn an_unknown_answer_is_not_an_empty_one() {
     assert!(
         error.to_string().contains("does not mean there is nothing"),
         "{error}"
+    );
+}
+
+#[test]
+fn usages_include_a_place_in_another_file() {
+    let language = FakeLanguage::new(true, Confidence::Certain);
+    let fixture = Fixture::new("usages", Some(language.clone()));
+    let here = platform::CanonPath::new(fixture.scope.project.join("Hello.fake"))
+        .unwrap()
+        .to_uri();
+    let other = platform::CanonPath::new(fixture.scope.project.join("Other.fake"))
+        .unwrap()
+        .to_uri();
+    let span = |line, character| TextSpan {
+        start: TextPoint { line, character },
+        end: TextPoint { line, character },
+    };
+    language.set_references(vec![
+        SourceSpan {
+            uri: here,
+            span: span(1, 2),
+        },
+        SourceSpan {
+            uri: other,
+            span: span(0, 0),
+        },
+    ]);
+
+    let text = fixture
+        .call(
+            "find_usages",
+            json!({"path": "Hello.fake", "line": 2, "column": 3}),
+        )
+        .expect("usages");
+
+    assert!(text.starts_with("2 usages of "), "{text}");
+    assert!(text.contains("Hello.fake:2:3\n"), "{text}");
+    assert!(text.contains("Hello.fake:2:3:   😀greet();"), "{text}");
+    assert!(text.contains("Other.fake:1:1: greet();"), "{text}");
+    assert!(
+        text.contains("source: fake-server, confidence: certain"),
+        "{text}"
     );
 }
 

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rebase;
@@ -482,20 +481,7 @@ impl Repository {
         for (name, value) in env {
             command.env(name, value);
         }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
-        if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
-            stdin.write_all(input)?;
-        }
-        let output = child.wait_with_output()?;
-        if output.status.success() {
-            return Ok(output.stdout);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(io::Error::other(format!("git: {}", stderr.trim())))
+        crate::GitRunner::checked_with_input(command, input).map(|output| output.stdout)
     }
 
     /// Sends the current branch. A branch with no upstream gets one on the first remote.

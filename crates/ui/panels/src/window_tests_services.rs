@@ -7,8 +7,7 @@
 #![cfg(windows)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
 use ui_kit::gpui;
 use ui_kit::gpui::{MouseButton, TestAppContext, VisualTestContext, WindowHandle, size};
@@ -16,7 +15,10 @@ use ui_kit::{Modifiers, point, px};
 use workspace::{SERVICES_TOOL, Workspace};
 
 use crate::docker::{ActiveDocker, DockerPanel};
-use crate::window_tests::{bounds_of, click, draw, open_window, sample_project, scratch};
+use crate::window_tests::{
+    bounds_of, click, draw, open_window, sample_project, scratch, wait_for_process,
+};
+use crate::window_tests_journal::{journal_of, journal_writer};
 use crate::window_tests_ui::{ENV, wait_for};
 
 /// What the stand-in `docker` says the daemon has: two containers of the compose project
@@ -28,18 +30,18 @@ const PS_LINES: [&str; 3] = [
 ];
 
 /// A `docker.cmd` that answers the calls of the panel from the constants above and writes
-/// every call to `calls.txt` next to itself. `logs` prints the first line at once and a
-/// tick every second until it is stopped.
+/// every call to a folder of its own under `calls/` next to itself. `logs` prints the
+/// first line at once and a tick every second until it is stopped.
 ///
 /// The panel runs the CLI calls of the watch, of the actions and of a live log at the same
-/// time, so several copies of this script write the file together. Windows lets one writer
-/// open it at a time, therefore a call that meets another writer waits a moment and tries
-/// again: a lost line would hide a `stop` from the test and a lost `ps` line would drop a
-/// container out of the tree.
+/// time, so several copies of this script run together. [`journal_writer`] gives every
+/// copy a file of its own: no call loses its line, so no `stop` goes missing from the test
+/// and no `ps` line drops a container out of the tree.
 pub(crate) fn fake_docker(name: &str) -> (PathBuf, PathBuf) {
     let folder = scratch(name);
     let script = folder.join("docker.cmd");
-    let calls = folder.join("calls.txt");
+    let calls = folder.join("calls");
+    let writer = journal_writer(&calls);
     let ps: String = PS_LINES
         .iter()
         .map(|line| format!("echo {line}\r\n"))
@@ -47,16 +49,7 @@ pub(crate) fn fake_docker(name: &str) -> (PathBuf, PathBuf) {
     let text = format!(
         r#"@echo off
 setlocal EnableExtensions
-set "calls={calls}"
-set "tries="
-:record
-echo %*>>"%calls%"
-if not errorlevel 1 goto recorded
-set /a tries+=1
-if %tries% geq 200 goto recorded
-ping -n 1 -w 5 127.0.0.1 >nul
-goto record
-:recorded
+{writer}
 if "%~1"=="--context" shift
 if "%~1"=="--context" shift
 if "%~1"=="version" goto version
@@ -101,7 +94,7 @@ exit /b 2
 :end
 endlocal
 "#,
-        calls = calls.display(),
+        writer = writer,
     );
     fs::write(&script, text).unwrap();
     (script, calls)
@@ -139,19 +132,6 @@ fn open_services(
     });
     draw(cx, window);
     (window, docker, calls)
-}
-
-fn calls_of(path: &Path) -> String {
-    // The stand-in writes the file between two reads of the test: a read that meets the
-    // writer waits for it, so the calls already made are not seen as lost.
-    for _ in 0..20 {
-        match fs::read_to_string(path) {
-            Ok(text) => return text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return String::new(),
-            Err(_) => std::thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    String::new()
 }
 
 pub(crate) fn right_click(
@@ -261,7 +241,7 @@ fn selecting_another_container_stops_the_log_of_the_first(cx: &mut TestAppContex
 
 #[ui_kit::gpui::test]
 fn the_container_menu_has_the_actions_and_stop_reaches_docker(cx: &mut TestAppContext) {
-    let (window, _, calls) = open_services(cx, "services-menu");
+    let (window, docker, calls) = open_services(cx, "services-menu");
 
     right_click(cx, window, "docker-container-petclinic-web-1");
     let labels = menu_labels(cx, window);
@@ -286,22 +266,44 @@ fn the_container_menu_has_the_actions_and_stop_reaches_docker(cx: &mut TestAppCo
         .expect("the Stop row");
     let selector: &'static str = Box::leak(format!("menu-{index}").into_boxed_str());
     click(cx, window, selector);
-    wait_for(cx, "the stop call of the stand-in docker", |_| {
-        calls_of(&calls).contains("stop web0001")
+    // The panel says when the call it started has ended, and the journal is read after
+    // that, not polled while a copy of the script may write it.
+    wait_for_process(cx, |cx| {
+        docker.read_with(cx, |panel, _| {
+            !panel
+                .report()
+                .iter()
+                .any(|line| line == "docker busy stop petclinic-web-1")
+        })
     });
+    let journal = journal_of(&calls);
+    assert!(
+        journal.contains("stop web0001"),
+        "the stand-in docker recorded the stop: {journal:?}"
+    );
 
     // The menu of a compose project stops the whole project through its name.
     right_click(cx, window, "docker-group-petclinic");
     let labels = menu_labels(cx, window);
     assert_eq!(labels, vec!["Up", "Down", "Restart", "Stop"]);
     click(cx, window, "menu-3");
-    wait_for(cx, "the compose stop call", |_| {
-        calls_of(&calls).lines().any(|line| {
+    wait_for_process(cx, |cx| {
+        docker.read_with(cx, |panel, _| {
+            !panel
+                .report()
+                .iter()
+                .any(|line| line == "docker busy compose stop petclinic")
+        })
+    });
+    let journal = journal_of(&calls);
+    assert!(
+        journal.lines().any(|line| {
             line.starts_with("compose --project-name petclinic")
                 && line.contains("--project-directory")
                 && line.ends_with(" stop")
-        })
-    });
+        }),
+        "the stand-in docker recorded the compose stop: {journal:?}"
+    );
 }
 
 #[ui_kit::gpui::test]

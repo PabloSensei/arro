@@ -36,6 +36,9 @@ pub enum SettingsPage {
     Debugger,
     Kubernetes,
     Database,
+    /// The group above the MCP server page, under Tools.
+    ToolsAi,
+    Mcp,
 }
 
 /// The names the language gives its two build tools. They are no part of this crate:
@@ -63,7 +66,7 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 25] = [
+    pub const ALL: [SettingsPage; 27] = [
         SettingsPage::Appearance,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
@@ -89,6 +92,8 @@ impl SettingsPage {
         SettingsPage::Plugins,
         SettingsPage::Keymap,
         SettingsPage::Database,
+        SettingsPage::ToolsAi,
+        SettingsPage::Mcp,
     ];
 
     pub fn title(self) -> &'static str {
@@ -118,6 +123,8 @@ impl SettingsPage {
             SettingsPage::Debugger => "Debugger",
             SettingsPage::Kubernetes => "Kubernetes",
             SettingsPage::Database => "Database",
+            SettingsPage::ToolsAi => "AI",
+            SettingsPage::Mcp => "MCP Server",
         }
     }
 
@@ -139,6 +146,8 @@ impl SettingsPage {
             | SettingsPage::EditorLiveTemplates
             | SettingsPage::EditorFileTemplates => 1,
             SettingsPage::EditorPostfix => 2,
+            SettingsPage::ToolsAi => 1,
+            SettingsPage::Mcp => 2,
             _ => 0,
         }
     }
@@ -149,6 +158,7 @@ impl SettingsPage {
             SettingsPage::BuildTools => SettingsPage::BuildToolsFirst,
             SettingsPage::VersionControl => SettingsPage::Git,
             SettingsPage::Tools => SettingsPage::Terminal,
+            SettingsPage::ToolsAi => SettingsPage::Mcp,
             page => page,
         }
     }
@@ -172,6 +182,8 @@ impl SettingsPage {
             | SettingsPage::Terminal
             | SettingsPage::Kubernetes
             | SettingsPage::Database => Some(SettingsPage::Tools),
+            SettingsPage::ToolsAi => Some(SettingsPage::Tools),
+            SettingsPage::Mcp => Some(SettingsPage::ToolsAi),
             _ => None,
         }
     }
@@ -279,6 +291,14 @@ pub enum SettingField {
     BuildToolFirstHomeKind,
     /// Whether the terminals put the downloaded first build tool on their `PATH`.
     BuildToolFirstTerminalPath,
+    /// Whether the window shares its MCP server with the agents outside it.
+    McpEnabled,
+    /// The program a client outside the window starts.
+    McpBinary,
+    /// Whether a tool of the MCP server may build, test and run without a question.
+    McpExecutePermission,
+    /// Whether the terminals put the downloaded second build tool on their `PATH`.
+    BuildToolSecondTerminalPath,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -999,6 +1019,38 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::BuildToolFirstTerminalPath,
         keywords: "terminal path environment downloaded bundled build tools",
     },
+    Setting {
+        id: "build_tool_second_terminal_path",
+        title: "Add the downloaded tool to the PATH of terminals",
+        page: SettingsPage::BuildToolsSecond,
+        kind: SettingKind::Toggle,
+        field: SettingField::BuildToolSecondTerminalPath,
+        keywords: "terminal path environment downloaded bundled build tools",
+    },
+    Setting {
+        id: "mcp_enabled",
+        title: "Share the MCP server with other programs",
+        page: SettingsPage::Mcp,
+        kind: SettingKind::Toggle,
+        field: SettingField::McpEnabled,
+        keywords: "mcp server ai agents claude codex cursor integrate tools",
+    },
+    Setting {
+        id: "mcp_binary",
+        title: "Path to arro-mcp",
+        page: SettingsPage::Mcp,
+        kind: SettingKind::Text,
+        field: SettingField::McpBinary,
+        keywords: "mcp arro-mcp binary path ai agents claude codex",
+    },
+    Setting {
+        id: "mcp_execute_permission",
+        title: "Permission to build, test and run",
+        page: SettingsPage::Mcp,
+        kind: SettingKind::Choice,
+        field: SettingField::McpExecutePermission,
+        keywords: "mcp permission ask allow trusted project build test run agent",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1110,6 +1162,10 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::GitGroupByDirectory => Some(settings.git_group_by_directory),
         SettingField::BuildToolFirstOffline => Some(settings.build_tools.first.offline),
         SettingField::BuildToolFirstTerminalPath => Some(settings.build_tools.first.terminal_path),
+        SettingField::McpEnabled => Some(settings.mcp_enabled),
+        SettingField::BuildToolSecondTerminalPath => {
+            Some(settings.build_tools.second.terminal_path)
+        }
         SettingField::BuildToolFirstUpdateSnapshots => {
             Some(settings.build_tools.first.update_snapshots)
         }
@@ -1169,7 +1225,9 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::DatabasePageRows
         | SettingField::ThemeLight
         | SettingField::ThemeDark
-        | SettingField::IconSet => None,
+        | SettingField::IconSet
+        | SettingField::McpBinary
+        | SettingField::McpExecutePermission => None,
     }
 }
 
@@ -1256,6 +1314,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::BuildToolFirstTerminalPath) => {
             settings.build_tools.first.terminal_path = !settings.build_tools.first.terminal_path;
+        }
+        Some(SettingField::McpEnabled) => settings.mcp_enabled = !settings.mcp_enabled,
+        Some(SettingField::BuildToolSecondTerminalPath) => {
+            settings.build_tools.second.terminal_path = !settings.build_tools.second.terminal_path;
         }
         Some(SettingField::BuildToolSecondOffline) => {
             settings.build_tools.second.offline = !settings.build_tools.second.offline;
@@ -1344,7 +1406,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::DatabasePageRows
             | SettingField::ThemeLight
             | SettingField::ThemeDark
-            | SettingField::IconSet,
+            | SettingField::IconSet
+            | SettingField::McpBinary
+            | SettingField::McpExecutePermission,
         )
         | None => {
             return false;
@@ -1489,6 +1553,7 @@ pub fn set_text(settings: &mut Settings, id: &str, text: &str) -> bool {
         SettingField::HeapSnapshotFolder => settings.heap_snapshot_folder = text.to_owned(),
         SettingField::KubectlPath => settings.kubectl_path = text.to_owned(),
         SettingField::KubeconfigPath => settings.kubeconfig_path = text.to_owned(),
+        SettingField::McpBinary => settings.mcp_binary = text.to_owned(),
         _ => return false,
     }
     true
@@ -1521,6 +1586,7 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
         SettingField::HeapSnapshotFolder => settings.heap_snapshot_folder.clone(),
         SettingField::KubectlPath => settings.kubectl_path.clone(),
         SettingField::KubeconfigPath => settings.kubeconfig_path.clone(),
+        SettingField::McpBinary => settings.mcp_binary.clone(),
         _ => return None,
     })
 }
@@ -1575,6 +1641,7 @@ pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
         SettingField::BuildToolFirstHomeKind => {
             home_kind_label(settings.build_tools.first.home_kind).to_owned()
         }
+        SettingField::McpExecutePermission => settings.mcp_execute_permission.label().to_owned(),
         _ => return None,
     };
     Some(label)
@@ -1629,6 +1696,9 @@ pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
                 ToolHome::Custom => ToolHome::Auto,
             };
         }
+        Some(SettingField::McpExecutePermission) => {
+            settings.mcp_execute_permission = settings.mcp_execute_permission.next();
+        }
         _ => return false,
     }
     true
@@ -1639,6 +1709,43 @@ fn next_theme(name: &str) -> String {
     let names = Theme::NAMES;
     let index = names.iter().position(|known| *known == name).unwrap_or(0);
     names[(index + 1) % names.len()].to_owned()
+}
+
+/// The program that gives an agent outside the window the tools of Arro: the path of the
+/// settings, or `arro-mcp` next to the program of the window, which on macOS is the
+/// `Resources` folder of the bundle.
+pub fn mcp_binary(settings: &Settings) -> String {
+    let configured = settings.mcp_binary.trim();
+    if !configured.is_empty() {
+        return configured.to_owned();
+    }
+    let program = std::env::current_exe().unwrap_or_default();
+    let name = if cfg!(windows) {
+        "arro-mcp.exe"
+    } else {
+        "arro-mcp"
+    };
+    platform::resources_dir(&program)
+        .join(name)
+        .display()
+        .to_string()
+}
+
+/// The three ways to point an MCP client at the window, ready to paste into its own
+/// settings. Arro itself runs none of them.
+pub fn mcp_lines(settings: &Settings) -> [String; 3] {
+    let binary = mcp_binary(settings);
+    let claude = format!("claude mcp add arro -- \"{binary}\"");
+    let toml = format!("[mcp_servers.arro]\ncommand = \"{}\"", toml_string(&binary));
+    // The path goes through the JSON writer, so a backslash of Windows is escaped.
+    let path = serde_json::json!(binary).to_string();
+    let json = format!("{{\"mcpServers\": {{\"arro\": {{\"command\": {path}}}}}}}");
+    [claude, toml, json]
+}
+
+/// A basic string of TOML: backslashes and quotes carry an escape there.
+fn toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]

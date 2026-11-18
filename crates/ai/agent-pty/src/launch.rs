@@ -13,14 +13,34 @@ pub const MCP_SERVER_NAME: &str = "arro";
 /// Carries the session token into the child, so that it is never written to disk.
 pub const TOKEN_VARIABLE: &str = "IDE_MCP_TOKEN";
 
-/// Read-only tools the agent may call without a question. A test keeps it equal to the list of
-/// the gateway, which this crate does not depend on.
+/// Tools the agent may call without a question of the harness. The gateway still asks the
+/// user before a tool of the class `Execute` runs. The tools that build, test and run the
+/// project are here too: the gateway asks the user about them itself, and a harness that
+/// does not allow them would ask for the same call a second time. A test keeps the list
+/// equal to the one of the gateway, which this crate does not depend on.
 const READ_TOOLS: &[&str] = &[
     "get_editor_context",
     "find_symbol",
     "get_symbol_info",
     "get_diagnostics",
     "debug_get_state",
+    "find_usages",
+    "get_type_hierarchy",
+    "get_call_hierarchy",
+    "get_project_structure",
+    "search_text",
+    "read_file",
+    "get_vcs_changes",
+    "propose_edit",
+    "rename_symbol",
+    "organize_imports",
+    "format_file",
+    "build_project",
+    "run_tests",
+    "list_run_configurations",
+    "run_configuration",
+    "get_run_output",
+    "stop_run",
 ];
 
 /// Prefixes a harness needs from the environment of the user: keys, gateways, cloud providers.

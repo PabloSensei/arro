@@ -5,6 +5,7 @@
 mod askpass;
 mod blame;
 mod blob;
+mod console;
 mod diff;
 mod git;
 mod history;
@@ -20,11 +21,15 @@ pub mod graph;
 pub use askpass::{ASKPASS_PORT, ASKPASS_TOKEN, AskpassServer, ask};
 pub use blame::BlameLine;
 pub use blob::BlobReader;
+pub use console::{
+    COMMAND_LIMIT, CommandConsole, CommandRecord, HIDDEN, command_console, hidden_argument,
+    is_background,
+};
 pub use diff::{
     Hunk, LineChange, LineChangeKind, TextEdit, WordChanges, gutter, line_hunks, revert_hunk,
     word_changes,
 };
-pub use git::GitRunner;
+pub use git::{GitRunner, command_id};
 pub use history::LineHistory;
 pub use merge::{Segment, SegmentKind, ThreeWay, merge};
 pub use rebase::{RebaseAction, RebasePlan, RebaseReport, RebaseStep};

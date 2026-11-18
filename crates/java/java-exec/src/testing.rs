@@ -37,6 +37,7 @@ impl JavaTestProvider {
             module: request.module.clone(),
             class: request.suite.clone(),
             method: request.case.clone(),
+            package: request.package.clone(),
             cases: request.cases.clone(),
         })
     }

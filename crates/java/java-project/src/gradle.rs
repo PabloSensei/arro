@@ -1,21 +1,29 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use base::program::bat_script;
 use base::{Cancel, Result};
 use proc_sup::{ProcessClass, ProcessSpec};
 use project_model::{
     BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, Module,
-    ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TaskOptions, Unit,
-    cache_file,
+    ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TaskOptions, ToolHome,
+    ToolProgress, ToolSetup, Unit, cache_file,
 };
 use serde::Deserialize;
 
 use crate::dependencies::{ReportTrees, exclude_in_script};
 use crate::env::{fresh_directory, run_tool};
 use crate::fingerprint::{BuildStamp, has_classes};
+use crate::gradle_download;
+use crate::tool_download;
+use crate::tool_home::{self, Tool};
 use crate::{BuildEnv, Jdk, find_jdks};
+
+pub use crate::tool_home::{
+    MissingTool as MissingGradle, ToolLocation as GradleHome, ToolOrigin as GradleOrigin,
+};
 
 const INIT_SCRIPT: &str = include_str!("../../../../helpers/gradle-init/ide-model.init.gradle");
 /// The init script of a profile run: it adds the recording flag to the JVMs of the task.
@@ -29,6 +37,26 @@ const BUILD_FILES: &[&str] = &[
     "build.gradle",
     "build.gradle.kts",
 ];
+
+/// The folder of the downloaded copies under the data folder of the IDE.
+const GRADLE: &str = "gradle";
+
+#[cfg(windows)]
+const WRAPPERS: &[&str] = &["gradlew.bat", "gradlew.cmd"];
+#[cfg(not(windows))]
+const WRAPPERS: &[&str] = &["gradlew"];
+#[cfg(windows)]
+const PROGRAMS: &[&str] = &["gradle.bat", "gradle.cmd"];
+#[cfg(not(windows))]
+const PROGRAMS: &[&str] = &["gradle"];
+
+/// The names of the scripts and the folder of the downloaded copies of Gradle.
+const TOOL: Tool = Tool {
+    folder: GRADLE,
+    label: "Gradle",
+    wrappers: WRAPPERS,
+    programs: PROGRAMS,
+};
 
 /// Never a scan: it would publish the build to a public server. And no configuration cache:
 /// the init script reads the model at execution time.
@@ -80,17 +108,36 @@ pub fn wrapper_version(root: &Path) -> Option<(u32, u32)> {
         .lines()
         .find_map(|line| line.strip_prefix("distributionUrl="))?;
     let name = url.rsplit('/').next()?;
-    let version = name.strip_prefix("gradle-")?;
+    version_in_name(name)
+}
+
+/// The version a distribution name carries: `gradle-9.5.1-bin.zip` gives `(9, 5)`.
+fn version_in_name(name: &str) -> Option<(u32, u32)> {
+    let version = name.strip_prefix("gradle-").unwrap_or(name);
     let mut parts = version.split(['.', '-']);
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
     Some((major, minor))
 }
 
+/// The version of a Gradle the search found, when its name or the wrapper says it. The
+/// copy on `PATH` may be anything, so it is not guessed.
+fn version_of(gradle: &GradleHome, root: &Path) -> Option<(u32, u32)> {
+    match gradle.origin {
+        GradleOrigin::Wrapper => wrapper_version(root),
+        GradleOrigin::Configured | GradleOrigin::Bundled => {
+            version_in_name(gradle.home.file_name()?.to_str()?)
+        }
+        GradleOrigin::Path => None,
+    }
+}
+
 pub struct Gradle {
     pub(crate) env: BuildEnv,
     /// The inputs of a build that started and has not reported success yet.
     stamp: BuildStamp,
+    /// The home the user chose in this session, which wins over the settings file.
+    chosen: Mutex<Option<PathBuf>>,
 }
 
 impl Gradle {
@@ -98,6 +145,7 @@ impl Gradle {
         Self {
             env,
             stamp: BuildStamp::new(),
+            chosen: Mutex::new(None),
         }
     }
 
@@ -106,27 +154,58 @@ impl Gradle {
         cache_file(&self.env.cache_root(), root).with_file_name("build-stamp")
     }
 
+    /// The home of the Gradle of this project, in the order the settings name.
+    pub fn resolve(&self, root: &Path) -> std::result::Result<GradleHome, MissingGradle> {
+        let settings = &self.env.build_tools.second;
+        let chosen = self
+            .chosen
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let (kind, configured) = match &chosen {
+            Some(home) => (ToolHome::Custom, Some(home.as_path())),
+            None => (settings.home_kind, settings.home_path().map(Path::new)),
+        };
+        tool_home::find(
+            &TOOL,
+            root,
+            configured,
+            &self.env.data_dir(),
+            env::var_os("PATH").as_deref(),
+            kind,
+        )
+    }
+
     /// The JDK the Gradle server runs on. The project JDK when Gradle starts on it, else
     /// the closest one it does start on: compiling for the project stays the job of
     /// toolchains in the build script.
-    fn tool_jdk(&self, root: &Path) -> Result<Jdk> {
+    ///
+    /// A copy the IDE downloaded is not replaced behind the back of the user: when the
+    /// project JDK does not run it, the failure says so and the window offers the choice.
+    fn tool_jdk(&self, root: &Path, gradle: &GradleHome) -> Result<Jdk> {
         let project = self.env.project_jdk(root)?;
-        let Some(version) = wrapper_version(root) else {
+        let Some(version) = version_of(gradle, root) else {
             return Ok(project);
         };
         if gradle_supports(version, project.feature) {
             return Ok(project);
         }
-        let usable = find_jdks()
-            .into_iter()
-            .filter(|jdk| gradle_supports(version, jdk.feature));
-        let nearest = usable.min_by_key(|jdk| jdk.feature.abs_diff(project.feature));
-        nearest.ok_or_else(|| {
-            let (major, minor) = version;
-            let jdk = project.feature;
-            format!("Gradle {major}.{minor} does not run on JDK {jdk}, and no other JDK found")
-                .into()
-        })
+        if gradle.origin != GradleOrigin::Bundled {
+            let usable = find_jdks()
+                .into_iter()
+                .filter(|jdk| gradle_supports(version, jdk.feature));
+            let nearest = usable.min_by_key(|jdk| jdk.feature.abs_diff(project.feature));
+            if let Some(nearest) = nearest {
+                return Ok(nearest);
+            }
+        }
+        let (major, minor) = version;
+        let jdk = project.feature;
+        Err(format!(
+            "Gradle {major}.{minor} does not run on JDK {jdk}; choose a Gradle distribution \
+             that does, or another JVM for Gradle"
+        )
+        .into())
     }
 
     /// The real client and not the wrapper script: the script would be the process to
@@ -134,38 +213,36 @@ impl Gradle {
     /// server outlives the client.
     pub(crate) fn command(&self, root: &Path) -> Result<ProcessSpec> {
         let settings = &self.env.build_tools.second;
+        let gradle = self.resolve(root)?;
         let jdk = match settings.runtime_home_path() {
             Some(home) => Jdk::at(Path::new(home)).ok_or_else(|| {
                 format!("no JDK of the settings at {home}, so the build tool cannot start")
             })?,
-            None => self.tool_jdk(root)?,
+            None => self.tool_jdk(root, &gradle)?,
         };
-        let wrapper = root.join(WRAPPER_JAR);
         let timeout = daemon_idle_timeout(root);
-        let spec = if let Some(home) = settings.home_path() {
-            let program = Path::new(home).join("bin").join(bat_script("gradle"));
-            if !program.is_file() {
-                return Err(format!("no {} in {}", bat_script("gradle"), program.display()).into());
+        let spec = match gradle.origin {
+            GradleOrigin::Wrapper => {
+                let wrapper = root.join(WRAPPER_JAR);
+                if !wrapper.is_file() {
+                    return Err(format!(
+                        "no {} next to {}, so the wrapper cannot start",
+                        WRAPPER_JAR,
+                        gradle.program.display()
+                    )
+                    .into());
+                }
+                ProcessSpec::new(jdk.java())
+                    .args(CLIENT_JVM_ARGS)
+                    .args(timeout)
+                    .arg("-classpath")
+                    .arg(&wrapper)
+                    .arg("org.gradle.wrapper.GradleWrapperMain")
             }
-            let spec = ProcessSpec::new(program);
-            match timeout {
-                Some(timeout) => spec.arg(timeout),
-                None => spec,
-            }
-        } else if wrapper.is_file() {
-            ProcessSpec::new(jdk.java())
-                .args(CLIENT_JVM_ARGS)
-                .args(timeout)
-                .arg("-classpath")
-                .arg(&wrapper)
-                .arg("org.gradle.wrapper.GradleWrapperMain")
-        } else {
-            let spec =
-                ProcessSpec::new(find_in_path().ok_or("no Gradle wrapper and no gradle in PATH")?);
-            match timeout {
-                Some(timeout) => spec.arg(timeout),
-                None => spec,
-            }
+            _ => match timeout {
+                Some(timeout) => ProcessSpec::new(&gradle.program).arg(timeout),
+                None => ProcessSpec::new(&gradle.program),
+            },
         };
         let mut spec = spec
             .cwd(root)
@@ -182,17 +259,28 @@ impl Gradle {
     }
 }
 
-fn find_in_path() -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    let name = bat_script("gradle");
-    env::split_paths(&path)
-        .map(|directory| directory.join(&name))
-        .find(|file| file.is_file())
-}
-
 /// The Gradle of this machine, `None` when only a wrapper can start it.
 pub fn find_gradle() -> Option<PathBuf> {
-    find_in_path()
+    tool_home::on_path(env::var_os("PATH").as_deref(), &TOOL).map(|found| found.program)
+}
+
+/// The order of the automatic search: the wrapper of the project, the home of the
+/// settings, the copy the IDE downloaded, and then `PATH`. The other kinds name one
+/// source only. `path` is the search path; `None` means the machine has no `PATH`.
+pub fn find_gradle_home(
+    root: &Path,
+    configured: Option<&Path>,
+    data_dir: &Path,
+    path: Option<&OsStr>,
+    kind: ToolHome,
+) -> std::result::Result<GradleHome, MissingGradle> {
+    tool_home::find(&TOOL, root, configured, data_dir, path, kind)
+}
+
+/// The newest copy of Gradle the IDE downloaded, `<data>/tools/gradle/<version>`, when it
+/// carries the program.
+pub fn bundled_home(data_dir: &Path) -> Option<PathBuf> {
+    tool_download::newest_home(data_dir, GRADLE, PROGRAMS)
 }
 
 impl BuildSystem for Gradle {
@@ -226,6 +314,77 @@ impl BuildSystem for Gradle {
             files.push(fs::read(entry?.path())?);
         }
         parse_reports(&files, root)
+    }
+
+    fn missing_tool(&self, root: &Path) -> Option<ToolSetup> {
+        match self.resolve(root) {
+            Ok(gradle) => {
+                // The tool is there, so the failure may be the JVM that runs it.
+                let jdk = self.env.project_jdk(root).ok()?;
+                let version = version_of(&gradle, root)?;
+                if gradle_supports(version, jdk.feature) {
+                    return None;
+                }
+                let (major, minor) = version;
+                Some(ToolSetup {
+                    name: "Gradle".into(),
+                    title: "Gradle does not run on this JDK".into(),
+                    text: format!(
+                        "Gradle {major}.{minor} does not run on JDK {}. Choose a Gradle \
+                         distribution for this JDK: another version is not downloaded \
+                         automatically.",
+                        jdk.feature
+                    ),
+                    download: (gradle.origin != GradleOrigin::Bundled)
+                        .then(|| "Download Gradle".to_owned()),
+                    choose: Some("Choose Gradle home\u{2026}".into()),
+                    settings: Some((
+                        "Build Tools \u{2192} Gradle".into(),
+                        "build_tool_second_home",
+                    )),
+                })
+            }
+            Err(missing) => Some(ToolSetup {
+                name: "Gradle".into(),
+                title: "Gradle not found".into(),
+                text: format!(
+                    "{missing}. Download Gradle from services.gradle.org or choose a Gradle \
+                     home folder."
+                ),
+                download: Some("Download Gradle".into()),
+                choose: Some("Choose Gradle home\u{2026}".into()),
+                settings: Some((
+                    "Build Tools \u{2192} Gradle".into(),
+                    "build_tool_second_home",
+                )),
+            }),
+        }
+    }
+
+    fn install_tool(&self, progress: &ToolProgress, cancel: &Cancel) -> Result<Option<PathBuf>> {
+        let home = gradle_download::download(
+            gradle_download::REPOSITORY,
+            &self.env.data_dir(),
+            None,
+            progress,
+            cancel,
+        )?;
+        Ok(Some(home))
+    }
+
+    fn use_home(&self, home: &Path) {
+        *self
+            .chosen
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(home.to_path_buf());
+    }
+
+    fn tool_bin(&self) -> Option<PathBuf> {
+        bundled_home(&self.env.data_dir()).map(|home| home.join("bin"))
+    }
+
+    fn terminal_path(&self) -> bool {
+        self.env.build_tools.second.terminal_path
     }
 
     fn assemble(&self, root: &Path) -> Result<ProcessSpec> {
@@ -813,6 +972,173 @@ mod tests {
         fs::write(root.join(WRAPPER_PROPERTIES), text).unwrap();
 
         assert_eq!(wrapper_version(&root), Some((9, 5)));
+    }
+
+    fn program() -> &'static str {
+        if cfg!(windows) {
+            "gradle.bat"
+        } else {
+            "gradle"
+        }
+    }
+
+    fn wrapper() -> &'static str {
+        if cfg!(windows) {
+            "gradlew.bat"
+        } else {
+            "gradlew"
+        }
+    }
+
+    fn write_program(home: &Path) {
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join(program()), b"@echo off\n").unwrap();
+    }
+
+    /// A program on `PATH`: a folder whose own file the search finds.
+    fn write_program_file(directory: &Path) {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join(program()), b"@echo off\n").unwrap();
+    }
+
+    fn search_path(directory: &Path) -> std::ffi::OsString {
+        env::join_paths([directory]).unwrap()
+    }
+
+    #[test]
+    fn the_wrapper_of_the_project_comes_before_every_other_home() {
+        let root = test_support::TempDir::new("gradle-order-wrapper");
+        let data = test_support::TempDir::new("gradle-order-data");
+        let path = test_support::TempDir::new("gradle-order-path");
+        fs::write(root.path().join(wrapper()), b"@echo off\n").unwrap();
+        let configured = root.path().join("configured");
+        write_program(&configured);
+        write_program(&data.path().join("tools/gradle/9.1.0"));
+        write_program_file(path.path());
+
+        let found = find_gradle_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search_path(path.path())),
+            ToolHome::Auto,
+        )
+        .expect("a wrapper is there");
+
+        assert_eq!(found.origin, GradleOrigin::Wrapper);
+        assert_eq!(found.program, root.path().join(wrapper()));
+    }
+
+    #[test]
+    fn the_configured_home_comes_next_then_the_downloaded_copy_then_path() {
+        let root = test_support::TempDir::new("gradle-order-configured");
+        let data = test_support::TempDir::new("gradle-order-bundled");
+        let path = test_support::TempDir::new("gradle-order-path-only");
+        let configured = root.path().join("configured");
+        let bundled = data.path().join("tools/gradle/9.1.0");
+        write_program(&configured);
+        write_program(&bundled);
+        write_program_file(path.path());
+        let search = search_path(path.path());
+
+        let found = find_gradle_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Auto,
+        )
+        .unwrap();
+        assert_eq!(found.origin, GradleOrigin::Configured);
+        assert_eq!(found.home, configured);
+
+        fs::remove_dir_all(&configured).unwrap();
+        let found = find_gradle_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Auto,
+        )
+        .unwrap();
+        assert_eq!(found.origin, GradleOrigin::Bundled);
+        assert_eq!(found.home, bundled, "the downloaded copy comes next");
+
+        fs::remove_dir_all(data.path().join("tools")).unwrap();
+        let found = find_gradle_home(
+            root.path(),
+            Some(&configured),
+            data.path(),
+            Some(&search),
+            ToolHome::Auto,
+        )
+        .unwrap();
+        assert_eq!(found.origin, GradleOrigin::Path);
+        assert_eq!(found.program, path.path().join(program()));
+    }
+
+    #[test]
+    fn a_missing_gradle_offers_a_download_and_the_second_settings_page() {
+        let root = test_support::TempDir::new("gradle-missing");
+        let data = test_support::TempDir::new("gradle-missing-data");
+        let mut env = BuildEnv {
+            data_dir: Some(data.path().to_path_buf()),
+            ..BuildEnv::default()
+        };
+        env.build_tools.second.home_kind = ToolHome::Custom;
+        let tool = Gradle::new(env);
+
+        let setup = tool
+            .missing_tool(root.path())
+            .expect("no home is chosen, so Gradle is missing");
+
+        assert_eq!(setup.name, "Gradle");
+        assert_eq!(setup.title, "Gradle not found");
+        assert_eq!(setup.download.as_deref(), Some("Download Gradle"));
+        assert_eq!(setup.choose.as_deref(), Some("Choose Gradle home\u{2026}"));
+        assert_eq!(
+            setup.settings.as_ref().map(|(_, id)| *id),
+            Some("build_tool_second_home")
+        );
+        assert!(
+            setup.text.contains("no Gradle home is chosen"),
+            "{}",
+            setup.text
+        );
+    }
+
+    #[test]
+    fn a_downloaded_gradle_that_does_not_run_on_the_project_jdk_is_named() {
+        let root = test_support::TempDir::new("gradle-jdk-project");
+        let data = test_support::TempDir::new("gradle-jdk-data");
+        write_program(&data.path().join("tools/gradle/9.0.0"));
+        let env = BuildEnv {
+            data_dir: Some(data.path().to_path_buf()),
+            jdk: Some(Jdk {
+                home: root.path().join("jdk"),
+                version: "25.0.3".to_owned(),
+                feature: 25,
+            }),
+            ..BuildEnv::default()
+        };
+        let tool = Gradle::new(env);
+
+        let setup = tool
+            .missing_tool(root.path())
+            .expect("the downloaded Gradle does not start on JDK 25");
+
+        assert_eq!(setup.title, "Gradle does not run on this JDK");
+        assert!(setup.text.contains("Gradle 9.0"), "{}", setup.text);
+        assert!(setup.text.contains("JDK 25"), "{}", setup.text);
+        assert!(
+            setup.download.is_none(),
+            "another version is not downloaded silently"
+        );
+        assert_eq!(
+            setup.settings.as_ref().map(|(_, id)| *id),
+            Some("build_tool_second_home")
+        );
     }
 
     fn tree_project(name: &str) -> PathBuf {

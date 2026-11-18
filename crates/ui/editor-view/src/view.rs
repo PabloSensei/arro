@@ -181,6 +181,8 @@ actions!(
         /// The editor takes the group keys of the window while it has the focus.
         MoveElementLeft,
         MoveElementRight,
+        /// Ctrl+F2 in a file whose format runs something: stop what it started.
+        StopRunning,
     ]
 );
 
@@ -190,6 +192,13 @@ struct Keys(Rc<Keymap>);
 /// the user changes what the editor runs at once.
 pub fn install_keymap(cx: &mut App, keymap: Rc<Keymap>) {
     cx.set_global(Keys(keymap));
+    // A file whose format runs something keeps Ctrl+F2 for stopping it: the deeper
+    // context wins over the Stop of the window, which belongs to the debugger.
+    cx.bind_keys([KeyBinding::new(
+        "ctrl-f2",
+        StopRunning,
+        Some("RunnableFile"),
+    )]);
 }
 
 /// The syntax colours of `text` as the editor of `path` would paint them, for a view
@@ -645,6 +654,8 @@ pub enum EditorEvent {
     /// Ctrl+Enter in a file whose format runs something, such as a request file: the
     /// line of the caret, from zero.
     RunRequest(u32),
+    /// Ctrl+F2 in a file whose format runs something: stop what it started.
+    StopRequest,
     /// Alt+click on a run mark: run the same test under the debugger.
     DebugRunMark(u32),
     /// The gutter was clicked away from the fold column: the line, from zero, and
@@ -2494,6 +2505,21 @@ impl EditorView {
         Some((primary.range(), primary.head))
     }
 
+    /// The primary selection as zero-based lines and UTF-16 characters, the units the
+    /// language protocols count in.
+    pub fn selection_points(&self) -> Option<((u32, u32), (u32, u32))> {
+        let state = self.state.as_ref()?;
+        let range = state.selections().primary().range();
+        let store = state.store();
+        let point = |offset: usize| {
+            let line = store.offset_to_line(offset);
+            let line_start = store.line_to_offset(line);
+            let character = store.offset_to_utf16(offset) - store.offset_to_utf16(line_start);
+            (line as u32, character as u32)
+        };
+        Some((point(range.start), point(range.end)))
+    }
+
     /// Replaces a byte range of the text as one edit of the user, so undo takes it back.
     pub fn replace_text(
         &mut self,
@@ -3981,6 +4007,9 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
+        // Ctrl+F2 stops what such a format runs, as it stops a program elsewhere.
+        // The action of the runnable context does that, before this handler sees a key
+        // the window has bound.
         let lookup = self
             .current_keymap(cx)
             .lookup(std::slice::from_ref(&stroke), &[actions::CONTEXT]);
@@ -6331,9 +6360,11 @@ impl Render for EditorView {
             self.context_info = None;
         }
         let popups = self.popups(window, cx);
+        let runs = self.runs_on_enter(cx);
         let root = div()
             .id("editor-view")
             .key_context("Editor")
+            .when(runs, |root| root.key_context("RunnableFile"))
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(self.style.background)
@@ -6347,6 +6378,10 @@ impl Render for EditorView {
                 if !this.move_element_action(true, cx) {
                     cx.propagate();
                 }
+            }))
+            .on_action(cx.listener(|_, _: &StopRunning, _, cx| {
+                cx.emit(EditorEvent::StopRequest);
+                cx.stop_propagation();
             }))
             .on_key_down(cx.listener(Self::on_key));
         match &self.failed {

@@ -1,5 +1,15 @@
 //! The parts of a URL the platform layer reads: the path of a `file://` URL.
 
+/// The part of a `file:` URI after the scheme and a `localhost` authority, still
+/// percent-encoded. `None` for any other scheme.
+pub(crate) fn file_rest(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("file://")?;
+    match rest.strip_prefix("localhost") {
+        Some(local) if local.is_empty() || local.starts_with('/') => Some(local),
+        _ => Some(rest),
+    }
+}
+
 /// The bytes a `%XX` sequence stands for. `None` when a percent is not followed by two
 /// hexadecimal digits.
 pub(crate) fn percent_decode(text: &str) -> Option<Vec<u8>> {
