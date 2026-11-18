@@ -285,6 +285,41 @@ pub(crate) fn run(workspace: &mut Workspace, window: &mut Window, cx: &mut Conte
         None
     };
     let text = view.read(cx).text().unwrap_or_default();
+    if crate::database_console::is_sql_file(&path) {
+        let case = match settings.sql_keyword_case {
+            workspace::SqlKeywordCase::Upper => database::KeywordCase::Upper,
+            workspace::SqlKeywordCase::Lower => database::KeywordCase::Lower,
+            workspace::SqlKeywordCase::Keep => database::KeywordCase::Keep,
+        };
+        let indent = if settings.use_tabs {
+            "\t".to_owned()
+        } else {
+            " ".repeat(settings.indent_size as usize)
+        };
+        // A selection of a SQL script is always what the reformat changes.
+        let selection = view
+            .read(cx)
+            .selection()
+            .map(|(range, _)| range)
+            .filter(|range| !range.is_empty());
+        let Some(edit) = crate::database_console::format_edit(&text, selection, case, &indent)
+        else {
+            workspace.notify_user("Reformat", "Nothing to reformat", cx);
+            return;
+        };
+        let Ok(uri) = CanonPath::new(&path) else {
+            return;
+        };
+        let change = WorkspaceChange {
+            edits: vec![SourceEdit {
+                uri: uri.to_uri(),
+                edits: vec![edit],
+            }],
+            renames: Vec::new(),
+        };
+        crate::changes::apply(workspace, change, window, cx);
+        return;
+    }
     if settings.reformat_only_changed {
         only_changed(workspace, view, path, text, optimize, window, cx);
         return;

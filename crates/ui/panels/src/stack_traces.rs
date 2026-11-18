@@ -37,6 +37,8 @@ pub struct StackTracePanel {
     line_scroll: ScrollHandle,
     /// Grows with every request, so the answer of an older one is dropped.
     generation: u64,
+    /// A remark of the language under the lines: the frames it could not place, for one.
+    note: Option<String>,
 }
 
 /// The panel of the window, for the commands that fill it.
@@ -58,6 +60,7 @@ impl StackTracePanel {
             thread_scroll: ScrollHandle::new(),
             line_scroll: ScrollHandle::new(),
             generation: 0,
+            note: None,
         })
     }
 
@@ -87,6 +90,7 @@ impl StackTracePanel {
         cx.spawn(async move |this, cx| {
             let mut first = true;
             while let Some(answer) = replies.next().await {
+                let note = answer.note.clone();
                 let current = this
                     .update(cx, |this, cx| {
                         if this.generation != generation {
@@ -98,6 +102,7 @@ impl StackTracePanel {
                         } else {
                             this.refine(answer.value, cx);
                         }
+                        this.set_note(note, cx);
                         true
                     })
                     .unwrap_or(false);
@@ -109,12 +114,23 @@ impl StackTracePanel {
         .detach();
     }
 
+    /// A remark of the language under the lines, in words for the user. `None` takes the
+    /// remark away.
+    pub fn set_note(&mut self, note: Option<String>, cx: &mut Context<Self>) {
+        if self.note == note {
+            return;
+        }
+        self.note = note;
+        cx.notify();
+    }
+
     /// Shows a report the caller already read, such as the dump of a running program.
     pub fn show(&mut self, report: Report, cx: &mut Context<Self>) {
         self.threads.clear();
         self.visible.clear();
         self.selected = None;
         self.filter = TextField::default();
+        self.note = None;
         if let Report::Dump { threads, .. } = &report {
             self.threads = threads.clone();
             // Blocked threads and threads of the project come first, as in IDEA.
@@ -571,6 +587,22 @@ impl Render for StackTracePanel {
                 )
             })
             .child(div().flex_1().min_h_0().child(body))
+            .when_some(self.note.clone(), |this, note| {
+                this.child(
+                    div()
+                        .id("stack-note")
+                        .debug_selector(|| "stack-note".to_owned())
+                        .flex_none()
+                        .h(px(CONTROL_HEIGHT))
+                        .px(px(ROW_MARGIN))
+                        .flex()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_color(theme.text_secondary)
+                        .child(note),
+                )
+            })
     }
 }
 
@@ -612,5 +644,10 @@ impl StackTracePanel {
 
     pub(crate) fn filter_text(&self) -> &str {
         &self.filter.text
+    }
+
+    /// The remark of the language under the lines.
+    pub(crate) fn note(&self) -> Option<&str> {
+        self.note.as_deref()
     }
 }

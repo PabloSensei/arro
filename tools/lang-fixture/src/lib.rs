@@ -22,48 +22,54 @@ pub struct MockDap {
 impl MockDap {
     /// Binds a free port and starts serving. The first connection gets the scenario.
     pub fn start() -> std::io::Result<Self> {
-        Self::start_with_threads(0, None, false, false, false, false)
+        Self::start_with_threads(0, None, false, false, false, false, false)
     }
 
     /// The same scenario with `virtual_threads` extra threads, named the way the JDK
     /// names a virtual thread. A test reads a large thread list without a real JVM.
     pub fn start_with_virtual_threads(virtual_threads: usize) -> std::io::Result<Self> {
-        Self::start_with_threads(virtual_threads, None, false, false, false, false)
+        Self::start_with_threads(virtual_threads, None, false, false, false, false, false)
     }
 
     /// The scenario with the stack frame of a real file, for the window actions that open
     /// the place of a frame.
     pub fn start_with_stack_source(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), false, false, false, false)
+        Self::start_with_threads(0, Some(source.into()), false, false, false, false, false)
     }
 
     /// The scenario of an adapter that lists the requests for method breakpoints, field
     /// watchpoints and frame restarts among its capabilities.
     pub fn start_with_breakpoint_kinds() -> std::io::Result<Self> {
-        Self::start_with_threads(0, None, true, false, false, false)
+        Self::start_with_threads(0, None, true, false, false, false, false)
     }
 
     /// The same, on a real file, for the window tests of the gutter.
     pub fn start_with_breakpoint_kinds_for(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), true, false, false, false)
+        Self::start_with_threads(0, Some(source.into()), true, false, false, false, false)
     }
 
     /// The scenario of an adapter that supports logpoints: a breakpoint with a message
     /// prints the message and does not stop the program.
     pub fn start_with_log_points(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), false, true, false, false)
+        Self::start_with_threads(0, Some(source.into()), false, true, false, false, false)
     }
 
     /// The scenario with frames of libraries between two frames of the project, for the
     /// filter of the stack.
     pub fn start_with_library_frames(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), false, false, true, false)
+        Self::start_with_threads(0, Some(source.into()), false, false, true, false, false)
     }
 
     /// The scenario of two stops with values of one type: at the second stop the handle
     /// of a value is given to another value, and the marked value has a new handle.
     pub fn start_with_identity_objects(source: impl Into<String>) -> std::io::Result<Self> {
-        Self::start_with_threads(0, Some(source.into()), false, false, false, true)
+        Self::start_with_threads(0, Some(source.into()), false, false, false, true, false)
+    }
+
+    /// The scenario whose stack moves one line down at every step, as a real debuggee
+    /// does between two statements.
+    pub fn start_with_moving_line(source: impl Into<String>) -> std::io::Result<Self> {
+        Self::start_with_threads(0, Some(source.into()), false, false, false, false, true)
     }
 
     fn start_with_threads(
@@ -73,6 +79,7 @@ impl MockDap {
         log_points: bool,
         library_frames: bool,
         identity_objects: bool,
+        moving_line: bool,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?.to_string();
@@ -84,6 +91,7 @@ impl MockDap {
             log_points,
             library_frames,
             identity_objects,
+            moving_line,
         };
         let thread = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
@@ -126,6 +134,8 @@ struct Scenario {
     log_points: bool,
     library_frames: bool,
     identity_objects: bool,
+    /// The stack moves one line down at every step.
+    moving_line: bool,
 }
 
 impl Drop for MockDap {
@@ -155,6 +165,7 @@ fn serve(
     let mut has_log_points = false;
     let mut text_value = "\"hello\"".to_owned();
     let mut identity_stop = 1;
+    let mut line: i64 = 42;
     while let Some(message) = read_message(&mut reader)? {
         if message.get("type").and_then(Value::as_str) != Some("request") {
             continue;
@@ -435,7 +446,7 @@ fn serve(
                     json!([
                         // No source and line zero on purpose.
                         {"id": 11, "name": "run", "source": {}, "line": 0, "column": 0},
-                        {"id": 12, "name": "start", "source": {"path": source}, "line": 42, "column": 1},
+                        {"id": 12, "name": "start", "source": {"path": source}, "line": if scenario.moving_line { line } else { 42 }, "column": 1},
                     ])
                 };
                 respond(
@@ -573,6 +584,9 @@ fn serve(
                 seq += 1;
                 if scenario.identity_objects && command == "next" {
                     identity_stop = 2;
+                }
+                if scenario.moving_line && command != "continue" {
+                    line += 1;
                 }
                 let exception = command == "continue"
                     && !exception_stopped

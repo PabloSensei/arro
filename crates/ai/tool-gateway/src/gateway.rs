@@ -1,23 +1,30 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::audit::AuditLog;
 use crate::backend::{
-    BuildRequest, CallHierarchyQuery, DebugStateQuery, DiagnosticsQuery, FileActionQuery, Position,
+    BreakpointId, BreakpointQuery, BuildRequest, CallHierarchyQuery, DebugEvaluateQuery,
+    DebugRunRequest, DebugStackQuery, DebugStateQuery, DebugStep, DebugStepQuery,
+    DebugVariablesQuery, DebugWaitQuery, DiagnosticsQuery, FileActionQuery, Position,
     ProjectStructureQuery, ProposeEditQuery, ReadFileQuery, RenameSymbolQuery, RunId, SearchQuery,
     SessionScope, StartRunRequest, SymbolQuery, TestsRequest, ToolBackend, ToolError,
     TypeHierarchyQuery, UsagesQuery, VcsQuery,
 };
+use crate::clients::{self, CallOutcome, ClientInfo, ClientLog};
 use crate::render;
 use crate::tools::{
-    BUILD_PROJECT, CALL_HIERARCHY, DEBUG_STATE, DIAGNOSTICS, EDITOR_CONTEXT, FIND_SYMBOL,
-    FIND_USAGES, FORMAT_FILE, GET_RUN_OUTPUT, LIST_RUN_CONFIGURATIONS, ORGANIZE_IMPORTS,
-    PROJECT_STRUCTURE, PROPOSE_EDIT, READ_FILE, RENAME_SYMBOL, RUN_CONFIGURATION, RUN_TESTS,
-    SEARCH_TEXT, STOP_RUN, SYMBOL_INFO, TOOLS, TYPE_HIERARCHY, ToolClass, ToolSpec, VCS_CHANGES,
+    BUILD_PROJECT, CALL_HIERARCHY, DEBUG_EVALUATE, DEBUG_RUN, DEBUG_STACK, DEBUG_STATE, DEBUG_STEP,
+    DEBUG_STOP, DEBUG_VARIABLES, DEBUG_WAIT, DIAGNOSTICS, EDITOR_CONTEXT, FIND_SYMBOL, FIND_USAGES,
+    FORMAT_FILE, GET_RUN_OUTPUT, LIST_BREAKPOINTS, LIST_RUN_CONFIGURATIONS, ORGANIZE_IMPORTS,
+    PROJECT_STRUCTURE, PROPOSE_EDIT, READ_FILE, REMOVE_BREAKPOINT, RENAME_SYMBOL,
+    RUN_CONFIGURATION, RUN_TESTS, SEARCH_TEXT, SET_BREAKPOINT, STOP_RUN, SYMBOL_INFO, TOOLS,
+    TYPE_HIERARCHY, ToolClass, ToolSpec, VCS_CHANGES,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +106,19 @@ fn describe(tool: &str, input: &Value) -> String {
         },
         RUN_CONFIGURATION => text("name").unwrap_or_else(|| "a configuration".to_string()),
         STOP_RUN | GET_RUN_OUTPUT => text("id").unwrap_or_default(),
+        SET_BREAKPOINT | REMOVE_BREAKPOINT => match (text("path"), input.get("line")) {
+            (Some(path), Some(line)) => format!("{path}:{line}"),
+            (Some(path), None) => path,
+            _ => tool.to_string(),
+        },
+        DEBUG_RUN => match (text("suite"), text("case"), text("configuration")) {
+            (Some(suite), Some(case), _) => format!("{suite}.{case}"),
+            (Some(suite), None, _) => suite,
+            (None, _, Some(configuration)) => configuration,
+            _ => "a debug session".to_string(),
+        },
+        DEBUG_EVALUATE => text("expression").unwrap_or_else(|| "an expression".to_string()),
+        DEBUG_STEP => text("action").unwrap_or_else(|| "a step".to_string()),
         _ => tool.to_string(),
     }
 }
@@ -119,6 +139,14 @@ struct CallHierarchyInput {
     column: u32,
     #[serde(default)]
     depth: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepInput {
+    action: String,
+    #[serde(default)]
+    seconds: Option<u64>,
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, ToolError> {
@@ -146,6 +174,22 @@ fn resolve(scope: &SessionScope, path: &Path) -> Result<PathBuf, ToolError> {
     Ok(resolved)
 }
 
+/// A call of the class `Execute` while it runs: the status bar shows that an agent works.
+struct Working<'a>(&'a AtomicUsize);
+
+impl<'a> Working<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for Working<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct ToolGateway {
     backend: Arc<dyn ToolBackend>,
     policy: Policy,
@@ -153,6 +197,10 @@ pub struct ToolGateway {
     approval: Option<Arc<dyn Approval>>,
     /// The sessions the user allowed for the rest of the life of this gateway.
     allowed_sessions: Mutex<HashSet<String>>,
+    /// The MCP clients of the project and the calls they made.
+    clients: ClientLog,
+    /// The calls of the class `Execute` that run now.
+    executing: AtomicUsize,
 }
 
 impl ToolGateway {
@@ -163,6 +211,8 @@ impl ToolGateway {
             audit,
             approval: None,
             allowed_sessions: Mutex::new(HashSet::new()),
+            clients: ClientLog::default(),
+            executing: AtomicUsize::new(0),
         }
     }
 
@@ -178,10 +228,12 @@ impl ToolGateway {
             audit,
             approval: Some(approval),
             allowed_sessions: Mutex::new(HashSet::new()),
+            clients: ClientLog::default(),
+            executing: AtomicUsize::new(0),
         }
     }
 
-    fn session_allowed(&self, session: &str) -> bool {
+    pub fn session_allowed(&self, session: &str) -> bool {
         self.allowed_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -193,6 +245,38 @@ impl ToolGateway {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(session.to_string());
+    }
+
+    /// Takes back "Allow for this session": the next `Execute` call asks again. False when
+    /// the session had no permission to revoke.
+    pub fn revoke_session(&self, session: &str) -> bool {
+        self.allowed_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session)
+    }
+
+    /// The sessions the user allowed for their lifetime, by name.
+    pub fn allowed_sessions(&self) -> Vec<String> {
+        let mut sessions: Vec<String> = self
+            .allowed_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        sessions.sort();
+        sessions
+    }
+
+    /// The MCP clients and the journal of their calls.
+    pub fn clients(&self) -> &ClientLog {
+        &self.clients
+    }
+
+    /// How many `Execute` calls run now, so the window shows that an agent is working.
+    pub fn executing(&self) -> usize {
+        self.executing.load(Ordering::SeqCst)
     }
 
     pub fn tools(&self) -> &'static [ToolSpec] {
@@ -210,7 +294,7 @@ impl ToolGateway {
         tool: &str,
         input: &Value,
     ) -> Result<String, ToolError> {
-        self.call_from(None, scope, tool, input)
+        self.call_as(None, scope, tool, input)
     }
 
     /// [`Self::call`] for a client that named itself in `initialize`; the name reaches
@@ -222,12 +306,44 @@ impl ToolGateway {
         tool: &str,
         input: &Value,
     ) -> Result<String, ToolError> {
+        let client = client.map(|name| ClientInfo {
+            name: name.to_string(),
+            version: String::new(),
+        });
+        self.call_as(client.as_ref(), scope, tool, input)
+    }
+
+    /// [`Self::call_from`] with the version the client gave itself, for the Agents tab.
+    pub fn call_as(
+        &self,
+        client: Option<&ClientInfo>,
+        scope: &SessionScope,
+        tool: &str,
+        input: &Value,
+    ) -> Result<String, ToolError> {
+        let started = Instant::now();
         let Some(spec) = TOOLS.iter().find(|spec| spec.name == tool) else {
-            self.audit
-                .record(&scope.session, client, tool, "unknown", "deny", false);
+            self.audit.record(
+                &scope.session,
+                client.map(|it| it.name.as_str()),
+                tool,
+                "unknown",
+                "deny",
+                false,
+            );
+            self.note_call(
+                client,
+                scope,
+                tool,
+                ToolClass::Read,
+                input,
+                CallOutcome::Refused,
+                started.elapsed(),
+            );
             return Err(ToolError::UnknownTool(tool.to_string()));
         };
-        let class = spec.class.name();
+        let class = spec.class;
+        let _working = (class == ToolClass::Execute).then(|| Working::new(&self.executing));
         let decision = self.policy.decide(spec);
         let mut refusal = None;
         let approved = match decision {
@@ -237,7 +353,7 @@ impl ToolGateway {
                 Some(approval) => {
                     let request = ApprovalRequest {
                         session: scope.session.clone(),
-                        client: client.map(str::to_string),
+                        client: client.map(|it| it.name.clone()),
                         tool: tool.to_string(),
                     };
                     match approval.ask_with(&request, &describe(tool, input)) {
@@ -263,19 +379,74 @@ impl ToolGateway {
             },
             Decision::Deny => false,
         };
+        let client_name = client.map(|it| it.name.as_str());
         if !approved {
             let name = decision.name();
             self.audit
-                .record(&scope.session, client, tool, class, name, false);
+                .record(&scope.session, client_name, tool, class.name(), name, false);
+            self.note_call(
+                client,
+                scope,
+                tool,
+                class,
+                input,
+                CallOutcome::Refused,
+                started.elapsed(),
+            );
             return Err(ToolError::Denied(
                 refusal.unwrap_or("needs permission").to_string(),
             ));
         }
-        let result = self.dispatch(client, scope, tool, input);
+        let result = self.dispatch(client_name, scope, tool, input);
         let name = decision.name();
-        self.audit
-            .record(&scope.session, client, tool, class, name, result.is_ok());
+        self.audit.record(
+            &scope.session,
+            client_name,
+            tool,
+            class.name(),
+            name,
+            result.is_ok(),
+        );
+        let outcome = if result.is_ok() {
+            CallOutcome::Ok
+        } else {
+            CallOutcome::Error
+        };
+        self.note_call(
+            client,
+            scope,
+            tool,
+            class,
+            input,
+            outcome,
+            started.elapsed(),
+        );
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn note_call(
+        &self,
+        client: Option<&ClientInfo>,
+        scope: &SessionScope,
+        tool: &str,
+        class: ToolClass,
+        input: &Value,
+        outcome: CallOutcome,
+        duration: Duration,
+    ) {
+        let Some(client) = client else {
+            return;
+        };
+        self.clients.record(
+            &scope.session,
+            client,
+            tool,
+            class,
+            clients::arguments(&scope.project, input),
+            outcome,
+            duration,
+        );
     }
 
     fn dispatch(
@@ -522,6 +693,126 @@ impl ToolGateway {
                 self.backend.stop_run(scope, &request.id)?;
                 Ok(format!("stopped {}\n", request.id))
             }
+            SET_BREAKPOINT => {
+                let input: BreakpointQuery = parse(input)?;
+                if input.line == 0 {
+                    return Err(ToolError::BadInput("lines start at 1".to_string()));
+                }
+                let query = BreakpointQuery {
+                    path: resolve(scope, &input.path)?,
+                    ..input
+                }
+                .clipped();
+                let info = self.backend.set_breakpoint(scope, &query)?;
+                Ok(render::breakpoint_set(&info))
+            }
+            REMOVE_BREAKPOINT => {
+                let input: BreakpointId = parse(input)?;
+                if input.line == 0 {
+                    return Err(ToolError::BadInput("lines start at 1".to_string()));
+                }
+                let id = BreakpointId {
+                    path: resolve(scope, &input.path)?,
+                    ..input
+                };
+                self.backend.remove_breakpoint(scope, &id)?;
+                Ok(render::breakpoint_removed(&id))
+            }
+            LIST_BREAKPOINTS => {
+                let breakpoints = self.backend.breakpoints(scope)?;
+                Ok(render::breakpoints(&breakpoints))
+            }
+            DEBUG_RUN => {
+                let request: DebugRunRequest = parse::<DebugRunRequest>(input)?.clipped();
+                let named = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                };
+                let request = DebugRunRequest {
+                    module: named(&request.module),
+                    suite: named(&request.suite),
+                    case: named(&request.case),
+                    configuration: named(&request.configuration),
+                    ..request
+                };
+                match (
+                    request.configuration.is_some(),
+                    request.suite.is_some(),
+                    request.case.is_some(),
+                    request.module.is_some(),
+                ) {
+                    (true, false, false, false) => {}
+                    (true, _, _, _) => {
+                        return Err(ToolError::BadInput(
+                            "pass a configuration or a test, not both".to_string(),
+                        ));
+                    }
+                    (false, false, _, _) if request.case.is_none() => {
+                        return Err(ToolError::BadInput(
+                            "pass a suite, a case with its suite, or a configuration".to_string(),
+                        ));
+                    }
+                    (false, false, _, _) => {
+                        return Err(ToolError::BadInput(
+                            "a case needs the suite it belongs to".to_string(),
+                        ));
+                    }
+                    (false, true, _, _) => {}
+                }
+                let outcome = self.backend.debug_run(scope, &request, client)?;
+                Ok(render::debug_run(&request, &outcome))
+            }
+            DEBUG_WAIT => {
+                let query: DebugWaitQuery = parse::<DebugWaitQuery>(input)?.clipped();
+                let state = self.backend.debug_wait(scope, &query)?;
+                Ok(render::debug_session(&state))
+            }
+            DEBUG_STACK => {
+                let query: DebugStackQuery = parse::<DebugStackQuery>(input)?.clipped();
+                let stack = self.backend.debug_stack(scope, &query)?;
+                Ok(render::debug_stack(&stack, &query))
+            }
+            DEBUG_VARIABLES => {
+                let query: DebugVariablesQuery = parse::<DebugVariablesQuery>(input)?.clipped();
+                let variables = self.backend.debug_variables(scope, &query)?;
+                Ok(render::debug_variables(&variables, &query))
+            }
+            DEBUG_EVALUATE => {
+                let input: DebugEvaluateQuery = parse(input)?;
+                let expression = input.expression.trim();
+                if expression.is_empty() {
+                    return Err(ToolError::BadInput("the expression is empty".to_string()));
+                }
+                let query = DebugEvaluateQuery {
+                    expression: expression.to_string(),
+                    frame: input.frame.map(|frame| frame.min(99)),
+                };
+                let value = self.backend.debug_evaluate(scope, &query)?;
+                Ok(render::debug_value(&value))
+            }
+            DEBUG_STEP => {
+                let input: StepInput = parse(input)?;
+                let Some(step) = DebugStep::parse(&input.action) else {
+                    let action = input.action;
+                    return Err(ToolError::BadInput(format!(
+                        "unknown step {action}, pass over, into, out or continue"
+                    )));
+                };
+                let query = DebugStepQuery {
+                    step,
+                    seconds: input.seconds.unwrap_or(10),
+                }
+                .clipped();
+                let state = self.backend.debug_step(scope, &query)?;
+                Ok(render::debug_session(&state))
+            }
+            DEBUG_STOP => {
+                self.backend.debug_stop(scope)?;
+                Ok("debug session stopped\n".to_string())
+            }
             _ => Err(ToolError::UnknownTool(tool.to_string())),
         }
     }
@@ -533,12 +824,15 @@ mod tests {
 
     use super::*;
     use crate::backend::{
-        CallHierarchy, CallHierarchyQuery, Confidence, Diagnostic, DiagnosticsPage, EditOutcome,
-        EditorContext, FileText, HierarchyNode, Location, ProjectModule, ProjectStructure,
-        ProjectStructureQuery, ProposeEditQuery, ProposedEdit, READ_LINE_LIMIT, ReadFileQuery,
-        SearchHit, SearchPage, SearchQuery, Severity, SymbolHit, SymbolInfo, SymbolPage,
-        TypeHierarchy, TypeHierarchyQuery, Usage, UsagePage, UsagesQuery, VcsChanges, VcsDiff,
-        VcsFile, VcsHunk, VcsQuery,
+        BreakpointId, BreakpointInfo, BreakpointQuery, CallHierarchy, CallHierarchyQuery,
+        Confidence, DebugEvaluateQuery, DebugFrame, DebugRunOutcome, DebugRunRequest, DebugScope,
+        DebugSessionState, DebugStack, DebugStackQuery, DebugStepQuery, DebugThread, DebugValue,
+        DebugVariable, DebugVariables, DebugVariablesQuery, DebugWaitQuery, Diagnostic,
+        DiagnosticsPage, EditOutcome, EditorContext, FileText, HierarchyNode, Location,
+        ProjectModule, ProjectStructure, ProjectStructureQuery, ProposeEditQuery, ProposedEdit,
+        READ_LINE_LIMIT, ReadFileQuery, SearchHit, SearchPage, SearchQuery, Severity, SymbolHit,
+        SymbolInfo, SymbolPage, TypeHierarchy, TypeHierarchyQuery, Usage, UsagePage, UsagesQuery,
+        VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
     };
     use crate::tools::TOOL_NAMES;
 
@@ -783,6 +1077,163 @@ mod tests {
                 hunks,
                 kept: hunks.saturating_sub(1),
             })
+        }
+
+        fn set_breakpoint(
+            &self,
+            _scope: &SessionScope,
+            query: &BreakpointQuery,
+        ) -> Result<BreakpointInfo, ToolError> {
+            Ok(BreakpointInfo {
+                path: query.path.clone(),
+                line: query.line,
+                enabled: true,
+                verified: true,
+                condition: query.condition.clone(),
+                log_message: query.log_message.clone(),
+            })
+        }
+
+        fn remove_breakpoint(
+            &self,
+            _scope: &SessionScope,
+            _id: &BreakpointId,
+        ) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        fn breakpoints(&self, scope: &SessionScope) -> Result<Vec<BreakpointInfo>, ToolError> {
+            Ok(vec![BreakpointInfo {
+                path: scope.project.join("Foo.txt"),
+                line: 3,
+                enabled: true,
+                verified: false,
+                condition: None,
+                log_message: None,
+            }])
+        }
+
+        fn debug_run(
+            &self,
+            _scope: &SessionScope,
+            _request: &DebugRunRequest,
+            _client: Option<&str>,
+        ) -> Result<DebugRunOutcome, ToolError> {
+            Ok(DebugRunOutcome {
+                session: "debug-1".to_string(),
+                state: stopped_state(),
+            })
+        }
+
+        fn debug_wait(
+            &self,
+            _scope: &SessionScope,
+            query: &DebugWaitQuery,
+        ) -> Result<DebugSessionState, ToolError> {
+            Ok(DebugSessionState {
+                reason: Some(format!("{} s", query.seconds)),
+                ..stopped_state()
+            })
+        }
+
+        fn debug_stack(
+            &self,
+            _scope: &SessionScope,
+            query: &DebugStackQuery,
+        ) -> Result<DebugStack, ToolError> {
+            let frames = (0..query.frames)
+                .map(|index| DebugFrame {
+                    index,
+                    name: format!("frame {index}"),
+                    path: None,
+                    line: 0,
+                    column: 0,
+                })
+                .collect();
+            Ok(DebugStack {
+                thread: Some(DebugThread {
+                    id: 1,
+                    name: "main".to_string(),
+                }),
+                total: query.frames + 2,
+                frames,
+            })
+        }
+
+        fn debug_variables(
+            &self,
+            _scope: &SessionScope,
+            query: &DebugVariablesQuery,
+        ) -> Result<DebugVariables, ToolError> {
+            let child = DebugVariable {
+                name: "child".to_string(),
+                value: "c".repeat(300),
+                type_name: "String".to_string(),
+                children: Vec::new(),
+            };
+            let items = DebugVariable {
+                name: "items".to_string(),
+                value: "ArrayList (2)".to_string(),
+                type_name: "ArrayList".to_string(),
+                children: if query.depth > 0 {
+                    vec![child]
+                } else {
+                    Vec::new()
+                },
+            };
+            Ok(DebugVariables {
+                scopes: vec![DebugScope {
+                    name: "Locals".to_string(),
+                    variables: vec![items],
+                }],
+                total: 1,
+                clipped: false,
+            })
+        }
+
+        fn debug_evaluate(
+            &self,
+            _scope: &SessionScope,
+            query: &DebugEvaluateQuery,
+        ) -> Result<DebugValue, ToolError> {
+            Ok(DebugValue {
+                expression: query.expression.clone(),
+                value: "42".to_string(),
+                type_name: "int".to_string(),
+            })
+        }
+
+        fn debug_step(
+            &self,
+            _scope: &SessionScope,
+            query: &DebugStepQuery,
+        ) -> Result<DebugSessionState, ToolError> {
+            Ok(DebugSessionState {
+                reason: Some(query.step.name().to_string()),
+                ..stopped_state()
+            })
+        }
+
+        fn debug_stop(&self, _scope: &SessionScope) -> Result<(), ToolError> {
+            Ok(())
+        }
+    }
+
+    fn stopped_state() -> DebugSessionState {
+        DebugSessionState {
+            state: "stopped".to_string(),
+            reason: Some("breakpoint".to_string()),
+            thread: Some(DebugThread {
+                id: 1,
+                name: "main".to_string(),
+            }),
+            frame: Some(DebugFrame {
+                index: 0,
+                name: "run".to_string(),
+                path: Some("project/Foo.txt".into()),
+                line: 12,
+                column: 1,
+            }),
         }
     }
 
@@ -1214,6 +1665,10 @@ mod tests {
                     | "rename_symbol"
                     | "organize_imports"
                     | "format_file"
+                    | "debug_run"
+                    | "debug_evaluate"
+                    | "debug_step"
+                    | "debug_stop"
             );
             let class = if executes {
                 ToolClass::Execute
@@ -1314,6 +1769,28 @@ mod tests {
     }
 
     #[test]
+    fn revoking_a_session_permission_makes_the_next_call_ask_again() {
+        let approval = Answering::new([ApprovalAnswer::Session, ApprovalAnswer::Deny]);
+        let gateway = asked_gateway(approval.clone());
+
+        assert!(was_allowed(gateway.call(
+            &scope(),
+            "build_project",
+            &json!({})
+        )));
+        assert_eq!(approval.asked(), 1);
+        assert!(gateway.session_allowed("s1"));
+        assert_eq!(gateway.allowed_sessions(), ["s1".to_string()]);
+
+        assert!(gateway.revoke_session("s1"), "the permission was there");
+        assert!(!gateway.session_allowed("s1"));
+        let denied = gateway.call(&scope(), "build_project", &json!({}));
+        assert!(matches!(denied, Err(ToolError::Denied(_))), "{denied:?}");
+        assert_eq!(approval.asked(), 2, "the next call asked again");
+        assert!(!gateway.revoke_session("s1"), "nothing is left to revoke");
+    }
+
+    #[test]
     fn a_case_without_its_suite_is_bad_input() {
         let result = asked_gateway(Answering::new([ApprovalAnswer::Once])).call(
             &scope(),
@@ -1322,5 +1799,235 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ToolError::BadInput(_))), "{result:?}");
+    }
+
+    #[test]
+    fn the_debug_tools_answer_with_their_parts() {
+        let gateway = allowing_gateway();
+
+        let set = gateway
+            .call(
+                &scope(),
+                "set_breakpoint",
+                &json!({"path": "Foo.txt", "line": 3, "condition": " x > 1 "}),
+            )
+            .expect("set breakpoint");
+        assert!(set.starts_with("breakpoint set: "), "{set}");
+        assert!(set.contains(":3 on, verified"), "{set}");
+        assert!(set.contains("condition: x > 1"), "{set}");
+
+        let listed = gateway
+            .call(&scope(), "list_breakpoints", &json!({}))
+            .expect("list breakpoints");
+        assert!(listed.starts_with("1 breakpoints:"), "{listed}");
+        assert!(listed.contains("project"), "{listed}");
+
+        let removed = gateway
+            .call(
+                &scope(),
+                "remove_breakpoint",
+                &json!({"path": "Foo.txt", "line": 3}),
+            )
+            .expect("remove breakpoint");
+        assert!(removed.contains("breakpoint removed: "), "{removed}");
+        assert!(removed.contains(":3"), "{removed}");
+
+        let run = gateway
+            .call(
+                &scope(),
+                "debug_run",
+                &json!({"suite": "demo.Vitest", "case": "fails", "wait_seconds": 12}),
+            )
+            .expect("debug run");
+        assert!(
+            run.starts_with("debugging demo.Vitest.fails: session debug-1\n"),
+            "{run}"
+        );
+        assert!(run.contains("debugging: stopped (breakpoint)"), "{run}");
+        assert!(run.contains("thread: main #1"), "{run}");
+        assert!(run.contains("#0 run at project"), "{run}");
+
+        let wait = gateway
+            .call(&scope(), "debug_wait", &json!({"seconds": 5}))
+            .expect("debug wait");
+        assert!(wait.contains("debugging: stopped (5 s)"), "{wait}");
+
+        let stack = gateway
+            .call(&scope(), "debug_stack", &json!({"frames": 2}))
+            .expect("debug stack");
+        assert!(stack.starts_with("stack of main #1: 4 frames\n"), "{stack}");
+        assert!(stack.contains("#0 frame 0\n#1 frame 1\n"), "{stack}");
+        assert!(stack.contains("clipped: showing 2 of 4 frames"), "{stack}");
+
+        let variables = gateway
+            .call(
+                &scope(),
+                "debug_variables",
+                &json!({"frame": 0, "depth": 1, "length": 40}),
+            )
+            .expect("debug variables");
+        assert!(
+            variables.starts_with("variables of frame #0\n"),
+            "{variables}"
+        );
+        assert!(variables.contains("  Locals:\n"), "{variables}");
+        assert!(
+            variables.contains("  items = ArrayList (2) (ArrayList)"),
+            "{variables}"
+        );
+        assert!(variables.contains("    child = cccc"), "{variables}");
+
+        let value = gateway
+            .call(
+                &scope(),
+                "debug_evaluate",
+                &json!({"expression": "items.size()"}),
+            )
+            .expect("debug evaluate");
+        assert_eq!(value, "items.size() = 42 (int)\n");
+
+        let step = gateway
+            .call(&scope(), "debug_step", &json!({"action": "over"}))
+            .expect("debug step");
+        assert!(step.contains("debugging: stopped (over)"), "{step}");
+
+        let stopped = gateway
+            .call(&scope(), "debug_stop", &json!({}))
+            .expect("debug stop");
+        assert_eq!(stopped, "debug session stopped\n");
+    }
+
+    #[test]
+    fn the_debug_answers_stay_inside_their_limits() {
+        let gateway = allowing_gateway();
+
+        let stack = gateway
+            .call(&scope(), "debug_stack", &json!({"frames": 10_000}))
+            .expect("debug stack");
+        assert!(stack.contains(": 102 frames"), "{stack}");
+        assert!(
+            stack.contains("clipped: showing 100 of 102 frames"),
+            "{stack}"
+        );
+
+        let variables = gateway
+            .call(
+                &scope(),
+                "debug_variables",
+                &json!({"depth": 1, "length": 20, "variables": 5}),
+            )
+            .expect("debug variables");
+        assert!(variables.contains("ccccccccccccccccccc…"), "{variables}");
+
+        let one = gateway
+            .call(
+                &scope(),
+                "debug_variables",
+                &json!({"depth": 1, "variables": 1}),
+            )
+            .expect("debug variables");
+        assert!(!one.contains("child ="), "{one}");
+        assert!(one.contains("clipped: 1 variables"), "{one}");
+
+        let short = gateway
+            .call(&scope(), "debug_wait", &json!({"seconds": 0}))
+            .expect("debug wait");
+        assert!(short.contains("stopped (1 s)"), "{short}");
+        let long = gateway
+            .call(&scope(), "debug_wait", &json!({"seconds": 10_000}))
+            .expect("debug wait");
+        assert!(long.contains("stopped (120 s)"), "{long}");
+    }
+
+    #[test]
+    fn the_debug_tools_refuse_an_empty_or_conflicting_input() {
+        let gateway = allowing_gateway();
+
+        let zero = gateway.call(
+            &scope(),
+            "set_breakpoint",
+            &json!({"path": "Foo.txt", "line": 0}),
+        );
+        let nothing = gateway.call(&scope(), "debug_run", &json!({}));
+        let both = gateway.call(
+            &scope(),
+            "debug_run",
+            &json!({"configuration": "Demo", "suite": "demo.Vitest"}),
+        );
+        let module = gateway.call(
+            &scope(),
+            "debug_run",
+            &json!({"configuration": "Demo", "module": "app"}),
+        );
+        let case = gateway.call(&scope(), "debug_run", &json!({"case": "fails"}));
+        let blank = gateway.call(&scope(), "debug_evaluate", &json!({"expression": " "}));
+        let step = gateway.call(&scope(), "debug_step", &json!({"action": "sideways"}));
+        let no_step = gateway.call(&scope(), "debug_step", &json!({}));
+
+        assert!(matches!(zero, Err(ToolError::BadInput(_))), "{zero:?}");
+        assert!(
+            matches!(nothing, Err(ToolError::BadInput(_))),
+            "{nothing:?}"
+        );
+        assert!(matches!(both, Err(ToolError::BadInput(_))), "{both:?}");
+        assert!(matches!(module, Err(ToolError::BadInput(_))), "{module:?}");
+        assert!(matches!(case, Err(ToolError::BadInput(_))), "{case:?}");
+        assert!(matches!(blank, Err(ToolError::BadInput(_))), "{blank:?}");
+        assert!(matches!(step, Err(ToolError::BadInput(_))), "{step:?}");
+        assert!(
+            matches!(no_step, Err(ToolError::BadInput(_))),
+            "{no_step:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_debug_tools_refuse_paths_outside_the_project() {
+        let gateway = allowing_gateway();
+        let set = gateway.call(
+            &scope(),
+            "set_breakpoint",
+            &json!({"path": "C:/Windows/win.ini", "line": 1}),
+        );
+        let remove = gateway.call(
+            &scope(),
+            "remove_breakpoint",
+            &json!({"path": "../project-other/secret.txt", "line": 1}),
+        );
+
+        assert!(matches!(set, Err(ToolError::Denied(_))), "{set:?}");
+        assert!(matches!(remove, Err(ToolError::Denied(_))), "{remove:?}");
+    }
+
+    #[test]
+    fn the_debug_tools_that_run_the_program_need_a_yes() {
+        let gateway = gateway();
+
+        for tool in ["debug_run", "debug_evaluate", "debug_step", "debug_stop"] {
+            let input = match tool {
+                "debug_run" => json!({"configuration": "Demo"}),
+                "debug_evaluate" => json!({"expression": "1 + 1"}),
+                "debug_step" => json!({"action": "over"}),
+                _ => json!({}),
+            };
+            let result = gateway.call(&scope(), tool, &input);
+            assert!(
+                matches!(result, Err(ToolError::Denied(_))),
+                "{tool}: {result:?}"
+            );
+        }
+        for (tool, input) in [
+            ("set_breakpoint", json!({"path": "Foo.txt", "line": 1})),
+            ("list_breakpoints", json!({})),
+            ("debug_wait", json!({"seconds": 1})),
+            ("debug_stack", json!({})),
+            ("debug_variables", json!({})),
+        ] {
+            let result = gateway.call(&scope(), tool, &input);
+            assert!(
+                !matches!(result, Err(ToolError::Denied(_))),
+                "{tool} asks no question: {result:?}"
+            );
+        }
     }
 }

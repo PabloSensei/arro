@@ -1,5 +1,6 @@
 //! Tool windows and popups on top of the workspace.
 
+mod agent_clients;
 mod agent_hunk;
 mod agent_tools;
 mod agents;
@@ -42,6 +43,7 @@ mod editor_tab;
 mod endpoints;
 mod file_tree;
 mod finder;
+mod fix_with_ai;
 mod folder_compare;
 mod git;
 mod git_history;
@@ -61,6 +63,7 @@ mod library_sources;
 mod live_panel;
 mod marks;
 mod mcp_approval;
+mod mcp_debug;
 mod mcp_edits;
 mod mcp_runs;
 mod merge_view;
@@ -112,6 +115,9 @@ mod trust;
 mod usages;
 mod window_features;
 mod window_popups;
+
+#[cfg(feature = "mock-agents")]
+mod mock_transcript;
 
 #[cfg(test)]
 mod test_alloc;
@@ -368,6 +374,8 @@ mod window_tests_bundle_buffers;
 #[cfg(test)]
 mod window_tests_bundle_editor;
 #[cfg(test)]
+mod window_tests_bundle_save;
+#[cfg(test)]
 mod window_tests_exit_buffers;
 
 #[cfg(test)]
@@ -440,6 +448,8 @@ mod window_tests_mask_hint;
 mod window_tests_mcp;
 #[cfg(test)]
 mod window_tests_mcp_approval;
+#[cfg(test)]
+mod window_tests_mcp_debug;
 #[cfg(test)]
 mod window_tests_mcp_runs;
 
@@ -518,6 +528,8 @@ mod window_tests_spelling;
 mod window_tests_spring_beans;
 #[cfg(test)]
 mod window_tests_spring_data;
+#[cfg(test)]
+mod window_tests_stack_library_note;
 #[cfg(test)]
 mod window_tests_stack_refinement;
 #[cfg(test)]
@@ -607,7 +619,33 @@ mod window_tests_mcp_edits;
 mod window_tests_postfix;
 
 #[cfg(test)]
+mod window_tests_database_scripts;
+#[cfg(test)]
 mod window_tests_journal;
+#[cfg(test)]
+mod window_tests_menu_scroll;
+
+#[cfg(test)]
+mod window_tests_ai_tools_text;
+
+#[cfg(test)]
+mod window_tests_mock_transcript;
+
+#[cfg(test)]
+mod window_tests_mcp_clients;
+
+#[cfg(test)]
+mod window_tests_ai_sessions;
+
+// The stand-in harness of these tests is a PowerShell script, so they run on Windows only.
+#[cfg(all(test, windows))]
+mod window_tests_ai_terminal_select;
+
+#[cfg(test)]
+mod window_tests_run_starting;
+
+#[cfg(test)]
+mod window_tests_fix_with_ai;
 
 mod choice;
 mod invalidate;
@@ -1240,12 +1278,15 @@ fn install(
         }
     })
     .detach();
+    let debug_tools = crate::mcp_debug::DebugBridge::new();
+    debug.update(cx, |panel, _| panel.set_tool_debug(debug_tools.clone()));
     cx.set_global(debug::ActiveDebug(debug));
 
     let hub = Arc::new(debug::DebugHub::default());
     let languages = Arc::new(LanguageTools::new());
     let project_root = workspace.root().to_path_buf();
     languages.register_debug(project_root.clone(), hub.clone());
+    languages.register_debug_control(project_root.clone(), debug_tools);
     let run_tools = crate::mcp_runs::RunBridge::new();
     runs.update(cx, |panel, _| panel.set_tool_runs(run_tools.clone()));
     languages.register_project(project_root, run_tools);
@@ -1283,6 +1324,7 @@ fn install(
     agents::install(cx);
     mcp_approval::bind_actions(workspace);
     mcp_edits::bind_actions(workspace);
+    agent_clients::bind_actions(workspace);
     // The entry point of the project goes away with the window, as the server does.
     let entry_state = close_state_dir;
     let entry_root = close_root;

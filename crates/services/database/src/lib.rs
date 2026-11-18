@@ -11,6 +11,7 @@ mod console;
 mod data;
 mod explain;
 mod export;
+mod format;
 mod passwords;
 mod protocol;
 mod schema;
@@ -30,6 +31,7 @@ pub use data::{
 };
 pub use explain::{ExplainNode, ExplainPlan, explain_statement, plan_of};
 pub use export::{ExportFormat, Exporter};
+pub use format::{FormatOptions, KeywordCase, format_sql, format_sql_range};
 pub use passwords::{PasswordStore, SystemPasswords, service_of};
 pub use protocol::{Command, Event, PROTOCOL, Param, Value};
 pub use schema::{Column, ColumnKind, ForeignKey, Index, ResultSet, Schema, Table, TableKind};

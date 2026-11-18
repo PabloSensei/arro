@@ -97,11 +97,15 @@ pub struct TemplateLanguage {
 }
 
 impl TemplateLanguage {
-    /// The compiled context query; `None` when it does not fit the grammar.
+    /// The compiled context query; `None` when it does not fit the grammar or when the
+    /// language names no context: every place is `other` there.
     pub fn query(&self) -> Option<&Query> {
-        let query = self
-            .query
-            .get_or_init(|| Query::new(&(self.grammar)(), self.contexts).ok());
+        let query = self.query.get_or_init(|| {
+            if self.contexts.trim().is_empty() {
+                return None;
+            }
+            Query::new(&(self.grammar)(), self.contexts).ok()
+        });
         query.as_ref()
     }
 

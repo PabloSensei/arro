@@ -264,9 +264,9 @@ pub struct RunPanel {
     /// Cancels a launch that is still planning in the background, as Stop does before
     /// the program of a configuration starts.
     launch: Cancel,
-    /// Stop was pressed while the launch was still planning: the plan, when it comes,
-    /// starts nothing and says why.
-    launch_cancelled: bool,
+    /// The number of the latest launch. A plan of a launch that Stop cancelled, or one a
+    /// newer launch overtook, starts nothing when it comes.
+    launch_generation: u64,
     /// Tests run again by themselves after a project file is saved.
     auto_test: bool,
     /// The saves since the last automatic run: a burst of saves runs the tests once.
@@ -573,7 +573,7 @@ impl RunPanel {
                 run_service: ServiceRun::default(),
                 confirm_rerun: None,
                 launch: Cancel::new(),
-                launch_cancelled: false,
+                launch_generation: 0,
                 auto_test: false,
                 auto_saves: 0,
                 auto_pending: false,
@@ -1404,10 +1404,7 @@ impl RunPanel {
         cx: &mut Context<Self>,
     ) {
         let title = config.name.clone();
-        let cancel = Cancel::new();
-        self.launch = cancel.clone();
-        self.launch_cancelled = false;
-        self.starting = true;
+        let (cancel, generation) = self.begin_launch();
         self.archive_console();
         self.confirm_rerun = None;
         self.live = None;
@@ -1448,12 +1445,11 @@ impl RunPanel {
         cx.spawn(async move |this, cx| {
             let planned: Result<_, String> = planned.await;
             this.update(cx, |this, cx| {
-                this.starting = false;
-                if this.launch_cancelled || cancel.is_cancelled() {
-                    this.launch_cancelled = false;
+                if !this.launch_still_wanted(&cancel, generation) {
                     this.changed(cx);
                     return;
                 }
+                this.starting = false;
                 match planned {
                     Ok((plan, live, steps)) => {
                         this.set_live(live, cx);
@@ -1519,10 +1515,7 @@ impl RunPanel {
             self.tell("Cannot run", message, cx);
             return;
         }
-        let cancel = Cancel::new();
-        self.launch = cancel.clone();
-        self.launch_cancelled = false;
-        self.starting = true;
+        let (cancel, generation) = self.begin_launch();
         self.archive_console();
         self.confirm_rerun = None;
         self.live = None;
@@ -1589,12 +1582,11 @@ impl RunPanel {
         cx.spawn(async move |this, cx| {
             let planned: Result<_, String> = planned.await;
             this.update(cx, |this, cx| {
-                this.starting = false;
-                if this.launch_cancelled || cancel.is_cancelled() {
-                    this.launch_cancelled = false;
+                if !this.launch_still_wanted(&cancel, generation) {
                     this.changed(cx);
                     return;
                 }
+                this.starting = false;
                 match planned {
                     Ok(starts) => {
                         let mut starts = starts.into_iter();
@@ -3127,20 +3119,100 @@ impl RunPanel {
         self.test_key(event, window, cx);
     }
 
-    /// The context menu of the console: Send EOF, as IDEA has it.
+    /// The context menu of the console: Send EOF, as IDEA has it, and Explain with AI
+    /// on an exception with its stack.
     fn console_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if !self.takes_input() {
+        let mut entries = Vec::new();
+        if self.takes_input() {
+            let panel = cx.weak_entity();
+            entries.push(MenuEntry::new("Send EOF", move |_, cx| {
+                panel.update(cx, |panel, cx| panel.send_eof(cx)).ok();
+            }));
+        }
+        if crate::fix_with_ai::enabled(cx)
+            && let Some((start, end)) = self
+                .console_line_at(position)
+                .and_then(|index| self.exception_at(index))
+        {
+            let text = self.exception_text(start, end);
+            let workspace = self.workspace.clone();
+            entries.push(MenuEntry::new("Explain with AI", move |window, cx| {
+                let message = crate::fix_with_ai::exception(&text);
+                workspace
+                    .update(cx, |workspace, cx| {
+                        crate::fix_with_ai::ask(workspace, message.clone(), window, cx)
+                    })
+                    .ok();
+            }));
+        }
+        if entries.is_empty() {
             return;
         }
-        let panel = cx.weak_entity();
-        let entry = MenuEntry::new("Send EOF", move |_, cx| {
-            panel.update(cx, |panel, cx| panel.send_eof(cx)).ok();
-        });
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_menu(position, vec![entry], cx)
+                workspace.show_menu(position, entries, cx)
             })
             .ok();
+    }
+
+    /// The line of the console under `position`, from zero.
+    fn console_line_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let state = self.scroll.0.borrow();
+        let viewport = state.base_handle.bounds();
+        if !viewport.contains(&position) {
+            return None;
+        }
+        // The rows of the list all have the height it measured on the last frame, and
+        // the offset puts the first of them at the top of the viewport.
+        let height = state
+            .last_item_size
+            .map_or_else(|| px(CODE_LINE_HEIGHT), |size| size.item.height);
+        let top = viewport.top() + state.base_handle.offset().y;
+        let row = ((position.y - top) / height).floor();
+        (row >= 0.)
+            .then_some(row as usize)
+            .filter(|row| *row < self.console_line_count())
+    }
+
+    /// The text of the line of the console on screen at `index`, from zero: the old run
+    /// the user looks at, or this one.
+    fn console_line(&self, index: usize) -> Option<&str> {
+        let line = match self.viewing.and_then(|view| self.draining.get(view)) {
+            Some(drain) => drain.lines.get(index)?,
+            None => self.lines.get(index)?,
+        };
+        Some(line.text.as_str())
+    }
+
+    /// How many lines the console on screen has.
+    fn console_line_count(&self) -> usize {
+        self.viewing
+            .and_then(|view| self.draining.get(view))
+            .map_or(self.lines.len(), |drain| drain.lines.len())
+    }
+
+    /// The exception line under `index` with its stack, when the line belongs to one.
+    /// A click on a frame finds the exception above it.
+    fn exception_at(&self, index: usize) -> Option<(usize, usize)> {
+        let mut start = index;
+        if !is_exception_head(self.console_line(start)?) {
+            start = (0..index)
+                .rev()
+                .find(|index| self.console_line(*index).is_some_and(is_exception_head))?;
+        }
+        let mut end = start + 1;
+        while self.console_line(end).is_some_and(is_stack_line) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// The text of the exception and its stack, from the lines `start..end`.
+    fn exception_text(&self, start: usize, end: usize) -> String {
+        (start..end)
+            .filter_map(|index| self.console_line(index))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The work that runs behind the console: the import of the project and a build.
@@ -3211,6 +3283,23 @@ impl RunPanel {
         self.changed(cx);
     }
 
+    /// Starts a launch that plans in the background, and answers the cancel of it with the
+    /// number of this launch. Stop cancels it, and a plan of a launch that comes after a
+    /// newer one started starts nothing.
+    fn begin_launch(&mut self) -> (Cancel, u64) {
+        let cancel = Cancel::new();
+        self.launch = cancel.clone();
+        self.launch_generation = self.launch_generation.wrapping_add(1);
+        self.starting = true;
+        (cancel, self.launch_generation)
+    }
+
+    /// Whether the plan of that launch may still start something: Stop did not cancel it,
+    /// and no newer launch overtook it.
+    fn launch_still_wanted(&self, cancel: &Cancel, generation: u64) -> bool {
+        self.launch_generation == generation && !cancel.is_cancelled()
+    }
+
     /// A build beside a running test session: output goes to the same console, but the
     /// test run, its tree and its title stay as they are.
     fn launch_build(
@@ -3219,13 +3308,17 @@ impl RunPanel {
         cx: &mut Context<Self>,
         make: impl FnOnce() -> Result<RunPlan, String> + Send + 'static,
     ) {
-        self.starting = true;
+        let (cancel, generation) = self.begin_launch();
         self.building_project = true;
         self.lines.push_back(info(&title));
         let plan = cx.background_executor().spawn(async move { make() });
         cx.spawn(async move |this, cx| {
             let plan = plan.await;
             this.update(cx, |this, cx| {
+                if !this.launch_still_wanted(&cancel, generation) {
+                    this.changed(cx);
+                    return;
+                }
                 this.starting = false;
                 match plan {
                     Ok(plan) => {
@@ -3258,7 +3351,7 @@ impl RunPanel {
         + Send
         + 'static,
     ) {
-        self.starting = true;
+        let (cancel, generation) = self.begin_launch();
         self.archive_console();
         self.live = None;
         self.live_open = false;
@@ -3281,6 +3374,10 @@ impl RunPanel {
         cx.spawn(async move |this, cx| {
             let plan = plan.await;
             this.update(cx, |this, cx| {
+                if !this.launch_still_wanted(&cancel, generation) {
+                    this.changed(cx);
+                    return;
+                }
                 this.starting = false;
                 match plan {
                     Ok((plan, live)) => {
@@ -3314,7 +3411,7 @@ impl RunPanel {
         // A launch that still plans in the background starts nothing when it comes.
         if self.starting {
             self.launch.cancel();
-            self.launch_cancelled = true;
+            self.launch_generation = self.launch_generation.wrapping_add(1);
             if !self.building_project {
                 self.note("Launch cancelled", false);
             }
@@ -3375,6 +3472,7 @@ impl RunPanel {
         cx.spawn(async move |this, cx| {
             let mut shown = false;
             while let Some(answer) = replies.next().await {
+                let note = answer.note.clone();
                 let dump = answer.value;
                 if let Some(error) = dump.error {
                     this.update(cx, |this, cx| {
@@ -3410,6 +3508,7 @@ impl RunPanel {
                                 } else {
                                     panel.refine(report, cx);
                                 }
+                                panel.set_note(note.clone(), cx);
                             });
                         }
                     });
@@ -3422,6 +3521,47 @@ impl RunPanel {
 
     /// Shift+F9: starts the selected configuration under the debugger.
     pub fn debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = window.window_handle();
+        self.start_debug(Some(handle), None, cx);
+    }
+
+    /// Starts the configuration named `name` under the debugger for a tool call. The
+    /// tool runs on a worker thread, so the window comes from the active one when there
+    /// is one.
+    pub(crate) fn debug_configuration_from_tool(
+        &mut self,
+        name: &str,
+        client: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.debug_service.is_none() {
+            return Err("the language server is not running".to_string());
+        }
+        if self
+            .session
+            .as_ref()
+            .and_then(ProjectSession::model)
+            .is_none()
+        {
+            return Err("the project is still loading".to_string());
+        }
+        if self.starting || self.busy() {
+            return Err("the Run window is busy".to_string());
+        }
+        if !self.select_named(name, cx) {
+            return Err(format!("the project has no run configuration {name}"));
+        }
+        let handle = cx.active_window();
+        self.start_debug(handle, client, cx);
+        Ok(())
+    }
+
+    fn start_debug(
+        &mut self,
+        handle: Option<ui_kit::gpui::AnyWindowHandle>,
+        client: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(service) = self.debug_service.clone() else {
             self.tell("Cannot debug", "The language server is not running", cx);
             return;
@@ -3449,6 +3589,7 @@ impl RunPanel {
         // made in the background.
         let provider = provider.clone();
         let name = config.name.clone();
+        self.note_tool_client(client);
         let plan = cx.background_executor().spawn(async move {
             if let Some(attach) = provider.attach_plan(&config, &model)? {
                 return Ok((Some(attach), None, None));
@@ -3460,7 +3601,6 @@ impl RunPanel {
         });
         let panel = cx.global::<crate::debug::ActiveDebug>().0.clone();
         let workspace = self.workspace.clone();
-        let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let plan = match plan.await {
                 Ok(plan) => plan,
@@ -3503,15 +3643,17 @@ impl RunPanel {
                         panel.start_plan(service, plan, name, entry, cx)
                     });
                 }
-                handle
-                    .update(cx, |_, window, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.show_tool(DEBUG_TOOL, window, cx)
-                            })
-                            .ok();
-                    })
-                    .ok();
+                if let Some(handle) = handle {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.show_tool(DEBUG_TOOL, window, cx)
+                                })
+                                .ok();
+                        })
+                        .ok();
+                }
             });
         })
         .detach();
@@ -3522,6 +3664,47 @@ impl RunPanel {
         &mut self,
         request: TestRequest,
         window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = window.window_handle();
+        self.debug_tests_with(request, Some(handle), None, cx);
+    }
+
+    /// Starts a test under the debugger for a tool call. The tool runs on a worker
+    /// thread, so the window comes from the active one when there is one.
+    pub(crate) fn debug_tests_from_tool(
+        &mut self,
+        request: TestRequest,
+        client: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.starting || self.busy() {
+            return Err("the Run window is busy".to_string());
+        }
+        if self.debug_service.is_none() {
+            return Err("the language server is not running".to_string());
+        }
+        if self.test_provider.is_none() {
+            return Err("the project has no test runner".to_string());
+        }
+        if self
+            .session
+            .as_ref()
+            .and_then(ProjectSession::model)
+            .is_none()
+        {
+            return Err("the project is still loading".to_string());
+        }
+        let handle = cx.active_window();
+        self.debug_tests_with(request, handle, client, cx);
+        Ok(())
+    }
+
+    fn debug_tests_with(
+        &mut self,
+        request: TestRequest,
+        handle: Option<ui_kit::gpui::AnyWindowHandle>,
+        client: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         if self.starting || self.busy() {
@@ -3547,6 +3730,7 @@ impl RunPanel {
         self.run_config = None;
         self.run_service = ServiceRun::default();
         self.title = title_of(&request).into();
+        self.note_tool_client(client);
         self.lines.clear();
         self.output = OutputBuffers::default();
         self.console_process = None;
@@ -3557,18 +3741,19 @@ impl RunPanel {
         let title = title_of(&request);
         // The key that starts this may come from an editor inside the workspace update.
         let workspace = self.workspace.clone();
-        let handle = window.window_handle();
-        cx.defer(move |cx| {
-            handle
-                .update(cx, |_, window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.show_tool(DEBUG_TOOL, window, cx)
-                        })
-                        .ok();
-                })
-                .ok();
-        });
+        if let Some(handle) = handle {
+            cx.defer(move |cx| {
+                handle
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_tool(DEBUG_TOOL, window, cx)
+                            })
+                            .ok();
+                    })
+                    .ok();
+            });
+        }
         let stop = Cancel::new();
         self.starting_tests = Some(stop.clone());
         let plan = cx.background_executor().spawn(async move {
@@ -4461,7 +4646,11 @@ impl RunPanel {
                     None => self.lines.get(index),
                 };
                 let line = line.unwrap_or(&current);
-                line_element(line, theme)
+                let selector = format!("run-console-line-{index}");
+                div()
+                    .debug_selector(move || selector)
+                    .child(line_element(line, theme))
+                    .into_any_element()
             })
             .collect()
     }
@@ -4655,6 +4844,30 @@ pub(crate) fn wrapped_line_element(line: &Line, theme: &Theme) -> AnyElement {
         .whitespace_normal()
         .child(highlighted(line, theme))
         .into_any_element()
+}
+
+/// Whether a line of the console is the headline of an exception: a class name that
+/// ends with `Exception` or `Error` and what it says.
+fn is_exception_head(line: &str) -> bool {
+    let text = line.trim();
+    if text.starts_with("at ") || text.starts_with("Caused by:") || text.starts_with("Suppressed:")
+    {
+        return false;
+    }
+    let class = text
+        .split(|character: char| character.is_whitespace() || character == ':')
+        .next()
+        .unwrap_or_default();
+    class.ends_with("Exception") || class.ends_with("Error")
+}
+
+/// Whether a line of the console belongs to the stack of an exception.
+fn is_stack_line(line: &str) -> bool {
+    let text = line.trim();
+    text.starts_with("at ")
+        || text.starts_with("Caused by:")
+        || text.starts_with("Suppressed:")
+        || text.starts_with("... ")
 }
 
 /// The text of a line in the colours of the console, with no layout of its own.

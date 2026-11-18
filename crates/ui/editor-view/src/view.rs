@@ -93,6 +93,12 @@ pub struct Languages {
 
 impl Global for Languages {}
 
+/// Live templates of a format that a tool adds beside the languages of the application,
+/// such as the SQL console. Every builder is asked in turn and the first answer wins.
+pub struct ExtraTemplates(pub Vec<fn(&Path) -> Option<&'static TemplateLanguage>>);
+
+impl Global for ExtraTemplates {}
+
 /// Names the code style language of a file when its syntax does not. The application
 /// knows the language that the project style files spell differently from the editor.
 pub struct CodeStyleLanguages(pub fn(&Path) -> Option<&'static str>);
@@ -592,9 +598,25 @@ pub struct UsagesUpdate {
     pub done: bool,
 }
 
+/// A diagnostic of the editor that the user sends to the agent from Alt+Enter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiProblem {
+    pub path: PathBuf,
+    /// The first line of the diagnostic, from zero.
+    pub line: usize,
+    pub severity: lang_api::Severity,
+    pub message: String,
+    pub code: Option<String>,
+    /// The text of the file with the unsaved edits of the user.
+    pub text: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum EditorEvent {
     Loaded,
+    /// Alt+Enter picked Fix with AI on a diagnostic: the window sends the problem to
+    /// the agent.
+    FixWithAi(AiProblem),
     Dirty(bool),
     Saved,
     Failed(SharedString),
@@ -861,6 +883,8 @@ pub struct EditorOptions {
     pub render_doc_comments: bool,
     /// The preview of a markdown file takes the pictures of an address of the internet.
     pub markdown_images_from_internet: bool,
+    /// Alt+Enter offers Fix with AI on the diagnostic under the caret.
+    pub ai_features: bool,
 }
 
 impl Default for EditorOptions {
@@ -892,6 +916,7 @@ impl Default for EditorOptions {
             code_vision_implementations: true,
             render_doc_comments: false,
             markdown_images_from_internet: true,
+            ai_features: true,
         }
     }
 }
@@ -1489,8 +1514,12 @@ impl EditorView {
         static NEXT_DOCUMENT: AtomicU64 = AtomicU64::new(1);
 
         let templates = cx
-            .try_global::<Languages>()
-            .and_then(|languages| (languages.templates)(&path));
+            .try_global::<ExtraTemplates>()
+            .and_then(|extra| extra.0.iter().find_map(|templates| templates(&path)))
+            .or_else(|| {
+                cx.try_global::<Languages>()
+                    .and_then(|languages| (languages.templates)(&path))
+            });
         if !cx.has_global::<Keys>() {
             cx.set_global(Keys(Rc::new(default_keymap().1)));
             // The window binds Ctrl+Alt+Shift+Left and Right to the split groups. The
@@ -2449,6 +2478,12 @@ impl EditorView {
     /// The text as the buffer holds it now, with LF line ends. `None` while loading.
     pub fn text(&self) -> Option<String> {
         self.state.as_ref().map(EditorState::text)
+    }
+
+    /// The document of the view. Its text is shared with the editor, so a reader outside
+    /// the window copies it only when it asks. `None` while loading.
+    pub fn document(&self) -> Option<text_core::Buffer> {
+        self.state.as_ref().map(EditorState::document)
     }
 
     /// The selected text of the primary selection, `None` when the caret covers nothing.

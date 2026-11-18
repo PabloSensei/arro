@@ -346,6 +346,11 @@ pub fn register(
         "Explain Plan",
         crate::database_panel::explain_plan,
     );
+    workspace.register_command(
+        crate::database_panel::RUN_SQL_SCRIPT,
+        "Run SQL Script",
+        crate::database_panel::run_script,
+    );
     if let Err(error) = workspace.bind_command(
         crate::database_panel::EXPLAIN_KEY,
         crate::database_panel::EXPLAIN_PLAN,

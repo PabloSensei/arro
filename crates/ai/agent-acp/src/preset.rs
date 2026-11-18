@@ -38,12 +38,26 @@ impl Preset {
         }
     }
 
-    /// Shown before the start, so the user knows what the agent will ask for.
+    /// The tooltip of its start button: what the agent is and what it asks for.
     pub fn note(&self) -> Option<&'static str> {
         match self {
-            Self::ClaudeAgent => Some("Needs an Anthropic API key in ANTHROPIC_API_KEY"),
-            Self::Codex => Some("Signs in through Codex itself"),
+            Self::ClaudeAgent => Some(
+                "Runs Claude through the Agent Client Protocol. Needs an Anthropic API key in \
+                 ANTHROPIC_API_KEY; a Claude subscription login does not work here.",
+            ),
+            Self::Codex => {
+                Some("Runs Codex through the Agent Client Protocol. Signs in through Codex itself.")
+            }
             Self::Custom(_) => None,
+        }
+    }
+
+    /// The variable that holds the API key of the agent, for a preset that takes one. The agent
+    /// inherits the environment of the IDE, so the key has to be set there.
+    pub fn api_key_variable(&self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeAgent => Some("ANTHROPIC_API_KEY"),
+            Self::Codex | Self::Custom(_) => None,
         }
     }
 
@@ -138,7 +152,17 @@ mod tests {
         let error = Preset::Codex.command(OsStr::new("")).unwrap_err();
 
         assert!(error.contains("Node.js"), "{error}");
-        assert!(Preset::ClaudeAgent.note().unwrap().contains("API key"));
+        assert!(
+            Preset::ClaudeAgent
+                .note()
+                .unwrap()
+                .contains("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            Preset::ClaudeAgent.api_key_variable(),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(Preset::Codex.api_key_variable(), None);
     }
 
     #[cfg(windows)]

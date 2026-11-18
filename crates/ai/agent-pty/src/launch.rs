@@ -41,6 +41,16 @@ const READ_TOOLS: &[&str] = &[
     "run_configuration",
     "get_run_output",
     "stop_run",
+    "set_breakpoint",
+    "remove_breakpoint",
+    "list_breakpoints",
+    "debug_run",
+    "debug_wait",
+    "debug_stack",
+    "debug_variables",
+    "debug_evaluate",
+    "debug_step",
+    "debug_stop",
 ];
 
 /// Prefixes a harness needs from the environment of the user: keys, gateways, cloud providers.

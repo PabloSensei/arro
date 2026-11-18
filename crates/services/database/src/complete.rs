@@ -934,7 +934,7 @@ fn dialect_functions(dialect: Dialect) -> &'static [&'static str] {
     }
 }
 
-const KEYWORDS: &[&str] = &[
+pub(crate) const KEYWORDS: &[&str] = &[
     "ALL",
     "ALTER",
     "AND",
@@ -1072,7 +1072,7 @@ const SQLITE_KEYWORDS: &[&str] = &["AUTOINCREMENT", "GLOB", "PRAGMA", "WITHOUT"]
 const ORACLE_KEYWORDS: &[&str] = &["CONNECT", "MINUS", "PRIOR", "ROWNUM", "SYNONYM"];
 const SQLSERVER_KEYWORDS: &[&str] = &["NOLOCK", "OUTPUT", "PIVOT", "TOP", "UNPIVOT"];
 
-const COMMON_FUNCTIONS: &[&str] = &[
+pub(crate) const COMMON_FUNCTIONS: &[&str] = &[
     "ABS",
     "AVG",
     "CAST",

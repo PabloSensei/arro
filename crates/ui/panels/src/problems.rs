@@ -205,6 +205,51 @@ fn problem_menu(item: &Item, workspace: &WeakEntity<Workspace>, cx: &App) -> Vec
     vec![jump, quick, copy]
 }
 
+/// The rows at the end of the menu of a problem: Fix with AI, which sends the problem
+/// to the agent with the code around it.
+fn problem_ai_menu(item: &Item, workspace: &WeakEntity<Workspace>, cx: &App) -> Vec<MenuEntry> {
+    if !crate::fix_with_ai::enabled(cx) {
+        return Vec::new();
+    }
+    let Some(workspace) = workspace.upgrade() else {
+        return Vec::new();
+    };
+    let root = workspace.read(cx).root().to_path_buf();
+    let problem = cx.try_global::<ActiveProblems>().and_then(|hub| {
+        let hub = hub.0.read(cx);
+        hub.state()
+            .of_file(&item.path)
+            .iter()
+            .find(|problem| problem.line == item.line)
+            .cloned()
+    });
+    let kind = match problem.as_ref().map(|problem| problem.severity) {
+        Some(Severity::Warning) => "warning",
+        Some(_) => "error",
+        None if item.icon == "status/warning" => "warning",
+        None => "error",
+    };
+    let message = problem.map_or_else(|| item.label.clone(), |problem| problem.message);
+    let text = crate::fix_with_ai::file_text(&item.path, cx);
+    let message = crate::fix_with_ai::diagnostic_at(
+        &root,
+        &item.path,
+        item.line,
+        kind,
+        &message,
+        None,
+        text.as_deref(),
+    );
+    vec![
+        MenuEntry::separator(),
+        MenuEntry::new("Fix with AI", move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                crate::fix_with_ai::ask(workspace, message.clone(), window, cx)
+            });
+        }),
+    ]
+}
+
 /// Keeps the problems and the window that lists them.
 pub struct ProblemsHub {
     state: ProblemsState,
@@ -228,9 +273,13 @@ impl ProblemsHub {
             workspace.clone(),
             cx,
         );
-        let weak = workspace;
+        let weak = workspace.clone();
         panel.update(cx, |panel, _| {
-            panel.set_row_menu(Rc::new(move |item, _, cx| problem_menu(item, &weak, cx)));
+            panel.set_row_menu(Rc::new(move |item, _, cx| {
+                let mut entries = problem_menu(item, &weak, cx);
+                entries.extend(problem_ai_menu(item, &weak, cx));
+                entries
+            }));
         });
         cx.new(|_| Self {
             state: ProblemsState::default(),

@@ -176,6 +176,31 @@ impl TestView {
         Some((node.node.suite.clone()?, node.node.case.clone()))
     }
 
+    /// The name, the message, the stack and the file of the failure of a test, for the
+    /// message the window sends to the agent. `None` when the test did not fail.
+    pub fn failure_for_ai(
+        &self,
+        id: &str,
+        files: &[PathBuf],
+    ) -> Option<(String, String, String, Option<PathBuf>)> {
+        let node = self.tree.get(id)?;
+        let (message, stack) = match &node.state {
+            TestState::Failed { message, trace } => (
+                message.clone().unwrap_or_default().to_string(),
+                trace.clone().unwrap_or_default().to_string(),
+            ),
+            _ => return None,
+        };
+        let name = match (&node.node.suite, &node.node.case) {
+            (Some(suite), Some(case)) => format!("{suite}#{case}"),
+            _ => node.node.name.trim_end_matches("()").to_string(),
+        };
+        let file = stack
+            .lines()
+            .find_map(|line| frame_target(line, files).map(|(path, _)| path));
+        Some((name, message, stack, file))
+    }
+
     /// Moves the selection through the rows as they show, opening no source.
     pub fn select_relative(&mut self, delta: isize, files: &[PathBuf]) {
         let rows = self.rows();
@@ -461,6 +486,93 @@ impl RunPanel {
         .detach();
         cx.emit(TestsChanged);
         self.changed(cx);
+    }
+
+    /// A finished run with one failed case, for the window tests of the Tests menu.
+    #[cfg(test)]
+    pub(crate) fn seed_test_failure(
+        &mut self,
+        suite: &str,
+        case: &str,
+        message: &str,
+        trace: &str,
+    ) {
+        use runner::{TestKind, TestNode, TestOutcome};
+
+        self.tests.request = Some(TestRequest::default());
+        let node =
+            |id: &str, parent: Option<&str>, name: &str, kind: TestKind, case: Option<&str>| {
+                TestNode {
+                    id: id.to_owned(),
+                    parent: parent.map(ToOwned::to_owned),
+                    name: name.to_owned(),
+                    kind,
+                    suite: (id != "seed").then(|| suite.to_owned()),
+                    case: case.map(ToOwned::to_owned),
+                }
+            };
+        let events = [
+            TestEvent::Started(node("seed", None, "Engine", TestKind::Suite, None)),
+            TestEvent::Started(node("seed/c", Some("seed"), suite, TestKind::Suite, None)),
+            TestEvent::Started(node(
+                "seed/c/f",
+                Some("seed/c"),
+                &format!("{case}()"),
+                TestKind::Case,
+                Some(case),
+            )),
+            TestEvent::Finished {
+                id: "seed/c/f".to_owned(),
+                outcome: TestOutcome::Failed,
+                message: Some(message.to_owned()),
+                error_type: None,
+                trace: Some(trace.to_owned()),
+                duration_ms: 3,
+            },
+        ];
+        for event in &events {
+            self.tests.tree.apply(event);
+        }
+    }
+
+    /// Lines of the console, for the window tests of its menu.
+    #[cfg(test)]
+    pub(crate) fn seed_console_lines(&mut self, lines: &[&str]) {
+        self.lines.clear();
+        for line in lines {
+            self.lines.push_back(crate::ansi::Line::plain(
+                *line,
+                crate::ansi::Style::default(),
+            ));
+        }
+    }
+
+    /// The context menu of a row of the test tree: Fix with AI on a failed test.
+    fn test_row_menu(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let files = self.file_list(cx);
+        self.tests.select(id, &files);
+        cx.notify();
+        if !crate::fix_with_ai::enabled(cx) {
+            return;
+        }
+        let Some((name, message, stack, file)) = self.tests.failure_for_ai(id, &files) else {
+            return;
+        };
+        let message =
+            crate::fix_with_ai::test_failure(&self.root, &name, file.as_deref(), &message, &stack);
+        let workspace = self.workspace.clone();
+        let entry = MenuEntry::new("Fix with AI", move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    crate::fix_with_ai::ask(workspace, message.clone(), window, cx)
+                })
+                .ok();
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![entry], cx)
+            })
+            .ok();
     }
 
     /// Debugs the test selected in the tree, or its class when the class is selected.
@@ -1034,9 +1146,16 @@ impl RunPanel {
             selected: self.tests.selected.as_deref() == Some(row.id.as_str()),
         };
         let row_id = id.clone();
+        let menu_id = id.clone();
         tree_row(shown, theme)
             .debug_selector(move || format!("test-row-{row_id}"))
             .on_click(cx.listener(move |this, _, _, cx| this.click_test(&id, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.test_row_menu(&menu_id, event.position, cx)
+                }),
+            )
     }
 
     fn detail_line(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {

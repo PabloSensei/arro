@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dap_client::{
     Breakpoint, BreakpointSpec, Command, ConsoleLine, DataAccessType, DataBreakpointSpec,
@@ -17,7 +17,10 @@ use dap_client::{
 use runner::{Console, ConsoleEvent, RunPlan, Step, Stream};
 use serde::{Deserialize, Serialize};
 use store::Store;
-use tool_gateway::DebugSnapshotSource;
+use tool_gateway::{
+    BreakpointInfo, DebugFrame, DebugScope, DebugSessionState, DebugSnapshotSource, DebugStack,
+    DebugThread, DebugValue, DebugVariable, DebugVariables,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -25,6 +28,7 @@ use workspace::{DEBUG_TOOL, Workspace};
 
 use crate::ansi::OutputBuffers;
 use crate::console_input::{ConsoleInput, ConsoleKey};
+use crate::mcp_debug::{Answer as ToolAnswer, DebugBridge, Job as ToolJob, Request as ToolRequest};
 use crate::navigation;
 use crate::prompt::Prompt;
 
@@ -168,6 +172,10 @@ struct BreakpointSetting {
     /// An expression whose value the console shows on every hit.
     #[serde(default)]
     log_expression: Option<String>,
+    /// The text the console prints on every hit instead of stopping, as an agent sets
+    /// it. A point with a message does not suspend the program.
+    #[serde(default)]
+    log_message: Option<String>,
     /// A breakpoint that goes away at the first stop.
     #[serde(default)]
     temporary: bool,
@@ -236,6 +244,7 @@ impl BreakpointSetting {
             suspend: true,
             hit_message: false,
             log_expression: None,
+            log_message: None,
             temporary: false,
         }
     }
@@ -247,6 +256,9 @@ impl BreakpointSetting {
     fn log_message(&self) -> Option<String> {
         if self.suspend {
             return None;
+        }
+        if let Some(message) = &self.log_message {
+            return Some(message.clone());
         }
         let mut parts = Vec::new();
         if self.hit_message {
@@ -500,6 +512,43 @@ struct TemporaryBreakpoint {
     backup: Option<Vec<BreakpointSpec>>,
 }
 
+/// A tool that waits for the program to stop or the session to end.
+struct PendingWait {
+    job: ToolJob,
+    deadline: Instant,
+}
+
+/// A tool that stepped the program and waits for the next stop.
+struct PendingStep {
+    job: ToolJob,
+    /// The stops of the session before the step, so the stop left over from before does
+    /// not end the wait.
+    stops: u64,
+    deadline: Instant,
+}
+
+/// A tool that reads a stack, and the thread whose stack it asked for.
+struct PendingStack {
+    job: ToolJob,
+    thread: Option<i64>,
+    frames: usize,
+    deadline: Instant,
+}
+
+/// A tool that reads the variables of a frame. Children are asked for one level per
+/// poll, so the window answers without waiting.
+struct PendingVariables {
+    job: ToolJob,
+    frame: usize,
+    depth: usize,
+    variables: usize,
+    /// The frame the adapter selected for the answer.
+    selected: Option<i64>,
+    /// The references whose children were asked for already.
+    expanded: BTreeSet<i64>,
+    deadline: Instant,
+}
+
 pub struct DebugPanel {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -607,6 +656,18 @@ pub struct DebugPanel {
     changed_values: BTreeSet<String>,
     /// The stop whose values are in `stop_values`; zero before the first stop.
     values_stop: u64,
+    /// The bridge of the MCP debug tools, taken in every poll.
+    tool_debug: Option<Arc<DebugBridge>>,
+    /// The tools that wait for the program while the window keeps drawing.
+    tool_waits: Vec<PendingWait>,
+    tool_steps: Vec<PendingStep>,
+    tool_stacks: Vec<PendingStack>,
+    tool_variables: Vec<PendingVariables>,
+    /// The id an answer of `debug_run` names.
+    next_tool_session: u64,
+    /// The client whose tool asked for the session that is about to start, until the
+    /// console says so.
+    tool_client: Option<String>,
 }
 
 impl EventEmitter<BreakpointsChanged> for DebugPanel {}
@@ -685,6 +746,13 @@ impl DebugPanel {
             stop_values: BTreeMap::new(),
             changed_values: BTreeSet::new(),
             values_stop: 0,
+            tool_debug: None,
+            tool_waits: Vec::new(),
+            tool_steps: Vec::new(),
+            tool_stacks: Vec::new(),
+            tool_variables: Vec::new(),
+            next_tool_session: 0,
+            tool_client: None,
         });
         let polling = panel.downgrade();
         cx.spawn(async move |cx| {
@@ -710,6 +778,624 @@ impl DebugPanel {
     /// The newest snapshot of the session, for scripts and tests.
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// Connects the tools of the MCP server to this window: their breakpoints, their
+    /// session and their steps go through the same gutter, trees and console as the
+    /// buttons of the user.
+    pub(crate) fn set_tool_debug(&mut self, bridge: Arc<DebugBridge>) {
+        self.tool_debug = Some(bridge);
+    }
+
+    /// Takes the jobs the MCP tools left and answers the ones that can be answered now.
+    fn poll_tool_jobs(&mut self, cx: &mut Context<Self>) {
+        let Some(bridge) = self.tool_debug.clone() else {
+            return;
+        };
+        while let Some(job) = bridge.take_job() {
+            self.take_tool_job(job, cx);
+        }
+        self.answer_tool_jobs(cx);
+    }
+
+    fn take_tool_job(&mut self, job: ToolJob, cx: &mut Context<Self>) {
+        match job.request.clone() {
+            ToolRequest::SetBreakpoint(query) => {
+                let message = query.log_message.clone();
+                match self.set_breakpoint_from_tool(
+                    &query.path,
+                    query.line,
+                    query.condition,
+                    message,
+                    cx,
+                ) {
+                    Ok(info) => job.answer(ToolAnswer::Breakpoint(info)),
+                    Err(message) => job.fail(message),
+                }
+            }
+            ToolRequest::RemoveBreakpoint(id) => {
+                self.remove_breakpoint(id.path, id.line, cx);
+                job.answer(ToolAnswer::Removed);
+            }
+            ToolRequest::Breakpoints => {
+                job.answer(ToolAnswer::Breakpoints(self.tool_breakpoints()));
+            }
+            ToolRequest::Run(request) => {
+                match self.start_tool_debug(&request, job.client.as_deref(), cx) {
+                    Ok(session) => job.answer(ToolAnswer::Started(session)),
+                    Err(message) => job.fail(message),
+                }
+            }
+            ToolRequest::Wait(query) => {
+                let seconds = query.seconds.clamp(1, 120);
+                self.tool_waits.push(PendingWait {
+                    job,
+                    deadline: Instant::now() + Duration::from_secs(seconds),
+                });
+            }
+            ToolRequest::Step { step, seconds } => {
+                if self.debugger.is_none()
+                    || !matches!(self.snapshot.state, DebugState::Stopped { .. })
+                {
+                    job.fail("the program is not stopped");
+                    return;
+                }
+                let stops = self.snapshot.stops;
+                let command = match step {
+                    tool_gateway::DebugStep::Over => Command::Next,
+                    tool_gateway::DebugStep::Into => Command::StepIn,
+                    tool_gateway::DebugStep::Out => Command::StepOut,
+                    tool_gateway::DebugStep::Continue => Command::Continue,
+                };
+                self.run_away(cx);
+                self.send(command, cx);
+                let seconds = seconds.clamp(1, 120);
+                self.tool_steps.push(PendingStep {
+                    job,
+                    stops,
+                    deadline: Instant::now() + Duration::from_secs(seconds),
+                });
+            }
+            ToolRequest::Stack(query) => {
+                let thread = query.thread;
+                if let (Some(id), Some(current)) = (thread, self.snapshot.current_thread)
+                    && id != current
+                {
+                    self.send(Command::SelectThread(id), cx);
+                }
+                self.tool_stacks.push(PendingStack {
+                    job,
+                    thread,
+                    frames: query.frames,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                });
+            }
+            ToolRequest::Variables(query) => {
+                self.tool_variables.push(PendingVariables {
+                    job,
+                    frame: query.frame,
+                    depth: query.depth,
+                    variables: query.variables,
+                    selected: None,
+                    expanded: BTreeSet::new(),
+                    deadline: Instant::now() + Duration::from_secs(10),
+                });
+            }
+            ToolRequest::Evaluate(query) => self.evaluate_for_tool(job, query, cx),
+            ToolRequest::Stop => {
+                if self.debugger.is_none()
+                    || matches!(
+                        self.snapshot.state,
+                        DebugState::Terminated | DebugState::Inactive
+                    )
+                {
+                    job.fail("debugging is not running");
+                    return;
+                }
+                self.stop(cx);
+                job.answer(ToolAnswer::Stopped);
+            }
+        }
+    }
+
+    /// Sets a breakpoint of the tool as the gutter sets one: the editor and the
+    /// Breakpoints window show it at once.
+    fn set_breakpoint_from_tool(
+        &mut self,
+        file: &Path,
+        line: u32,
+        condition: Option<String>,
+        log_message: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<BreakpointInfo, String> {
+        if line == 0 {
+            return Err("lines start at 1".to_string());
+        }
+        let file = file.to_path_buf();
+        let existing = self
+            .breakpoints
+            .iter()
+            .position(|breakpoint| breakpoint.file == file && breakpoint.line == line);
+        let mut setting = match existing {
+            Some(index) => self.breakpoints.remove(index),
+            None => BreakpointSetting::new(file.clone(), line),
+        };
+        setting.log_message = log_message.clone();
+        setting.condition = condition.clone();
+        setting.suspend = log_message.is_none();
+        setting.enabled = true;
+        let spec = setting.spec();
+        self.send(Command::SetBreakpoint(spec), cx);
+        let info = BreakpointInfo {
+            path: file,
+            line,
+            enabled: setting.enabled,
+            verified: self.verified_breakpoint(&setting.file, line),
+            condition,
+            log_message,
+        };
+        self.breakpoints.push(setting);
+        self.breakpoints
+            .sort_by(|left, right| (&left.file, left.line).cmp(&(&right.file, right.line)));
+        self.changed(cx);
+        Ok(info)
+    }
+
+    /// Whether the adapter accepted the breakpoint of that line.
+    fn verified_breakpoint(&self, file: &Path, line: u32) -> bool {
+        self.shown_breakpoints
+            .iter()
+            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
+            .is_some_and(|breakpoint| breakpoint.verified)
+    }
+
+    fn tool_breakpoints(&self) -> Vec<BreakpointInfo> {
+        self.breakpoints
+            .iter()
+            .map(|breakpoint| BreakpointInfo {
+                path: breakpoint.file.clone(),
+                line: breakpoint.line,
+                enabled: breakpoint.enabled,
+                verified: self.verified_breakpoint(&breakpoint.file, breakpoint.line),
+                condition: breakpoint.condition.clone(),
+                log_message: breakpoint.log_message.clone(),
+            })
+            .collect()
+    }
+
+    /// Starts a test or a configuration under the debugger through the Run window, the
+    /// same way Shift+F9 does, and answers the id of the session.
+    fn start_tool_debug(
+        &mut self,
+        request: &tool_gateway::DebugRunRequest,
+        client: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if self.debugger.is_some()
+            && !matches!(
+                self.snapshot.state,
+                DebugState::Terminated | DebugState::Inactive
+            )
+        {
+            return Err("a debug session is already running".to_string());
+        }
+        let runs = cx
+            .try_global::<crate::script::ActiveRunPanel>()
+            .map(|panel| panel.0.clone())
+            .ok_or_else(|| "the Run window is not connected yet".to_string())?;
+        let started = match (&request.configuration, &request.suite) {
+            (Some(name), _) => runs.update(cx, |runs, cx| {
+                runs.debug_configuration_from_tool(name, client, cx)
+            }),
+            (None, Some(suite)) => {
+                let test = runner::TestRequest {
+                    module: request.module.clone(),
+                    package: None,
+                    suite: Some(suite.clone()),
+                    case: request.case.clone(),
+                    cases: Vec::new(),
+                };
+                runs.update(cx, |runs, cx| runs.debug_tests_from_tool(test, client, cx))
+            }
+            _ => Err("pass a suite or a configuration".to_string()),
+        };
+        started?;
+        self.next_tool_session += 1;
+        let session = format!("debug-{}", self.next_tool_session);
+        self.tool_client = client.map(str::to_string);
+        // A session that ended is gone before the new one starts, so a stop of the old
+        // session cannot answer the wait of the new one.
+        if self.debugger.is_some() {
+            self.reset_session();
+        }
+        // The start of the Run window is asynchronous. The session counts as starting
+        // at once, so a tool that waits for the first stop does not read the end of the
+        // previous session.
+        self.snapshot = Snapshot {
+            state: DebugState::Starting,
+            ..Snapshot::default()
+        };
+        cx.notify();
+        Ok(session)
+    }
+
+    /// Evaluates an expression of a tool through the adapter and answers its value.
+    fn evaluate_for_tool(
+        &mut self,
+        job: ToolJob,
+        query: tool_gateway::DebugEvaluateQuery,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(debugger) = self.debugger.clone() else {
+            job.fail("debugging is not running");
+            return;
+        };
+        if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            job.fail("the program is not stopped");
+            return;
+        }
+        let index = query.frame.unwrap_or(0);
+        let Some(frame) = self.snapshot.frames.get(index).map(|frame| frame.id) else {
+            job.fail("the stack has no such frame");
+            return;
+        };
+        let expression = query.expression;
+        let arguments = serde_json::json!({
+            "expression": expression,
+            "frameId": frame,
+            "context": "repl",
+        });
+        let asked = expression.clone();
+        cx.spawn(async move |this, cx| {
+            let answer = debugger.request("evaluate", arguments).await;
+            this.update(cx, |panel, cx| panel.tool_evaluated(job, asked, answer, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn tool_evaluated(
+        &mut self,
+        job: ToolJob,
+        expression: String,
+        answer: Result<serde_json::Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match answer {
+            Ok(body) => {
+                let value = body
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let type_name = body
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                job.answer(ToolAnswer::Value(DebugValue {
+                    expression,
+                    value,
+                    type_name,
+                }));
+            }
+            Err(error) => job.fail(format!(
+                "the program could not evaluate the expression: {error}"
+            )),
+        }
+        cx.notify();
+    }
+
+    /// Answers the tools that wait for the session with the newest state.
+    fn answer_tool_jobs(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.answer_tool_waits(now);
+        self.answer_tool_steps(now);
+        self.answer_tool_stacks(now);
+        self.answer_tool_variables(now, cx);
+    }
+
+    fn answer_tool_waits(&mut self, now: Instant) {
+        let waits = std::mem::take(&mut self.tool_waits);
+        let mut keep = Vec::new();
+        for wait in waits {
+            let stopped = matches!(self.snapshot.state, DebugState::Stopped { .. });
+            // A start of the Run window is not the end of the session: the debugger of
+            // the new one comes a moment later.
+            let over = matches!(
+                self.snapshot.state,
+                DebugState::Terminated | DebugState::Inactive
+            );
+            if stopped || over || now >= wait.deadline {
+                wait.job.answer(ToolAnswer::State(self.tool_state()));
+            } else {
+                keep.push(wait);
+            }
+        }
+        self.tool_waits = keep;
+    }
+
+    fn answer_tool_steps(&mut self, now: Instant) {
+        let steps = std::mem::take(&mut self.tool_steps);
+        let mut keep = Vec::new();
+        for step in steps {
+            let stopped = matches!(self.snapshot.state, DebugState::Stopped { .. })
+                && self.snapshot.stops > step.stops;
+            let over = self.debugger.is_none()
+                || matches!(
+                    self.snapshot.state,
+                    DebugState::Terminated | DebugState::Inactive
+                );
+            if stopped || over || now >= step.deadline {
+                step.job.answer(ToolAnswer::State(self.tool_state()));
+            } else {
+                keep.push(step);
+            }
+        }
+        self.tool_steps = keep;
+    }
+
+    fn answer_tool_stacks(&mut self, now: Instant) {
+        let stacks = std::mem::take(&mut self.tool_stacks);
+        let mut keep = Vec::new();
+        for stack in stacks {
+            if self.debugger.is_none()
+                || matches!(
+                    self.snapshot.state,
+                    DebugState::Terminated | DebugState::Inactive
+                )
+            {
+                stack.job.fail("debugging is not running");
+                continue;
+            }
+            if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+                stack
+                    .job
+                    .fail("the program is running, wait for a stop with debug_wait".to_string());
+                continue;
+            }
+            if let Some(thread) = stack.thread
+                && self.snapshot.current_thread != Some(thread)
+            {
+                if now >= stack.deadline {
+                    stack
+                        .job
+                        .fail(format!("the adapter did not show thread {thread}"));
+                } else {
+                    keep.push(stack);
+                }
+                continue;
+            }
+            let thread = self
+                .snapshot
+                .current_thread
+                .and_then(|id| self.snapshot.threads.iter().find(|thread| thread.id == id))
+                .map(|thread| DebugThread {
+                    id: thread.id,
+                    name: thread.name.clone(),
+                });
+            let total = self.snapshot.frames.len();
+            let frames = self
+                .snapshot
+                .frames
+                .iter()
+                .take(stack.frames)
+                .enumerate()
+                .map(|(index, frame)| self.tool_frame(index, frame))
+                .collect();
+            stack.job.answer(ToolAnswer::Stack(DebugStack {
+                thread,
+                total,
+                frames,
+            }));
+        }
+        self.tool_stacks = keep;
+    }
+
+    fn answer_tool_variables(&mut self, now: Instant, cx: &mut Context<Self>) {
+        let variables = std::mem::take(&mut self.tool_variables);
+        let mut keep = Vec::new();
+        for mut pending in variables {
+            if self.debugger.is_none()
+                || matches!(
+                    self.snapshot.state,
+                    DebugState::Terminated | DebugState::Inactive
+                )
+            {
+                pending.job.fail("debugging is not running");
+                continue;
+            }
+            if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+                pending
+                    .job
+                    .fail("the program is running, wait for a stop with debug_wait".to_string());
+                continue;
+            }
+            let Some(frame) = self
+                .snapshot
+                .frames
+                .get(pending.frame)
+                .map(|frame| frame.id)
+            else {
+                pending.job.fail("the stack has no such frame");
+                continue;
+            };
+            if self.snapshot.selected_frame != Some(frame) {
+                if pending.selected != Some(frame) {
+                    pending.selected = Some(frame);
+                    self.send(Command::SelectFrame(frame), cx);
+                }
+                if now >= pending.deadline {
+                    pending
+                        .job
+                        .fail("the adapter did not show the frame of the stack");
+                } else {
+                    keep.push(pending);
+                }
+                continue;
+            }
+            let mut missing = Vec::new();
+            self.missing_children(pending.depth, &mut missing);
+            let mut waiting = false;
+            for reference in missing {
+                waiting = true;
+                if pending.expanded.insert(reference) {
+                    self.send(Command::Expand(reference), cx);
+                }
+            }
+            if waiting && now < pending.deadline {
+                keep.push(pending);
+                continue;
+            }
+            let answer = self.tool_variables_of(&pending);
+            pending.job.answer(ToolAnswer::Variables(answer));
+        }
+        self.tool_variables = keep;
+    }
+
+    /// The references whose children the answer needs but the snapshot does not have.
+    fn missing_children(&self, depth: usize, out: &mut Vec<i64>) {
+        fn walk(
+            snapshot: &Snapshot,
+            variables: &[Variable],
+            level: usize,
+            depth: usize,
+            out: &mut Vec<i64>,
+        ) {
+            for variable in variables {
+                if variable.reference == 0 || level >= depth {
+                    continue;
+                }
+                match snapshot.variables.get(&variable.reference) {
+                    Some(children) => walk(snapshot, children, level + 1, depth, out),
+                    None => out.push(variable.reference),
+                }
+            }
+        }
+        for scope in &self.snapshot.scopes {
+            match self.snapshot.variables.get(&scope.reference) {
+                Some(children) => walk(&self.snapshot, children, 0, depth, out),
+                None => out.push(scope.reference),
+            }
+        }
+    }
+
+    fn tool_variables_of(&self, pending: &PendingVariables) -> DebugVariables {
+        let mut total = 0;
+        let mut clipped = false;
+        let mut scopes = Vec::new();
+        for scope in &self.snapshot.scopes {
+            let children = self
+                .snapshot
+                .variables
+                .get(&scope.reference)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut shown = 0;
+            let variables = children
+                .iter()
+                .filter_map(|variable| {
+                    self.tool_variable(
+                        variable,
+                        0,
+                        pending.depth,
+                        pending.variables,
+                        &mut shown,
+                        &mut clipped,
+                    )
+                })
+                .collect();
+            total += shown;
+            scopes.push(DebugScope {
+                name: scope.name.clone(),
+                variables,
+            });
+        }
+        DebugVariables {
+            scopes,
+            total,
+            clipped,
+        }
+    }
+
+    fn tool_variable(
+        &self,
+        variable: &Variable,
+        level: usize,
+        depth: usize,
+        limit: usize,
+        shown: &mut usize,
+        clipped: &mut bool,
+    ) -> Option<DebugVariable> {
+        if *shown >= limit {
+            *clipped = true;
+            return None;
+        }
+        *shown += 1;
+        let children = if level < depth {
+            self.snapshot
+                .variables
+                .get(&variable.reference)
+                .map(|children| {
+                    children
+                        .iter()
+                        .filter_map(|child| {
+                            self.tool_variable(child, level + 1, depth, limit, shown, clipped)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Some(DebugVariable {
+            name: variable.name.clone(),
+            value: variable.value.clone(),
+            type_name: variable.type_name.clone(),
+            children,
+        })
+    }
+
+    fn tool_state(&self) -> DebugSessionState {
+        let state = match &self.snapshot.state {
+            DebugState::Inactive | DebugState::Terminated => "ended",
+            DebugState::Starting => "starting",
+            DebugState::Running => "running",
+            DebugState::Stopped { .. } => "stopped",
+        };
+        let reason = match &self.snapshot.state {
+            DebugState::Stopped { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        let thread = self
+            .snapshot
+            .current_thread
+            .and_then(|id| self.snapshot.threads.iter().find(|thread| thread.id == id))
+            .map(|thread| DebugThread {
+                id: thread.id,
+                name: thread.name.clone(),
+            });
+        let frame = self
+            .snapshot
+            .frames
+            .first()
+            .map(|frame| self.tool_frame(0, frame));
+        DebugSessionState {
+            state: state.to_string(),
+            reason,
+            thread,
+            frame,
+        }
+    }
+
+    fn tool_frame(&self, index: usize, frame: &Frame) -> DebugFrame {
+        DebugFrame {
+            index,
+            name: frame.name.clone(),
+            path: frame.source.clone(),
+            line: frame.line,
+            column: frame.column,
+        }
     }
 
     /// The values of the frame at the stop, with the ones that changed since the
@@ -1172,6 +1858,7 @@ impl DebugPanel {
             entry: entry.clone(),
         });
         self.reset_session();
+        self.note_tool_client();
         self.session = service.begin_session();
         if let Some(hub) = cx.try_global::<ActiveDebugHub>() {
             hub.0.clear();
@@ -1255,6 +1942,7 @@ impl DebugPanel {
 
     fn begin_attach(&mut self, debugger: Debugger, cx: &mut Context<Self>) {
         self.reset_session();
+        self.note_tool_client();
         if let Some(hub) = cx.try_global::<ActiveDebugHub>() {
             hub.0.clear();
         }
@@ -1914,6 +2602,8 @@ impl DebugPanel {
     ) {
         let text = text.trim().to_owned();
         if let Some(setting) = self.find(file, line) {
+            // The user edits the point: the message an agent set gives way.
+            setting.log_message = None;
             setting.log_expression = (!text.is_empty()).then_some(text);
             let spec = setting.spec();
             self.send(Command::SetBreakpoint(spec), cx);
@@ -1982,6 +2672,15 @@ impl DebugPanel {
         cx.notify();
     }
 
+    /// Says in the console which client asked for the session, once the session starts.
+    fn note_tool_client(&mut self) {
+        let Some(client) = self.tool_client.take() else {
+            return;
+        };
+        self.local_console
+            .push(ConsoleLine::new(format!("Started by {client}"), false));
+    }
+
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.save_state();
         cx.emit(BreakpointsChanged);
@@ -2014,6 +2713,8 @@ impl DebugPanel {
 
     fn poll(&mut self, cx: &mut Context<Self>) {
         let mut build_changed = self.poll_build(cx);
+        // The tools answer from the snapshot of this poll, so their jobs come first.
+        self.poll_tool_jobs(cx);
         if let Some(reason) = self.debugger.as_ref().and_then(Debugger::take_input_error) {
             self.input_error_line(&reason);
             build_changed = true;
@@ -2029,12 +2730,14 @@ impl DebugPanel {
             if let Some(hub) = cx.try_global::<ActiveDebugHub>() {
                 hub.0.clear();
             }
+            self.answer_tool_jobs(cx);
             if build_changed {
                 cx.notify();
             }
             return;
         };
         let Some(snapshot) = debugger.poll() else {
+            self.answer_tool_jobs(cx);
             if build_changed {
                 cx.notify();
             }
@@ -2121,6 +2824,7 @@ impl DebugPanel {
         if breakpoints_changed {
             cx.emit(BreakpointsChanged);
         }
+        self.answer_tool_jobs(cx);
         cx.notify();
     }
 
@@ -5232,7 +5936,11 @@ impl Render for BreakpointPopup {
                 setting.enabled,
                 setting.suspend,
                 setting.hit_message,
-                setting.log_expression.clone().unwrap_or_default(),
+                setting
+                    .log_expression
+                    .clone()
+                    .or_else(|| setting.log_message.clone())
+                    .unwrap_or_default(),
             ),
             None => (String::new(), false, false, false, String::new()),
         };
@@ -5425,7 +6133,11 @@ impl Render for BreakpointsView {
             let on = setting.enabled;
             let suspend = setting.suspend;
             let hit_message = setting.hit_message;
-            let log_expression = setting.log_expression.clone().unwrap_or_default();
+            let log_expression = setting
+                .log_expression
+                .clone()
+                .or_else(|| setting.log_message.clone())
+                .unwrap_or_default();
             let line = setting.line;
             let enable_file = setting.file.clone();
             let condition_file = setting.file.clone();
@@ -6307,6 +7019,13 @@ mod tests {
                 stop_values: BTreeMap::new(),
                 changed_values: BTreeSet::new(),
                 values_stop: 0,
+                tool_debug: None,
+                tool_waits: Vec::new(),
+                tool_steps: Vec::new(),
+                tool_stacks: Vec::new(),
+                tool_variables: Vec::new(),
+                next_tool_session: 0,
+                tool_client: None,
             })
         })
     }

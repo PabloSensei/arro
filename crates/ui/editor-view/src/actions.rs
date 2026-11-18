@@ -12,8 +12,8 @@ use lang_api::{
 use text_core::{Edit, RopeStore, TextStore};
 use ui_kit::*;
 
-use crate::semantic::{NO_ANSWER, first, offset_at, point_at};
-use crate::view::{EditorEvent, EditorView};
+use crate::semantic::{NO_ANSWER, first, offset_at, point_at, uri_path};
+use crate::view::{AiProblem, EditorEvent, EditorView};
 
 /// The caret rests this long before its occurrences are asked for.
 const HIGHLIGHT_DELAY: Duration = Duration::from_millis(250);
@@ -111,6 +111,10 @@ pub(crate) enum Pick {
     CreateTest {
         spot: DocumentSpot,
     },
+    /// Fix with AI: the window sends the diagnostic under the caret to the agent.
+    FixWithAi {
+        problem: AiProblem,
+    },
     /// Add Inline Watch: the expression of the caret and its line, from zero.
     InlineWatch {
         line: usize,
@@ -148,6 +152,7 @@ impl Pick {
             | Self::SaveSpelling { label, .. } => label,
             Self::CreateTest { .. } => "Create Test",
             Self::InlineWatch { .. } => "Add Inline Watch",
+            Self::FixWithAi { .. } => "Fix with AI",
         }
     }
 
@@ -546,6 +551,35 @@ impl EditorView {
         })
     }
 
+    /// The error or warning under the caret, for Fix with AI.
+    fn ai_problem_at(&self, caret: usize) -> Option<AiProblem> {
+        if !self.options.ai_features {
+            return None;
+        }
+        let (lsp, state) = (self.lsp.as_ref()?, self.state.as_ref()?);
+        let mark = lsp
+            .server_marks
+            .iter()
+            .chain(lsp.native_marks.values().flatten())
+            .find(|mark| {
+                mark.range.start <= caret
+                    && caret <= mark.range.end
+                    && matches!(
+                        mark.severity,
+                        lang_api::Severity::Error | lang_api::Severity::Warning
+                    )
+                    && mark.code.as_deref() != Some(lang_api::SPELLING_INSPECTION)
+            })?;
+        Some(AiProblem {
+            path: uri_path(&lsp.uri)?,
+            line: state.store().offset_to_line(mark.range.start),
+            severity: mark.severity,
+            message: mark.message.clone(),
+            code: mark.code.clone(),
+            text: state.text(),
+        })
+    }
+
     /// Alt+Enter: fixes of the problem under the caret first, then the suppressions of
     /// its check and the other actions.
     pub(crate) fn show_actions(&mut self, cx: &mut Context<Self>) {
@@ -567,6 +601,10 @@ impl EditorView {
                 .into_iter()
                 .map(|row| (row.section(), row)),
         );
+        // Fix with AI is the last row of the menu, after every fix and intention.
+        if let Some(problem) = self.ai_problem_at(caret) {
+            own.push((MenuSection::Intention, Pick::FixWithAi { problem }));
+        }
         let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.actions()) else {
             if own.is_empty() {
                 self.show_transient_note(caret, NO_ACTIONS, cx);
@@ -1004,6 +1042,9 @@ impl EditorView {
                         cx.emit(EditorEvent::EditInspection(id))
                     }
                     (Some(Pick::CreateTest { spot }), _) => cx.emit(EditorEvent::CreateTest(spot)),
+                    (Some(Pick::FixWithAi { problem }), _) => {
+                        cx.emit(EditorEvent::FixWithAi(problem))
+                    }
                     (Some(Pick::InlineWatch { line, expression }), _) => {
                         cx.emit(EditorEvent::AddInlineWatch { line, expression })
                     }

@@ -18,8 +18,8 @@ use workspace::{Settings, ToggleTerminal, Workspace};
 use crate::navigation;
 use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
-    CellMetrics, GridView, Position, Selection, every_frame, grid, is_paste, line_selection,
-    scroll_lines, selection_text, send_key, word_at,
+    CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, is_paste, pressed,
+    scroll_lines, send_key,
 };
 use crate::term_links::{LinkKind, LinkText};
 use crate::term_tabs::{self, Split, TabState, TabsState};
@@ -704,18 +704,13 @@ impl TerminalPanel {
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(pane) = self.tabs.get_mut(self.active).map(|tab| tab.pane()) else {
+        let Some(pane) = self.tabs.get(self.active).map(|tab| tab.pane()) else {
             return false;
         };
-        let (Some(session), Some(selection)) = (pane.session(), pane.selection) else {
+        let Some(session) = pane.session() else {
             return false;
         };
-        let text = selection_text(&session.screen(), selection);
-        if text.is_empty() {
-            return false;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        true
+        crate::term_grid::copy_selection(session, pane.selection, cx)
     }
 
     fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -1006,24 +1001,7 @@ impl TerminalPanel {
             return;
         };
         found.hover = None;
-        if clicks >= 3 {
-            let screen = session.screen();
-            let row = position.line + screen.display_offset as i32;
-            if row >= 0 && row < screen.rows as i32 {
-                found.selection = Some(line_selection(&screen, row as u16, position.line));
-            }
-            found.dragging = None;
-        } else if clicks == 2 {
-            let screen = session.screen();
-            let row = position.line + screen.display_offset as i32;
-            if row >= 0 && row < screen.rows as i32 {
-                found.selection = word_at(&screen, row as u16, position.line, position.column);
-            }
-            found.dragging = None;
-        } else {
-            found.selection = None;
-            found.dragging = Some(position);
-        }
+        (found.selection, found.dragging) = pressed(&session.screen(), position, clicks);
         chosen.active = pane;
         cx.notify();
     }
@@ -1876,6 +1854,55 @@ impl Render for TerminalPanel {
             .child(measure)
             .child(panel_header("Terminal", GROUP, hide, &theme))
             .child(body)
+    }
+}
+
+impl GridPanel for TerminalPanel {
+    fn pane_focus(&self, pane: usize) -> FocusHandle {
+        TerminalPanel::pane_focus(self, pane)
+    }
+
+    fn grid_pressed(
+        &mut self,
+        pane: usize,
+        position: Position,
+        clicks: usize,
+        cx: &mut Context<Self>,
+    ) {
+        TerminalPanel::grid_pressed(self, pane, position, clicks, cx)
+    }
+
+    fn grid_moved(
+        &mut self,
+        pane: usize,
+        position: Option<Position>,
+        control: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        TerminalPanel::grid_moved(self, pane, position, control, cx)
+    }
+
+    fn grid_released(&mut self, pane: usize, cx: &mut Context<Self>) {
+        TerminalPanel::grid_released(self, pane, cx)
+    }
+
+    fn grid_context_menu(&mut self, pane: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        TerminalPanel::grid_context_menu(self, pane, position, cx)
+    }
+
+    fn link_at(&self, pane: usize, position: Position) -> Option<LinkText> {
+        TerminalPanel::link_at(self, pane, position)
+    }
+
+    fn open_link(
+        &mut self,
+        pane: usize,
+        position: Position,
+        link: LinkText,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        TerminalPanel::open_link(self, pane, position, link, window, cx)
     }
 }
 

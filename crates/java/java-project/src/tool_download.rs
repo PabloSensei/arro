@@ -352,8 +352,8 @@ fn extract_zip(
         let target = into.join(&relative);
         if entry.is_dir() {
             fs::create_dir_all(&target).map_err(DownloadError::Files)?;
-            platform::set_mode(&target, entry.unix_mode().unwrap_or(0o755))
-                .map_err(DownloadError::Files)?;
+            let mode = directory_mode(entry.unix_mode().unwrap_or(0o755));
+            platform::set_mode(&target, mode).map_err(DownloadError::Files)?;
             continue;
         }
         let mode = file_mode(entry.unix_mode(), is_program(&relative));
@@ -385,6 +385,17 @@ fn file_mode(recorded: Option<u32>, program: bool) -> Option<u32> {
     match recorded {
         None | Some(0) if program => Some(0o755),
         Some(mode) if program => Some(mode | 0o111),
+        mode => mode,
+    }
+}
+
+/// The permission bits of an unpacked directory. The files below it are written after it,
+/// so a directory without the owner's write bit cannot take them: an empty header means
+/// the usual `0o755`, and a directory whose owner cannot write gets the bits to do so.
+fn directory_mode(recorded: u32) -> u32 {
+    match recorded {
+        0 => 0o755,
+        mode if mode & 0o200 == 0 => mode | 0o700,
         mode => mode,
     }
 }
@@ -441,7 +452,7 @@ fn extract_tar_gz(
             if !relative.as_os_str().is_empty() {
                 let target = into.join(relative);
                 fs::create_dir_all(&target).map_err(DownloadError::Files)?;
-                platform::set_mode(&target, mode).map_err(DownloadError::Files)?;
+                platform::set_mode(&target, directory_mode(mode)).map_err(DownloadError::Files)?;
             }
             skip_data(&mut reader, size)?;
             continue;
@@ -907,6 +918,30 @@ pub(crate) mod testing {
         bytes
     }
 
+    /// A tar.gz whose `lib` folder entry carries `mode`, with the files below that folder.
+    #[cfg(unix)]
+    pub(crate) fn tar_gz_archive_with_folder_mode(
+        top: &str,
+        mode: u32,
+        files: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        let mut tar = Vec::new();
+        tar_entry(&mut tar, &format!("{top}/"), b'5', b"", 0o755);
+        tar_entry(&mut tar, &format!("{top}/lib/"), b'5', b"", mode);
+        for (name, text) in files {
+            tar_entry(&mut tar, &format!("{top}/{name}"), b'0', text, 0o644);
+        }
+        tar.extend_from_slice(&[0u8; 1024]);
+        let mut bytes = Vec::new();
+        {
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut bytes, flate2::Compression::default());
+            encoder.write_all(&tar).unwrap();
+            encoder.finish().unwrap();
+        }
+        bytes
+    }
+
     fn tar_entry(out: &mut Vec<u8>, name: &str, kind: u8, data: &[u8], mode: u32) {
         let size = data.len();
         let mut header = [0u8; 512];
@@ -1032,6 +1067,61 @@ mod tests {
         assert_eq!(super::file_mode(Some(0o644), false), Some(0o644));
         assert_eq!(super::file_mode(Some(0), false), Some(0));
         assert_eq!(super::file_mode(None, false), None);
+    }
+
+    #[test]
+    fn a_folder_gets_the_bits_its_files_need() {
+        assert_eq!(
+            super::directory_mode(0),
+            0o755,
+            "an empty header means the usual folder"
+        );
+        assert_eq!(
+            super::directory_mode(0o555),
+            0o755,
+            "a folder whose owner cannot write takes the files below it"
+        );
+        assert_eq!(super::directory_mode(0o500), 0o700);
+        assert_eq!(super::directory_mode(0o755), 0o755);
+        assert_eq!(super::directory_mode(0o775), 0o775);
+    }
+
+    /// A tar header may leave the mode of a folder empty, and a distribution may pack its
+    /// folders without the write bit of the owner. The files below them still unpack, so
+    /// the folder of a home is readable after the unpacking.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_without_its_own_permissions_still_takes_the_files_inside_it() {
+        let work = test_support::TempDir::new("tool-tar-folder-mode");
+        let cancel = base::Cancel::new();
+
+        for mode in [0, 0o555] {
+            let tar = work.path().join(format!("tool-{mode:o}-bin.tar.gz"));
+            std::fs::write(
+                &tar,
+                super::testing::tar_gz_archive_with_folder_mode(
+                    "tool-1.0",
+                    mode,
+                    &[("lib/tool.txt", b"data")],
+                ),
+            )
+            .unwrap();
+            let into = work.path().join(format!("tar-{mode:o}"));
+            std::fs::create_dir_all(&into).unwrap();
+            super::extract_tar_gz(&tar, &into, "tool-1.0", &cancel).unwrap();
+
+            let lib = into.join("lib");
+            assert_eq!(
+                std::fs::read_to_string(lib.join("tool.txt")).unwrap(),
+                "data",
+                "the file inside a folder of mode {mode:o} is unpacked"
+            );
+            assert_eq!(
+                platform::mode(&lib).unwrap() & 0o700,
+                0o700,
+                "the owner writes into a folder of mode {mode:o}"
+            );
+        }
     }
 
     /// The build starts the program of a home directly, so a copy unpacked on a Unix

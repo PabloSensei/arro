@@ -779,6 +779,8 @@ impl BranchPopup {
         self.submenu_entries = entries;
         self.submenu_state.clear();
         self.submenu_state.hover(&[0]);
+        // The lists of a new submenu have their own scroll, not the one of the last submenu.
+        self.submenu_geometry = MenuGeometry::default();
         cx.notify();
     }
 
@@ -788,6 +790,7 @@ impl BranchPopup {
         }
         self.submenu_entries.clear();
         self.submenu_state.clear();
+        self.submenu_geometry = MenuGeometry::default();
         cx.notify();
         true
     }
@@ -1058,12 +1061,25 @@ impl BranchPopup {
             match key {
                 "down" => {
                     self.submenu_state.move_down(&self.submenu_entries);
+                    self.submenu_geometry.reveal(&self.submenu_state);
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
                 "up" => {
                     self.submenu_state.move_up(&self.submenu_entries);
+                    self.submenu_geometry.reveal(&self.submenu_state);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "home" | "end" => {
+                    if key == "home" {
+                        self.submenu_state.move_first(&self.submenu_entries);
+                    } else {
+                        self.submenu_state.move_last(&self.submenu_entries);
+                    }
+                    self.submenu_geometry.reveal(&self.submenu_state);
                     cx.stop_propagation();
                     cx.notify();
                     return;
@@ -2042,7 +2058,7 @@ impl Render for BranchPopup {
             let entries = &self.submenu_entries;
             let state = &self.submenu_state;
             let geometry = &self.submenu_geometry;
-            let menu = menu(entries, state, geometry, &callbacks, viewport, &theme);
+            let menu = menu(entries, state, geometry, &callbacks, &theme, window, cx);
             body = body.child(
                 deferred(
                     anchored()

@@ -423,6 +423,9 @@ pub const TERMINAL_TOOL: &str = "terminal";
 pub const RUN_TOOL: &str = "run";
 pub const DEBUG_TOOL: &str = "debug";
 pub const AI_TOOL: &str = "ai";
+/// The command of the agents indicator of the status bar: it opens the AI window on the
+/// tab of the connected MCP clients.
+pub const AI_CLIENTS: &str = "ai.mcp.clients";
 pub const TASKS_TOOL: &str = "tasks";
 pub const COMMIT_TOOL: &str = "commit";
 pub const STRUCTURE_TOOL: &str = "structure";
@@ -704,6 +707,10 @@ pub struct Workspace {
     tool_activator: Option<ToolActivator>,
     /// The state of the language server, shown in the status bar.
     pub(crate) language_status: Option<SharedString>,
+    /// The MCP clients that are connected now, and whether one of them runs an `Execute`
+    /// tool, for the indicator of the status bar.
+    pub(crate) agent_clients: usize,
+    pub(crate) agent_busy: bool,
     /// The explanation behind the language status line, for the balloon of a click.
     pub(crate) language_details: Option<SharedString>,
     /// A page with the tool the language server did not find, and the label of its button.
@@ -1078,6 +1085,8 @@ impl Workspace {
             config_choose: None,
             tool_activator: None,
             language_status: None,
+            agent_clients: 0,
+            agent_busy: false,
             language_details: None,
             language_download: None,
             language_check: false,
@@ -2526,6 +2535,22 @@ impl Workspace {
 
     pub fn language_status(&self) -> Option<&SharedString> {
         self.language_status.as_ref()
+    }
+
+    /// The connected MCP clients and whether one runs an `Execute` tool.
+    pub fn agent_clients(&self) -> (usize, bool) {
+        (self.agent_clients, self.agent_busy)
+    }
+
+    /// The number of the agents indicator of the status bar, and the mark of a running
+    /// `Execute` call. Nothing is redrawn while the numbers stay the same.
+    pub fn set_agent_clients(&mut self, clients: usize, busy: bool, cx: &mut Context<Self>) {
+        if self.agent_clients == clients && self.agent_busy == busy {
+            return;
+        }
+        self.agent_clients = clients;
+        self.agent_busy = busy;
+        cx.notify();
     }
 
     /// The first line of `text` stands in the status bar, the rest explains the state
@@ -4683,16 +4708,36 @@ impl Workspace {
             Run(MenuAction),
         }
         let step = {
-            let Some(Overlay::Menu { entries, state, .. }) = self.overlay.as_mut() else {
+            let Some(Overlay::Menu {
+                entries,
+                state,
+                geometry,
+                ..
+            }) = self.overlay.as_mut()
+            else {
                 return false;
             };
+            // The keys that move the highlight also scroll its list into view. A row that
+            // a key opens is not revealed: its list has no viewport until it is drawn.
             match key {
                 "down" => {
                     state.move_down(entries);
+                    geometry.reveal(state);
                     Step::Done
                 }
                 "up" => {
                     state.move_up(entries);
+                    geometry.reveal(state);
+                    Step::Done
+                }
+                "home" => {
+                    state.move_first(entries);
+                    geometry.reveal(state);
+                    Step::Done
+                }
+                "end" => {
+                    state.move_last(entries);
+                    geometry.reveal(state);
                     Step::Done
                 }
                 "right" => {
@@ -4701,6 +4746,7 @@ impl Workspace {
                 }
                 "left" => {
                     if state.close_submenu() {
+                        geometry.reveal(state);
                         Step::Done
                     } else {
                         Step::CloseMenu

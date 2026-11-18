@@ -299,6 +299,12 @@ pub enum SettingField {
     McpExecutePermission,
     /// Whether the terminals put the downloaded second build tool on their `PATH`.
     BuildToolSecondTerminalPath,
+    /// The case Reformat Code gives the keywords of SQL.
+    SqlKeywordCase,
+    /// Whether Run SQL Script stops at the first statement that fails.
+    SqlScriptStopOnError,
+    /// Whether Ask AI, Fix with AI and Explain with AI are offered.
+    AiEnabled,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -1051,6 +1057,30 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::McpExecutePermission,
         keywords: "mcp permission ask allow trusted project build test run agent",
     },
+    Setting {
+        id: "sql_keyword_case",
+        title: "Keyword case",
+        page: SettingsPage::Database,
+        kind: SettingKind::Choice,
+        field: SettingField::SqlKeywordCase,
+        keywords: "sql keyword case upper lower reformat console script database",
+    },
+    Setting {
+        id: "sql_script_stop_on_error",
+        title: "Stop Run SQL Script at the first error",
+        page: SettingsPage::Database,
+        kind: SettingKind::Toggle,
+        field: SettingField::SqlScriptStopOnError,
+        keywords: "sql script run error stop continue statement database",
+    },
+    Setting {
+        id: "ai_enabled",
+        title: "Enable AI features",
+        page: SettingsPage::ToolsAi,
+        kind: SettingKind::Toggle,
+        field: SettingField::AiEnabled,
+        keywords: "ai assistant ask fix explain agent features",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1163,6 +1193,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::BuildToolFirstOffline => Some(settings.build_tools.first.offline),
         SettingField::BuildToolFirstTerminalPath => Some(settings.build_tools.first.terminal_path),
         SettingField::McpEnabled => Some(settings.mcp_enabled),
+        SettingField::AiEnabled => Some(settings.ai_enabled),
         SettingField::BuildToolSecondTerminalPath => {
             Some(settings.build_tools.second.terminal_path)
         }
@@ -1170,6 +1201,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
             Some(settings.build_tools.first.update_snapshots)
         }
         SettingField::BuildToolSecondOffline => Some(settings.build_tools.second.offline),
+        SettingField::SqlScriptStopOnError => Some(settings.sql_script_stop_on_error),
         SettingField::DownloadSourcesAutomatically => Some(settings.download_sources_automatically),
         SettingField::CheckDependencyUpdates => Some(settings.check_dependency_updates),
         SettingField::GitAutoUpdateOnReject => Some(settings.git_auto_update_on_reject),
@@ -1227,7 +1259,8 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::ThemeDark
         | SettingField::IconSet
         | SettingField::McpBinary
-        | SettingField::McpExecutePermission => None,
+        | SettingField::McpExecutePermission
+        | SettingField::SqlKeywordCase => None,
     }
 }
 
@@ -1316,6 +1349,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             settings.build_tools.first.terminal_path = !settings.build_tools.first.terminal_path;
         }
         Some(SettingField::McpEnabled) => settings.mcp_enabled = !settings.mcp_enabled,
+        Some(SettingField::SqlScriptStopOnError) => {
+            settings.sql_script_stop_on_error = !settings.sql_script_stop_on_error;
+        }
+        Some(SettingField::AiEnabled) => settings.ai_enabled = !settings.ai_enabled,
         Some(SettingField::BuildToolSecondTerminalPath) => {
             settings.build_tools.second.terminal_path = !settings.build_tools.second.terminal_path;
         }
@@ -1408,7 +1445,8 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::ThemeDark
             | SettingField::IconSet
             | SettingField::McpBinary
-            | SettingField::McpExecutePermission,
+            | SettingField::McpExecutePermission
+            | SettingField::SqlKeywordCase,
         )
         | None => {
             return false;
@@ -1642,6 +1680,7 @@ pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
             home_kind_label(settings.build_tools.first.home_kind).to_owned()
         }
         SettingField::McpExecutePermission => settings.mcp_execute_permission.label().to_owned(),
+        SettingField::SqlKeywordCase => settings.sql_keyword_case.label().to_owned(),
         _ => return None,
     };
     Some(label)
@@ -1698,6 +1737,9 @@ pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::McpExecutePermission) => {
             settings.mcp_execute_permission = settings.mcp_execute_permission.next();
+        }
+        Some(SettingField::SqlKeywordCase) => {
+            settings.sql_keyword_case = settings.sql_keyword_case.next();
         }
         _ => return false,
     }

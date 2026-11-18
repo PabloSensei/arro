@@ -1,13 +1,14 @@
 //! A scripted agent for UI and flow tests: no network, no process, no money.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::runtime::{
     AgentError, AgentEvent, AgentRuntime, AgentSession, PermissionReply, Role, RuntimeCaps,
@@ -30,6 +31,16 @@ pub enum MockStep {
         tool: String,
         description: String,
     },
+    /// Writes a file of the project as a harness does, so the change tracker and the review
+    /// see the edit. The chat shows the call and its answer.
+    Edit {
+        path: PathBuf,
+        old_text: String,
+        new_text: String,
+    },
+    /// What the user typed. A turn that opens with it shows this text as the message of the
+    /// user instead of the prompt that started the turn.
+    User(String),
     /// Runs until `cancel`.
     Hang,
     Fail(String),
@@ -72,13 +83,14 @@ impl AgentRuntime for MockRuntime {
         }
     }
 
-    fn start(&self, _spec: SessionSpec) -> Result<Box<dyn AgentSession>, AgentError> {
+    fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>, AgentError> {
         let turns = std::mem::take(&mut *self.turns.lock().unwrap());
         let (events, stream) = unbounded();
         let (prompts, inbox) = bounded(64);
         let (replies, answers) = bounded(8);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker = Worker {
+            root: spec.cwd,
             turns,
             tools: self.tools.clone(),
             events,
@@ -137,6 +149,8 @@ impl AgentSession for MockSession {
 }
 
 struct Worker {
+    /// The project folder the edit steps write in.
+    root: PathBuf,
     turns: VecDeque<Vec<MockStep>>,
     tools: Option<ToolInvoker>,
     events: Sender<AgentEvent>,
@@ -155,14 +169,23 @@ impl Worker {
         self.emit(AgentEvent::Status(SessionStatus::WaitingForUser));
         for prompt in inbox {
             self.cancelled.store(false, Ordering::SeqCst);
+            let default = vec![MockStep::Reply("mock reply".to_string())];
+            let mut steps = self.turns.pop_front().unwrap_or(default);
+            // A turn may name the words of the user, so a demo shows what a person would
+            // have typed instead of the prompt that started the turn.
+            let typed = match steps.first().cloned() {
+                Some(MockStep::User(text)) => {
+                    steps.remove(0);
+                    text
+                }
+                _ => prompt,
+            };
             self.emit(AgentEvent::Message {
                 role: Role::User,
-                text: prompt,
+                text: typed,
             });
             self.emit(AgentEvent::TurnStarted);
             self.emit(AgentEvent::Status(SessionStatus::Running));
-            let default = vec![MockStep::Reply("mock reply".to_string())];
-            let steps = self.turns.pop_front().unwrap_or(default);
             let finished = self.play(steps);
             self.emit(AgentEvent::TurnEnded);
             self.emit(AgentEvent::Status(finished));
@@ -191,6 +214,15 @@ impl Worker {
                         return SessionStatus::Done;
                     }
                 }
+                MockStep::Edit {
+                    path,
+                    old_text,
+                    new_text,
+                } => self.edit(index, path, old_text, new_text),
+                MockStep::User(text) => self.emit(AgentEvent::Message {
+                    role: Role::User,
+                    text,
+                }),
                 MockStep::Hang => {
                     while !self.cancelled.load(Ordering::SeqCst) {
                         thread::sleep(POLL);
@@ -219,6 +251,23 @@ impl Worker {
         self.emit(AgentEvent::ToolResult { id, output });
     }
 
+    /// Writes the file the way a harness does: straight to disk, so the change tracker and
+    /// the review of the window see it. The chat shows the call and its answer as for any
+    /// other tool.
+    fn edit(&self, index: usize, path: PathBuf, old_text: String, new_text: String) {
+        let id = format!("edit-{index}");
+        let output = match edit_file(&self.root, &path, &old_text, &new_text) {
+            Ok(()) => format!("Edited {}", path.display()),
+            Err(error) => format!("error: {error}"),
+        };
+        self.emit(AgentEvent::ToolCall {
+            id: id.clone(),
+            name: "Edit".to_string(),
+            input: json!({"path": path}),
+        });
+        self.emit(AgentEvent::ToolResult { id, output });
+    }
+
     fn ask(&self, index: usize, tool: String, description: String) -> bool {
         self.emit(AgentEvent::Status(SessionStatus::WaitingForUser));
         self.emit(AgentEvent::PermissionRequest {
@@ -238,8 +287,34 @@ impl Worker {
     }
 }
 
+/// Replaces the first `old_text` of a file of the project. A path that leaves the project,
+/// a file that is not there and text the file does not hold are refused, so a transcript
+/// can neither overwrite a file outside the project nor guess at its text.
+fn edit_file(root: &Path, path: &Path, old_text: &str, new_text: &str) -> Result<(), String> {
+    let absolute = root.join(path);
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("the project folder is not read: {error}"))?;
+    let file = absolute
+        .canonicalize()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !file.starts_with(&root) {
+        return Err(format!("{} is outside the project", path.display()));
+    }
+    let text = std::fs::read_to_string(&file).map_err(|error| error.to_string())?;
+    let Some(start) = text.find(old_text) else {
+        return Err(format!("{} does not hold that text", path.display()));
+    };
+    let mut changed = String::with_capacity(text.len() + new_text.len());
+    changed.push_str(&text[..start]);
+    changed.push_str(new_text);
+    changed.push_str(&text[start + old_text.len()..]);
+    std::fs::write(&file, changed).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Instant;
 
     use serde_json::json;
@@ -255,6 +330,14 @@ mod tests {
             cols: 80,
             rows: 24,
             tools: None,
+        }
+    }
+
+    fn spec_in(root: &Path) -> SessionSpec {
+        SessionSpec {
+            project: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            ..spec()
         }
     }
 
@@ -383,5 +466,80 @@ mod tests {
         collect(&stream, turn_ended);
         let events = collect(&stream, turn_ended);
         assert!(events.contains(&AgentEvent::TextDelta("two".to_string())));
+    }
+
+    #[test]
+    fn a_user_step_shows_instead_of_the_prompt() {
+        let steps = vec![
+            MockStep::User("what a person would type".to_string()),
+            MockStep::Reply("hello".to_string()),
+        ];
+        let runtime = MockRuntime::new(vec![steps]);
+        let session = runtime.start(spec()).expect("start");
+
+        session.prompt("the prompt of the script").expect("prompt");
+
+        let events = collect(&session.events(), turn_ended);
+        let typed = |text: &str| AgentEvent::Message {
+            role: Role::User,
+            text: text.to_string(),
+        };
+        assert!(events.contains(&typed("what a person would type")));
+        assert!(!events.contains(&typed("the prompt of the script")));
+    }
+
+    #[test]
+    fn an_edit_writes_a_file_of_the_project() {
+        let root = test_support::scratch("mock-edit");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src").join("main.txt");
+        std::fs::write(&file, "alpha\nbeta\n").unwrap();
+        let steps = vec![MockStep::Edit {
+            path: "src/main.txt".into(),
+            old_text: "alpha".to_string(),
+            new_text: "ALPHA".to_string(),
+        }];
+        let runtime = MockRuntime::new(vec![steps]);
+        let session = runtime.start(spec_in(&root)).expect("start");
+
+        session.prompt("edit it").expect("prompt");
+
+        let events = collect(&session.events(), turn_ended);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ALPHA\nbeta\n");
+        let result = AgentEvent::ToolResult {
+            id: "edit-0".to_string(),
+            output: "Edited src/main.txt".to_string(),
+        };
+        assert!(
+            events.contains(&result),
+            "the chat shows the edit: {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_edit_outside_the_project_is_refused() {
+        let root = test_support::scratch("mock-edit-root");
+        let outside = test_support::scratch("mock-edit-outside").join("keep.txt");
+        std::fs::write(&outside, "keep\n").unwrap();
+        let steps = vec![MockStep::Edit {
+            path: outside.clone(),
+            old_text: "keep".to_string(),
+            new_text: "gone".to_string(),
+        }];
+        let runtime = MockRuntime::new(vec![steps]);
+        let session = runtime.start(spec_in(&root)).expect("start");
+
+        session.prompt("edit it").expect("prompt");
+
+        let events = collect(&session.events(), turn_ended);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep\n");
+        let refused = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolResult { output, .. }
+                    if output.starts_with("error: ") && output.contains("outside the project")
+            )
+        });
+        assert!(refused, "the edit is refused: {events:?}");
     }
 }

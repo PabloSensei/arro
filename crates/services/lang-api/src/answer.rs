@@ -33,6 +33,9 @@ pub struct Answer<T> {
     pub value: T,
     pub confidence: Confidence,
     pub source: SourceId,
+    /// A remark of the language about the answer, in words for the user: the part of it
+    /// the language could not reach, for one. The window shows it under the answer.
+    pub note: Option<String>,
 }
 
 impl<T> Answer<T> {
@@ -41,7 +44,14 @@ impl<T> Answer<T> {
             value,
             confidence,
             source,
+            note: None,
         }
+    }
+
+    /// Adds a remark about the answer, in words for the user.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 
     pub fn map<U>(self, change: impl FnOnce(T) -> U) -> Answer<U> {
@@ -49,6 +59,7 @@ impl<T> Answer<T> {
             value: change(self.value),
             confidence: self.confidence,
             source: self.source,
+            note: self.note,
         }
     }
 }

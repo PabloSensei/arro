@@ -3,6 +3,7 @@
 //! module reads it and finds the source of every frame.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,7 +20,7 @@ use lang_api::{
 use lsp_client::lsp_types::{OneOf, Uri, WorkspaceSymbolResponse};
 use platform::CanonPath;
 use project_model::ProjectModel;
-use semantic_router::Router;
+use semantic_router::{RouteError, Router};
 use tokio::runtime::Handle;
 
 const SOURCE: SourceId = SourceId::new("java-stack");
@@ -32,6 +33,12 @@ const MAX_LOOKUPS: usize = 64;
 /// Lookups in flight at once: the second answer takes a few rounds instead of one request
 /// after another.
 const LOOKUP_CONCURRENCY: usize = 8;
+/// How long the frames of the libraries wait for the server. A report with the frames of
+/// the project is on screen already, and a server that is starting or hung must not keep
+/// the rest pending.
+const LIBRARY_DEADLINE: Duration = Duration::from_secs(5);
+/// The line under a report whose library frames the server could not answer.
+const LIBRARY_NOTE: &str = "Library frames are not resolved: the Java server is not ready";
 
 /// Reads a pasted stack trace or thread dump. Frames carry no place until the project
 /// resolves them.
@@ -390,40 +397,90 @@ fn unresolved(report: &Report) -> Vec<String> {
 }
 
 /// The place the server knows for each class: a `jdt:` URI for a class of a library or
-/// of the runtime, a file for a class of the project. Runs the lookups side by side and
-/// keeps the answer of every class the server knew.
-async fn lookups(router: &Router, classes: &[String]) -> HashMap<String, SourceSpan> {
-    let found = futures_util::stream::iter(classes.iter().cloned())
-        .map(|class| async move {
-            let place = lookup_class(router, &class).await;
-            (class, place)
+/// of the runtime, a file for a class of the project.
+struct Lookups {
+    /// The place of every class the server knew.
+    found: HashMap<String, SourceSpan>,
+    /// At least one question failed: the server is not running, or it did not answer.
+    unanswered: bool,
+}
+
+/// The server as the stack reader uses it: the symbols of one name, the way
+/// `workspace/symbol` finds them.
+trait SymbolServer {
+    fn symbols(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<WorkspaceSymbolResponse>, RouteError>> + Send;
+}
+
+impl SymbolServer for Router {
+    async fn symbols(&self, name: &str) -> Result<Option<WorkspaceSymbolResponse>, RouteError> {
+        self.workspace_symbol(name).await
+    }
+}
+
+/// The name a class is looked up by: the simple name of its outermost class.
+fn query_of(class: &str) -> &str {
+    let (_, simple) = split_class(class);
+    simple.split('$').next().unwrap_or(simple)
+}
+
+/// The names to ask the server, each once: classes of one file, a nested one and the
+/// class around it for one, share a question.
+fn queries_of(classes: &[String]) -> Vec<String> {
+    let names: BTreeSet<&str> = classes.iter().map(|class| query_of(class)).collect();
+    names.into_iter().map(str::to_owned).collect()
+}
+
+/// Asks the server about every name once, a limited number of questions at a time, and
+/// keeps the place of every class it knew. Runs the lookups side by side.
+async fn lookups<S: SymbolServer + Sync>(server: &S, classes: &[String]) -> Lookups {
+    let answers = futures_util::stream::iter(queries_of(classes))
+        .map(|name| async move {
+            let answer = server.symbols(&name).await;
+            (name, answer)
         })
         .buffer_unordered(LOOKUP_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
-    found
-        .into_iter()
-        .filter_map(|(class, place)| place.map(|place| (class, place)))
-        .collect()
+    let mut known: HashMap<String, Vec<(String, Option<String>, SourceSpan)>> = HashMap::new();
+    let mut unanswered = false;
+    for (name, answer) in answers {
+        match answer {
+            Ok(Some(response)) => {
+                known.insert(name, symbol_places(response));
+            }
+            Ok(None) => {}
+            Err(_) => unanswered = true,
+        }
+    }
+    let found = classes
+        .iter()
+        .filter_map(|class| {
+            let symbols = known.get(query_of(class))?;
+            let place = place_of_class(class, symbols)?;
+            Some((class.clone(), place))
+        })
+        .collect();
+    Lookups { found, unanswered }
 }
 
-/// The place of one class, `None` when the server does not answer with its symbol.
-async fn lookup_class(router: &Router, class: &str) -> Option<SourceSpan> {
+/// The place of one class among the symbols of one name, `None` when none of them names
+/// the class.
+fn place_of_class(
+    class: &str,
+    symbols: &[(String, Option<String>, SourceSpan)],
+) -> Option<SourceSpan> {
     let (package, simple) = split_class(class);
     let outer = simple.split('$').next().unwrap_or(simple);
-    let Ok(Some(response)) = router.workspace_symbol(outer).await else {
-        return None;
-    };
-    for (name, container, location) in symbol_places(response) {
-        if name != simple && name != outer {
-            continue;
-        }
-        if !container_matches(container.as_deref(), package, outer) {
-            continue;
-        }
-        return Some(location);
-    }
-    None
+    symbols
+        .iter()
+        .find(|(name, container, _)| {
+            (name == simple || name == outer)
+                && container_matches(container.as_deref(), package, outer)
+        })
+        .map(|(_, _, span)| span.clone())
 }
 
 fn split_class(class: &str) -> (&str, &str) {
@@ -666,16 +723,36 @@ impl StackService {
         resolved.unwrap_or_else(|_| parse(text))
     }
 
-    /// Fills the frames of the libraries and of the runtime. Answers whether a frame got
-    /// a place: the report is worth a second answer only then.
-    async fn refine(&self, report: &mut Report) -> bool {
+    /// Fills the frames of the libraries and of the runtime, waiting for the server no
+    /// longer than [`LIBRARY_DEADLINE`].
+    async fn refine(&self, report: &mut Report) -> Refined {
         let classes = unresolved(report);
         if classes.is_empty() {
-            return false;
+            return Refined::Nothing;
         }
-        let found = lookups(&self.router, &classes).await;
-        apply_lookups(report, &found, &self.root)
+        let looked =
+            tokio::time::timeout(LIBRARY_DEADLINE, lookups(self.router.as_ref(), &classes)).await;
+        let Ok(looked) = looked else {
+            return Refined::NotReady;
+        };
+        if apply_lookups(report, &looked.found, &self.root) {
+            Refined::Places
+        } else if looked.unanswered {
+            Refined::NotReady
+        } else {
+            Refined::Nothing
+        }
     }
+}
+
+/// What the lookups of the libraries added to a report.
+enum Refined {
+    /// Some frames got their places: the report is worth a second answer.
+    Places,
+    /// The server did not answer the questions about the libraries.
+    NotReady,
+    /// The server answered and knows nothing more about the report.
+    Nothing,
 }
 
 impl Provider<TraceQuery, Report> for StackService {
@@ -692,8 +769,18 @@ impl Provider<TraceQuery, Report> for StackService {
             {
                 return;
             }
-            if service.refine(&mut report).await {
-                let _ = reply.send(Answer::new(report, Confidence::Certain, SOURCE));
+            match service.refine(&mut report).await {
+                Refined::Places => {
+                    let _ = reply.send(Answer::new(report, Confidence::Certain, SOURCE));
+                }
+                Refined::NotReady => {
+                    // The frames of the project stay as they are, and the line says why
+                    // the rest will not come.
+                    let answer =
+                        Answer::new(report, Confidence::Partial, SOURCE).with_note(LIBRARY_NOTE);
+                    let _ = reply.send(answer);
+                }
+                Refined::Nothing => {}
             }
         });
     }
@@ -737,12 +824,24 @@ impl Provider<lang_api::DumpQuery, DumpAnswer> for StackService {
             {
                 return;
             }
-            if service.refine(&mut report).await {
-                let answer = DumpAnswer {
-                    report: Some(report),
-                    error: None,
-                };
-                let _ = reply.send(Answer::new(answer, Confidence::Certain, SOURCE));
+            match service.refine(&mut report).await {
+                Refined::Places => {
+                    let answer = DumpAnswer {
+                        report: Some(report),
+                        error: None,
+                    };
+                    let _ = reply.send(Answer::new(answer, Confidence::Certain, SOURCE));
+                }
+                Refined::NotReady => {
+                    let answer = DumpAnswer {
+                        report: Some(report),
+                        error: None,
+                    };
+                    let answer =
+                        Answer::new(answer, Confidence::Partial, SOURCE).with_note(LIBRARY_NOTE);
+                    let _ = reply.send(answer);
+                }
+                Refined::Nothing => {}
             }
         });
     }
@@ -750,6 +849,8 @@ impl Provider<lang_api::DumpQuery, DumpAnswer> for StackService {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -935,6 +1036,145 @@ mod tests {
         let frame = lines[0].frame.as_ref().unwrap();
         assert_eq!(frame.origin, FrameOrigin::Unknown);
         assert!(frame.place.is_none());
+    }
+
+    /// A server that answers from memory: it counts the questions and how many of them
+    /// were in flight at once.
+    struct FakeServer {
+        asked: Mutex<Vec<String>>,
+        in_flight: AtomicUsize,
+        most_in_flight: AtomicUsize,
+        delay: Duration,
+        ready: bool,
+    }
+
+    impl FakeServer {
+        fn new(delay: Duration, ready: bool) -> Self {
+            Self {
+                asked: Mutex::new(Vec::new()),
+                in_flight: AtomicUsize::new(0),
+                most_in_flight: AtomicUsize::new(0),
+                delay,
+                ready,
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+
+        fn most_in_flight(&self) -> usize {
+            self.most_in_flight.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SymbolServer for FakeServer {
+        async fn symbols(&self, name: &str) -> Result<Option<WorkspaceSymbolResponse>, RouteError> {
+            self.asked.lock().unwrap().push(name.to_owned());
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if self.ready {
+                Ok(None)
+            } else {
+                Err(RouteError::NotReady)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_class_is_asked_once_and_a_nested_one_shares_the_question() {
+        let report = parse(
+            "\tat com.example.Main.run(Main.java:3)\n\
+             \tat com.example.Main.run(Main.java:9)\n\
+             \tat com.example.Main$Inner.call(Main.java:12)\n\
+             \tat com.example.Other.go(Other.java:1)",
+        );
+        let classes = unresolved(&report);
+        assert_eq!(
+            classes,
+            [
+                "com.example.Main",
+                "com.example.Main$Inner",
+                "com.example.Other"
+            ]
+        );
+
+        let server = FakeServer::new(Duration::ZERO, true);
+        let looked = lookups(&server, &classes).await;
+
+        assert_eq!(server.asked(), ["Main", "Other"], "each name once");
+        assert!(!looked.unanswered, "the server answered every question");
+        assert!(looked.found.is_empty(), "the server knew no class");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_questions_run_side_by_side_up_to_the_limit() {
+        let classes: Vec<String> = (0..20).map(|index| format!("p.C{index}")).collect();
+        let server = FakeServer::new(Duration::from_millis(30), true);
+        let looked = lookups(&server, &classes).await;
+
+        assert_eq!(server.asked().len(), 20, "each class is asked once");
+        assert!(
+            server.most_in_flight() > 1,
+            "the questions share the time, not one after another"
+        );
+        assert!(
+            server.most_in_flight() <= LOOKUP_CONCURRENCY,
+            "at most {LOOKUP_CONCURRENCY} questions at once, saw {}",
+            server.most_in_flight()
+        );
+        assert!(!looked.unanswered);
+    }
+
+    /// A router whose server never started: every question about the libraries fails.
+    fn not_ready_router() -> Arc<Router> {
+        let (_sender, status) = tokio::sync::watch::channel(sidecar::Status {
+            state: sidecar::State::Stopped,
+            generation: 0,
+            alive: false,
+            client: None,
+            process_id: None,
+            crashes: 0,
+            last_error: None,
+        });
+        Router::new(status)
+    }
+
+    #[tokio::test]
+    async fn a_server_that_is_not_ready_leaves_a_note_about_the_library_frames() {
+        let service = StackService::new(
+            test_support::scratch("lang-stack-note"),
+            not_ready_router(),
+            Handle::current(),
+            Arc::new(Mutex::new(None)),
+        );
+        let text = "\tat com.example.Main.run(Main.java:3)";
+        let answers: Vec<Answer<Report>> = lang_api::ask(&service, TraceQuery(text.to_owned()))
+            .collect()
+            .await;
+
+        assert_eq!(
+            answers.len(),
+            2,
+            "the answer of the project frames and the note"
+        );
+        assert_eq!(answers[0].confidence, Confidence::Partial);
+        assert_eq!(answers[0].note, None, "the first answer has no remark");
+        let Report::Trace { lines } = &answers[0].value else {
+            panic!("a trace");
+        };
+        assert_eq!(
+            lines[0].frame.as_ref().unwrap().origin,
+            FrameOrigin::Unknown
+        );
+
+        assert_eq!(answers[1].note.as_deref(), Some(LIBRARY_NOTE));
+        assert_eq!(
+            answers[1].value, answers[0].value,
+            "the note comes with the frames the window already shows"
+        );
     }
 
     #[test]

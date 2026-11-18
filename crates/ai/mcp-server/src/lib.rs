@@ -13,17 +13,19 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
-    ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, InitializeRequestParams,
+    InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+    ServerConfig, Tool, ToolAnnotations,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::transport::streamable_http_server::{
+    SessionId, SessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 use rmcp::{ErrorData, ServerHandler};
 use serde_json::Value;
 use tokio::sync::oneshot;
-use tool_gateway::{SessionScope, ToolClass, ToolGateway, ToolSpec};
+use tool_gateway::{ClientInfo, SessionScope, ToolClass, ToolGateway, ToolSpec};
 
 const WORKER_THREADS: usize = 2;
 const TOKEN_BYTES: usize = 32;
@@ -33,6 +35,37 @@ type Tokens = RwLock<HashMap<String, SessionScope>>;
 #[derive(Clone)]
 struct Handler {
     gateway: Arc<ToolGateway>,
+}
+
+fn client_info(info: Option<Arc<InitializeRequestParams>>) -> Option<ClientInfo> {
+    info.map(|info| ClientInfo {
+        name: info.client_info.name.clone(),
+        version: info.client_info.version.clone(),
+    })
+}
+
+impl Handler {
+    /// Notes who is on the other side of a request: the Agents tab lists the client and
+    /// Disconnect closes the transport session that the request carries.
+    fn note_client(&self, parts: Option<&http::request::Parts>, info: Option<ClientInfo>) {
+        let (Some(parts), Some(info)) = (parts, info) else {
+            return;
+        };
+        let Some(scope) = parts.extensions.get::<SessionScope>() else {
+            return;
+        };
+        let connection = parts
+            .headers
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok());
+        match connection {
+            Some(connection) => self
+                .gateway
+                .clients()
+                .bind(&scope.session, &info, connection),
+            None => self.gateway.clients().connect(&scope.session, &info),
+        }
+    }
 }
 
 fn tool(spec: &ToolSpec) -> Tool {
@@ -52,6 +85,22 @@ fn tool(spec: &ToolSpec) -> Tool {
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        context.peer.set_peer_info(request.clone());
+        let parts = context.extensions.get::<http::request::Parts>();
+        self.note_client(parts, client_info(Some(Arc::new(request.clone()))));
+        self.negotiate_initialize(&request)
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        let parts = context.extensions.get::<http::request::Parts>();
+        self.note_client(parts, client_info(context.peer.peer_info()));
     }
 
     async fn list_tools(
@@ -74,15 +123,14 @@ impl ServerHandler for Handler {
             return Err(ErrorData::invalid_request("no session", None));
         };
         let gateway = self.gateway.clone();
-        // The name the client gave itself in `initialize` names it in the audit log.
-        let client = context
-            .peer
-            .peer_info()
-            .map(|info| info.client_info.name.to_string());
+        // The name the client gave itself in `initialize` names it in the audit log and
+        // in the Agents tab, and the transport session lets Disconnect close it.
+        let client = client_info(context.peer.peer_info());
+        self.note_client(parts, client.clone());
         let name = request.name.into_owned();
         let input = Value::Object(request.arguments.unwrap_or_default());
         // A service may take its time, and the transport threads have other sessions to serve.
-        let work = move || gateway.call_from(client.as_deref(), &scope, &name, &input);
+        let work = move || gateway.call_as(client.as_ref(), &scope, &name, &input);
         let result = tokio::task::spawn_blocking(work).await;
         let result = result.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         let answer = match result {
@@ -112,6 +160,9 @@ async fn guard(State(tokens): State<Arc<Tokens>>, mut request: Request, next: Ne
 pub struct McpServer {
     port: u16,
     tokens: Arc<Tokens>,
+    /// The transport sessions of the clients, so Disconnect can close one.
+    sessions: Arc<LocalSessionManager>,
+    runtime: tokio::runtime::Handle,
     stop: Option<oneshot::Sender<()>>,
 }
 
@@ -125,20 +176,19 @@ impl McpServer {
         let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
         let port = listener.local_addr()?.port();
         let tokens = Arc::new(Tokens::default());
+        let sessions = Arc::new(LocalSessionManager::default());
 
         // Nothing is on the allowlist, so rmcp refuses every Origin too.
         let config = StreamableHttpServerConfig::default().enforce_origin_validation();
         let handler = Handler { gateway };
-        let service = StreamableHttpService::new(
-            move || Ok(handler.clone()),
-            Arc::new(LocalSessionManager::default()),
-            config,
-        );
+        let service =
+            StreamableHttpService::new(move || Ok(handler.clone()), sessions.clone(), config);
         let router = axum::Router::new()
             .nest_service("/mcp", service)
             .layer(middleware::from_fn_with_state(tokens.clone(), guard));
 
         let (stop, stopped) = oneshot::channel::<()>();
+        let handle = runtime.handle().clone();
         thread::Builder::new()
             .name("mcp-listener".to_string())
             .spawn(move || {
@@ -150,6 +200,8 @@ impl McpServer {
         Ok(Self {
             port,
             tokens,
+            sessions,
+            runtime: handle,
             stop: Some(stop),
         })
     }
@@ -169,6 +221,16 @@ impl McpServer {
 
     pub fn revoke(&self, token: &str) {
         self.tokens.write().unwrap().remove(token);
+    }
+
+    /// Disconnect: the transport session of one client ends on the server, while the
+    /// tokens of the window and of the other clients stay.
+    pub fn disconnect(&self, connection: &str) {
+        let sessions = self.sessions.clone();
+        let id: SessionId = SessionId::from(connection);
+        self.runtime.spawn(async move {
+            let _ = sessions.close_session(&id).await;
+        });
     }
 }
 

@@ -8,14 +8,15 @@
 //! the database.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ::base::Cancel;
-use editor_view::{FileLanguages, uri_path};
+use editor_view::{FileLanguages, Template, TemplateKind, TemplateLanguage, uri_path};
 use lang_api::{
     Answer, CompletionEntry, CompletionKind, CompletionList, CompletionProvider, Confidence,
     DiagnosticEntry, DiagnosticsProvider, DiagnosticsQuery, DocumentEdit, DocumentSpot, LanguageFn,
@@ -35,6 +36,142 @@ const DEBOUNCE: Duration = Duration::from_millis(120);
 /// The name this language answers under.
 const NAME: &str = "sql-console";
 
+/// The live templates of the console, after the default set of DataGrip. Tab expands a
+/// key and walks its fields.
+const TEMPLATES: &[Template] = &[
+    Template {
+        key: "sel",
+        description: "Select all rows",
+        kind: TemplateKind::Abbreviation,
+        body: "SELECT * FROM $END$;",
+        fields: &[],
+        contexts: &[editor_view::TEMPLATE_ANY],
+    },
+    Template {
+        key: "selw",
+        description: "Select rows with a condition",
+        kind: TemplateKind::Abbreviation,
+        body: "SELECT * FROM $TABLE$ WHERE $CONDITION$$END$;",
+        fields: &[("TABLE", ""), ("CONDITION", "")],
+        contexts: &[editor_view::TEMPLATE_ANY],
+    },
+    Template {
+        key: "ins",
+        description: "Insert a row",
+        kind: TemplateKind::Abbreviation,
+        body: "INSERT INTO $TABLE$ ($COLUMNS$) VALUES ($VALUES$);$END$",
+        fields: &[("TABLE", ""), ("COLUMNS", ""), ("VALUES", "")],
+        contexts: &[editor_view::TEMPLATE_ANY],
+    },
+    Template {
+        key: "upd",
+        description: "Update rows",
+        kind: TemplateKind::Abbreviation,
+        body: "UPDATE $TABLE$ SET $COLUMN$ = $VALUE$ WHERE $CONDITION$;$END$",
+        fields: &[
+            ("TABLE", ""),
+            ("COLUMN", ""),
+            ("VALUE", ""),
+            ("CONDITION", ""),
+        ],
+        contexts: &[editor_view::TEMPLATE_ANY],
+    },
+    Template {
+        key: "del",
+        description: "Delete rows",
+        kind: TemplateKind::Abbreviation,
+        body: "DELETE FROM $TABLE$ WHERE $CONDITION$;$END$",
+        fields: &[("TABLE", ""), ("CONDITION", "")],
+        contexts: &[editor_view::TEMPLATE_ANY],
+    },
+    Template {
+        key: "cnt",
+        description: "Count rows",
+        kind: TemplateKind::Abbreviation,
+        body: "SELECT COUNT(*) FROM $TABLE$;$END$",
+        fields: &[("TABLE", "")],
+        contexts: &[editor_view::TEMPLATE_ANY],
+    },
+];
+
+/// Whether the editor opens `path` as a SQL script.
+pub(crate) fn is_sql_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
+}
+
+/// The templates of a `.sql` file: the console of a source and the script of a project
+/// share them.
+pub(crate) fn templates_for(path: &Path) -> Option<&'static TemplateLanguage> {
+    is_sql_file(path).then(language)
+}
+
+/// The SQL templates as the editor fills their fields. They name no syntax context, so
+/// no query of the grammar is ever built.
+fn language() -> &'static TemplateLanguage {
+    static LANGUAGE: OnceLock<TemplateLanguage> = OnceLock::new();
+    LANGUAGE.get_or_init(|| TemplateLanguage {
+        templates: TEMPLATES,
+        contexts: "",
+        grammar: || panic!("the SQL templates name no context to parse"),
+        indent_unit: "    ",
+        receiver_prefixes: &[],
+        postfix: None,
+        query: OnceLock::new(),
+        declarations: None,
+    })
+}
+
+/// The abbreviations of the templates as the rows of the completion list.
+fn template_entries() -> Vec<CompletionEntry> {
+    TEMPLATES
+        .iter()
+        .map(|template| CompletionEntry {
+            label: template.key.to_owned(),
+            insert_text: Some(templates::snippet_of(template, "")),
+            detail: Some(template.description.to_owned()),
+            kind: CompletionKind::Snippet,
+            snippet: true,
+            ..CompletionEntry::default()
+        })
+        .collect()
+}
+
+/// The edit of Reformat Code for `text`: the selected lines alone, or the whole script.
+pub(crate) fn format_edit(
+    text: &str,
+    selection: Option<Range<usize>>,
+    keyword_case: database::KeywordCase,
+    indent: &str,
+) -> Option<DocumentEdit> {
+    let options = database::FormatOptions {
+        keyword_case,
+        indent: indent.to_owned(),
+    };
+    match selection.filter(|range| range.start < range.end) {
+        Some(range) => {
+            let (range, formatted) = database::format_sql_range(text, range, &options)?;
+            Some(DocumentEdit {
+                span: TextSpan {
+                    start: point_at(text, range.start),
+                    end: point_at(text, range.end),
+                },
+                text: formatted,
+            })
+        }
+        None => {
+            let formatted = database::format_sql(text, &options);
+            (formatted != text).then(|| DocumentEdit {
+                span: TextSpan {
+                    start: TextPoint::default(),
+                    end: point_at(text, text.len()),
+                },
+                text: formatted,
+            })
+        }
+    }
+}
+
 /// The tables, the dialect and the default schema of one source.
 #[derive(Clone, Default)]
 struct SourceSchema {
@@ -49,6 +186,8 @@ struct Shared {
     state_dir: PathBuf,
     documents: Mutex<HashMap<String, Arc<str>>>,
     sources: Mutex<HashMap<SourceId, SourceSchema>>,
+    /// The source the user picked for a `.sql` script of the project, by path.
+    files: Mutex<HashMap<PathBuf, SourceId>>,
     /// One serial per document: an answer of an older text is not published.
     serials: Mutex<HashMap<String, u64>>,
     next_serial: AtomicU64,
@@ -84,10 +223,20 @@ impl Shared {
         serial
     }
 
-    /// The source of a console document, as the state folder names it.
+    /// The source of a console document, as the state folder names it, or the source the
+    /// user picked for a script of the project.
     fn source_of(&self, uri: &str) -> Option<SourceId> {
         let path = uri_path(uri)?;
-        source_of_console(&self.state_dir, &path)
+        source_of_console(&self.state_dir, &path).or_else(|| self.file_source(&path))
+    }
+
+    /// The source of a `.sql` script of the project, when the user picked one.
+    fn file_source(&self, path: &Path) -> Option<SourceId> {
+        let key = ::platform::path_key(path);
+        self.files
+            .lock()
+            .ok()
+            .and_then(|files| files.get(&key).cloned())
     }
 
     fn schema_of(&self, source: &SourceId) -> SourceSchema {
@@ -172,6 +321,7 @@ impl SqlLanguage {
             state_dir,
             documents: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
+            files: Mutex::new(HashMap::new()),
             serials: Mutex::new(HashMap::new()),
             next_serial: AtomicU64::new(0),
             listeners: Mutex::new(HashMap::new()),
@@ -251,6 +401,14 @@ impl SqlLanguage {
     /// The state folder whose consoles this language answers for.
     pub(crate) fn state_dir(&self) -> &Path {
         &self.shared.state_dir
+    }
+
+    /// Answers for a `.sql` script of the project with `source`: completion and the
+    /// checks of its names follow the schema of that source.
+    pub fn set_file_source(&self, path: &Path, source: SourceId) {
+        if let Ok(mut files) = self.shared.files.lock() {
+            files.insert(::platform::path_key(path), source);
+        }
     }
 }
 
@@ -389,7 +547,9 @@ impl Provider<DocumentSpot, CompletionList> for SqlLanguage {
                 if cancel.is_cancelled() {
                     return;
                 }
-                let entries = suggestions.into_iter().map(entry_of).collect();
+                let mut entries: Vec<CompletionEntry> =
+                    suggestions.into_iter().map(entry_of).collect();
+                entries.extend(template_entries());
                 let _ = reply.send(Answer::new(
                     CompletionList {
                         entries,
@@ -434,6 +594,7 @@ impl LanguageSupport for SqlLanguage {
 
     fn matches(&self, path: &Path) -> bool {
         source_of_console(&self.shared.state_dir, path).is_some()
+            || self.shared.file_source(path).is_some()
     }
 
     fn syntax(&self) -> &dyn SyntaxProvider {
@@ -526,6 +687,37 @@ impl SyntaxProvider for NoSyntax {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_templates_of_a_script_are_offered_as_snippets() {
+        let entries = template_entries();
+        let sel = entries
+            .iter()
+            .find(|entry| entry.label == "sel")
+            .expect("the select template is offered");
+        assert_eq!(sel.kind, CompletionKind::Snippet);
+        assert!(sel.snippet);
+        assert!(
+            sel.insert_text
+                .as_deref()
+                .is_some_and(|text| { text.starts_with("SELECT * FROM") && text.ends_with(';') })
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            ["sel", "selw", "ins", "upd", "del", "cnt"]
+        );
+    }
+
+    #[test]
+    fn the_templates_belong_to_the_sql_files_alone() {
+        assert!(templates_for(Path::new("console.sql")).is_some());
+        assert!(templates_for(Path::new("report.SQL")).is_some());
+        assert!(templates_for(Path::new("notes.txt")).is_none());
+        assert!(!is_sql_file(Path::new("notes.txt")));
+    }
 
     #[test]
     fn a_point_counts_the_units_the_editor_counts() {

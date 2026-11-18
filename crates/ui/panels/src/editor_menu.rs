@@ -426,9 +426,10 @@ fn build(
     if model.gutter && ::http_client::is_request_file(&path) {
         entries.push(MenuEntry::separator());
         let clicked = view.clone();
+        let requests = workspace.clone();
         entries.push(
             MenuEntry::new("Run All Requests", move |window, cx| {
-                workspace
+                requests
                     .update(cx, |workspace, cx| {
                         crate::http::run_all(&clicked, workspace, window, cx)
                     })
@@ -438,28 +439,45 @@ fn build(
         );
     }
 
-    // Ask AI: the row is dead without a selection, because there is no snippet to send.
-    entries.push(MenuEntry::separator());
-    let selected = view
-        .read(cx)
-        .selection()
-        .is_some_and(|(range, _)| !range.is_empty());
-    let runner = ask_runner;
-    let ask_ai = if selected {
-        MenuEntry::new("Ask AI...", move |window, cx| {
-            runner
-                .update(cx, |workspace, cx| {
-                    workspace.run_command(crate::agents::ASK_AI, window, cx)
-                })
-                .ok();
-        })
-    } else {
-        MenuEntry::disabled("Ask AI...")
-    };
-    entries.push(match model.key(crate::agents::ASK_AI) {
-        Some(shortcut) => ask_ai.shortcut(shortcut),
-        None => ask_ai,
-    });
+    if crate::database_console::is_sql_file(&path) {
+        let runner = workspace.clone();
+        entries.push(
+            MenuEntry::new("Run SQL Script", move |window, cx| {
+                runner
+                    .update(cx, |workspace, cx| {
+                        crate::database_panel::run_script(workspace, window, cx)
+                    })
+                    .ok();
+            })
+            .icon("run/run"),
+        );
+    }
+
+    // Ask AI: the row is dead without a selection, because there is no snippet to send,
+    // and the block goes away with the AI features of the settings.
+    if crate::fix_with_ai::enabled(cx) {
+        entries.push(MenuEntry::separator());
+        let selected = view
+            .read(cx)
+            .selection()
+            .is_some_and(|(range, _)| !range.is_empty());
+        let runner = ask_runner;
+        let ask_ai = if selected {
+            MenuEntry::new("Ask AI...", move |window, cx| {
+                runner
+                    .update(cx, |workspace, cx| {
+                        workspace.run_command(crate::agents::ASK_AI, window, cx)
+                    })
+                    .ok();
+            })
+        } else {
+            MenuEntry::disabled("Ask AI...")
+        };
+        entries.push(match model.key(crate::agents::ASK_AI) {
+            Some(shortcut) => ask_ai.shortcut(shortcut),
+            None => ask_ai,
+        });
+    }
 
     entries
 }

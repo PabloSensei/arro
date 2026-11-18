@@ -11,7 +11,7 @@ pub use protocol::file_uri;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -408,10 +408,16 @@ impl Bridge {
 impl Drop for Bridge {
     fn drop(&mut self) {
         // The accepting thread waits in `accept`, so a connection of our own wakes it;
-        // joining it closes the port before the lock file goes.
+        // joining it closes the port before the lock file goes. When the connection cannot
+        // be made — the port is gone or a firewall holds it — nothing would ever wake the
+        // thread and the join would wait forever, so the thread is let go; the stop flag
+        // already set makes it leave on the next connection that does arrive.
         self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(("127.0.0.1", self.port));
-        if let Some(accept) = self.accept.take() {
+        let address = SocketAddr::from(([127, 0, 0, 1], self.port));
+        let woken = TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok();
+        if let Some(accept) = self.accept.take()
+            && woken
+        {
             let _ = accept.join();
         }
         let _ = fs::remove_file(&self.lock);
@@ -676,6 +682,63 @@ mod tests {
             TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err(),
             "the port still accepts connections"
         );
+    }
+
+    /// A bridge whose port is already gone: the connection of the drop fails, and the
+    /// accepting thread has nothing to wake it. The drop has to let the thread go instead
+    /// of waiting for a connection that never comes.
+    #[test]
+    fn a_bridge_whose_port_is_gone_leaves_its_thread() {
+        let home = test_support::TempDir::new("bridge-no-port");
+        let project = home.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        // A port no listener holds: a connection to it fails at once.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let lock = home.path().join("ide").join(format!("{port}.lock"));
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, b"{}").unwrap();
+        let (sender, events) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            project,
+            token: token().unwrap(),
+            diagnostics: Arc::new(Diagnostics::default()),
+            editors: Arc::new(Editors::default()),
+            next_diff: AtomicU64::new(0),
+            next_connection: AtomicU64::new(0),
+            connected: AtomicUsize::new(0),
+            pending: Mutex::new(HashMap::new()),
+            events: sender,
+        });
+        // The stand-in waits where `accept` waits: only a connection gets it out. The
+        // test releases it after the drop, so the run leaves no thread behind.
+        let release = Arc::new(AtomicBool::new(false));
+        let waiting = release.clone();
+        let accept = thread::spawn(move || {
+            while !waiting.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let bridge = Bridge {
+            shared,
+            port,
+            lock: lock.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: Some(accept),
+            events: Mutex::new(events),
+        };
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(bridge);
+            let _ = done_tx.send(());
+        });
+        let dropped = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        release.store(true, Ordering::SeqCst);
+        assert!(dropped, "the drop waits for a connection that never comes");
+        assert!(!lock.exists(), "the lock file goes with the bridge");
     }
 
     #[test]

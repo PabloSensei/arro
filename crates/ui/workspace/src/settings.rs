@@ -135,6 +135,37 @@ impl CompletionCase {
     }
 }
 
+/// The case Reformat Code gives the keywords of SQL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlKeywordCase {
+    /// `SELECT`, `FROM`, `WHERE`.
+    #[default]
+    Upper,
+    /// `select`, `from`, `where`.
+    Lower,
+    /// The case the statement was typed in.
+    Keep,
+}
+
+impl SqlKeywordCase {
+    pub fn label(self) -> &'static str {
+        match self {
+            SqlKeywordCase::Upper => "Upper case",
+            SqlKeywordCase::Lower => "Lower case",
+            SqlKeywordCase::Keep => "As is",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            SqlKeywordCase::Upper => SqlKeywordCase::Lower,
+            SqlKeywordCase::Lower => SqlKeywordCase::Keep,
+            SqlKeywordCase::Keep => SqlKeywordCase::Upper,
+        }
+    }
+}
+
 /// The tool windows of the layout the user stores as their default: which are open and
 /// how wide they are.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -415,9 +446,16 @@ pub struct Settings {
     pub kubeconfig_path: String,
     /// How many rows one page of a data tab reads from the table.
     pub database_page_rows: u32,
+    /// The case Reformat Code gives the keywords of SQL.
+    pub sql_keyword_case: SqlKeywordCase,
+    /// Run SQL Script stops at the first statement that fails.
+    pub sql_script_stop_on_error: bool,
     /// The project tree selects the file of every tab that becomes active, as the Always
     /// Select Opened File switch of its view options says.
     pub project_always_select_opened_file: bool,
+    /// The AI features of the window are on: Ask AI, Fix with AI and Explain with AI
+    /// offer the problem at hand to the agent. The AI Sessions window itself stays.
+    pub ai_enabled: bool,
     /// The window shares its MCP server with the agents outside it while the project is
     /// open. The sessions of AI Sessions work either way.
     pub mcp_enabled: bool,
@@ -522,7 +560,10 @@ impl Default for Settings {
             kubectl_path: String::new(),
             kubeconfig_path: String::new(),
             database_page_rows: DEFAULT_DATABASE_PAGE_ROWS,
+            sql_keyword_case: SqlKeywordCase::Upper,
+            sql_script_stop_on_error: true,
             project_always_select_opened_file: false,
+            ai_enabled: true,
             mcp_enabled: true,
             mcp_binary: String::new(),
             mcp_execute_permission: McpExecutePermission::AlwaysAsk,
