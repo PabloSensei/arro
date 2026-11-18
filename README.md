@@ -45,7 +45,7 @@
 </p>
 
 <p align="center">
-  <img src=".github/readme/hero.png" alt="Arro in the Dark theme: a Spring PetClinic controller and its repository side by side, sticky lines, endpoint marks and parameter hints" width="100%">
+  <img src=".github/readme/hero.png" alt="Arro in the Dark theme: an AI agent in the AI Sessions panel traces a Spring PetClinic bug through the IDE tools, its edit to the controller waits for review with Accept All and Reject All, and the Git log sits below" width="100%">
 </p>
 
 > [!WARNING]
