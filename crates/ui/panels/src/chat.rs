@@ -1,7 +1,7 @@
 //! The chat of an ACP session: the transcript, the question the agent waits on as buttons,
 //! and the message box with `@` mentions.
 
-use agent_core::{PermissionReply, ToolStatus};
+use agent_core::{PermissionReply, PromptPart, ToolStatus};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -36,17 +36,38 @@ impl AgentsPanel {
             .kept_selection()
             .or_else(|| self.editor_selection(cx));
         let parts = Composer::parts(&text, &self.root, selection);
-        let Some(entry) = self.active_entry_mut() else {
+        if self.deliver(&parts, cx) {
+            self.composer.take();
+        }
+    }
+
+    /// Sends a message that is complete already, such as the problem of Fix with AI. The
+    /// draft in the message box and its selection stay for the user.
+    pub(crate) fn send_finished(&mut self, message: &str, cx: &mut Context<Self>) {
+        let text = message.trim().to_string();
+        if text.is_empty() {
             return;
+        }
+        self.deliver(&Composer::parts(&text, &self.root, None), cx);
+    }
+
+    /// Gives the parts to the session of the chat; false when it did not take them.
+    fn deliver(&mut self, parts: &[PromptPart], cx: &mut Context<Self>) -> bool {
+        let Some(entry) = self.active_entry_mut() else {
+            return false;
         };
-        match entry.session.prompt_parts(&parts) {
+        match entry.session.prompt_parts(parts) {
             Ok(()) => {
                 entry.sent += 1;
-                self.composer.take();
+                cx.notify();
+                true
             }
-            Err(error) => self.error = Some(format!("The message is not sent: {error}").into()),
+            Err(error) => {
+                self.error = Some(format!("The message is not sent: {error}").into());
+                cx.notify();
+                false
+            }
         }
-        cx.notify();
     }
 
     pub(crate) fn answer(&mut self, reply: PermissionReply, cx: &mut Context<Self>) {

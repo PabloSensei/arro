@@ -366,11 +366,11 @@ fn the_problems_menu_jumps_shows_fixes_copies_and_survives_an_empty_window(
     draw(cx, window);
 
     right_click(cx, window, "item-row-0");
-    click(cx, window, "menu-2");
+    click_menu_row(cx, window, "Copy Problem Description");
     assert_eq!(clipboard(cx).as_deref(), Some("first error"));
 
     right_click(cx, window, "item-row-0");
-    click(cx, window, "menu-4");
+    click_menu_row(cx, window, "Copy Path");
     assert_eq!(
         clipboard(cx).map(PathBuf::from),
         Some(path.clone()),

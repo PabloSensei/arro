@@ -49,6 +49,16 @@ pub(crate) const LIST_RUN_CONFIGURATIONS: &str = "list_run_configurations";
 pub(crate) const RUN_CONFIGURATION: &str = "run_configuration";
 pub(crate) const GET_RUN_OUTPUT: &str = "get_run_output";
 pub(crate) const STOP_RUN: &str = "stop_run";
+pub(crate) const SET_BREAKPOINT: &str = "set_breakpoint";
+pub(crate) const REMOVE_BREAKPOINT: &str = "remove_breakpoint";
+pub(crate) const LIST_BREAKPOINTS: &str = "list_breakpoints";
+pub(crate) const DEBUG_RUN: &str = "debug_run";
+pub(crate) const DEBUG_WAIT: &str = "debug_wait";
+pub(crate) const DEBUG_STACK: &str = "debug_stack";
+pub(crate) const DEBUG_VARIABLES: &str = "debug_variables";
+pub(crate) const DEBUG_EVALUATE: &str = "debug_evaluate";
+pub(crate) const DEBUG_STEP: &str = "debug_step";
+pub(crate) const DEBUG_STOP: &str = "debug_stop";
 
 /// Every tool, for harnesses that list what may run without a question.
 pub const TOOL_NAMES: &[&str] = &[
@@ -74,6 +84,16 @@ pub const TOOL_NAMES: &[&str] = &[
     RUN_CONFIGURATION,
     GET_RUN_OUTPUT,
     STOP_RUN,
+    SET_BREAKPOINT,
+    REMOVE_BREAKPOINT,
+    LIST_BREAKPOINTS,
+    DEBUG_RUN,
+    DEBUG_WAIT,
+    DEBUG_STACK,
+    DEBUG_VARIABLES,
+    DEBUG_EVALUATE,
+    DEBUG_STEP,
+    DEBUG_STOP,
 ];
 
 /// Tools arrive together with their services, not as one package.
@@ -565,6 +585,223 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
                 "additionalProperties": false,
             }),
         },
+        ToolSpec {
+            name: SET_BREAKPOINT,
+            description: "Puts a breakpoint on a line of a file. The user sees it in the \
+                          editor gutter and in the Breakpoints window, as one set by hand. \
+                          A condition stops only when it is true; a log message prints \
+                          instead of stopping.",
+            class: ToolClass::Read,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "A file of the project, relative to its root or absolute",
+                    },
+                    "line": {"type": "integer", "minimum": 1, "description": "1-based"},
+                    "condition": {
+                        "type": "string",
+                        "description": "An expression the program evaluates at the line",
+                    },
+                    "log_message": {
+                        "type": "string",
+                        "description": "What the console prints instead of stopping the program",
+                    },
+                },
+                "required": ["path", "line"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: REMOVE_BREAKPOINT,
+            description: "Takes a breakpoint away from a line, as the same key in the gutter \
+                          does. Read-only for the program.",
+            class: ToolClass::Read,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "A file of the project, relative to its root or absolute",
+                    },
+                    "line": {"type": "integer", "minimum": 1, "description": "1-based"},
+                },
+                "required": ["path", "line"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: LIST_BREAKPOINTS,
+            description: "Every breakpoint of the project with its line, whether it is on, \
+                          its condition and its log message. Read-only.",
+            class: ToolClass::Read,
+            input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
+        ToolSpec {
+            name: DEBUG_RUN,
+            description: "Starts a test suite or case, or a run configuration, under the \
+                          debugger the way Shift+F9 does, and waits for the first stop. \
+                          Answers the id of the session and where the program stopped. \
+                          `debug_wait` waits again, `debug_stack` and `debug_variables` read \
+                          the stop. The user watches the same session in the Debug window \
+                          and may continue or stop it.",
+            class: ToolClass::Execute,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "module": {"type": "string", "description": "Only this module"},
+                    "suite": {
+                        "type": "string",
+                        "description": "A class or a file of tests, in the terms the project uses",
+                    },
+                    "case": {
+                        "type": "string",
+                        "description": "One test of the suite; it needs `suite`",
+                    },
+                    "configuration": {
+                        "type": "string",
+                        "description": "The name from `list_run_configurations`",
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "description": "How long to wait for the first stop, 30 by default",
+                    },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: DEBUG_WAIT,
+            description: "Waits for the debugged program to stop or the session to end, up \
+                          to the given number of seconds, and answers the reason, the \
+                          thread and the top frame. Read-only, it never resumes or stops \
+                          the program.",
+            class: ToolClass::Read,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "description": "How long to wait, 10 by default",
+                    },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: DEBUG_STACK,
+            description: "The frames of the stopped thread with their places, the top one \
+                          first. `debug_variables` reads a frame by its index. Read-only.",
+            class: ToolClass::Read,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread": {
+                        "type": "integer",
+                        "description": "The thread by id; the selected thread by default",
+                    },
+                    "frames": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "How many top frames to show, 10 by default",
+                    },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: DEBUG_VARIABLES,
+            description: "The variables of a stopped frame, grouped by scope, with children \
+                          down to the given depth and values cut to the given length. \
+                          Read-only.",
+            class: ToolClass::Read,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "frame": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "The index of a frame of `debug_stack`, zero by default",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "How many levels of children of a variable to follow",
+                    },
+                    "length": {
+                        "type": "integer",
+                        "minimum": 20,
+                        "maximum": 2000,
+                        "description": "The longest value to show, in characters",
+                    },
+                    "variables": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "How many variables of a scope to show, 50 by default",
+                    },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: DEBUG_EVALUATE,
+            description: "Evaluates an expression in a stopped frame, as the console of the \
+                          debugger does, and answers the value and its type. The expression \
+                          may change the program, so the user is asked first.",
+            class: ToolClass::Execute,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"},
+                    "frame": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "The index of a frame of `debug_stack`, zero by default",
+                    },
+                },
+                "required": ["expression"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: DEBUG_STEP,
+            description: "Moves the stopped program: `over` a line, `into` a call, `out` of \
+                          a method or `continue` to the next breakpoint, and answers where \
+                          it stopped. The user may step it too.",
+            class: ToolClass::Execute,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["over", "into", "out", "continue"],
+                    },
+                    "seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "description": "How long to wait for the next stop, 10 by default",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolSpec {
+            name: DEBUG_STOP,
+            description: "Ends the debug session and the program under it, as the Stop \
+                          button of the Debug window does.",
+            class: ToolClass::Execute,
+            input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
     ]
 });
 
@@ -612,6 +849,34 @@ mod tests {
             let spec = TOOLS.iter().find(|spec| spec.name == name).expect(name);
             assert_eq!(spec.class, ToolClass::Execute, "{name}");
             assert_eq!(spec.input_schema["type"], "object", "{name}");
+        }
+    }
+
+    #[test]
+    fn the_debug_tools_are_listed_and_only_the_program_ones_need_the_user() {
+        for name in [
+            "set_breakpoint",
+            "remove_breakpoint",
+            "list_breakpoints",
+            "debug_run",
+            "debug_wait",
+            "debug_stack",
+            "debug_variables",
+            "debug_evaluate",
+            "debug_step",
+            "debug_stop",
+        ] {
+            let spec = TOOLS.iter().find(|spec| spec.name == name).expect(name);
+            let runs_the_program = matches!(
+                name,
+                "debug_run" | "debug_evaluate" | "debug_step" | "debug_stop"
+            );
+            let class = if runs_the_program {
+                ToolClass::Execute
+            } else {
+                ToolClass::Read
+            };
+            assert_eq!(spec.class, class, "{name}");
         }
     }
 }

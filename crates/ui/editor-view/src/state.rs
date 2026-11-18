@@ -611,6 +611,12 @@ impl EditorState {
         self.buffer.text()
     }
 
+    /// Another view of this document. The text is shared with the editor, not copied: a
+    /// reader outside the window gets it only when it asks.
+    pub fn document(&self) -> Buffer {
+        self.buffer.fork()
+    }
+
     /// The text for reading. A copy, which does not change when the document does.
     pub fn store(&self) -> RopeStore {
         self.buffer.store()

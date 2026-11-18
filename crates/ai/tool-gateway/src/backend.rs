@@ -623,6 +623,310 @@ pub trait DebugSnapshotSource: Send + Sync {
     fn snapshot(&self) -> Option<Arc<dap_client::Snapshot>>;
 }
 
+/// A breakpoint as an agent asks for it. `condition` and `log_message` are optional: a
+/// point with a log message prints it and lets the program run on.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BreakpointQuery {
+    /// A file of the project, relative to its root or absolute.
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    #[serde(default)]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub log_message: Option<String>,
+}
+
+impl BreakpointQuery {
+    /// Empty optional fields say the same as absent ones.
+    pub fn clipped(mut self) -> Self {
+        self.condition = self
+            .condition
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        self.log_message = self
+            .log_message
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        self
+    }
+}
+
+/// The place of a breakpoint the agent wants gone.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BreakpointId {
+    /// A file of the project, relative to its root or absolute.
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+}
+
+/// One breakpoint as the window holds it: what the user sees in the editor gutter and in
+/// the Breakpoints window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreakpointInfo {
+    pub path: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    pub enabled: bool,
+    /// Whether the adapter accepted the place. False while no session runs.
+    pub verified: bool,
+    pub condition: Option<String>,
+    pub log_message: Option<String>,
+}
+
+/// What a `debug_run` asks: a test suite or case, or a stored run configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugRunRequest {
+    pub module: Option<String>,
+    /// A class or a file of tests, in the terms the project uses.
+    pub suite: Option<String>,
+    /// One test of the suite; it needs `suite`.
+    pub case: Option<String>,
+    /// The name from `list_run_configurations`.
+    pub configuration: Option<String>,
+    /// How long to wait for the first stop, 30 seconds by default.
+    pub wait_seconds: u64,
+}
+
+impl DebugRunRequest {
+    pub fn clipped(mut self) -> Self {
+        if self.wait_seconds == 0 {
+            self.wait_seconds = default_wait_seconds();
+        }
+        self.wait_seconds = self.wait_seconds.clamp(1, 120);
+        self
+    }
+}
+
+fn default_wait_seconds() -> u64 {
+    30
+}
+
+/// How long `debug_wait` waits for a stop or the end of the session.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugWaitQuery {
+    pub seconds: u64,
+}
+
+impl Default for DebugWaitQuery {
+    fn default() -> Self {
+        Self { seconds: 10 }
+    }
+}
+
+impl DebugWaitQuery {
+    pub fn clipped(mut self) -> Self {
+        self.seconds = self.seconds.clamp(1, 120);
+        self
+    }
+}
+
+/// One thread of the debuggee, as an answer names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugThread {
+    pub id: i64,
+    pub name: String,
+}
+
+/// One frame of a stack, with the place when the adapter sent one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugFrame {
+    /// Zero for the top frame.
+    pub index: usize,
+    pub name: String,
+    pub path: Option<PathBuf>,
+    /// 1-based, zero when the adapter did not know the line.
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Where the session is after a run, a wait or a step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugSessionState {
+    /// `starting`, `running`, `stopped` or `ended`.
+    pub state: String,
+    /// Why the program stopped, such as `breakpoint`, `step` or `exception`.
+    pub reason: Option<String>,
+    pub thread: Option<DebugThread>,
+    /// The top frame of the stopped thread.
+    pub frame: Option<DebugFrame>,
+}
+
+impl DebugSessionState {
+    pub fn stopped_reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+/// What a `debug_run` answered: the id of the session and where it got to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugRunOutcome {
+    pub session: String,
+    pub state: DebugSessionState,
+}
+
+/// How much of a stack `debug_stack` shows.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugStackQuery {
+    /// The thread by id, the selected one by default.
+    pub thread: Option<i64>,
+    pub frames: usize,
+}
+
+impl Default for DebugStackQuery {
+    fn default() -> Self {
+        Self {
+            thread: None,
+            frames: 10,
+        }
+    }
+}
+
+impl DebugStackQuery {
+    pub fn clipped(mut self) -> Self {
+        self.frames = self.frames.clamp(1, 100);
+        self
+    }
+}
+
+/// The frames of one thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugStack {
+    pub thread: Option<DebugThread>,
+    /// How many frames the adapter sent.
+    pub total: usize,
+    pub frames: Vec<DebugFrame>,
+}
+
+/// How much of the variables of a frame `debug_variables` shows.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugVariablesQuery {
+    /// The frame by its index in the stack, zero for the top one.
+    pub frame: usize,
+    /// How many levels of children of a variable to follow.
+    pub depth: usize,
+    /// The longest value to show, in characters.
+    pub length: usize,
+    /// How many variables of a scope to show.
+    pub variables: usize,
+}
+
+impl Default for DebugVariablesQuery {
+    fn default() -> Self {
+        Self {
+            frame: 0,
+            depth: 2,
+            length: 200,
+            variables: 50,
+        }
+    }
+}
+
+impl DebugVariablesQuery {
+    pub fn clipped(mut self) -> Self {
+        self.frame = self.frame.min(99);
+        self.depth = self.depth.min(5);
+        self.length = self.length.clamp(20, 2_000);
+        self.variables = self.variables.clamp(1, 200);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugVariable {
+    pub name: String,
+    pub value: String,
+    pub type_name: String,
+    pub children: Vec<DebugVariable>,
+}
+
+/// One group of variables of a frame, such as the locals or the static fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugScope {
+    pub name: String,
+    pub variables: Vec<DebugVariable>,
+}
+
+/// The variables of one frame, with the children the caller asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugVariables {
+    pub scopes: Vec<DebugScope>,
+    /// How many variables the answer carries at every level.
+    pub total: usize,
+    pub clipped: bool,
+}
+
+/// An expression to evaluate in a frame. Evaluation may change the program, so it asks
+/// the user.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugEvaluateQuery {
+    pub expression: String,
+    /// The frame by its index in the stack, zero for the top one.
+    #[serde(default)]
+    pub frame: Option<usize>,
+}
+
+/// What an expression gave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugValue {
+    pub expression: String,
+    pub value: String,
+    pub type_name: String,
+}
+
+/// Which way a step goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugStep {
+    Over,
+    Into,
+    Out,
+    Continue,
+}
+
+impl DebugStep {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "over" => Some(Self::Over),
+            "into" => Some(Self::Into),
+            "out" => Some(Self::Out),
+            "continue" => Some(Self::Continue),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Over => "over",
+            Self::Into => "into",
+            Self::Out => "out",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+/// A step the agent asks for, with how long to wait for the next stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugStepQuery {
+    pub step: DebugStep,
+    /// How long to wait for the next stop, 10 seconds by default.
+    pub seconds: u64,
+}
+
+impl DebugStepQuery {
+    pub fn clipped(mut self) -> Self {
+        self.seconds = self.seconds.clamp(1, 120);
+        self
+    }
+}
+
 pub trait ToolBackend: Send + Sync {
     fn editor_context(&self, scope: &SessionScope) -> Result<EditorContext, ToolError>;
 
@@ -809,6 +1113,89 @@ pub trait ToolBackend: Send + Sync {
             "the run window of this project is not connected yet".to_string(),
         ))
     }
+
+    /// Sets a breakpoint the user sees in the editor and the Breakpoints window.
+    fn set_breakpoint(
+        &self,
+        _scope: &SessionScope,
+        _query: &BreakpointQuery,
+    ) -> Result<BreakpointInfo, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// Removes a breakpoint of the project.
+    fn remove_breakpoint(
+        &self,
+        _scope: &SessionScope,
+        _id: &BreakpointId,
+    ) -> Result<(), ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// Every breakpoint of the project.
+    fn breakpoints(&self, _scope: &SessionScope) -> Result<Vec<BreakpointInfo>, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// Starts a test or a configuration under the debugger.
+    fn debug_run(
+        &self,
+        _scope: &SessionScope,
+        _request: &DebugRunRequest,
+        _client: Option<&str>,
+    ) -> Result<DebugRunOutcome, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// Waits for a stop or the end of the session.
+    fn debug_wait(
+        &self,
+        _scope: &SessionScope,
+        _query: &DebugWaitQuery,
+    ) -> Result<DebugSessionState, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// The frames of a thread.
+    fn debug_stack(
+        &self,
+        _scope: &SessionScope,
+        _query: &DebugStackQuery,
+    ) -> Result<DebugStack, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// The variables of a frame.
+    fn debug_variables(
+        &self,
+        _scope: &SessionScope,
+        _query: &DebugVariablesQuery,
+    ) -> Result<DebugVariables, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// Evaluates an expression in a frame.
+    fn debug_evaluate(
+        &self,
+        _scope: &SessionScope,
+        _query: &DebugEvaluateQuery,
+    ) -> Result<DebugValue, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// Moves the program and answers where it got.
+    fn debug_step(
+        &self,
+        _scope: &SessionScope,
+        _query: &DebugStepQuery,
+    ) -> Result<DebugSessionState, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// Ends the debug session, as the Stop button does.
+    fn debug_stop(&self, _scope: &SessionScope) -> Result<(), ToolError> {
+        Err(not_connected("the debug window"))
+    }
 }
 
 fn not_connected(what: &str) -> ToolError {
@@ -950,6 +1337,61 @@ pub struct RunOutput {
     pub running: bool,
     pub exit_code: Option<i32>,
     pub lines: Vec<String>,
+}
+
+/// What the debug window of a project offers beyond the snapshot `debug_get_state`
+/// reads: breakpoints the user sees, a session started the way the Debug button starts
+/// it, and the commands of a stopped program. A window registers one when its Debug
+/// panel opens; every call blocks the worker thread until the panel answers, and the
+/// panel itself never waits.
+pub trait DebugControl: Send + Sync {
+    fn set_breakpoint(
+        &self,
+        scope: &SessionScope,
+        query: &BreakpointQuery,
+    ) -> Result<BreakpointInfo, ToolError>;
+
+    fn remove_breakpoint(&self, scope: &SessionScope, id: &BreakpointId) -> Result<(), ToolError>;
+
+    fn breakpoints(&self, scope: &SessionScope) -> Result<Vec<BreakpointInfo>, ToolError>;
+
+    /// Starts a test or a configuration under the debugger and answers the id of the
+    /// session, waited for its first stop for `request.wait_seconds`.
+    fn run(
+        &self,
+        scope: &SessionScope,
+        request: &DebugRunRequest,
+        client: Option<&str>,
+    ) -> Result<DebugRunOutcome, ToolError>;
+
+    fn wait(
+        &self,
+        scope: &SessionScope,
+        query: &DebugWaitQuery,
+    ) -> Result<DebugSessionState, ToolError>;
+
+    fn stack(&self, scope: &SessionScope, query: &DebugStackQuery)
+    -> Result<DebugStack, ToolError>;
+
+    fn variables(
+        &self,
+        scope: &SessionScope,
+        query: &DebugVariablesQuery,
+    ) -> Result<DebugVariables, ToolError>;
+
+    fn evaluate(
+        &self,
+        scope: &SessionScope,
+        query: &DebugEvaluateQuery,
+    ) -> Result<DebugValue, ToolError>;
+
+    fn step(
+        &self,
+        scope: &SessionScope,
+        query: &DebugStepQuery,
+    ) -> Result<DebugSessionState, ToolError>;
+
+    fn stop(&self, scope: &SessionScope) -> Result<(), ToolError>;
 }
 
 /// What the run window of a project offers: the build tool, the tests and the stored

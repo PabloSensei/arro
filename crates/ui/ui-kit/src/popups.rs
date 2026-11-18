@@ -3,13 +3,17 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::metrics::*;
-use crate::{Theme, icon, icon_button, icon_sized, motion, popup_frame, script_spot};
+use crate::{
+    TOOLTIP_CREATE_DELAY, Theme, icon, icon_button, icon_sized, motion, popup_frame, script_spot,
+    scrollable, tooltip,
+};
 
 /// The one entry motion of a popup or a dialog: a short fade, no movement.
 pub fn enter(
@@ -61,6 +65,8 @@ pub struct MenuEntry {
     pub id: Option<SharedString>,
     /// A less important row, such as a temporary run configuration.
     pub muted: bool,
+    /// What the row does, shown as its tooltip while the pointer rests on it.
+    pub tip: Option<SharedString>,
 }
 
 impl MenuEntry {
@@ -77,6 +83,7 @@ impl MenuEntry {
             submenu: Vec::new(),
             id: None,
             muted: false,
+            tip: None,
         }
     }
 
@@ -117,6 +124,12 @@ impl MenuEntry {
         self
     }
 
+    /// The hint of the row: a tooltip that says what the row starts or does.
+    pub fn tip(mut self, tip: impl Into<SharedString>) -> Self {
+        self.tip = Some(tip.into());
+        self
+    }
+
     pub fn separator() -> Self {
         Self {
             label: SharedString::default(),
@@ -127,6 +140,7 @@ impl MenuEntry {
             submenu: Vec::new(),
             id: None,
             muted: false,
+            tip: None,
         }
     }
 
@@ -243,6 +257,29 @@ impl MenuState {
 
     pub fn move_up(&mut self, entries: &[MenuEntry]) {
         self.step(entries, false);
+    }
+
+    /// Highlights the first selectable row of the deepest open level, as Home does.
+    pub fn move_first(&mut self, entries: &[MenuEntry]) {
+        let level = self.level(entries);
+        if let Some(index) = level.iter().position(MenuEntry::selectable) {
+            self.highlight_row(index);
+        }
+    }
+
+    /// Highlights the last selectable row of the deepest open level, as End does.
+    pub fn move_last(&mut self, entries: &[MenuEntry]) {
+        let level = self.level(entries);
+        if let Some(index) = level.iter().rposition(MenuEntry::selectable) {
+            self.highlight_row(index);
+        }
+    }
+
+    /// Highlights the row `index` of the deepest open level.
+    fn highlight_row(&mut self, index: usize) {
+        let depth = self.open.len();
+        self.highlight.truncate(depth);
+        self.highlight.push(index);
     }
 
     /// Highlights the row at `path`; submenus below its level close. A row whose own
@@ -394,6 +431,8 @@ pub fn menu_position(
     viewport: Size<Pixels>,
 ) -> Point<Pixels> {
     let margin = px(SPACE_M);
+    // A menu taller than the window scrolls, so it is placed with the height it takes.
+    let height = size.height.min(menu_max_height(viewport));
     let max_x = (viewport.width - size.width - margin).max(margin);
     let mut x = anchor.left();
     if x + size.width + margin > viewport.width {
@@ -402,13 +441,19 @@ pub fn menu_position(
     let x = x.clamp(margin, max_x);
 
     let below = anchor.bottom() + px(SPACE_XS);
-    let max_y = (viewport.height - size.height - margin).max(margin);
-    let y = if below + size.height + margin > viewport.height {
-        anchor.top() - px(SPACE_XS) - size.height
+    let max_y = (viewport.height - height - margin).max(margin);
+    let y = if below + height + margin > viewport.height {
+        anchor.top() - px(SPACE_XS) - height
     } else {
         below
     };
     point(x, y.clamp(margin, max_y))
+}
+
+/// The tallest a menu goes: the window less `SPACE_M` above and below it. A menu that
+/// is taller than that scrolls inside its frame.
+pub fn menu_max_height(viewport: Size<Pixels>) -> Pixels {
+    (viewport.height - px(SPACE_M) * 2.).max(px(0.))
 }
 
 /// The area of a control that opens a menu. A menu opened by a button stands under that
@@ -443,12 +488,30 @@ impl MenuAnchor {
     }
 }
 
-/// The row bounds and the submenu sizes the menu measured while drawing. A submenu is
-/// drawn hidden until its size is measured, then placed from it.
-#[derive(Clone, Default)]
+/// The row bounds, the submenu sizes and the scroll of each list that the menu measured
+/// while drawing. A submenu is drawn hidden until its size is measured, then placed from it.
+#[derive(Clone)]
 pub struct MenuGeometry {
+    /// Tells the lists of this menu from the lists of the next one: a bar keeps the handle
+    /// of the list it was first drawn for, so a new menu must not reuse the id.
+    id: usize,
     rows: Rc<RefCell<HashMap<Vec<usize>, Bounds<Pixels>>>>,
     sizes: Rc<RefCell<HashMap<Vec<usize>, Size<Pixels>>>>,
+    /// The scroll of the list of each level, keyed by the path of the row that opens it;
+    /// the top level has the empty path.
+    scrolls: Rc<RefCell<HashMap<Vec<usize>, ScrollHandle>>>,
+}
+
+impl Default for MenuGeometry {
+    fn default() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            rows: Rc::default(),
+            sizes: Rc::default(),
+            scrolls: Rc::default(),
+        }
+    }
 }
 
 impl MenuGeometry {
@@ -460,8 +523,29 @@ impl MenuGeometry {
         self.sizes.borrow().get(path).copied()
     }
 
-    fn record_row(&self, path: &[usize], bounds: Bounds<Pixels>) {
-        self.rows.borrow_mut().insert(path.to_vec(), bounds);
+    /// The scroll of the list of the level opened by the row at `parent`, or of the top
+    /// level for the empty path. Every copy of the geometry shares it.
+    pub fn scroll(&self, parent: &[usize]) -> ScrollHandle {
+        self.scrolls
+            .borrow_mut()
+            .entry(parent.to_vec())
+            .or_default()
+            .clone()
+    }
+
+    /// Scrolls the list of the deepest open level, so that its highlighted row shows. Only
+    /// a key that moves the highlight asks for it: a list that a pointer opens keeps its
+    /// place, and a list drawn for the first time has no viewport to scroll in yet.
+    pub fn reveal(&self, state: &MenuState) {
+        let open = state.open_path();
+        if let Some(index) = state.highlighted_at(open.len()) {
+            self.scroll(open).scroll_to_item(index);
+        }
+    }
+
+    /// Records the bounds of a row and tells whether they moved since the last frame.
+    fn record_row(&self, path: &[usize], bounds: Bounds<Pixels>) -> bool {
+        self.rows.borrow_mut().insert(path.to_vec(), bounds) != Some(bounds)
     }
 
     fn record_size(&self, path: &[usize], size: Size<Pixels>) {
@@ -509,6 +593,8 @@ fn menu_level(
     parent_path: &[usize],
     interactive: bool,
     render: &MenuRender,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Stateful<Div> {
     let MenuRender {
         state,
@@ -567,8 +653,15 @@ fn menu_level(
         let measure = {
             let geometry = (*geometry).clone();
             let path = path.clone();
+            // A row with an open submenu that moved, by a wheel of its list, is measured
+            // again in the next frame: the submenu is placed from the row it was drawn at.
+            let follows = open;
             canvas(
-                move |bounds, _, _| geometry.record_row(&path, bounds),
+                move |bounds, window, _| {
+                    if geometry.record_row(&path, bounds) && follows {
+                        window.request_animation_frame();
+                    }
+                },
                 |_, _, _, _| {},
             )
             .absolute()
@@ -652,6 +745,12 @@ fn menu_level(
                 .child(entry.label.clone()),
         );
 
+        if let Some(tip) = entry.tip.clone() {
+            row = row
+                .tooltip(move |_, cx| tooltip(tip.clone(), None, cx))
+                .tooltip_show_delay(TOOLTIP_CREATE_DELAY);
+        }
+
         if let Some(shortcut) = entry.shortcut.clone() {
             row = row.child(
                 div()
@@ -664,7 +763,15 @@ fn menu_level(
 
         if open {
             let size = geometry.size(&path);
-            let submenu = menu_level(&entry.submenu, depth + 1, &path, size.is_some(), render);
+            let submenu = menu_level(
+                &entry.submenu,
+                depth + 1,
+                &path,
+                size.is_some(),
+                render,
+                window,
+                cx,
+            );
             let row_bounds = geometry.row(&path);
             let position = match (row_bounds, size) {
                 (Some(row), Some(size)) => submenu_position(row, size, *viewport),
@@ -704,27 +811,50 @@ fn menu_level(
         items.push(row.into_any_element());
     }
 
-    surface.children(items)
+    // The rows scroll inside the frame when they do not fit the window. A list that fits
+    // takes exactly the height of its rows.
+    let scroll = geometry.scroll(parent_path);
+    let list_height =
+        (menu_max_height(*viewport) - px(POPUP_PADDING * 2. + MENU_FRAME)).max(px(0.));
+    let list = SharedString::from(format!("menu-list-{}-{depth}", geometry.id));
+    let bars = SharedString::from(format!("menu-scroll-{}-{depth}", geometry.id));
+    surface.child(scrollable(
+        bars,
+        scroll.clone(),
+        div()
+            .id(list)
+            .flex()
+            .flex_col()
+            .max_h(list_height)
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .children(items),
+        theme,
+        window,
+        cx,
+    ))
 }
 
 /// The menu body with its submenus. `callbacks` closes the popup, tracks the pointer and
-/// opens a row a click picked.
+/// opens a row a click picked. The menu is no taller than the window, and its rows scroll
+/// when they do not fit.
 pub fn menu(
     entries: &[MenuEntry],
     state: &MenuState,
     geometry: &MenuGeometry,
     callbacks: &MenuCallbacks,
-    viewport: Size<Pixels>,
     theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Stateful<Div> {
     let render = MenuRender {
         state,
         geometry,
         callbacks,
-        viewport,
+        viewport: window.viewport_size(),
         theme,
     };
-    menu_level(entries, 0, &[], true, &render)
+    menu_level(entries, 0, &[], true, &render, window, cx)
 }
 
 /// What a button of a notification does when it is pressed.
@@ -815,7 +945,10 @@ pub fn notification(
 
 #[cfg(test)]
 mod menu_tests {
-    use super::{MenuEntry, MenuState, SUBMENU_MARGIN, menu_position, submenu_position};
+    use super::{
+        MenuEntry, MenuGeometry, MenuState, SUBMENU_MARGIN, menu_max_height, menu_position,
+        submenu_position,
+    };
     use crate::gpui::{Bounds, point, px, size};
 
     fn action(label: &'static str) -> MenuEntry {
@@ -959,5 +1092,67 @@ mod menu_tests {
         assert!(at.x + px(336.) <= px(400.) - SUBMENU_MARGIN);
         assert!(at.y >= SUBMENU_MARGIN);
         assert!(at.y + px(240.) <= px(500.) - SUBMENU_MARGIN);
+    }
+
+    #[test]
+    fn home_and_end_go_to_the_first_and_the_last_selectable_row() {
+        let entries = sample();
+        let mut state = MenuState::default();
+        state.move_last(&entries);
+        assert_eq!(state.highlighted_at(0), Some(3), "Help is the last row");
+        state.move_first(&entries);
+        assert_eq!(state.highlighted_at(0), Some(0), "File is the first row");
+        assert!(state.open_submenu(&entries));
+        state.move_last(&entries);
+        assert_eq!(
+            state.highlighted_at(1),
+            Some(3),
+            "Recent is the last row of File"
+        );
+        assert_eq!(
+            state.highlighted_at(0),
+            Some(0),
+            "the top level keeps its row"
+        );
+        state.move_first(&entries);
+        assert_eq!(
+            state.highlighted_at(1),
+            Some(0),
+            "Open is the first row of File"
+        );
+    }
+
+    #[test]
+    fn a_menu_is_no_taller_than_the_window_less_the_margins() {
+        assert_eq!(menu_max_height(size(px(800.), px(600.))), px(584.));
+        assert_eq!(menu_max_height(size(px(800.), px(10.))), px(0.));
+    }
+
+    #[test]
+    fn a_menu_taller_than_the_window_starts_at_the_top_margin() {
+        let button = Bounds::new(point(px(100.), px(40.)), size(px(120.), px(26.)));
+        let at = menu_position(button, size(px(336.), px(900.)), size(px(800.), px(600.)));
+        assert_eq!(
+            at.y, SUBMENU_MARGIN,
+            "it is no taller than the window and scrolls"
+        );
+    }
+
+    #[test]
+    fn each_level_keeps_its_scroll_and_a_copy_of_the_geometry_shares_it() {
+        let geometry = MenuGeometry::default();
+        let copy = geometry.clone();
+        geometry.scroll(&[]).set_offset(point(px(0.), px(-40.)));
+        assert_eq!(copy.scroll(&[]).offset().y, px(-40.));
+        assert_eq!(
+            copy.scroll(&[2]).offset().y,
+            px(0.),
+            "a submenu has a list of its own"
+        );
+        assert_ne!(
+            MenuGeometry::default().id,
+            geometry.id,
+            "a new menu has ids of its own"
+        );
     }
 }

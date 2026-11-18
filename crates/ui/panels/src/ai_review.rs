@@ -5,6 +5,7 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use change_tracker::{ChangeSet, ChangeTracker, FileReview};
 use ui_kit::metrics::*;
@@ -14,6 +15,16 @@ use ui_kit::*;
 use crate::agents::AgentsPanel;
 use crate::chat::text_button;
 use crate::outline::OpenEditors;
+
+/// How long the result of the AGENTS.md button stays next to it, unless the user acts first.
+pub(crate) const AGENTS_MD_NOTE_TIME: Duration = Duration::from_secs(5);
+
+/// What the AGENTS.md button reported last: a result, or why nothing was written.
+#[derive(Clone)]
+pub(crate) struct AgentsMdNote {
+    pub(crate) text: SharedString,
+    pub(crate) failed: bool,
+}
 
 #[derive(Default)]
 pub(crate) struct Review {
@@ -25,6 +36,11 @@ pub(crate) struct Review {
     /// Every file a session changed so far, also after a revert, for scripts.
     touched: Vec<String>,
     generation: u64,
+    /// The lines of the shown file that the user selected, by their place in the review: where
+    /// the selection began and where it ends. A new file clears them.
+    pub(crate) lines: Option<(usize, usize)>,
+    /// Whether the button is down over the lines, so that a move extends the selection.
+    pub(crate) dragging: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +171,16 @@ impl AgentsPanel {
     pub(crate) fn select_change(&mut self, path: String, cx: &mut Context<Self>) {
         self.review.selected = Some(path);
         self.review.notice = None;
+        self.review.lines = None;
         self.reload_review(cx);
+    }
+
+    /// Shows `file` as the review of the selected file. Its lines are new, so the selection of
+    /// the lines of the file before goes.
+    fn show_file(&mut self, file: Option<FileReview>) {
+        self.review.file = file;
+        self.review.lines = None;
+        self.review.dragging = false;
     }
 
     /// Accepts or reverts one file, for the bar above its editor.
@@ -175,7 +200,7 @@ impl AgentsPanel {
             .as_ref()
             .is_some_and(|file| file.path != path)
         {
-            self.review.file = None;
+            self.show_file(None);
         }
         self.act(action, cx);
     }
@@ -195,7 +220,8 @@ impl AgentsPanel {
                 .position(|proposal| proposal.relative == path)
         });
         if let Some(position) = proposal {
-            self.review.file = Some(self.proposals[position].view());
+            let file = self.proposals[position].view();
+            self.show_file(Some(file));
             cx.notify();
             return;
         }
@@ -203,7 +229,8 @@ impl AgentsPanel {
             && let Some(proposal) = self.proposals.first()
         {
             self.review.selected = Some(proposal.relative.clone());
-            self.review.file = Some(proposal.view());
+            let file = proposal.view();
+            self.show_file(Some(file));
             cx.notify();
             return;
         }
@@ -214,7 +241,7 @@ impl AgentsPanel {
         }
         let (Some(path), Some(tracker)) = (self.review.selected.clone(), self.tracker().cloned())
         else {
-            self.review.file = None;
+            self.show_file(None);
             cx.notify();
             return;
         };
@@ -230,9 +257,9 @@ impl AgentsPanel {
                     return;
                 }
                 match result {
-                    Ok(file) => this.review.file = Some(file),
+                    Ok(file) => this.show_file(Some(file)),
                     Err(error) => {
-                        this.review.file = None;
+                        this.show_file(None);
                         this.review.notice = Some(error.to_string());
                     }
                 }
@@ -319,22 +346,72 @@ impl AgentsPanel {
     }
 
     /// Adds the section on IDE tools to `AGENTS.md`, or refreshes it, unless an editor holds
-    /// the file with unsaved edits.
+    /// the file with unsaved edits. The result shows next to the button, and a written file
+    /// joins the changes at once.
     pub(crate) fn add_agents_md(&mut self, cx: &mut Context<Self>) {
         let file = self.root.join("AGENTS.md");
         if OpenEditors::is_dirty(&file, cx) {
-            self.review.notice =
-                Some("AGENTS.md has unsaved edits in the editor, save them first".to_string());
-            cx.notify();
+            self.show_agents_md_note(
+                "AGENTS.md has unsaved edits in the editor, save them first",
+                true,
+                cx,
+            );
             return;
         }
-        let existing = std::fs::read_to_string(&file).unwrap_or_default();
-        let text = tool_gateway::with_agents_md_section(&existing, agent_pty::MCP_SERVER_NAME);
-        self.review.notice = match std::fs::write(&file, text) {
-            Ok(()) => Some("AGENTS.md lists the IDE tools now".to_string()),
-            Err(error) => Some(format!("AGENTS.md is not written: {error}")),
+        let existing = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            // A file that cannot be read stays as it is: writing over it would lose its text.
+            Err(error) => {
+                self.show_agents_md_note(format!("AGENTS.md is not read: {error}"), true, cx);
+                return;
+            }
         };
-        OpenEditors::reload(&file, cx);
+        let text = tool_gateway::with_agents_md_section(&existing, agent_pty::MCP_SERVER_NAME);
+        if text == existing {
+            self.show_agents_md_note("AGENTS.md already lists the IDE tools", false, cx);
+            return;
+        }
+        match std::fs::write(&file, text) {
+            Ok(()) => {
+                OpenEditors::reload(&file, cx);
+                // A snapshot now, as the other actions take one after they write a file.
+                if let Some(tracker) = self.tracker() {
+                    tracker.refresh();
+                }
+                self.show_agents_md_note("AGENTS.md lists the IDE tools now", false, cx);
+            }
+            Err(error) => {
+                self.show_agents_md_note(format!("AGENTS.md is not written: {error}"), true, cx)
+            }
+        }
+    }
+
+    /// Shows what the AGENTS.md button did, next to it, until the next action or until
+    /// `AGENTS_MD_NOTE_TIME` passes. A newer result is not cleared by an older timer.
+    fn show_agents_md_note(
+        &mut self,
+        text: impl Into<SharedString>,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.agents_md_generation = self.agents_md_generation.wrapping_add(1);
+        let mine = self.agents_md_generation;
+        self.agents_md = Some(AgentsMdNote {
+            text: text.into(),
+            failed,
+        });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AGENTS_MD_NOTE_TIME).await;
+            this.update(cx, |this, cx| {
+                if this.agents_md_generation == mine {
+                    this.agents_md = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -385,9 +462,11 @@ impl AgentsPanel {
         list
     }
 
+    /// The lines of a hunk; `first` is the place of its first line among the lines of the file.
     fn hunk_view(
         &self,
         index: usize,
+        first: usize,
         hunk: &change_tracker::ReviewHunk,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -399,16 +478,37 @@ impl AgentsPanel {
             hunk.after.start + 1,
             hunk.after.len()
         );
+        let picked = self
+            .review
+            .lines
+            .map(|(from, to)| (from.min(to), from.max(to)));
         let mut lines = div().flex().flex_col().font_family(MONO_FONT);
+        let mut place = first;
         for line in &hunk.removed {
-            lines = lines.child(
-                div()
-                    .text_color(theme.close_hover)
-                    .child(format!("- {line}")),
+            let row = self.review_line(
+                place,
+                format!("- {line}"),
+                theme.close_hover,
+                picked,
+                theme,
+                cx,
             );
+            lines = lines.child(row);
+            place += 1;
         }
-        for line in &hunk.added {
-            lines = lines.child(div().text_color(theme.string).child(format!("+ {line}")));
+        for (number, line) in hunk.added.iter().enumerate() {
+            let row = self.review_line(place, format!("+ {line}"), theme.string, picked, theme, cx);
+            // The last line of a hunk has a selector, so a test can see that the list reaches it.
+            let row = if number + 1 == hunk.added.len() {
+                div()
+                    .debug_selector(move || format!("review-last-line-{index}"))
+                    .child(row)
+                    .into_any_element()
+            } else {
+                row.into_any_element()
+            };
+            lines = lines.child(row);
+            place += 1;
         }
         div()
             .flex()
@@ -446,13 +546,121 @@ impl AgentsPanel {
             .child(lines)
     }
 
+    /// One line of a hunk. A press selects it, and a drag from it extends the selection over
+    /// the lines it passes. The text is what the line shows, with its sign.
+    fn review_line(
+        &self,
+        place: usize,
+        text: String,
+        color: Hsla,
+        picked: Option<(usize, usize)>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let chosen = picked.is_some_and(|(from, to)| (from..=to).contains(&place));
+        div()
+            .id(("review-line", place))
+            .debug_selector(move || format!("review-line-{place}"))
+            .when(chosen, |this| this.bg(theme.selection))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.press_review_line(place, event.modifiers.shift, cx)
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                    this.enter_review_line(place, cx)
+                }),
+            )
+            .text_color(color)
+            .child(text)
+    }
+
+    /// A press on a line of the review. Shift keeps the start of the selection and moves its end.
+    pub(crate) fn press_review_line(&mut self, place: usize, extend: bool, cx: &mut Context<Self>) {
+        let start = match (extend, self.review.lines) {
+            (true, Some((start, _))) => start,
+            _ => place,
+        };
+        self.review.lines = Some((start, place));
+        self.review.dragging = true;
+        cx.notify();
+    }
+
+    /// The pointer moved over a line while the button is down: the selection reaches it.
+    pub(crate) fn enter_review_line(&mut self, place: usize, cx: &mut Context<Self>) {
+        if !self.review.dragging {
+            return;
+        }
+        if let Some((start, end)) = self.review.lines
+            && end != place
+        {
+            self.review.lines = Some((start, place));
+            cx.notify();
+        }
+    }
+
+    /// The button came up: the selection stays, and a move no longer extends it.
+    pub(crate) fn release_review_lines(&mut self, cx: &mut Context<Self>) {
+        if self.review.dragging {
+            self.review.dragging = false;
+            cx.notify();
+        }
+    }
+
+    /// Copies the selected lines of the review without their signs, one line each. False when
+    /// no line is selected.
+    pub(crate) fn copy_review_lines(&self, cx: &mut App) -> bool {
+        let Some((start, end)) = self.review.lines else {
+            return false;
+        };
+        let Some(file) = &self.review.file else {
+            return false;
+        };
+        let lines: Vec<&str> = file
+            .hunks
+            .iter()
+            .flat_map(|hunk| hunk.removed.iter().chain(&hunk.added))
+            .map(String::as_str)
+            .collect();
+        if lines.is_empty() {
+            return false;
+        }
+        // The selection may name lines of the file before a change: it is cut to the lines there are.
+        let (first, last) = (start.min(end), start.max(end).min(lines.len() - 1));
+        if first > last {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(lines[first..=last].join("\n")));
+        true
+    }
+
     pub(crate) fn changes_view(
         &self,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let view = div().flex().flex_col().gap(px(SPACE_S)).p(px(SPACE_M));
+        // The content scrolls as a whole, the notice and the buttons with the files and the
+        // hunks, and the wrapper takes the height that the body of the panel leaves over. A
+        // drag that ends off the lines ends here too.
+        let view = div()
+            .id("changes-content")
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(SPACE_M))
+            .overflow_y_scroll()
+            .track_scroll(&self.review_scroll)
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.release_review_lines(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.release_review_lines(cx)),
+            );
         let state = if !self.proposals.is_empty() {
             None
         } else {
@@ -478,7 +686,9 @@ impl AgentsPanel {
         if let Some(state) = state {
             let shown = div().text_color(theme.text_secondary).child(state);
             let view = view.children(notice).child(shown);
-            return scrollable("changes", &self.review_scroll, view, theme, window, cx);
+            return scrollable("changes", &self.review_scroll, view, theme, window, cx)
+                .flex_1()
+                .min_h_0();
         }
         let session = div()
             .flex()
@@ -520,11 +730,15 @@ impl AgentsPanel {
             if file.binary {
                 view = view.child(div().text_color(theme.text_secondary).child("Binary file"));
             }
+            let mut first = 0;
             for (index, hunk) in file.hunks.iter().enumerate() {
-                view = view.child(self.hunk_view(index, hunk, theme, cx));
+                view = view.child(self.hunk_view(index, first, hunk, theme, cx));
+                first += hunk.removed.len() + hunk.added.len();
             }
         }
         scrollable("changes", &self.review_scroll, view, theme, window, cx)
+            .flex_1()
+            .min_h_0()
     }
 }
 

@@ -111,6 +111,7 @@ pub(crate) fn options_of(cx: &App) -> EditorOptions {
         code_vision_implementations: settings.code_vision_implementations,
         render_doc_comments: settings.render_doc_comments,
         markdown_images_from_internet: settings.markdown_images_from_internet,
+        ai_features: settings.ai_enabled,
     }
 }
 
@@ -563,6 +564,15 @@ fn open(
                             }
                         })
                         .detach();
+                }
+                EditorEvent::FixWithAi(problem) => {
+                    runner
+                        .update(cx, |workspace, cx| {
+                            let message =
+                                crate::fix_with_ai::diagnostic_message(workspace.root(), problem);
+                            crate::fix_with_ai::ask(workspace, message, window, cx)
+                        })
+                        .ok();
                 }
                 EditorEvent::CreateTest(spot) => {
                     let spot = spot.clone();

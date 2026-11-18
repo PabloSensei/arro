@@ -3,6 +3,7 @@
 
 mod audit;
 mod backend;
+mod clients;
 mod edit;
 mod gateway;
 mod hint;
@@ -12,16 +13,23 @@ mod tools;
 
 pub use audit::{AuditEntry, AuditLog};
 pub use backend::{
-    BuildOutcome, BuildProblem, BuildRequest, CallHierarchy, CallHierarchyQuery, Confidence,
-    DebugSnapshotSource, DebugStateQuery, Diagnostic, DiagnosticsPage, DiagnosticsQuery,
-    EditOutcome, EditorContext, FileActionOutcome, FileActionQuery, FileText, HierarchyNode,
-    Location, OUTPUT_TAIL, Position, ProjectModule, ProjectRunner, ProjectStructure,
-    ProjectStructureQuery, ProposeEditQuery, ProposedEdit, READ_LINE_LIMIT, ReadFileQuery,
-    RenameSymbolQuery, RenamedSymbol, RunConfiguration, RunId, RunOutput, SearchHit, SearchPage,
-    SearchQuery, SessionScope, Severity, StartRunRequest, SymbolHit, SymbolInfo, SymbolPage,
-    SymbolQuery, TestCase, TestOutcome, TestsOutcome, TestsRequest, TextReplacement, ToolBackend,
-    ToolError, TypeHierarchy, TypeHierarchyQuery, Unavailable, Usage, UsagePage, UsagesQuery,
-    VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
+    BreakpointId, BreakpointInfo, BreakpointQuery, BuildOutcome, BuildProblem, BuildRequest,
+    CallHierarchy, CallHierarchyQuery, Confidence, DebugControl, DebugEvaluateQuery, DebugFrame,
+    DebugRunOutcome, DebugRunRequest, DebugScope, DebugSessionState, DebugSnapshotSource,
+    DebugStack, DebugStackQuery, DebugStateQuery, DebugStep, DebugStepQuery, DebugThread,
+    DebugValue, DebugVariable, DebugVariables, DebugVariablesQuery, DebugWaitQuery, Diagnostic,
+    DiagnosticsPage, DiagnosticsQuery, EditOutcome, EditorContext, FileActionOutcome,
+    FileActionQuery, FileText, HierarchyNode, Location, OUTPUT_TAIL, Position, ProjectModule,
+    ProjectRunner, ProjectStructure, ProjectStructureQuery, ProposeEditQuery, ProposedEdit,
+    READ_LINE_LIMIT, ReadFileQuery, RenameSymbolQuery, RenamedSymbol, RunConfiguration, RunId,
+    RunOutput, SearchHit, SearchPage, SearchQuery, SessionScope, Severity, StartRunRequest,
+    SymbolHit, SymbolInfo, SymbolPage, SymbolQuery, TestCase, TestOutcome, TestsOutcome,
+    TestsRequest, TextReplacement, ToolBackend, ToolError, TypeHierarchy, TypeHierarchyQuery,
+    Unavailable, Usage, UsagePage, UsagesQuery, VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
+};
+pub use clients::{
+    CALL_LIMIT, CLIENT_LIMIT, CallOutcome, CallRecord, ClientInfo, ClientLog, ClientRecord, HIDDEN,
+    arguments as client_arguments,
 };
 pub use edit::apply_replacements;
 pub use gateway::{Approval, ApprovalAnswer, ApprovalRequest, Decision, Policy, ToolGateway};

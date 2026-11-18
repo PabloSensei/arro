@@ -1934,6 +1934,12 @@ impl EditorView {
         self.request_doc_comments(cx);
     }
 
+    /// Asks the languages of the window for this file again after the application made
+    /// one of them match it, such as the source picked for a SQL script.
+    pub fn attach_support(&mut self, cx: &mut Context<Self>) {
+        self.attach(cx);
+    }
+
     /// Asks for the semantic tokens once the file is open. The whole document is asked
     /// for; the visible part comes later for a big one.
     pub(crate) fn semantic_tokens_now(&mut self, cx: &mut Context<Self>) {

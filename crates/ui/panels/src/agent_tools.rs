@@ -1,7 +1,8 @@
 //! What the tools of an agent answer from inside the window: the language server, the
 //! file list of the index, the open buffers, the project model and Git. The window writes
 //! its latest snapshot on the UI thread, and a tool call reads it on its own worker
-//! thread.
+//! thread. The text of an open document is not in the snapshot: the window hands over the
+//! document itself, and a tool copies the text only when it asks.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,33 +10,38 @@ use std::sync::{Arc, RwLock};
 
 use project_model::{EnvironmentProvider, ProjectModel, TEST_UNIT};
 use tool_gateway::{
-    BuildOutcome, BuildRequest, CallHierarchy, CallHierarchyQuery, DiagnosticsPage,
-    DiagnosticsQuery, EditOutcome, EditorContext, FileActionOutcome, FileActionQuery, FileText,
-    LanguageTools, Position, ProjectStructure, ProjectStructureQuery, ProposeEditQuery,
-    ProposedEdit, ReadFileQuery, RenameSymbolQuery, RenamedSymbol, RunConfiguration, RunOutput,
-    SearchHit, SearchPage, SearchQuery, SessionScope, StartRunRequest, SymbolInfo, SymbolPage,
-    SymbolQuery, TestsOutcome, TestsRequest, ToolBackend, ToolError, TypeHierarchy,
-    TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
+    BreakpointId, BreakpointInfo, BreakpointQuery, BuildOutcome, BuildRequest, CallHierarchy,
+    CallHierarchyQuery, DebugEvaluateQuery, DebugRunOutcome, DebugRunRequest, DebugSessionState,
+    DebugStack, DebugStackQuery, DebugStepQuery, DebugValue, DebugVariables, DebugVariablesQuery,
+    DebugWaitQuery, DiagnosticsPage, DiagnosticsQuery, EditOutcome, EditorContext,
+    FileActionOutcome, FileActionQuery, FileText, LanguageTools, Position, ProjectStructure,
+    ProjectStructureQuery, ProposeEditQuery, ProposedEdit, ReadFileQuery, RenameSymbolQuery,
+    RenamedSymbol, RunConfiguration, RunOutput, SearchHit, SearchPage, SearchQuery, SessionScope,
+    StartRunRequest, SymbolInfo, SymbolPage, SymbolQuery, TestsOutcome, TestsRequest, ToolBackend,
+    ToolError, TypeHierarchy, TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges, VcsDiff,
+    VcsFile, VcsHunk, VcsQuery,
 };
 use ui_kit::Global;
 use vcs::{Change, FileStatus, GitRunner, Repository};
 
 use crate::mcp_edits::{EditKind, EditReply, EditRequests};
 
-/// One open editor as the last update of the window saw it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One open editor as the last update of the window saw it. The document shares its text
+/// with the editor, so the window copies nothing: a tool that needs the text reads it when
+/// it asks.
 pub struct OpenDocument {
     pub path: PathBuf,
     /// The version of the text the language server holds.
     pub version: i32,
     pub dirty: bool,
+    /// Another view of the same document; the text lives in the editor.
+    pub document: text_core::Buffer,
 }
 
-#[derive(Clone, Debug)]
 struct OpenBuffer {
     version: i32,
     dirty: bool,
-    text: String,
+    document: text_core::Buffer,
 }
 
 /// The latest snapshot, shared between the window and the tool calls.
@@ -101,13 +107,10 @@ impl WindowTools {
         *known = files;
     }
 
-    /// The open editors and the text of those the window has not sent yet. The closure is
-    /// called only for a document whose version or unsaved state changed.
-    pub fn update_open(
-        &self,
-        documents: &[OpenDocument],
-        mut text_of: impl FnMut(&Path) -> Option<String>,
-    ) {
+    /// The open editors of the window, as the last frame saw them. The snapshot keeps the
+    /// version and the unsaved state of each document; the text stays in the editor and a
+    /// tool call reads it only when it asks.
+    pub fn update_open(&self, documents: Vec<OpenDocument>) {
         let mut open = self
             .state
             .open
@@ -119,23 +122,16 @@ impl WindowTools {
                 known.version != document.version || known.dirty != document.dirty
             });
             if changed {
-                match text_of(&document.path) {
-                    Some(text) => {
-                        open.insert(
-                            document.path.clone(),
-                            OpenBuffer {
-                                version: document.version,
-                                dirty: document.dirty,
-                                text,
-                            },
-                        );
-                    }
-                    None => {
-                        open.remove(&document.path);
-                    }
-                }
+                open.insert(
+                    document.path.clone(),
+                    OpenBuffer {
+                        version: document.version,
+                        dirty: document.dirty,
+                        document: document.document,
+                    },
+                );
             }
-            seen.insert(document.path.clone());
+            seen.insert(document.path);
         }
         open.retain(|path, _| seen.contains(path));
     }
@@ -157,7 +153,9 @@ impl WindowTools {
             .read()
             .unwrap_or_else(|error| error.into_inner());
         open.get(path)
-            .map(|buffer| (buffer.text.clone(), buffer.dirty))
+            // The text and its unsaved state come from the document itself, which may be
+            // newer than the frame that published the snapshot.
+            .map(|buffer| (buffer.document.text(), buffer.document.is_dirty()))
     }
 
     fn text_of(&self, path: &Path) -> Result<(String, bool), ToolError> {
@@ -315,7 +313,7 @@ impl WindowTools {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .iter()
-            .map(|(path, buffer)| (path.clone(), buffer.text.clone()))
+            .map(|(path, buffer)| (path.clone(), buffer.document.text()))
             .collect();
         let text_query = search::TextQuery {
             pattern: query.pattern.clone(),
@@ -796,6 +794,75 @@ impl ToolBackend for WindowTools {
 
     fn stop_run(&self, scope: &SessionScope, id: &str) -> Result<(), ToolError> {
         self.languages.stop_run(scope, id)
+    }
+
+    fn set_breakpoint(
+        &self,
+        scope: &SessionScope,
+        query: &BreakpointQuery,
+    ) -> Result<BreakpointInfo, ToolError> {
+        self.languages.set_breakpoint(scope, query)
+    }
+
+    fn remove_breakpoint(&self, scope: &SessionScope, id: &BreakpointId) -> Result<(), ToolError> {
+        self.languages.remove_breakpoint(scope, id)
+    }
+
+    fn breakpoints(&self, scope: &SessionScope) -> Result<Vec<BreakpointInfo>, ToolError> {
+        self.languages.breakpoints(scope)
+    }
+
+    fn debug_run(
+        &self,
+        scope: &SessionScope,
+        request: &DebugRunRequest,
+        client: Option<&str>,
+    ) -> Result<DebugRunOutcome, ToolError> {
+        self.languages.debug_run(scope, request, client)
+    }
+
+    fn debug_wait(
+        &self,
+        scope: &SessionScope,
+        query: &DebugWaitQuery,
+    ) -> Result<DebugSessionState, ToolError> {
+        self.languages.debug_wait(scope, query)
+    }
+
+    fn debug_stack(
+        &self,
+        scope: &SessionScope,
+        query: &DebugStackQuery,
+    ) -> Result<DebugStack, ToolError> {
+        self.languages.debug_stack(scope, query)
+    }
+
+    fn debug_variables(
+        &self,
+        scope: &SessionScope,
+        query: &DebugVariablesQuery,
+    ) -> Result<DebugVariables, ToolError> {
+        self.languages.debug_variables(scope, query)
+    }
+
+    fn debug_evaluate(
+        &self,
+        scope: &SessionScope,
+        query: &DebugEvaluateQuery,
+    ) -> Result<DebugValue, ToolError> {
+        self.languages.debug_evaluate(scope, query)
+    }
+
+    fn debug_step(
+        &self,
+        scope: &SessionScope,
+        query: &DebugStepQuery,
+    ) -> Result<DebugSessionState, ToolError> {
+        self.languages.debug_step(scope, query)
+    }
+
+    fn debug_stop(&self, scope: &SessionScope) -> Result<(), ToolError> {
+        self.languages.debug_stop(scope)
     }
 }
 

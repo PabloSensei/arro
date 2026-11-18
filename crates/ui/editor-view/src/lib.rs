@@ -59,10 +59,11 @@ pub use style::{EditorStyle, SemanticLook};
 pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
-    ActionMark, BookmarkEntry, CodeStyleLanguages, CoverageMark, CoverageState, DebugValue,
-    DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView, EndpointMark,
-    FileBar, GutterKind, GutterMark, InlayPaint, InlineValue, InlineWatchRow, Languages,
-    LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark, PlaceTarget, PlainSyntax,
-    ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot, TemplateSettings, Usage,
-    UsagesUpdate, bookmarks, clipboard_history, highlight_text, install_keymap,
+    ActionMark, AiProblem, BookmarkEntry, CodeStyleLanguages, CoverageMark, CoverageState,
+    DebugValue, DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView,
+    EndpointMark, ExtraTemplates, FileBar, GutterKind, GutterMark, InlayPaint, InlineValue,
+    InlineWatchRow, Languages, LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark,
+    PlaceTarget, PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot,
+    TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
+    install_keymap,
 };

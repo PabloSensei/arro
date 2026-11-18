@@ -4,12 +4,14 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::backend::{
-    BuildOutcome, BuildProblem, BuildRequest, CallHierarchy, CallHierarchyQuery, DebugStateQuery,
-    DiagnosticsPage, DiagnosticsQuery, EditorContext, FileActionOutcome, FileText, HierarchyNode,
-    ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol, RunConfiguration,
-    RunOutput, SearchPage, SearchQuery, SymbolHit, SymbolInfo, SymbolPage, SymbolQuery,
-    TestOutcome, TestsOutcome, TestsRequest, TypeHierarchy, TypeHierarchyQuery, UsagePage,
-    UsagesQuery, VcsChanges, VcsQuery,
+    BreakpointId, BreakpointInfo, BuildOutcome, BuildProblem, BuildRequest, CallHierarchy,
+    CallHierarchyQuery, DebugFrame, DebugRunOutcome, DebugRunRequest, DebugSessionState,
+    DebugStack, DebugStackQuery, DebugStateQuery, DebugValue, DebugVariable, DebugVariables,
+    DebugVariablesQuery, DiagnosticsPage, DiagnosticsQuery, EditorContext, FileActionOutcome,
+    FileText, HierarchyNode, ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol,
+    RunConfiguration, RunOutput, SearchPage, SearchQuery, SymbolHit, SymbolInfo, SymbolPage,
+    SymbolQuery, TestOutcome, TestsOutcome, TestsRequest, TypeHierarchy, TypeHierarchyQuery,
+    UsagePage, UsagesQuery, VcsChanges, VcsQuery,
 };
 
 const CONTEXT_LINES: usize = 2;
@@ -863,13 +865,186 @@ pub(crate) fn run_output(output: &RunOutput) -> String {
     text
 }
 
+/// One breakpoint, with the properties the user gave it.
+fn breakpoint(text: &mut String, info: &BreakpointInfo) {
+    let path = info.path.display();
+    let state = if !info.enabled {
+        "off".to_string()
+    } else if info.verified {
+        "on, verified".to_string()
+    } else {
+        "on".to_string()
+    };
+    let condition = info
+        .condition
+        .as_deref()
+        .map(|condition| format!(", condition: {}", clipped(condition, 200)))
+        .unwrap_or_default();
+    let message = info
+        .log_message
+        .as_deref()
+        .map(|message| format!(", log: {}", clipped(message, 200)))
+        .unwrap_or_default();
+    let _ = writeln!(text, "{path}:{} {state}{condition}{message}", info.line);
+}
+
+pub(crate) fn breakpoint_set(info: &BreakpointInfo) -> String {
+    let mut text = String::from("breakpoint set: ");
+    breakpoint(&mut text, info);
+    text
+}
+
+pub(crate) fn breakpoint_removed(id: &BreakpointId) -> String {
+    format!("breakpoint removed: {}:{}\n", id.path.display(), id.line)
+}
+
+pub(crate) fn breakpoints(items: &[BreakpointInfo]) -> String {
+    if items.is_empty() {
+        return "no breakpoints\n".to_string();
+    }
+    let count = items.len();
+    let mut text = format!("{count} breakpoints:\n");
+    for info in items {
+        breakpoint(&mut text, info);
+    }
+    text
+}
+
+fn debug_frame(text: &mut String, frame: &DebugFrame) {
+    match (&frame.path, frame.line) {
+        (Some(path), line) if line > 0 => {
+            let column = if frame.column > 0 {
+                format!(":{}", frame.column)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                text,
+                "#{} {} at {}:{line}{column}",
+                frame.index,
+                frame.name,
+                path.display()
+            );
+        }
+        _ => {
+            let _ = writeln!(text, "#{} {}", frame.index, frame.name);
+        }
+    }
+}
+
+/// Where the session is, with the thread and the top frame when it stopped.
+pub(crate) fn debug_session(state: &DebugSessionState) -> String {
+    let state_text = match state.stopped_reason() {
+        Some(reason) => format!("stopped ({reason})"),
+        None => state.state.clone(),
+    };
+    let mut text = format!("debugging: {state_text}\n");
+    if let Some(thread) = &state.thread {
+        let _ = writeln!(text, "thread: {} #{}", thread.name, thread.id);
+    }
+    if let Some(frame) = &state.frame {
+        debug_frame(&mut text, frame);
+    }
+    text
+}
+
+pub(crate) fn debug_run(request: &DebugRunRequest, outcome: &DebugRunOutcome) -> String {
+    let what = match (&request.suite, &request.case, &request.configuration) {
+        (Some(suite), Some(case), _) => format!("{suite}.{case}"),
+        (Some(suite), None, _) => suite.clone(),
+        (None, _, Some(configuration)) => configuration.clone(),
+        _ => "the program".to_string(),
+    };
+    let mut text = format!("debugging {what}: session {}\n", outcome.session);
+    text.push_str(&debug_session(&outcome.state));
+    text
+}
+
+pub(crate) fn debug_stack(stack: &DebugStack, _query: &DebugStackQuery) -> String {
+    let head = match &stack.thread {
+        Some(thread) => format!("stack of {} #{}", thread.name, thread.id),
+        None => "stack".to_string(),
+    };
+    let mut text = format!("{head}: {} frames\n", stack.total);
+    for frame in &stack.frames {
+        debug_frame(&mut text, frame);
+    }
+    if stack.frames.len() < stack.total {
+        let shown = stack.frames.len();
+        let total = stack.total;
+        let _ = writeln!(text, "clipped: showing {shown} of {total} frames");
+    }
+    text
+}
+
+fn debug_variable_tree(
+    text: &mut String,
+    variable: &DebugVariable,
+    depth: usize,
+    query: &DebugVariablesQuery,
+    shown: &mut usize,
+) {
+    if *shown >= query.variables {
+        return;
+    }
+    *shown += 1;
+    let indent = "  ".repeat(depth + 1);
+    let type_name = if variable.type_name.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", variable.type_name)
+    };
+    let value = clipped(&variable.value, query.length);
+    let _ = writeln!(text, "{indent}{} = {value}{type_name}", variable.name);
+    if depth >= query.depth {
+        return;
+    }
+    for child in &variable.children {
+        debug_variable_tree(text, child, depth + 1, query, shown);
+    }
+}
+
+pub(crate) fn debug_variables(variables: &DebugVariables, query: &DebugVariablesQuery) -> String {
+    let frame = query.frame;
+    let mut text = format!("variables of frame #{frame}\n");
+    let mut shown = 0;
+    for scope in &variables.scopes {
+        if scope.variables.is_empty() {
+            continue;
+        }
+        let _ = writeln!(text, "  {}:", scope.name);
+        for variable in &scope.variables {
+            debug_variable_tree(&mut text, variable, 0, query, &mut shown);
+        }
+    }
+    if variables.total == 0 {
+        text.push_str("variables: none loaded\n");
+    } else if variables.clipped || shown >= query.variables {
+        let _ = writeln!(
+            text,
+            "clipped: {} variables, raise the limits for more",
+            variables.total
+        );
+    }
+    text
+}
+
+pub(crate) fn debug_value(value: &DebugValue) -> String {
+    let type_name = if value.type_name.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", value.type_name)
+    };
+    format!("{} = {}{type_name}\n", value.expression, value.value)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::backend::{
-        CallHierarchy, CallHierarchyQuery, Confidence, Diagnostic, FileText, HierarchyNode,
-        Location, ProjectModule, ProjectStructure, ProjectStructureQuery, SearchHit, SearchPage,
-        SearchQuery, Severity, TestCase, TypeHierarchy, TypeHierarchyQuery, Usage, UsagePage,
-        UsagesQuery, VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
+        CallHierarchy, CallHierarchyQuery, Confidence, DebugScope, DebugThread, Diagnostic,
+        FileText, HierarchyNode, Location, ProjectModule, ProjectStructure, ProjectStructureQuery,
+        SearchHit, SearchPage, SearchQuery, Severity, TestCase, TypeHierarchy, TypeHierarchyQuery,
+        Usage, UsagePage, UsagesQuery, VcsChanges, VcsDiff, VcsFile, VcsHunk, VcsQuery,
     };
 
     use super::*;
@@ -1323,5 +1498,117 @@ mod tests {
             empty.contains("running") && empty.contains("no output"),
             "{empty}"
         );
+    }
+
+    #[test]
+    fn a_breakpoint_shows_its_line_its_state_and_its_properties() {
+        let info = BreakpointInfo {
+            path: "src/A.txt".into(),
+            line: 12,
+            enabled: true,
+            verified: true,
+            condition: Some("x > 1".to_string()),
+            log_message: Some("x is {x}".to_string()),
+        };
+
+        let text = breakpoint_set(&info);
+
+        assert_eq!(
+            text,
+            "breakpoint set: src/A.txt:12 on, verified, condition: x > 1, log: x is {x}\n"
+        );
+        let listed = breakpoints(&[info]);
+        assert_eq!(
+            listed,
+            "1 breakpoints:\nsrc/A.txt:12 on, verified, condition: x > 1, log: x is {x}\n"
+        );
+        assert_eq!(breakpoints(&[]), "no breakpoints\n");
+    }
+
+    #[test]
+    fn a_debug_session_names_the_reason_the_thread_and_the_top_frame() {
+        let state = DebugSessionState {
+            state: "stopped".to_string(),
+            reason: Some("breakpoint".to_string()),
+            thread: Some(DebugThread {
+                id: 1,
+                name: "main".to_string(),
+            }),
+            frame: Some(DebugFrame {
+                index: 0,
+                name: "run".to_string(),
+                path: Some("src/A.txt".into()),
+                line: 12,
+                column: 3,
+            }),
+        };
+
+        assert_eq!(
+            debug_session(&state),
+            "debugging: stopped (breakpoint)\nthread: main #1\n#0 run at src/A.txt:12:3\n"
+        );
+        let running = DebugSessionState {
+            state: "running".to_string(),
+            reason: None,
+            thread: None,
+            frame: None,
+        };
+        assert_eq!(debug_session(&running), "debugging: running\n");
+    }
+
+    #[test]
+    fn variables_are_indented_and_cut_to_the_length() {
+        let query = DebugVariablesQuery {
+            depth: 1,
+            length: 5,
+            ..DebugVariablesQuery::default()
+        };
+        let variables = DebugVariables {
+            scopes: vec![DebugScope {
+                name: "Locals".to_string(),
+                variables: vec![DebugVariable {
+                    name: "items".to_string(),
+                    value: "ArrayList".to_string(),
+                    type_name: "List".to_string(),
+                    children: vec![DebugVariable {
+                        name: "0".to_string(),
+                        value: "abcdefgh".to_string(),
+                        type_name: "String".to_string(),
+                        children: Vec::new(),
+                    }],
+                }],
+            }],
+            total: 2,
+            clipped: false,
+        };
+
+        let text = debug_variables(&variables, &query);
+
+        assert!(
+            text.starts_with("variables of frame #0\n  Locals:\n"),
+            "{text}"
+        );
+        assert!(text.contains("  items = Array… (List)\n"), "{text}");
+        assert!(text.contains("    0 = abcde… (String)\n"), "{text}");
+    }
+
+    #[test]
+    fn a_stack_says_how_many_frames_it_left_out() {
+        let stack = DebugStack {
+            thread: None,
+            total: 3,
+            frames: vec![DebugFrame {
+                index: 0,
+                name: "run".to_string(),
+                path: None,
+                line: 0,
+                column: 0,
+            }],
+        };
+
+        let text = debug_stack(&stack, &DebugStackQuery::default());
+
+        assert!(text.starts_with("stack: 3 frames\n#0 run\n"), "{text}");
+        assert!(text.contains("clipped: showing 1 of 3 frames"), "{text}");
     }
 }

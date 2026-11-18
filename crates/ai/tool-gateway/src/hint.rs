@@ -3,9 +3,11 @@
 //! forcing it made them worse in the pilot (section 7 of the architecture).
 
 use crate::tools::{
-    CALL_HIERARCHY, DIAGNOSTICS, EDITOR_CONTEXT, FIND_SYMBOL, FIND_USAGES, FORMAT_FILE,
-    ORGANIZE_IMPORTS, PROJECT_STRUCTURE, PROPOSE_EDIT, READ_FILE, RENAME_SYMBOL, SEARCH_TEXT,
-    SYMBOL_INFO, TOOLS, TYPE_HIERARCHY, VCS_CHANGES,
+    CALL_HIERARCHY, DEBUG_EVALUATE, DEBUG_RUN, DEBUG_STACK, DEBUG_STEP, DEBUG_STOP,
+    DEBUG_VARIABLES, DEBUG_WAIT, DIAGNOSTICS, EDITOR_CONTEXT, FIND_SYMBOL, FIND_USAGES,
+    FORMAT_FILE, LIST_BREAKPOINTS, ORGANIZE_IMPORTS, PROJECT_STRUCTURE, PROPOSE_EDIT, READ_FILE,
+    REMOVE_BREAKPOINT, RENAME_SYMBOL, SEARCH_TEXT, SET_BREAKPOINT, SYMBOL_INFO, TOOLS,
+    TYPE_HIERARCHY, VCS_CHANGES,
 };
 
 pub const HINT_START: &str = "<!-- ide-tools:start -->";
@@ -29,6 +31,16 @@ fn when(name: &str) -> &'static str {
         RENAME_SYMBOL => "a declaration changes its name and every use should follow",
         ORGANIZE_IMPORTS => "the imports of a file need tidying after an edit",
         FORMAT_FILE => "the code of a file should match the formatting of the project",
+        SET_BREAKPOINT => "you want the program to stop at a line while you watch it",
+        REMOVE_BREAKPOINT => "a breakpoint you set is no longer needed",
+        LIST_BREAKPOINTS => "you need to know which breakpoints the project has",
+        DEBUG_RUN => "you want to watch a test or a program run instead of reading its log",
+        DEBUG_WAIT => "the program is still running and you want its next stop",
+        DEBUG_STACK => "you need the calls that led to the stopped line",
+        DEBUG_VARIABLES => "you need the values of the stopped frame",
+        DEBUG_EVALUATE => "you need a value the variables do not show, such as a getter",
+        DEBUG_STEP => "you need the next line, the inside of a call or the end of a method",
+        DEBUG_STOP => "the debug session should end",
         _ => "its description fits the question",
     }
 }
@@ -50,6 +62,18 @@ pub fn agents_md_section(server: &str) -> String {
          text of a symbol to rename it, use `rename_symbol` so that every use follows. Keep \
          the shell for what these tools do not cover, such as running a program. An answer \
          marked `confidence: unknown` means the IDE could not tell, not that nothing exists.\n",
+    );
+    text.push_str(
+        "\nA program that misbehaves is often better watched than printed into. Put a \
+         breakpoint with `set_breakpoint` on the line where the state goes wrong, start the \
+         test or the configuration with `debug_run`, read `debug_stack` and \
+         `debug_variables`, and move with `debug_step`. Choose the debugger over adding \
+         print calls and running again when the failure depends on values inside a call, on \
+         one iteration of a loop, or on an exception whose stack alone does not explain the \
+         state. Keep printing when the question is about the order of events over time or \
+         about a program nobody watches. A debug session stops the program, so end it with \
+         `debug_stop`, and leave the breakpoints of the user alone when they do not belong \
+         to the question.\n",
     );
     text.push_str(HINT_END);
     text.push('\n');

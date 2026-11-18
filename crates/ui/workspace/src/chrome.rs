@@ -20,10 +20,10 @@ use crate::appearance::{
 use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
 use crate::window::{
-    AI_TOOL, AboutApp, BOOKMARKS_POPUP, BalloonAction, BringAllToFront, BuildProject, COMMIT_TOOL,
-    CheckForUpdatesApp, ChooseDebugConfiguration, ChooseRunConfiguration, CloseTab, Compile,
-    CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug, Dismiss, DockSide, EditBreakpoint, Evaluate,
-    FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto, ForceStepOver,
+    AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_POPUP, BalloonAction, BringAllToFront, BuildProject,
+    COMMIT_TOOL, CheckForUpdatesApp, ChooseDebugConfiguration, ChooseRunConfiguration, CloseTab,
+    Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug, Dismiss, DockSide, EditBreakpoint,
+    Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto, ForceStepOver,
     FullyExpandTreeNode, GotoRelated, HTTP_TOOL, HideApp, HideCoverage, HideOtherApps,
     HideToolWindow, LOG_TOOL, MenuRow, MinimizeWindow, MoveToOtherGroup, NewElementSamePlace,
     NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL,
@@ -2730,14 +2730,7 @@ impl Workspace {
                     on_hover,
                     on_open,
                 };
-                let body = menu(
-                    entries,
-                    state,
-                    geometry,
-                    &callbacks,
-                    window.viewport_size(),
-                    theme,
-                );
+                let body = menu(entries, state, geometry, &callbacks, theme, window, cx);
                 let backdrop = deferred(
                     div()
                         .id("menu-backdrop")
@@ -3710,6 +3703,8 @@ impl Render for StatusBarView {
             enc_anchor,
             indent_anchor,
             zoom_notice,
+            agent_clients,
+            agent_busy,
         ) = {
             let workspace = workspace.read(cx);
             (
@@ -3727,6 +3722,8 @@ impl Render for StatusBarView {
                 workspace.st_enc_anchor.clone(),
                 workspace.st_indent_anchor.clone(),
                 workspace.zoom_notice().cloned(),
+                workspace.agent_clients,
+                workspace.agent_busy,
             )
         };
         #[cfg(any(test, feature = "test-support"))]
@@ -3900,11 +3897,48 @@ impl Render for StatusBarView {
                         }))
                 }))
         });
+        let agents = (agent_clients > 0).then(|| {
+            let workspace = self.workspace.clone();
+            let label = if agent_busy {
+                "An agent is working"
+            } else {
+                "Connected agents"
+            };
+            div()
+                .id("st-agents")
+                .debug_selector(|| "st-agents".to_owned())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .flex_none()
+                .cursor_pointer()
+                .tooltip(move |_, cx| tooltip(label, None, cx))
+                .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.run_command(AI_CLIENTS, window, cx);
+                        })
+                        .ok();
+                }))
+                .child(icon("own/aiSessions", &theme))
+                .child(agent_clients.to_string())
+                .when(agent_busy, |this| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "st-agents-busy".to_owned())
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    )
+                })
+        });
         let widgets = div()
             .flex()
             .items_center()
             .gap(px(SPACE_L))
             .children(zoom)
+            .children(agents)
             .children(language)
             .children(editor);
         div()

@@ -2,6 +2,7 @@
 //! shows the active one as a terminal or a chat, next to a review of the files it changed.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,20 +32,23 @@ use ui_kit::*;
 use workspace::{AI_TOOL, Settings, ToggleAi, Workspace};
 
 use crate::agent_tools::{AgentTools, OpenDocument, WindowTools};
-use crate::ai_review::{Action, Review};
+use crate::ai_review::{Action, AgentsMdNote, Review};
 use crate::chat::text_button;
 use crate::composer::{Composer, Selection};
 use crate::mcp_approval::{McpApprovals, Reply};
 use crate::mcp_edits::{EditKind, EditReply, EditRequests};
 use crate::outline::OpenEditors;
 use crate::proposal::{Proposal, Waiter};
-use crate::term_grid::{every_frame, grid, scroll_lines, send_key};
+use crate::term_grid::{GridPanel, GridView, Position, every_frame, grid, scroll_lines, send_key};
 use crate::terminal_panel::message;
 use crate::transcript::Transcript;
 use crate::trust::TrustDialog;
 
 pub(crate) const GROUP: &str = "right-panel";
 const FIRST_SIZE: (u16, u16) = (80, 24);
+/// The tooltip of the start button of Claude Code in a terminal.
+const CLAUDE_CODE_TIP: &str = "Claude Code in a terminal. On Windows it runs without a sandbox. \
+    Its LSP plugin, if on, starts a second language server next to the IDE's.";
 
 /// The command of the editor menu and of Find Action: asks the agent about the selection.
 pub const ASK_AI: &str = "ai.ask_selection";
@@ -53,6 +57,8 @@ pub const ASK_AI: &str = "ai.ask_selection";
 type Kept = Box<dyn Send>;
 /// Variables of a prepared environment.
 type Env = Vec<(String, String)>;
+/// The runtime of a session, what a mock run keeps alive, and the name a scripted agent gives.
+type Runtime = (Box<dyn AgentRuntime>, Option<Kept>, Option<String>);
 
 /// How harnesses run in this window.
 #[derive(Clone, Debug, Default)]
@@ -121,8 +127,8 @@ impl AgentKind {
 /// The MCP server of the project window: one gateway and one policy for the sessions of
 /// the AI tool window and for the clients that find the window by its entry point.
 pub(crate) struct Mcp {
-    gateway: Arc<ToolGateway>,
-    server: McpServer,
+    pub(crate) gateway: Arc<ToolGateway>,
+    pub(crate) server: McpServer,
     root: PathBuf,
     state_dir: PathBuf,
     /// The entry point of the window while the switch of the settings is on.
@@ -130,7 +136,7 @@ pub(crate) struct Mcp {
 }
 
 struct Published {
-    token: String,
+    entry: EntryPoint,
     file: EntryPointFile,
 }
 
@@ -168,11 +174,11 @@ impl Mcp {
         };
         match entry.write(&self.state_dir) {
             Ok(file) => {
-                *published = Some(Published { token, file });
+                *published = Some(Published { entry, file });
                 Ok(())
             }
             Err(error) => {
-                self.server.revoke(&token);
+                self.server.revoke(&entry.token);
                 Err(error.to_string())
             }
         }
@@ -182,9 +188,17 @@ impl Mcp {
     /// window keep their own tokens and go on working.
     fn unpublish(&self) {
         if let Some(published) = self.published().take() {
-            self.server.revoke(&published.token);
+            self.server.revoke(&published.entry.token);
             drop(published.file);
         }
+    }
+
+    /// The entry point a client outside the window uses, for tests and scripts.
+    #[cfg(all(test, windows))]
+    pub(crate) fn entry_point(&self) -> Option<EntryPoint> {
+        self.published()
+            .as_ref()
+            .map(|published| published.entry.clone())
     }
 
     fn published(&self) -> MutexGuard<'_, Option<Published>> {
@@ -202,7 +216,7 @@ impl Drop for Mcp {
 
 /// What a session of the window shares: the MCP server and the tracker of its changes.
 pub(crate) struct Services {
-    mcp: Arc<Mcp>,
+    pub mcp: Arc<Mcp>,
     pub tracker: Result<Arc<ChangeTracker>, String>,
 }
 
@@ -221,13 +235,20 @@ pub(crate) struct Entry {
     services: Arc<Services>,
     /// What a mock run needs to live as long as the session.
     _mock: Option<Kept>,
+    /// The name of the session that the script of a mock agent gives, instead of its kind.
+    name: Option<String>,
+    /// The text that a drag or a click selected on the terminal of this session.
+    selection: Option<crate::term_grid::Selection>,
+    /// The place the button went down on, while a drag extends the selection from it.
+    dragging: Option<Position>,
 }
 
 impl Entry {
     fn title(&self) -> String {
+        let kind = self.name.clone().unwrap_or_else(|| self.kind.title());
         match &self.transcript.title {
-            Some(title) => format!("{} {}: {title}", self.kind.title(), self.id),
-            None => format!("{} {}", self.kind.title(), self.id),
+            Some(title) => format!("{kind} {}: {title}", self.id),
+            None => format!("{kind} {}", self.id),
         }
     }
 
@@ -247,6 +268,8 @@ impl Drop for Entry {
 pub(crate) enum Tab {
     Session,
     Changes,
+    /// The MCP clients of the project, their calls and their permissions.
+    Agents,
 }
 
 /// The unaccepted hunks of one file an agent changed, for the bar above its editor.
@@ -283,6 +306,8 @@ pub struct AgentsPanel {
     pub(crate) active: Option<usize>,
     next_id: usize,
     starting: Option<AgentKind>,
+    /// The transcript the next mock session plays, named by a window script.
+    mock_transcript: Option<PathBuf>,
     pub(crate) error: Option<SharedString>,
     pub(crate) changes: Arc<ChangeSet>,
     /// The files with unaccepted agent hunks, by absolute path, for the bar above an
@@ -310,11 +335,22 @@ pub struct AgentsPanel {
     version: u64,
     pub(crate) tab: Tab,
     pub(crate) composer: Composer,
+    /// A request waits for the chat session that is starting, and goes out when it is up.
+    pending_message: Option<String>,
     pub(crate) files: Entity<Arc<Vec<PathBuf>>>,
     pub(crate) expanded: HashSet<String>,
     pub(crate) chat_scroll: ScrollHandle,
     pub(crate) review_scroll: ScrollHandle,
     pub(crate) review: Review,
+    /// What the AGENTS.md button reported last, shown next to it for a while.
+    pub(crate) agents_md: Option<AgentsMdNote>,
+    /// Numbers the results of that button, so the fade of an older one leaves a newer one.
+    pub(crate) agents_md_generation: u64,
+    /// The client the Agents tab shows, by its place in the list.
+    pub(crate) clients_selected: usize,
+    /// The Agents tab shows only the calls that run something of the project.
+    pub(crate) clients_only_actions: bool,
+    pub(crate) clients_scroll: ScrollHandle,
 }
 
 /// A short stable name for the state of one project.
@@ -341,7 +377,9 @@ fn open_mcp(
     approvals: Arc<McpApprovals>,
     publish: bool,
 ) -> Result<Mcp, String> {
-    let backend: Arc<dyn ToolBackend> = if options.mock { mock::tools()? } else { tools };
+    // A mock run has a stand-in model but not stand-in tools: a demo shows the answers the
+    // window itself gives, from the index and the language server of the project.
+    let backend: Arc<dyn ToolBackend> = tools;
     let gateway = Arc::new(ToolGateway::with_approval(
         backend,
         AuditLog::default(),
@@ -385,7 +423,37 @@ fn mock_turns() -> Vec<Vec<MockStep>> {
     vec![first]
 }
 
-/// The runtime for `kind`, and what a mock run keeps alive.
+/// The turns of a mock session and the name its session takes: the transcript a window script
+/// or the environment names, or the built-in chat, which has no name of its own.
+fn mock_scenario(
+    transcript: Option<&Path>,
+    root: &Path,
+) -> Result<(Option<String>, Vec<Vec<MockStep>>), String> {
+    #[cfg(feature = "mock-agents")]
+    if let Some(script) = crate::mock_transcript::named(transcript, root)? {
+        return Ok((script.title, script.turns));
+    }
+    #[cfg(not(feature = "mock-agents"))]
+    let _ = (transcript, root);
+    Ok((None, mock_turns()))
+}
+
+/// What a preset that needs an API key says when the key is not in the environment of the IDE,
+/// which the agent inherits. `None` when the preset needs no key or the key is set.
+fn missing_api_key(preset: &Preset, key: Option<&OsStr>) -> Option<String> {
+    let variable = preset.api_key_variable()?;
+    if key.is_some_and(|key| !key.is_empty()) {
+        return None;
+    }
+    Some(format!(
+        "{} needs {variable}, and it is not set in the environment of the IDE. \
+         Set it and start the agent again.",
+        preset.title()
+    ))
+}
+
+/// The runtime for `kind`, what a mock run keeps alive, and the name a scripted agent gives its
+/// session.
 #[allow(clippy::too_many_arguments)]
 fn runtime_for(
     kind: &AgentKind,
@@ -396,7 +464,8 @@ fn runtime_for(
     gateway: &Arc<ToolGateway>,
     ide: &[(String, String)],
     id: usize,
-) -> Result<(Box<dyn AgentRuntime>, Option<Kept>), String> {
+    transcript: Option<&Path>,
+) -> Result<Runtime, String> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     match kind {
         AgentKind::Tui(harness) => {
@@ -423,7 +492,7 @@ fn runtime_for(
                 let arguments = ["--permission-mode", "acceptEdits"].map(String::from);
                 runtime = runtime.with_arguments(arguments.to_vec());
             }
-            Ok((Box::new(runtime), home))
+            Ok((Box::new(runtime), home, None))
         }
         AgentKind::Acp(preset) => {
             let mut command = preset.command(&path)?;
@@ -432,9 +501,14 @@ fn runtime_for(
                 let (env, kept) = mock::acp_env(preset, root, id)?;
                 command = command.with_env(env);
                 home = Some(kept);
+            } else if let Some(variable) = preset.api_key_variable() {
+                let key = std::env::var_os(variable);
+                if let Some(missing) = missing_api_key(preset, key.as_deref()) {
+                    return Err(missing);
+                }
             }
             let runtime = AcpRuntime::new(preset.title(), command);
-            Ok((Box::new(runtime), home))
+            Ok((Box::new(runtime), home, None))
         }
         AgentKind::Mock => {
             let tools = gateway.clone();
@@ -447,8 +521,9 @@ fn runtime_for(
                 let result = tools.call(&scope, name, input);
                 result.map_err(|error| error.to_string())
             });
-            let runtime = MockRuntime::new(mock_turns()).with_tools(invoke);
-            Ok((Box::new(runtime), None))
+            let (name, turns) = mock_scenario(transcript, root)?;
+            let runtime = MockRuntime::new(turns).with_tools(invoke);
+            Ok((Box::new(runtime), None, name))
         }
     }
 }
@@ -466,6 +541,7 @@ fn launch(
     environment: Option<Arc<dyn EnvironmentProvider>>,
     ide: Vec<(String, String)>,
     id: usize,
+    transcript: Option<PathBuf>,
 ) -> Result<Entry, String> {
     let mcp = match mcp {
         Some(mcp) => mcp,
@@ -475,7 +551,7 @@ fn launch(
         mcp,
         tracker: open_tracker(&root, &options),
     });
-    let (runtime, mock) = runtime_for(
+    let (runtime, mock, name) = runtime_for(
         &kind,
         installed,
         &root,
@@ -484,6 +560,7 @@ fn launch(
         &services.mcp.gateway,
         &ide,
         id,
+        transcript.as_deref(),
     )?;
     let token = services
         .mcp
@@ -529,7 +606,94 @@ fn launch(
         token,
         services,
         _mock: mock,
+        name,
+        selection: None,
+        dragging: None,
     })
+}
+
+/// What a start row says about its agent, as its tooltip: what it is and what it asks for.
+fn start_tip(kind: &AgentKind) -> Option<&'static str> {
+    match kind {
+        AgentKind::Tui(Harness::Claude) => Some(CLAUDE_CODE_TIP),
+        AgentKind::Acp(preset) => preset.note(),
+        _ => None,
+    }
+}
+
+/// The row of an agent in the New Session menu: a click starts the session, and the hint of the
+/// agent shows as the tooltip of the row.
+fn start_entry(panel: &Entity<AgentsPanel>, kind: AgentKind) -> MenuEntry {
+    let id = format!("new-session-{}", kind.stem());
+    let tip = start_tip(&kind);
+    let panel = panel.clone();
+    let start = kind.clone();
+    let entry = MenuEntry::new(kind.title(), move |window, cx| {
+        panel.update(cx, |this, cx| this.request(start.clone(), window, cx));
+    })
+    .id(id);
+    match tip {
+        Some(tip) => entry.tip(tip),
+        None => entry,
+    }
+}
+
+/// One tab of the session window: the height and the colours of the tabs of the Git window,
+/// with an accent line under the chosen one. A count follows the name as a badge.
+fn session_tab(
+    id: &'static str,
+    label: &'static str,
+    count: Option<usize>,
+    selected: bool,
+    theme: &Theme,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let hover = theme.hover;
+    let mut content = div().flex().items_center().gap(px(SPACE_S)).child(label);
+    if let Some(count) = count {
+        content = content.child(count_badge(count, theme));
+    }
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(24.))
+        .px(px(SPACE_M))
+        .rounded(px(CONTROL_RADIUS))
+        .border_b_2()
+        .border_color(if selected {
+            theme.accent
+        } else {
+            transparent_black()
+        })
+        .text_color(if selected {
+            theme.text
+        } else {
+            theme.text_secondary
+        })
+        .when(selected, |this| this.bg(theme.selection_inactive))
+        .when(!selected, |this| this.hover(move |style| style.bg(hover)))
+        .on_click(on_click)
+        .child(content)
+}
+
+/// A count in a tab, as a small badge.
+fn count_badge(count: usize, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .min_w(px(18.))
+        .h(px(16.))
+        .px(px(SPACE_S))
+        .rounded(px(8.))
+        .text_size(px(TEXT_SMALL))
+        .bg(theme.selection_hover)
+        .text_color(theme.text_secondary)
+        .child(count.to_string())
 }
 
 impl AgentsPanel {
@@ -571,6 +735,7 @@ impl AgentsPanel {
                 active: None,
                 next_id: 1,
                 starting: None,
+                mock_transcript: None,
                 error: None,
                 changes: Arc::new(ChangeSet::default()),
                 pending: HashMap::new(),
@@ -587,11 +752,17 @@ impl AgentsPanel {
                 version: 0,
                 tab: Tab::Session,
                 composer: Composer::default(),
+                pending_message: None,
                 files,
                 expanded: HashSet::new(),
                 chat_scroll: ScrollHandle::new(),
                 review_scroll: ScrollHandle::new(),
                 review: Review::default(),
+                agents_md: None,
+                agents_md_generation: 0,
+                clients_selected: 0,
+                clients_only_actions: false,
+                clients_scroll: ScrollHandle::new(),
             };
             panel.sync_mcp(cx);
             panel
@@ -678,6 +849,10 @@ impl AgentsPanel {
             "build_project" => "build the project",
             "run_configuration" => "run a configuration",
             "stop_run" => "stop a run",
+            "debug_run" => "start a debug session",
+            "debug_evaluate" => "evaluate an expression in the debugger",
+            "debug_step" => "step the debugger",
+            "debug_stop" => "stop the debug session",
             other => other,
         };
         let detail = self.approvals.pending_detail().unwrap_or_default();
@@ -1234,8 +1409,67 @@ impl AgentsPanel {
         cx.notify();
     }
 
+    /// Names the transcript of the next mock session, for a demo without a model. A build
+    /// without the mock agents ignores it.
+    pub(crate) fn set_mock_transcript(&mut self, path: PathBuf) {
+        self.mock_transcript = Some(path);
+    }
+
+    /// Sends a plain message to the active session for a script, as the message box sends
+    /// text without mentions. `false` while no session takes it yet, an error when the
+    /// session refuses it for good.
+    pub(crate) fn prompt(&mut self, text: &str, cx: &mut Context<Self>) -> Result<bool, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(true);
+        }
+        let Some(entry) = self.active_entry_mut() else {
+            return Ok(false);
+        };
+        entry
+            .session
+            .prompt(text)
+            .map_err(|error| error.to_string())?;
+        entry.sent += 1;
+        cx.notify();
+        Ok(true)
+    }
+
+    /// Sends a finished message to the chat of the window, or starts the usual chat
+    /// session and sends it when that one is up. A terminal of a TUI is not a chat, so
+    /// the message opens a session of its own, as Ask AI does.
+    pub(crate) fn ask_message(
+        &mut self,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chats = |kind: &AgentKind| matches!(kind, AgentKind::Acp(_));
+        let needs_session = self
+            .active_entry()
+            .is_none_or(|entry| entry.terminal.is_some());
+        // A chat that is already starting takes the message when it is up.
+        let starting_chat = self.starting.as_ref().is_some_and(chats);
+        if needs_session
+            && (self.starting.is_none() || starting_chat)
+            && let Some(kind) = self.kinds().into_iter().find(chats)
+        {
+            self.pending_message = Some(message);
+            if self.starting.is_none() {
+                self.start(kind, window, cx);
+            }
+        } else {
+            // The caller may be an update of the window, which the message reads: it
+            // goes out after that update.
+            cx.defer_in(window, move |this, _, cx| this.send_finished(&message, cx));
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     /// Starts a session of `kind`, asking first when the project is not trusted yet.
     pub fn request(&mut self, kind: AgentKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.agents_md = None;
         if self.trust.is_trusted(&self.root) {
             self.start(kind, window, cx);
             return;
@@ -1274,6 +1508,7 @@ impl AgentsPanel {
         let approvals = self.approvals.clone();
         let options = self.options.clone();
         let environment = self.environment.clone();
+        let transcript = self.mock_transcript.clone();
         let ide = cx
             .try_global::<crate::claude_ide::ActiveClaude>()
             .map(crate::claude_ide::ActiveClaude::environment)
@@ -1290,6 +1525,7 @@ impl AgentsPanel {
                 environment,
                 ide,
                 id,
+                transcript,
             )
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -1316,19 +1552,27 @@ impl AgentsPanel {
                 self.active = Some(self.entries.len() - 1);
                 self.tab = Tab::Session;
                 window.focus(&self.focus, cx);
+                if let Some(message) = self.pending_message.take() {
+                    self.send_finished(&message, cx);
+                }
             }
-            Err(error) => self.error = Some(format!("The session did not start: {error}").into()),
+            Err(error) => {
+                self.pending_message = None;
+                self.error = Some(format!("The session did not start: {error}").into());
+            }
         }
         cx.notify();
     }
 
     fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.agents_md = None;
         self.active = Some(index);
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
     fn close(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.agents_md = None;
         if index < self.entries.len() {
             self.entries.remove(index);
         }
@@ -1382,6 +1626,12 @@ impl AgentsPanel {
 
     pub(crate) fn tracker(&self) -> Option<&Arc<ChangeTracker>> {
         self.services.as_ref()?.tracker.as_ref().ok()
+    }
+
+    /// The entry point the window published for the clients outside it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn entry_point(&self) -> Option<EntryPoint> {
+        self.mcp.as_ref()?.entry_point()
     }
 
     /// Reads the hunks of every open file a session changed, for the marks of its gutter
@@ -1490,7 +1740,9 @@ impl AgentsPanel {
     }
 
     /// Gives the tools of the agents the latest files, open buffers and project model.
-    /// Called every frame, so a tool call from a worker sees the window as it is.
+    /// Called every frame, so a tool call from a worker sees the window as it is. The
+    /// snapshot of an open document is its version, its unsaved state and the document
+    /// itself: no text is copied here, and a tool reads it only when it asks.
     pub(crate) fn sync_tools(&mut self, cx: &mut Context<Self>) {
         let files = self.files.read(cx).clone();
         self.tools.update_files(files);
@@ -1499,16 +1751,16 @@ impl AgentsPanel {
             .filter_map(|view| {
                 let view = view.read(cx);
                 let version = view.version()?;
+                let document = view.document()?;
                 Some(OpenDocument {
                     path: view.path().to_path_buf(),
                     version,
                     dirty: view.is_dirty(),
+                    document,
                 })
             })
             .collect();
-        let app: &App = cx;
-        self.tools
-            .update_open(&documents, |path| OpenEditors::text(path, app));
+        self.tools.update_open(documents);
         if let Some(runs) = cx.try_global::<crate::script::ActiveRunPanel>() {
             let model = runs.0.read(cx).model();
             self.tools.update_model(model);
@@ -1565,14 +1817,53 @@ impl AgentsPanel {
         if changed {
             cx.notify();
         }
+        let mcp = self
+            .services
+            .as_ref()
+            .map(|services| &services.mcp)
+            .or(self.mcp.as_ref());
+        let (clients, busy) = match mcp {
+            Some(mcp) => (
+                mcp.gateway.clients().connected(),
+                mcp.gateway.executing() > 0,
+            ),
+            None => (0, false),
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.set_agent_clients(clients, busy, cx)
+            })
+            .ok();
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        let modifiers = stroke.modifiers;
+        // Ctrl+C copies what is selected, as in the terminal window; without a selection it
+        // goes on to the program. The lines of the Changes tab are copied the same way.
+        let copy = modifiers.control && !modifiers.alt && stroke.key == "c";
         if self.tab == Tab::Changes {
+            if copy && self.copy_review_lines(cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if self.tab != Tab::Session {
             return;
         }
         if let Some(terminal) = self.active_terminal().cloned() {
-            if !terminal.is_closed() && send_key(&terminal, &event.keystroke, cx) {
+            if modifiers.control && modifiers.shift && stroke.key == "c" {
+                cx.stop_propagation();
+                self.copy_grid_selection(cx);
+                return;
+            }
+            if copy && !modifiers.shift && self.copy_grid_selection(cx) {
+                cx.stop_propagation();
+                return;
+            }
+            if !terminal.is_closed() && send_key(&terminal, stroke, cx) {
+                // What the user types takes the selection away, as it does in a terminal.
+                self.clear_grid_selection();
                 cx.stop_propagation();
             }
             return;
@@ -1583,6 +1874,7 @@ impl AgentsPanel {
     }
 
     pub(crate) fn show_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.agents_md = None;
         self.tab = tab;
         if tab == Tab::Changes {
             self.reload_review(cx);
@@ -1637,6 +1929,9 @@ impl AgentsPanel {
                 ));
             }
         }
+        if let Some(note) = &self.agents_md {
+            lines.push(format!("agents-md {}", note.text));
+        }
         lines.extend(self.review.report(&self.root, cx));
         lines
     }
@@ -1669,81 +1964,94 @@ impl AgentsPanel {
         kinds
     }
 
-    fn start_buttons(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let mut row = div()
+    /// The row under the header: the button that starts a session, and on its right the button
+    /// of AGENTS.md. The result of that button sits in a row of its own under them.
+    fn start_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let row = div()
             .flex()
             .flex_wrap()
-            .flex_none()
-            .gap(px(SPACE_S))
+            .items_center()
+            .justify_between()
+            .gap(px(SPACE_M))
             .px(px(SPACE_M))
-            .pb(px(SPACE_S));
-        for kind in self.kinds() {
-            let id = SharedString::from(format!("start-{}", kind.stem()));
-            let (hover, pressed) = (theme.hover, theme.pressed);
-            let label = if self.starting.as_ref() == Some(&kind) {
-                format!("Starting {}", kind.title())
-            } else {
-                kind.title()
-            };
-            let tip = match &kind {
-                AgentKind::Acp(preset) => preset.note(),
-                _ => None,
-            };
-            let mut button = div()
-                .id(id)
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .h(px(26.))
-                .pl(px(4.))
-                .pr(px(SPACE_M))
-                .rounded(px(CONTROL_RADIUS))
-                .border_1()
-                .border_color(theme.control_border)
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-                .child(icon("general/add", theme))
-                .child(label);
-            if let Some(tip) = tip {
-                button = button.tooltip(move |_, cx| tooltip(tip, None, cx));
-            }
-            let start = kind.clone();
-            row = row.child(button.on_click(
-                cx.listener(move |this, _, window, cx| this.request(start.clone(), window, cx)),
-            ));
-        }
-        row
-    }
-
-    /// Facts the user should know before an agent runs.
-    fn notes(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let mut notes = vec!["Claude Agent (ACP) needs an Anthropic API key in ANTHROPIC_API_KEY."];
-        if self
-            .installs
-            .iter()
-            .any(|install| install.harness == Harness::Claude)
-        {
-            notes.push(
-                "Claude Code runs without a sandbox on Windows. If its LSP plugin for the \
-                 language of the project is on, it starts a second language server next to \
-                 the IDE's.",
+            .pb(px(SPACE_S))
+            .child(self.new_session_button(theme, cx))
+            .child(
+                text_button("agents-md", "Add IDE tools to AGENTS.md", theme)
+                    .debug_selector(|| "agents-md".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.add_agents_md(cx))),
             );
-        }
+        let result = self.agents_md.as_ref().map(|note| {
+            let color = if note.failed {
+                theme.close_hover
+            } else {
+                theme.text_secondary
+            };
+            div()
+                .id("agents-md-result")
+                .debug_selector(|| "agents-md-result".to_owned())
+                .px(px(SPACE_M))
+                .pb(px(SPACE_S))
+                .min_w_0()
+                .truncate()
+                .text_color(color)
+                .child(note.text.clone())
+        });
         div()
             .flex()
             .flex_col()
             .flex_none()
-            .px(px(12.))
-            .pb(px(SPACE_S))
-            .gap(px(2.))
-            .text_color(theme.text_secondary)
-            .children(notes)
-            .child(
-                div().flex().child(
-                    crate::chat::text_button("agents-md", "Add IDE tools to AGENTS.md", theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.add_agents_md(cx))),
-                ),
-            )
+            .child(row)
+            .children(result)
+    }
+
+    /// The button that opens the menu of the agents that can start here.
+    fn new_session_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (hover, pressed) = (theme.hover, theme.pressed);
+        div()
+            .id("agent-new-session")
+            .debug_selector(|| "agent-new-session".to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .h(px(24.))
+            .px(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.control_border)
+            .hover(move |style| style.bg(hover))
+            .active(move |style| style.bg(pressed))
+            .child(icon("general/add", theme))
+            .child("New Session")
+            .child(icon("general/chevronDown", theme))
+            .on_click(cx.listener(|this, _, window, cx| this.new_session_menu(window, cx)))
+    }
+
+    /// Opens the menu of the agents at the pointer: the harnesses on PATH, a separator, and the
+    /// ACP agents, with the mock of the tests last.
+    fn new_session_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = cx.entity();
+        let (harnesses, others): (Vec<AgentKind>, Vec<AgentKind>) = self
+            .kinds()
+            .into_iter()
+            .partition(|kind| matches!(kind, AgentKind::Tui(_)));
+        let mut entries: Vec<MenuEntry> = harnesses
+            .into_iter()
+            .map(|kind| start_entry(&panel, kind))
+            .collect();
+        if !entries.is_empty() && !others.is_empty() {
+            entries.push(MenuEntry::separator());
+        }
+        entries.extend(others.into_iter().map(|kind| start_entry(&panel, kind)));
+        if entries.is_empty() {
+            entries.push(MenuEntry::disabled("No agent can start here"));
+        }
+        let position = window.mouse_position();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
     }
 
     fn session_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -1791,35 +2099,49 @@ impl AgentsPanel {
         list
     }
 
+    /// The tabs of the session: the terminal or the chat, the changes and the agents of the
+    /// window, with their counts as badges. The row has a line above and below it.
     fn tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let session = match self.active_entry() {
             Some(entry) if entry.terminal.is_some() => "Terminal",
             _ => "Chat",
         };
-        let changes = format!("Changes ({})", self.changes.session.len());
-        let tab = |id: &'static str, label: SharedString, which: Tab, cx: &mut Context<Self>| {
-            let selected = self.tab == which;
-            div()
-                .id(id)
-                .px(px(SPACE_M))
-                .h(px(26.))
-                .flex()
-                .items_center()
-                .rounded(px(CONTROL_RADIUS))
-                .when(selected, |this| this.bg(theme.tab_selected))
-                .on_click(cx.listener(move |this, _, _, cx| this.show_tab(which, cx)))
-                .child(label)
-        };
+        let changes = self.changes.session.len();
+        let agents = self.agents_count();
         div()
             .flex()
             .flex_none()
-            .gap(px(4.))
-            .px(px(8.))
-            .py(px(4.))
+            .items_center()
+            .gap(px(SPACE_XS))
+            .px(px(SPACE_M))
+            .py(px(SPACE_XS))
             .border_t_1()
+            .border_b_1()
             .border_color(theme.border)
-            .child(tab("tab-session", session.into(), Tab::Session, cx))
-            .child(tab("tab-changes", changes.into(), Tab::Changes, cx))
+            .child(session_tab(
+                "tab-session",
+                session,
+                None,
+                self.tab == Tab::Session,
+                theme,
+                cx.listener(|this, _, _, cx| this.show_tab(Tab::Session, cx)),
+            ))
+            .child(session_tab(
+                "tab-changes",
+                "Changes",
+                Some(changes),
+                self.tab == Tab::Changes,
+                theme,
+                cx.listener(|this, _, _, cx| this.show_tab(Tab::Changes, cx)),
+            ))
+            .child(session_tab(
+                "tab-agents",
+                "Agents",
+                Some(agents),
+                self.tab == Tab::Agents,
+                theme,
+                cx.listener(|this, _, _, cx| this.show_tab(Tab::Agents, cx)),
+            ))
     }
 
     /// Reads the hunks of `view` again and shows the window of the hunk that holds
@@ -1903,6 +2225,134 @@ impl AgentsPanel {
                 .ok();
         })
         .detach();
+    }
+}
+
+impl AgentsPanel {
+    /// Copies the selection of the terminal of the active session; false without one.
+    fn copy_grid_selection(&self, cx: &mut Context<Self>) -> bool {
+        let Some(entry) = self.active_entry() else {
+            return false;
+        };
+        let (Some(session), selection) = (entry.terminal.as_ref(), entry.selection) else {
+            return false;
+        };
+        crate::term_grid::copy_selection(session, selection, cx)
+    }
+
+    fn clear_grid_selection(&mut self) {
+        if let Some(entry) = self.active_entry_mut() {
+            entry.selection = None;
+        }
+    }
+
+    /// Sends the clipboard to the terminal of the active session, as Ctrl+V does.
+    fn paste_grid_text(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let Some(session) = self.active_terminal().cloned() else {
+            return;
+        };
+        let _ = session.paste(&text);
+        self.clear_grid_selection();
+        cx.notify();
+    }
+
+    /// The text that the terminal of the active session has selected, for tests.
+    #[cfg(all(test, windows))]
+    pub(crate) fn grid_selection_text(&self) -> Option<String> {
+        let entry = self.active_entry()?;
+        let session = entry.terminal.as_ref()?;
+        let selection = entry.selection?;
+        Some(crate::term_grid::selection_text(
+            &session.screen(),
+            selection,
+        ))
+    }
+
+    /// Replaces the harnesses on PATH with `installs`, so that a test starts a stand-in program
+    /// and never a real harness.
+    #[cfg(test)]
+    pub(crate) fn use_installs_for_test(&mut self, installs: Vec<Installed>) {
+        self.installs = installs;
+    }
+}
+
+impl GridPanel for AgentsPanel {
+    fn pane_focus(&self, _pane: usize) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    fn grid_pressed(
+        &mut self,
+        _pane: usize,
+        position: Position,
+        clicks: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.active_entry_mut() else {
+            return;
+        };
+        let Some(session) = entry.terminal.clone() else {
+            return;
+        };
+        (entry.selection, entry.dragging) =
+            crate::term_grid::pressed(&session.screen(), position, clicks);
+        cx.notify();
+    }
+
+    fn grid_moved(
+        &mut self,
+        _pane: usize,
+        position: Option<Position>,
+        _control: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(entry) = self.active_entry_mut() else {
+            return false;
+        };
+        if let (Some(pressed), Some(position)) = (entry.dragging, position) {
+            entry.selection = Some(crate::term_grid::Selection::new(pressed, position));
+            cx.notify();
+        }
+        false
+    }
+
+    fn grid_released(&mut self, _pane: usize, cx: &mut Context<Self>) {
+        if let Some(entry) = self.active_entry_mut() {
+            entry.dragging = None;
+        }
+        cx.notify();
+    }
+
+    fn grid_context_menu(&mut self, _pane: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let panel = cx.entity();
+        let copy = panel.clone();
+        let paste = panel.clone();
+        let has_selection = self
+            .active_entry()
+            .is_some_and(|entry| entry.selection.is_some());
+        let copy_entry = if has_selection {
+            MenuEntry::new("Copy", move |_, cx| {
+                copy.update(cx, |this, cx| {
+                    this.copy_grid_selection(cx);
+                });
+            })
+        } else {
+            MenuEntry::disabled("Copy")
+        };
+        let entries = vec![
+            copy_entry,
+            MenuEntry::new("Paste", move |_, cx| {
+                paste.update(cx, |this, cx| this.paste_grid_text(cx));
+            }),
+        ];
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
     }
 }
 
@@ -2090,18 +2540,19 @@ impl Render for AgentsPanel {
                 cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
             );
         let body = match (self.tab, self.active_terminal().cloned()) {
+            (Tab::Agents, _) => body.child(self.clients_view(&theme, window, cx)),
             (Tab::Changes, _) => body.child(self.changes_view(&theme, window, cx)),
             (Tab::Session, Some(terminal)) => {
                 let scrolled = terminal.clone();
-                let view = crate::term_grid::GridView {
+                let view = GridView {
                     session: terminal.clone(),
                     focused,
                     theme,
-                    selection: None,
+                    selection: self.active_entry().and_then(|entry| entry.selection),
                     matches: Vec::new(),
                     current: None,
                     hover: None,
-                    host: None,
+                    host: Some(cx.entity()),
                     pane: 0,
                     metrics: std::rc::Rc::new(std::cell::Cell::new(None)),
                 };
@@ -2125,8 +2576,7 @@ impl Render for AgentsPanel {
             .h_full()
             .text_size(px(UI_SIZE))
             .child(panel_header("AI Sessions", GROUP, hide, &theme))
-            .child(self.start_buttons(&theme, cx))
-            .child(self.notes(&theme, cx))
+            .child(self.start_row(&theme, cx))
             .children(error)
             .child(self.session_rows(&theme, cx))
             .child(self.tabs(&theme, cx))
@@ -2137,15 +2587,11 @@ impl Render for AgentsPanel {
 #[cfg(feature = "mock-agents")]
 mod mock {
     use super::*;
-    use agent_testkit::{FakeTools, MOCK_MODEL, MockApi, Sandbox, claude_env, codex_env};
+    use agent_testkit::{MOCK_MODEL, MockApi, Sandbox, claude_env, codex_env};
 
     struct Home {
         _sandbox: Sandbox,
         _api: MockApi,
-    }
-
-    pub fn tools() -> Result<Arc<dyn ToolBackend>, String> {
-        Ok(Arc::new(FakeTools))
     }
 
     fn home(name: &str, root: &Path) -> Result<(Sandbox, MockApi), String> {
@@ -2228,10 +2674,6 @@ mod mock {
 
     const MISSING: &str = "this build has no mock agents";
 
-    pub fn tools() -> Result<Arc<dyn ToolBackend>, String> {
-        Err(MISSING.to_string())
-    }
-
     pub fn launch(_: Harness, _: &Path, _: usize) -> Result<(Launch, Box<dyn Send>), String> {
         Err(MISSING.to_string())
     }
@@ -2243,7 +2685,9 @@ mod mock {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentKind, project_key};
+    use super::{AgentKind, missing_api_key, project_key};
+    use agent_acp::Preset;
+    use std::ffi::OsStr;
     use std::path::Path;
 
     #[test]
@@ -2260,5 +2704,14 @@ mod tests {
             assert_eq!(AgentKind::parse(name).unwrap().stem(), name);
         }
         assert!(AgentKind::parse("vim").is_none());
+    }
+
+    #[test]
+    fn an_acp_agent_that_needs_a_key_says_so_without_one() {
+        let message = missing_api_key(&Preset::ClaudeAgent, None).unwrap();
+        assert!(message.contains("ANTHROPIC_API_KEY"), "{message}");
+        assert!(missing_api_key(&Preset::ClaudeAgent, Some(OsStr::new(""))).is_some());
+        assert!(missing_api_key(&Preset::ClaudeAgent, Some(OsStr::new("key"))).is_none());
+        assert!(missing_api_key(&Preset::Codex, None).is_none());
     }
 }

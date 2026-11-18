@@ -20,7 +20,7 @@ use database::{
     ResultSet, Secret, Session, Source, SourceId, SourceStore, Suggestion, Support,
     SystemPasswords, Table, TableRef, Value, VendorTemplate, asked_parameters, bind_parameters,
 };
-use editor_view::{EditorView, RunFiles};
+use editor_view::{EditorView, ExtraTemplates, FileBar, RunFiles};
 use lang_api::{
     MigrationHistory, MigrationHistoryRows, MigrationKind, MigrationModel, MigrationState,
     MigrationSupport, MigrationTool,
@@ -261,6 +261,8 @@ type SentQuery = (String, Option<usize>);
 /// is Recent Locations there.
 pub const EXPLAIN_PLAN: &str = "database.explain_plan";
 pub const EXPLAIN_KEY: &str = "alt-shift-e";
+/// Run SQL Script of the open `.sql` file, from Find Action and from the menu of the file.
+pub const RUN_SQL_SCRIPT: &str = "database.run_script";
 
 /// What the console asks before it runs a statement with placeholders: the value of each
 /// name, with the last value of the console already in its field.
@@ -430,6 +432,8 @@ struct Scripted {
     replies: VecDeque<ScriptedReply>,
     /// The answers of the console, one per statement; an empty queue answers with `rows`.
     console_replies: VecDeque<ResultSet>,
+    /// The answers of a script, one per statement: an `Err` fails the statement.
+    console_answers: VecDeque<std::result::Result<ResultSet, String>>,
     /// Every request of the window, with the transaction commands of a data tab.
     commands: Arc<Mutex<Vec<ScriptedCommand>>>,
     /// The statement runs until the window stops it, as a long query does.
@@ -690,6 +694,8 @@ pub struct DatabasePanel {
     selected_cell: Option<(usize, usize)>,
     /// The sources whose console is in Manual: a statement waits for Commit or Rollback.
     manual: HashMap<SourceId, bool>,
+    /// The source the user picked for a `.sql` script of the project, by path.
+    file_sources: HashMap<PathBuf, SourceId>,
     /// The statements that changed rows of each source since its last Commit or Rollback.
     pending: HashMap<SourceId, u32>,
     /// The transaction commands the helper has not answered yet.
@@ -716,6 +722,10 @@ pub struct DatabasePanel {
     /// download even when a jar is present.
     driver_failed: HashSet<SourceId>,
     queue: VecDeque<QueuedStatement>,
+    /// Run SQL Script stops the queue at the first statement that fails.
+    script_stop: bool,
+    /// The first failure of a script stopped its queue.
+    script_halt: bool,
     next_id: u64,
     passwords: HashMap<SourceId, Secret>,
     password: TextField,
@@ -796,6 +806,7 @@ impl DatabasePanel {
                 sort: None,
                 selected_cell: None,
                 manual: HashMap::new(),
+                file_sources: HashMap::new(),
                 pending: HashMap::new(),
                 transaction_ids: HashMap::new(),
                 question: None,
@@ -810,6 +821,8 @@ impl DatabasePanel {
                 connect_ids: HashMap::new(),
                 driver_failed: HashSet::new(),
                 queue: VecDeque::new(),
+                script_stop: false,
+                script_halt: false,
                 next_id: 1,
                 passwords: HashMap::new(),
                 password: TextField::default(),
@@ -927,6 +940,78 @@ impl DatabasePanel {
             .iter()
             .any(|known| &known.id == source)
             .then(|| database::console_path(&self.state_dir, source))
+    }
+
+    /// The source a `.sql` script runs against: the console of a source, or the source
+    /// the user picked in the bar above a file of the project.
+    pub(crate) fn source_of_script(&self, path: &Path) -> Option<SourceId> {
+        database::source_of_console(&self.state_dir, path)
+            .or_else(|| self.file_sources.get(path).cloned())
+    }
+
+    /// The source the user picked for a script of the project.
+    #[cfg(test)]
+    pub(crate) fn file_source(&self, path: &Path) -> Option<SourceId> {
+        self.file_sources.get(path).cloned()
+    }
+
+    /// Runs `path` against `source` from now on: its completion, its checks and its
+    /// script follow the schema of that source.
+    fn select_sql_source(&mut self, path: PathBuf, source: SourceId, cx: &mut Context<Self>) {
+        self.file_sources.insert(path.clone(), source.clone());
+        if let Some(language) = crate::database_console::language_for(&self.state_dir, cx) {
+            language.set_file_source(&path, source.clone());
+        }
+        self.sync_schema(&source, cx);
+        if let Some(view) = self.workspace.upgrade().and_then(|workspace| {
+            workspace
+                .read(cx)
+                .view_of(&path)
+                .and_then(|view| view.downcast::<EditorView>().ok())
+        }) {
+            view.update(cx, |view, cx| view.attach_support(cx));
+        }
+        cx.notify();
+    }
+
+    /// The sources of the window as a menu: the choice of the source a `.sql` script of
+    /// the project runs against.
+    fn show_sql_source_menu(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sources.is_empty() {
+            self.status = Some("No data sources. Press + to add one.".to_owned());
+            cx.notify();
+            return;
+        }
+        let current = self.file_sources.get(&path).cloned();
+        let panel = cx.weak_entity();
+        let entries: Vec<MenuEntry> = self
+            .sources
+            .iter()
+            .map(|source| {
+                let panel = panel.clone();
+                let target = path.clone();
+                let chosen = source.id.clone();
+                let picked = current.as_ref() == Some(&source.id);
+                let entry = MenuEntry::new(source.name.clone(), move |_window, cx| {
+                    let chosen = chosen.clone();
+                    let target = target.clone();
+                    let _ = panel.update(cx, |panel, cx| {
+                        panel.select_sql_source(target, chosen, cx);
+                    });
+                });
+                if picked {
+                    entry.icon("general/check")
+                } else {
+                    entry
+                }
+            })
+            .collect();
+        let position = window.mouse_position();
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            });
+        }
     }
 
     /// The migrations of the project, as the tree shows them.
@@ -1166,6 +1251,7 @@ impl DatabasePanel {
             param_queries: Arc::new(Mutex::new(Vec::new())),
             replies: VecDeque::new(),
             console_replies: VecDeque::new(),
+            console_answers: VecDeque::new(),
             commands: Arc::new(Mutex::new(Vec::new())),
             hangs: false,
             count: None,
@@ -1196,6 +1282,17 @@ impl DatabasePanel {
     pub(crate) fn scripted_console_replies_for_test(&mut self, replies: Vec<ResultSet>) {
         if let Some(scripted) = &mut self.scripted {
             scripted.console_replies = replies.into();
+        }
+    }
+
+    /// The answers a scripted connection gives the console, one per statement.
+    #[cfg(test)]
+    pub(crate) fn scripted_console_answers_for_test(
+        &mut self,
+        answers: Vec<std::result::Result<ResultSet, String>>,
+    ) {
+        if let Some(scripted) = &mut self.scripted {
+            scripted.console_answers = answers.into();
         }
     }
 
@@ -1689,6 +1786,9 @@ impl DatabasePanel {
                     if self.query_ids.get(&source) == Some(&id) {
                         self.query_ids.remove(&source);
                     }
+                    if cancelled && self.script_stop {
+                        self.script_halt = true;
+                    }
                     cx.notify();
                     self.run_next(cx);
                 }
@@ -1730,6 +1830,9 @@ impl DatabasePanel {
                         self.query_ids.remove(&source);
                     }
                     self.errors.insert(source.clone(), text);
+                    if self.script_stop {
+                        self.script_halt = true;
+                    }
                     cx.notify();
                     self.run_next(cx);
                 }
@@ -2440,6 +2543,27 @@ impl DatabasePanel {
         max_rows: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.start_queue(source, text, max_rows, false, cx);
+    }
+
+    /// Run SQL Script: the whole file, with the choice of the settings about a failure.
+    fn run_script(&mut self, source: SourceId, text: String, cx: &mut Context<Self>) {
+        let stop = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.sql_script_stop_on_error);
+        let rows = Some(self.console_rows(cx));
+        self.start_queue(source, text, rows, stop, cx);
+    }
+
+    /// Queues the statements of `text` and runs the first one.
+    fn start_queue(
+        &mut self,
+        source: SourceId,
+        text: String,
+        max_rows: Option<usize>,
+        stop_on_error: bool,
+        cx: &mut Context<Self>,
+    ) {
         let scripted_source = self
             .scripted
             .as_ref()
@@ -2466,6 +2590,8 @@ impl DatabasePanel {
             return;
         }
         self.queue.clear();
+        self.script_stop = stop_on_error;
+        self.script_halt = false;
         for statement in statements {
             self.queue.push_back(QueuedStatement {
                 source: source.clone(),
@@ -2480,7 +2606,18 @@ impl DatabasePanel {
     /// Runs the next statement of the queue. A statement with placeholders is not sent
     /// until the user gave their values: the dialog opens and the queue waits.
     fn run_next(&mut self, cx: &mut Context<Self>) {
-        while let Some(mut queued) = self.queue.pop_front() {
+        loop {
+            if self.script_halt {
+                self.queue.clear();
+                self.script_halt = false;
+                self.script_stop = false;
+                cx.notify();
+                return;
+            }
+            let Some(mut queued) = self.queue.pop_front() else {
+                self.script_stop = false;
+                return;
+            };
             if self.scripted.is_none() && !self.sessions.contains_key(&queued.source) {
                 continue;
             }
@@ -2549,23 +2686,30 @@ impl DatabasePanel {
                     cx.notify();
                     return false;
                 }
+                let answer = scripted.console_answers.pop_front();
                 let error = scripted.error.clone();
-                let rows = scripted
-                    .console_replies
-                    .pop_front()
-                    .unwrap_or_else(|| scripted.rows.clone());
-                (error, rows)
+                let reply = scripted.console_replies.pop_front();
+                match answer {
+                    Some(answer) => answer,
+                    None => match (error, reply) {
+                        (Some(error), _) => Err(error),
+                        (None, reply) => Ok(reply.unwrap_or_else(|| scripted.rows.clone())),
+                    },
+                }
             };
             let index = self.results.len() - 1;
             let tab = &mut self.results[index];
             tab.elapsed = Some(tab.started.elapsed());
-            match rows.0 {
-                Some(error) => {
+            match rows {
+                Err(error) => {
                     tab.error = Some(error.clone());
                     self.errors.insert(source.clone(), error);
+                    if self.script_stop {
+                        self.script_halt = true;
+                    }
                 }
-                None => {
-                    tab.result = Some(rows.1);
+                Ok(result) => {
+                    tab.result = Some(result);
                     tab.bytes = 0;
                     tab.settle(false, false);
                 }
@@ -2996,6 +3140,11 @@ impl DatabasePanel {
         let Some(source) = self.selected.clone() else {
             return;
         };
+        self.stop_source(source, cx);
+    }
+
+    /// Stops the statement of `source`, which a console or a script of the project runs.
+    fn stop_source(&mut self, source: SourceId, cx: &mut Context<Self>) {
         let Some(id) = self.query_ids.get(&source).copied() else {
             return;
         };
@@ -6042,12 +6191,79 @@ pub(crate) fn install(state_dir: PathBuf, cx: &mut App) {
     let console_dir = state_dir.clone();
     cx.set_global(RunFiles(Arc::new(move |path: &Path| {
         database::source_of_console(&console_dir, path).is_some()
+            || crate::database_console::is_sql_file(path)
     })));
-    crate::database_console::install(state_dir, cx);
+    crate::database_console::install(state_dir.clone(), cx);
+    let mut extra = cx
+        .try_global::<ExtraTemplates>()
+        .map(|extra| extra.0.clone())
+        .unwrap_or_default();
+    let sql_templates: fn(&Path) -> Option<&'static editor_view::TemplateLanguage> =
+        crate::database_console::templates_for;
+    if !extra.contains(&sql_templates) {
+        extra.push(sql_templates);
+        cx.set_global(ExtraTemplates(extra));
+    }
+    let bar = cx.try_global::<FileBar>().map(|bar| bar.0.clone());
+    cx.set_global(FileBar(Rc::new(
+        move |path: &Path, window: &mut Window, cx: &mut Context<EditorView>| {
+            sql_file_bar(path, window, cx)
+                .or_else(|| bar.as_ref().and_then(|bar| bar(path, window, cx)))
+        },
+    )));
 }
 
-/// Runs the selection or the statement at `line` of a `.sql` console. The answer is
-/// `false` when the file is not a console, so another tool may take the key.
+/// The row above a `.sql` script of the project: the source its statements run against.
+fn sql_file_bar(
+    path: &Path,
+    _window: &mut Window,
+    cx: &mut Context<EditorView>,
+) -> Option<AnyElement> {
+    if !crate::database_console::is_sql_file(path) {
+        return None;
+    }
+    let root = cx.try_global::<DatabaseConsoleRoot>()?.0.clone();
+    if database::source_of_console(&root, path).is_some() {
+        return None;
+    }
+    let panel = cx.try_global::<ActiveDatabase>()?.0.clone();
+    let theme = *cx.global::<Theme>();
+    let label = panel
+        .read_with(cx, |panel, _| {
+            panel
+                .file_sources
+                .get(path)
+                .and_then(|id| panel.sources.iter().find(|source| &source.id == id))
+                .map(|source| source.name.clone())
+        })
+        .unwrap_or_else(|| "No data source".to_owned());
+    let target = path.to_path_buf();
+    let click = panel.clone();
+    let button = toolbar_dropdown("database-sql-source", None, label, &theme)
+        .debug_selector(|| "database-sql-source".to_owned())
+        .on_click(move |_, window, cx| {
+            let target = target.clone();
+            click.update(cx, |panel, cx| {
+                panel.show_sql_source_menu(target, window, cx)
+            });
+        });
+    Some(
+        div()
+            .id("database-sql-file-bar")
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(button)
+            .into_any_element(),
+    )
+}
+
+/// Runs the selection or the statement at `line` of a `.sql` console or script. The
+/// answer is `false` when the file is not SQL, so another tool may take the key.
 pub(crate) fn run_line(
     view: &Entity<EditorView>,
     line: usize,
@@ -6056,13 +6272,23 @@ pub(crate) fn run_line(
     cx: &mut Context<Workspace>,
 ) -> bool {
     let path = view.read(cx).path().to_path_buf();
-    let Some(root) = cx
-        .try_global::<DatabaseConsoleRoot>()
-        .map(|root| root.0.clone())
+    let sql_file = crate::database_console::is_sql_file(&path);
+    let Some(panel) = cx
+        .try_global::<ActiveDatabase>()
+        .map(|panel| panel.0.clone())
     else {
         return false;
     };
-    let Some(source) = database::source_of_console(&root, &path) else {
+    let source = panel.read(cx).source_of_script(&path);
+    let Some(source) = source else {
+        if sql_file {
+            workspace.notify_user(
+                "Run SQL Script",
+                "Choose a data source in the bar above the file.",
+                cx,
+            );
+            return true;
+        }
         return false;
     };
     let selection = view.read(cx).selected_text();
@@ -6071,12 +6297,6 @@ pub(crate) fn run_line(
             .text()
             .and_then(|text| database::statement_at(&text, line))
     });
-    let Some(panel) = cx
-        .try_global::<ActiveDatabase>()
-        .map(|panel| panel.0.clone())
-    else {
-        return false;
-    };
     workspace.show_tool(DATABASE_TOOL, window, cx);
     // The console keeps the focus: the next statement is typed where the last one was
     // written, as in a console that runs what its editor holds.
@@ -6093,31 +6313,65 @@ pub(crate) fn run_line(
     true
 }
 
-/// Stops the statement of the console of `view`, as Ctrl+F2 does. The answer is `false`
-/// when the file is not a console, so another tool may take the key.
+/// Run SQL Script: every statement of the open `.sql` file, with the choice of the
+/// settings about the first failure.
+pub(crate) fn run_script(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(view) = workspace
+        .active_view()
+        .and_then(|view| view.downcast::<EditorView>().ok())
+    else {
+        return;
+    };
+    let path = view.read(cx).path().to_path_buf();
+    if !crate::database_console::is_sql_file(&path) {
+        return;
+    }
+    let Some(panel) = cx
+        .try_global::<ActiveDatabase>()
+        .map(|panel| panel.0.clone())
+    else {
+        return;
+    };
+    let source = panel.read(cx).source_of_script(&path);
+    let Some(source) = source else {
+        workspace.notify_user(
+            "Run SQL Script",
+            "Choose a data source in the bar above the file.",
+            cx,
+        );
+        return;
+    };
+    let Some(text) = view.read(cx).text() else {
+        return;
+    };
+    workspace.show_tool(DATABASE_TOOL, window, cx);
+    panel.update(cx, |panel, cx| panel.run_script(source, text, cx));
+}
+
+/// Stops the statement of the console or the script of `view`, as Ctrl+F2 does. The
+/// answer is `false` when the file is not SQL, so another tool may take the key.
 pub(crate) fn stop_line(
     view: &Entity<EditorView>,
     workspace: &mut Workspace,
     cx: &mut Context<Workspace>,
 ) -> bool {
     let path = view.read(cx).path().to_path_buf();
-    let Some(root) = cx
-        .try_global::<DatabaseConsoleRoot>()
-        .map(|root| root.0.clone())
-    else {
-        return false;
-    };
-    let Some(_source) = database::source_of_console(&root, &path) else {
-        return false;
-    };
     let Some(panel) = cx
         .try_global::<ActiveDatabase>()
         .map(|panel| panel.0.clone())
     else {
         return false;
     };
+    let source = panel.read(cx).source_of_script(&path);
+    let Some(source) = source else {
+        return false;
+    };
     let _ = workspace;
-    panel.update(cx, |panel, cx| panel.stop(cx));
+    panel.update(cx, |panel, cx| panel.stop_source(source, cx));
     true
 }
 

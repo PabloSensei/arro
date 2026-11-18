@@ -14,7 +14,7 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
-use crate::terminal_panel::TerminalPanel;
+use crate::term_links::LinkText;
 
 /// How often a view looks for a new snapshot.
 const REFRESH: Duration = Duration::from_millis(16);
@@ -312,15 +312,94 @@ fn same_look(a: &Cell, b: &Cell) -> bool {
     a.fg == b.fg && a.bg == b.bg && a.flags == b.flags
 }
 
+/// The panel that owns a grid and hears its pointer. The terminal window and the AI sessions
+/// implement it, so one grid draws and listens the same way for both.
+pub trait GridPanel: Sized + 'static {
+    /// The focus that a press in `pane` gives to the window.
+    fn pane_focus(&self, pane: usize) -> FocusHandle;
+    /// A press of the left button on the grid; `clicks` tells a click from a double or a triple one.
+    fn grid_pressed(
+        &mut self,
+        pane: usize,
+        position: Position,
+        clicks: usize,
+        cx: &mut Context<Self>,
+    );
+    /// The pointer moved; `position` is `None` outside the grid. Returns true over a link.
+    fn grid_moved(
+        &mut self,
+        pane: usize,
+        position: Option<Position>,
+        control: bool,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    /// The left button came up.
+    fn grid_released(&mut self, pane: usize, cx: &mut Context<Self>);
+    /// The right button: the menu of the grid, at the pointer.
+    fn grid_context_menu(&mut self, pane: usize, position: Point<Pixels>, cx: &mut Context<Self>);
+    /// The link under a press with the control key, for a panel that opens links.
+    fn link_at(&self, _pane: usize, _position: Position) -> Option<LinkText> {
+        None
+    }
+    /// Opens the link that `link_at` found.
+    fn open_link(
+        &mut self,
+        _pane: usize,
+        _position: Position,
+        _link: LinkText,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+}
+
+/// What a press of the left button does to the selection of `screen`: one click clears the
+/// selection and starts a drag from its place, two clicks take the word under it and three
+/// clicks the row. Returns the selection and the place a drag extends from.
+pub fn pressed(
+    screen: &Screen,
+    position: Position,
+    clicks: usize,
+) -> (Option<Selection>, Option<Position>) {
+    let row = position.line + screen.display_offset as i32;
+    let row = match u16::try_from(row) {
+        Ok(row) if row < screen.rows => row,
+        _ => return (None, None),
+    };
+    match clicks {
+        3.. => (Some(line_selection(screen, row, position.line)), None),
+        2 => (word_at(screen, row, position.line, position.column), None),
+        _ => (None, Some(position)),
+    }
+}
+
+/// Copies the text that `selection` covers on `session` to the clipboard. False when there is
+/// no selection or it covers no text.
+pub fn copy_selection(
+    session: &TerminalSession,
+    selection: Option<Selection>,
+    cx: &mut App,
+) -> bool {
+    let Some(selection) = selection else {
+        return false;
+    };
+    let text = selection_text(&session.screen(), selection);
+    if text.is_empty() {
+        return false;
+    }
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    true
+}
+
 /// The pointer of a grid: who hears it and where its cells are.
-struct Pointer {
-    host: Entity<TerminalPanel>,
+struct Pointer<H: GridPanel> {
+    host: Entity<H>,
     pane: usize,
     metrics: CellMetrics,
     hitbox: Hitbox,
 }
 
-impl Pointer {
+impl<H: GridPanel> Pointer<H> {
     /// The clicks select or open a link, a drag extends the selection, and the control
     /// key shows the link under the pointer.
     fn listen(self, window: &mut Window) {
@@ -392,15 +471,15 @@ impl Pointer {
     }
 }
 
-pub struct Frame {
+pub struct Frame<H: GridPanel> {
     backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     cursor: Option<(Bounds<Pixels>, Hsla)>,
     line_height: Pixels,
-    pointer: Option<Pointer>,
+    pointer: Option<Pointer<H>>,
 }
 
-impl Frame {
+impl<H: GridPanel> Frame<H> {
     fn paint(mut self, window: &mut Window, cx: &mut App) {
         if let Some(pointer) = self.pointer.take() {
             pointer.listen(window);
@@ -418,7 +497,7 @@ impl Frame {
 }
 
 /// What a view of the grid shows and who hears its pointer.
-pub struct GridView {
+pub struct GridView<H: GridPanel> {
     pub session: Arc<TerminalSession>,
     pub focused: bool,
     pub theme: Theme,
@@ -429,14 +508,18 @@ pub struct GridView {
     pub current: Option<SearchMatch>,
     /// The link under the pointer with the control key held, if any.
     pub hover: Option<SearchMatch>,
-    pub host: Option<Entity<TerminalPanel>>,
+    pub host: Option<Entity<H>>,
     pub pane: usize,
     /// Where the last frame put the grid, for the drag of the split divider.
     pub metrics: Rc<SharedCell<Option<CellMetrics>>>,
 }
 
 /// Shapes the visible rows and asks the session for the size that fits the bounds.
-fn layout(view: &GridView, bounds: Bounds<Pixels>, window: &mut Window) -> Frame {
+fn layout<H: GridPanel>(
+    view: &GridView<H>,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) -> Frame<H> {
     let theme = &view.theme;
     let mut mono = font(MONO_FONT);
     mono.features = FontFeatures::disable_ligatures();
@@ -573,14 +656,14 @@ fn layout(view: &GridView, bounds: Bounds<Pixels>, window: &mut Window) -> Frame
 }
 
 /// The screen of the view, sized to fill its parent.
-pub fn grid(view: GridView) -> impl IntoElement {
+pub fn grid<H: GridPanel>(view: GridView<H>) -> impl IntoElement {
     div()
         .debug_selector(|| "terminal-grid".to_owned())
         .size_full()
         .child(
             canvas(
                 move |bounds, window, _| layout(&view, bounds, window),
-                |_, frame: Frame, window, cx| frame.paint(window, cx),
+                |_, frame: Frame<H>, window, cx| frame.paint(window, cx),
             )
             .size_full(),
         )
@@ -679,7 +762,8 @@ pub fn scroll_lines(event: &ScrollEvent) -> i32 {
 mod tests {
     use super::{
         Key, KeyEvent, Keystroke, Mods, OperatingSystem, Position, Selection, indexed, is_paste,
-        key_events, line_selection, rgb, row_text, selection_span, selection_text, word_at,
+        key_events, line_selection, pressed, rgb, row_text, selection_span, selection_text,
+        word_at,
     };
     use terminal::{Cell, Screen};
     use ui_kit::{gpui, px};
@@ -807,5 +891,26 @@ mod tests {
             line_selection(&screen, 0, 0),
             Selection::new(Position::new(0, 0), Position::new(0, 14))
         );
+    }
+
+    #[test]
+    fn a_press_starts_a_drag_or_takes_the_word_or_the_row() {
+        let screen = screen(&["  run the build  "], 0);
+        let at = Position::new(0, 8);
+        assert_eq!(pressed(&screen, at, 1), (None, Some(at)));
+        assert_eq!(
+            pressed(&screen, at, 2),
+            (
+                Some(Selection::new(Position::new(0, 6), Position::new(0, 8))),
+                None
+            )
+        );
+        assert_eq!(
+            pressed(&screen, at, 3),
+            (Some(line_selection(&screen, 0, 0)), None)
+        );
+        // A place above the screen is not on the grid, so nothing is pressed.
+        let above = Position::new(-1, 0);
+        assert_eq!(pressed(&screen, above, 1), (None, None));
     }
 }

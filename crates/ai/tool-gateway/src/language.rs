@@ -19,12 +19,15 @@ use lang_api::{
 use platform::{CanonPath, path_from_uri};
 
 use crate::backend::{
-    BuildOutcome, BuildRequest, CallHierarchy, CallHierarchyQuery, Confidence, DebugSnapshotSource,
-    Diagnostic, DiagnosticsPage, DiagnosticsQuery, EditorContext, FileText, HierarchyNode,
-    Location, Position, ProjectRunner, READ_LINE_LIMIT, ReadFileQuery, RenameSymbolQuery,
-    RunConfiguration, RunOutput, SessionScope, Severity, StartRunRequest, SymbolInfo, SymbolPage,
-    SymbolQuery, TestsOutcome, TestsRequest, ToolBackend, ToolError, TypeHierarchy,
-    TypeHierarchyQuery, Usage, UsagePage, UsagesQuery,
+    BreakpointId, BreakpointInfo, BreakpointQuery, BuildOutcome, BuildRequest, CallHierarchy,
+    CallHierarchyQuery, Confidence, DebugControl, DebugEvaluateQuery, DebugRunOutcome,
+    DebugRunRequest, DebugSessionState, DebugSnapshotSource, DebugStack, DebugStackQuery,
+    DebugStepQuery, DebugValue, DebugVariables, DebugVariablesQuery, DebugWaitQuery, Diagnostic,
+    DiagnosticsPage, DiagnosticsQuery, EditorContext, FileText, HierarchyNode, Location, Position,
+    ProjectRunner, READ_LINE_LIMIT, ReadFileQuery, RenameSymbolQuery, RunConfiguration, RunOutput,
+    SessionScope, Severity, StartRunRequest, SymbolInfo, SymbolPage, SymbolQuery, TestsOutcome,
+    TestsRequest, ToolBackend, ToolError, TypeHierarchy, TypeHierarchyQuery, Usage, UsagePage,
+    UsagesQuery,
 };
 
 /// How long a tool waits for the first answer of the server.
@@ -174,6 +177,7 @@ const MAX_NODES: usize = 200;
 pub struct LanguageTools {
     languages: RwLock<Vec<Arc<dyn LanguageSupport>>>,
     debug: RwLock<Vec<(PathBuf, Arc<dyn DebugSnapshotSource>)>>,
+    debug_controls: RwLock<Vec<(PathBuf, Arc<dyn DebugControl>)>>,
     projects: RwLock<Vec<(PathBuf, Arc<dyn ProjectRunner>)>>,
     wait: Option<Duration>,
 }
@@ -244,6 +248,43 @@ impl LanguageTools {
             .rev()
             .find(|(known, _)| same_project(known, project))
             .map(|(_, source)| source.clone())
+    }
+
+    /// Makes the debug tools reach the Debug window of this project. Replaces an earlier
+    /// control of the same project.
+    pub fn register_debug_control(&self, project: PathBuf, control: Arc<dyn DebugControl>) {
+        let mut controls = self
+            .debug_controls
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        controls.retain(|(known, _)| !same_project(known, &project));
+        controls.push((project, control));
+    }
+
+    pub fn unregister_debug_control(&self, project: &Path) {
+        let mut controls = self
+            .debug_controls
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        controls.retain(|(known, _)| !same_project(known, project));
+    }
+
+    fn debug_control_for(&self, project: &Path) -> Result<Arc<dyn DebugControl>, ToolError> {
+        let controls = self
+            .debug_controls
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        controls
+            .iter()
+            .rev()
+            .find(|(known, _)| same_project(known, project))
+            .map(|(_, control)| control.clone())
+            .ok_or_else(|| {
+                ToolError::Failed(format!(
+                    "the Debug window of {} is not connected yet",
+                    project.display()
+                ))
+            })
     }
 
     /// Makes the tools that run the project reach the Run window of this project.
@@ -810,6 +851,80 @@ impl ToolBackend for LanguageTools {
 
     fn stop_run(&self, scope: &SessionScope, id: &str) -> Result<(), ToolError> {
         self.project_for(&scope.project)?.stop(scope, id)
+    }
+
+    fn set_breakpoint(
+        &self,
+        scope: &SessionScope,
+        query: &BreakpointQuery,
+    ) -> Result<BreakpointInfo, ToolError> {
+        self.debug_control_for(&scope.project)?
+            .set_breakpoint(scope, query)
+    }
+
+    fn remove_breakpoint(&self, scope: &SessionScope, id: &BreakpointId) -> Result<(), ToolError> {
+        self.debug_control_for(&scope.project)?
+            .remove_breakpoint(scope, id)
+    }
+
+    fn breakpoints(&self, scope: &SessionScope) -> Result<Vec<BreakpointInfo>, ToolError> {
+        self.debug_control_for(&scope.project)?.breakpoints(scope)
+    }
+
+    fn debug_run(
+        &self,
+        scope: &SessionScope,
+        request: &DebugRunRequest,
+        client: Option<&str>,
+    ) -> Result<DebugRunOutcome, ToolError> {
+        self.debug_control_for(&scope.project)?
+            .run(scope, request, client)
+    }
+
+    fn debug_wait(
+        &self,
+        scope: &SessionScope,
+        query: &DebugWaitQuery,
+    ) -> Result<DebugSessionState, ToolError> {
+        self.debug_control_for(&scope.project)?.wait(scope, query)
+    }
+
+    fn debug_stack(
+        &self,
+        scope: &SessionScope,
+        query: &DebugStackQuery,
+    ) -> Result<DebugStack, ToolError> {
+        self.debug_control_for(&scope.project)?.stack(scope, query)
+    }
+
+    fn debug_variables(
+        &self,
+        scope: &SessionScope,
+        query: &DebugVariablesQuery,
+    ) -> Result<DebugVariables, ToolError> {
+        self.debug_control_for(&scope.project)?
+            .variables(scope, query)
+    }
+
+    fn debug_evaluate(
+        &self,
+        scope: &SessionScope,
+        query: &DebugEvaluateQuery,
+    ) -> Result<DebugValue, ToolError> {
+        self.debug_control_for(&scope.project)?
+            .evaluate(scope, query)
+    }
+
+    fn debug_step(
+        &self,
+        scope: &SessionScope,
+        query: &DebugStepQuery,
+    ) -> Result<DebugSessionState, ToolError> {
+        self.debug_control_for(&scope.project)?.step(scope, query)
+    }
+
+    fn debug_stop(&self, scope: &SessionScope) -> Result<(), ToolError> {
+        self.debug_control_for(&scope.project)?.stop(scope)
     }
 }
 

@@ -7,7 +7,9 @@
 //! `agent:claude|codex|acp-codex|acp-claude|mock`, `agent-input:MS`, `wait-agent:MS`,
 //! `allow`, `allow-always`, `deny`, `agent-stop`, `changes`, `review:FILE`, `accept-hunk:N`,
 //! `revert-hunk:N`, `accept-file`, `revert-file`, `accept-all`, `revert-all`, `agents-md`.
-//! `agent-input` waits until the active session shows its input box and
+//! `agent-transcript:FILE` names the script a mock session plays, and `agent-prompt:TEXT`
+//! sends a plain message to the active session, so a scenario runs a turn without a key
+//! press. `agent-input` waits until the active session shows its input box and
 //! closes the window when it does not, so a script never types into a login or permission
 //! screen. `wait-agent` waits until a chat ends its turn or asks for permission. `type` and `key` go to whatever has the focus,
 //! the terminal of a dock included.
@@ -140,6 +142,8 @@ pub enum Step {
     Search,
     Dismiss,
     Agent(AgentKind),
+    AgentTranscript(PathBuf),
+    AgentPrompt(String),
     AgentInput(u64),
     WaitAgent(u64),
     Answer(PermissionReply),
@@ -279,6 +283,8 @@ fn parse_step(step: &str) -> Result<Step, String> {
         "search" => Step::Search,
         "dismiss" => Step::Dismiss,
         "agent" => Step::Agent(AgentKind::parse(value).ok_or(format!("unknown agent {value}"))?),
+        "agent-transcript" => Step::AgentTranscript(named(value, "agent-transcript")?.into()),
+        "agent-prompt" => Step::AgentPrompt(value.to_string()),
         "wait-agent" => Step::WaitAgent(value.parse().map_err(|_| format!("bad wait {value}"))?),
         "allow" => Step::Answer(PermissionReply::AllowOnce),
         "allow-always" => Step::Answer(PermissionReply::AllowAlways),
@@ -675,6 +681,8 @@ fn apply(step: &Step, workspace: &mut Workspace, window: &mut Window, cx: &mut C
         | Step::Docker(..)
         | Step::DockerUntil(_)
         | Step::Agent(_)
+        | Step::AgentTranscript(_)
+        | Step::AgentPrompt(_)
         | Step::AgentInput(_)
         | Step::WaitAgent(_)
         | Step::Answer(_)
@@ -733,6 +741,7 @@ fn panel_step(step: &Step, panel: &mut AgentsPanel, cx: &mut Context<AgentsPanel
     match step {
         Step::Answer(reply) => panel.answer(*reply, cx),
         Step::AgentStop => panel.stop(cx),
+        Step::AgentTranscript(path) => panel.set_mock_transcript(path.clone()),
         Step::Changes => panel.show_tab(Tab::Changes, cx),
         Step::ReviewFile(path) => {
             panel.show_tab(Tab::Changes, cx);
@@ -776,6 +785,25 @@ async fn wait_for(cx: &mut AsyncWindowContext, ms: u64, ready: fn(&AgentsPanel) 
         match now {
             Ok(true) => return true,
             Ok(false) if std::time::Instant::now() < deadline => {}
+            _ => return false,
+        }
+        cx.background_executor().timer(INPUT_POLL).await;
+    }
+}
+
+/// Sends the text of `agent-prompt` to the active session, waiting for `agent:mock` or
+/// another start step to make one. It runs outside the workspace update because the panel
+/// updates the workspace itself.
+async fn prompt_agent(cx: &mut AsyncWindowContext, text: &str) -> bool {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        let sent = cx.update(|_, cx| {
+            let panel = cx.global::<ActiveAgents>().0.clone();
+            panel.update(cx, |panel, cx| panel.prompt(text, cx))
+        });
+        match sent {
+            Ok(Ok(true)) => return true,
+            Ok(Ok(false)) if std::time::Instant::now() < deadline => {}
             _ => return false,
         }
         cx.background_executor().timer(INPUT_POLL).await;
@@ -1194,6 +1222,7 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                 }
                 Step::Answer(_)
                 | Step::AgentStop
+                | Step::AgentTranscript(_)
                 | Step::Changes
                 | Step::ReviewFile(_)
                 | Step::Act(_)
@@ -1203,6 +1232,19 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                         panel.update(cx, |panel, cx| panel_step(&step, panel, cx));
                     });
                     if done.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // The text goes to the active session as a plain message, so a scenario
+                // runs a turn of a session that is already up without a key press.
+                Step::AgentPrompt(text) => {
+                    if !prompt_agent(cx, text).await {
+                        eprintln!("the agent takes no message, the script stops here");
+                        this.update_in(cx, |workspace, window, cx| {
+                            workspace.close_window(window, cx)
+                        })
+                        .ok();
                         break;
                     }
                     continue;
