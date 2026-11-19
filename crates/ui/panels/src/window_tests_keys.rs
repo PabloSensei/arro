@@ -12,7 +12,8 @@ use lang_api::{
     ActionEntry, ActionKind, Answer, Confidence, DocumentEdit, DocumentSpot, HierarchyProvider,
     HierarchyQuery, HoverProvider, HoverText, LanguageId, LanguageSupport, Provider,
     SignatureProvider, SignatureQuery, SignatureText, SourceId, SourceSpan, SymbolEntry,
-    SyntaxProvider, TextPoint, TextSpan,
+    SyntaxProvider, TextPoint, TextSpan, TypeHierarchyItem, TypeHierarchyProvider,
+    TypeHierarchyQuery, TypeKind,
 };
 use ui_kit::gpui;
 use ui_kit::gpui::{TestAppContext, WindowHandle};
@@ -570,6 +571,28 @@ impl Provider<HierarchyQuery, Vec<SymbolEntry>> for Described {
     }
 }
 
+impl Provider<TypeHierarchyQuery, Vec<TypeHierarchyItem>> for Described {
+    fn start(
+        &self,
+        _: TypeHierarchyQuery,
+        _: base::Cancel,
+        mut reply: lang_api::Reply<Vec<TypeHierarchyItem>>,
+    ) {
+        let item = TypeHierarchyItem {
+            name: "Base".to_owned(),
+            detail: None,
+            kind: TypeKind::Class,
+            abstract_type: false,
+            place: Some(SourceSpan {
+                uri: "file:///hierarchy.txt".to_owned(),
+                span: TextSpan::default(),
+            }),
+            handle: "base".to_owned(),
+        };
+        let _ = reply.send(answer(vec![item]));
+    }
+}
+
 impl LanguageSupport for Described {
     fn id(&self) -> LanguageId {
         self.inner.id()
@@ -592,6 +615,10 @@ impl LanguageSupport for Described {
     }
 
     fn hierarchy(&self) -> Option<&HierarchyProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy(&self) -> Option<&TypeHierarchyProvider> {
         Some(self)
     }
 }
@@ -636,10 +663,9 @@ fn doc_signature_type_and_hierarchy_keys_show_notes_and_lists(cx: &mut TestAppCo
     press(cx, window, "ctrl-h");
     draw(cx, window);
     assert!(
-        bounds_of(cx, window, "actions-popup").size.height > px(0.),
-        "Ctrl+H lists the type hierarchy"
+        bounds_of(cx, window, "type-hierarchy-panel").size.height > px(0.),
+        "Ctrl+H opens the type hierarchy window"
     );
-    press(cx, window, "escape");
 }
 
 #[ui_kit::gpui::test]

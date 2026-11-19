@@ -251,7 +251,11 @@ pub fn register(
         "Recent Locations",
         places::show_recent,
     );
-    workspace.register_command("window.show_bookmarks", "Bookmarks", places::show_bookmarks);
+    workspace.register_command(
+        "window.show_bookmarks",
+        "Bookmarks",
+        crate::bookmarks::show_window,
+    );
     workspace.register_command(keys::BACK, "Back", navigation::back);
     workspace.register_command(keys::FORWARD, "Forward", navigation::forward);
     workspace.register_command(keys::SHOW_CONTENT, "Show Content", show_content);

@@ -602,6 +602,8 @@ mod tests {
         std::fs::create_dir_all(home.join("bin")).unwrap();
         std::fs::write(home.join("bin/javac"), "").unwrap();
         std::fs::write(home.join("bin/javac.exe"), "").unwrap();
+        std::fs::write(home.join("bin/java"), "").unwrap();
+        std::fs::write(home.join("bin/java.exe"), "").unwrap();
         std::fs::write(
             home.join("release"),
             format!(

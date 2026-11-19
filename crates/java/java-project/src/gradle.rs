@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use base::{Cancel, Result};
 use proc_sup::{ProcessClass, ProcessSpec};
 use project_model::{
-    BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, Module,
+    BuildGroup, BuildModule, BuildSelection, BuildSystem, BuildTask, Exclusion, FileEdit, Module,
     ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TaskOptions, ToolHome,
     ToolProgress, ToolSetup, Unit, cache_file,
 };
@@ -255,7 +255,13 @@ impl Gradle {
         if let Some(home) = settings.user_home_path() {
             spec = spec.env("GRADLE_USER_HOME", home);
         }
-        Ok(self.env.apply(spec, &jdk))
+        // Every command of every window and provider goes through here, so the chosen
+        // values reach a build, a task, the tests and the import alike.
+        let selection = crate::build_selection::load_selection(root);
+        Ok(self
+            .env
+            .apply(spec, &jdk)
+            .args(crate::build_selection::property_args(&selection)))
     }
 }
 
@@ -385,6 +391,18 @@ impl BuildSystem for Gradle {
 
     fn terminal_path(&self) -> bool {
         self.env.build_tools.second.terminal_path
+    }
+
+    fn takes_properties(&self) -> bool {
+        true
+    }
+
+    fn selection(&self, root: &Path) -> BuildSelection {
+        crate::build_selection::load_selection(root)
+    }
+
+    fn choose(&self, root: &Path, selection: &BuildSelection) -> Result {
+        crate::build_selection::save_selection(root, selection)
     }
 
     fn assemble(&self, root: &Path) -> Result<ProcessSpec> {
@@ -656,6 +674,8 @@ struct ReportProject {
     name: String,
     project_dir: PathBuf,
     #[serde(default)]
+    build_dir: Option<PathBuf>,
+    #[serde(default)]
     build_file: Option<PathBuf>,
     source_sets: Vec<ReportSet>,
     #[serde(default)]
@@ -747,19 +767,38 @@ fn parse_reports(files: &[Vec<u8>], root: &Path) -> Result<ProjectModel> {
         model.problems.extend(report.project.problems);
         model.dependencies.push(ModuleDependencies {
             module: report.project.path.clone(),
-            build_file: report.project.build_file,
+            build_file: report.project.build_file.clone(),
             scopes: report.project.dependencies.into_scopes(),
         });
+        let units: Vec<Unit> = report
+            .project
+            .source_sets
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        // The build folder holds what the compiler writes, generated sources included.
+        let mut generated_roots: Vec<PathBuf> = units
+            .iter()
+            .flat_map(|unit| unit.source_roots.iter())
+            .filter(|source| {
+                report
+                    .project
+                    .build_dir
+                    .as_ref()
+                    .is_some_and(|dir| source.starts_with(dir))
+            })
+            .cloned()
+            .collect();
+        generated_roots.dedup();
+        let excluded_roots: Vec<PathBuf> = report.project.build_dir.into_iter().collect();
         model.modules.push(Module {
             id: report.project.path,
             name: report.project.name,
             dir: report.project.project_dir,
-            units: report
-                .project
-                .source_sets
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            build_file: report.project.build_file,
+            generated_roots,
+            excluded_roots,
+            units,
         });
     }
     model.modules.sort_by(|left, right| left.id.cmp(&right.id));

@@ -65,7 +65,8 @@ pub use hierarchy::{
     DefinitionPreviewQuery, FileSymbol, FileSymbolsProvider, FileSymbolsQuery,
     MethodHierarchyEntry, MethodHierarchyProvider, MethodHierarchyQuery, MethodRelation,
     OverridableMethod, OverridableMethods, OverridableMethodsProvider, OverridableMethodsQuery,
-    ReferenceQuery, ReferenceStringProvider,
+    ReferenceQuery, ReferenceStringProvider, TypeHierarchyItem, TypeHierarchyProvider,
+    TypeHierarchyQuery, TypeKind,
 };
 pub use inlay::{
     InlayHintEntry, InlayHintKind, InlayHintProvider, InlayHintQuery, InlayHintSettings,
@@ -101,14 +102,15 @@ pub use semantic::{
     HighlightProvider, HoverProvider, HoverText, MemberActionForm, MemberActionParametersProvider,
     MemberActionProvider, MemberActionQuery, MemberActionRequest, MemberChoice, MemberRefactoring,
     MemberSelection, MemberTarget, MethodSignature, MoveDestination, MoveDestinationProvider,
-    MoveKind, MoveOutcome, MoveProvider, MoveQuery, MoveRequest, NavigationKind,
-    NavigationProvider, NavigationQuery, ProjectProblem, ProjectProblemsProvider,
-    ProjectProblemsQuery, RefactorSelectionsProvider, ReferencesProvider, RenamePosition,
-    RenameProvider, RenameQuery, SelectionEntry, SelectionQuery, SemanticServer, Severity,
-    SignatureException, SignatureParameter, SignatureProvider, SignatureQuery, SignatureText,
-    SourceEdit, SourceSpan, SourceTextProvider, SourceTextQuery, SuppressionQuery,
-    SuppressionStyle, SuppressionTarget, SymbolEntry, SymbolQuery, TextPoint, TextSpan,
-    WorkspaceChange, WorkspaceSymbolProvider, apply_to_text, offset_in,
+    MoveKind, MoveMember, MoveMembersForm, MoveMembersFormProvider, MoveMembersQuery, MoveOutcome,
+    MovePlace, MoveProvider, MoveQuery, MoveRequest, NavigationKind, NavigationProvider,
+    NavigationQuery, ProjectProblem, ProjectProblemsProvider, ProjectProblemsQuery,
+    RefactorSelectionsProvider, ReferencesProvider, RenamePosition, RenameProvider, RenameQuery,
+    SelectionEntry, SelectionQuery, SemanticServer, Severity, SignatureException,
+    SignatureParameter, SignatureProvider, SignatureQuery, SignatureText, SourceEdit, SourceSpan,
+    SourceTextProvider, SourceTextQuery, SuppressionQuery, SuppressionStyle, SuppressionTarget,
+    SymbolEntry, SymbolQuery, TextPoint, TextSpan, WorkspaceChange, WorkspaceSymbolProvider,
+    apply_to_text, offset_in,
 };
 pub use semantic::{
     CallParameter, CallSignature, CompletionKind, ExpectedType, ExpectedTypeProvider, ExternalDoc,

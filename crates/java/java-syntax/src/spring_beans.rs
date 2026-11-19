@@ -102,6 +102,8 @@ pub struct Type {
     pub type_parameters: Vec<String>,
     pub annotations: Vec<Annotation>,
     pub fields: Vec<Field>,
+    /// The components of a record, which the canonical constructor takes as parameters.
+    pub components: Vec<Field>,
     pub constructors: Vec<Constructor>,
     pub methods: Vec<Method>,
     /// The line of the type name, from zero.
@@ -265,6 +267,7 @@ fn visit_type(node: Node<'_>, package: &str, owner: &str, text: &str, out: &mut 
         line: line_of(text, name_node.start_byte()),
         column: column_of(text, name_node.start_byte()),
         offset: name_node.start_byte(),
+        components: record_components(node, text),
         ..Type::default()
     };
     if let Some(body) = node.child_by_field_name("body") {
@@ -334,6 +337,44 @@ fn visit_type(node: Node<'_>, package: &str, owner: &str, text: &str, out: &mut 
         }
     }
     out.push(found);
+}
+
+/// The components a record header declares, in their order. Each one is the field of the
+/// record, so a place that jumps to the declaration of a property finds it the same way.
+fn record_components(node: Node<'_>, text: &str) -> Vec<Field> {
+    if node.kind() != "record_declaration" {
+        return Vec::new();
+    }
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "formal_parameter" {
+            continue;
+        }
+        let Some(name) = parameter.child_by_field_name("name") else {
+            continue;
+        };
+        let type_node = parameter.child_by_field_name("type");
+        found.push(Field {
+            type_text: type_node
+                .map(|kind| clean_type(text_of(text, kind)))
+                .unwrap_or_default(),
+            type_arguments: type_node
+                .map(|kind| type_arguments(text_of(text, kind)))
+                .unwrap_or_default(),
+            name: text_of(text, name).to_owned(),
+            annotations: annotations(parameter, text),
+            is_static: false,
+            line: line_of(text, name.start_byte()),
+            column: column_of(text, name.start_byte()),
+            offset: name.start_byte(),
+            type_offset: type_node.map_or(parameter.start_byte(), |kind| kind.start_byte()),
+        });
+    }
+    found
 }
 
 /// The declared supertypes as the source spells them, without type arguments, with the
@@ -702,6 +743,30 @@ interface OwnerRepository extends JpaRepository<Owner, Long> {}
             service.methods[0].annotations[0].value.as_deref(),
             Some("clock")
         );
+    }
+
+    #[test]
+    fn the_components_of_a_record_are_read_as_fields() {
+        let source = r#"package demo;
+record ServerProperties(int port, String address) {}
+"#;
+        let file = spring_file(source);
+        let kind = &file.types[0];
+        assert_eq!(kind.fields.len(), 0, "a record header names no field body");
+        let names: Vec<&str> = kind
+            .components
+            .iter()
+            .map(|component| component.name.as_str())
+            .collect();
+        assert_eq!(names, ["port", "address"]);
+        let port = source.find("int port").unwrap() + "int ".len();
+        let line_start = source[..port].rfind('\n').map_or(0, |index| index + 1);
+        assert_eq!(kind.components[0].line, 1);
+        assert_eq!(
+            kind.components[0].column,
+            source[line_start..port].encode_utf16().count() as u32
+        );
+        assert_eq!(kind.components[0].type_text, "int");
     }
 
     #[test]

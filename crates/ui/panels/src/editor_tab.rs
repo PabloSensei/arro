@@ -388,6 +388,29 @@ fn open(
                             .ok();
                     });
                 }
+                EditorEvent::MoveMembers(spot) => {
+                    let spot = spot.clone();
+                    let origin = view.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::move_members::MoveMembersDialog::show(
+                                            spot,
+                                            Some(origin),
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
                 EditorEvent::RefactorForm(handle_text) => {
                     let handle_text = handle_text.clone();
                     let workspace = runner.clone();
@@ -481,6 +504,32 @@ fn open(
                                     .update(cx, |workspace, cx| {
                                         workspace.show_tool(
                                             workspace::CALL_HIERARCHY_TOOL,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::TypeHierarchy(spot) => {
+                    let Some(hub) = cx.try_global::<crate::type_hierarchy::ActiveTypeHierarchy>()
+                    else {
+                        return;
+                    };
+                    let hub = hub.0.clone();
+                    let spot = spot.clone();
+                    hub.update(cx, |hub, cx| hub.start(spot, cx));
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.show_tool(
+                                            workspace::TYPE_HIERARCHY_TOOL,
                                             window,
                                             cx,
                                         )

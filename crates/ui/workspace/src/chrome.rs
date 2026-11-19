@@ -22,7 +22,7 @@ use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
 use crate::split::SplitNode;
 use crate::window::{
-    AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_POPUP, BUILD_TOOL, BalloonAction, BringAllToFront,
+    AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_TOOL, BUILD_TOOL, BalloonAction, BringAllToFront,
     BuildModule, BuildProject, COMMIT_TOOL, CheckForUpdatesApp, ChooseDebugConfiguration,
     ChooseRunConfiguration, CloseTab, Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug,
     Dismiss, DockSide, EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup,
@@ -37,8 +37,8 @@ use crate::window::{
     STRUCTURE_TOOL, SaveAll, ShowAllApps, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
     ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop,
     StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi,
-    ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug, ToggleFullScreen,
-    ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
+    ToggleBookmarks, ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug,
+    ToggleFullScreen, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
     ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
     UpdateProject, VcsQuickList, ViewBreakpoints, Workspace, ZoomWindow,
 };
@@ -781,35 +781,14 @@ impl Workspace {
                     "s-bookmarks",
                     "toolwindows/bookmarks",
                     "Bookmarks",
-                    None,
-                    self.overlay_tag() == Some(BOOKMARKS_POPUP),
+                    Some("workspace::ToggleBookmarks"),
+                    self.tool_open(BOOKMARKS_TOOL),
                     theme,
                 )
-                // The open popup hears this press too and closes itself on it, so the
-                // button reads the popup before the pointer does. A second press then
-                // closes the popup instead of opening it again.
-                .capture_any_mouse_down(cx.listener(
-                    |this, event: &MouseDownEvent, window, cx| {
-                        if event.button == MouseButton::Left {
-                            this.toggle_bookmarks(window, cx);
-                        }
-                    },
-                )),
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.toggle_tool(BOOKMARKS_TOOL, window, cx)),
+                ),
             )
-    }
-
-    /// The Bookmarks button of the right stripe: the popup opens, and the same button
-    /// closes it while it is open.
-    fn toggle_bookmarks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlay_tag() == Some(BOOKMARKS_POPUP) {
-            self.close_overlay(window, cx);
-            return;
-        }
-        // A popup that is open now closes on this same press and would take the new one
-        // with it, so the bookmarks open after the press is through.
-        cx.defer_in(window, |this, window, cx| {
-            this.run_command("window.show_bookmarks", window, cx);
-        });
     }
 
     /// The areas of the window controls that the platform reads for hit testing. The title
@@ -3093,21 +3072,6 @@ impl Workspace {
         };
         let close = cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_balloon(cx));
         let mut actions = Vec::new();
-        if let Some((label, path)) = self
-            .balloon
-            .as_ref()
-            .and_then(|balloon| balloon.action.clone())
-        {
-            actions.push(NotificationAction {
-                id: "file",
-                label,
-                on_click: Box::new(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.balloon_visible = false;
-                    cx.notify();
-                    this.open_file(path.clone(), window, cx);
-                })),
-            });
-        }
         if let Some(balloon) = self.balloon.as_ref() {
             for button in &balloon.buttons {
                 let id = button.id;
@@ -3140,6 +3104,22 @@ impl Workspace {
                     on_click,
                 });
             }
+        }
+        // The file of a notification comes after the commands, as the last way out.
+        if let Some((label, path)) = self
+            .balloon
+            .as_ref()
+            .and_then(|balloon| balloon.action.clone())
+        {
+            actions.push(NotificationAction {
+                id: "file",
+                label,
+                on_click: Box::new(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.balloon_visible = false;
+                    cx.notify();
+                    this.open_file(path.clone(), window, cx);
+                })),
+            });
         }
         let body = notification(
             title,
@@ -3470,6 +3450,9 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_tool(AI_TOOL, window, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleBookmarks, window, cx| {
+                this.toggle_tool(BOOKMARKS_TOOL, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ShowSearch, window, cx| this.show_search(window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(
@@ -4006,6 +3989,7 @@ impl Render for StatusBarView {
             active,
             language_status,
             language_details,
+            language_action,
             branch,
             status,
             branch_anchor,
@@ -4025,6 +4009,7 @@ impl Render for StatusBarView {
                     .map(|tab| (tab.path.clone(), tab.icon)),
                 workspace.language_status.clone(),
                 workspace.language_details.is_some(),
+                workspace.language_action,
                 workspace.branch.clone(),
                 workspace.active_status(cx),
                 workspace.st_branch_anchor.clone(),
@@ -4097,7 +4082,25 @@ impl Render for StatusBarView {
             let widget = status_widget("st-language", text, &theme)
                 .debug_selector(|| "st-language".to_owned())
                 .when(!ready, |widget| widget.text_color(theme.warning_mark));
-            if language_details {
+            if let Some(action) = language_action {
+                let workspace = self.workspace.clone();
+                widget
+                    .cursor_pointer()
+                    .tooltip(|_, cx| tooltip("Import failed. Click for details.", None, cx))
+                    .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        let shown = workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.run_command(action, window, cx)
+                            })
+                            .unwrap_or(false);
+                        if !shown {
+                            workspace
+                                .update(cx, |workspace, cx| workspace.show_language_help(cx))
+                                .ok();
+                        }
+                    }))
+            } else if language_details {
                 let workspace = self.workspace.clone();
                 widget
                     .cursor_pointer()

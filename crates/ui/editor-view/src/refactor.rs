@@ -8,10 +8,9 @@ use ::platform;
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt;
 use lang_api::{
-    ActionEntry, ActionKind, Confidence, DocumentEdit, DocumentSpot, ExtractKind,
-    HierarchyDirection, HierarchyQuery, MoveDestination, MoveKind, MoveQuery, MoveRequest,
-    RenamePosition, RenameQuery, SelectionQuery, SourceSpan, SymbolEntry, TextSpan,
-    WorkspaceChange, apply_to_text, ask,
+    ActionEntry, ActionKind, Confidence, DocumentEdit, DocumentSpot, ExtractKind, MoveDestination,
+    MoveKind, MovePlace, MoveQuery, MoveRequest, RenamePosition, RenameQuery, SelectionQuery,
+    SourceSpan, TextSpan, WorkspaceChange, apply_to_text, ask,
 };
 use text_core::TextStore;
 use ui_kit::*;
@@ -336,15 +335,6 @@ fn summary(change: &WorkspaceChange) -> String {
         text.push_str(&format!(", {} files renamed", change.renames.len()));
     }
     text + ". Enter applies, Escape cancels"
-}
-
-fn symbol_row(symbol: SymbolEntry, arrow: &str) -> Option<Pick> {
-    let target = symbol.place?;
-    let detail = format!("{arrow} {}", symbol.name);
-    Some(Pick::Place {
-        label: place_label(&target, Some(&detail)),
-        target,
-    })
 }
 
 /// What a drop on a folder did in the editor.
@@ -1250,11 +1240,27 @@ impl EditorView {
         cx.emit(EditorEvent::MemberRefactoring { refactoring, spot });
     }
 
-    /// F6: asks where the file can go and shows the destinations in a searchable list.
+    /// F6: on a member it opens the form of Move Members, and elsewhere it asks where
+    /// the file can go and shows the destinations in a searchable list.
     pub(crate) fn start_move(&mut self, cx: &mut Context<Self>) {
         let Some((spot, caret)) = self.spot() else {
             return;
         };
+        let place = match (&self.lsp, &self.state) {
+            (Some(lsp), Some(state)) => lsp.support.move_place(&state.text(), caret),
+            _ => MovePlace::File,
+        };
+        match place {
+            MovePlace::Member => {
+                cx.emit(EditorEvent::MoveMembers(spot));
+                return;
+            }
+            MovePlace::Unmovable(reason) => {
+                self.show_note(caret, reason, cx);
+                return;
+            }
+            MovePlace::File => {}
+        }
         let Some(provider) = self
             .lsp
             .as_ref()
@@ -1859,45 +1865,20 @@ impl EditorView {
         .detach();
     }
 
-    /// Ctrl+H: supertypes and subtypes of the type at the caret.
+    /// Ctrl+H: the window shows the type hierarchy of the type at the caret.
     pub(crate) fn type_hierarchy(&mut self, cx: &mut Context<Self>) {
-        let Some((spot, caret)) = self.spot() else {
+        let Some((spot, _)) = self.spot() else {
             return;
         };
-        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.hierarchy()) else {
+        if self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.support.type_hierarchy())
+            .is_none()
+        {
             return;
-        };
-        let query = |direction| HierarchyQuery {
-            spot: spot.clone(),
-            direction,
-        };
-        let up = ask(provider, query(HierarchyDirection::Supertypes));
-        let down = ask(provider, query(HierarchyDirection::Subtypes));
-        cx.spawn(async move |this, cx| {
-            let (up, down) = (first(up).await, first(down).await);
-            this.update(cx, |this, cx| {
-                let unknown = [&up, &down]
-                    .iter()
-                    .any(|answer| matches!(answer, Some((_, Confidence::Unknown))));
-                if unknown {
-                    this.show_note(caret, NO_ANSWER, cx);
-                    return;
-                }
-                let up = up.map(|(list, _)| list).unwrap_or_default();
-                let down = down.map(|(list, _)| list).unwrap_or_default();
-                let rows = up
-                    .into_iter()
-                    .filter_map(|symbol| symbol_row(symbol, "↑"))
-                    .chain(
-                        down.into_iter()
-                            .filter_map(|symbol| symbol_row(symbol, "↓")),
-                    )
-                    .collect();
-                this.show_picks(caret, rows, "No type hierarchy here", cx);
-            })
-            .ok();
-        })
-        .detach();
+        }
+        cx.emit(EditorEvent::TypeHierarchy(spot));
     }
 }
 

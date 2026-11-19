@@ -3,6 +3,9 @@
 //! language a project is written in.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use lang_api::WorkspaceChange;
 
 use crate::ProjectModel;
 
@@ -51,6 +54,21 @@ pub struct EnvironmentDetail {
     pub value: String,
 }
 
+/// The change of a build file that sets a language level, before it is written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LanguageLevelEdit {
+    /// The build file the change goes to.
+    pub file: PathBuf,
+    /// The line the value takes in the changed file, counted from zero.
+    pub line: Option<u32>,
+    /// What the form says before the change is written, such as the line it adds.
+    pub summary: String,
+    /// The file has no place for the level yet, so the change brings one into being.
+    pub added: bool,
+    /// The edits, in the coordinates of the text the language read.
+    pub change: WorkspaceChange,
+}
+
 /// Everything Project Structure shows about the environment of one project.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectEnvironmentInfo {
@@ -92,6 +110,30 @@ pub trait EnvironmentProvider: Send + Sync {
     /// only when its server starts, such as a dependency. Called on the UI thread, so
     /// the reaction must not block.
     fn project_model(&self, _model: &ProjectModel) {}
+
+    /// The last model the language read, for the pages that show its modules. Cheap:
+    /// it hands out a copy of a value the language already holds.
+    fn model(&self) -> Option<Arc<ProjectModel>> {
+        None
+    }
+
+    /// The level of one module and the build file that decides it. Blocks on the disk:
+    /// not for the UI thread.
+    fn module_language(&self, _module: &str) -> Option<LanguageLevelInfo> {
+        None
+    }
+
+    /// The change that sets the level of the project, or of the module `module`, in the
+    /// coordinates of `text` when that is the text of the build file the user sees.
+    /// Blocks on the disk: not for the UI thread.
+    fn language_change(
+        &self,
+        _level: &str,
+        _module: Option<&str>,
+        _text: Option<&str>,
+    ) -> Result<LanguageLevelEdit, String> {
+        Err("The language of this project cannot change its level".to_owned())
+    }
 
     /// A short line for the user that has not been shown yet, taken once.
     fn take_notice(&self) -> Option<String> {

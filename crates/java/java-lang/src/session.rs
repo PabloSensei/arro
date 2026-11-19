@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use java_project::Jdk;
-use jdtls_adapter::{JdtlsConfig, Runtime};
+use jdtls_adapter::{ImportFailure, JdtlsConfig, Runtime};
 use sidecar::{State, Status, Trust};
 use tokio::runtime;
 use tokio::sync::watch;
@@ -246,6 +246,16 @@ mod runtime_tests {
     }
 }
 
+/// The status bar line for a server state. A failed import is the line itself: the
+/// server may still say `ready`, but completion and checks do not work until the project
+/// is imported, and a `ready` line would hide the reason.
+pub fn status_line(status: &Status, failure: Option<&ImportFailure>) -> String {
+    match failure {
+        Some(failure) => format!("Java: import failed: {}", failure.summary),
+        None => status_text(status),
+    }
+}
+
 /// The status bar line for a server state.
 pub fn status_text(status: &Status) -> String {
     let state = match status.state {
@@ -326,11 +336,8 @@ impl JavaSession {
         self.runtime.spawn(async move {
             let mut shown = String::new();
             loop {
-                let text = status_text(&status.borrow_and_update());
-                let text = match failure.borrow_and_update().as_ref() {
-                    Some(failure) => format!("{text}: import failed: {}", failure.summary),
-                    None => text,
-                };
+                let failure_now = failure.borrow_and_update().clone();
+                let text = status_line(&status.borrow_and_update(), failure_now.as_ref());
                 if text != shown {
                     on_change(text.clone());
                     shown = text;
@@ -391,6 +398,25 @@ mod tests {
         let mut out_of_memory = status(State::Stopped);
         out_of_memory.last_error = Some("memory is low".to_owned());
         assert_eq!(status_text(&out_of_memory), "Java: stopped: memory is low");
+    }
+
+    #[test]
+    fn a_failed_import_is_the_line_and_hides_ready() {
+        let mut ready = status(State::Ready);
+        ready.last_error = None;
+        assert_eq!(status_text(&ready), "Java: ready");
+        let failure = ImportFailure {
+            file: PathBuf::new(),
+            line: 0,
+            message: "the cause".into(),
+            summary: "the cause".into(),
+            jdk: None,
+            tool: None,
+        };
+        assert_eq!(
+            status_line(&ready, Some(&failure)),
+            "Java: import failed: the cause"
+        );
     }
 
     #[test]

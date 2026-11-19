@@ -107,6 +107,11 @@ pub(crate) fn fingerprint(root: &Path) -> Result<u64> {
             add(&modified.to_le_bytes());
         }
     }
+    // The answers of the user for the build are inputs too: another profile or value can
+    // change what the sources compile to, and the stamp of the last build must go.
+    if let Ok(text) = fs::read(crate::build_selection::selection_file(root)) {
+        add(&text);
+    }
     Ok(hash)
 }
 

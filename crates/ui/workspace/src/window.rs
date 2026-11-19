@@ -31,7 +31,8 @@ use crate::editor::{
 use crate::external::{OpenRequests, OpenTarget, Request, open_target};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{
-    DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_layout, save_theme,
+    BookmarkLayout, DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_layout,
+    save_theme,
 };
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
@@ -52,6 +53,7 @@ actions!(
         ToggleTerminal,
         ToggleRun,
         ToggleAi,
+        ToggleBookmarks,
         ToggleCommit,
         ToggleStructure,
         ToggleServices,
@@ -223,7 +225,7 @@ macro_rules! window_keys {
 #[rustfmt::skip]
 window_keys![
     ("alt-1", ToggleProject, None, Some("ActivateProjectToolWindow"), None),
-    ("alt-2", ToggleAi, None, None, Some("cmd-2")),
+    ("alt-2", ToggleBookmarks, None, Some("ActivateBookmarksToolWindow"), None),
     ("alt-3", ToggleUsages, None, Some("ActivateFindToolWindow"), None),
     ("alt-4", ToggleRun, None, Some("ActivateRunToolWindow"), None),
     ("alt-5", ToggleDebug, None, Some("ActivateDebugToolWindow"), None),
@@ -444,6 +446,7 @@ pub const DOCUMENTATION_TOOL: &str = "documentation";
 pub const LOG_TOOL: &str = "log";
 pub const SELECTION_HISTORY_TOOL: &str = "selection-history";
 pub const CALL_HIERARCHY_TOOL: &str = "call-hierarchy";
+pub const TYPE_HIERARCHY_TOOL: &str = "type-hierarchy";
 pub const STACK_TRACE_TOOL: &str = "stack-trace";
 pub const METHOD_HIERARCHY_TOOL: &str = "method-hierarchy";
 pub const INSPECTION_TOOL: &str = "inspection-results";
@@ -454,6 +457,8 @@ pub const DATABASE_TOOL: &str = "database";
 pub const JSHELL_TOOL: &str = "jshell";
 pub const ENDPOINTS_TOOL: &str = "endpoints";
 pub const BEANS_TOOL: &str = "beans";
+/// The Bookmarks window: the groups of the project and their files.
+pub const BOOKMARKS_TOOL: &str = "bookmarks";
 
 pub(crate) struct DockTool {
     pub id: &'static str,
@@ -725,6 +730,8 @@ pub struct Workspace {
     pub(crate) agent_busy: bool,
     /// The explanation behind the language status line, for the balloon of a click.
     pub(crate) language_details: Option<SharedString>,
+    /// The command a click on the language status line runs instead of the help balloon.
+    pub(crate) language_action: Option<&'static str>,
     /// A page with the tool the language server did not find, and the label of its button.
     pub(crate) language_download: Option<(SharedString, String)>,
     /// Whether the balloon also offers a second search for the tool.
@@ -1102,6 +1109,7 @@ impl Workspace {
             agent_clients: 0,
             agent_busy: false,
             language_details: None,
+            language_action: None,
             language_download: None,
             language_check: false,
             run: None,
@@ -2608,6 +2616,21 @@ impl Workspace {
 
     pub fn language_status(&self) -> Option<&SharedString> {
         self.language_status.as_ref()
+    }
+
+    /// The command a click on the language status line runs, such as the notification
+    /// of a failed import. Without one, the click opens the help balloon.
+    pub fn language_action(&self) -> Option<&'static str> {
+        self.language_action
+    }
+
+    /// Sets what a click on the language status line does besides opening its balloon.
+    pub fn set_language_action(&mut self, action: Option<&'static str>, cx: &mut Context<Self>) {
+        if self.language_action == action {
+            return;
+        }
+        self.language_action = action;
+        cx.notify();
     }
 
     /// The connected MCP clients and whether one runs an `Execute` tool.
@@ -4560,16 +4583,6 @@ impl Workspace {
         }
     }
 
-    /// Closes the open popup and gives the focus back to the editor, as a second press on
-    /// the button that opened it does.
-    pub(crate) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlay.take().is_some() {
-            self.menu_task = None;
-            self.focus_active(window, cx);
-            cx.notify();
-        }
-    }
-
     pub fn show_menu(
         &mut self,
         position: Point<Pixels>,
@@ -5071,6 +5084,36 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A notification with buttons that run commands of the window and one button that
+    /// opens `action_path`. The command buttons come first, the file last.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify_user_with_action_and_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        action: impl Into<SharedString>,
+        action_path: PathBuf,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.balloon = Some(Balloon {
+            title: title.into(),
+            text: text.into(),
+            action: Some((action.into(), action_path)),
+            buttons: buttons
+                .into_iter()
+                .map(|(id, label, command)| BalloonButton {
+                    id,
+                    label,
+                    action: BalloonAction::Command(command),
+                })
+                .collect(),
+        });
+        self.balloon_visible = true;
+        self.balloon_serial += 1;
+        cx.notify();
+    }
+
     /// The last notification, for scripts and tests.
     pub fn last_notification(&self) -> Option<(SharedString, SharedString)> {
         self.balloon
@@ -5091,16 +5134,21 @@ impl Workspace {
             .and_then(|balloon| balloon.action.clone())
     }
 
-    /// The buttons of the last notification, for scripts and tests.
+    /// The buttons of the last notification in the order they are shown, including the
+    /// one that opens a file, for scripts and tests.
     pub fn last_notification_buttons(&self) -> Vec<SharedString> {
         self.balloon
             .as_ref()
             .map(|balloon| {
-                balloon
+                let mut labels: Vec<SharedString> = balloon
                     .buttons
                     .iter()
                     .map(|button| button.label.clone())
-                    .collect()
+                    .collect();
+                if let Some((label, _)) = &balloon.action {
+                    labels.push(label.clone());
+                }
+                labels
             })
             .unwrap_or_default()
     }
@@ -5419,7 +5467,18 @@ impl Workspace {
             services_collapsed: self.layout.services_collapsed.clone(),
             services_selected: self.layout.services_selected.clone(),
             services_show_all: self.layout.services_show_all,
+            bookmarks: self.layout.bookmarks.clone(),
         }
+    }
+
+    /// The Bookmarks window changed its groups or its descriptions: the project keeps
+    /// them with the next layout.
+    pub fn set_bookmarks(&mut self, bookmarks: BookmarkLayout, cx: &mut Context<Self>) {
+        if self.layout.bookmarks == bookmarks {
+            return;
+        }
+        self.layout.bookmarks = bookmarks;
+        self.layout_changed(cx);
     }
 
     /// A tab changed something the saved layout keeps, such as what its preview shows.

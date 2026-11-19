@@ -7,9 +7,9 @@ use std::sync::Mutex;
 use base::{Cancel, Result};
 use proc_sup::ProcessSpec;
 use project_model::{
-    BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, MAIN_UNIT, Module,
-    ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TEST_UNIT, TaskOptions,
-    ToolHome, ToolProgress, ToolSetup, Unit, cache_file,
+    BuildGroup, BuildModule, BuildSelection, BuildSystem, BuildTask, Exclusion, FileEdit,
+    MAIN_UNIT, Module, ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask,
+    TEST_UNIT, TaskOptions, ToolHome, ToolProgress, ToolSetup, Unit, cache_file,
 };
 use serde::Deserialize;
 
@@ -130,6 +130,7 @@ impl Maven {
         let settings = &self.env.build_tools.first;
         let maven = self.resolve(root)?.program;
         let jdk = self.env.project_jdk(root)?;
+        let selection = crate::build_selection::load_selection(root);
         let mut spec = ProcessSpec::new(maven)
             .cwd(root)
             .args(["-B", "-ntp"])
@@ -146,7 +147,13 @@ impl Maven {
         if let Some(options) = project_model::BuildToolSettings::path(&settings.vm_options) {
             spec = spec.env("MAVEN_OPTS", options);
         }
-        Ok(self.env.apply(spec, &jdk).args(&self.env.maven_args))
+        // Every command of every window and provider goes through here, so the chosen
+        // profiles reach a build, a task, the tests and the import alike.
+        Ok(self
+            .env
+            .apply(spec, &jdk)
+            .args(&self.env.maven_args)
+            .args(crate::build_selection::profile_args(&selection)))
     }
 
     /// Where the fingerprint of the last successful build waits.
@@ -177,7 +184,9 @@ impl BuildSystem for Maven {
             .arg(format!("-Dide.model.out={}", report.display()))
             .arg(MODEL_PHASE);
         run_tool(&spec, cancel)?;
-        parse_report(&fs::read(&report)?, root)
+        let mut model = parse_report(&fs::read(&report)?, root)?;
+        model.profiles = crate::pom::module_profiles(&model.modules);
+        Ok(model)
     }
 
     fn missing_tool(&self, root: &Path) -> Option<ToolSetup> {
@@ -381,6 +390,14 @@ impl BuildSystem for Maven {
 
     fn supports_skip_tests(&self) -> bool {
         true
+    }
+
+    fn selection(&self, root: &Path) -> BuildSelection {
+        crate::build_selection::load_selection(root)
+    }
+
+    fn choose(&self, root: &Path, selection: &BuildSelection) -> Result {
+        crate::build_selection::save_selection(root, selection)
     }
 
     fn supports_profiler(&self) -> bool {
@@ -607,6 +624,22 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
         };
         let mut test_paths = vec![main_output];
         test_paths.extend(paths(project.test_classpath));
+        // The build folder holds what the compiler writes, generated sources included.
+        let build_dir = project.output_dir.parent().map(Path::to_path_buf);
+        let mut generated_roots: Vec<PathBuf> = project
+            .source_roots
+            .iter()
+            .chain(project.test_source_roots.iter())
+            .filter(|source| {
+                build_dir
+                    .as_ref()
+                    .is_some_and(|dir| source.starts_with(dir))
+            })
+            .cloned()
+            .collect();
+        generated_roots.dedup();
+        let excluded_roots: Vec<PathBuf> = build_dir.into_iter().collect();
+        let build_file = project.build_file.clone();
         let main = Unit {
             name: MAIN_UNIT.into(),
             source_roots: project.source_roots,
@@ -633,6 +666,9 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
                 id: project.id,
                 name,
                 dir: project.base_dir,
+                build_file,
+                generated_roots,
+                excluded_roots,
                 units: vec![main, test],
             },
             dependencies,
@@ -646,6 +682,7 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
         tool_version: report.tool_version,
         modules,
         dependencies,
+        profiles: Vec::new(),
         resolved: true,
         problems,
     })

@@ -176,7 +176,7 @@ The default keymap follows IntelliJ IDEA, so moving over is easy.
 Window and panels:
 
   Alt+1                  Project
-  Alt+2                  AI Assistant
+  Alt+2                  Bookmarks
   Alt+3                  Usages
   Alt+4                  Run
   Alt+5                  Debug

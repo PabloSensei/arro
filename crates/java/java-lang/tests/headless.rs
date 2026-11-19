@@ -548,6 +548,40 @@ public class Param {
 }
 "#;
 
+const STATIC_MOVER: &str = r#"package probe;
+
+public class StaticMover {
+
+    public static String greet() {
+        return "moved";
+    }
+
+    public String instance() {
+        return "stays";
+    }
+}
+"#;
+
+const STATIC_TARGET: &str = r#"package probe;
+
+public class StaticTarget {
+
+    public static String hello() {
+        return "target";
+    }
+}
+"#;
+
+const STATIC_USER: &str = r#"package probe;
+
+public class StaticUser {
+
+    public String use() {
+        return StaticMover.greet();
+    }
+}
+"#;
+
 fn uri_of(path: &Path) -> String {
     file_uri(&CanonPath::new(path).unwrap())
         .unwrap()
@@ -1211,4 +1245,135 @@ async fn pull_members_up_moves_the_method_of_the_java_layer() {
     project.stop().await;
     let _ = fs::remove_file(&base_path);
     let _ = fs::remove_file(&child_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "runs jdtls on a corpus project"]
+async fn move_members_moves_a_static_method_between_two_classes() {
+    let Fixture { probe, config } = fixture("petclinic", ".", &["build.gradle", "settings.gradle"]);
+    let mover_path = probe.with_file_name("StaticMover.java");
+    let target_path = probe.with_file_name("StaticTarget.java");
+    let user_path = probe.with_file_name("StaticUser.java");
+    fs::write(&mover_path, STATIC_MOVER).unwrap();
+    fs::write(&target_path, STATIC_TARGET).unwrap();
+    fs::write(&user_path, STATIC_USER).unwrap();
+    let project = JavaProject::open(config, Trust::Trusted).unwrap();
+    let mut status = project.status();
+    until(&mut status, |status| status.state == State::Ready).await;
+    let server = project.server().unwrap();
+    let mut mover = Open {
+        project: &project,
+        uri: uri_of(&mover_path),
+        text: STATIC_MOVER.to_owned(),
+        version: 1,
+    };
+    let mut target = Open {
+        project: &project,
+        uri: uri_of(&target_path),
+        text: STATIC_TARGET.to_owned(),
+        version: 1,
+    };
+    let mut user = Open {
+        project: &project,
+        uri: uri_of(&user_path),
+        text: STATIC_USER.to_owned(),
+        version: 1,
+    };
+    server.open(&mover.uri, 1, mover.text.as_str().into());
+    server.open(&target.uri, 1, target.text.as_str().into());
+    server.open(&user.uri, 1, user.text.as_str().into());
+    wait_error(&project, &mover.uri, false).await;
+    wait_error(&project, &target.uri, false).await;
+    wait_error(&project, &user.uri, false).await;
+
+    // F6 on a static method names the member, and the type of the project that takes it.
+    let greet = mover.text.find("greet").unwrap();
+    assert_eq!(
+        project.move_place(&mover.text, greet),
+        lang_api::MovePlace::Member
+    );
+    let instance = mover.text.find("instance").unwrap();
+    assert!(matches!(
+        project.move_place(&mover.text, instance),
+        lang_api::MovePlace::Unmovable(_)
+    ));
+    let form = first(ask(
+        project.move_members_form().unwrap(),
+        lang_api::MoveMembersQuery {
+            spot: mover.spot("greet()", 0),
+        },
+    ))
+    .await
+    .expect("the form arrives")
+    .expect("the form has the members");
+    assert_eq!(form.title, "Move Members");
+    assert!(
+        !form.members.iter().any(|member| member.name == "instance"),
+        "an instance member stays"
+    );
+    let member = form
+        .members
+        .iter()
+        .find(|member| member.name == "greet")
+        .expect("the static method is a member");
+    assert!(member.checked, "the member under the caret is ticked");
+    let destination = form
+        .targets
+        .iter()
+        .find(|target| target.name == "StaticTarget")
+        .expect("the type of the project is a target")
+        .clone();
+    assert_eq!(destination.handle, "probe.StaticTarget");
+
+    let outcome = first(ask(
+        project.move_file().unwrap(),
+        MoveRequest {
+            spot: DocumentSpot {
+                uri: mover.uri.clone(),
+                version: mover.version,
+                point: member.span.start,
+            },
+            kind: MoveKind::Member,
+            destination,
+            update_references: true,
+        },
+    ))
+    .await
+    .expect("the edits arrive");
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let changed = |path: &Path| {
+        outcome
+            .change
+            .edits
+            .iter()
+            .any(|source| source.uri == uri_of(path) && !source.edits.is_empty())
+    };
+    assert!(changed(&mover_path), "{outcome:?}");
+    assert!(changed(&target_path), "{outcome:?}");
+    assert!(changed(&user_path), "{outcome:?}");
+
+    apply_change(&mut [&mut mover, &mut target, &mut user], &outcome.change);
+    assert!(
+        !mover.text.contains("static String greet"),
+        "the method left its type: {}",
+        mover.text
+    );
+    assert!(
+        target.text.contains("greet("),
+        "the target type took the method: {}",
+        target.text
+    );
+    assert!(
+        user.text.contains("StaticTarget.greet"),
+        "the call follows the method: {}",
+        user.text
+    );
+    wait_error(&project, &mover.uri, false).await;
+    wait_error(&project, &target.uri, false).await;
+    wait_error(&project, &user.uri, false).await;
+
+    project.stop().await;
+    let _ = fs::remove_file(&mover_path);
+    let _ = fs::remove_file(&target_path);
+    let _ = fs::remove_file(&user_path);
 }

@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use base::program::executable;
 use lsp_client::lsp_types::{Diagnostic, DiagnosticSeverity, Uri};
 use lsp_client::uri::file_path;
 use serde_json::Value;
@@ -22,10 +23,17 @@ const BUILD_FILES: &[&str] = &[
     "pom.xml",
 ];
 
+/// The build tool that could not import the project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildTool {
+    Maven,
+    Gradle,
+}
+
 /// Why the server could not import the project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportFailure {
-    /// The build script the server named.
+    /// The build script the server named, or an empty path when the report names none.
     pub file: PathBuf,
     /// The line of the script, counted from zero.
     pub line: u32,
@@ -33,6 +41,11 @@ pub struct ImportFailure {
     pub message: String,
     /// The line that names the cause, for the status bar and the notification.
     pub summary: String,
+    /// The JDK the build tool tried to start with and did not find, when the report
+    /// says that the folder of a removed JDK is still there.
+    pub jdk: Option<PathBuf>,
+    /// The tool that failed, when the report names it.
+    pub tool: Option<BuildTool>,
 }
 
 impl ImportFailure {
@@ -43,6 +56,8 @@ impl ImportFailure {
             line: diagnostic.range.start.line,
             summary: short(&message),
             message,
+            jdk: None,
+            tool: tool_of(&diagnostic.message, file),
         }
     }
 }
@@ -113,23 +128,85 @@ fn marker_file(message: &str) -> Option<(PathBuf, u32)> {
     Some((path, line))
 }
 
-/// An import failure from `window/logMessage`, where the server puts the exception text.
-/// The marker report of the workspace build names the script in its fields; the report
-/// of a failed model query, which comes without the marker, names it in the exception.
-fn from_log(message: &str) -> Option<ImportFailure> {
-    let report = message.contains("; resource:")
-        || message.contains("Could not fetch model")
-        || message.contains("Error occured while building workspace");
-    if !report {
+/// The JDK of a report that says the build tool could not start because the folder of
+/// a removed JDK is still there. Gradle names the executable it tried:
+/// `Tried location: C:\Program Files\Amazon Corretto\jdk25.0.3_9\bin\java.exe`.
+fn java_home_problem(message: &str) -> Option<PathBuf> {
+    let after = message.rsplit_once("Tried location:")?.1;
+    let tried = after.lines().next()?.trim();
+    let (bin, file) = tried.rsplit_once(['\\', '/'])?;
+    if file != "java" && file != "java.exe" {
         return None;
     }
-    let (file, line) = build_file(message).or_else(|| marker_file(message))?;
+    let (home, last) = bin.rsplit_once(['\\', '/'])?;
+    if !last.eq_ignore_ascii_case("bin") {
+        return None;
+    }
+    Some(PathBuf::from(home))
+}
+
+/// The build tool a report or a diagnostic names.
+fn tool_of(message: &str, file: &Path) -> Option<BuildTool> {
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if message.contains("Gradle")
+        || name.starts_with("build.gradle")
+        || name.starts_with("settings.gradle")
+    {
+        return Some(BuildTool::Gradle);
+    }
+    if message.contains("Maven") || name == "pom.xml" {
+        return Some(BuildTool::Maven);
+    }
+    None
+}
+
+/// Reports that a build tool could not import the project. A report of another kind,
+/// such as the stack trace of a failed request, is not an import failure.
+fn import_report(message: &str) -> bool {
+    [
+        "JavaHomeException",
+        "; resource:",
+        "Could not fetch model",
+        "Error occured while building workspace",
+        "failed due to an error connecting to the",
+        "failed due to an error in the referenced",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+/// An import failure from `window/logMessage` or `window/showMessage`, where the server
+/// puts the exception text. The marker report of the workspace build names the script in
+/// its fields; the report of a failed model query, which comes without the marker, names
+/// it in the exception when it names one at all. A report about the JDK of the build tool
+/// names no script: the summary then names the JDK that is gone.
+fn from_log(message: &str) -> Option<ImportFailure> {
+    if !import_report(message) {
+        return None;
+    }
+    let (file, line) = build_file(message)
+        .or_else(|| marker_file(message))
+        .map(|(file, line)| (file, line.saturating_sub(1)))
+        .unwrap_or_default();
+    let jdk = java_home_problem(message);
+    let summary = match &jdk {
+        Some(home) => format!(
+            "JDK at {} was not removed completely: {} is missing",
+            home.display(),
+            home.join("bin").join(executable("java")).display()
+        ),
+        None => short(message),
+    };
     Some(ImportFailure {
+        tool: tool_of(message, &file),
         file,
-        // The log counts lines from one, the diagnostic from zero.
-        line: line.saturating_sub(1),
-        summary: short(message),
+        line,
+        summary,
         message: message.to_owned(),
+        jdk,
     })
 }
 
@@ -166,9 +243,12 @@ pub fn is_build_file(path: &Path) -> bool {
         .is_some_and(|name| BUILD_FILES.contains(&name))
 }
 
-/// Takes the failure out of a `textDocument/publishDiagnostics`, forgets it when the
-/// server no longer reports an error on that script, and forgets it when a new import
-/// of the project starts.
+/// Takes the failure out of the messages of the server: the error and warning lines of
+/// the log, the error and warning balloons, and the diagnostics on a build script. A new
+/// import of the project clears the failure, so that an old failure is not shown while
+/// the new one is not known yet. A project status of `OK` does not clear it: the server
+/// sends that status for the project it imported before a reimport fails, so a failure
+/// that arrives while a project is still known would vanish at once.
 pub(crate) fn observe(
     method: &str,
     params: &Value,
@@ -180,19 +260,26 @@ pub(crate) fn observe(
         }
         return;
     }
+    // The server reports the failed import of a Gradle project as a warning, not as an
+    // error, so every type of a log line can carry one.
     if method == "window/logMessage" {
-        if params.get("type").and_then(Value::as_i64) != Some(1) {
+        let Some(message) = params.get("message").and_then(Value::as_str) else {
+            return;
+        };
+        store(from_log(message), failures);
+        return;
+    }
+    if method == "window/showMessage" {
+        let Some(severity) = params.get("type").and_then(Value::as_i64) else {
+            return;
+        };
+        if !matches!(severity, 1 | 2) {
             return;
         }
         let Some(message) = params.get("message").and_then(Value::as_str) else {
             return;
         };
-        let Some(failure) = from_log(message) else {
-            return;
-        };
-        if failures.borrow().as_ref() != Some(&failure) {
-            failures.send_replace(Some(failure));
-        }
+        store(from_log(message), failures);
         return;
     }
     if method != "textDocument/publishDiagnostics" {
@@ -226,6 +313,16 @@ pub(crate) fn observe(
             failures.send_replace(None);
         }
         _ => {}
+    }
+}
+
+/// Stores a failure found in a message, and does nothing when the message carries none.
+fn store(failure: Option<ImportFailure>, failures: &watch::Sender<Option<ImportFailure>>) {
+    let Some(failure) = failure else {
+        return;
+    };
+    if failures.borrow().as_ref() != Some(&failure) {
+        failures.send_replace(Some(failure));
     }
 }
 
@@ -330,6 +427,8 @@ mod tests {
             line: 4,
             message: "old".into(),
             summary: "old".into(),
+            jdk: None,
+            tool: None,
         }));
 
         observe(
@@ -344,6 +443,8 @@ mod tests {
             line: 1,
             message: "old".into(),
             summary: "old".into(),
+            jdk: None,
+            tool: None,
         }));
         observe(
             "textDocument/publishDiagnostics",
@@ -455,6 +556,8 @@ mod tests {
             line: 4,
             message: "old".into(),
             summary: "old".into(),
+            jdk: None,
+            tool: None,
         }));
         observe(
             "$/progress",
@@ -472,6 +575,92 @@ mod tests {
             &failures,
         );
         assert!(watch.borrow().is_some());
+    }
+
+    #[test]
+    fn a_warning_of_a_gradle_import_names_the_removed_jdk() {
+        let (failures, watch) = watch::channel(None);
+        let message = "Nov 19, 2026, 7:43:43 PM Synchronize project petclinic failed due to \
+             an error connecting to the Gradle build.\n\
+             org.gradle.tooling.GradleConnectionException: Could not run phased build action.\n\
+             \tat org.gradle.tooling.internal.consumer.ResultHandlerAdapter.onFailure\n\
+             Caused by: org.gradle.internal.jvm.JavaHomeException: The supplied javaHome \
+             seems to be invalid. I cannot find the java executable. Tried location: \
+             C:\\Program Files\\Amazon Corretto\\jdk25.0.3_9\\bin\\java.exe\n\
+             \tat org.gradle.internal.jvm.Jvm.findExecutable(Jvm.java:191)\n";
+        observe(
+            "window/logMessage",
+            &json!({"type": 2, "message": message}),
+            &failures,
+        );
+        let failure = watch.borrow().clone().unwrap();
+        assert_eq!(failure.tool, Some(super::BuildTool::Gradle));
+        assert_eq!(
+            failure.jdk.as_deref(),
+            Some(Path::new(r"C:\Program Files\Amazon Corretto\jdk25.0.3_9"))
+        );
+        assert!(
+            failure
+                .summary
+                .contains(r"C:\Program Files\Amazon Corretto\jdk25.0.3_9"),
+            "{}",
+            failure.summary
+        );
+        assert!(
+            failure.summary.contains("not removed completely"),
+            "{}",
+            failure.summary
+        );
+        assert!(failure.file.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn a_project_status_of_ok_does_not_hide_a_failure_of_a_reimport() {
+        let (failures, watch) = watch::channel(None);
+        let message = "Could not fetch model of type 'Map' using connection to Gradle \
+             distribution 'https://services.gradle.org/distributions/gradle-9.7.1-bin.zip'.\n\
+             Caused by: Task with name 'noSuchTask' not found in root project 'demo'.";
+        observe(
+            "window/logMessage",
+            &json!({"type": 1, "message": message}),
+            &failures,
+        );
+        assert!(watch.borrow().is_some());
+        // The server reports `OK` for the project it imported before the failed reimport,
+        // so the failure must stay until a new import starts.
+        observe(
+            "language/status",
+            &json!({"type": "ProjectStatus", "message": "OK"}),
+            &failures,
+        );
+        assert!(watch.borrow().is_some());
+
+        observe(
+            "$/progress",
+            &json!({
+                "token": "1",
+                "value": {"kind": "begin", "title": "Synchronize Gradle projects with workspace"}
+            }),
+            &failures,
+        );
+        assert!(
+            watch.borrow().is_none(),
+            "a new import clears the old failure"
+        );
+    }
+
+    #[test]
+    fn an_error_balloon_can_carry_the_failure_too() {
+        let (failures, watch) = watch::channel(None);
+        let message = "Could not fetch model of type 'Map'.\n\
+             Caused by: java.lang.IllegalStateException: the build cannot start";
+        observe(
+            "window/showMessage",
+            &json!({"type": 1, "message": message}),
+            &failures,
+        );
+        let failure = watch.borrow().clone().unwrap();
+        assert_eq!(failure.summary, "the build cannot start");
     }
 
     #[test]

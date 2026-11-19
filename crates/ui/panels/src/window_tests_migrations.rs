@@ -43,6 +43,7 @@ fn project_model(root: &Path, coordinates: &str) -> ProjectModel {
                 resource_roots: vec![resources],
                 ..Unit::default()
             }],
+            ..Module::default()
         }],
         dependencies: vec![ModuleDependencies {
             module: "app".to_owned(),

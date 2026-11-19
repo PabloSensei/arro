@@ -3,12 +3,13 @@ use std::fs;
 use std::path::Path;
 
 use base::Result;
-use project_model::{MAIN_UNIT, Module, ProjectModel, TEST_UNIT, Unit};
+use project_model::{BuildProfile, MAIN_UNIT, Module, ProjectModel, TEST_UNIT, Unit};
 use roxmltree::{Document, Node};
 
 const RELEASE_PROPERTIES: &[&str] = &[
     "maven.compiler.release",
     "maven.compiler.target",
+    "maven.compiler.source",
     "java.version",
 ];
 
@@ -22,6 +23,19 @@ pub struct Pom {
     pub source_dir: Option<String>,
     pub test_source_dir: Option<String>,
     pub java_release: Option<String>,
+    pub profiles: Vec<PomProfile>,
+}
+
+/// One profile a POM declares. The window shows it; nothing here decides whether it is
+/// on, because that depends on the machine and the command line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PomProfile {
+    pub id: String,
+    /// The profile turns on by itself when the user says nothing.
+    pub active_by_default: bool,
+    /// The condition the tool checks before turning the profile on, as a line for the
+    /// window. `None` when only the command line turns the profile on.
+    pub condition: Option<String>,
 }
 
 pub fn read_pom(file: &Path) -> Result<Pom> {
@@ -61,6 +75,7 @@ pub fn read_pom(file: &Path) -> Result<Pom> {
             .iter()
             .find_map(|name| properties.get(*name))
             .map(|value| expand(value.clone())),
+        profiles: profiles_of(project),
     })
 }
 
@@ -104,6 +119,91 @@ fn expand(value: &str, properties: &HashMap<String, String>) -> String {
     found.map_or_else(|| value.to_owned(), Clone::clone)
 }
 
+/// The profiles a POM declares, in the order of the file.
+fn profiles_of(project: Node) -> Vec<PomProfile> {
+    let Some(profiles) = child(project, "profiles") else {
+        return Vec::new();
+    };
+    profiles
+        .children()
+        .filter(|node| node.has_tag_name_local("profile"))
+        .filter_map(|profile| {
+            let id = text_of(profile, "id")?;
+            let activation = child(profile, "activation");
+            let active_by_default = activation
+                .and_then(|node| text_of(node, "activeByDefault"))
+                .is_some_and(|text| text.eq_ignore_ascii_case("true"));
+            Some(PomProfile {
+                id,
+                active_by_default,
+                condition: activation.and_then(activation_line),
+            })
+        })
+        .collect()
+}
+
+/// The conditions of one `<activation>` as a line for the window. Maven turns the profile
+/// on only when everything named here matches, so the parts are joined by `and`.
+fn activation_line(activation: Node) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(jdk) = text_of(activation, "jdk") {
+        parts.push(format!("JDK {jdk}"));
+    }
+    if let Some(os) = child(activation, "os") {
+        let fields: Vec<String> = ["family", "name", "arch", "version"]
+            .into_iter()
+            .filter_map(|field| text_of(os, field).map(|value| format!("{field}={value}")))
+            .collect();
+        if !fields.is_empty() {
+            parts.push(format!("OS {}", fields.join(", ")));
+        }
+    }
+    if let Some(property) = child(activation, "property") {
+        match (text_of(property, "name"), text_of(property, "value")) {
+            (Some(name), Some(value)) => parts.push(format!("property {name} = {value}")),
+            (Some(name), None) => parts.push(format!("property {name}")),
+            (None, Some(value)) => parts.push(format!("property = {value}")),
+            (None, None) => {}
+        }
+    }
+    if let Some(file) = child(activation, "file") {
+        if let Some(path) = text_of(file, "exists") {
+            parts.push(format!("file exists {path}"));
+        }
+        if let Some(path) = text_of(file, "missing") {
+            parts.push(format!("file missing {path}"));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" and "))
+}
+
+/// The profiles of the POM files of the modules, one per name: an id that several modules
+/// declare is listed once, by the first file that names it.
+pub fn module_profiles(modules: &[Module]) -> Vec<BuildProfile> {
+    let mut profiles: Vec<BuildProfile> = Vec::new();
+    for module in modules {
+        let file = module
+            .build_file
+            .clone()
+            .unwrap_or_else(|| module.dir.join("pom.xml"));
+        let Ok(pom) = read_pom(&file) else {
+            continue;
+        };
+        for profile in pom.profiles {
+            if profiles.iter().any(|known| known.name == profile.id) {
+                continue;
+            }
+            profiles.push(BuildProfile {
+                name: profile.id,
+                active_by_default: profile.active_by_default,
+                source: Some(file.clone()),
+                condition: profile.condition,
+            });
+        }
+    }
+    profiles
+}
+
 /// Modules and their roots from the POM files alone, without starting anything. A module
 /// that cannot be read becomes a problem, the rest of the project is still worth showing.
 pub fn scan_poms(root: &Path) -> Result<ProjectModel> {
@@ -114,6 +214,7 @@ pub fn scan_poms(root: &Path) -> Result<ProjectModel> {
         ..ProjectModel::default()
     };
     scan_module(root, &mut model);
+    model.profiles = module_profiles(&model.modules);
     Ok(model)
 }
 
@@ -141,6 +242,9 @@ fn scan_module(directory: &Path, model: &mut ProjectModel) {
         id: id.join(":"),
         name,
         dir: directory.to_owned(),
+        build_file: Some(file.clone()),
+        generated_roots: Vec::new(),
+        excluded_roots: vec![directory.join("target")],
         units,
     });
     for module in &pom.modules {
@@ -277,5 +381,114 @@ mod tests {
         let root = temp_dir("missing");
 
         assert!(scan_poms(&root).is_err());
+    }
+
+    const PROFILES: &str = r#"<project>
+          <artifactId>app</artifactId>
+          <profiles>
+            <profile><id>dev</id>
+              <activation><activeByDefault>true</activeByDefault></activation>
+            </profile>
+            <profile><id>only-named</id></profile>
+            <profile><id>jdk17</id><activation><jdk>17</jdk></activation></profile>
+            <profile><id>windows</id><activation>
+              <os><family>windows</family><arch>amd64</arch></os>
+            </activation></profile>
+            <profile><id>debug</id><activation>
+              <property><name>debug</name><value>true</value></property>
+            </activation></profile>
+            <profile><id>generated</id><activation>
+              <file><exists>${basedir}/gen</exists></file>
+            </activation></profile>
+          </profiles>
+        </project>"#;
+
+    #[test]
+    fn the_profiles_of_a_pom_keep_their_default_and_their_conditions() {
+        let root = temp_dir("profiles");
+        write_pom(&root, PROFILES);
+
+        let pom = read_pom(&root.join("pom.xml")).unwrap();
+
+        let found: Vec<(&str, bool)> = pom
+            .profiles
+            .iter()
+            .map(|profile| (profile.id.as_str(), profile.active_by_default))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("dev", true),
+                ("only-named", false),
+                ("jdk17", false),
+                ("windows", false),
+                ("debug", false),
+                ("generated", false),
+            ]
+        );
+        assert_eq!(pom.profiles[0].condition, None, "no condition is a default");
+        assert_eq!(
+            pom.profiles[1].condition, None,
+            "only the command line turns it on"
+        );
+        assert_eq!(pom.profiles[2].condition.as_deref(), Some("JDK 17"));
+        assert_eq!(
+            pom.profiles[3].condition.as_deref(),
+            Some("OS family=windows, arch=amd64")
+        );
+        assert_eq!(
+            pom.profiles[4].condition.as_deref(),
+            Some("property debug = true")
+        );
+        assert_eq!(
+            pom.profiles[5].condition.as_deref(),
+            Some("file exists ${basedir}/gen")
+        );
+    }
+
+    #[test]
+    fn a_scan_collects_the_profiles_of_every_module_once() {
+        let root = temp_dir("scan-profiles");
+        let parent = r#"<project><groupId>demo</groupId><artifactId>parent</artifactId>
+            <version>1.0</version><modules><module>core</module><module>app</module></modules>
+            <profiles><profile><id>dev</id>
+              <activation><activeByDefault>true</activeByDefault></activation>
+            </profile></profiles>
+          </project>"#;
+        write_pom(&root, parent);
+        let module = r#"<project><parent><groupId>demo</groupId><version>1.0</version></parent>
+            <artifactId>core</artifactId>
+            <profiles><profile><id>dev</id></profile>
+              <profile><id>core-only</id><activation><jdk>21</jdk></activation></profile>
+            </profiles>
+          </project>"#;
+        write_pom(&root.join("core"), module);
+        let app = r#"<project><parent><groupId>demo</groupId><version>1.0</version></parent>
+            <artifactId>app</artifactId>
+            <profiles><profile><id>dev</id></profile></profiles>
+          </project>"#;
+        write_pom(&root.join("app"), app);
+
+        let model = scan_poms(&root).unwrap();
+
+        let names: Vec<&str> = model
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(names, ["dev", "core-only"]);
+        assert!(
+            model.profiles[0].active_by_default,
+            "the parent turns it on"
+        );
+        assert_eq!(
+            model.profiles[0].source.as_deref(),
+            Some(root.join("pom.xml").as_path())
+        );
+        assert_eq!(model.profiles[1].condition.as_deref(), Some("JDK 21"));
+        assert_eq!(
+            model.profiles[1].source.as_deref(),
+            Some(root.join("core").join("pom.xml").as_path())
+        );
     }
 }

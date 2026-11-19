@@ -18,8 +18,8 @@ use futures_util::StreamExt;
 use lang_api::{DumpQuery, ask};
 use proc_sup::ProcessSpec;
 use project_model::{
-    BuildModule, BuildSystem, EnvironmentProvider, ProjectModel, ProjectSession, SyncEvent,
-    TaskOptions, ToolHome, ToolProgress, ToolSetup, open_project,
+    BuildModule, BuildSelection, BuildSystem, EnvironmentProvider, ProjectModel, ProjectSession,
+    SyncEvent, TaskOptions, ToolHome, ToolProgress, ToolSetup, open_project,
 };
 use runner::{
     BeforeLaunchStep, Console, ConsoleEvent, CoverageOwner, FindTests, LiveApplication,
@@ -191,6 +191,9 @@ pub struct RunPanel {
     /// The state folder of the window, for the file of a complete run log.
     state_dir: PathBuf,
     tool: Option<Arc<dyn BuildSystem>>,
+    /// The answers of the user for the build: which named settings are on and which
+    /// values it reads. The tool keeps them for the next command, the window shows them.
+    selection: BuildSelection,
     providers: Vec<Arc<dyn RunConfigProvider>>,
     /// The SDKs of the project; it also carries a changed model to the language.
     environment: Option<Arc<dyn EnvironmentProvider>>,
@@ -530,6 +533,10 @@ impl RunPanel {
     ) -> Entity<Self> {
         cx.new(|cx| {
             let project_root = root.clone();
+            let selection = setup
+                .tool
+                .as_ref()
+                .map_or_else(BuildSelection::default, |tool| tool.selection(&root));
             let (session, sync) = match setup.tool.clone() {
                 Some(tool) => {
                     let (session, sync) = open_project(tool, root, &setup.cache_root);
@@ -587,6 +594,7 @@ impl RunPanel {
                 cache_root: setup.cache_root.clone(),
                 state_dir,
                 tool: setup.tool,
+                selection,
                 providers,
                 environment: setup.environment.clone(),
                 loading: session.is_some(),
@@ -1171,6 +1179,55 @@ impl RunPanel {
     /// question of its own, such as the change of a build file.
     pub(crate) fn build_system(&self) -> Option<Arc<dyn BuildSystem>> {
         self.tool.clone()
+    }
+
+    /// The answers of the user for the build of the project.
+    pub(crate) fn build_selection(&self) -> &BuildSelection {
+        &self.selection
+    }
+
+    /// Whether the build tool takes named values on its command line, so that the build
+    /// window offers to edit them.
+    pub(crate) fn takes_properties(&self) -> bool {
+        self.tool
+            .as_ref()
+            .is_some_and(|tool| tool.takes_properties())
+    }
+
+    /// The next answer for one named setting: the build file, on, off, and the build file
+    /// again. The answer is kept for the commands that follow and the project is imported
+    /// again in the background, as after a change of a build file.
+    pub(crate) fn cycle_profile(&mut self, name: &str, cx: &mut Context<Self>) {
+        let mut next = self.selection.clone();
+        next.cycle(name);
+        self.store_selection(next, cx);
+    }
+
+    /// Takes the named values of the build as the window edited them.
+    pub(crate) fn set_build_properties(&mut self, text: &str, cx: &mut Context<Self>) {
+        let mut next = self.selection.clone();
+        next.set_properties_text(text);
+        self.store_selection(next, cx);
+    }
+
+    /// Keeps the answers through the tool, which every later command of every window and
+    /// provider asks before it starts.
+    fn store_selection(&mut self, next: BuildSelection, cx: &mut Context<Self>) {
+        let Some(tool) = self.tool.clone() else {
+            return;
+        };
+        if let Err(error) = tool.choose(&self.root, &next) {
+            self.tell("Build Settings", error.to_string(), cx);
+            return;
+        }
+        self.selection = next;
+        self.model_file_changed(cx);
+        if let Some(semantic) = cx.try_global::<Semantic>()
+            && let Some(server) = semantic.0.server()
+        {
+            server.reimport();
+        }
+        self.changed(cx);
     }
 
     /// Why `.arro/run.toml` cannot be read, if it is broken.

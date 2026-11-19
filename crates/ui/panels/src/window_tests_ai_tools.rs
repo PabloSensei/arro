@@ -186,6 +186,7 @@ impl FakeTool {
                     ..Unit::default()
                 },
             ],
+            ..Module::default()
         };
         let dependencies = ModuleDependencies {
             module: "app".to_string(),
@@ -205,6 +206,7 @@ impl FakeTool {
                 tool_version: Some("1.0".to_string()),
                 modules: vec![module],
                 dependencies: vec![dependencies],
+                profiles: Vec::new(),
                 resolved: true,
                 problems: Vec::new(),
             },

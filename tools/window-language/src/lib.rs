@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -234,6 +235,98 @@ pub fn spring_config_with_sources(
     support
 }
 
+const SPRING_SOURCE: lang_api::SourceId = lang_api::SourceId::new("spring-config");
+
+/// A Java source of a project with its configuration files and no language server: the
+/// key of a `@Value`, a `@ConfigProperty` or a `@Property` leads to the configuration
+/// file that names it, or to the member of the class that declares it.
+pub fn spring_source_with_config(
+    root: &Path,
+    classpath: Vec<PathBuf>,
+    sources: Vec<PathBuf>,
+    resources: Vec<PathBuf>,
+) -> Arc<dyn LanguageSupport> {
+    let config = java_lang::spring_config(root.to_path_buf());
+    config.set_classpath(classpath);
+    config.set_sources(sources);
+    config.set_resources(resources);
+    Arc::new(SpringSource {
+        syntax: java_lang::JavaSyntax::new(),
+        navigation: SpringAnnotationNavigation(config.clone()),
+        config,
+    })
+}
+
+struct SpringSource {
+    syntax: java_lang::JavaSyntax,
+    navigation: SpringAnnotationNavigation,
+    config: Arc<java_lang::SpringConfigSupport>,
+}
+
+impl LanguageSupport for SpringSource {
+    fn id(&self) -> lang_api::LanguageId {
+        java_lang::LANGUAGE_ID
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
+    }
+
+    fn syntax(&self) -> &dyn lang_api::SyntaxProvider {
+        &self.syntax
+    }
+
+    fn embedded_languages(&self) -> Vec<Arc<dyn LanguageSupport>> {
+        vec![self.config.clone()]
+    }
+
+    fn navigation(&self) -> Option<&lang_api::NavigationProvider> {
+        Some(&self.navigation)
+    }
+}
+
+/// The places a key of a configuration annotation leads to, read off the interface
+/// thread from the file of the open buffer and the configuration files.
+struct SpringAnnotationNavigation(Arc<java_lang::SpringConfigSupport>);
+
+impl lang_api::Provider<lang_api::NavigationQuery, Vec<lang_api::SourceSpan>>
+    for SpringAnnotationNavigation
+{
+    fn start(
+        &self,
+        query: lang_api::NavigationQuery,
+        cancel: Cancel,
+        mut reply: lang_api::Reply<Vec<lang_api::SourceSpan>>,
+    ) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let config = self.0.clone();
+        std::thread::spawn(move || {
+            let path = lsp_client::lsp_types::Uri::from_str(&query.spot.uri)
+                .ok()
+                .and_then(|uri| lsp_client::uri::file_path(&uri));
+            let spans = path
+                .as_deref()
+                .and_then(|path| fs::read_to_string(path).ok())
+                .map(|text| {
+                    let offset = lang_api::offset_in(&text, query.spot.point);
+                    config
+                        .annotation_navigation(&text, offset)
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let confidence = if spans.is_empty() {
+                lang_api::Confidence::Unknown
+            } else {
+                lang_api::Confidence::Certain
+            };
+            let _ = reply.send(lang_api::Answer::new(spans, confidence, SPRING_SOURCE));
+        });
+    }
+}
+
 /// The model of the beans of the sources of a project model, as the language reads it.
 pub fn bean_model(model: &ProjectModel) -> lang_api::BeanModel {
     java_lang::bean_model_for(model)
@@ -378,6 +471,8 @@ pub fn second_build_tool_command(root: &Path, build_tools: &BuildTools, task: &s
 pub fn write_fake_jdk(home: &Path) {
     fs::create_dir_all(home.join("bin")).expect("the bin folder of the fake JDK");
     fs::write(home.join("bin/javac.exe"), b"").expect("the compiler of the fake JDK");
+    fs::write(home.join("bin/java.exe"), b"").expect("the launcher of the fake JDK");
+    fs::write(home.join("bin/java"), b"").expect("the launcher of the fake JDK");
     fs::write(home.join("release"), "JAVA_VERSION=\"17.0.1\"\n")
         .expect("the release file of the fake JDK");
 }

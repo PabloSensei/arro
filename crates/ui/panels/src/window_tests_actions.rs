@@ -18,8 +18,9 @@ use ui_kit::gpui;
 use ui_kit::gpui::{ModifiersChangedEvent, TestAppContext, VisualTestContext, WindowHandle};
 use ui_kit::{Modifiers, px};
 use workspace::{
-    AI_TOOL, COMMIT_TOOL, DEBUG_TOOL, LOG_TOOL, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROJECT_TOOL,
-    RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    BOOKMARKS_TOOL, COMMIT_TOOL, DEBUG_TOOL, LOG_TOOL, PERFORMANCE_TOOL, PROBLEMS_TOOL,
+    PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL,
+    Workspace,
 };
 
 use crate::debug::ActiveDebug;
@@ -462,7 +463,7 @@ fn every_tool_window_opens_by_its_key_closes_by_shift_escape_and_toggles(cx: &mu
 
     let keys_and_tools = [
         ("alt-1", PROJECT_TOOL),
-        ("alt-2", AI_TOOL),
+        ("alt-2", BOOKMARKS_TOOL),
         ("alt-3", USAGES_TOOL),
         ("alt-4", RUN_TOOL),
         ("alt-5", DEBUG_TOOL),

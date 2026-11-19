@@ -450,37 +450,9 @@ pub struct LineDeclaration {
     pub kind: OutlineKind,
 }
 
-/// The bookmarks of all files seen in this window, by path, lines from zero.
-#[derive(Default)]
-struct BookmarkStore(std::collections::HashMap<PathBuf, Vec<(u32, Option<char>)>>);
-
-impl Global for BookmarkStore {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BookmarkEntry {
-    pub path: PathBuf,
-    pub line: u32,
-    pub mnemonic: Option<char>,
-}
-
-/// Every bookmark, files in path order.
-pub fn bookmarks(cx: &App) -> Vec<BookmarkEntry> {
-    let Some(store) = cx.try_global::<BookmarkStore>() else {
-        return Vec::new();
-    };
-    let mut entries: Vec<_> = store
-        .0
-        .iter()
-        .flat_map(|(path, lines)| {
-            lines.iter().map(|(line, mnemonic)| BookmarkEntry {
-                path: path.clone(),
-                line: *line,
-                mnemonic: *mnemonic,
-            })
-        })
-        .collect();
-    entries.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-    entries
+/// Every bookmark of the window, files in path order.
+pub fn bookmarks(cx: &App) -> Vec<crate::bookmarks::BookmarkEntry> {
+    crate::bookmarks::bookmark_entries(cx)
 }
 
 /// What a run mark says about its test.
@@ -685,6 +657,8 @@ pub enum EditorEvent {
         refactoring: lang_api::MemberRefactoring,
         spot: lang_api::DocumentSpot,
     },
+    /// F6 on a member: the window shows the form that moves it into another type.
+    MoveMembers(lang_api::DocumentSpot),
     /// Refactor This picked an action of the server that needs values: the window shows
     /// its form, and the handle names the action for the language.
     RefactorForm(String),
@@ -694,6 +668,8 @@ pub enum EditorEvent {
     ShowDocumentation,
     /// Ctrl+Alt+H: the window shows the call hierarchy of this place.
     CallHierarchy(lang_api::DocumentSpot),
+    /// Ctrl+H: the window shows the type hierarchy of this place.
+    TypeHierarchy(lang_api::DocumentSpot),
     /// Ctrl+Shift+H: the window shows the hierarchy of the method at this place.
     MethodHierarchy(lang_api::DocumentSpot),
     /// Ctrl+Alt+Shift+U: the window shows the diagram of the type at this place.
@@ -1485,12 +1461,11 @@ impl EditorView {
             view.start_syntax(language.clone(), &state, cx);
         }
         view.state = Some(state);
-        let saved = shows_bookmarks
-            .then(|| cx.try_global::<BookmarkStore>())
-            .flatten()
-            .and_then(|store| store.0.get(&view.path).cloned());
-        if let (Some(saved), Some(state)) = (saved, &mut view.state) {
-            state.set_bookmarks(&saved);
+        if shows_bookmarks {
+            let saved = crate::bookmarks::bookmark_lines(&view.path, cx);
+            if let Some(state) = &mut view.state {
+                state.set_bookmarks(&saved);
+            }
         }
         view.refresh_plain_spans(cx);
         view.attach(cx);
@@ -1604,10 +1579,8 @@ impl EditorView {
                 self.debug_values.clear();
                 // The bookmarks of the file belong to the window, not to this view: read
                 // them again instead of syncing an empty list over the stored ones.
-                let saved = cx
-                    .try_global::<BookmarkStore>()
-                    .and_then(|store| store.0.get(&self.path).cloned());
-                if let (Some(saved), Some(state)) = (saved, &mut self.state) {
+                let saved = crate::bookmarks::bookmark_lines(&self.path, cx);
+                if let Some(state) = &mut self.state {
                     state.set_bookmarks(&saved);
                 }
                 // The server gets the new text and answers with the marks of it.
@@ -2519,10 +2492,8 @@ impl EditorView {
                 self.refresh_plain_spans(cx);
                 self.attach(cx);
                 self.reveal(cx);
-                let saved = cx
-                    .try_global::<BookmarkStore>()
-                    .and_then(|store| store.0.get(&self.path).cloned());
-                if let (Some(saved), Some(state)) = (saved, &mut self.state) {
+                let saved = crate::bookmarks::bookmark_lines(&self.path, cx);
+                if let Some(state) = &mut self.state {
                     state.set_bookmarks(&saved);
                 }
                 if let Some(spot) = self.pending_spot.take() {
@@ -3820,6 +3791,16 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Delete of the Bookmarks window takes the bookmark of `line` from zero away.
+    pub fn remove_bookmark_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.catch_up(cx);
+        if let Some(state) = &mut self.state {
+            state.remove_bookmark_at_line(line);
+        }
+        self.sync_bookmarks(cx);
+        cx.notify();
+    }
+
     /// Ctrl+F11 from a menu: the next typed key names the bookmark of `line`.
     pub fn await_mnemonic_bookmark_at(&mut self, line: usize, cx: &mut Context<Self>) {
         self.awaiting_mnemonic = true;
@@ -3843,12 +3824,7 @@ impl EditorView {
             return;
         }
         let lines = state.bookmarks();
-        let store = cx.default_global::<BookmarkStore>();
-        if lines.is_empty() {
-            store.0.remove(&self.path);
-        } else {
-            store.0.insert(self.path.clone(), lines);
-        }
+        crate::bookmarks::replace_bookmark_lines(&self.path, &lines, cx);
     }
 
     /// Ctrl+digit: the line of the bookmark with that name, in this file or another.

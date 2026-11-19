@@ -140,6 +140,22 @@ impl SpringConfigSupport {
         start_reader(self.inner.clone());
     }
 
+    /// The resource roots the keys are searched for in, for a caller that has no model.
+    pub fn set_resources(&self, resources: Vec<PathBuf>) {
+        let mut state = self.lock_state();
+        if state.paths.resources == resources {
+            return;
+        }
+        state.paths.resources = resources;
+        state.generation += 1;
+        if state.loading {
+            return;
+        }
+        state.loading = true;
+        drop(state);
+        start_reader(self.inner.clone());
+    }
+
     fn set_paths(&self, paths: Paths) {
         let mut state = self.lock_state();
         if state.paths == paths {
@@ -635,6 +651,27 @@ impl Metadata {
         None
     }
 
+    /// The property a key names under relaxed binding: `max-connections`,
+    /// `maxConnections` and `max_connections` are the same key.
+    fn navigation_property(&self, key: &str) -> Option<&Property> {
+        let mut end = key.len();
+        loop {
+            let prefix = &key[..end];
+            if let Some(found) = self.properties.get(prefix) {
+                return Some(found);
+            }
+            let wanted = normalized_key(prefix);
+            if let Some(found) = self
+                .properties
+                .values()
+                .find(|property| normalized_key(&property.name) == wanted)
+            {
+                return Some(found);
+            }
+            end = prefix.rfind('.')?;
+        }
+    }
+
     fn hint_values(&self, key: &str) -> &[HintValue] {
         self.hints.get(key).map(Vec::as_slice).unwrap_or_default()
     }
@@ -1074,6 +1111,60 @@ fn kebab(name: &str) -> String {
     out
 }
 
+/// A key without the differences relaxed binding allows: the case, the `-` and the `_`
+/// of its levels, and the index of a list entry.
+fn normalized_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut in_index = false;
+    for character in key.chars() {
+        match character {
+            '[' => in_index = true,
+            ']' => in_index = false,
+            _ if in_index => {}
+            '-' | '_' => {}
+            _ => out.extend(character.to_lowercase()),
+        }
+    }
+    out
+}
+
+/// The member a level of a key names: `max-connections`, `maxConnections` and
+/// `max_connections` all give `maxConnections`, and `roles[0]` gives `roles`.
+fn member_name(segment: &str) -> Option<String> {
+    let segment = segment.split('[').next().unwrap_or(segment).trim();
+    if segment.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(segment.len());
+    let mut capitalize = false;
+    for character in segment.chars() {
+        if character == '-' || character == '_' {
+            capitalize = true;
+            continue;
+        }
+        if capitalize {
+            out.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            out.push(character);
+        }
+    }
+    Some(out)
+}
+
+/// The member a key of the metadata names: the last level of the key.
+fn member_of(key: &str) -> Option<String> {
+    member_name(key.rsplit('.').next()?)
+}
+
+fn capitalized(name: &str) -> String {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return String::new();
+    };
+    first.to_uppercase().collect::<String>() + characters.as_str()
+}
+
 fn collect_java_sources(
     folder: &Path,
     out: &mut Vec<(PathBuf, java_syntax::SpringFile)>,
@@ -1212,6 +1303,110 @@ fn placeholder_name(inner: &str) -> Option<String> {
         return None;
     }
     Some(name.to_owned())
+}
+
+/// Every `${...}` of a text with the name it reads and the range of that name. The range
+/// covers the name alone, not the braces or the default value.
+fn placeholder_places(text: &str) -> Vec<(String, Range<usize>)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(start) = text[at..].find("${") {
+        let start = at + start;
+        let Some(end) = text[start + 2..].find('}') else {
+            break;
+        };
+        let inner = &text[start + 2..start + 2 + end];
+        if let Some(name) = placeholder_name(inner) {
+            let raw = inner.split(':').next().unwrap_or(inner);
+            let lead = raw.len() - raw.trim_start().len();
+            let name_start = start + 2 + lead;
+            found.push((name, name_start..name_start + raw.trim().len()));
+        }
+        at = start + 2 + end + 1;
+    }
+    found
+}
+
+/// The name of the `${...}` that holds an offset.
+fn placeholder_at(text: &str, offset: usize) -> Option<String> {
+    placeholder_places(text)
+        .into_iter()
+        .find(|(_, range)| offset >= range.start && offset <= range.end)
+        .map(|(name, _)| name)
+}
+
+/// The places the `${name}` of a Java source reads, for the usages of a key.
+fn placeholder_spans_in_sources(sources: &[PathBuf], key: &str) -> Vec<SourceSpan> {
+    let mut found = Vec::new();
+    let mut seen = 0;
+    for root in sources {
+        collect_placeholder_spans(root, key, &mut found, &mut seen);
+        if seen >= MAX_PLACEHOLDER_FILES {
+            break;
+        }
+    }
+    found
+}
+
+fn collect_placeholder_spans(root: &Path, key: &str, out: &mut Vec<SourceSpan>, seen: &mut usize) {
+    if *seen >= MAX_PLACEHOLDER_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *seen >= MAX_PLACEHOLDER_FILES {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if matches!(
+                name.as_ref(),
+                "target" | "build" | "out" | ".git" | ".gradle"
+            ) {
+                continue;
+            }
+            collect_placeholder_spans(&path, key, out, seen);
+            continue;
+        }
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
+        {
+            continue;
+        }
+        if entry.metadata().map(|meta| meta.len()).unwrap_or(0) > 2 * 1024 * 1024 {
+            continue;
+        }
+        *seen += 1;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let places: Vec<Range<usize>> = placeholder_places(&text)
+            .into_iter()
+            .filter(|(name, _)| name == key)
+            .map(|(_, range)| range)
+            .collect();
+        if places.is_empty() {
+            continue;
+        }
+        let Ok(canonical) = CanonPath::new(&path) else {
+            continue;
+        };
+        let Some(uri) = file_uri(&canonical) else {
+            continue;
+        };
+        let uri = uri.as_str().to_owned();
+        for range in places {
+            out.push(SourceSpan {
+                uri: uri.clone(),
+                span: span_in(&text, range.start, range.end),
+            });
+        }
+    }
 }
 
 /// The keys and the value of one line of a configuration file, for completion, hover
@@ -1742,10 +1937,12 @@ fn annotation_key_entries(
     Some(entries)
 }
 
-/// The place a key is written in the configuration files of the resource roots, the key
-/// itself being the place a jump underlines.
-fn key_location(key: &str, resources: &[PathBuf]) -> Option<(PathBuf, Range<usize>)> {
+/// The places a key is written in the configuration files of the resource roots, the key
+/// itself being the place a jump underlines. A key of a profile file belongs to the key
+/// without the profile prefix of Quarkus.
+fn key_locations(key: &str, resources: &[PathBuf]) -> Vec<SourceSpan> {
     let wanted = without_profile(key);
+    let mut found = Vec::new();
     for root in resources {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
@@ -1760,26 +1957,43 @@ fn key_location(key: &str, resources: &[PathBuf]) -> Option<(PathBuf, Range<usiz
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            let mut places = Vec::new();
             match config_kind(&path) {
                 Some(ConfigKind::Properties) => {
-                    for (found, range, _) in properties_entries(&text) {
-                        if without_profile(&found) == wanted {
-                            return Some((path, range));
+                    for (name, range, _) in properties_entries(&text) {
+                        if without_profile(&name) == wanted {
+                            places.push(range);
                         }
                     }
                 }
                 Some(ConfigKind::Yaml) => {
                     for pair in yaml_pairs(&text) {
                         if without_profile(&pair.full_key) == wanted {
-                            return Some((path, pair.key));
+                            places.push(pair.key);
                         }
                     }
                 }
                 None => {}
             }
+            if places.is_empty() {
+                continue;
+            }
+            let Ok(canonical) = CanonPath::new(&path) else {
+                continue;
+            };
+            let Some(uri) = file_uri(&canonical) else {
+                continue;
+            };
+            let uri = uri.as_str().to_owned();
+            for range in places {
+                found.push(SourceSpan {
+                    uri: uri.clone(),
+                    span: span_in(&text, range.start, range.end),
+                });
+            }
         }
     }
-    None
+    found
 }
 
 fn value_entries(
@@ -2222,28 +2436,124 @@ fn documentation(snapshot: &Snapshot, key: &str) -> Option<String> {
     Some(text)
 }
 
+/// The place a key of the metadata leads to: the member of its configuration class that
+/// declares the key, or the declaration of the class when the member is not found.
 fn source_span(snapshot: &Snapshot, key: &str, sources: &[PathBuf]) -> Option<SourceSpan> {
     let key = without_profile(key);
     let metadata = &snapshot.metadata;
-    let source_type = metadata
-        .property(key)
-        .and_then(|property| property.source_type.as_deref())
-        .or_else(|| {
-            metadata
-                .groups
-                .get(key)
-                .and_then(|group| group.source_type.as_deref())
-        })?;
+    let (source_type, member, source_method) =
+        if let Some(property) = metadata.navigation_property(key) {
+            (
+                property.source_type.as_deref(),
+                member_of(&property.name),
+                property.source_method.as_deref(),
+            )
+        } else {
+            (
+                metadata
+                    .groups
+                    .get(key)
+                    .and_then(|group| group.source_type.as_deref()),
+                None,
+                None,
+            )
+        };
+    let source_type = source_type?;
     let path = source_file(source_type, sources)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let file = java_syntax::spring_file(&text);
+    let kind = type_in_file(&file, source_type);
+    let span = kind
+        .and_then(|kind| member_span(kind, member.as_deref(), source_method, &text))
+        .or_else(|| kind.map(|kind| type_span(kind, &text)))
+        .unwrap_or_default();
     let canonical = CanonPath::new(&path).ok()?;
     let uri = file_uri(&canonical)?;
     Some(SourceSpan {
         uri: uri.as_str().to_owned(),
-        span: TextSpan {
-            start: TextPoint::default(),
-            end: TextPoint::default(),
-        },
+        span,
     })
+}
+
+/// The places a key leads to: its lines in the configuration files, or the member of the
+/// class that declares it when no file has the key.
+fn key_navigation(
+    snapshot: &Snapshot,
+    key: &str,
+    sources: &[PathBuf],
+    resources: &[PathBuf],
+) -> Vec<SourceSpan> {
+    let mut found = key_locations(key, resources);
+    if found.is_empty() {
+        found.extend(source_span(snapshot, key, sources));
+    }
+    found
+}
+
+/// The type of a parsed file the `sourceType` names. A nested type lives in the file of
+/// its outer type, and the simple name is the fallback for a file the package moved in.
+fn type_in_file<'a>(
+    file: &'a java_syntax::SpringFile,
+    source_type: &str,
+) -> Option<&'a java_syntax::Type> {
+    let name = source_type.split('<').next().unwrap_or(source_type).trim();
+    file.types
+        .iter()
+        .find(|kind| kind.qualified == name)
+        .or_else(|| {
+            let simple = name.rsplit('.').next().unwrap_or(name);
+            file.types.iter().find(|kind| kind.name == simple)
+        })
+}
+
+/// The declaration of the member a key names: the field or the record component first,
+/// then the method the metadata names, the setter, the getter and a method of that name.
+fn member_span(
+    kind: &java_syntax::Type,
+    name: Option<&str>,
+    source_method: Option<&str>,
+    text: &str,
+) -> Option<TextSpan> {
+    let name = name?;
+    let field = kind
+        .fields
+        .iter()
+        .chain(kind.components.iter())
+        .find(|field| field.name == name);
+    if let Some(field) = field {
+        return Some(span_in(text, field.offset, field.offset + field.name.len()));
+    }
+    if let Some(method) =
+        source_method.and_then(|method| kind.methods.iter().find(|found| found.name == method))
+    {
+        return Some(span_in(
+            text,
+            method.offset,
+            method.offset + method.name.len(),
+        ));
+    }
+    let capitalized = capitalized(name);
+    let candidates = [
+        format!("set{capitalized}"),
+        format!("get{capitalized}"),
+        format!("is{capitalized}"),
+        name.to_owned(),
+    ];
+    for candidate in &candidates {
+        if let Some(method) = kind.methods.iter().find(|method| method.name == *candidate) {
+            return Some(span_in(
+                text,
+                method.offset,
+                method.offset + method.name.len(),
+            ));
+        }
+    }
+    None
+}
+
+/// The place of the name in the declaration of a type.
+fn type_span(kind: &java_syntax::Type, text: &str) -> TextSpan {
+    span_in(text, kind.offset, kind.offset + kind.name.len())
 }
 
 fn source_file(source_type: &str, sources: &[PathBuf]) -> Option<PathBuf> {
@@ -2332,6 +2642,10 @@ impl LanguageSupport for SpringConfigSupport {
     fn navigation(&self) -> Option<&NavigationProvider> {
         Some(self)
     }
+
+    fn references(&self) -> Option<&lang_api::ReferencesProvider> {
+        Some(self)
+    }
 }
 
 impl SpringConfigSupport {
@@ -2389,27 +2703,17 @@ impl SpringConfigSupport {
         })
     }
 
-    /// The place of a key of an annotation: the key in a configuration file, or the
-    /// class that declares it.
-    pub(crate) fn annotation_navigation(
-        &self,
-        text: &str,
-        offset: usize,
-    ) -> Option<Vec<SourceSpan>> {
+    /// The places a key of an annotation leads to: its lines in the configuration files,
+    /// or the member of the class that declares it.
+    pub fn annotation_navigation(&self, text: &str, offset: usize) -> Option<Vec<SourceSpan>> {
         let found = java_syntax::config_key_at(text, offset)?;
         let snapshot = self.ready_snapshot();
-        let sources = self.lock_state().paths.sources.clone();
-        let resources = self.lock_state().paths.resources.clone();
-        if let Some((path, range)) = key_location(&found.key, &resources) {
-            let canonical = CanonPath::new(&path).ok()?;
-            let uri = file_uri(&canonical)?;
-            let config = std::fs::read_to_string(&path).ok()?;
-            return Some(vec![SourceSpan {
-                uri: uri.as_str().to_owned(),
-                span: span_in(&config, range.start, range.end),
-            }]);
-        }
-        source_span(&snapshot, &found.key, &sources).map(|span| vec![span])
+        let (sources, resources) = {
+            let state = self.lock_state();
+            (state.paths.sources.clone(), state.paths.resources.clone())
+        };
+        let spans = key_navigation(&snapshot, &found.key, &sources, &resources);
+        (!spans.is_empty()).then_some(spans)
     }
 
     /// The documentation of the key an annotation names.
@@ -2494,16 +2798,51 @@ impl Provider<NavigationQuery, Vec<SourceSpan>> for SpringConfigSupport {
                 return;
             }
             let snapshot = support.snapshot();
-            let sources = support.lock_state().paths.sources.clone();
+            let (sources, resources) = {
+                let state = support.lock_state();
+                (state.paths.sources.clone(), state.paths.resources.clone())
+            };
             let spans = support
                 .kind_of(&query.spot.uri)
                 .zip(support.text_of(&query.spot.uri))
-                .and_then(|(kind, text)| {
-                    let key = key_at(&text, offset_in(&text, query.spot.point), kind)?;
-                    source_span(&snapshot, &key, &sources)
+                .map(|(kind, text)| {
+                    let offset = offset_in(&text, query.spot.point);
+                    // A `${...}` of a value names another key of the files.
+                    if let Some(key) = placeholder_at(&text, offset) {
+                        key_navigation(&snapshot, &key, &sources, &resources)
+                    } else if let Some(key) = key_at(&text, offset, kind) {
+                        source_span(&snapshot, &key, &sources).into_iter().collect()
+                    } else {
+                        Vec::new()
+                    }
                 })
-                .into_iter()
-                .collect();
+                .unwrap_or_default();
+            let _ = reply.send(Answer::new(spans, Confidence::Certain, SOURCE));
+        });
+    }
+}
+
+/// The `${name}` of the Java sources that read the key under the caret. Find Usages of a
+/// key in a configuration file lists them.
+impl Provider<DocumentSpot, Vec<SourceSpan>> for SpringConfigSupport {
+    fn start(&self, query: DocumentSpot, _: Cancel, mut reply: Reply<Vec<SourceSpan>>) {
+        let support = self.clone();
+        thread::spawn(move || {
+            let spans = support
+                .kind_of(&query.uri)
+                .zip(support.text_of(&query.uri))
+                .map(|(kind, text)| {
+                    let offset = offset_in(&text, query.point);
+                    let key = placeholder_at(&text, offset)
+                        .or_else(|| key_at(&text, offset, kind))
+                        .unwrap_or_default();
+                    if key.is_empty() {
+                        return Vec::new();
+                    }
+                    let sources = support.lock_state().paths.sources.clone();
+                    placeholder_spans_in_sources(&sources, &key)
+                })
+                .unwrap_or_default();
             let _ = reply.send(Answer::new(spans, Confidence::Certain, SOURCE));
         });
     }
@@ -3040,10 +3379,16 @@ mod tests {
         let root = folder.path().join("src").join("main").join("java");
         let file = root.join("org").join("example").join("JpaProperties.java");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "package org.example;\nclass JpaProperties {}\n").unwrap();
+        let text = "package org.example;\nclass JpaProperties {}\n";
+        std::fs::write(&file, text).unwrap();
         let snapshot = snapshot(SAMPLE);
         let span = source_span(&snapshot, "spring.jpa.open-in-view", &[root]).unwrap();
         assert!(span.uri.ends_with("JpaProperties.java"), "{}", span.uri);
+        assert_eq!(
+            span.span.start,
+            point_in(text, text.find("JpaProperties").unwrap()),
+            "a key whose member is not found leads to the declaration of the class"
+        );
         assert!(
             source_span(
                 &snapshot,
@@ -3053,6 +3398,214 @@ mod tests {
             .is_none(),
             "a key without a source type has no place to go"
         );
+    }
+
+    const MEMBERS: &str = r#"{
+        "properties": [
+            {
+                "name": "server.port",
+                "type": "java.lang.Integer",
+                "sourceType": "com.example.ServerProperties"
+            },
+            {
+                "name": "shop.max-connections",
+                "type": "java.lang.Integer",
+                "sourceType": "com.example.Limits"
+            },
+            {
+                "name": "spring.datasource.hikari.maximum-pool-size",
+                "type": "java.lang.Integer",
+                "sourceType": "com.example.HikariConfig"
+            }
+        ]
+    }"#;
+
+    fn write_source(root: &Path, relative: &str, text: &str) -> PathBuf {
+        let file = root.join(relative);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_key_leads_to_the_field_of_its_source_type() {
+        let folder = test_support::TempDir::new("spring-member");
+        let root = folder.path().join("src").join("main").join("java");
+        let server = "package com.example;\n\nclass ServerProperties {\n    private int port;\n}\n";
+        write_source(&root, "com/example/ServerProperties.java", server);
+        let snapshot = snapshot(MEMBERS);
+        let span = source_span(&snapshot, "server.port", &[root]).unwrap();
+        assert!(span.uri.ends_with("ServerProperties.java"), "{}", span.uri);
+        assert_eq!(
+            span.span.start,
+            point_in(server, server.find("port;").unwrap()),
+            "the caret goes to the field"
+        );
+        assert_eq!(
+            span.span.end.character - span.span.start.character,
+            "port".len() as u32,
+            "the span is the name of the field"
+        );
+    }
+
+    #[test]
+    fn a_relaxed_key_names_the_same_field() {
+        let folder = test_support::TempDir::new("spring-relaxed");
+        let root = folder.path().join("src").join("main").join("java");
+        let limits = "package com.example;\n\nclass Limits {\n    private int maxConnections;\n}\n";
+        write_source(&root, "com/example/Limits.java", limits);
+        let snapshot = snapshot(MEMBERS);
+        let expected = point_in(limits, limits.find("maxConnections").unwrap());
+        for key in [
+            "shop.max-connections",
+            "shop.maxConnections",
+            "shop.max_connections",
+        ] {
+            let span = source_span(&snapshot, key, std::slice::from_ref(&root))
+                .unwrap_or_else(|| panic!("the key {key} leads to its field"));
+            assert_eq!(span.span.start, expected, "the key {key}");
+        }
+    }
+
+    #[test]
+    fn a_nested_key_leads_to_the_field_of_its_nested_type() {
+        let folder = test_support::TempDir::new("spring-nested");
+        let root = folder.path().join("src").join("main").join("java");
+        let hikari =
+            "package com.example;\n\nclass HikariConfig {\n    private int maximumPoolSize;\n}\n";
+        write_source(&root, "com/example/HikariConfig.java", hikari);
+        let snapshot = snapshot(MEMBERS);
+        let span = source_span(
+            &snapshot,
+            "spring.datasource.hikari.maximum-pool-size",
+            &[root],
+        )
+        .unwrap();
+        assert_eq!(
+            span.span.start,
+            point_in(hikari, hikari.find("maximumPoolSize").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_key_without_a_field_leads_to_its_setter() {
+        let folder = test_support::TempDir::new("spring-setter");
+        let root = folder.path().join("src").join("main").join("java");
+        let server =
+            "package com.example;\n\nclass ServerProperties {\n    void setPort(int port) {}\n}\n";
+        write_source(&root, "com/example/ServerProperties.java", server);
+        let snapshot = snapshot(MEMBERS);
+        let span = source_span(&snapshot, "server.port", &[root]).unwrap();
+        assert_eq!(
+            span.span.start,
+            point_in(server, server.find("setPort").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_key_without_a_file_leads_to_the_field_of_the_metadata() {
+        let folder = test_support::TempDir::new("spring-key-fallback");
+        let root = folder.path().join("src").join("main").join("java");
+        let server = "package com.example;\n\nclass ServerProperties {\n    private int port;\n}\n";
+        write_source(&root, "com/example/ServerProperties.java", server);
+        let snapshot = snapshot(MEMBERS);
+        let spans = key_navigation(&snapshot, "server.port", &[root], &[]);
+        assert_eq!(spans.len(), 1, "the metadata names the class of the key");
+        assert_eq!(
+            spans[0].span.start,
+            point_in(server, server.find("port;").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_key_of_a_record_leads_to_its_component() {
+        let folder = test_support::TempDir::new("spring-record");
+        let root = folder.path().join("src").join("main").join("java");
+        let record = "package com.example;\n\nrecord ServerProperties(int port) {}\n";
+        write_source(&root, "com/example/ServerProperties.java", record);
+        let snapshot = snapshot(MEMBERS);
+        let span = source_span(&snapshot, "server.port", &[root]).unwrap();
+        assert_eq!(
+            span.span.start,
+            point_in(record, record.find("int port").unwrap() + "int ".len())
+        );
+    }
+
+    #[test]
+    fn a_placeholder_name_drops_its_default() {
+        let text = "url=${a.b:1}\n";
+        let inside = text.find("a.b").unwrap() + 1;
+        assert_eq!(placeholder_at(text, inside).as_deref(), Some("a.b"));
+
+        let text = "urls=${server.port:8080},${server.port}\n";
+        let places = placeholder_places(text);
+        assert_eq!(places.len(), 2);
+        for (name, range) in places {
+            assert_eq!(name, "server.port");
+            assert_eq!(&text[range], "server.port");
+        }
+    }
+
+    #[test]
+    fn a_key_in_two_profile_files_gives_two_places() {
+        let folder = test_support::TempDir::new("spring-profiles");
+        let root = folder.path().join("src").join("main").join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("application.properties"),
+            "spring.application.name=demo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("application-dev.properties"),
+            "server.port=8081\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("application-prod.properties"),
+            "server.port=8082\n",
+        )
+        .unwrap();
+        let places = key_locations("server.port", &[root]);
+        assert_eq!(places.len(), 2, "one place in each profile file");
+        assert_ne!(places[0].uri, places[1].uri);
+        assert_eq!(places[0].span.start.line, 0);
+        assert_eq!(places[1].span.start.line, 0);
+    }
+
+    #[test]
+    fn the_usages_of_a_key_are_its_value_placeholders() {
+        let folder = test_support::TempDir::new("spring-usages");
+        let root = folder.path().join("src").join("main").join("java");
+        let source = "package com.example;\n\nclass Shop {\n    @Value(\"${server.port}\")\n    String port;\n    @Value(\"${server.port:8080}\")\n    String alternate;\n}\n";
+        write_source(&root, "com/example/Shop.java", source);
+        let spans = placeholder_spans_in_sources(&[root], "server.port");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].span.start.line, 3);
+        assert_eq!(spans[1].span.start.line, 5);
+    }
+
+    #[test]
+    fn a_value_annotation_leads_to_the_key_in_the_configuration_file() {
+        let folder = test_support::TempDir::new("spring-annotation-nav");
+        let resources = folder.path().join("src").join("main").join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            resources.join("application.properties"),
+            "server.port=8080\n",
+        )
+        .unwrap();
+        let sources = folder.path().join("src").join("main").join("java");
+        let support = spring_config(folder.path().to_path_buf());
+        support.set_sources(vec![sources]);
+        support.set_resources(vec![resources]);
+        let text = "package com.example;\n\nclass Shop {\n    @Value(\"${server.port}\")\n    int port;\n}\n";
+        let offset = text.find("server.port").unwrap() + 2;
+        let spans = support
+            .annotation_navigation(text, offset)
+            .expect("the key is in the file");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].span.start.line, 0);
     }
 
     #[test]
@@ -3274,21 +3827,21 @@ class ServerProperties {
             "# the server\nquarkus.http.port=8081\n",
         )
         .unwrap();
-        let (path, range) = key_location("quarkus.http.port", &[root.path().to_path_buf()])
-            .expect("the place of the key");
-        assert_eq!(path, root.path().join("application.properties"));
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(&text[range], "quarkus.http.port");
+        let places = key_locations("quarkus.http.port", &[root.path().to_path_buf()]);
+        assert_eq!(places.len(), 1);
+        assert!(places[0].uri.ends_with("application.properties"));
+        assert_eq!(places[0].span.start.line, 1);
+        assert_eq!(places[0].span.start.character, 0);
 
         std::fs::write(
             root.path().join("application.yml"),
             "quarkus:\n  http:\n    host: 0.0.0.0\n",
         )
         .unwrap();
-        let (path, range) = key_location("quarkus.http.host", &[root.path().to_path_buf()])
-            .expect("the place of the YAML key");
-        assert!(path.ends_with("application.yml"));
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(&text[range], "host");
+        let places = key_locations("quarkus.http.host", &[root.path().to_path_buf()]);
+        assert_eq!(places.len(), 1);
+        assert!(places[0].uri.ends_with("application.yml"));
+        assert_eq!(places[0].span.start.line, 2);
+        assert_eq!(places[0].span.start.character, 4);
     }
 }

@@ -389,6 +389,9 @@ pub struct ProjectProblem {
     pub summary: String,
     /// The server log, when it has one, for the Show Log action.
     pub log: Option<PathBuf>,
+    /// The build tool of the project that the problem concerns, by the index of its
+    /// Settings page, when the language names one.
+    pub tool: Option<usize>,
 }
 
 /// The problems of the project itself. The stream stays open and sends the current
@@ -740,10 +743,50 @@ pub struct RenameQuery {
 }
 
 /// What F6 moves. A file holds its type, so moving it into another package moves the
-/// type with every reference and its `package` line.
+/// type with every reference and its `package` line. A member leaves its type and the
+/// target type takes it with every reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveKind {
     File,
+    Member,
+}
+
+/// What F6 works on at a place of a file, as the language sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MovePlace {
+    /// The file itself.
+    File,
+    /// A member that moves into another type.
+    Member,
+    /// A member that this move cannot take, with the reason the window shows.
+    Unmovable(String),
+}
+
+/// One member that the Move Members form lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveMember {
+    pub name: String,
+    pub detail: Option<String>,
+    pub checked: bool,
+    /// The place of the member's name, given back as the place of the move.
+    pub span: TextSpan,
+}
+
+/// What the Move Members form shows: the members a type gives away and the types of the
+/// project that can take them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoveMembersForm {
+    pub title: String,
+    pub members_label: String,
+    pub members: Vec<MoveMember>,
+    pub target_label: String,
+    pub targets: Vec<MoveDestination>,
+}
+
+/// F6 on a member: the members of its type and the types of the project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveMembersQuery {
+    pub spot: DocumentSpot,
 }
 
 /// F6: where the file at `spot` can go.
@@ -945,6 +988,7 @@ pub type ReferencesProvider = dyn Provider<DocumentSpot, Vec<SourceSpan>>;
 pub type RenameProvider = dyn Provider<RenameQuery, WorkspaceChange>;
 pub type MoveDestinationProvider = dyn Provider<MoveQuery, Vec<MoveDestination>>;
 pub type MoveProvider = dyn Provider<MoveRequest, MoveOutcome>;
+pub type MoveMembersFormProvider = dyn Provider<MoveMembersQuery, Option<MoveMembersForm>>;
 pub type ChangeSignatureInfoProvider = dyn Provider<DocumentSpot, ChangeSignatureInfo>;
 pub type ChangeSignatureProvider = dyn Provider<ChangeSignatureRequest, ChangeSignatureOutcome>;
 pub type HierarchyProvider = dyn Provider<HierarchyQuery, Vec<SymbolEntry>>;

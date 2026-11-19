@@ -152,12 +152,14 @@ fn modules_setup(root: &Path) -> ProjectSetup {
                 name: "app".into(),
                 dir: root.to_path_buf(),
                 units: Vec::new(),
+                ..Module::default()
             },
             Module {
                 id: "tests".into(),
                 name: "tests".into(),
                 dir: root.join("src"),
                 units: Vec::new(),
+                ..Module::default()
             },
         ],
         ..ProjectModel::default()

@@ -25,8 +25,9 @@ use lang_api::{
     OverridableMethods, OverridableMethodsQuery, Provider, RangeFormatQuery, RenameQuery, Reply,
     SemanticServer, SemanticToken, SemanticTokenKind, SemanticTokenModifiers, SemanticTokensQuery,
     Severity, SignatureException, SignatureHelp, SignatureParameter, SignatureQuery, SignatureText,
-    SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery, TextPoint, TextSpan, UsageEntry,
-    UsageKind, WorkspaceChange, WorkspaceDiagnosticsQuery, offset_in,
+    SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery, TextPoint, TextSpan,
+    TypeHierarchyItem, TypeHierarchyQuery, TypeKind, UsageEntry, UsageKind, WorkspaceChange,
+    WorkspaceDiagnosticsQuery, offset_in,
 };
 use lsp_client::SemanticTokensCapability;
 use lsp_client::lsp_types::{
@@ -107,6 +108,8 @@ pub struct LspProviders {
     refactor_selections_request: Option<&'static str>,
     move_destinations_request: Option<&'static str>,
     move_request: Option<&'static str>,
+    /// The `moveKind` a member move asks for, named by the language that has one.
+    move_member_kind: Option<&'static str>,
     change_signature_info_request: Option<&'static str>,
     change_signature_edit_request: Option<&'static str>,
     change_signature_command: Option<&'static str>,
@@ -1258,6 +1261,7 @@ impl LspProviders {
             refactor_selections_request: None,
             move_destinations_request: None,
             move_request: None,
+            move_member_kind: None,
             change_signature_info_request: None,
             change_signature_edit_request: None,
             change_signature_command: None,
@@ -1325,9 +1329,11 @@ impl LspProviders {
         mut self,
         destinations: &'static str,
         move_request: &'static str,
+        member_kind: &'static str,
     ) -> Self {
         self.move_destinations_request = Some(destinations);
         self.move_request = Some(move_request);
+        self.move_member_kind = Some(member_kind);
         self
     }
 
@@ -2256,9 +2262,13 @@ impl Provider<RenameQuery, WorkspaceChange> for LspProviders {
     }
 }
 
-fn move_kind(kind: MoveKind) -> &'static str {
-    match kind {
-        MoveKind::File => "moveResource",
+impl LspProviders {
+    /// The `moveKind` the server expects for a move, when it has one for it.
+    fn move_kind(&self, kind: MoveKind) -> Option<&'static str> {
+        match kind {
+            MoveKind::File => Some("moveResource"),
+            MoveKind::Member => self.move_member_kind,
+        }
     }
 }
 
@@ -2272,14 +2282,16 @@ fn destination_folder(destination: &serde_json::Value) -> Option<PathBuf> {
 impl Provider<MoveQuery, Vec<MoveDestination>> for LspProviders {
     fn start(&self, query: MoveQuery, cancel: Cancel, reply: Reply<Vec<MoveDestination>>) {
         let router = self.router.clone();
-        let Some(request) = self.move_destinations_request else {
+        let (Some(request), Some(kind)) =
+            (self.move_destinations_request, self.move_kind(query.kind))
+        else {
             self.answer(cancel, reply, async { Some(Ok(Vec::new())) });
             return;
         };
         self.answer(cancel, reply, async move {
             let place = place(&query.spot)?;
             let params = serde_json::json!({
-                "moveKind": move_kind(query.kind),
+                "moveKind": kind,
                 "sourceUris": [place.uri.as_str()],
             });
             let answer = router.extension(request, params).await;
@@ -2319,16 +2331,37 @@ impl Provider<MoveRequest, MoveOutcome> for LspProviders {
             self.answer(cancel, reply, async { Some(Ok(MoveOutcome::default())) });
             return;
         };
+        let Some(kind) = self.move_kind(query.kind) else {
+            self.answer(cancel, reply, async {
+                Some(Ok(MoveOutcome {
+                    change: WorkspaceChange::default(),
+                    error: Some("This language has no move of members".to_owned()),
+                }))
+            });
+            return;
+        };
         self.answer(cancel, reply, async move {
             let place = place(&query.spot)?;
-            let destination: serde_json::Value =
-                serde_json::from_str(&query.destination.handle).ok()?;
-            let params = serde_json::json!({
-                "moveKind": move_kind(query.kind),
+            // A destination of a file comes from the server as JSON, a type of a member
+            // move is the name a person typed.
+            let destination = serde_json::from_str(&query.destination.handle)
+                .unwrap_or_else(|_| serde_json::Value::String(query.destination.handle.clone()));
+            let mut params = serde_json::json!({
+                "moveKind": kind,
                 "sourceUris": [place.uri.as_str()],
                 "destination": destination,
                 "updateReferences": query.update_references,
             });
+            if query.kind == MoveKind::Member {
+                // A member move names the member under the caret in the context of the
+                // action, and the server takes the member that is there.
+                let at = position(query.spot.point);
+                params["params"] = serde_json::json!({
+                    "textDocument": {"uri": place.uri.as_str()},
+                    "range": {"start": at, "end": at},
+                    "context": {"diagnostics": []},
+                });
+            }
             let answer = router.extension(request, params).await;
             Some(answer.map(|value| {
                 let error = value
@@ -2527,28 +2560,68 @@ impl Provider<ChangeSignatureRequest, ChangeSignatureOutcome> for LspProviders {
     }
 }
 
-/// One item of a type hierarchy as the raw reply carries it. The server's `kind` is
-/// left out: some servers send a value this LSP shape does not read.
-fn hierarchy_entry(item: &serde_json::Value) -> Option<SymbolEntry> {
+/// The place of one item of a type hierarchy as the raw reply carries it. Some servers
+/// name the declaration with `range`, others the name with `selectionRange`.
+fn hierarchy_place(item: &serde_json::Value) -> Option<SourceSpan> {
     let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
-    let range = item.get("selectionRange")?;
+    let range = item.get("selectionRange").or_else(|| item.get("range"))?;
     let point = |value: &serde_json::Value| {
         Some(TextPoint {
             line: value.get("line")?.as_u64()? as u32,
             character: value.get("character")?.as_u64()? as u32,
         })
     };
+    Some(SourceSpan {
+        uri: text("uri")?.to_owned(),
+        span: TextSpan {
+            start: point(range.get("start")?)?,
+            end: point(range.get("end")?)?,
+        },
+    })
+}
+
+/// One item of a type hierarchy as the raw reply carries it. The server's `kind` is
+/// left out: some servers send a value this LSP shape does not read.
+fn hierarchy_entry(item: &serde_json::Value) -> Option<SymbolEntry> {
+    let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
     Some(SymbolEntry {
         name: text("name")?.to_owned(),
         container: text("detail").map(str::to_owned),
-        place: Some(SourceSpan {
-            uri: text("uri")?.to_owned(),
-            span: TextSpan {
-                start: point(range.get("start")?)?,
-                end: point(range.get("end")?)?,
-            },
-        }),
+        place: hierarchy_place(item),
     })
+}
+
+/// The first item of the hierarchy of a place, as the raw reply carries it.
+async fn prepare_type_hierarchy(
+    router: &Router,
+    uri: &Uri,
+    at: Position,
+) -> Result<Option<serde_json::Value>, RouteError> {
+    let params = serde_json::json!({
+        "textDocument": {"uri": uri.as_str()},
+        "position": {"line": at.line, "character": at.character},
+    });
+    let prepared = router
+        .extension("textDocument/prepareTypeHierarchy", params)
+        .await?;
+    Ok(prepared.as_array().and_then(|items| items.first()).cloned())
+}
+
+/// The types above or below one item of a type hierarchy, as the raw reply carries them.
+async fn type_hierarchy_relations(
+    router: &Router,
+    item: &serde_json::Value,
+    supertypes: bool,
+) -> Result<Vec<serde_json::Value>, RouteError> {
+    let method = if supertypes {
+        "typeHierarchy/supertypes"
+    } else {
+        "typeHierarchy/subtypes"
+    };
+    let reply = router
+        .extension(method, serde_json::json!({"item": item}))
+        .await?;
+    Ok(reply.as_array().cloned().unwrap_or_default())
 }
 
 /// The type hierarchy of a place through the JSON of the protocol, so a server that
@@ -2559,30 +2632,69 @@ async fn type_hierarchy(
     at: Position,
     supertypes: bool,
 ) -> Result<Vec<SymbolEntry>, RouteError> {
-    let params = serde_json::json!({
-        "textDocument": {"uri": uri.as_str()},
-        "position": {"line": at.line, "character": at.character},
-    });
-    let prepared = router
-        .extension("textDocument/prepareTypeHierarchy", params)
-        .await?;
-    let Some(item) = prepared.as_array().and_then(|items| items.first()) else {
+    let Some(item) = prepare_type_hierarchy(router, uri, at).await? else {
         return Ok(Vec::new());
     };
-    let method = if supertypes {
-        "typeHierarchy/supertypes"
-    } else {
-        "typeHierarchy/subtypes"
-    };
-    let reply = router
-        .extension(method, serde_json::json!({"item": item}))
-        .await?;
-    Ok(reply
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(hierarchy_entry)
-        .collect())
+    let items = type_hierarchy_relations(router, &item, supertypes).await?;
+    Ok(items.iter().filter_map(hierarchy_entry).collect())
+}
+
+/// How a type of the hierarchy is declared, from the kind the server sends.
+fn type_hierarchy_kind(kind: Option<u64>) -> TypeKind {
+    match kind {
+        Some(10) => TypeKind::Enum,
+        Some(11) => TypeKind::Interface,
+        Some(23) => TypeKind::Record,
+        _ => TypeKind::Class,
+    }
+}
+
+/// One item of the type hierarchy with the type it declares. The raw item is kept in
+/// `handle`, so the same type can be asked for its own neighbours.
+fn type_hierarchy_item(item: &serde_json::Value) -> Option<TypeHierarchyItem> {
+    let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
+    Some(TypeHierarchyItem {
+        name: text("name")?.to_owned(),
+        detail: text("detail").map(str::to_owned),
+        kind: type_hierarchy_kind(item.get("kind").and_then(serde_json::Value::as_u64)),
+        abstract_type: false,
+        place: hierarchy_place(item),
+        handle: item.to_string(),
+    })
+}
+
+impl Provider<TypeHierarchyQuery, Vec<TypeHierarchyItem>> for LspProviders {
+    fn start(
+        &self,
+        query: TypeHierarchyQuery,
+        cancel: Cancel,
+        reply: Reply<Vec<TypeHierarchyItem>>,
+    ) {
+        let router = self.router.clone();
+        self.answer(cancel, reply, async move {
+            let items = match query {
+                TypeHierarchyQuery::Root(spot) => {
+                    let place = place(&spot)?;
+                    match prepare_type_hierarchy(&router, &place.uri, place.position).await {
+                        Ok(Some(item)) => vec![item],
+                        Ok(None) => Vec::new(),
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                TypeHierarchyQuery::Neighbours { item, direction } => {
+                    let Ok(item) = serde_json::from_str(&item.handle) else {
+                        return Some(Ok(Vec::new()));
+                    };
+                    let supertypes = direction == HierarchyDirection::Supertypes;
+                    match type_hierarchy_relations(&router, &item, supertypes).await {
+                        Ok(items) => items,
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+            };
+            Some(Ok(items.iter().filter_map(type_hierarchy_item).collect()))
+        });
+    }
 }
 
 impl Provider<HierarchyQuery, Vec<SymbolEntry>> for LspProviders {

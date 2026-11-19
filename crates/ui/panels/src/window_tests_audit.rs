@@ -73,6 +73,7 @@ fn tables() -> Vec<&'static [workspace::KeyRow]> {
         crate::branches::KEYS,
         crate::items::KEYS,
         crate::plugins::KEYS,
+        crate::bookmarks::KEYS,
     ]
 }
 

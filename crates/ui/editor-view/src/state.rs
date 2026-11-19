@@ -1497,6 +1497,13 @@ impl EditorState {
         }
     }
 
+    /// Takes the bookmark of a line away, as Delete of the Bookmarks window does.
+    pub fn remove_bookmark_at_line(&mut self, line: usize) {
+        let store = self.buffer.store();
+        let line_of = |at: usize| store.offset_to_line(at.min(store.len()));
+        self.bookmarks.retain(|(at, _)| line_of(*at) != line);
+    }
+
     /// A mnemonic is on one bookmark only.
     fn drop_mnemonic(&mut self, letter: char, keep: Option<usize>) {
         for (index, (_, mnemonic)) in self.bookmarks.iter_mut().enumerate() {

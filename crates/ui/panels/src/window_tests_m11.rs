@@ -441,6 +441,7 @@ fn model(root: &Path) -> ProjectModel {
                 output_dirs: vec![root.join("classes")],
                 ..Unit::default()
             }],
+            ..Module::default()
         }],
         ..ProjectModel::default()
     }

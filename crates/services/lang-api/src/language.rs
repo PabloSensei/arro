@@ -8,11 +8,11 @@ use crate::{
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
     GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
     MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveProvider, NavigationProvider, OverridableMethodsProvider,
-    PrepareDiagnosticsProvider, ProjectProblemsProvider, RangeFormatProvider,
-    ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer, SignatureProvider,
-    SourceTextProvider, SymbolProvider, SyntaxProvider, WorkspaceDiagnosticsProvider,
-    WorkspaceSymbolProvider,
+    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider, NavigationProvider,
+    OverridableMethodsProvider, PrepareDiagnosticsProvider, ProjectProblemsProvider,
+    RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
+    SemanticServer, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
+    TypeHierarchyProvider, WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use crate::{
     ExpectedTypeProvider, ExternalDocProvider, LibraryClassProvider, SignatureInfoProvider,
@@ -238,6 +238,19 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// F6 on a member: the members its type gives away and the types of the project
+    /// that can take them.
+    fn move_members_form(&self) -> Option<&MoveMembersFormProvider> {
+        None
+    }
+
+    /// What F6 works on at a place of a file. A language that moves no members answers
+    /// [`MovePlace::File`].
+    fn move_place(&self, text: &str, offset: usize) -> MovePlace {
+        let _ = (text, offset);
+        MovePlace::File
+    }
+
     /// Ctrl+F6: the signature the caret is on, and the edits of a new one.
     fn change_signature_info(&self) -> Option<&ChangeSignatureInfoProvider> {
         None
@@ -259,6 +272,12 @@ pub trait LanguageSupport: Send + Sync {
     }
 
     fn hierarchy(&self) -> Option<&HierarchyProvider> {
+        None
+    }
+
+    /// Ctrl+H: the type at a place and the types above and below it, one level per
+    /// request.
+    fn type_hierarchy(&self) -> Option<&TypeHierarchyProvider> {
         None
     }
 

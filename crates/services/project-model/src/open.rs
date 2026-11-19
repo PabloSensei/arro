@@ -6,7 +6,7 @@ use base::{Cancel, Result, Snapshot};
 use proc_sup::ProcessSpec;
 use workspace_core::{EventBus, Subscription};
 
-use crate::{BuildModule, Exclusion, FileEdit, Module, ProjectModel, cache};
+use crate::{BuildModule, BuildSelection, Exclusion, FileEdit, Module, ProjectModel, cache};
 
 const EVENT_QUEUE: usize = 16;
 
@@ -181,6 +181,26 @@ pub trait BuildSystem: Send + Sync {
     /// Whether [`TaskOptions::skip_tests`] changes what the tool runs.
     fn supports_skip_tests(&self) -> bool {
         false
+    }
+
+    /// Whether the tool takes named values on its command line, so the window offers to
+    /// edit them beside the named settings.
+    fn takes_properties(&self) -> bool {
+        false
+    }
+
+    /// What the user chose for the build of `root`, as the tool keeps it. A tool that
+    /// keeps no choices answers with the defaults.
+    fn selection(&self, root: &Path) -> BuildSelection {
+        let _ = root;
+        BuildSelection::default()
+    }
+
+    /// Keeps the choices for `root`, so that every command built from now on carries them,
+    /// whichever window or process asks for it.
+    fn choose(&self, root: &Path, selection: &BuildSelection) -> Result<()> {
+        let _ = (root, selection);
+        Ok(())
     }
 
     /// The change to the build file that leaves the dependency `request.exclude` out of

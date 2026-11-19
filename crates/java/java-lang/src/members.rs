@@ -5,8 +5,8 @@
 use std::ops::Range;
 
 use lang_api::{
-    DocumentEdit, MemberActionForm, MemberChoice, MemberSelection, MemberTarget, SourceEdit,
-    TextPoint, TextSpan, WorkspaceChange,
+    DocumentEdit, MemberActionForm, MemberChoice, MemberSelection, MemberTarget, MoveMember,
+    MovePlace, SourceEdit, TextPoint, TextSpan, WorkspaceChange,
 };
 use tree_sitter::{Node, Parser, Tree};
 
@@ -58,9 +58,11 @@ struct MemberInfo {
     detail: String,
     text: String,
     range: Range<usize>,
+    name_range: Range<usize>,
     body: Option<Range<usize>>,
     signature: String,
     private: bool,
+    static_: bool,
     abstract_: bool,
 }
 
@@ -212,26 +214,29 @@ fn members_of(text: &str, node: Node<'_>) -> Vec<MemberInfo> {
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
         let (kind, declaration) = match child.kind() {
-            "field_declaration" => (MemberKind::Field, child),
+            "field_declaration" | "constant_declaration" => (MemberKind::Field, child),
             "method_declaration" => (MemberKind::Method, child),
             "constructor_declaration" | "compact_constructor_declaration" => {
                 (MemberKind::Constructor, child)
             }
             _ => continue,
         };
-        let name = if kind == MemberKind::Field {
+        let name_node = if kind == MemberKind::Field {
             let mut cursor = declaration.walk();
             declaration
                 .named_children(&mut cursor)
                 .find(|child| child.kind() == "variable_declarator")
                 .and_then(|declarator| declarator.child_by_field_name("name"))
-                .map(|name| text_of(text, name).to_owned())
         } else {
-            name_of(text, declaration)
+            declaration.child_by_field_name("name")
         };
-        let Some(name) = name.filter(|name| !name.is_empty()) else {
+        let Some(name) = name_node
+            .map(|node| text_of(text, node).to_owned())
+            .filter(|name| !name.is_empty())
+        else {
             continue;
         };
+        let name_range = name_node.map_or(declaration.byte_range(), |node| node.byte_range());
         let modifiers = modifiers_of(text, declaration);
         let body_node = body_of(declaration);
         let body = body_node.map(|body| body.byte_range());
@@ -253,9 +258,11 @@ fn members_of(text: &str, node: Node<'_>) -> Vec<MemberInfo> {
             detail,
             text: dedent(text_of(text, declaration), &indent),
             range: declaration.byte_range(),
+            name_range,
             body,
             signature: signature.trim_end_matches('{').trim().to_owned(),
             private: has_word(modifiers, "private"),
+            static_: has_word(modifiers, "static"),
             abstract_: has_word(modifiers, "abstract"),
         });
     }
@@ -293,6 +300,78 @@ fn type_at(text: &str, offset: usize) -> Option<ParsedType> {
     // The file functions describe the first type; a nested one is not a place these
     // refactorings work on, so the two agree only for the first type.
     (file.node_range == node.byte_range()).then_some(file)
+}
+
+/// What F6 moves at a byte offset of a file: the file, a member the form takes, or a
+/// member that this move cannot take.
+pub(crate) fn move_place(text: &str, offset: usize) -> MovePlace {
+    let Some(tree) = parse(text) else {
+        return MovePlace::File;
+    };
+    let mut node = node_at(&tree, offset);
+    loop {
+        match node.kind() {
+            "constructor_declaration" | "compact_constructor_declaration" => {
+                return MovePlace::Unmovable(
+                    "A constructor cannot move to another type".to_owned(),
+                );
+            }
+            "static_initializer" => {
+                return MovePlace::Unmovable(
+                    "A static initializer cannot move to another type".to_owned(),
+                );
+            }
+            "method_declaration" | "field_declaration" | "constant_declaration" => {
+                let field = matches!(node.kind(), "field_declaration" | "constant_declaration");
+                // The fields of an interface are constants without the modifier.
+                let implicit = field
+                    && type_declaration(node).is_some_and(|owner| {
+                        matches!(
+                            owner.kind(),
+                            "interface_declaration" | "annotation_type_declaration"
+                        )
+                    });
+                let modifiers = modifiers_of(text, node);
+                return if has_word(modifiers, "static") || implicit {
+                    MovePlace::Member
+                } else {
+                    MovePlace::Unmovable("Move Members moves static members only".to_owned())
+                };
+            }
+            kind if TYPE_KINDS.contains(&kind) => return MovePlace::File,
+            _ => {}
+        }
+        let Some(parent) = node.parent() else {
+            return MovePlace::File;
+        };
+        node = parent;
+    }
+}
+
+/// The members of the type around a byte offset that the Move Members form lists, with
+/// the one at the offset ticked. `None` when the type has no member the move can take.
+pub(crate) fn move_members(text: &str, offset: usize) -> Option<Vec<MoveMember>> {
+    let tree = parse(text)?;
+    let node = type_declaration(node_at(&tree, offset))?;
+    let implicit = matches!(
+        node.kind(),
+        "interface_declaration" | "annotation_type_declaration"
+    );
+    let offset = offset.min(text.len());
+    let members: Vec<MoveMember> = members_of(text, node)
+        .into_iter()
+        .filter(|member| member.static_ || (implicit && member.kind == MemberKind::Field))
+        .map(|member| MoveMember {
+            checked: member.range.contains(&offset),
+            span: TextSpan {
+                start: point(text, member.name_range.start),
+                end: point(text, member.name_range.end),
+            },
+            name: member.name,
+            detail: Some(member.detail),
+        })
+        .collect();
+    (!members.is_empty()).then_some(members)
 }
 
 #[derive(Clone)]
@@ -1523,5 +1602,42 @@ mod tests {
             text_of(&change, "file:///a/Point.java", ""),
             "package a;\n\nrecord Point(int x, int y) {\n}\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use lang_api::MovePlace;
+
+    use super::{move_members, move_place};
+
+    const CLASS: &str = "package a;\n\nclass Owner {\n    static void save() {\n    }\n\n    String name() {\n        return \"\";\n    }\n}\n";
+
+    #[test]
+    fn a_static_member_moves_and_an_instance_member_says_why_not() {
+        let save = CLASS.find("save").unwrap();
+        assert_eq!(move_place(CLASS, save), MovePlace::Member);
+        let name = CLASS.find("name").unwrap();
+        assert!(matches!(move_place(CLASS, name), MovePlace::Unmovable(_)));
+        let file = CLASS.find("Owner").unwrap();
+        assert_eq!(move_place(CLASS, file), MovePlace::File);
+    }
+
+    #[test]
+    fn the_form_lists_the_static_members_and_ticks_the_one_at_the_caret() {
+        let save = CLASS.find("save").unwrap();
+        let members = move_members(CLASS, save).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "save");
+        assert!(members[0].checked);
+        assert_eq!(members[0].span.start.line, 3);
+    }
+
+    #[test]
+    fn a_field_of_an_interface_is_a_constant_without_the_modifier() {
+        let text = "package a;\n\ninterface Values {\n    int MAX = 10;\n}\n";
+        let max = text.find("MAX").unwrap();
+        assert_eq!(move_place(text, max), MovePlace::Member);
+        assert_eq!(move_members(text, max).unwrap()[0].name, "MAX");
     }
 }

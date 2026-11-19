@@ -187,7 +187,7 @@ fn a_failed_build_import_reaches_the_window(cx: &mut TestAppContext) {
     assert!(log.is_file(), "{}", log.display());
 
     draw(cx, window);
-    click(cx, window, "notification-action");
+    click(cx, window, "notification-action-file");
     wait_for(cx, "the server log in a tab", LIMIT, |cx| {
         window
             .read_with(cx, |workspace, _| workspace.active_path())

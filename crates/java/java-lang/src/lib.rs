@@ -19,6 +19,7 @@ mod lombok;
 mod members;
 mod messages;
 mod migrations;
+mod move_members;
 pub mod newproject;
 mod problems;
 mod project;
@@ -62,7 +63,7 @@ pub use project::{JavaProject, OpenError};
 pub use project_model::BuildTools;
 pub use session::{
     DEBUG_PLUGIN, JAVA_HOME, JDTLS_HOME, JavaSession, MAVEN_SETTINGS, OFFLINE, config_from_env,
-    config_of, config_of_with, open_error_text, project_state_dir, status_text,
+    config_of, config_of_with, open_error_text, project_state_dir, status_line, status_text,
 };
 pub use setup::{Missing, Search, Toolchain, discover};
 pub use sidecar::{State, Status, Trust};

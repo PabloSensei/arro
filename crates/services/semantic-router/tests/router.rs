@@ -372,7 +372,7 @@ fn providers_for(router: &Arc<Router>) -> LspProviders {
     )
     .with_edit_command("lang.applyEdit")
     .with_refactor_action("lang.applyRefactor", "lang/getRefactorEdit")
-    .with_move_requests("lang/getMoveDestinations", "lang/move")
+    .with_move_requests("lang/getMoveDestinations", "lang/move", "moveMember")
 }
 
 #[tokio::test]

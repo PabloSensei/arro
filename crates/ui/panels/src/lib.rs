@@ -74,6 +74,7 @@ mod mcp_runs;
 mod member_form;
 mod merge_view;
 mod method_hierarchy;
+mod move_members;
 mod navigation;
 mod new_project;
 mod outline;
@@ -121,6 +122,7 @@ mod todo;
 mod transcript;
 mod tree_ops;
 mod trust;
+mod type_hierarchy;
 mod usages;
 mod window_features;
 mod window_popups;
@@ -192,6 +194,8 @@ mod window_tests_live;
 mod window_tests_log_graph;
 #[cfg(test)]
 mod window_tests_member;
+#[cfg(test)]
+mod window_tests_type_hierarchy;
 
 #[cfg(test)]
 mod window_tests_appearance;
@@ -362,6 +366,9 @@ mod window_tests_editor_settings;
 mod window_tests_project_structure;
 
 #[cfg(test)]
+mod window_tests_project_structure_modules;
+
+#[cfg(test)]
 mod window_tests_branches;
 #[cfg(test)]
 mod window_tests_debug_depth;
@@ -397,6 +404,8 @@ mod window_tests_exit_buffers;
 
 #[cfg(test)]
 mod window_tests_spring_config;
+#[cfg(test)]
+mod window_tests_spring_config_nav;
 
 #[cfg(test)]
 mod window_tests_kubernetes;
@@ -713,6 +722,10 @@ mod window_tests_annotate_idea;
 #[cfg(test)]
 mod window_tests_git_log_icons;
 
+mod bookmarks;
+#[cfg(test)]
+mod window_tests_build_profiles;
+
 mod choice;
 mod invalidate;
 
@@ -728,11 +741,11 @@ use lang_api::{FileChange, LanguageSupport, ProjectProblemsQuery, ask};
 use tool_gateway::LanguageTools;
 use ui_kit::*;
 use workspace::{
-    AI_TOOL, BEANS_TOOL, BUILD_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL, DEBUG_TOOL,
-    DOCUMENTATION_TOOL, DockSide, ENDPOINTS_TOOL, INSPECTION_TOOL, LOG_TOOL, Launch, OpenRequests,
-    PERFORMANCE_TOOL, PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL, SELECTION_HISTORY_TOOL,
-    SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL,
-    USAGES_TOOL, Workspace,
+    AI_TOOL, BEANS_TOOL, BOOKMARKS_TOOL, BUILD_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL,
+    DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, ENDPOINTS_TOOL, INSPECTION_TOOL, LOG_TOOL, Launch,
+    OpenRequests, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL,
+    SELECTION_HISTORY_TOOL, SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL, TASKS_TOOL,
+    TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
 };
 
 use crate::index::{IndexEvent, ProjectIndex};
@@ -941,7 +954,22 @@ pub fn connect_server(
             workspace.notify_user("Language Server", text, cx);
         },
     );
-    connect_project_problems(support, cx);
+    workspace.register_command(
+        "language.reimport_project",
+        "Reload Project",
+        |_workspace, _window, cx| {
+            if let Some(semantic) = cx.try_global::<Semantic>()
+                && let Some(server) = semantic.0.server()
+            {
+                server.reimport();
+            }
+            if let Some(panel) = cx.try_global::<script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.reload_project(cx));
+            }
+        },
+    );
+    connect_project_problems(workspace, support, cx);
     watch_status(workspace, status, cx);
 }
 
@@ -1014,7 +1042,12 @@ fn watch_status(
                         cx,
                     );
                 }
-                workspace.set_language_status(Some(text.into()), cx)
+                let failed_import = import_failed(&text);
+                workspace.set_language_status(Some(text.into()), cx);
+                workspace.set_language_action(
+                    failed_import.then_some("language.show_import_failure"),
+                    cx,
+                )
             });
             if shown.is_err() {
                 break;
@@ -1035,10 +1068,38 @@ fn failed_reason(text: &str) -> Option<&str> {
     (!reason.is_empty()).then_some(reason)
 }
 
+/// Whether the line says that the build tool could not import the project. A click on
+/// such a line opens the notification of the failure again.
+fn import_failed(text: &str) -> bool {
+    text.contains(": import failed")
+}
+
 /// Takes the problems the server reports about the project itself. A build script
-/// that could not be imported lands in Problems, in a notification and, through the
-/// status line of the language, in the status bar.
-fn connect_project_problems(support: Arc<dyn LanguageSupport>, cx: &mut Context<Workspace>) {
+/// that could not be imported lands in Problems and in a notification with the ways
+/// out: the Settings page of that build tool, another import and the server log. The
+/// status line of the language carries the same reason.
+fn connect_project_problems(
+    workspace: &mut Workspace,
+    support: Arc<dyn LanguageSupport>,
+    cx: &mut Context<Workspace>,
+) {
+    // The notification may be closed or replaced by another one. A click on the status
+    // line asks for the last failure, so the window keeps it.
+    let last: Arc<std::sync::Mutex<Option<lang_api::ProjectProblem>>> = Arc::default();
+    let shown = last.clone();
+    workspace.register_command(
+        "language.show_import_failure",
+        "Show Import Failure",
+        move |workspace, _window, cx| {
+            let problem = shown
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            if let Some(problem) = problem {
+                notify_project_problem(workspace, &problem, cx);
+            }
+        },
+    );
     cx.spawn(async move |workspace, cx| {
         let Some(provider) = support.project_problems() else {
             return;
@@ -1047,19 +1108,14 @@ fn connect_project_problems(support: Arc<dyn LanguageSupport>, cx: &mut Context<
         let mut notified = String::new();
         while let Some(answer) = replies.next().await {
             let problems = answer.value;
-            match problems.first() {
+            let first = problems.first().cloned();
+            *last.lock().unwrap_or_else(|poison| poison.into_inner()) = first.clone();
+            match &first {
                 Some(problem) if problem.summary != notified => {
                     notified = problem.summary.clone();
-                    let text = format!("import failed: {}", problem.summary);
-                    let updated = workspace.update(cx, |workspace, cx| match &problem.log {
-                        Some(log) => workspace.notify_user_with_action(
-                            "Language Server",
-                            text,
-                            "Show Log",
-                            log.clone(),
-                            cx,
-                        ),
-                        None => workspace.notify_user("Language Server", text, cx),
+                    let problem = problem.clone();
+                    let updated = workspace.update(cx, |workspace, cx| {
+                        notify_project_problem(workspace, &problem, cx)
                     });
                     if updated.is_err() {
                         break;
@@ -1082,6 +1138,40 @@ fn connect_project_problems(support: Arc<dyn LanguageSupport>, cx: &mut Context<
     .detach();
 }
 
+/// The notification of a failed import: the reason, the page of its build tool, another
+/// try and the log of the server.
+fn notify_project_problem(
+    workspace: &mut Workspace,
+    problem: &lang_api::ProjectProblem,
+    cx: &mut Context<Workspace>,
+) {
+    let text = format!("import failed: {}", problem.summary);
+    let settings = if problem.tool == Some(1) {
+        "settings.build_tool_second"
+    } else {
+        "settings.build_tools"
+    };
+    let buttons = vec![
+        ("settings", "Open Settings".into(), settings),
+        (
+            "reload",
+            "Reload Project".into(),
+            "language.reimport_project",
+        ),
+    ];
+    match &problem.log {
+        Some(log) => workspace.notify_user_with_action_and_commands(
+            "Language Server",
+            text,
+            "Show Log",
+            log.clone(),
+            buttons,
+            cx,
+        ),
+        None => workspace.notify_user_with_commands("Language Server", text, buttons, cx),
+    }
+}
+
 fn install(
     workspace: &mut Workspace,
     search: SearchSetup,
@@ -1095,6 +1185,14 @@ fn install(
     editor_view::install_find_history(&agents.state_dir, cx);
     editor_view::install_completion_usage(&agents.state_dir, cx);
     finder::install_history(&agents.state_dir, cx);
+    // The bookmarks of the project open before the first editor reads them.
+    let project_name = workspace.root().file_name().map_or_else(
+        || "Bookmarks".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let saved = workspace.layout().bookmarks.clone();
+    let (groups, default) = bookmarks::groups_from_layout(&saved, &project_name);
+    editor_view::install_bookmarks(groups, default, &project_name, cx);
     // The open editors take a keymap file of the user as soon as it is applied.
     workspace.set_keymap_listener(editor_view::install_keymap);
     project::bind_keys(cx);
@@ -1105,6 +1203,7 @@ fn install(
     plugins::bind_keys(cx);
     usages::bind_keys(cx);
     terminal_panel::bind_keys(cx);
+    bookmarks::bind_keys(cx);
 
     let mut templates = tree_ops::basic_templates();
     templates.extend(project.templates.iter().cloned());
@@ -1537,6 +1636,17 @@ fn install(
     );
     cx.set_global(call_hierarchy::ActiveCallHierarchy(call_hierarchy));
 
+    let type_hierarchy = type_hierarchy::TypeHierarchyPanel::create(weak.clone(), cx);
+    let focus = type_hierarchy.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        workspace::TYPE_HIERARCHY_TOOL,
+        type_hierarchy.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(type_hierarchy::ActiveTypeHierarchy(type_hierarchy));
+
     let method_hierarchy = method_hierarchy::MethodHierarchyPanel::create(weak.clone(), cx);
     let focus = method_hierarchy.read(cx).panel().read(cx).focus();
     workspace.set_dock(
@@ -1679,6 +1789,16 @@ fn install(
     })
     .detach();
     watch_project(events, files, cx);
+    let bookmarks = bookmarks::BookmarksPanel::create(weak.clone(), cx);
+    let focus = bookmarks.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Right,
+        BOOKMARKS_TOOL,
+        bookmarks.clone().into(),
+        Some(focus),
+        cx,
+    );
+    cx.set_global(bookmarks::ActiveBookmarks(bookmarks));
     settings_archive::bind_commands(workspace, cx);
     release_on_close(window, cx);
 }
@@ -1710,6 +1830,7 @@ fn release_globals(cx: &mut App) {
         agents::ActiveAgents,
         beans::ActiveBeanHub,
         beans::ActiveBeans,
+        bookmarks::ActiveBookmarks,
         call_hierarchy::ActiveCallHierarchy,
         debug::ActiveDebug,
         debug::ActiveDebugHub,
@@ -1738,6 +1859,7 @@ fn release_globals(cx: &mut App) {
         structure::ActiveStructure,
         terminal_panel::ActiveTerminal,
         todo::ActiveTodo,
+        type_hierarchy::ActiveTypeHierarchy,
         usages::ActiveFindUsagesSettings,
         usages::ActiveShowUsages,
         usages::ActiveUsages,
@@ -1926,3 +2048,11 @@ mod window_tests_run_console;
 mod window_tests_beans_menu;
 #[cfg(test)]
 mod window_tests_generate_list;
+#[cfg(test)]
+mod window_tests_import_failure;
+
+#[cfg(test)]
+mod window_tests_bookmarks;
+
+#[cfg(test)]
+mod window_tests_move_members;

@@ -862,8 +862,10 @@ fn module_setup(root: &Path) -> ProjectSetup {
             name: "petclinic".to_owned(),
             dir: root.to_path_buf(),
             units: Vec::new(),
+            ..project_model::Module::default()
         }],
         dependencies: Vec::new(),
+        profiles: Vec::new(),
         resolved: true,
         problems: Vec::new(),
     };

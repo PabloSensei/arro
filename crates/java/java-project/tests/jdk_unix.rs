@@ -16,6 +16,7 @@ fn home(name: &str) -> PathBuf {
 fn a_release_file_gives_the_version_and_the_program_names() {
     let home = home("home");
     fs::write(home.join("bin").join("javac"), "").unwrap();
+    fs::write(home.join("bin").join("java"), "").unwrap();
     fs::write(
         home.join("release"),
         "IMPLEMENTOR=\"x\"\nJAVA_VERSION=\"21.0.2\"\n",

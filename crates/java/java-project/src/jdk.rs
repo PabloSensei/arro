@@ -30,9 +30,12 @@ pub struct Jdk {
 }
 
 impl Jdk {
-    /// A JDK needs `javac` as well: a plain runtime can run a program but not build one.
+    /// A JDK needs `java` as well as `javac`: a runtime without a compiler cannot build
+    /// a project, and a folder left by a partial removal has neither the one nor the
+    /// other, so such a record is never offered.
     pub fn at(home: &Path) -> Option<Self> {
-        if !home.join("bin").join(executable("javac")).is_file() {
+        let bin = home.join("bin");
+        if !bin.join(executable("javac")).is_file() || !bin.join(executable("java")).is_file() {
             return None;
         }
         let release = fs::read_to_string(home.join("release")).ok()?;
@@ -258,6 +261,7 @@ mod tests {
         let home = temp_dir("home");
         fs::create_dir_all(home.join("bin")).unwrap();
         fs::write(home.join("bin/javac.exe"), "").unwrap();
+        fs::write(home.join("bin/java.exe"), "").unwrap();
         fs::write(
             home.join("release"),
             "IMPLEMENTOR=\"x\"\nJAVA_VERSION=\"1.8.0_492\"\n",

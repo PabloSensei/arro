@@ -17,8 +17,8 @@ use editor_view::{EditorView, Semantic, Spot};
 use futures_util::StreamExt;
 use lang_api::{DependencyVersion, DependencyVersionQuery, ask};
 use project_model::{
-    BuildGroup, BuildModule, BuildSystem, BuildTask, Coordinates, Dependency, Exclusion, Module,
-    ProjectModel,
+    BuildGroup, BuildModule, BuildProfile, BuildSelection, BuildSystem, BuildTask, Coordinates,
+    Dependency, Exclusion, Module, ProfileChoice, ProjectModel,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -34,6 +34,8 @@ pub(crate) use dependencies::ANALYZE_COMMAND;
 
 use dependencies::Artifact;
 
+pub(crate) use dependencies::{declaration_offset, short_name};
+
 const GROUP: &str = "right-panel";
 const ROW_MARGIN: f32 = SPACE_L;
 /// Lines of the Execute field that stay offered.
@@ -43,6 +45,10 @@ const POPUP_WIDTH: f32 = 250.;
 const LIST_WIDTH: f32 = 260.;
 /// How deep the tree of one scope may go before the window stops drawing it.
 const MAX_TREE_DEPTH: usize = 32;
+/// Why a check box of a profile is shown.
+const PROFILE_HINT: &str = "Turn the profile on or off for the build";
+/// What the values of a build are edited as.
+const PROPERTIES_HINT: &str = "Values for the build, as name=value; ...; Enter saves";
 
 /// The buttons of the window and the hint each of them shows. The tests read the same
 /// table the render does.
@@ -58,6 +64,10 @@ pub(crate) const TOOLTIPS: &[(&str, &str)] = &[
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowKind {
+    /// The node of the project that holds the named settings of its build.
+    Profiles,
+    /// One named setting of the build, with its check box.
+    Profile,
     Module,
     Group,
     Task,
@@ -67,6 +77,16 @@ enum RowKind {
     Scope,
     /// One edge of a scope tree.
     Dependency,
+}
+
+/// A named setting of the build as the tree shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProfileRow {
+    name: String,
+    /// The build turns the setting on with the answers of the user.
+    active: bool,
+    /// The answer of the user: the file, on, or off.
+    choice: ProfileChoice,
 }
 
 /// A dependency row names the artifact its declaration is searched by.
@@ -102,6 +122,7 @@ struct Row {
     /// The grey text after the label, such as the version a conflict dropped.
     hint: Option<String>,
     dependency: Option<DependencyRow>,
+    profile: Option<ProfileRow>,
 }
 
 pub struct BuildPanel {
@@ -140,6 +161,10 @@ pub struct BuildPanel {
     analyzer_details_scroll: ScrollHandle,
     /// Why the last command of the analyzer did nothing.
     message: Option<String>,
+    /// The named values of the build, as the window edits them.
+    properties: TextField,
+    /// The values take the keys: a click in them turns the mode on.
+    properties_active: bool,
     _run: Subscription,
 }
 
@@ -150,6 +175,7 @@ impl BuildPanel {
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
+            let properties = TextField::from_text(run.read(cx).build_selection().properties_text());
             let _run = cx.observe(&run, |_, _, cx| cx.notify());
             let this = cx.entity().downgrade();
             Self {
@@ -178,6 +204,8 @@ impl BuildPanel {
                 analyzer_list_scroll: ScrollHandle::new(),
                 analyzer_details_scroll: ScrollHandle::new(),
                 message: None,
+                properties,
+                properties_active: false,
                 _run,
             }
         })
@@ -341,6 +369,47 @@ impl BuildPanel {
         self.message.clone()
     }
 
+    /// The named settings of the build as the tree lists them, for tests.
+    #[cfg(test)]
+    pub(crate) fn profile_rows(&self, cx: &App) -> Vec<(String, bool)> {
+        self.rows(cx)
+            .into_iter()
+            .filter_map(|row| row.profile.map(|profile| (profile.name, profile.active)))
+            .collect()
+    }
+
+    /// The answers of the user for the named settings, for tests.
+    #[cfg(test)]
+    pub(crate) fn profile_choices(&self, cx: &App) -> Vec<(String, ProfileChoice)> {
+        self.rows(cx)
+            .into_iter()
+            .filter_map(|row| row.profile.map(|profile| (profile.name, profile.choice)))
+            .collect()
+    }
+
+    /// The line of one named setting, for tests.
+    #[cfg(test)]
+    pub(crate) fn profile_row(&self, name: &str, cx: &App) -> Option<usize> {
+        self.rows(cx).iter().position(|row| {
+            row.profile
+                .as_ref()
+                .is_some_and(|profile| profile.name == name)
+        })
+    }
+
+    /// The values of the build as the field shows them, for tests.
+    #[cfg(test)]
+    pub(crate) fn properties_text(&self) -> String {
+        self.properties.text.clone()
+    }
+
+    /// Edits the values and saves them as Enter does, for tests.
+    #[cfg(test)]
+    pub(crate) fn set_properties(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.properties = TextField::from_text(text);
+        self.commit_properties(cx);
+    }
+
     /// The model the panel shows, for tests.
     fn model(&self, cx: &App) -> Option<Arc<ProjectModel>> {
         self.run.read(cx).model()
@@ -350,6 +419,20 @@ impl BuildPanel {
         let tree = self.run.read(cx).build_tree();
         let model = self.model(cx);
         let mut rows = Vec::new();
+        let profiles: &[BuildProfile] = model
+            .as_deref()
+            .map_or(&[], |model| model.profiles.as_slice());
+        if !profiles.is_empty() {
+            let selection = self.run.read(cx).build_selection().clone();
+            let key = profiles_key();
+            let open = !self.closed_groups.contains(&key);
+            rows.push(profiles_row(open));
+            if open {
+                for profile in profiles {
+                    rows.push(profile_row(profile, &selection));
+                }
+            }
+        }
         for module in &tree {
             let found = model
                 .as_deref()
@@ -410,11 +493,17 @@ impl BuildPanel {
         self.selected = Some(index);
         match row.kind {
             RowKind::Task => self.run_row(&row, window, cx),
+            RowKind::Profile => {
+                if let Some(profile) = &row.profile {
+                    let name = profile.name.clone();
+                    self.run.update(cx, |run, cx| run.cycle_profile(&name, cx));
+                }
+            }
             RowKind::Module => {
                 toggle(&mut self.closed_modules, &row.module);
                 cx.notify();
             }
-            RowKind::Group | RowKind::Dependencies | RowKind::Scope => {
+            RowKind::Profiles | RowKind::Group | RowKind::Dependencies | RowKind::Scope => {
                 if let Some(key) = &row.key {
                     toggle(&mut self.closed_groups, key);
                 }
@@ -454,6 +543,17 @@ impl BuildPanel {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
+        self.properties_active = false;
+        let profile = self
+            .rows(cx)
+            .into_iter()
+            .nth(index)
+            .is_some_and(|row| row.kind == RowKind::Profile);
+        if profile {
+            // A check box answers on one click; a task needs a double click.
+            self.activate(index, window, cx);
+            return;
+        }
         if event.click_count() >= 2 {
             let second = self
                 .rows(cx)
@@ -484,6 +584,22 @@ impl BuildPanel {
                 }
                 _ => {
                     if self.execute.key_with_clipboard(event, false, cx) {
+                        cx.notify();
+                    }
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.properties_active {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.properties_active = false;
+                    self.reset_properties(cx);
+                }
+                "enter" => self.commit_properties(cx),
+                _ => {
+                    if self.properties.key_with_clipboard(event, false, cx) {
                         cx.notify();
                     }
                 }
@@ -658,6 +774,23 @@ impl BuildPanel {
         self.show_run(window, cx);
     }
 
+    /// Saves the values of the build as Enter does and shows them as the build tool kept
+    /// them.
+    fn commit_properties(&mut self, cx: &mut Context<Self>) {
+        let text = self.properties.text.clone();
+        self.properties_active = false;
+        self.run
+            .update(cx, |run, cx| run.set_build_properties(&text, cx));
+        self.reset_properties(cx);
+    }
+
+    /// Puts the values of the build back as they are kept.
+    fn reset_properties(&mut self, cx: &mut Context<Self>) {
+        let text = self.run.read(cx).build_selection().properties_text();
+        self.properties = TextField::from_text(&text);
+        cx.notify();
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.run.update(cx, |run, cx| run.reload_project(cx));
         if let Some(semantic) = cx.try_global::<Semantic>()
@@ -676,6 +809,12 @@ impl BuildPanel {
 
     fn collapse_all(&mut self, cx: &mut Context<Self>) {
         let model = self.model(cx);
+        if model
+            .as_deref()
+            .is_some_and(|model| !model.profiles.is_empty())
+        {
+            self.closed_groups.insert(profiles_key());
+        }
         for module in self.run.read(cx).build_tree() {
             for group in &module.groups {
                 self.closed_groups
@@ -1007,6 +1146,7 @@ impl BuildPanel {
             dependency: Some(DependencyRow {
                 coordinates: artifact.coordinates(),
             }),
+            profile: None,
         };
         self.go_to_dependency(&row, window, cx);
     }
@@ -1257,6 +1397,67 @@ impl BuildPanel {
                 }),
             ),
         )
+    }
+
+    /// The row of the named values of the build: a field edited as `name=value; ...`, and
+    /// Enter keeps it for the commands that follow.
+    fn properties_bar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let empty = self.properties.text.is_empty();
+        let color = if empty {
+            theme.text_secondary
+        } else {
+            theme.text
+        };
+        let active = self.properties_active;
+        div()
+            .id("build-properties")
+            .debug_selector(|| "build-properties".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(px(SPACE_S))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(ROW_MARGIN))
+            .tooltip(move |_, cx| tooltip(PROPERTIES_HINT, None, cx))
+            .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child("Properties"),
+            )
+            .child(
+                div()
+                    .id("build-properties-field")
+                    .debug_selector(|| "build-properties-field".to_owned())
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(if active { theme.accent } else { theme.border })
+                    .text_color(color)
+                    .children(text_field_children_named(
+                        "build-properties-text",
+                        &self.properties,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        16.,
+                        active,
+                    ))
+                    .when(empty, |this| this.child("name=value; ...")),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                window.focus(&this.focus, cx);
+                this.properties_active = true;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn execute_popup(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -1516,6 +1717,48 @@ fn artifact_label(artifact: &Artifact) -> String {
     }
 }
 
+/// `Profiles` of the project: the node the named settings of the build hang under.
+fn profiles_row(open: bool) -> Row {
+    Row {
+        kind: RowKind::Profiles,
+        depth: 0,
+        label: "Profiles".into(),
+        expandable: true,
+        open,
+        module: String::new(),
+        module_name: String::new(),
+        task: None,
+        program: false,
+        key: Some(profiles_key()),
+        hint: None,
+        dependency: None,
+        profile: None,
+    }
+}
+
+/// One named setting of the build with its check box.
+fn profile_row(profile: &BuildProfile, selection: &BuildSelection) -> Row {
+    Row {
+        kind: RowKind::Profile,
+        depth: 1,
+        label: profile.name.clone(),
+        expandable: false,
+        open: false,
+        module: String::new(),
+        module_name: String::new(),
+        task: None,
+        program: false,
+        key: None,
+        hint: profile.condition.clone(),
+        dependency: None,
+        profile: Some(ProfileRow {
+            name: profile.name.clone(),
+            active: selection.active(profile),
+            choice: selection.choice(&profile.name),
+        }),
+    }
+}
+
 fn module_row(module: &BuildModule, has_dependencies: bool, closed: &HashSet<String>) -> Row {
     Row {
         kind: RowKind::Module,
@@ -1530,6 +1773,7 @@ fn module_row(module: &BuildModule, has_dependencies: bool, closed: &HashSet<Str
         key: None,
         hint: None,
         dependency: None,
+        profile: None,
     }
 }
 
@@ -1547,6 +1791,7 @@ fn group_row(module: &BuildModule, group: &BuildGroup, open: bool) -> Row {
         key: Some(group_key(&module.id, &group.name)),
         hint: None,
         dependency: None,
+        profile: None,
     }
 }
 
@@ -1564,6 +1809,7 @@ fn task_row(module: &BuildModule, task: &BuildTask) -> Row {
         key: None,
         hint: None,
         dependency: None,
+        profile: None,
     }
 }
 
@@ -1582,6 +1828,7 @@ fn dependencies_row(module: &BuildModule, open: bool) -> Row {
         key: Some(dependencies_key(&module.id)),
         hint: None,
         dependency: None,
+        profile: None,
     }
 }
 
@@ -1599,6 +1846,7 @@ fn scope_row(module: &BuildModule, scope: &str, open: bool) -> Row {
         key: Some(scope_key(&module.id, scope)),
         hint: None,
         dependency: None,
+        profile: None,
     }
 }
 
@@ -1632,6 +1880,7 @@ fn push_dependency_rows(
         dependency: Some(DependencyRow {
             coordinates: node.coordinates.clone(),
         }),
+        profile: None,
     });
     if open {
         for child in &node.children {
@@ -1652,6 +1901,10 @@ fn scope_name(scope: &str) -> String {
 
 fn group_key(module: &str, group: &str) -> String {
     format!("{module}\u{0}{group}")
+}
+
+fn profiles_key() -> String {
+    "profiles".to_owned()
 }
 
 fn dependencies_key(module: &str) -> String {
@@ -1724,6 +1977,46 @@ fn filter_button(on: bool, theme: &Theme) -> Stateful<Div> {
         .child("Only conflicts")
 }
 
+/// One named setting of the build: the check box, the name, the condition of the build
+/// file and the answer of the user.
+fn profile_element(index: usize, row: &Row, theme: &Theme) -> Stateful<Div> {
+    let active = row.profile.as_ref().is_some_and(|profile| profile.active);
+    let mark = match row.profile.as_ref().map(|profile| profile.choice) {
+        Some(ProfileChoice::On) => Some("on"),
+        Some(ProfileChoice::Off) => Some("off"),
+        _ => None,
+    };
+    let hover = theme.selection_hover;
+    div()
+        .id(("build-row", index))
+        .flex()
+        .items_center()
+        .flex_none()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .pl(px(row.depth as f32 * 19. + ROW_PADDING_X))
+        .pr(px(ROW_PADDING_X))
+        .rounded(px(ROW_RADIUS))
+        .hover(move |style| style.bg(hover))
+        .child(div().size(px(16.)).flex_none())
+        .child(checkbox(active, theme))
+        .child(div().ml(px(SPACE_S)).flex_none().child(row.label.clone()))
+        .children(row.hint.clone().map(|hint| {
+            div()
+                .ml(px(SPACE_M))
+                .text_color(theme.text_secondary)
+                .flex_none()
+                .child(hint)
+        }))
+        .children(mark.map(|mark| {
+            div()
+                .ml(px(SPACE_M))
+                .text_color(theme.text_secondary)
+                .flex_none()
+                .child(mark)
+        }))
+}
+
 impl Render for BuildPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -1740,11 +2033,14 @@ impl Render for BuildPanel {
         };
         let rows = self.rows(cx);
         let selected = self.selected;
+        let properties_supported = self.run.read(cx).takes_properties();
         let rows: Vec<_> =
             rows.into_iter()
                 .enumerate()
                 .map(|(index, row)| {
                     let icon = match row.kind {
+                        RowKind::Profiles => "nodes/folder",
+                        RowKind::Profile => "general/check",
                         RowKind::Module => "nodes/module",
                         RowKind::Group => "nodes/folder",
                         RowKind::Task => "run/run",
@@ -1762,10 +2058,17 @@ impl Render for BuildPanel {
                         open: row.open,
                         selected: selected == Some(index),
                     };
-                    let actionable = matches!(row.kind, RowKind::Task | RowKind::Dependency);
-                    let element = tree_row(style, &theme).on_click(cx.listener(
-                        move |this, event, window, cx| this.click(index, event, window, cx),
-                    ));
+                    let actionable = matches!(
+                        row.kind,
+                        RowKind::Task | RowKind::Dependency | RowKind::Profile
+                    );
+                    let element = match row.kind {
+                        RowKind::Profile => profile_element(index, &row, &theme),
+                        _ => tree_row(style, &theme),
+                    };
+                    let element = element.on_click(cx.listener(move |this, event, window, cx| {
+                        this.click(index, event, window, cx)
+                    }));
                     let element = element.on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1774,6 +2077,13 @@ impl Render for BuildPanel {
                             cx.notify();
                         }),
                     );
+                    let element = if row.kind == RowKind::Profile {
+                        element
+                            .tooltip(move |_, cx| tooltip(PROFILE_HINT, None, cx))
+                            .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
+                    } else {
+                        element
+                    };
                     let element = if actionable {
                         element.cursor_pointer()
                     } else {
@@ -1790,6 +2100,8 @@ impl Render for BuildPanel {
         } else {
             ""
         };
+        let properties =
+            (properties_supported && !self.analyzer).then(|| self.properties_bar(&theme, cx));
         let body = if self.analyzer {
             self.analyzer_body(&theme, window, cx).into_any_element()
         } else {
@@ -1830,6 +2142,7 @@ impl Render for BuildPanel {
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .child(panel_header(title, GROUP, hide, &theme))
             .child(self.toolbar(&theme, loading, skip_supported, cx))
+            .children(properties)
             .child(body)
             .when(self.execute_open, |this| {
                 this.child(self.execute_popup(&theme, cx))
