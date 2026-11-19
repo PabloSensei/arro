@@ -16,6 +16,7 @@ use workspace::Workspace;
 use workspace_core::{DocumentStore, EditSource, LoadedFile, SaveRequest, WorkspaceTransaction};
 
 use crate::navigation;
+use crate::preview::{self, FilePreview, PreviewTarget};
 
 const CONTEXT: &str = "FindInFiles";
 const WIDTH: f32 = 900.;
@@ -43,11 +44,40 @@ pub struct ActiveFinder(pub Option<Entity<Finder>>);
 
 impl Global for ActiveFinder {}
 
-/// The queries of Find in Files, newest first, kept for the whole window.
+/// The queries of Find in Files, newest first, kept for the whole window and in a file of
+/// the state folder.
 #[derive(Default)]
-pub struct SearchHistory(pub Vec<String>);
+pub struct SearchHistory {
+    pub queries: Vec<String>,
+    path: Option<PathBuf>,
+}
 
 impl Global for SearchHistory {}
+
+/// The file of the state folder that keeps the queries.
+const HISTORY_FILE: &str = "find-in-files-history.txt";
+
+/// Reads the queries of Find in Files that the state folder keeps.
+pub(crate) fn install_history(state_dir: &std::path::Path, cx: &mut App) {
+    if cx.try_global::<SearchHistory>().is_some() {
+        return;
+    }
+    let path = state_dir.join(HISTORY_FILE);
+    let queries = std::fs::read_to_string(&path)
+        .map(|body| {
+            body.lines()
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
+                .take(20)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    cx.set_global(SearchHistory {
+        queries,
+        path: Some(path),
+    });
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -77,6 +107,8 @@ pub struct Finder {
     match_case: bool,
     whole_words: bool,
     regex: bool,
+    /// A replacement takes the case of the text it replaces.
+    preserve_case: bool,
     results: Vec<FileHits>,
     truncated: bool,
     message: Option<String>,
@@ -96,6 +128,14 @@ pub struct Finder {
     history_selected: usize,
     /// Ctrl+Alt+E: search only the selection of the active editor.
     in_selection: bool,
+    /// The preview of the selected row under the list.
+    preview: Entity<FilePreview>,
+    /// The height of that preview, changed by the divider above it.
+    preview_height: f32,
+    /// Where the pointer was when a drag of the divider began.
+    preview_drag: Option<f32>,
+    /// The state folder that remembers the height.
+    store: Option<Arc<store::Store>>,
 }
 
 type Found = (Result<(), SearchError>, Vec<FileHits>);
@@ -111,6 +151,13 @@ impl Finder {
     ) {
         let weak = cx.weak_entity();
         let mask_hint = project_mask(files.read(cx).as_slice(), cx);
+        let store = workspace.store();
+        let saved = preview::load(store.as_deref(), root.as_path());
+        let preview_height = saved
+            .finder_height
+            .unwrap_or(preview::DEFAULT_FINDER_PREVIEW)
+            .clamp(preview::MIN_FINDER_PREVIEW, preview::MAX_FINDER_PREVIEW);
+        let preview = cx.new(|_| FilePreview::default());
         let view = cx.new(|cx| Self {
             // The list of files may arrive after the dialog: the hint waits for it.
             _files_changed: cx.observe(&files, |finder: &mut Self, _, cx| {
@@ -129,6 +176,7 @@ impl Finder {
             match_case: false,
             whole_words: false,
             regex: false,
+            preserve_case: false,
             results: Vec::new(),
             truncated: false,
             message: None,
@@ -141,10 +189,14 @@ impl Finder {
             mask_hint,
             history: cx
                 .try_global::<SearchHistory>()
-                .map_or_else(Vec::new, |history| history.0.clone()),
+                .map_or_else(Vec::new, |history| history.queries.clone()),
             history_popup: false,
             history_selected: 0,
             in_selection: false,
+            preview,
+            preview_height,
+            preview_drag: None,
+            store,
         });
         cx.set_global(ActiveFinder(Some(view.clone())));
         let focus = view.read(cx).focus.clone();
@@ -157,6 +209,7 @@ impl Finder {
             regex: self.regex,
             match_case: self.match_case,
             whole_words: self.whole_words,
+            preserve_case: self.preserve_case,
         }
     }
 
@@ -201,6 +254,8 @@ impl Finder {
             self.results.clear();
             self.truncated = false;
             self.selected = 0;
+            self.preview
+                .update(cx, |preview, cx| preview.show(None, cx));
             cx.notify();
             return;
         }
@@ -293,6 +348,7 @@ impl Finder {
         found.retain(|file| !file.lines.is_empty());
         self.results = found;
         self.selected = self.first_hit().unwrap_or(0);
+        self.show_selected_preview(cx);
         cx.notify();
     }
 
@@ -426,7 +482,75 @@ impl Finder {
             }
         }
         self.scroll.scroll_to_item(self.selected);
+        self.show_selected_preview(cx);
         cx.notify();
+    }
+
+    /// A click selects the row and shows its file in the preview; a second click opens
+    /// the file, as the list of IDEA does.
+    fn pick(&mut self, index: usize, clicks: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.rows().get(index), Some(Row::Hit(..))) {
+            self.selected = index;
+            self.scroll.scroll_to_item(index);
+            self.show_selected_preview(cx);
+            cx.notify();
+        }
+        if clicks >= 2 {
+            self.open(index, window, cx);
+        }
+    }
+
+    /// The row selected now, as the preview shows it: the file and its first match.
+    fn selected_target(&self) -> Option<PreviewTarget> {
+        let Row::Hit(file, line) = self.rows().get(self.selected).copied()? else {
+            return None;
+        };
+        let hits = self.results.get(file)?;
+        let hit = hits.lines.get(line)?;
+        let found = hit.matches.first()?.clone();
+        Some(PreviewTarget::found(
+            hits.path.clone(),
+            hit.line as usize,
+            found,
+        ))
+    }
+
+    /// Shows the file of the selected row in the preview under the list.
+    fn show_selected_preview(&mut self, cx: &mut Context<Self>) {
+        let target = self.selected_target();
+        self.preview
+            .update(cx, |preview, cx| preview.show(target, cx));
+    }
+
+    /// The divider above the preview follows the pointer; a drag up makes the preview
+    /// taller.
+    fn drag_preview(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(from) = self.preview_drag else {
+            return;
+        };
+        let now = f32::from(event.position.y);
+        self.preview_height = (self.preview_height + from - now)
+            .clamp(preview::MIN_FINDER_PREVIEW, preview::MAX_FINDER_PREVIEW);
+        self.preview_drag = Some(now);
+        cx.notify();
+    }
+
+    /// The drag is over: the height goes to the state folder.
+    fn finish_preview_drag(&mut self) {
+        if self.preview_drag.take().is_none() {
+            return;
+        }
+        preview::save_finder_height(
+            self.store.as_deref(),
+            self.root.as_path(),
+            self.preview_height,
+        );
+    }
+
+    /// The preview under the list, for a test.
+    #[cfg(test)]
+    pub(crate) fn preview(&self) -> &Entity<FilePreview> {
+        &self.preview
     }
 
     /// The current query joins the history of Alt+Down.
@@ -441,7 +565,22 @@ impl Finder {
     }
 
     fn remember_global(&self, cx: &mut App) {
-        cx.default_global::<SearchHistory>().0 = self.history.clone();
+        let (path, body) = {
+            let history = cx.default_global::<SearchHistory>();
+            history.queries = self.history.clone();
+            (history.path.clone(), history.queries.join("\n"))
+        };
+        let Some(path) = path else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                if let Some(folder) = path.parent() {
+                    let _ = std::fs::create_dir_all(folder);
+                }
+                let _ = std::fs::write(path, body);
+            })
+            .detach();
     }
 
     fn open(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -734,7 +873,9 @@ impl Finder {
                     .overflow_hidden()
                     .when(selected, |this| this.bg(theme.selection))
                     .when(!selected, |this| this.hover(move |style| style.bg(hover)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open(at, window, cx)))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.pick(at, event.click_count(), window, cx)
+                    }))
                     .child(
                         div()
                             .w(px(40.))
@@ -1005,6 +1146,29 @@ impl Render for Finder {
                         ))
                         .child(
                             div()
+                                .id("replace-preserve-case")
+                                .debug_selector(|| "replace-preserve-case".to_owned())
+                                .flex()
+                                .items_center()
+                                .flex_none()
+                                .h(px(26.))
+                                .px(px(SPACE_M))
+                                .rounded(px(CONTROL_RADIUS))
+                                .border_1()
+                                .border_color(theme.control_border)
+                                .cursor_pointer()
+                                .when(self.preserve_case, |this| {
+                                    this.bg(theme.tab_selected)
+                                        .border_color(theme.tab_selected_border)
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.preserve_case = !this.preserve_case;
+                                    cx.notify();
+                                }))
+                                .child("Preserve Case"),
+                        )
+                        .child(
+                            div()
                                 .id("replace-all")
                                 .flex()
                                 .items_center()
@@ -1027,22 +1191,77 @@ impl Render for Finder {
                     .child(status),
             )
             .child(
-                scrollable(
-                    "find-list",
-                    &self.scroll,
-                    div()
-                        .id("find-list")
-                        .flex()
-                        .flex_col()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .children(items),
-                    &theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_h_0(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        scrollable(
+                            "find-list",
+                            &self.scroll,
+                            div()
+                                .id("find-list")
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll)
+                                .children(items),
+                            &theme,
+                            window,
+                            cx,
+                        )
+                        .flex_1()
+                        .min_h_0(),
+                    )
+                    .child(
+                        div()
+                            .id("finder-splitter")
+                            .debug_selector(|| "finder-splitter".to_owned())
+                            .flex_none()
+                            .w_full()
+                            .h(px(SPACE_XS))
+                            .bg(theme.border)
+                            .cursor_row_resize()
+                            .hover({
+                                let hover = theme.hover;
+                                move |style| style.bg(hover)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.preview_drag = Some(f32::from(event.position.y));
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                                this.drag_preview(event, cx)
+                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.finish_preview_drag();
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.finish_preview_drag();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("finder-preview")
+                            .debug_selector(|| "finder-preview".to_owned())
+                            .flex_none()
+                            .w_full()
+                            .h(px(self.preview_height))
+                            .overflow_hidden()
+                            .child(self.preview.clone()),
+                    ),
             );
 
         div()

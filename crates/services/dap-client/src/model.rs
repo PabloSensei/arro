@@ -360,6 +360,9 @@ pub enum Command {
     },
     /// The filters the adapter should stop on, by id from its capabilities.
     SetExceptionBreakpoints(Vec<String>),
+    /// Mutes or unmutes every breakpoint of the session: a muted session sends the
+    /// adapter no breakpoints and keeps the settings for the moment it is unmuted.
+    SetMuteBreakpoints(bool),
     /// Replaces every method breakpoint of the session.
     SetFunctionBreakpoints(Vec<FunctionBreakpointSpec>),
     /// Replaces every field watchpoint of the session.
@@ -376,6 +379,9 @@ pub enum Command {
     SetTypeRenderers(Vec<TypeRenderer>),
     /// Evaluate an expression in the console of the selected frame.
     Evaluate(String),
+    /// Evaluate an expression for the Evaluate window: the value goes to the window as
+    /// well as to the console, so its fields can be read there.
+    EvaluateWindow(String),
     /// Evaluate an expression at a breakpoint that suspends the program and print its
     /// value in the console, one line per hit.
     EvaluateLog(String),

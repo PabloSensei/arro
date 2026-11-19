@@ -1882,6 +1882,7 @@ impl Element for EditorElement {
         let coverage = self.view.read(cx).coverage.clone();
         let breakpoints = self.view.read(cx).breakpoints.clone();
         let muted_breakpoints = self.view.read(cx).muted_breakpoints.clone();
+        let disabled_breakpoints = self.view.read(cx).disabled_breakpoints.clone();
         let temporary_breakpoints = self.view.read(cx).temporary_breakpoints.clone();
         let function_breakpoints = self.view.read(cx).function_breakpoints.clone();
         let field_watchpoints = self.view.read(cx).field_watchpoints.clone();
@@ -2095,7 +2096,14 @@ impl Element for EditorElement {
                             point(bounds.left() + px(RUN_X + 2.), shown.y + px(5.)),
                             size(px(9.), px(9.)),
                         );
-                        window.paint_quad(fill(dot, style.error).corner_radii(px(4.5)));
+                        // A breakpoint the window muted keeps its shape and loses its
+                        // colour, so the user sees where the program would have stopped.
+                        let color = if disabled_breakpoints.contains(&line) {
+                            style.line_number
+                        } else {
+                            style.error
+                        };
+                        window.paint_quad(fill(dot, color).corner_radii(px(4.5)));
                         if temporary_breakpoints.contains(&line) {
                             // A temporary breakpoint is a ring, not a filled dot.
                             let hole = Bounds::new(

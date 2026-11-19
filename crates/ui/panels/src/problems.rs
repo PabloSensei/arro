@@ -13,7 +13,7 @@ use lang_api::{DiagnosticEntry, ProjectProblem, Severity};
 use ui_kit::*;
 use workspace::{PROBLEMS_TOOL, Workspace};
 
-use crate::items::{Item, ItemsPanel, open_at};
+use crate::items::{Item, ItemsPanel, PanelRow, PanelTab, open_at};
 
 /// One diagnostic. Line and column count from zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,7 +81,15 @@ impl ProblemsState {
     }
 
     pub fn of_file(&self, path: &Path) -> &[Problem] {
-        self.files.get(path).map_or(&[], Vec::as_slice)
+        if let Some(problems) = self.files.get(path) {
+            return problems.as_slice();
+        }
+        // The file of the editor and the file of the diagnostics may come from
+        // different spellings of the same place, such as a long Windows path.
+        self.files
+            .iter()
+            .find(|(known, _)| same_path(known, path))
+            .map_or(&[], |(_, problems)| problems.as_slice())
     }
 
     /// Every file that has problems, for the IDE protocol.
@@ -115,25 +123,96 @@ impl ProblemsState {
         entries.sort_by_key(|(path, problem)| (problem.severity, (*path).clone(), problem.line));
         entries
             .into_iter()
-            .map(|(path, problem)| {
-                let relative = path.strip_prefix(root).unwrap_or(path);
-                let hint = format!("{}:{}", relative.display(), problem.line + 1);
-                let icon = match problem.severity {
-                    Severity::Error => "status/error",
-                    Severity::Warning => "status/warning",
-                    Severity::Information | Severity::Hint => "status/info",
-                };
-                Item {
-                    path: path.clone(),
-                    line: problem.line,
-                    column: problem.column,
-                    label: problem.message.lines().next().unwrap_or("").to_string(),
-                    hint: hint.replace('\\', "/"),
-                    icon,
-                }
-            })
+            .map(|(path, problem)| item_of(root, path, problem))
             .collect()
     }
+
+    /// The problems of one file, in the order of the text.
+    pub fn items_of_file(&self, root: &Path, path: &Path) -> Vec<Item> {
+        self.of_file(path)
+            .iter()
+            .map(|problem| item_of(root, path, problem))
+            .collect()
+    }
+
+    /// The list of the whole project, with a row per file and its problems under it.
+    pub fn project_view(&self, root: &Path) -> (Vec<Item>, Vec<PanelRow>) {
+        let mut items = Vec::new();
+        let mut rows = Vec::new();
+        for (path, problems) in &self.files {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            rows.push(PanelRow::Group {
+                label: relative.display().to_string().replace('\\', "/"),
+                depth: 0,
+                icon: "fileTypes/text",
+            });
+            for problem in problems {
+                let index = items.len();
+                rows.push(PanelRow::Item {
+                    index,
+                    depth: 1,
+                    excluded: false,
+                });
+                items.push(item_of(root, path, problem));
+            }
+        }
+        (items, rows)
+    }
+
+    /// Every problem of every file, for the counters of the tabs.
+    pub fn total(&self) -> usize {
+        self.files.values().map(Vec::len).sum()
+    }
+}
+
+/// Whether two paths name the same file. Windows knows several spellings of one path:
+/// the long form, either slash and either case.
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let normalize = |path: &Path| {
+            path.to_string_lossy()
+                .replace('/', "\\")
+                .trim_start_matches(r"\\?\")
+                .to_lowercase()
+        };
+        normalize(left) == normalize(right)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// One row of the list for a problem of `path`.
+fn item_of(root: &Path, path: &Path, problem: &Problem) -> Item {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let hint = format!("{}:{}", relative.display(), problem.line + 1);
+    let icon = match problem.severity {
+        Severity::Error => "status/error",
+        Severity::Warning => "status/warning",
+        Severity::Information | Severity::Hint => "status/info",
+    };
+    Item {
+        path: path.to_path_buf(),
+        line: problem.line,
+        column: problem.column,
+        label: problem.message.lines().next().unwrap_or("").to_string(),
+        hint: hint.replace('\\', "/"),
+        icon,
+    }
+}
+
+/// Which problems the window lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// The problems of the file of the active tab.
+    CurrentFile,
+    /// Every file of the project, grouped by file.
+    Project,
 }
 
 /// Whether the language of the window can offer a fix at a problem.
@@ -257,6 +336,10 @@ pub struct ProblemsHub {
     panel: Entity<ItemsPanel>,
     /// Files that carry problems of the project itself, replaced as a group.
     project_files: Vec<PathBuf>,
+    /// Which problems the window lists.
+    scope: Scope,
+    /// The file of the active tab, when there is one.
+    active_file: Option<PathBuf>,
 }
 
 /// The hub of the window, for scripts and for whoever receives diagnostics.
@@ -286,6 +369,8 @@ impl ProblemsHub {
             root,
             panel,
             project_files: Vec::new(),
+            scope: Scope::CurrentFile,
+            active_file: None,
         })
     }
 
@@ -295,6 +380,27 @@ impl ProblemsHub {
 
     pub fn state(&self) -> &ProblemsState {
         &self.state
+    }
+
+    /// A tab became active: the problems of Current File follow it.
+    pub fn set_active_file(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.active_file == path {
+            return;
+        }
+        self.active_file = path;
+        if self.scope == Scope::CurrentFile {
+            self.refresh(cx);
+        } else {
+            self.refresh_tabs(cx);
+        }
+    }
+
+    fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        self.refresh(cx);
     }
 
     /// Takes the latest diagnostics of a file.
@@ -350,12 +456,89 @@ impl ProblemsHub {
             .map(|(path, problems)| (path.clone(), problems.to_vec()));
         crate::claude_ide::publish_problems(cx, files);
         let (errors, warnings) = self.state.totals();
-        let items = self.state.items(&self.root);
         let title = format!("Problems ({errors} errors, {warnings} warnings)");
+        let (items, rows, empty) = match self.scope {
+            Scope::Project => {
+                let (items, rows) = self.state.project_view(&self.root);
+                (items, rows, "No problems found.")
+            }
+            // With no file open there is nothing to scope the tab to, so it lists the
+            // project rather than an empty window.
+            Scope::CurrentFile => match &self.active_file {
+                Some(path) => {
+                    let items = self.state.items_of_file(&self.root, path);
+                    let rows = (0..items.len())
+                        .map(|index| PanelRow::Item {
+                            index,
+                            depth: 0,
+                            excluded: false,
+                        })
+                        .collect();
+                    (items, rows, "No problems in the current file.")
+                }
+                _ => {
+                    let (items, rows) = self.state.project_view(&self.root);
+                    (items, rows, "No problems found.")
+                }
+            },
+        };
+        let current = self.current_count();
+        let total = self.state.total();
+        let tabs = self.tabs(current, total, cx);
         self.panel.update(cx, |panel, cx| {
             panel.set_title(title, cx);
-            panel.set_items(items, cx);
+            panel.set_empty(empty, cx);
+            panel.set_tabs(tabs, cx);
+            panel.set_view(items, rows, cx);
         });
+    }
+
+    /// Updates the counters of the tabs without building the list again.
+    fn refresh_tabs(&mut self, cx: &mut Context<Self>) {
+        let (current, total) = (self.current_count(), self.state.total());
+        let tabs = self.tabs(current, total, cx);
+        self.panel.update(cx, |panel, cx| panel.set_tabs(tabs, cx));
+    }
+
+    /// The problems the Current File tab counts.
+    fn current_count(&self) -> usize {
+        match &self.active_file {
+            Some(path) => self.state.of_file(path).len(),
+            None => self.state.total(),
+        }
+    }
+
+    /// The two tabs of the window, each with the number of the problems it lists.
+    fn tabs(&self, current: usize, total: usize, cx: &mut Context<Self>) -> Vec<PanelTab> {
+        let weak = cx.entity().downgrade();
+        let tab = |scope: Scope, id: &'static str, label: String| {
+            let weak = weak.clone();
+            PanelTab {
+                id,
+                label,
+                active: self.scope == scope,
+                run: Rc::new(move |_window, cx| {
+                    let weak = weak.clone();
+                    // The tab is clicked inside an update of its own panel, so the hub
+                    // builds the list after that update ends.
+                    cx.defer(move |cx| {
+                        weak.update(cx, |hub, cx| hub.set_scope(scope, cx)).ok();
+                    });
+                }),
+            }
+        };
+        vec![
+            tab(
+                Scope::CurrentFile,
+                "current-file",
+                format!("Current File ({current})"),
+            ),
+            tab(
+                Scope::Project,
+                "project-errors",
+                format!("Project Errors ({total})"),
+            ),
+        ]
     }
 }
 

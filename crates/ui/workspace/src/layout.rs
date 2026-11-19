@@ -8,6 +8,7 @@ use ui_kit::metrics::*;
 
 use crate::editor::BundleLayout;
 use crate::editor::PreviewLayout;
+use crate::split::SplitLayout;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DockState {
@@ -44,8 +45,13 @@ pub struct Layout {
     pub bottom: DockState,
     pub panes: Vec<PaneState>,
     pub active_pane: usize,
-    /// Groups of tabs sit one under another instead of side by side.
+    /// Groups of tabs sit one under another instead of side by side. A layout without
+    /// `splits` opens as one row or one column of them, which is what this meant before
+    /// the groups could nest.
     pub split_down: bool,
+    /// The shape of the groups, nested as the splits were. `None` in a layout saved
+    /// before the groups nested: `panes` then sit in one row or one column.
+    pub splits: Option<SplitLayout>,
     pub tree_expanded: Vec<PathBuf>,
     pub tree_selected: Option<PathBuf>,
     /// The tool window the bottom dock showed.
@@ -84,6 +90,7 @@ impl Default for Layout {
             panes: Vec::new(),
             active_pane: 0,
             split_down: false,
+            splits: None,
             tree_expanded: Vec::new(),
             tree_selected: None,
             bottom_tool: None,
@@ -223,10 +230,29 @@ mod tests {
             pinned: vec![PathBuf::from("C:/project/pom.xml")],
         }];
         layout.split_down = true;
+        layout.splits = Some(SplitLayout::Split {
+            down: false,
+            ratio: 0.3,
+            first: Box::new(SplitLayout::Group),
+            second: Box::new(SplitLayout::Group),
+        });
         layout.tree_expanded = vec![PathBuf::from("C:/project/src")];
         let json = serde_json::to_string(&layout).unwrap();
         save_layout(&store, root, &json).unwrap();
         assert_eq!(load_layout(&store, root), layout);
+    }
+
+    #[test]
+    fn a_layout_saved_before_the_groups_nested_opens_as_one_row() {
+        let store = Store::in_memory().unwrap();
+        let root = Path::new("C:/project");
+        let old = r#"{"panes":[{"tabs":["C:/project/a.txt"],"active":0},
+            {"tabs":["C:/project/b.txt"],"active":0}],"split_down":true}"#;
+        save_layout(&store, root, old).unwrap();
+        let layout = load_layout(&store, root);
+        assert_eq!(layout.panes.len(), 2);
+        assert!(layout.split_down);
+        assert_eq!(layout.splits, None, "the old file has no tree");
     }
 
     #[test]

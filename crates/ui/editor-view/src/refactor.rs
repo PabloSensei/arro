@@ -31,6 +31,11 @@ fn usages_of(name: &str, spans: Vec<SourceSpan>) -> Vec<Usage> {
         .collect()
 }
 
+/// Whether the place names a file, compared the way the system compares paths.
+fn same_file(uri: &str, path: &Path) -> bool {
+    uri_path(uri).is_some_and(|found| platform::path_key(&found) == platform::path_key(path))
+}
+
 /// The places of the answer with the kind and the container of each, and the module of
 /// the file it is in.
 fn detailed_usages_of(
@@ -350,12 +355,17 @@ fn under_source_root(destinations: &[MoveDestination], folder: &Path) -> bool {
 impl EditorView {
     /// Alt+F7: the uses of the symbol, listed in the Usages window.
     pub fn find_usages(&mut self, cx: &mut Context<Self>) {
-        self.usage_search(false, cx);
+        self.usage_search(false, false, cx);
+    }
+
+    /// Ctrl+F7: the uses of the symbol in this file, listed in the Usages window.
+    pub fn find_usages_in_file(&mut self, cx: &mut Context<Self>) {
+        self.usage_search(false, true, cx);
     }
 
     /// Ctrl+Alt+F7: the uses of the symbol, in the popup at the caret.
     pub(crate) fn show_usages(&mut self, cx: &mut Context<Self>) {
-        self.usage_search(true, cx);
+        self.usage_search(true, false, cx);
     }
 
     /// The uses of the declaration the caret names: Ctrl+B on the name of a field, a
@@ -483,7 +493,16 @@ impl EditorView {
         self.usages = (!ranges.is_empty()).then_some(ranges);
     }
 
-    pub(crate) fn usage_search(&mut self, popup: bool, cx: &mut Context<Self>) {
+    pub(crate) fn usage_search(&mut self, popup: bool, in_file: bool, cx: &mut Context<Self>) {
+        if in_file {
+            let has_provider = self.lsp.as_ref().is_some_and(|lsp| {
+                lsp.support.usages().is_some() || lsp.support.references().is_some()
+            });
+            // A file whose language has no usages keeps the marks of Ctrl+Shift+F7.
+            if !has_provider {
+                return self.highlight_usages(cx);
+            }
+        }
         let Some((spot, caret)) = self.spot() else {
             return;
         };
@@ -497,13 +516,21 @@ impl EditorView {
             if let Some(provider) = detailed {
                 let replies = ask(provider, spot);
                 let support = support.clone();
+                let here = in_file.then(|| self.path.clone());
                 cx.spawn(async move |this, cx| {
                     let answer = first(replies).await;
                     this.update(cx, |this, cx| match answer {
                         Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
-                        Some((entries, _)) => {
+                        Some((mut entries, _)) => {
+                            if let Some(here) = &here {
+                                entries.retain(|entry| same_file(&entry.target.uri, here));
+                            }
                             let usages = detailed_usages_of(&name, entries, &*support);
-                            cx.emit(EditorEvent::UsagesDetailed(usages));
+                            cx.emit(if here.is_some() {
+                                EditorEvent::UsagesDetailedInFile(usages)
+                            } else {
+                                EditorEvent::UsagesDetailed(usages)
+                            });
                         }
                         None => {}
                     })
@@ -516,13 +543,22 @@ impl EditorView {
                 return;
             };
             let replies = ask(provider, spot);
+            let here = in_file.then(|| self.path.clone());
             cx.spawn(async move |this, cx| {
                 let answer = first(replies).await;
                 this.update(cx, |this, cx| match answer {
                     Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
-                    Some((spans, _)) => {
+                    Some((mut spans, _)) => {
+                        if let Some(here) = &here {
+                            spans.retain(|span| same_file(&span.uri, here));
+                        }
                         this.set_usage_ranges(&spans);
-                        cx.emit(EditorEvent::Usages(usages_of(&name, spans)));
+                        let usages = usages_of(&name, spans);
+                        cx.emit(if here.is_some() {
+                            EditorEvent::UsagesInFile(usages)
+                        } else {
+                            EditorEvent::Usages(usages)
+                        });
                     }
                     None => {}
                 })

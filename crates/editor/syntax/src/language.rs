@@ -59,6 +59,10 @@ pub struct LanguageConfig {
     pub block_comment: Option<(&'static str, &'static str)>,
     /// What Complete Statement adds to a line.
     pub statements: Option<StatementRules>,
+    /// The query of the nodes Move Statement moves: the statements of a block, the
+    /// members of a type and the elements of a list. An empty query leaves the command
+    /// to the braces of the text.
+    pub move_units: &'static str,
     pub indent_unit: &'static str,
     /// What Find in Files offers in its mask field for a project of this language.
     pub file_mask: &'static str,

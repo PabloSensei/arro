@@ -2142,9 +2142,14 @@ impl Render for SettingsView {
                 .flex()
                 .flex_col()
                 .gap(px(SPACE_XS))
+                // The space above and below the page is padding: the scroll range counts the
+                // padding of the scrolled element, but not the margin of its first child, so
+                // the last section stopped under the buttons at the end of the scroll.
+                .pt(px(DIALOG_GAP))
+                .pb(px(DIALOG_GAP))
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll_content)
-                .child(heading(self.page.title(), &theme))
+                .child(heading(self.page.title(), &theme).mt(px(0.)))
                 .children(content),
             &theme,
             window,

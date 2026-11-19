@@ -24,6 +24,8 @@ mod compare;
 mod composer;
 mod conflict;
 mod console_input;
+mod console_links;
+mod console_search;
 mod copy_class;
 mod coverage;
 mod create_test;
@@ -75,6 +77,7 @@ mod palette;
 mod performance;
 mod places;
 mod plugins;
+mod preview;
 mod problems;
 mod profiler;
 mod project;
@@ -82,6 +85,7 @@ mod project_state;
 mod project_structure;
 mod prompt;
 mod proposal;
+mod push;
 mod refactor_form;
 mod reformat;
 mod run;
@@ -195,6 +199,8 @@ mod window_tests_menu_main;
 #[cfg(test)]
 mod window_tests_menus;
 #[cfg(test)]
+mod window_tests_nested_splits;
+#[cfg(test)]
 mod window_tests_perf;
 #[cfg(test)]
 mod window_tests_real;
@@ -202,6 +208,8 @@ mod window_tests_real;
 mod window_tests_real_actions_on_save;
 #[cfg(test)]
 mod window_tests_real_drag;
+#[cfg(test)]
+mod window_tests_refactor_copy;
 #[cfg(test)]
 mod window_tests_refactor_this;
 #[cfg(test)]
@@ -610,6 +618,8 @@ mod window_tests_git_console;
 #[cfg(test)]
 mod window_tests_git_log_labels;
 #[cfg(test)]
+mod window_tests_git_partial;
+#[cfg(test)]
 mod window_tests_gradle_missing;
 #[cfg(test)]
 mod window_tests_kubernetes_journal;
@@ -646,6 +656,38 @@ mod window_tests_run_starting;
 
 #[cfg(test)]
 mod window_tests_fix_with_ai;
+
+#[cfg(test)]
+mod window_tests_idea_editor;
+
+#[cfg(test)]
+mod window_tests_find_idea;
+
+#[cfg(test)]
+mod window_tests_column;
+
+#[cfg(test)]
+mod window_tests_smart_enter;
+
+#[cfg(test)]
+mod window_tests_preview_crumbs;
+
+#[cfg(test)]
+mod window_tests_icon_sets_buttons;
+
+#[cfg(test)]
+mod window_tests_diff_idea;
+#[cfg(test)]
+mod window_tests_settings_scroll;
+
+#[cfg(test)]
+mod window_tests_completion_idea;
+
+#[cfg(test)]
+mod window_tests_project_compact;
+
+#[cfg(test)]
+mod window_tests_daily;
 
 mod choice;
 mod invalidate;
@@ -1024,6 +1066,10 @@ fn install(
     cx: &mut Context<Workspace>,
 ) {
     history::open(&agents.state_dir, cx);
+    clipboard::open(&agents.state_dir, cx);
+    editor_view::install_find_history(&agents.state_dir, cx);
+    editor_view::install_completion_usage(&agents.state_dir, cx);
+    finder::install_history(&agents.state_dir, cx);
     // The open editors take a keymap file of the user as soon as it is applied.
     workspace.set_keymap_listener(editor_view::install_keymap);
     project::bind_keys(cx);
@@ -1301,6 +1347,7 @@ fn install(
     cx.set_global(agent_tools::AgentTools(tools));
     cx.set_global(AgentLanguages(languages));
     let files = cx.new(|_| Arc::new(Vec::new()));
+    workspace.set_project_files(files.clone());
     let close_state_dir = agents.state_dir.clone();
     let close_root = workspace.root().to_path_buf();
     let agent_panel = agents::AgentsPanel::create(
@@ -1471,6 +1518,10 @@ fn install(
     ))));
     let runs = cx.global::<script::ActiveRunPanel>().0.clone();
     runs.update(cx, |runs, _| runs.set_files(files.clone()));
+    if let Some(debug) = cx.try_global::<debug::ActiveDebug>() {
+        let debug = debug.0.clone();
+        debug.update(cx, |debug, _| debug.set_files(files.clone()));
+    }
     commands::register(workspace, &index, &files);
     let endpoints = endpoints::EndpointsPanel::create(files.clone(), weak.clone(), cx);
     let focus = endpoints.read(cx).focus();
@@ -1550,6 +1601,15 @@ fn install(
     workspace.set_tab_listener(|path, cx| {
         cx.default_global::<Navigator>().activated(path);
         project::follow_active_file(path, cx);
+        if let Some(problems) = cx.try_global::<problems::ActiveProblems>() {
+            let hub = problems.0.clone();
+            let path = path.to_path_buf();
+            // A tab may change while its list is being updated, as a click on a row
+            // opens a file: the hub rebuilds the list once that update ends.
+            cx.defer(move |cx| {
+                hub.update(cx, |hub, cx| hub.set_active_file(Some(path), cx));
+            });
+        }
         let panel = cx.global::<structure::ActiveStructure>().0.clone();
         panel.update(cx, |panel, cx| panel.show(path.to_path_buf(), cx));
         let documentation = cx.global::<documentation::ActiveDocumentation>().0.clone();
@@ -1800,3 +1860,6 @@ fn disk_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context<Wo
         }
     });
 }
+
+#[cfg(test)]
+mod window_tests_run_console;

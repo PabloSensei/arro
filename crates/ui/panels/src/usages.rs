@@ -284,7 +284,6 @@ impl UsagesHub {
 
     /// Replaces the list with the uses of one symbol, grouped by file.
     pub fn set_usages(&mut self, usages: Vec<Usage>, cx: &mut Context<Self>) {
-        self.structural = None;
         let detailed = usages
             .into_iter()
             .map(|usage| DetailedUsage {
@@ -298,12 +297,51 @@ impl UsagesHub {
         self.set_detailed_usages(detailed, cx);
     }
 
+    /// Replaces the list with the uses of one symbol in this file, as Ctrl+F7 asks.
+    pub fn set_usages_in_file(&mut self, usages: Vec<Usage>, cx: &mut Context<Self>) {
+        let detailed = usages
+            .into_iter()
+            .map(|usage| DetailedUsage {
+                name: usage.name,
+                target: usage.target,
+                kind: UsageKind::Unknown,
+                container: None,
+                module: None,
+            })
+            .collect();
+        self.set_detailed_usages_in_file(detailed, cx);
+    }
+
     /// Replaces the list with the uses of one symbol and the grouping the settings ask.
-    pub fn set_detailed_usages(&mut self, mut usages: Vec<DetailedUsage>, cx: &mut Context<Self>) {
+    pub fn set_detailed_usages(&mut self, usages: Vec<DetailedUsage>, cx: &mut Context<Self>) {
+        self.set_detailed_usages_with(usages, None, false, cx);
+    }
+
+    /// Replaces the list with the uses of one symbol in this file, as Ctrl+F7 asks.
+    pub fn set_detailed_usages_in_file(
+        &mut self,
+        usages: Vec<DetailedUsage>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_detailed_usages_with(usages, Some(FindUsagesScope::CurrentFile), true, cx);
+    }
+
+    fn set_detailed_usages_with(
+        &mut self,
+        mut usages: Vec<DetailedUsage>,
+        scope: Option<FindUsagesScope>,
+        already_scoped: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.structural = None;
-        let options = cx
+        let mut options = cx
             .try_global::<PendingFindUsages>()
             .and_then(|pending| pending.0.clone());
+        if let Some(scope) = scope {
+            let mut chosen = options.clone().unwrap_or_default();
+            chosen.scope = scope;
+            options = Some(chosen);
+        }
         let name = usages
             .first()
             .map(|usage| usage.name.clone())
@@ -312,10 +350,13 @@ impl UsagesHub {
         if let Some(options) = &options {
             usages.retain(|usage| {
                 options.shows_itself()
-                    && self.in_scope(usage, options, cx)
+                    && (already_scoped || self.in_scope(usage, options, cx))
                     && options.shows_kind(usage.kind)
             });
             prefix = search_title(&name, options);
+            if options.scope == FindUsagesScope::CurrentFile {
+                prefix.push_str(" in file");
+            }
         }
         let new_tab = self.tabs.is_empty()
             || options

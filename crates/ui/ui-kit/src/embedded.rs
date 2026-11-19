@@ -31,9 +31,19 @@ impl AssetSource for Assets {
 
 /// The application with our assets.
 pub fn app() -> Application {
-    #[cfg(windows)]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    ))]
     let application = Application::with_platform(crate::scale::platform());
-    #[cfg(not(windows))]
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    )))]
     let application = gpui_kit::application();
     application.with_assets(Assets)
 }

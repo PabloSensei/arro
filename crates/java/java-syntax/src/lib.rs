@@ -8,6 +8,7 @@ mod inline;
 mod spelling;
 mod spring_beans;
 mod spring_data;
+mod statement;
 mod structural;
 
 use std::sync::OnceLock;
@@ -35,6 +36,7 @@ pub use spring_data::{
     Operator, Order, Prefix, PropertyPath, Query, Reference, Segment, Token as QueryToken,
     TokenKind, method_cursor, parse_method_name, parse_query, token_at, tokens as query_tokens,
 };
+pub use statement::{StatementEdit, complete_statement};
 pub use structural::{
     Search as StructuralSearch, find as structural_find, ready_templates,
     replace as structural_replace, variables as structural_variables,
@@ -103,6 +105,7 @@ pub fn config() -> LanguageConfig {
         line_comment: Some("//"),
         block_comment: Some(("/*", "*/")),
         statements: Some(STATEMENTS),
+        move_units: include_str!("../../../../queries/java/move.scm"),
         indent_unit: "    ",
         file_mask: "*.java !*Test.java",
         injections: Vec::new(),

@@ -209,9 +209,9 @@ const TEST_EVENTS: &[&str] = &[
 ];
 
 /// A test provider that plays the listener from a thread and keeps every request.
-struct FixtureTests {
-    requests: Arc<Mutex<Vec<TestRequest>>>,
-    image: PathBuf,
+pub(crate) struct FixtureTests {
+    pub(crate) requests: Arc<Mutex<Vec<TestRequest>>>,
+    pub(crate) image: PathBuf,
 }
 
 impl TestProvider for FixtureTests {
@@ -282,7 +282,7 @@ fn find_tests(text: &str, _: &Path) -> Vec<TestSite> {
         .unwrap_or_default()
 }
 
-fn test_source(root: &Path) -> PathBuf {
+pub(crate) fn test_source(root: &Path) -> PathBuf {
     let directory = root.join("src").join("demo");
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("Vitest.code");
@@ -382,6 +382,24 @@ impl MockService {
         {
             server.join();
         }
+    }
+
+    /// The `setBreakpoints` requests the adapter received, oldest first.
+    pub(crate) fn breakpoint_requests(&self) -> Vec<serde_json::Value> {
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(server) = server.as_ref() else {
+            return Vec::new();
+        };
+        server
+            .requests()
+            .into_iter()
+            .filter(|message| {
+                message.get("command").and_then(serde_json::Value::as_str) == Some("setBreakpoints")
+            })
+            .collect()
     }
 }
 

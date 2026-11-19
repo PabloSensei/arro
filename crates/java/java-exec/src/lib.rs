@@ -2,6 +2,7 @@
 //! the provider that turns a stored configuration into a command, finding tests and running
 //! them through the build tool.
 
+mod attach;
 mod coverage;
 mod flags;
 mod live;
@@ -13,6 +14,9 @@ mod quarkus;
 mod test_sources;
 mod testing;
 
+pub use attach::{
+    DebuggableProcess, debug_attach_processes, debug_attach_processes_in, jdwp_address, parse_jps,
+};
 pub use coverage::{exec_file, report};
 pub use flags::JvmFlags;
 pub use live::{

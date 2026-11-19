@@ -38,7 +38,7 @@ pub(crate) fn style_of(cx: &App) -> EditorStyle {
             .try_global::<workspace::EditorAppearance>()
             .and_then(|appearance| appearance.presentation_font)
             .unwrap_or(settings.font_size);
-        let font_size = (points * text_scale(settings.ui_scale)).round().max(6.);
+        let font_size = points.round().max(6.);
         if !settings.editor_font_family.trim().is_empty() {
             style.font_family = settings.editor_font_family.clone().into();
         }
@@ -112,6 +112,8 @@ pub(crate) fn options_of(cx: &App) -> EditorOptions {
         render_doc_comments: settings.render_doc_comments,
         markdown_images_from_internet: settings.markdown_images_from_internet,
         ai_features: settings.ai_enabled,
+        soft_wrap: settings.soft_wrap,
+        show_whitespace: settings.show_whitespace,
     }
 }
 
@@ -423,15 +425,19 @@ fn open(
                 EditorEvent::CopyElement => {
                     let workspace = runner.clone();
                     let handle = window.window_handle();
-                    handle
-                        .update(cx, |_, window, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.run_command("workspace.copy_element", window, cx)
-                                })
-                                .ok();
-                        })
-                        .ok();
+                    // Refactor This runs the row while the editor is being updated: the
+                    // window takes the command once that update is over.
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.run_command("workspace.copy_element", window, cx)
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
                 }
                 EditorEvent::CallHierarchy(spot) => {
                     let Some(hub) = cx.try_global::<crate::call_hierarchy::ActiveCallHierarchy>()
@@ -988,6 +994,22 @@ fn open(
                 })
                 .ok();
         }
+        EditorEvent::UsagesInFile(usages) => {
+            let Some(hub) = cx.try_global::<ActiveUsages>() else {
+                return;
+            };
+            let hub = hub.0.clone();
+            let usages = usages.clone();
+            hub.update(cx, |hub, cx| hub.set_usages_in_file(usages, cx));
+            let workspace = reports.clone();
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_tool(USAGES_TOOL, window, cx))
+                        .ok();
+                })
+                .ok();
+        }
         EditorEvent::UsagesDetailed(usages) => {
             let Some(hub) = cx.try_global::<ActiveUsages>() else {
                 return;
@@ -995,6 +1017,22 @@ fn open(
             let hub = hub.0.clone();
             let usages = usages.clone();
             hub.update(cx, |hub, cx| hub.set_detailed_usages(usages, cx));
+            let workspace = reports.clone();
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_tool(USAGES_TOOL, window, cx))
+                        .ok();
+                })
+                .ok();
+        }
+        EditorEvent::UsagesDetailedInFile(usages) => {
+            let Some(hub) = cx.try_global::<ActiveUsages>() else {
+                return;
+            };
+            let hub = hub.0.clone();
+            let usages = usages.clone();
+            hub.update(cx, |hub, cx| hub.set_detailed_usages_in_file(usages, cx));
             let workspace = reports.clone();
             handle
                 .update(cx, |_, window, cx| {

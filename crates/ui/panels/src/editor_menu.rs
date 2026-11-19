@@ -23,8 +23,14 @@ impl MenuModel {
         let ids = [
             actions::CUT,
             actions::COPY,
+            actions::COPY_REFERENCE,
             actions::PASTE,
             actions::PASTE_HISTORY,
+            actions::COLUMN_MODE,
+            actions::FOLD,
+            actions::UNFOLD,
+            actions::FOLD_ALL,
+            actions::UNFOLD_ALL,
             actions::GOTO_DECLARATION,
             actions::GOTO_IMPLEMENTATION,
             actions::GOTO_SUPER,
@@ -161,6 +167,10 @@ fn build(
     let actions_available = matches && support.as_ref().is_some_and(|s| s.actions().is_some());
     let navigation = matches && support.as_ref().is_some_and(|s| s.navigation().is_some());
     let references = matches && support.as_ref().is_some_and(|s| s.references().is_some());
+    let reference = matches
+        && support
+            .as_ref()
+            .is_some_and(|s| s.reference_string().is_some());
     let rename = matches && support.as_ref().is_some_and(|s| s.rename().is_some());
     let format = matches && support.as_ref().is_some_and(|s| s.format().is_some());
     let diagram = matches && support.as_ref().is_some_and(|s| s.type_graph().is_some());
@@ -186,6 +196,7 @@ fn build(
     let mut entries = vec![
         entry("Cut", actions::CUT, true),
         entry("Copy", actions::COPY, true),
+        entry("Copy Reference", actions::COPY_REFERENCE, reference),
         entry("Paste", actions::PASTE, paste),
         entry("Paste from History...", actions::PASTE_HISTORY, history),
     ];
@@ -298,6 +309,29 @@ fn build(
     ));
     entries.push(MenuEntry::separator());
     entries.push(entry("Comment Line", actions::TOGGLE_COMMENT, true));
+    entries.push(entry("Column Selection Mode", actions::COLUMN_MODE, true));
+    entries.push(MenuEntry::separator());
+    entries.push(MenuEntry::submenu(
+        "Folding",
+        vec![
+            entry("Expand", actions::UNFOLD, true),
+            entry("Collapse", actions::FOLD, true),
+            entry("Expand All", actions::UNFOLD_ALL, true),
+            entry("Collapse All", actions::FOLD_ALL, true),
+        ],
+    ));
+    // Analyze Stack Trace opens on the text of the user, so it needs no language.
+    let stack_workspace = workspace.clone();
+    entries.push(MenuEntry::new(
+        "Analyze Stack Trace...",
+        move |window, cx| {
+            stack_workspace
+                .update(cx, |workspace, cx| {
+                    workspace.run_command("workspace.analyze_stack_trace", window, cx);
+                })
+                .ok();
+        },
+    ));
     entries.push(entry("Show Diagram", actions::SHOW_DIAGRAM, diagram));
     entries.push(entry(
         "Generate Sequence Diagram",

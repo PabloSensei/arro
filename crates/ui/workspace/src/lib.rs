@@ -15,6 +15,7 @@ mod native_menu;
 mod pane;
 mod run;
 mod settings;
+mod split;
 mod window;
 
 mod about;
@@ -44,18 +45,22 @@ pub use launch::{
     AppInfo, Launch, StartContext, choose_platform_keymap, run, spawn_path, spawn_path_taking_over,
     spawn_project, start_context,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use layout::load_layout;
 pub use layout::{DockState, Layout, PaneState, WindowPlacement};
 pub use native_menu::ScreenMenus;
 pub use run::{DebugControls, DebugRunState, RunControls, RunState};
 pub use settings::{
     COMPLETION_DELAY_STEP_MS, CompletionCase, DEFAULT_DATABASE_PAGE_ROWS,
-    DEFAULT_HTTP_TIMEOUT_SECONDS, DEFAULT_RIGHT_MARGIN, DefaultLayout, GitUpdateMethod,
-    InlayParameterNames, LINE_SPACING_STEP, MAX_COMPLETION_DELAY_MS, MAX_DATABASE_PAGE_ROWS,
-    MAX_FONT_SIZE, MAX_HTTP_TIMEOUT_SECONDS, MAX_INDENT_SIZE, MAX_LINE_SPACING, MAX_RIGHT_MARGIN,
-    MAX_UI_SCALE, MIN_FONT_SIZE, MIN_LINE_SPACING, MIN_RIGHT_MARGIN, MIN_UI_SCALE,
-    McpExecutePermission, RIGHT_MARGIN_STEP, ReformatScope, SETTINGS_FILE, Settings,
-    SqlKeywordCase, TrimTrailingWhitespace, UI_SCALE_STEP,
+    DEFAULT_HTTP_TIMEOUT_SECONDS, DEFAULT_RIGHT_MARGIN, DefaultLayout, DiffHighlighting,
+    DiffWhitespace, GitUpdateMethod, InlayParameterNames, LINE_SPACING_STEP,
+    MAX_COMPLETION_DELAY_MS, MAX_DATABASE_PAGE_ROWS, MAX_DIFF_CONTEXT_LINES, MAX_FONT_SIZE,
+    MAX_HTTP_TIMEOUT_SECONDS, MAX_INDENT_SIZE, MAX_LINE_SPACING, MAX_RIGHT_MARGIN, MAX_UI_SCALE,
+    MIN_FONT_SIZE, MIN_LINE_SPACING, MIN_RIGHT_MARGIN, MIN_UI_SCALE, McpExecutePermission,
+    RIGHT_MARGIN_STEP, ReformatScope, SETTINGS_FILE, Settings, SqlKeywordCase,
+    TrimTrailingWhitespace, UI_SCALE_STEP,
 };
+pub use split::SplitLayout;
 pub use window::{
     AI_CLIENTS, AI_TOOL, BEANS_TOOL, BOOKMARKS_POPUP, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP,
     COMMIT_TOOL, COVERAGE_TOOL, CloseTab, CommandFn, DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL,

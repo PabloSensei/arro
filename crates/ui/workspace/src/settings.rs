@@ -30,6 +30,8 @@ const DEFAULT_LINE_SPACING: f32 = 1.;
 pub const MAX_INDENT_SIZE: f32 = 16.;
 /// The longest wait before the completion list opens on its own, in milliseconds.
 pub const MAX_COMPLETION_DELAY_MS: u32 = 5000;
+/// The most unchanged lines the diff keeps around a change.
+pub const MAX_DIFF_CONTEXT_LINES: u32 = 100;
 /// The column of the right margin: the width of the centred text of Distraction Free
 /// Mode, in characters.
 pub const DEFAULT_RIGHT_MARGIN: u32 = 120;
@@ -73,6 +75,80 @@ impl TrimTrailingWhitespace {
             TrimTrailingWhitespace::None => TrimTrailingWhitespace::Modified,
             TrimTrailingWhitespace::Modified => TrimTrailingWhitespace::All,
             TrimTrailingWhitespace::All => TrimTrailingWhitespace::None,
+        }
+    }
+}
+
+/// What the diff leaves out of the comparison of two lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffWhitespace {
+    /// Every character counts.
+    #[default]
+    DoNotIgnore,
+    /// The spaces at both ends of a line do not count.
+    Trim,
+    /// No whitespace inside a line counts either.
+    Ignore,
+    /// No whitespace counts, and lines that hold nothing but whitespace do not count.
+    IgnoreAndEmptyLines,
+}
+
+impl DiffWhitespace {
+    pub fn label(self) -> &'static str {
+        match self {
+            DiffWhitespace::DoNotIgnore => "Do not ignore",
+            DiffWhitespace::Trim => "Trim whitespaces",
+            DiffWhitespace::Ignore => "Ignore whitespaces",
+            DiffWhitespace::IgnoreAndEmptyLines => "Ignore whitespaces and empty lines",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            DiffWhitespace::DoNotIgnore => DiffWhitespace::Trim,
+            DiffWhitespace::Trim => DiffWhitespace::Ignore,
+            DiffWhitespace::Ignore => DiffWhitespace::IgnoreAndEmptyLines,
+            DiffWhitespace::IgnoreAndEmptyLines => DiffWhitespace::DoNotIgnore,
+        }
+    }
+}
+
+/// What a diff marks inside the lines it shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffHighlighting {
+    /// Only whole lines.
+    ByLine,
+    /// The words that differ inside a changed line.
+    #[default]
+    ByWord,
+    /// The words that differ, with a changed line split into its removed and added parts.
+    SplitChanges,
+    /// The characters that differ.
+    ByCharacter,
+    /// Nothing.
+    None,
+}
+
+impl DiffHighlighting {
+    pub fn label(self) -> &'static str {
+        match self {
+            DiffHighlighting::ByLine => "By line",
+            DiffHighlighting::ByWord => "By word",
+            DiffHighlighting::SplitChanges => "Split changes",
+            DiffHighlighting::ByCharacter => "By character",
+            DiffHighlighting::None => "Do not highlight",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            DiffHighlighting::ByLine => DiffHighlighting::ByWord,
+            DiffHighlighting::ByWord => DiffHighlighting::SplitChanges,
+            DiffHighlighting::SplitChanges => DiffHighlighting::ByCharacter,
+            DiffHighlighting::ByCharacter => DiffHighlighting::None,
+            DiffHighlighting::None => DiffHighlighting::ByLine,
         }
     }
 }
@@ -287,9 +363,9 @@ pub struct Settings {
     pub editor_font_family: String,
     /// Distance between two editor lines, as a share of the font size, from 1 to 2.
     pub line_spacing: f32,
-    /// Long lines wrap at the edge of the editor. Kept for the editor; not drawn yet.
+    /// Long lines wrap at the edge of the editor, in every editor of the window.
     pub soft_wrap: bool,
-    /// Show spaces and tabs as marks. Kept for the editor; not drawn yet.
+    /// Spaces and tabs show as marks, in every editor of the window.
     pub show_whitespace: bool,
     /// The line numbers in the gutter of the editor.
     pub show_line_numbers: bool,
@@ -435,6 +511,20 @@ pub struct Settings {
     pub terminal_confirm_multiline_paste: bool,
     /// The diff shows the two versions side by side rather than as one list.
     pub diff_side_by_side: bool,
+    /// What the diff leaves out of the comparison of two lines.
+    pub diff_whitespace: DiffWhitespace,
+    /// What the diff marks inside the lines it shows.
+    pub diff_highlighting: DiffHighlighting,
+    /// A scroll of one pane of the diff moves the other one.
+    pub diff_synchronize_scrolling: bool,
+    /// The diff shows the numbers of the lines in the gutter.
+    pub diff_show_line_numbers: bool,
+    /// Long lines of the diff wrap at the edge of the pane.
+    pub diff_soft_wrap: bool,
+    /// Unchanged lines around a change the diff keeps in sight, on each side.
+    pub diff_context_lines: u32,
+    /// The diff folds the unchanged lines away.
+    pub diff_collapse_unchanged: bool,
     /// The branch popup groups local and remote branches by the folders of their names.
     pub git_group_by_directory: bool,
     /// How long an HTTP request may take before it is stopped, in seconds.
@@ -453,6 +543,10 @@ pub struct Settings {
     /// The project tree selects the file of every tab that becomes active, as the Always
     /// Select Opened File switch of its view options says.
     pub project_always_select_opened_file: bool,
+    /// The project tree shows a chain of folders that have one subfolder each as one row,
+    /// `com.example.demo` below a source root and `a/b/c` elsewhere, as the Compact Middle
+    /// Packages switch of its view options says.
+    pub project_compact_middle_packages: bool,
     /// The AI features of the window are on: Ask AI, Fix with AI and Explain with AI
     /// offer the problem at hand to the agent. The AI Sessions window itself stays.
     pub ai_enabled: bool,
@@ -555,6 +649,13 @@ impl Default for Settings {
             terminal_environment: String::new(),
             terminal_confirm_multiline_paste: true,
             diff_side_by_side: true,
+            diff_whitespace: DiffWhitespace::DoNotIgnore,
+            diff_highlighting: DiffHighlighting::ByWord,
+            diff_synchronize_scrolling: true,
+            diff_show_line_numbers: true,
+            diff_soft_wrap: false,
+            diff_context_lines: 3,
+            diff_collapse_unchanged: false,
             git_group_by_directory: true,
             http_timeout_seconds: DEFAULT_HTTP_TIMEOUT_SECONDS,
             kubectl_path: String::new(),
@@ -563,6 +664,7 @@ impl Default for Settings {
             sql_keyword_case: SqlKeywordCase::Upper,
             sql_script_stop_on_error: true,
             project_always_select_opened_file: false,
+            project_compact_middle_packages: true,
             ai_enabled: true,
             mcp_enabled: true,
             mcp_binary: String::new(),
@@ -673,6 +775,7 @@ impl Settings {
         self.indent_size = self.indent_size.clamp(1, MAX_INDENT_SIZE as u32);
         self.right_margin = self.right_margin.clamp(MIN_RIGHT_MARGIN, MAX_RIGHT_MARGIN);
         self.completion_delay_ms = self.completion_delay_ms.min(MAX_COMPLETION_DELAY_MS);
+        self.diff_context_lines = self.diff_context_lines.min(MAX_DIFF_CONTEXT_LINES);
         self.http_timeout_seconds = self.http_timeout_seconds.clamp(1, MAX_HTTP_TIMEOUT_SECONDS);
         self
     }
@@ -808,6 +911,20 @@ mod tests {
             !Settings::load_with_theme_choice(&dir.join("missing.json"), true).theme_sync_with_os,
             "a start without a settings file keeps the chosen theme too"
         );
+    }
+
+    #[test]
+    fn the_compact_middle_packages_switch_is_on_by_default_and_saved_when_off() {
+        let dir = test_support::scratch("settings-compact-packages");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, "{}").unwrap();
+        assert!(Settings::load(&file).project_compact_middle_packages);
+        let off = Settings {
+            project_compact_middle_packages: false,
+            ..Settings::default()
+        };
+        off.save(&file).unwrap();
+        assert!(!Settings::load(&file).project_compact_middle_packages);
     }
 
     #[test]

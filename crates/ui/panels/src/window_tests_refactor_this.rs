@@ -44,7 +44,7 @@ impl SyntaxProvider for NoSyntax {
 }
 
 /// The language of the test: every answer is set, no process runs.
-struct RefactorLanguage {
+pub(crate) struct RefactorLanguage {
     syntax: NoSyntax,
     actions: Mutex<Vec<ActionEntry>>,
     form: Mutex<Option<ActionParameters>>,
@@ -53,7 +53,7 @@ struct RefactorLanguage {
 }
 
 impl RefactorLanguage {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             syntax: NoSyntax(Queries::default()),
             actions: Mutex::new(Vec::new()),
@@ -166,7 +166,7 @@ fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     root
 }
 
-fn open_window(
+pub(crate) fn open_window(
     cx: &mut TestAppContext,
     root: PathBuf,
     language: Arc<RefactorLanguage>,

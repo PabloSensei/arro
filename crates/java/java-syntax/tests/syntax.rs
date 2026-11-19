@@ -215,3 +215,74 @@ fn a_plain_block_comment_is_a_comment() {
         Some(HighlightKind::Comment)
     );
 }
+
+/// The units of Move Statement of a text, from the caret with a neighbour `forward`.
+fn move_units<'a>(
+    snapshot: &syntax::Tree,
+    text: &'a str,
+    caret: usize,
+    forward: bool,
+) -> (Vec<&'a str>, usize) {
+    let config = java_syntax::config();
+    let query =
+        tree_sitter::Query::new(&config.grammar, config.move_units).expect("the query compiles");
+    let (units, index) =
+        syntax::unit_siblings(snapshot, &query, text.as_bytes(), caret..caret, forward)
+            .expect("the caret is in a unit with a neighbour");
+    (
+        units
+            .into_iter()
+            .map(|range| &text[range])
+            .collect::<Vec<_>>(),
+        index,
+    )
+}
+
+#[test]
+fn move_units_are_the_statements_of_a_block() {
+    let text = "class A {\n    void a() {\n        one();\n        two();\n    }\n}\n";
+    let (_service, receiver, _) = parse(text);
+    let snapshot = wait(&receiver);
+    let caret = text.find("one()").unwrap();
+    let (units, index) = move_units(&snapshot.tree, text, caret, true);
+    assert_eq!(units[index], "one();");
+    assert_eq!(units[index + 1], "two();");
+    let (units, index) = move_units(&snapshot.tree, text, text.find("two()").unwrap(), false);
+    assert_eq!(units[index], "two();");
+    assert_eq!(units[index - 1], "one();");
+}
+
+#[test]
+fn a_statement_at_the_end_of_a_block_has_no_neighbour() {
+    let text = "class A {\n    void a() {\n        one();\n    }\n    void b() {}\n}\n";
+    let (_service, receiver, _) = parse(text);
+    let snapshot = wait(&receiver);
+    let config = java_syntax::config();
+    let query = tree_sitter::Query::new(&config.grammar, config.move_units).unwrap();
+    let caret = text.find("one()").unwrap();
+    assert!(
+        syntax::unit_siblings(&snapshot.tree, &query, text.as_bytes(), caret..caret, true)
+            .is_none(),
+        "the last statement does not take its method with it"
+    );
+}
+
+#[test]
+fn move_units_are_the_members_of_a_class() {
+    let text = "class A {\n    int one;\n    int two;\n}\n";
+    let (_service, receiver, _) = parse(text);
+    let snapshot = wait(&receiver);
+    let (units, index) = move_units(&snapshot.tree, text, text.find("int one").unwrap(), true);
+    assert_eq!(units[index], "int one;");
+    assert_eq!(units[index + 1], "int two;");
+}
+
+#[test]
+fn move_units_are_the_arguments_of_a_call() {
+    let text = "class A {\n    void a() {\n        f(first, second);\n    }\n}\n";
+    let (_service, receiver, _) = parse(text);
+    let snapshot = wait(&receiver);
+    let (units, index) = move_units(&snapshot.tree, text, text.find("first").unwrap(), true);
+    assert_eq!(units[index], "first");
+    assert_eq!(units[index + 1], "second");
+}

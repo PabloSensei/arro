@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use base::Cancel;
 use dap_client::{
     BreakpointSpec, DebugService, DebugSessionToken, Debugger, Launch, OutputLine, ReloadOutcome,
     Snapshot, output_sender,
 };
 use jdtls_adapter::Autobuild;
+use lang_api::{Answer, Confidence, DebugProcess, Provider, Reply, SourceId};
 use lsp_client::lsp_types::Uri;
 use lsp_client::uri::file_uri;
 use platform::CanonPath;
@@ -344,6 +346,35 @@ fn collect_classes(directory: &Path, since: SystemTime, found: &mut Vec<PathBuf>
         if written.is_ok_and(|written| written >= since) {
             found.push(path);
         }
+    }
+}
+
+/// The processes of the machine that listen for a debugger, for Attach to Process. The
+/// scan runs on a thread of its own: the window only gets the list when it is ready.
+pub(crate) struct DebugProcesses;
+
+pub(crate) static DEBUG_PROCESSES: DebugProcesses = DebugProcesses;
+
+/// Where the list of the attachable processes comes from.
+const ATTACH_SOURCE: SourceId = SourceId::new("java-attach");
+
+impl Provider<(), Vec<DebugProcess>> for DebugProcesses {
+    fn start(&self, _: (), cancel: Cancel, mut reply: Reply<Vec<DebugProcess>>) {
+        thread::spawn(move || {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let processes = java_exec::debug_attach_processes()
+                .into_iter()
+                .map(|process| DebugProcess {
+                    pid: process.pid,
+                    name: process.name,
+                    host: process.host,
+                    port: process.port,
+                })
+                .collect();
+            let _ = reply.send(Answer::new(processes, Confidence::Certain, ATTACH_SOURCE));
+        });
     }
 }
 

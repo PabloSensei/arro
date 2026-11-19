@@ -25,12 +25,15 @@ use workspace::{
 
 use crate::index::ProjectIndex;
 use crate::navigation;
+use crate::preview::{self, FilePreview, PreviewTarget};
 use crate::settings::SettingsView;
 use crate::settings_catalog::{self, SettingKind};
 
 const CONTEXT: &str = "SearchEverywhere";
 const WIDTH: f32 = 702.;
 const HEIGHT: f32 = 600.;
+/// The width of the preview right of the list of the palette.
+const PREVIEW_WIDTH: f32 = 330.;
 const GROUP_ROWS: usize = 5;
 const MAX_ROWS: usize = 200;
 
@@ -290,6 +293,12 @@ pub struct Palette {
     /// reads the rows: only the last answer of a group may still change them.
     pending_replies: usize,
     tasks: Vec<Task<()>>,
+    /// The preview of the selected row, right of the list.
+    preview: Entity<FilePreview>,
+    /// The Preview button of the header shows it.
+    preview_open: bool,
+    /// The state folder that remembers the button.
+    store: Option<Arc<store::Store>>,
     /// How many times the popup asked the window for a frame, for a test of typing.
     #[cfg(test)]
     pub(crate) frames_asked: usize,
@@ -334,6 +343,9 @@ impl Palette {
         let weak = cx.weak_entity();
         let icons = workspace.icons().clone();
         let edited_only = mode == Mode::RecentChanged;
+        let store = workspace.store();
+        let preview_open = preview::load(store.as_deref(), project.root.as_path()).palette;
+        let preview = cx.new(|_| FilePreview::default());
         let view = cx.new(|cx| {
             let mut palette = Self {
                 project,
@@ -357,6 +369,9 @@ impl Palette {
                 navigated: false,
                 pending_replies: 0,
                 tasks: Vec::new(),
+                preview,
+                preview_open,
+                store,
                 #[cfg(test)]
                 frames_asked: 0,
             };
@@ -880,6 +895,7 @@ impl Palette {
                 _ => first,
             },
         };
+        self.show_selected_preview(cx);
         cx.notify();
     }
 
@@ -978,6 +994,78 @@ impl Palette {
         self.rebuild(cx);
     }
 
+    /// Whether this mode has a preview: the lists of files and symbols that belong to
+    /// the project. The commands, the settings and the tool windows have no file.
+    fn preview_applies(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Everywhere(_) | Mode::Recent | Mode::RecentChanged
+        )
+    }
+
+    /// The file of the selected row: the file itself, or the one its symbol stands in.
+    fn selected_target(&self) -> Option<PreviewTarget> {
+        match self.rows.get(self.selected)?.item.as_ref()? {
+            Item::File { path, spot } => Some(match *spot {
+                Some(spot) => PreviewTarget::at(path.clone(), spot),
+                None => PreviewTarget::file(path.clone()),
+            }),
+            Item::Symbol(row) => match &row.target {
+                Target::Offset { path, offset } => {
+                    Some(PreviewTarget::at(path.clone(), Spot::Offset(*offset)))
+                }
+                Target::Line { path, line, column } => Some(PreviewTarget::at(
+                    path.clone(),
+                    Spot::Line {
+                        line: *line,
+                        column: *column,
+                    },
+                )),
+                Target::Uri(_) => None,
+            },
+            Item::Declaration { offset } => {
+                let (path, _) = self.structure.as_ref()?;
+                Some(PreviewTarget::at(path.clone(), Spot::Offset(*offset)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Shows the file of the selected row in the preview, or nothing when the Preview
+    /// button is off or the row has no file.
+    fn show_selected_preview(&mut self, cx: &mut Context<Self>) {
+        let target = (self.preview_open && self.preview_applies())
+            .then(|| self.selected_target())
+            .flatten();
+        self.preview
+            .update(cx, |preview, cx| preview.show(target, cx));
+    }
+
+    /// The Preview button of the header: the preview right of the list appears or goes
+    /// away, and the state folder remembers the choice.
+    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_open = !self.preview_open;
+        preview::save_palette(
+            self.store.as_deref(),
+            self.project.root.as_path(),
+            self.preview_open,
+        );
+        self.show_selected_preview(cx);
+        cx.notify();
+    }
+
+    /// The preview right of the list, for a test.
+    #[cfg(test)]
+    pub(crate) fn preview(&self) -> &Entity<FilePreview> {
+        &self.preview
+    }
+
+    /// Whether the Preview button is on, for a test.
+    #[cfg(test)]
+    pub(crate) fn preview_open(&self) -> bool {
+        self.preview_open
+    }
+
     /// Tab, Shift+Tab and the arrow keys: the Switcher walks its list, the other lists
     /// of Search Everywhere keep Tab for their tabs.
     fn iterate(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1051,6 +1139,7 @@ impl Palette {
         self.selected = header + 1;
         self.navigated = true;
         self.scroll.scroll_to_item(self.selected);
+        self.show_selected_preview(cx);
         cx.notify();
     }
 
@@ -1069,6 +1158,7 @@ impl Palette {
             }
         }
         self.scroll.scroll_to_item(self.selected);
+        self.show_selected_preview(cx);
         cx.notify();
     }
 
@@ -1118,6 +1208,7 @@ impl Palette {
             }
         }
         self.scroll.scroll_to_item(self.selected);
+        self.show_selected_preview(cx);
         cx.notify();
     }
 
@@ -1374,6 +1465,13 @@ impl Render for Palette {
             Mode::ChooseRun { debug: true } => Some("Choose Debug Configuration"),
             Mode::Everywhere(_) => None,
         };
+        let preview_button = (self.preview_applies() && !collapsed).then(|| {
+            let open = self.preview_open;
+            icon_button("palette-preview", "general/show", "Preview", None, &theme)
+                .debug_selector(|| "palette-preview".to_owned())
+                .when(open, |this| this.bg(theme.selection))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
+        });
         let chips = div()
             .flex()
             .items_center()
@@ -1459,13 +1557,15 @@ impl Render for Palette {
                 div()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .flex_none()
                     .h(px(42.))
                     .px(px(SPACE_XS))
                     .child(match heading {
                         Some(title) => div().px(px(ROW_PADDING_X)).child(title).into_any_element(),
                         None => chips.into_any_element(),
-                    }),
+                    })
+                    .children(preview_button),
             )
             .child(
                 div()
@@ -1524,30 +1624,46 @@ impl Render for Palette {
                 },
             )
             .when(!collapsed, |this| {
-                this.child(
-                    scrollable(
-                        "palette-list",
-                        &self.scroll,
-                        div()
-                            .id("palette-list")
-                            .flex()
-                            .flex_col()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .children(rows)
-                            .when(empty, |this| {
-                                this.items_center()
-                                    .justify_center()
-                                    .text_color(theme.text_secondary)
-                                    .child("Nothing found")
-                            }),
-                        &theme,
-                        window,
-                        cx,
-                    )
-                    .flex_1()
-                    .min_h_0(),
+                let list = scrollable(
+                    "palette-list",
+                    &self.scroll,
+                    div()
+                        .id("palette-list")
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .children(rows)
+                        .when(empty, |this| {
+                            this.items_center()
+                                .justify_center()
+                                .text_color(theme.text_secondary)
+                                .child("Nothing found")
+                        }),
+                    &theme,
+                    window,
+                    cx,
                 )
+                .flex_1()
+                .min_h_0();
+                if self.preview_open && self.preview_applies() {
+                    this.child(
+                        div().flex().flex_1().min_h_0().w_full().child(list).child(
+                            div()
+                                .id("palette-preview-box")
+                                .debug_selector(|| "palette-preview-box".to_owned())
+                                .flex_none()
+                                .w(px(PREVIEW_WIDTH))
+                                .h_full()
+                                .overflow_hidden()
+                                .border_l_1()
+                                .border_color(theme.border)
+                                .child(self.preview.clone()),
+                        ),
+                    )
+                } else {
+                    this.child(list)
+                }
             });
 
         div()

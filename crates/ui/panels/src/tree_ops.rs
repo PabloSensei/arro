@@ -247,6 +247,52 @@ pub fn copy_name(name: &str, serial: usize) -> String {
     format!("{base}_{}{extension}", current + serial)
 }
 
+/// The name of a copy of `name` made while the same name is taken: `name (1).ext`, `name
+/// (2).ext`, as Ctrl+drag names it.
+pub fn numbered_name(name: &str, serial: usize) -> String {
+    let path = Path::new(name);
+    match (path.file_stem(), path.extension()) {
+        (Some(stem), Some(extension)) => format!(
+            "{} ({serial}).{}",
+            stem.to_string_lossy(),
+            extension.to_string_lossy()
+        ),
+        _ => format!("{name} ({serial})"),
+    }
+}
+
+/// Where a drop with Ctrl copies `from`: the same name in `target_folder`, or the first
+/// `name (N)` that is free there. A folder cannot be copied into itself or into its own
+/// folder. The existence of the places is checked here, so the panel calls this away from
+/// the window thread.
+pub fn plan_drop_copy(from: &Path, target_folder: &Path, folder: bool) -> Result<PathBuf, String> {
+    if folder && target_folder == from {
+        return Err("A folder cannot be copied into itself".into());
+    }
+    if folder && target_folder.starts_with(from) {
+        return Err("A folder cannot be copied into its own folder".into());
+    }
+    let name = from
+        .file_name()
+        .ok_or("The project folder cannot be copied")?
+        .to_string_lossy()
+        .into_owned();
+    let same = target_folder.join(&name);
+    if !same.exists() {
+        return Ok(same);
+    }
+    for serial in 1..=10_000 {
+        let to = target_folder.join(numbered_name(&name, serial));
+        if !to.exists() {
+            return Ok(to);
+        }
+    }
+    Err(format!(
+        "\"{name}\" has too many copies in {}",
+        target_folder.display()
+    ))
+}
+
 /// Where a paste of `from` into `target_folder` goes. A copy beside its source gets a
 /// numbered name; a cut beside its source does nothing. The existence of the place is
 /// checked here, so the panel calls this away from the window thread.
@@ -424,6 +470,36 @@ mod tests {
         assert_eq!(renamed(path, "B.txt").unwrap(), Path::new("/p/src/B.txt"));
         assert!(renamed(path, "x/y").is_err());
         assert!(renamed(Path::new("/"), "x").is_err());
+    }
+
+    #[test]
+    fn a_drop_copy_keeps_the_name_or_numbers_it_when_the_name_is_taken() {
+        assert_eq!(numbered_name("note.txt", 1), "note (1).txt");
+        assert_eq!(numbered_name("Makefile", 2), "Makefile (2)");
+        let root = test_support::scratch("drop-copy-names");
+        let from = root.join("note.txt");
+        std::fs::write(&from, "text").unwrap();
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(
+            plan_drop_copy(&from, &other, false).unwrap(),
+            other.join("note.txt"),
+            "a free name is kept"
+        );
+        assert_eq!(
+            plan_drop_copy(&from, &root, false).unwrap(),
+            root.join("note (1).txt"),
+            "the file holds its name in its own folder, so the copy is numbered"
+        );
+        std::fs::write(root.join("note (1).txt"), "copy").unwrap();
+        assert_eq!(
+            plan_drop_copy(&from, &root, false).unwrap(),
+            root.join("note (2).txt")
+        );
+        let folder = root.join("dir");
+        std::fs::create_dir_all(folder.join("inner")).unwrap();
+        assert!(plan_drop_copy(&folder, &folder, true).is_err());
+        assert!(plan_drop_copy(&folder, &folder.join("inner"), true).is_err());
     }
 
     #[test]

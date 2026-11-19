@@ -55,7 +55,7 @@ pub struct JavaSyntax {
 }
 
 impl JavaSyntax {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let config = java_syntax::config();
         let queries = Queries {
             highlights: config.highlights,
@@ -64,6 +64,12 @@ impl JavaSyntax {
             locals: "",
         };
         Self { queries }
+    }
+}
+
+impl Default for JavaSyntax {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -118,6 +124,21 @@ impl SyntaxProvider for JavaSyntax {
 
     fn first_type_offset(&self, text: &str) -> Option<usize> {
         java_syntax::first_type_offset(text)
+    }
+
+    fn complete_statement(
+        &self,
+        text: &str,
+        offset: usize,
+        indent_unit: &str,
+    ) -> Option<lang_api::StatementEdit> {
+        let edit = java_syntax::complete_statement(text, offset, indent_unit)?;
+        Some(lang_api::StatementEdit {
+            start: edit.start,
+            end: edit.end,
+            text: edit.text,
+            caret: edit.caret,
+        })
     }
 }
 
@@ -393,6 +414,10 @@ impl LanguageSupport for JavaProject {
 
     fn actions(&self) -> Option<&ActionProvider> {
         Some(&self.java_messages)
+    }
+
+    fn debug_processes(&self) -> Option<&lang_api::DebugProcessProvider> {
+        Some(&crate::debug::DEBUG_PROCESSES)
     }
 
     fn action_resolve(&self) -> Option<&lang_api::ActionResolveProvider> {

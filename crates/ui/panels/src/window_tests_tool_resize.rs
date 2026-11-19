@@ -272,6 +272,8 @@ fn fully_expand_opens_the_project_tree_down_to_the_depth_limit(cx: &mut TestAppC
     fs::write(root.join("main.txt"), "main\n").unwrap();
 
     let window = open_window(cx, root);
+    // The depth limit counts rows: the chain of these folders would be one compacted row.
+    crate::window_tests_project_compact::set_compact(cx, window, false);
     show_project(cx, window);
     press(cx, window, "numpad_multiply");
 

@@ -100,12 +100,12 @@ fn repackage(text: &str, package: &str) -> String {
 }
 
 /// The language of the window tests: a `class Name` declaration and a `package` line.
-struct TestLanguage {
+pub(crate) struct TestLanguage {
     syntax: NoSyntax,
 }
 
 impl TestLanguage {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             syntax: NoSyntax(Queries::default()),
         })
@@ -150,7 +150,7 @@ impl LanguageSupport for TestLanguage {
     }
 }
 
-fn open_language_window(
+pub(crate) fn open_language_window(
     cx: &mut TestAppContext,
     root: PathBuf,
     language: Arc<TestLanguage>,
@@ -210,7 +210,7 @@ fn open_language_window(
     })
 }
 
-fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
+pub(crate) fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let root = scratch(name);
     for (path, text) in files {
         let path = root.join(path);
@@ -238,7 +238,11 @@ fn focus_project(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     draw(cx, window);
 }
 
-fn shown(cx: &mut TestAppContext, window: WindowHandle<Workspace>, selector: &'static str) -> bool {
+pub(crate) fn shown(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    selector: &'static str,
+) -> bool {
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.debug_bounds(selector).is_some()
 }

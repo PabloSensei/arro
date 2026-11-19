@@ -8,7 +8,7 @@ use display_map::{Bias, DisplayChunk, DisplayMap, DisplayPoint, DisplaySnapshot,
 use keymap::editor as actions;
 use syntax::{
     HighlightSpan, LanguageConfig, Query, SyntaxSnapshot, Tree, enclosing_range, indent_after,
-    normalize_spans, shift_spans,
+    normalize_spans, shift_spans, unit_siblings,
 };
 use text_core::{
     Buffer, Change, Decoded, Edit, EditKind, EditSource, Followed, RopeStore, Selection,
@@ -137,6 +137,14 @@ struct Parsed {
     indents: Arc<Query>,
 }
 
+/// A rectangle of the column mode: both corners are a line and a column in characters.
+/// A column past the end of a line is the virtual space after it.
+#[derive(Clone, Copy, Debug)]
+struct Block {
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
+
 /// One document as the editor sees it.
 pub struct EditorState {
     buffer: Buffer,
@@ -181,6 +189,12 @@ pub struct EditorState {
     saved_text: String,
     /// The save rules of the window; `.editorconfig` wins over them.
     save: SaveOptions,
+    /// Alt+Shift+Insert: Shift+arrows take a rectangle of the text.
+    column_mode: bool,
+    /// The rectangle of the column mode while Shift+arrows move it.
+    block: Option<Block>,
+    /// The query of the units Move Statement moves, compiled from the language.
+    move_units: Option<Query>,
 }
 
 /// Edit places kept.
@@ -203,6 +217,55 @@ fn column_of_char(text: &str, chars: usize) -> usize {
     text.char_indices()
         .nth(chars)
         .map_or(text.len(), |(at, _)| at)
+}
+
+/// Where Ctrl+W grows a selection in a file without a parse: the line, then the
+/// paragraph between empty lines, then the whole file.
+fn selection_step(store: &RopeStore, current: Range<usize>, head: usize) -> Range<usize> {
+    let file = 0..store.len();
+    if current.is_empty() {
+        let word = commands::word_at(store, head);
+        if !word.is_empty() {
+            return word;
+        }
+        return line_range(store, store.offset_to_line(head));
+    }
+    let line = store.offset_to_line(head);
+    let paragraph = paragraph_range(store, line);
+    for step in [line_range(store, line), paragraph, file.clone()] {
+        if step.start <= current.start && current.end <= step.end && step != current {
+            return step;
+        }
+    }
+    file
+}
+
+/// The line with its break, so that the step after it has more than the line.
+fn line_range(store: &RopeStore, line: usize) -> Range<usize> {
+    let start = store.line_to_offset(line);
+    let end = if line + 1 < store.line_count() {
+        store.line_to_offset(line + 1)
+    } else {
+        store.len()
+    };
+    start..end
+}
+
+/// The lines around `line` up to the empty ones.
+fn paragraph_range(store: &RopeStore, line: usize) -> Range<usize> {
+    let blank = |index: usize| store.line_text(index).trim().is_empty();
+    if blank(line) {
+        return line_range(store, line);
+    }
+    let mut first = line;
+    while first > 0 && !blank(first - 1) {
+        first -= 1;
+    }
+    let mut last = line;
+    while last + 1 < store.line_count() && !blank(last + 1) {
+        last += 1;
+    }
+    store.line_to_offset(first)..line_range(store, last).end
 }
 
 /// Moves the offset of a blame label with the text. Text inserted exactly at the offset
@@ -237,6 +300,10 @@ impl EditorState {
             .map_or("    ", |language| language.indent_unit);
         let indent =
             text_core::IndentSettings::resolve(&text_core::Properties::default(), text, unit);
+        let move_units = language
+            .as_ref()
+            .filter(|language| !language.move_units.is_empty())
+            .and_then(|language| Query::new(&language.grammar, language.move_units).ok());
         let mut map = DisplayMap::default();
         map.tab_size = indent.tab_width;
         Self {
@@ -264,12 +331,20 @@ impl EditorState {
             new_file: text.is_empty(),
             saved_text: text.to_owned(),
             save: SaveOptions::default(),
+            column_mode: false,
+            block: None,
+            move_units,
         }
     }
 
     /// Another view of the same document: the text and its undo history are shared, while
     /// the carets, folds, scroll and selections belong to this view alone.
     pub fn fork(&self) -> Self {
+        let move_units = self
+            .language
+            .as_ref()
+            .filter(|language| !language.move_units.is_empty())
+            .and_then(|language| Query::new(&language.grammar, language.move_units).ok());
         let mut map = DisplayMap::default();
         map.tab_size = self.map.tab_size;
         Self {
@@ -297,6 +372,9 @@ impl EditorState {
             new_file: self.new_file,
             saved_text: self.saved_text.clone(),
             save: self.save,
+            column_mode: self.column_mode,
+            block: None,
+            move_units,
         }
     }
 
@@ -849,6 +927,8 @@ impl EditorState {
         self.goal = None;
         self.grown.clear();
         self.marked = None;
+        // The text changed under the rectangle: its columns point at the text no more.
+        self.block = None;
         self.reveal();
         Some(change)
     }
@@ -912,6 +992,7 @@ impl EditorState {
     }
 
     fn select(&mut self, selections: SelectionSet) {
+        self.block = None;
         self.buffer.set_selections(selections);
         self.reveal();
     }
@@ -919,6 +1000,18 @@ impl EditorState {
     /// Runs an action by its keymap name. Returns the change to hand to the parser.
     pub fn perform(&mut self, action: &str, page_rows: usize) -> Option<Change> {
         self.catch_up();
+        // Only the keys that stretch the rectangle and Tab, which pads a short line up to
+        // its column, read the block; anything else starts from the carets alone.
+        if !matches!(
+            action,
+            actions::SELECT_UP
+                | actions::SELECT_DOWN
+                | actions::SELECT_LEFT
+                | actions::SELECT_RIGHT
+                | actions::TAB
+        ) {
+            self.block = None;
+        }
         let keeps_goal = matches!(
             action,
             actions::MOVE_UP
@@ -1047,7 +1140,9 @@ impl EditorState {
                 return self.finish(change);
             }
             actions::BACKSPACE => {
-                return self.edit(|buffer| commands::backspace(buffer, EditSource::User));
+                let indent = self.indent.clone();
+                return self
+                    .edit(|buffer| commands::backspace_indent(buffer, &indent, EditSource::User));
             }
             actions::DELETE => {
                 return self.edit(|buffer| commands::delete_forward(buffer, EditSource::User));
@@ -1077,7 +1172,7 @@ impl EditorState {
                 return self.edit(|buffer| editing::unindent(buffer, &unit, EditSource::User));
             }
             actions::AUTO_INDENT => return self.auto_indent(),
-            actions::COMPLETE_STATEMENT => return self.complete_statement(),
+            actions::COMPLETE_STATEMENT => return self.complete_statement(Vec::new()),
             actions::START_LINE => return self.start_line(false),
             actions::START_LINE_ABOVE => return self.start_line(true),
             actions::JOIN_LINES => {
@@ -1118,6 +1213,10 @@ impl EditorState {
             return None;
         }
         let text = normalize_newlines(text);
+        if self.block.is_some() {
+            let change = self.block_insert(&text, EditKind::Command);
+            return self.finish(change);
+        }
         if self.overwrite && text.chars().count() == 1 && !text.contains('\n') {
             let (edits, after) = self.overwrite_edits(&text);
             return self.edit(|buffer| {
@@ -1131,7 +1230,15 @@ impl EditorState {
     /// line, and the indentation of the pasted block keeps its own shape above that.
     pub fn paste(&mut self, text: &str) -> Option<Change> {
         self.catch_up();
-        if self.is_read_only() || text.is_empty() || !text.contains(['\n', '\r']) {
+        if self.is_read_only() || text.is_empty() {
+            return None;
+        }
+        if self.block.is_some() {
+            let text = normalize_newlines(text);
+            let change = self.block_insert(&text, EditKind::Command);
+            return self.finish(change);
+        }
+        if !text.contains(['\n', '\r']) {
             return self.type_text(text);
         }
         let text = normalize_newlines(text);
@@ -1142,7 +1249,7 @@ impl EditorState {
         self.edit(|buffer| commands::insert(buffer, &pasted, EditSource::User))
     }
 
-    fn indent_unit(&self) -> &str {
+    pub(crate) fn indent_unit(&self) -> &str {
         &self.indent.unit
     }
 
@@ -1277,18 +1384,34 @@ impl EditorState {
         (parsed, self.indent.unit.clone())
     }
 
-    /// Ctrl+Shift+Enter, by the rules of the language.
-    fn complete_statement(&mut self) -> Option<Change> {
+    /// Ctrl+Shift+Enter, by the rules of the language. `plans` holds one plan per caret,
+    /// in the order of the carets; a caret a language gave no plan for finishes its line
+    /// by the rules alone.
+    pub(crate) fn complete_statement(
+        &mut self,
+        plans: Vec<Option<editing::StatementPlan>>,
+    ) -> Option<Change> {
         let rules = self.language.as_ref()?.statements?;
         let unit = self.indent_unit().to_owned();
         self.edit(|buffer| {
-            editing::complete_statement(
-                buffer,
-                rules.terminator,
-                rules.block_words,
-                &unit,
-                EditSource::User,
-            )
+            let store = buffer.snapshot();
+            let plans = buffer
+                .selections()
+                .iter()
+                .zip(plans.into_iter().chain(std::iter::repeat(None)))
+                .map(|(selection, plan)| {
+                    plan.unwrap_or_else(|| {
+                        editing::line_statement_plan(
+                            &store,
+                            selection,
+                            rules.terminator,
+                            rules.block_words,
+                            &unit,
+                        )
+                    })
+                })
+                .collect();
+            editing::apply_statement_plans(buffer, plans, EditSource::User)
         })
     }
 
@@ -1561,73 +1684,41 @@ impl EditorState {
         self.reveal();
     }
 
-    /// Ctrl+Shift+Up and Ctrl+Shift+Down: the statement, member or whole block moves
-    /// past its neighbour and never leaves its own block.
+    /// Ctrl+Shift+Up and Ctrl+Shift+Down: the statement, member or whole block under
+    /// every caret moves past its neighbour and never leaves its own block. The language
+    /// query names the units; without one the braces of the text do. One undo step.
     fn move_statement(&mut self, down: bool) -> Option<Change> {
         let store = self.buffer.snapshot();
         let text = store.text();
         let pairs = brace_pairs(&text);
         let selections = self.buffer.selections().clone();
-        let primary = selections.primary().range();
-        let block = containing_block(&pairs, primary.clone())?;
-        let units = units_in(&text, &pairs, block);
-        if units.is_empty() {
+        let tree = self
+            .parsed
+            .as_ref()
+            .filter(|parsed| parsed.version == self.buffer.version())
+            .map(|parsed| &parsed.tree);
+        let plans = statement_plans(
+            &text,
+            &pairs,
+            tree,
+            self.move_units.as_ref(),
+            &selections,
+            down,
+        );
+        if plans.is_empty() {
             return None;
         }
-        let touches = |unit: &Range<usize>| {
-            if primary.start == primary.end {
-                unit.start <= primary.start
-                    && (primary.start < unit.end || primary.start == text.len())
-            } else {
-                unit.start < primary.end && primary.start < unit.end
-            }
-        };
-        let first = units.iter().position(touches)?;
-        let last = units.iter().rposition(touches)?;
-        let moving_start = units[first].start;
-        let moving_end = units[last].end;
-        let (other, replacement, shift) = if down {
-            let next = units.get(last + 1)?;
-            let between = &text[moving_end..next.start];
-            let moving = &text[moving_start..moving_end];
-            let other = &text[next.start..next.end];
-            (
-                next.clone(),
-                format!("{other}{between}{moving}"),
-                (other.len() + between.len()) as isize,
-            )
-        } else {
-            let previous = units.get(first.checked_sub(1)?)?;
-            let between = &text[previous.end..moving_start];
-            let moving = &text[moving_start..moving_end];
-            let other = &text[previous.start..previous.end];
-            (
-                previous.clone(),
-                format!("{moving}{between}{other}"),
-                -((other.len() + between.len()) as isize),
-            )
-        };
-        let range = if down {
-            moving_start..other.end
-        } else {
-            other.start..moving_end
-        };
-        let shift_offset = |at: usize| {
-            if moving_start <= at && at <= moving_end {
-                (at as isize + shift) as usize
-            } else {
-                at
-            }
-        };
         let after = selections.map(|selection| {
-            Selection::new(shift_offset(selection.anchor), shift_offset(selection.head))
+            let moved = |at: usize| plans.iter().find_map(|plan| plan.moved(at)).unwrap_or(at);
+            Selection::new(moved(selection.anchor), moved(selection.head))
         });
-        let change = self.buffer.apply(
-            vec![Edit::new(range, replacement)],
-            Some(after),
-            EditSource::User,
-            EditKind::Command,
-        );
+        let edits = plans
+            .into_iter()
+            .map(|plan| Edit::new(plan.range, plan.replacement))
+            .collect();
+        let change = self
+            .buffer
+            .apply(edits, Some(after), EditSource::User, EditKind::Command);
         self.finish(change)
     }
 
@@ -1707,6 +1798,9 @@ impl EditorState {
     }
 
     fn move_horizontally(&mut self, forward: bool, extend: bool) {
+        if extend && self.column_mode {
+            return self.extend_block_columns(forward);
+        }
         let store = self.buffer.snapshot();
         let map = &self.map;
         let moved = self.buffer.selections().map(|selection| {
@@ -1733,6 +1827,9 @@ impl EditorState {
     }
 
     fn move_rows(&mut self, rows: isize, extend: bool) {
+        if extend && self.column_mode {
+            return self.extend_block_rows(rows);
+        }
         let display = self.map.snapshot_owned(self.buffer.store());
         let primary = display.to_display(self.buffer.selections().primary().head);
         let goal = self
@@ -1756,6 +1853,85 @@ impl EditorState {
         });
         self.goal = Some(goal);
         self.buffer.set_selections(moved);
+    }
+
+    /// Shift+Up and Shift+Down in the column mode: the rectangle grows or shrinks a line
+    /// at a time and keeps the column of its moving corner, so a short line takes a caret
+    /// after its end.
+    fn extend_block_rows(&mut self, rows: isize) {
+        let store = self.buffer.store();
+        let block = self.block.unwrap_or_else(|| {
+            let (line, column) = line_column_of(&store, self.buffer.selections().primary().head);
+            Block {
+                anchor: (line, column),
+                head: (line, column),
+            }
+        });
+        let last = store.line_count().saturating_sub(1) as isize;
+        let line = (block.head.0 as isize + rows).clamp(0, last) as usize;
+        let block = Block {
+            anchor: block.anchor,
+            head: (line, block.head.1),
+        };
+        self.block = Some(block);
+        self.goal = Some(block.head.1);
+        let selections = block_selections(&store, block.anchor, block.head);
+        self.buffer.set_selections(selections);
+        self.reveal();
+    }
+
+    /// Shift+Left and Shift+Right in the column mode: the moving corner goes a character
+    /// along its line and may stand in the virtual space after its end.
+    fn extend_block_columns(&mut self, forward: bool) {
+        let store = self.buffer.store();
+        let head = self.block.map_or_else(
+            || line_column_of(&store, self.buffer.selections().primary().head),
+            |block| block.head,
+        );
+        let column = if forward {
+            head.1 + 1
+        } else {
+            head.1.saturating_sub(1)
+        };
+        let block = Block {
+            anchor: self.block.map_or(head, |block| block.anchor),
+            head: (head.0, column),
+        };
+        self.block = Some(block);
+        let selections = block_selections(&store, block.anchor, block.head);
+        self.buffer.set_selections(selections);
+        self.reveal();
+    }
+
+    /// Typing over a rectangle: every line takes the text in its own place, and a line
+    /// shorter than the column of the rectangle gets the spaces that reach it first.
+    fn block_insert(&mut self, text: &str, kind: EditKind) -> Change {
+        let store = self.buffer.snapshot();
+        let selections = self.buffer.selections().clone();
+        let from = self
+            .block
+            .map_or(0, |block| block.anchor.1.min(block.head.1));
+        let mut edits = Vec::with_capacity(selections.len());
+        let mut carets = Vec::with_capacity(selections.len());
+        let mut shift = 0isize;
+        for selection in selections.iter() {
+            let line = store.offset_to_line(selection.start());
+            let length = store.line_text(line).chars().count();
+            let pad = from.saturating_sub(length);
+            let mut replacement = String::with_capacity(pad + text.len());
+            replacement.push_str(&" ".repeat(pad));
+            replacement.push_str(text);
+            let start = (selection.start() as isize + shift) as usize;
+            carets.push(Selection::caret(start + replacement.len()));
+            shift += replacement.len() as isize - (selection.end() - selection.start()) as isize;
+            edits.push(Edit::new(selection.range(), replacement));
+        }
+        self.buffer.apply(
+            edits,
+            Some(SelectionSet::from_vec(carets)),
+            EditSource::User,
+            kind,
+        )
     }
 
     /// Home goes to the first non-blank character, then to the column zero.
@@ -1807,15 +1983,17 @@ impl EditorState {
             .filter(|parsed| parsed.version == version)
             .map(|parsed| &parsed.tree);
         let grown = self.buffer.selections().map(|selection| {
-            let range = if selection.is_empty() {
-                let word = commands::word_at(&store, selection.head);
-                (!word.is_empty()).then_some(word)
-            } else {
-                None
+            let word = selection
+                .is_empty()
+                .then(|| commands::word_at(&store, selection.head));
+            let range = match (word.filter(|word| !word.is_empty()), tree) {
+                (Some(word), _) => word,
+                // A file without a parse still grows by its words, lines and paragraphs.
+                (None, None) => selection_step(&store, selection.range(), selection.head),
+                (None, Some(tree)) => {
+                    enclosing_range(tree, selection.range()).unwrap_or(0..store.len())
+                }
             };
-            let range = range
-                .or_else(|| tree.and_then(|tree| enclosing_range(tree, selection.range())))
-                .unwrap_or(0..store.len());
             Selection::new(range.start, range.end)
         });
         self.grown.push(self.buffer.selections().clone());
@@ -1824,6 +2002,7 @@ impl EditorState {
 
     fn clear_carets(&mut self) {
         let primary = self.buffer.selections().primary();
+        self.block = None;
         self.buffer
             .set_selections(SelectionSet::single(Selection::caret(primary.head)));
     }
@@ -1902,9 +2081,34 @@ impl EditorState {
         self.map.folds.unfold_at(offset);
     }
 
+    /// Hides the lines of `range` behind `placeholder`, as a diff does with the lines that
+    /// did not change.
+    pub fn collapse_lines(&mut self, range: Range<usize>, placeholder: String) {
+        self.collapse(Fold { range, placeholder });
+    }
+
+    /// Shows every line again, also the ones a caller hid rather than the parser.
+    pub fn clear_folds(&mut self) {
+        self.map.folds.clear();
+    }
+
     /// Insert replaces the character under the caret; the status bar says which mode.
     pub fn overwrite(&self) -> bool {
         self.overwrite
+    }
+
+    /// Whether Alt+Shift+Insert put the editor into the column selection mode.
+    pub fn column_mode(&self) -> bool {
+        self.column_mode
+    }
+
+    /// Toggles the column selection mode. Leaving it keeps the carets but forgets the
+    /// rectangle they came from.
+    pub fn toggle_column_mode(&mut self) {
+        self.column_mode = !self.column_mode;
+        if !self.column_mode {
+            self.block = None;
+        }
     }
 
     /// One typed character in overwrite mode: a selection is replaced, a caret replaces
@@ -2155,6 +2359,7 @@ impl EditorState {
     pub fn click(&mut self, offset: usize, extend: bool, add_caret: bool, count: usize) {
         self.goal = None;
         self.grown.clear();
+        self.block = None;
         let store = self.buffer.store();
         let range = match count {
             2 => commands::word_at(&store, offset),
@@ -2273,8 +2478,11 @@ impl EditorState {
         let text = normalize_newlines(text);
         let single = text.chars().count() == 1 && !mark;
         let typed = single.then(|| text.chars().next()).flatten();
-        let lone =
-            target.is_none() && single && self.buffer.selections().iter().all(Selection::is_empty);
+        let in_block = target.is_none() && self.block.is_some();
+        let lone = !in_block
+            && target.is_none()
+            && single
+            && self.buffer.selections().iter().all(Selection::is_empty);
         let start = lone.then(|| self.buffer.selections().primary().head);
         let change = match target {
             Some(range) => {
@@ -2288,6 +2496,7 @@ impl EditorState {
                     EditKind::Typing,
                 )
             }
+            None if in_block => self.block_insert(&text, EditKind::Typing),
             None if lone && self.overwrite => {
                 let (edits, after) = self.overwrite_edits(&text);
                 self.buffer
@@ -2356,6 +2565,7 @@ impl EditorState {
     }
 
     pub fn select_range(&mut self, range: Range<usize>) {
+        self.block = None;
         self.buffer
             .set_selections(SelectionSet::single(Selection::new(range.start, range.end)));
         self.reveal();
@@ -2363,6 +2573,7 @@ impl EditorState {
 
     /// Puts the primary caret at `offset`; with `extend` the selection keeps its anchor.
     pub fn select_to(&mut self, offset: usize, extend: bool) {
+        self.block = None;
         let selection = self.buffer.selections().primary();
         let kept = if extend {
             Selection::new(selection.anchor, offset)
@@ -2379,16 +2590,7 @@ impl EditorState {
 
     /// The offset of a 0-based line and column in characters, clamped to the text.
     pub fn offset_at(&self, line: usize, column: usize) -> usize {
-        let store = self.buffer.store();
-        let line = line.min(store.line_count().saturating_sub(1));
-        let start = store.line_to_offset(line);
-        let text = store.line_text(line);
-        let text = text.trim_end_matches(['\n', '\r']);
-        let within = text
-            .char_indices()
-            .nth(column)
-            .map_or(text.len(), |(at, _)| at);
-        start + within
+        offset_of_column(&self.buffer.store(), line, column)
     }
 
     /// Edits from outside the keyboard, such as Replace in Files. One undo step.
@@ -2413,6 +2615,218 @@ impl EditorState {
         let change = self.buffer.apply_batches(batches);
         self.finish(change)
     }
+}
+
+/// One swap of a move command: `moving` changes places with `other`, and the swap is one
+/// edit over the text from the first of them to the second.
+struct MovePlan {
+    range: Range<usize>,
+    replacement: String,
+    moving: Range<usize>,
+    other: Range<usize>,
+    down: bool,
+}
+
+impl MovePlan {
+    /// Where `at` lands after the swap, or `None` when the swap does not touch it.
+    fn moved(&self, at: usize) -> Option<usize> {
+        if at < self.range.start || at > self.range.end {
+            return None;
+        }
+        let moving = self.moving.len();
+        let other = self.other.len();
+        if self.down {
+            let between = self.other.start - self.moving.end;
+            if at <= self.moving.end {
+                Some(at + other + between)
+            } else if at < self.other.start {
+                Some(self.moving.start + other + (at - self.moving.end))
+            } else {
+                Some(self.moving.start + (at - self.other.start))
+            }
+        } else {
+            let between = self.moving.start - self.other.end;
+            if at >= self.moving.start {
+                Some(self.other.start + (at - self.moving.start))
+            } else if at > self.other.end {
+                Some(self.other.start + moving + (at - self.other.end))
+            } else {
+                Some(self.other.start + moving + between + (at - self.other.start))
+            }
+        }
+    }
+}
+
+/// The swaps of a move command, one per caret: the carets on one line move the text once,
+/// the plans that would edit the same text twice are dropped, and the rest are one change.
+fn statement_plans(
+    text: &str,
+    pairs: &[(usize, usize)],
+    tree: Option<&Tree>,
+    query: Option<&Query>,
+    selections: &SelectionSet,
+    down: bool,
+) -> Vec<MovePlan> {
+    let mut plans: Vec<MovePlan> = Vec::new();
+    let mut lines: Vec<usize> = Vec::new();
+    for selection in selections.iter() {
+        let caret = selection.range();
+        let line = text[..caret.start.min(text.len())]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        if lines.contains(&line) {
+            continue;
+        }
+        lines.push(line);
+        let plan = tree
+            .zip(query)
+            .and_then(|(tree, query)| tree_statement_plan(text, tree, query, caret.clone(), down))
+            .or_else(|| text_statement_plan(text, pairs, caret, down));
+        let Some(plan) = plan else {
+            continue;
+        };
+        if plans.iter().any(|seen| seen.moving == plan.moving) {
+            continue;
+        }
+        plans.push(plan);
+    }
+    plans.sort_by_key(|plan| plan.range.start);
+    let mut accepted: Vec<MovePlan> = Vec::new();
+    for plan in plans {
+        let clashes = accepted
+            .iter()
+            .any(|seen| seen.range.end > plan.range.start && plan.range.end > seen.range.start);
+        if !clashes {
+            accepted.push(plan);
+        }
+    }
+    accepted
+}
+
+/// The unit under `caret` from the query of the language and its nearest sibling.
+fn tree_statement_plan(
+    text: &str,
+    tree: &Tree,
+    query: &Query,
+    caret: Range<usize>,
+    down: bool,
+) -> Option<MovePlan> {
+    let (units, index) = unit_siblings(tree, query, text.as_bytes(), caret, down)?;
+    let moving = units.get(index)?.clone();
+    let other = if down {
+        units.get(index + 1)?.clone()
+    } else {
+        units.get(index.checked_sub(1)?)?.clone()
+    };
+    Some(swap_plan(text, moving, other, down))
+}
+
+/// The unit under `caret` from the braces of the text, for a language without a query.
+fn text_statement_plan(
+    text: &str,
+    pairs: &[(usize, usize)],
+    caret: Range<usize>,
+    down: bool,
+) -> Option<MovePlan> {
+    let block = containing_block(pairs, caret.clone())?;
+    let units = units_in(text, pairs, block);
+    if units.is_empty() {
+        return None;
+    }
+    let touches = |unit: &Range<usize>| {
+        if caret.start == caret.end {
+            unit.start <= caret.start && (caret.start < unit.end || caret.start == text.len())
+        } else {
+            unit.start < caret.end && caret.start < unit.end
+        }
+    };
+    let first = units.iter().position(touches)?;
+    let last = units.iter().rposition(touches)?;
+    let moving = units[first].start..units[last].end;
+    let other = if down {
+        units.get(last + 1)?.clone()
+    } else {
+        units.get(first.checked_sub(1)?)?.clone()
+    };
+    Some(swap_plan(text, moving, other, down))
+}
+
+/// The text of the two units with the bytes between them kept in place.
+fn swap_plan(text: &str, moving: Range<usize>, other: Range<usize>, down: bool) -> MovePlan {
+    let (range, replacement) = if down {
+        let between = &text[moving.end..other.start];
+        (
+            moving.start..other.end,
+            format!(
+                "{}{}{}",
+                &text[other.clone()],
+                between,
+                &text[moving.clone()]
+            ),
+        )
+    } else {
+        let between = &text[other.end..moving.start];
+        (
+            other.start..moving.end,
+            format!(
+                "{}{}{}",
+                &text[moving.clone()],
+                between,
+                &text[other.clone()]
+            ),
+        )
+    };
+    MovePlan {
+        range,
+        replacement,
+        moving,
+        other,
+        down,
+    }
+}
+
+/// One selection per line of a rectangle, both corners as a line and a column in
+/// characters. The columns of a short line clamp to its end, so the caret stands in the
+/// virtual space after it.
+fn block_selections(
+    store: &RopeStore,
+    anchor: (usize, usize),
+    head: (usize, usize),
+) -> SelectionSet {
+    let (first, last) = (anchor.0.min(head.0), anchor.0.max(head.0));
+    let (from, to) = (anchor.1.min(head.1), anchor.1.max(head.1));
+    let mut selections = Vec::with_capacity(last - first + 1);
+    for line in first..=last {
+        selections.push(Selection::new(
+            offset_of_column(store, line, from),
+            offset_of_column(store, line, to),
+        ));
+    }
+    if head.0 < anchor.0 {
+        selections.reverse();
+    }
+    SelectionSet::from_vec(selections)
+}
+
+/// The line of `offset` and the column in characters within it.
+fn line_column_of(store: &RopeStore, offset: usize) -> (usize, usize) {
+    let line = store.offset_to_line(offset);
+    let column = chars_in(&store.line_text(line), offset - store.line_to_offset(line));
+    (line, column)
+}
+
+/// The offset of a 0-based line and column in characters, clamped to the line.
+fn offset_of_column(store: &RopeStore, line: usize, column: usize) -> usize {
+    let line = line.min(store.line_count().saturating_sub(1));
+    let start = store.line_to_offset(line);
+    let text = store.line_text(line);
+    let text = text.trim_end_matches(['\n', '\r']);
+    let within = text
+        .char_indices()
+        .nth(column)
+        .map_or(text.len(), |(at, _)| at);
+    start + within
 }
 
 /// The lines of a pasted text after the first take `base`, and the piece of indentation
@@ -3061,5 +3475,99 @@ mod action_checks {
         assert_eq!(state.map().folds.as_slice().len(), 1);
         assert!(state.display().line(0).text.starts_with("//region First"));
         assert!(state.display().line(0).text.contains("..."));
+    }
+}
+
+#[cfg(test)]
+mod block_checks {
+    use keymap::editor as actions;
+    use text_core::FileFormat;
+
+    use super::{EditorState, block_selections};
+
+    fn state(text: &str) -> EditorState {
+        EditorState::new(text, FileFormat::default(), None, false)
+    }
+
+    fn type_in(state: &mut EditorState, text: &str) {
+        for character in text.chars() {
+            state.replace_range(None, &character.to_string(), false);
+        }
+    }
+
+    #[test]
+    fn a_rectangle_takes_the_same_columns_and_clamps_a_short_line() {
+        let state = state("abc\nd\nefgh\n");
+        let store = state.buffer.store();
+        let text = state.text();
+        let selections = block_selections(&store, (0, 1), (2, 3));
+        let ranges: Vec<_> = selections
+            .iter()
+            .map(|selection| selection.range())
+            .collect();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(&text[ranges[0].clone()], "bc");
+        assert_eq!(ranges[1].start, text.find('d').unwrap() + 1);
+        assert_eq!(ranges[1], ranges[1].start..ranges[1].start);
+        assert_eq!(&text[ranges[2].clone()], "fg");
+    }
+
+    #[test]
+    fn typing_in_a_rectangle_pads_a_short_line_up_to_its_column() {
+        let mut state = state("abc\nd\nxy\n");
+        state.select_range(2..2);
+        state.toggle_column_mode();
+        state.perform(actions::SELECT_DOWN, 10);
+        state.perform(actions::SELECT_DOWN, 10);
+        type_in(&mut state, "x");
+        assert_eq!(state.text(), "abxc\nd x\nxyx\n");
+        state.perform(actions::BACKSPACE, 10);
+        assert_eq!(state.text(), "abc\nd \nxy\n");
+    }
+
+    #[test]
+    fn escape_leaves_one_line_of_the_rectangle_for_the_next_typing() {
+        let mut state = state("abc\ndef\nghi\n");
+        state.select_range(1..1);
+        state.toggle_column_mode();
+        state.perform(actions::SELECT_DOWN, 10);
+        assert_eq!(state.selections().len(), 2);
+        state.perform(actions::CLEAR_CARETS, 10);
+        assert_eq!(state.selections().len(), 1);
+        type_in(&mut state, "z");
+        assert_eq!(state.text(), "abc\ndzef\nghi\n");
+    }
+
+    #[test]
+    fn a_statement_goes_up_and_down_again() {
+        let text = "class A {\n    void a() {\n        int first = 1;\n        int second = 2;\n    }\n}\n";
+        let mut first = state(text);
+        let caret = text.find("int second").unwrap();
+        first.select_range(caret..caret);
+        first.perform(actions::MOVE_STATEMENT_UP, 10);
+        assert!(
+            first
+                .text()
+                .contains("int second = 2;\n        int first = 1;"),
+            "the second statement goes above the first: {:?}",
+            first.text()
+        );
+        first.perform(actions::MOVE_STATEMENT_DOWN, 10);
+        assert_eq!(first.text(), text);
+
+        // From the start of the line, before its indentation, the keys work the same.
+        let mut again = state(text);
+        let line3 = text.find("        int second").unwrap();
+        let pairs = super::brace_pairs(text);
+        let plan = super::text_statement_plan(text, &pairs, line3..line3, false).unwrap();
+        assert_eq!(plan.other.start, text.find("        int first").unwrap());
+        assert_eq!(
+            plan.moved(line3),
+            Some(text.find("        int first").unwrap())
+        );
+        again.select_range(line3..line3);
+        again.perform(actions::MOVE_STATEMENT_UP, 10);
+        again.perform(actions::MOVE_STATEMENT_DOWN, 10);
+        assert_eq!(again.text(), text);
     }
 }

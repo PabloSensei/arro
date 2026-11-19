@@ -10,7 +10,7 @@ use lang_api::Severity;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use vcs::{CommitOptions, CommitRequest};
+use vcs::{CommitOptions, CommitRequest, Hunk, PartialFile};
 use workspace::{COMMIT_TOOL, Settings, Workspace};
 
 use crate::changelists::{Changelists, Grouping};
@@ -279,6 +279,8 @@ struct PendingCommit {
     request: CommitRequest,
     push: bool,
     options: CommitOptions,
+    /// The files whose hunks were picked one by one.
+    partial: Vec<PartialFile>,
 }
 
 /// What the Commit window and the Local Changes tab of the Git window share: the message
@@ -300,6 +302,9 @@ pub struct CommitDraft {
     /// The store key of [`CommitDraft::lists`].
     lists_key: String,
     store: Option<std::sync::Arc<store::Store>>,
+    /// The hunks the user took the tick off, by the path git knows them by. They stay
+    /// out of the commit and in the working tree.
+    excluded_hunks: HashMap<String, Vec<Hunk>>,
 }
 
 impl CommitDraft {
@@ -325,11 +330,47 @@ impl CommitDraft {
             lists,
             lists_key,
             store,
+            excluded_hunks: HashMap::new(),
         })
     }
 
     fn save_lists(&self) {
         self.lists.save(self.store.as_deref(), &self.lists_key);
+    }
+
+    /// The hunks of `path` that stay out of the commit.
+    pub fn excluded_hunks(&self, path: &str) -> &[Hunk] {
+        self.excluded_hunks
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Whether one hunk of a file goes into the commit.
+    pub fn hunk_checked(&self, path: &str, hunk: &Hunk) -> bool {
+        !self.excluded_hunks(path).contains(hunk)
+    }
+
+    /// The tick of one hunk of the diff. Taking the last hunk off takes the tick off the
+    /// file; a file with a tick again has every hunk.
+    pub fn set_hunk_checked(&mut self, path: &str, hunk: &Hunk, checked: bool, total: usize) {
+        let excluded = {
+            let hunks = self.excluded_hunks.entry(path.to_string()).or_default();
+            if checked {
+                hunks.retain(|known| known != hunk);
+            } else if !hunks.contains(hunk) {
+                hunks.push(hunk.clone());
+            }
+            hunks.len()
+        };
+        if excluded == 0 {
+            self.excluded_hunks.remove(path);
+        }
+        if total > 0 && excluded >= total {
+            self.unchecked.insert(path.to_string());
+        } else {
+            self.unchecked.remove(path);
+        }
     }
 }
 
@@ -343,6 +384,8 @@ pub struct CommitPanel {
     message: TextField,
     /// Files the user took the tick off. A new file starts ticked.
     unchecked: HashSet<String>,
+    /// The hunks taken off, by path, so that a file shows a partial tick.
+    partial: HashMap<String, Vec<Hunk>>,
     selected: Option<usize>,
     scroll_files: ScrollHandle,
     scroll_shelves: ScrollHandle,
@@ -409,6 +452,7 @@ impl CommitPanel {
             let shared = draft.read(cx);
             let message = shared.message.clone();
             let unchecked = shared.unchecked.clone();
+            let partial = shared.excluded_hunks.clone();
             let amend = shared.amend;
             let sign_off = shared.sign_off;
             let author = shared.author.clone();
@@ -421,6 +465,7 @@ impl CommitPanel {
                 draft,
                 message,
                 unchecked,
+                partial,
                 selected: None,
                 scroll_files: ScrollHandle::new(),
                 scroll_shelves: ScrollHandle::new(),
@@ -475,6 +520,7 @@ impl CommitPanel {
         let draft = self.draft.read(cx);
         self.message = draft.message.clone();
         self.unchecked = draft.unchecked.clone();
+        self.partial = draft.excluded_hunks.clone();
         self.amend = draft.amend;
         self.sign_off = draft.sign_off;
         self.author = draft.author.clone();
@@ -591,6 +637,7 @@ impl CommitPanel {
         self.change(cx, |draft| {
             if checked {
                 draft.unchecked.remove(&path);
+                draft.excluded_hunks.remove(&path);
             } else {
                 draft.unchecked.insert(path);
             }
@@ -772,6 +819,7 @@ impl CommitPanel {
     fn status_changed(&mut self, status: &vcs::Status, cx: &mut Context<Self>) {
         let paths: HashSet<String> = status.files.iter().map(|file| file.path.clone()).collect();
         self.change(cx, |draft| {
+            draft.excluded_hunks.retain(|path, _| paths.contains(path));
             if draft.lists.retain_paths(&paths) {
                 draft.save_lists();
             }
@@ -1482,10 +1530,34 @@ impl CommitPanel {
             sign_off: self.sign_off,
             author: self.author.clone(),
         };
-        if self.analysis && self.start_analysis(&request, push, cx) {
+        let partial = self.partial_files(&request.paths, cx);
+        if self.analysis && self.start_analysis(&request, push, partial.clone(), cx) {
             return;
         }
-        self.commit_now(request, push, options, cx);
+        self.commit_now(request, push, options, partial, cx);
+    }
+
+    /// The ticked files whose hunks the user picked one by one. A deleted file has no
+    /// hunks to pick and goes into the commit whole.
+    fn partial_files(&self, paths: &[String], cx: &App) -> Vec<PartialFile> {
+        let git = self.git.read(cx);
+        let files = &git.status().files;
+        paths
+            .iter()
+            .filter_map(|path| {
+                let excluded = self.partial.get(path)?;
+                if excluded.is_empty() {
+                    return None;
+                }
+                let file = files.iter().find(|file| &file.path == path)?;
+                let deleted =
+                    file.index == vcs::Change::Deleted || file.worktree == vcs::Change::Deleted;
+                (!deleted).then(|| PartialFile {
+                    path: path.clone(),
+                    excluded: excluded.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Warns about CRLF line separators of the ticked files, as the settings ask. The
@@ -1526,6 +1598,7 @@ impl CommitPanel {
         request: CommitRequest,
         push: bool,
         options: CommitOptions,
+        partial: Vec<PartialFile>,
         cx: &mut Context<Self>,
     ) {
         let root = self
@@ -1541,6 +1614,7 @@ impl CommitPanel {
                 request,
                 options,
                 push,
+                partial,
                 move |git: &mut GitState, _ids, cx| {
                     let text = if amend && push {
                         "Amended the commit and pushed".to_string()
@@ -1556,6 +1630,7 @@ impl CommitPanel {
                         this.change(cx, |draft| {
                             draft.message.text.clear();
                             draft.amend = false;
+                            draft.excluded_hunks.clear();
                         });
                         cx.notify();
                     })
@@ -1572,6 +1647,7 @@ impl CommitPanel {
         &mut self,
         request: &CommitRequest,
         push: bool,
+        partial: Vec<PartialFile>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(hub) = cx.try_global::<ActiveInspect>().map(|hub| hub.0.clone()) else {
@@ -1593,6 +1669,7 @@ impl CommitPanel {
                 sign_off: self.sign_off,
                 author: self.author.clone(),
             },
+            partial,
         });
         let observe = cx.observe(&hub, |this, hub, cx| {
             if hub.read(cx).is_running() {
@@ -1612,7 +1689,13 @@ impl CommitPanel {
             return;
         };
         let Some(hub) = cx.try_global::<ActiveInspect>().map(|hub| hub.0.clone()) else {
-            self.commit_now(pending.request, pending.push, pending.options, cx);
+            self.commit_now(
+                pending.request,
+                pending.push,
+                pending.options,
+                pending.partial,
+                cx,
+            );
             return;
         };
         let errors = hub
@@ -1622,7 +1705,13 @@ impl CommitPanel {
             .filter(|finding| finding.severity == Severity::Error)
             .count();
         if errors == 0 {
-            self.commit_now(pending.request, pending.push, pending.options, cx);
+            self.commit_now(
+                pending.request,
+                pending.push,
+                pending.options,
+                pending.partial,
+                cx,
+            );
             return;
         }
         self.pending_commit = Some(pending);
@@ -1652,7 +1741,13 @@ impl CommitPanel {
                 let Some(pending) = this.pending_commit.take() else {
                     return;
                 };
-                this.commit_now(pending.request, pending.push, pending.options, cx);
+                this.commit_now(
+                    pending.request,
+                    pending.push,
+                    pending.options,
+                    pending.partial,
+                    cx,
+                );
             });
         };
         window
@@ -1714,9 +1809,10 @@ impl CommitPanel {
             .filter_map(|file| git.absolute(&file.path))
             .collect();
         let index = files.iter().position(|file| *file == path).unwrap_or(0);
-        DiffView::open_list(
+        DiffView::open_commit_list(
             self.git.clone(),
             self.workspace.clone(),
+            self.draft.clone(),
             files,
             index,
             window,
@@ -1859,6 +1955,10 @@ impl CommitPanel {
             None => (String::new(), path.clone()),
         };
         let checked = !self.unchecked.contains(&path);
+        let partial = self
+            .partial
+            .get(&path)
+            .is_some_and(|hunks| !hunks.is_empty());
         let pointer = self.git.read(cx).pointer(&path).cloned();
         let pointer_text = pointer.map(|(old, new)| {
             let old = old.map_or_else(|| "0000000".to_owned(), |id| short_commit(&id));
@@ -1890,8 +1990,18 @@ impl CommitPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .when(checked, |this| {
+                    .when(checked && !partial, |this| {
                         this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                    })
+                    .when(checked && partial, |this| {
+                        this.child(
+                            div()
+                                .debug_selector(move || format!("commit-partial-{index}"))
+                                .w(px(8.))
+                                .h(px(2.))
+                                .rounded(px(1.))
+                                .bg(theme.over_accent),
+                        )
                     }),
             );
         let selected = self.selected == Some(index);

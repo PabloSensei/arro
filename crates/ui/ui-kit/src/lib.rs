@@ -31,7 +31,7 @@ pub use palette::{
 pub use popups::*;
 #[cfg(feature = "test-support")]
 pub use scale::scale_test_window;
-pub use scale::{set_ui_scale, text_scale, window_scale};
+pub use scale::{set_ui_scale, window_scale};
 // GPUI has a `surface` element of its own on macOS; the popup surface is the one meant.
 pub use popups::surface;
 pub use rows::*;

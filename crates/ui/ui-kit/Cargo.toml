@@ -9,13 +9,23 @@ publish.workspace = true
 # from the platform crate rather than from gpui-kit: gpui-kit's own `test-support`
 # also asks the optional Fast backend for it, and that backend pins versions the
 # engine cannot use.
-test-support = ["gpui_windows/test-support"]
+test-support = [
+    "gpui_windows/test-support",
+    "gpui_linux/test-support",
+    "gpui_macos/test-support",
+]
 
 [dependencies]
 gpui-kit.workspace = true
 gpui_windows = { workspace = true, default-features = false }
 rust-embed = { version = "8.13.0", features = ["debug-embed"] }
 theme = { path = "../../editor/theme" }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_linux.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos.workspace = true
 
 [dev-dependencies]
 # Temporary folders of the tests: one root and removal without help from a test.

@@ -12,8 +12,8 @@ use editor_view::{EditorView, GutterKind, GutterMark};
 use ui_kit::*;
 use vcs::{
     BlameLine, Change, CommitOptions, CommitRequest, ConflictSide, FileStatus, GitRunner, Hunk,
-    LineChangeKind, Operation, RebasePlan, RebaseReport, RefKind, Repository, ResetMode,
-    RootsUpdate, Stash, Status, UpdateMode, UpdateReport, command_id,
+    LineChangeKind, Operation, PartialFile, PushRequest, RebasePlan, RebaseReport, RefKind,
+    Repository, ResetMode, RootsUpdate, Stash, Status, UpdateMode, UpdateReport, command_id,
 };
 use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
@@ -872,6 +872,7 @@ impl GitState {
         request: CommitRequest,
         options: CommitOptions,
         push: bool,
+        partial: Vec<PartialFile>,
         done: impl FnOnce(&mut Self, Vec<String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
@@ -892,27 +893,41 @@ impl GitState {
         // records their new commits.
         order.sort_by_key(|root| std::cmp::Reverse(root.prefix.len()));
         for root in order {
-            let mut paths = Vec::new();
-            for path in &request.paths {
+            let owns = |path: &String| {
                 if root.prefix.is_empty() {
                     // The project takes its own files and the pointers of its submodules.
-                    if self.root_of(path).is_empty()
+                    self.root_of(path).is_empty()
                         || self.roots.iter().any(|other| other.prefix == *path)
-                    {
-                        paths.push(path.clone());
-                    }
-                } else if path != &root.prefix
-                    && path.strip_prefix(&format!("{}/", root.prefix)).is_some()
-                {
-                    paths.push(
-                        path.strip_prefix(&format!("{}/", root.prefix))
-                            .unwrap_or(path)
-                            .to_owned(),
-                    );
+                } else {
+                    path != &root.prefix
+                        && path.strip_prefix(&format!("{}/", root.prefix)).is_some()
                 }
-            }
+            };
+            let relative = |path: &String| {
+                if root.prefix.is_empty() {
+                    path.clone()
+                } else {
+                    path.strip_prefix(&format!("{}/", root.prefix))
+                        .unwrap_or(path)
+                        .to_owned()
+                }
+            };
+            let paths: Vec<String> = request
+                .paths
+                .iter()
+                .filter(|path| owns(path))
+                .map(relative)
+                .collect();
+            let hunks: Vec<PartialFile> = partial
+                .iter()
+                .filter(|file| request.paths.contains(&file.path) && owns(&file.path))
+                .map(|file| PartialFile {
+                    path: relative(&file.path),
+                    excluded: file.excluded.clone(),
+                })
+                .collect();
             if !paths.is_empty() {
-                groups.push((root.repo.clone(), paths));
+                groups.push((root.repo.clone(), paths, hunks));
             }
         }
         if groups.is_empty() {
@@ -926,13 +941,17 @@ impl GitState {
         cx.notify();
         let job = cx.background_executor().spawn(async move {
             let mut ids = Vec::new();
-            for (repo, paths) in groups {
+            for (repo, paths, partial) in groups {
                 let request = CommitRequest {
                     message: message.clone(),
                     paths,
                     amend,
                 };
-                let id = repo.commit_with(&request, &options)?;
+                let id = if partial.is_empty() {
+                    repo.commit_with(&request, &options)?
+                } else {
+                    repo.commit_partial(&request, &options, &partial)?
+                };
                 if push {
                     repo.push()?;
                 }
@@ -1009,6 +1028,9 @@ impl GitState {
         Ok(())
     }
 
+    /// Sends the current branch with git's own upstream. The windows run
+    /// [`GitState::push_to`]; this is the plain form the tests call.
+    #[cfg(test)]
     pub fn push(&mut self, cx: &mut Context<Self>) {
         if let Err(message) = self.save_open_files(cx) {
             self.report("Push", message, cx);
@@ -1035,6 +1057,58 @@ impl GitState {
             |this, (), cx| this.tell("Push", "Pushed to the remote", cx),
             cx,
         );
+    }
+
+    /// Push with the choices of the Push window: the remote and the branch there, the
+    /// tags, and force with a lease. A rejected push is updated and sent again when the
+    /// settings say so, as Ctrl+Shift+K did before the window.
+    pub fn push_to(
+        &mut self,
+        request: PushRequest,
+        done: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(message) = self.save_open_files(cx) {
+            self.report("Push", message, cx);
+            return;
+        }
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let auto = settings.git_auto_update_on_reject;
+        let mode = update_mode(&settings);
+        let shown = format!("{}/{}", request.remote, request.destination);
+        self.run(
+            "Push",
+            move |repo| {
+                let first = repo.push_to(&request);
+                if !auto {
+                    return first;
+                }
+                match first {
+                    Err(error) if push_rejected(&error) => {
+                        repo.update_with(mode)?;
+                        repo.push_to(&request)
+                    }
+                    other => other,
+                }
+            },
+            move |this, (), cx| {
+                this.tell("Push", format!("Pushed to {shown}"), cx);
+                done(this, cx);
+            },
+            cx,
+        );
+    }
+
+    /// Ctrl+Shift+K and Push... of the menus: the window of the commits on their way and
+    /// the remote they go to. The window runs the push, not this.
+    pub fn show_push_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let git = cx.entity();
+        workspace.update(cx, |workspace, cx| {
+            crate::push::PushWindow::open(git, workspace, window, cx)
+        });
     }
 
     /// Fetch without merging; the status and the ahead/behind counts follow.
@@ -2067,8 +2141,9 @@ impl GitState {
         );
         let push = me.clone();
         entries.push(
-            MenuEntry::new("Push...", move |_, cx| {
-                push.update(cx, |this, cx| this.push(cx)).ok();
+            MenuEntry::new("Push...", move |window, cx| {
+                push.update(cx, |this, cx| this.show_push_window(window, cx))
+                    .ok();
             })
             .icon("general/vcs"),
         );
@@ -2938,8 +3013,14 @@ pub fn bind_actions(git: Entity<GitState>, window: AnyWindowHandle, cx: &mut App
     let state = git.clone();
     cx.on_action(move |_: &PushChanges, cx| {
         let state = state.clone();
-        // The window is being updated while its action runs, so the save waits for it.
-        cx.defer(move |cx| state.update(cx, |this, cx| this.push(cx)));
+        // The window is being updated while its action runs, so the window waits for it.
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    state.update(cx, |this, cx| this.show_push_window(window, cx))
+                })
+                .ok();
+        });
     });
     let state = git.clone();
     cx.on_action(move |_: &UpdateProject, cx| {

@@ -20,6 +20,7 @@ use crate::window_tests::{
     active_path, bounds_of, buffer_of, click, draw, editor_of, line_height, open_path, press,
     sample_project, scratch, type_text, with_window,
 };
+use crate::window_tests_git::has_selector;
 use workspace::Workspace;
 
 /// How long a test waits for an external process or a panel timer.
@@ -762,6 +763,10 @@ fn a_commit_from_the_window_and_ctrl_shift_k_push_it_to_the_origin(cx: &mut Test
     assert_eq!(bare_subject(&git, &bare), "base");
 
     press(cx, window, "ctrl-shift-k");
+    wait_for(cx, "the Push window", |cx| {
+        has_selector(cx, window, "push-dialog")
+    });
+    click(cx, window, "push-go");
     wait_for(cx, "the push to the origin", |cx| {
         let _ = cx;
         bare_subject(&git, &bare) == "from the window"

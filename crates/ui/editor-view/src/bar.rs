@@ -4,11 +4,12 @@
 use std::ops::Range;
 
 use text_core::TextStore;
-use text_core::find::{FindOptions, find_all, replacements};
+use text_core::find::{FindOptions, find_all, find_in_range, replacements_in};
 use ui_kit::metrics::CONTROL_RADIUS;
 use ui_kit::prelude::*;
 use ui_kit::*;
 
+use crate::find_history::{self, FindHistory};
 use crate::state::EditorState;
 use crate::view::EditorView;
 
@@ -34,8 +35,16 @@ pub(crate) struct Bar {
     pub matches: Vec<Range<usize>>,
     pub current: Option<usize>,
     error: Option<String>,
+    /// The lines that were selected when the search began, when it stays inside them.
+    limit: Option<Range<usize>>,
+    /// Ctrl+Alt+E: the search covers only `limit`.
+    in_selection: bool,
     /// The caret before the search began; the first match is the one at or after it.
     origin: usize,
+    /// Alt+Down: the list of past queries, the newest first.
+    history_popup: bool,
+    history_selected: usize,
+    history_scroll: ScrollHandle,
     /// The keys go to the bar, not to the text.
     pub active: bool,
 }
@@ -52,15 +61,19 @@ impl EditorView {
         self.bar.as_ref().is_some_and(|bar| bar.active)
     }
 
-    /// Ctrl+F and Ctrl+R. A selection on one line becomes the query.
+    /// Ctrl+F and Ctrl+R. A selection on one line becomes the query; a selection over
+    /// several lines, as in IDEA, makes the search cover only it.
     pub(crate) fn open_find(&mut self, replace: bool, cx: &mut Context<Self>) {
         let Some(state) = &self.state else {
             return;
         };
         let selection = state.selections().primary();
-        let selected = (!selection.is_empty())
-            .then(|| state.store().slice(selection.range()))
-            .filter(|text| !text.contains('\n'));
+        let selected_range = selection.range();
+        let lines_selected = (!selected_range.is_empty())
+            .then(|| state.store().slice(selected_range.clone()))
+            .is_some_and(|text| text.contains('\n'));
+        let selected = (!selected_range.is_empty() && !lines_selected)
+            .then(|| state.store().slice(selected_range.clone()));
         let remembered = self.last_find.clone();
         let kind = if replace {
             BarKind::Replace
@@ -78,14 +91,24 @@ impl EditorView {
                 matches: Vec::new(),
                 current: None,
                 error: None,
+                limit: None,
+                in_selection: false,
                 origin: selection.start(),
+                history_popup: false,
+                history_selected: 0,
+                history_scroll: ScrollHandle::new(),
                 active: true,
             },
         };
         bar.kind = kind;
         bar.active = true;
         bar.field = Field::Query;
+        bar.history_popup = false;
         bar.origin = selection.start();
+        if lines_selected {
+            bar.in_selection = true;
+            bar.limit = Some(selected_range);
+        }
         if let Some(text) = selected {
             bar.query = TextField::from_text(text);
         }
@@ -107,7 +130,12 @@ impl EditorView {
             matches: Vec::new(),
             current: None,
             error: None,
+            limit: None,
+            in_selection: false,
             origin: 0,
+            history_popup: false,
+            history_selected: 0,
+            history_scroll: ScrollHandle::new(),
             active: true,
         });
         cx.notify();
@@ -118,11 +146,26 @@ impl EditorView {
             && bar.kind != BarKind::Goto
         {
             self.last_find = LastFind {
-                query: bar.query.text,
+                query: bar.query.text.clone(),
                 options: bar.options,
             };
+            self.remember_query(&bar.query.text, cx);
         }
         cx.notify();
+    }
+
+    /// Puts a query of the search at the top of the history of Alt+Down.
+    fn remember_query(&mut self, query: &str, cx: &mut Context<Self>) {
+        let changes = {
+            let history = cx.default_global::<FindHistory>();
+            history.remember(query)
+        };
+        if changes {
+            let history = cx.default_global::<FindHistory>();
+            if let Some((path, body)) = history.file() {
+                find_history::save(path, body, cx);
+            }
+        }
     }
 
     /// Looks for the query again. `reselect` also moves the caret to the match at or after
@@ -135,7 +178,16 @@ impl EditorView {
             return;
         }
         let text = state.text();
-        match find_all(&text, &bar.query.text, bar.options) {
+        let within = if bar.in_selection {
+            bar.limit.clone()
+        } else {
+            None
+        };
+        let found = match within {
+            Some(range) => find_in_range(&text, &bar.query.text, bar.options, range),
+            None => find_all(&text, &bar.query.text, bar.options),
+        };
+        match found {
             Ok(found) => {
                 bar.matches = found;
                 bar.error = None;
@@ -206,7 +258,12 @@ impl EditorView {
                     matches: found,
                     current: None,
                     error: None,
+                    limit: None,
+                    in_selection: false,
                     origin: word.start,
+                    history_popup: false,
+                    history_selected: 0,
+                    history_scroll: ScrollHandle::new(),
                     active: false,
                 });
                 if let Some(bar) = &mut self.bar {
@@ -277,7 +334,12 @@ impl EditorView {
                 matches: Vec::new(),
                 current: None,
                 error: None,
+                limit: None,
+                in_selection: false,
                 origin: start,
+                history_popup: false,
+                history_selected: 0,
+                history_scroll: ScrollHandle::new(),
                 active: false,
             });
             self.refresh_matches(false, cx);
@@ -307,6 +369,7 @@ impl EditorView {
         let Some((edits, at)) = self.replace_edits(true) else {
             return;
         };
+        self.shift_limit(&edits);
         if let Some(state) = &mut self.state {
             let change = state.apply_edits(edits);
             self.changed(change, cx);
@@ -325,11 +388,33 @@ impl EditorView {
         if edits.is_empty() {
             return;
         }
+        self.shift_limit(&edits);
         if let Some(state) = &mut self.state {
             let change = state.apply_edits(edits);
             self.changed(change, cx);
         }
         self.refresh_matches(false, cx);
+    }
+
+    /// Moves the end of the selection of Find in Selection after the replacements, so a
+    /// second Replace All covers the same lines.
+    fn shift_limit(&mut self, edits: &[text_core::Edit]) {
+        let Some(bar) = self.bar.as_mut() else {
+            return;
+        };
+        if !bar.in_selection {
+            return;
+        }
+        let Some(limit) = bar.limit.as_mut() else {
+            return;
+        };
+        for edit in edits {
+            if edit.range.start < limit.start || edit.range.end > limit.end {
+                continue;
+            }
+            let delta = edit.text.len() as isize - (edit.range.end - edit.range.start) as isize;
+            limit.end = (limit.end as isize + delta).max(limit.start as isize) as usize;
+        }
     }
 
     /// The edits of Replace or Replace All and the offset after the first of them.
@@ -341,13 +426,15 @@ impl EditorView {
         } else {
             None
         };
+        let within = bar.limit.as_ref().filter(|_| bar.in_selection);
         let text = state.text();
-        let edits = replacements(
+        let edits = replacements_in(
             &text,
             &bar.query.text,
             bar.options,
             &bar.replacement.text,
             only,
+            within,
         )
         .ok()?;
         let after = edits
@@ -382,17 +469,52 @@ impl EditorView {
 
     /// Keys while the bar is active. `false` leaves the key to the keymap.
     pub(crate) fn bar_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let history_len = cx
+            .try_global::<FindHistory>()
+            .map_or(0, |history| history.entries().len());
         let Some(bar) = &mut self.bar else {
             return false;
         };
         let modifiers = event.keystroke.modifiers;
         let (control, alt, shift) = (modifiers.control, modifiers.alt, modifiers.shift);
         let kind = bar.kind;
+        let field_empty = match bar.field {
+            Field::Query => bar.query.text.is_empty(),
+            Field::Replacement => bar.replacement.text.is_empty(),
+        };
+        if bar.history_popup {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    bar.history_popup = false;
+                    cx.notify();
+                    return true;
+                }
+                "up" => {
+                    bar.history_selected = bar.history_selected.saturating_sub(1);
+                    cx.notify();
+                    return true;
+                }
+                "down" => {
+                    bar.history_selected =
+                        (bar.history_selected + 1).min(history_len.saturating_sub(1));
+                    cx.notify();
+                    return true;
+                }
+                "enter" => {
+                    let at = bar.history_selected;
+                    self.choose_history(at, cx);
+                    return true;
+                }
+                _ => bar.history_popup = false,
+            }
+        }
         match event.keystroke.key.as_str() {
             "escape" => {
                 self.close_bar(cx);
                 return true;
             }
+            "down" if alt && !control && kind != BarKind::Goto => self.show_history(cx),
+            "up" | "down" if !control && !alt && !shift && field_empty => self.show_history(cx),
             "enter" if control && kind == BarKind::Replace => self.replace_all(cx),
             "enter" => match kind {
                 BarKind::Goto => self.submit_goto(cx),
@@ -404,14 +526,17 @@ impl EditorView {
                     Field::Query => Field::Replacement,
                     Field::Replacement => Field::Query,
                 };
+                bar.history_popup = false;
                 cx.notify();
             }
+            "e" if control && alt && kind != BarKind::Goto => self.toggle_in_selection(cx),
             "c" | "w" | "x" if alt && kind != BarKind::Goto => {
                 match event.keystroke.key.as_str() {
                     "c" => bar.options.case_sensitive = !bar.options.case_sensitive,
                     "w" => bar.options.whole_word = !bar.options.whole_word,
                     _ => bar.options.regex = !bar.options.regex,
                 }
+                bar.history_popup = false;
                 self.refresh_matches(true, cx);
             }
             _ => {
@@ -424,6 +549,67 @@ impl EditorView {
             }
         }
         true
+    }
+
+    /// Alt+Down and Up or Down in an empty field: the list of past queries.
+    fn show_history(&mut self, cx: &mut Context<Self>) {
+        let Some(bar) = &mut self.bar else {
+            return;
+        };
+        if bar.kind == BarKind::Goto {
+            return;
+        }
+        bar.history_popup = true;
+        bar.history_selected = 0;
+        bar.active = true;
+        cx.notify();
+    }
+
+    /// Puts a query of the list into the field the caret is in.
+    fn choose_history(&mut self, at: usize, cx: &mut Context<Self>) {
+        let Some(text) = cx
+            .try_global::<FindHistory>()
+            .and_then(|history| history.entries().get(at).cloned())
+        else {
+            return;
+        };
+        let Some(bar) = &mut self.bar else {
+            return;
+        };
+        bar.history_popup = false;
+        let reselect = bar.field == Field::Query;
+        match bar.field {
+            Field::Query => bar.query = TextField::from_text(text),
+            Field::Replacement => bar.replacement = TextField::from_text(text),
+        }
+        self.refresh_matches(reselect, cx);
+    }
+
+    /// Ctrl+Alt+E: the search covers the selection, or the whole text again.
+    fn toggle_in_selection(&mut self, cx: &mut Context<Self>) {
+        let selection = self
+            .state
+            .as_ref()
+            .map(|state| state.selections().primary().range())
+            .filter(|range| !range.is_empty());
+        let Some(bar) = &mut self.bar else {
+            return;
+        };
+        if bar.kind == BarKind::Goto {
+            return;
+        }
+        bar.active = true;
+        if bar.in_selection {
+            bar.in_selection = false;
+            bar.limit = None;
+        } else {
+            let Some(selection) = selection else {
+                return;
+            };
+            bar.in_selection = true;
+            bar.limit = Some(selection);
+        }
+        self.refresh_matches(true, cx);
     }
 
     /// The marks over the text in `visible`: matches of the search, the other occurrences
@@ -489,10 +675,13 @@ impl EditorView {
     }
 
     /// The bar as an element, `None` while it is closed.
-    pub(crate) fn render_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(crate) fn render_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let bar = self.bar.as_ref()?;
         let style = self.style.clone();
         let theme = *cx.global::<Theme>();
+        let history: Vec<String> = cx
+            .try_global::<FindHistory>()
+            .map_or_else(Vec::new, |history| history.entries().to_vec());
         let field =
             |id: &'static str, value: &TextField, on: bool, which: Field, hint: &'static str| {
                 let placeholder = value.text.is_empty() && !on;
@@ -532,6 +721,7 @@ impl EditorView {
                         if let Some(bar) = &mut this.bar {
                             bar.field = which;
                             bar.active = true;
+                            bar.history_popup = false;
                             cx.notify();
                         }
                     }))
@@ -638,6 +828,11 @@ impl EditorView {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_option(2, cx))),
                 )
                 .child(
+                    chip("bar-selection", "In Selection", bar.in_selection)
+                        .debug_selector(|| "bar-selection".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_in_selection(cx))),
+                )
+                .child(
                     div()
                         .min_w(px(70.))
                         .text_color(if bad { style.error } else { style.line_number })
@@ -700,6 +895,15 @@ impl EditorView {
                     "Replace",
                 ))
                 .child(
+                    chip(
+                        "bar-preserve-case",
+                        "Preserve Case",
+                        bar.options.preserve_case,
+                    )
+                    .debug_selector(|| "bar-preserve-case".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_option(3, cx))),
+                )
+                .child(
                     chip("bar-replace", "Replace", false)
                         .px(px(8.))
                         .on_click(cx.listener(|this, _, _, cx| this.replace_current(cx))),
@@ -711,6 +915,62 @@ impl EditorView {
                 );
             bar_view = bar_view.child(line);
         }
+        if bar.history_popup {
+            let rows: Vec<_> = if history.is_empty() {
+                vec![
+                    div()
+                        .id("bar-history-empty")
+                        .h(px(22.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .text_color(style.line_number)
+                        .child("No history")
+                        .into_any_element(),
+                ]
+            } else {
+                history
+                    .iter()
+                    .enumerate()
+                    .map(|(at, query)| {
+                        let chosen = at == bar.history_selected;
+                        let query = query.clone();
+                        div()
+                            .id(("bar-history", at))
+                            .debug_selector(move || format!("bar-history-{at}"))
+                            .h(px(22.))
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(CONTROL_RADIUS))
+                            .when(chosen, |this| this.bg(style.selection))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.choose_history(at, cx)),
+                            )
+                            .child(SharedString::from(query))
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+            let list = scrollable(
+                "bar-history-list",
+                &bar.history_scroll,
+                div()
+                    .id("bar-history-list")
+                    .flex()
+                    .flex_col()
+                    .max_h(px(180.))
+                    .overflow_y_scroll()
+                    .track_scroll(&bar.history_scroll)
+                    .children(rows),
+                &theme,
+                window,
+                cx,
+            )
+            .flex_none()
+            .mb(px(6.));
+            bar_view = bar_view.child(list);
+        }
         Some(bar_view)
     }
 
@@ -719,9 +979,11 @@ impl EditorView {
             match which {
                 0 => bar.options.case_sensitive = !bar.options.case_sensitive,
                 1 => bar.options.whole_word = !bar.options.whole_word,
-                _ => bar.options.regex = !bar.options.regex,
+                2 => bar.options.regex = !bar.options.regex,
+                _ => bar.options.preserve_case = !bar.options.preserve_case,
             }
             bar.active = true;
+            bar.history_popup = false;
         }
         self.refresh_matches(true, cx);
     }

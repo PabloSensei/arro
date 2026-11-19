@@ -84,6 +84,7 @@ pub async fn run_with_output(
         breakpoints: BTreeMap::new(),
         function_breakpoints: launch.function_breakpoints.clone(),
         data_breakpoints: launch.data_breakpoints.clone(),
+        muted: false,
         inline_watch: Vec::new(),
         renderers: Vec::new(),
         rendered_children: HashMap::new(),
@@ -161,6 +162,8 @@ struct Session {
     function_breakpoints: Vec<FunctionBreakpointSpec>,
     /// Field watchpoints, as the window set them.
     data_breakpoints: Vec<DataBreakpointSpec>,
+    /// The window muted the breakpoints: the settings stay, the adapter hears none.
+    muted: bool,
     /// Inline watch expressions, as the window set them.
     inline_watch: Vec<String>,
     /// How values of some types are shown.
@@ -251,17 +254,20 @@ impl Session {
 
     /// Sends the breakpoints of one file and records what the adapter made of them.
     async fn send_breakpoints(&mut self, file: &Path) {
-        let settings: Vec<BreakpointSpec> = self
-            .breakpoints
-            .get(file)
-            .map(|lines| {
-                lines
-                    .values()
-                    .filter(|spec| spec.enabled && spec.line > 0)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let settings: Vec<BreakpointSpec> = if self.muted {
+            Vec::new()
+        } else {
+            self.breakpoints
+                .get(file)
+                .map(|lines| {
+                    lines
+                        .values()
+                        .filter(|spec| spec.enabled && spec.line > 0)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let requested = settings
             .iter()
             .map(|spec| {
@@ -368,6 +374,16 @@ impl Session {
 
     /// Sends every enabled method breakpoint and keeps what the adapter made of them.
     async fn send_function_breakpoints(&mut self) {
+        if self.muted {
+            // A muted session keeps its settings and tells the adapter nothing.
+            if self.state.capabilities.function_breakpoints {
+                let _ = self
+                    .client
+                    .request("setFunctionBreakpoints", json!({"breakpoints": []}))
+                    .await;
+            }
+            return;
+        }
         let requested: Vec<Value> = self
             .function_breakpoints
             .iter()
@@ -412,6 +428,16 @@ impl Session {
 
     /// Sends every enabled field watchpoint and keeps what the adapter made of them.
     async fn send_data_breakpoints(&mut self) {
+        if self.muted {
+            // A muted session keeps its settings and tells the adapter nothing.
+            if self.state.capabilities.data_breakpoints {
+                let _ = self
+                    .client
+                    .request("setDataBreakpoints", json!({"breakpoints": []}))
+                    .await;
+            }
+            return;
+        }
         let requested: Vec<Value> = self
             .data_breakpoints
             .iter()
@@ -724,6 +750,10 @@ impl Session {
                 self.exception_filters = filters.into_iter().collect();
                 self.send_exception_filters().await;
             }
+            Command::SetMuteBreakpoints(muted) => {
+                self.muted = muted;
+                self.send_all_breakpoints().await;
+            }
             Command::SetFunctionBreakpoints(specs) => {
                 self.function_breakpoints = specs;
                 self.send_function_breakpoints().await;
@@ -781,6 +811,16 @@ impl Session {
                     Ok(value) => self.console(format!("> {expression}\n{value}"), false),
                     Err(error) => self.console(format!("> {expression}\n{error}"), true),
                 }
+            }
+            Command::EvaluateWindow(expression) => {
+                let answer = self.evaluate_quick(&expression).await;
+                let failed = answer.error.is_some();
+                let text = match &answer.error {
+                    Some(error) => format!("> {expression}\n{error}"),
+                    None => format!("> {expression}\n{}", answer.value),
+                };
+                self.console(text, failed);
+                self.state.evaluation = Some(answer);
             }
             Command::EvaluateLog(expression) => {
                 let answer = self.evaluate(&expression, "repl").await;

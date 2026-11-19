@@ -1,15 +1,16 @@
 //! Edits that a language server computes: Ctrl+Alt+L, Ctrl+Alt+O, Alt+Enter, and the
 //! occurrences of the symbol under the caret.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::time::Duration;
 
 use lang_api::{
     ActionEntry, ActionKind, ActionQuery, ActionResolveQuery, Confidence, DocumentEdit,
-    DocumentSpot, GenerateKind, SourceSpan, SuppressionQuery, SuppressionTarget, TextPoint,
-    TextSpan, UnwrapEdit, WorkspaceChange, ask,
+    DocumentSpot, GenerateKind, SourceEdit, SourceSpan, SuppressionQuery, SuppressionTarget,
+    TextPoint, TextSpan, UnwrapEdit, WorkspaceChange, ask,
 };
-use text_core::{Edit, RopeStore, TextStore};
+use text_core::{Edit, RopeStore, TextStore, editing};
 use ui_kit::*;
 
 use crate::semantic::{NO_ANSWER, first, offset_at, point_at, uri_path};
@@ -96,6 +97,12 @@ pub(crate) enum Pick {
         label: String,
         edit: DocumentEdit,
     },
+    /// Fix all the problems of one check in the file, with the same quick fix at every
+    /// place of the check.
+    FixAllInFile {
+        label: String,
+        code: String,
+    },
     /// A row that turns a check off in the settings of the project.
     DisableInspection {
         label: String,
@@ -146,6 +153,7 @@ impl Pick {
             | Self::Generate { label, .. }
             | Self::Unwrap { label, .. }
             | Self::Suppress { label, .. }
+            | Self::FixAllInFile { label, .. }
             | Self::DisableInspection { label, .. }
             | Self::EditInspection { label, .. }
             | Self::Spelling { label, .. }
@@ -169,7 +177,8 @@ impl Pick {
     fn section(&self) -> MenuSection {
         match self {
             Self::Action(entry) => section_of(entry),
-            Self::Spelling { .. } => MenuSection::QuickFix,
+            // The fix of a whole file belongs beside the quick fixes of the places.
+            Self::Spelling { .. } | Self::FixAllInFile { .. } => MenuSection::QuickFix,
             _ => MenuSection::Intention,
         }
     }
@@ -198,6 +207,12 @@ impl ActionMenu {
     /// Whether the row is a quick fix, which carries the red bulb and comes first.
     pub fn quick_fix(&self, row: usize) -> bool {
         self.sections.get(row) == Some(&MenuSection::QuickFix)
+    }
+
+    /// Whether the row is an item under another one, such as the fix of a whole file
+    /// under the fix of one place. The list indents it.
+    pub fn nested(&self, row: usize) -> bool {
+        matches!(self.rows.get(row), Some(Pick::FixAllInFile { .. }))
     }
 
     /// Whether the list is the menu of Alt+Enter with its sections and its preview.
@@ -242,6 +257,9 @@ const OVERLAPPING: &str = "The language server sent overlapping edits, nothing w
 
 /// Alt+Enter with nothing to offer.
 const NO_ACTIONS: &str = "No actions available here";
+
+/// Fix all found no fix it could apply to every place of the check.
+const NO_FIX_ALL: &str = "The language gave no fix for every place of the check";
 
 /// Whole-word occurrences of `needle` in `text`, in text order.
 pub(crate) fn word_ranges(text: &str, needle: &str) -> Vec<Range<usize>> {
@@ -494,6 +512,65 @@ impl EditorView {
     /// Ctrl+Alt+L: the whole file, through the flags of the Reformat File dialog.
     pub(crate) fn reformat(&mut self, cx: &mut Context<Self>) {
         cx.emit(EditorEvent::Reformat);
+    }
+
+    /// Ctrl+Shift+Enter: the language closes the statement at every caret from its tree;
+    /// a caret it has no plan for finishes its line by the rules of the language alone.
+    pub(crate) fn complete_statement(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        if state.is_read_only()
+            || state
+                .language()
+                .is_none_or(|language| language.statements.is_none())
+        {
+            return;
+        }
+        let mut evolving = state.text();
+        let unit = state.indent_unit().to_owned();
+        let carets: Vec<usize> = state.selections().iter().map(|caret| caret.head).collect();
+        let syntax = self.lsp.as_ref().map(|lsp| lsp.support.syntax());
+        let mut plans = Vec::with_capacity(carets.len());
+        if let Some(syntax) = syntax {
+            // The plans are read in the order of the carets, each from the text with the
+            // plans before it already in: a statement that an earlier caret closed no
+            // longer holds the brackets of this one.
+            let mut shift = 0isize;
+            let mut done_to = 0usize;
+            for caret in carets {
+                let at = (caret as isize + shift).max(0) as usize;
+                let Some(edit) = syntax.complete_statement(&evolving, at, &unit) else {
+                    plans.push(None);
+                    continue;
+                };
+                let start = (edit.start as isize - shift).max(0) as usize;
+                let end = (edit.end as isize - shift).max(0) as usize;
+                // A caret whose line another caret already finished has no plan of its own.
+                if start < done_to {
+                    plans.push(None);
+                    continue;
+                }
+                // A plan of a language that names bytes outside the text is left out.
+                if evolving.get(edit.start..edit.end).is_none() {
+                    plans.push(None);
+                    continue;
+                }
+                done_to = end;
+                shift += edit.text.len() as isize - (edit.end - edit.start) as isize;
+                evolving.replace_range(edit.start..edit.end, &edit.text);
+                plans.push(Some(editing::StatementPlan {
+                    range: start..end,
+                    select: edit.caret..edit.caret,
+                    text: edit.text,
+                }));
+            }
+        }
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let change = state.complete_statement(plans);
+        self.changed(change, cx);
     }
 
     pub(crate) fn ask_actions(
@@ -922,6 +999,13 @@ impl EditorView {
         let text = state.text();
         let text: std::sync::Arc<str> = text.into();
         let mut rows = Vec::new();
+        let places = self.marks_with_code(&code);
+        if places.len() > 1 {
+            rows.push(Pick::FixAllInFile {
+                label: format!("Fix all '{}' in file", info.title),
+                code: code.clone(),
+            });
+        }
         let annotation = |target| {
             support.suppression_edit(SuppressionQuery {
                 text: text.clone(),
@@ -985,6 +1069,124 @@ impl EditorView {
         rows
     }
 
+    /// The places of the file that carry a diagnostic of one check, in text order.
+    fn marks_with_code(&self, code: &str) -> Vec<Range<usize>> {
+        let Some(lsp) = &self.lsp else {
+            return Vec::new();
+        };
+        let mut ranges: Vec<Range<usize>> = lsp
+            .server_marks
+            .iter()
+            .chain(lsp.native_marks.values().flatten())
+            .filter(|mark| mark.code.as_deref() == Some(code))
+            .map(|mark| mark.range.clone())
+            .collect();
+        ranges.sort_by_key(|range| range.start);
+        ranges.dedup();
+        ranges
+    }
+
+    /// Fix all the places of one check in the file with the quick fix the language gives
+    /// for the first of them. Every answer works on the version the menu opened on, and
+    /// the edits of all answers land as one undo step.
+    fn fix_all_in_file(&mut self, version: i32, code: String, cx: &mut Context<Self>) {
+        self.catch_up(cx);
+        let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
+            return;
+        };
+        let uri = lsp.uri.clone();
+        let support = lsp.support.clone();
+        let store = state.store();
+        let ranges = self.marks_with_code(&code);
+        if ranges.len() < 2 {
+            return;
+        }
+        let spans: Vec<TextSpan> = ranges
+            .iter()
+            .map(|range| TextSpan {
+                start: point_at(&store, range.start),
+                end: point_at(&store, range.end),
+            })
+            .collect();
+        let caret = state.selections().primary().head;
+        cx.spawn(async move |this, cx| {
+            let mut title: Option<String> = None;
+            let mut edits: BTreeMap<String, Vec<DocumentEdit>> = BTreeMap::new();
+            let mut renames = Vec::new();
+            for span in spans {
+                let Some(provider) = support.actions() else {
+                    break;
+                };
+                let replies = ask(
+                    provider,
+                    ActionQuery {
+                        uri: uri.clone(),
+                        version,
+                        span,
+                        only: Some(ActionKind::QuickFix),
+                    },
+                );
+                let Some((entries, _)) = first(replies).await else {
+                    continue;
+                };
+                let mut entry = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        !entry.edits.is_empty()
+                            || !entry.renames.is_empty()
+                            || entry.resolve.is_some()
+                    })
+                    .find(|entry| title.as_ref().is_none_or(|title| entry.title == *title));
+                // The same fix as the first place may come without its edits, which the
+                // server fills in on resolve.
+                if let Some(found) = &entry
+                    && found.edits.is_empty()
+                    && found.renames.is_empty()
+                    && let Some(resolve) = &found.resolve
+                    && let Some(provider) = support.action_resolve()
+                {
+                    let replies = ask(
+                        provider,
+                        ActionResolveQuery {
+                            uri: uri.clone(),
+                            version,
+                            resolve: resolve.clone(),
+                        },
+                    );
+                    if let Some((Some(resolved), _)) = first(replies).await {
+                        entry = Some(resolved);
+                    }
+                }
+                let Some(entry) = entry else {
+                    continue;
+                };
+                if title.is_none() {
+                    title = Some(entry.title.clone());
+                }
+                for source in entry.edits {
+                    edits.entry(source.uri).or_default().extend(source.edits);
+                }
+                renames.extend(entry.renames);
+            }
+            this.update(cx, |this, cx| {
+                if edits.is_empty() && renames.is_empty() {
+                    this.show_note(caret, NO_FIX_ALL.to_owned(), cx);
+                    return;
+                }
+                let change = WorkspaceChange {
+                    edits: edits
+                        .into_iter()
+                        .map(|(uri, edits)| SourceEdit { uri, edits })
+                        .collect(),
+                    renames,
+                };
+                this.apply_change(version, change, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Keys of an open action list. Returns whether the key was taken; Escape is
     /// closed by the popup rules of the view.
     pub(crate) fn action_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
@@ -1034,6 +1236,9 @@ impl EditorView {
                     (Some(Pick::Unwrap { edit, .. }), _) => self.apply_unwrap(edit, cx),
                     (Some(Pick::Suppress { edit, .. }), _) => {
                         self.apply_document_edits(vec![edit], cx);
+                    }
+                    (Some(Pick::FixAllInFile { code, .. }), Some(version)) => {
+                        self.fix_all_in_file(version, code, cx);
                     }
                     (Some(Pick::DisableInspection { id, title, .. }), _) => {
                         cx.emit(EditorEvent::DisableInspection { id, title })

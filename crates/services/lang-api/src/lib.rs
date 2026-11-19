@@ -4,6 +4,7 @@
 //! may change: a new extension point appears here together with its first real caller.
 
 mod answer;
+mod attach;
 mod bundle;
 mod code_lens;
 mod coverage;
@@ -31,6 +32,7 @@ mod syntax;
 mod test_gen;
 
 pub use answer::{Answer, Confidence, SourceId};
+pub use attach::{DebugProcess, DebugProcessProvider};
 pub use bundle::BundleFile;
 pub use code_lens::{
     CodeLensCommand, CodeLensEntry, CodeLensKind, CodeLensProvider, CodeLensQuery,
@@ -137,7 +139,7 @@ pub use structural::{
 };
 pub use symbol::{Symbol, SymbolKind, SymbolProvider};
 pub use syntax::{
-    Deletion, DeletionKind, IdentifierLines, Queries, SyntaxProvider, UnwrapEdit,
+    Deletion, DeletionKind, IdentifierLines, Queries, StatementEdit, SyntaxProvider, UnwrapEdit,
     identifiers_around,
 };
 pub use test_gen::{

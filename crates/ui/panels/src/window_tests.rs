@@ -1334,23 +1334,23 @@ fn settings_keep_a_draft_and_apply_reaches_the_window_and_the_file(cx: &mut Test
 }
 
 #[ui_kit::gpui::test]
-fn evaluate_without_a_session_opens_a_prompt(cx: &mut TestAppContext) {
+fn evaluate_without_a_session_opens_the_evaluate_window(cx: &mut TestAppContext) {
     let (root, window) = open_sample_window(cx, "evaluate");
     let path = root.join("src").join("main.txt");
     open_path(cx, window, &path);
     press(cx, window, "alt-f8");
     draw(cx, window);
     assert!(
-        bounds_of(cx, window, "prompt").size.height > px(0.),
-        "Alt+F8 asks for an expression without a session"
+        bounds_of(cx, window, "evaluate-window").size.height > px(0.),
+        "Alt+F8 opens the Evaluate window without a session"
     );
     press(cx, window, "escape");
     cx.run_until_parked();
     draw(cx, window);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     assert!(
-        visual.debug_bounds("prompt").is_none(),
-        "Escape closes the prompt"
+        visual.debug_bounds("evaluate-window").is_none(),
+        "Escape closes the Evaluate window"
     );
 }
 
