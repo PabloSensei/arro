@@ -418,6 +418,9 @@ fn a_file_and_a_folder_move_by_drag_and_a_taken_name_is_refused(cx: &mut TestApp
     let window = crate::window_tests::open_window(cx, root.clone());
     cx.run_until_parked();
     draw(cx, window);
+    // The folders of this test are plain: outer holds one folder, which would be a row shared
+    // with inner under Compact Middle Packages, and the test drags the two rows apart.
+    crate::window_tests_project_compact::set_compact(cx, window, false);
     let main = src.join("main.txt");
     open_path(cx, window, &main);
     show_project(cx, window);

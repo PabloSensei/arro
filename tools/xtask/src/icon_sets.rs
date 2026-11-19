@@ -5,10 +5,14 @@
 //! The folders `welcome`, `ultimate`, `meetNewUi`, `survey` and `ide` hold the icons of
 //! JetBrains products and their logos; the file names below are the logos of products or
 //! companies. Neither may reach the binary.
+//!
+//! Every icon name the sources ask for (a `"group/name"` literal whose group is a folder of
+//! the `arro` set) has a file in the `arro` set in both looks. A set without an icon of its
+//! own shows the `arro` file, so a name without that file leaves an empty place.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::Result;
 
@@ -33,6 +37,14 @@ const FORBIDDEN_NAMES: &[&str] = &[
 
 /// The line every copied SVG has to keep.
 const COPYRIGHT: &str = "Copyright 2000-";
+
+/// The folder of the `arro` set, the fallback of every set.
+const ARRO_FOLDER: &str = "crates/ui/ui-kit/assets/icons";
+/// The icons with one file for both looks, see `arro_file` in ui-kit.
+const SINGLE_LOOK: &[&str] = &["fileTypes/gitignore"];
+/// Literals of the sources that have the form of an icon name but are not one: the source
+/// path of an IntelliJ icon in a test of ui-kit.
+const NOT_ICONS: &[&str] = &["nodes/star"];
 
 pub fn run(root: &Path) -> Result {
     let folder = root.join("crates/ui/ui-kit/assets/icon-sets/intellij");
@@ -93,6 +105,21 @@ pub fn run(root: &Path) -> Result {
             ));
         }
     }
+    // A name the intellij set has no file for shows the arro file, and a name it has shows
+    // its own. Either way the arro file of every name has to exist.
+    let arro = root.join(ARRO_FOLDER);
+    let groups = icon_groups(&arro)?;
+    let arro_files = arro_files(&arro)?;
+    for (name, place) in icon_names(root, &groups)? {
+        for dark in [false, true] {
+            let file = arro_file(&name, dark);
+            if !arro_files.contains(&file) {
+                problems.push(format!(
+                    "{name} is asked at {place}, but {ARRO_FOLDER}/{file} is missing: the icon is empty"
+                ));
+            }
+        }
+    }
     if problems.is_empty() {
         return Ok(());
     }
@@ -137,10 +164,111 @@ fn parse_map(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The SVG files of the `arro` set by their path with `/` between the folders, as text. The
+/// names are compared exactly: on Windows a file that differs only in case exists, but the
+/// binary and Linux do not find it.
+fn arro_files(arro: &Path) -> Result<HashSet<String>> {
+    let mut files = Vec::new();
+    svgs(arro, "", &mut files)?;
+    Ok(files
+        .iter()
+        .filter_map(|file| file.strip_prefix(arro).ok())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .collect())
+}
+
+/// The folders of the `arro` set: the groups its icon names start with.
+fn icon_groups(arro: &Path) -> Result<HashSet<String>> {
+    let mut groups = HashSet::new();
+    for entry in fs::read_dir(arro)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            groups.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(groups)
+}
+
+/// The icon names the Rust sources of `crates` ask for, each with the place of its first
+/// literal, as `file:line`.
+fn icon_names(root: &Path, groups: &HashSet<String>) -> Result<BTreeMap<String, String>> {
+    let mut files = Vec::new();
+    rust_sources(&root.join("crates"), &mut files)?;
+    let mut names = BTreeMap::new();
+    for file in files {
+        let text = fs::read_to_string(&file)?;
+        let relative = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (number, line) in text.lines().enumerate() {
+            for name in icon_literals(line, groups) {
+                names
+                    .entry(name.to_owned())
+                    .or_insert_with(|| format!("{relative}:{}", number + 1));
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The `"group/name"` literals of a line whose group is one of `groups`. The text between
+/// two quotes is every second field of the line split at its quotes.
+fn icon_literals<'a>(line: &'a str, groups: &'a HashSet<String>) -> impl Iterator<Item = &'a str> {
+    line.split('"').skip(1).step_by(2).filter(move |literal| {
+        literal.split_once('/').is_some_and(|(group, name)| {
+            groups.contains(group) && is_name(name) && !NOT_ICONS.contains(literal)
+        })
+    })
+}
+
+/// Whether a name of an icon is made of letters, digits and underscores.
+fn is_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// The file of an icon in the `arro` set, named the way `arro_file` of ui-kit names it.
+fn arro_file(name: &str, dark: bool) -> String {
+    let suffix = if dark && !SINGLE_LOOK.contains(&name) {
+        "_dark"
+    } else {
+        ""
+    };
+    format!("{name}{suffix}.svg")
+}
+
+/// The Rust sources below `folder`.
+fn rust_sources(folder: &Path, files: &mut Vec<PathBuf>) -> Result {
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            rust_sources(&path, files)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     #[test]
     fn the_bundled_set_has_no_product_logos_and_names_every_file() {
         super::run(&crate::workspace_root()).unwrap();
+    }
+
+    #[test]
+    fn an_icon_name_is_a_literal_of_a_group_of_the_arro_set() {
+        let groups: HashSet<String> = ["general", "nodes"].into_iter().map(String::from).collect();
+        let line = r#"icon("general/settings", "textDocument/hover", "general/a/b", "nodes/star", "general/")"#;
+        let names: Vec<&str> = super::icon_literals(line, &groups).collect();
+        assert_eq!(names, ["general/settings"]);
     }
 }

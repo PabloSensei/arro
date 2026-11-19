@@ -15,6 +15,8 @@ pub struct FindOptions {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub regex: bool,
+    /// A replacement takes the case of the text it replaces.
+    pub preserve_case: bool,
 }
 
 fn pattern(query: &str, options: FindOptions) -> Result<Regex, String> {
@@ -43,22 +45,72 @@ fn pattern(query: &str, options: FindOptions) -> Result<Regex, String> {
         })
 }
 
+/// The part of `text` that `range` covers, moved to the characters of the text.
+fn inside(text: &str, range: &Range<usize>) -> Range<usize> {
+    let mut start = range.start.min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = range.end.max(start).min(text.len());
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    start..end
+}
+
 /// Every match of `query` in `text`, empty matches left out. An empty query finds nothing.
 pub fn find_all(
     text: &str,
     query: &str,
     options: FindOptions,
 ) -> Result<Vec<Range<usize>>, String> {
+    find_in_range(text, query, options, 0..text.len())
+}
+
+/// Every match of `query` inside `range` of `text`, with the offsets of the whole text.
+/// A match that begins before the range does not count, as in Find in Selection.
+pub fn find_in_range(
+    text: &str,
+    query: &str,
+    options: FindOptions,
+    range: Range<usize>,
+) -> Result<Vec<Range<usize>>, String> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
+    let range = inside(text, &range);
     let found = pattern(query, options)?
-        .find_iter(text)
+        .find_iter(&text[range.clone()])
         .filter(|found| !found.is_empty())
         .take(MAX_MATCHES)
-        .map(|found| found.range())
+        .map(|found| range.start + found.start()..range.start + found.end())
         .collect();
     Ok(found)
+}
+
+/// `replacement` in the case of `found`: an all-capitals word keeps the whole replacement
+/// in capitals, a capital first letter capitalises the first letter of the replacement,
+/// a lower one lowercases it.
+pub fn preserve_case(found: &str, replacement: &str) -> String {
+    let mut letters = found.chars().filter(|c| c.is_alphabetic());
+    let Some(first) = letters.next() else {
+        return replacement.to_owned();
+    };
+    if first.is_uppercase() && letters.all(|c| c.is_uppercase()) {
+        return replacement.to_uppercase();
+    }
+    let mut chars = replacement.chars();
+    let Some(head) = chars.next() else {
+        return String::new();
+    };
+    let head: String = if first.is_uppercase() {
+        head.to_uppercase().collect()
+    } else {
+        head.to_lowercase().collect()
+    };
+    let mut result = head;
+    result.push_str(chars.as_str());
+    result
 }
 
 /// The edits that replace the matches in `only` (all when `None`) with `replacement`. With
@@ -70,16 +122,40 @@ pub fn replacements(
     replacement: &str,
     only: Option<&Range<usize>>,
 ) -> Result<Vec<Edit>, String> {
+    replacements_in(text, query, options, replacement, only, None)
+}
+
+/// [`replacements`] restricted to `within` when it is given, as Replace All with Find in
+/// Selection does. The offsets of the edits are those of the whole text.
+pub fn replacements_in(
+    text: &str,
+    query: &str,
+    options: FindOptions,
+    replacement: &str,
+    only: Option<&Range<usize>>,
+    within: Option<&Range<usize>>,
+) -> Result<Vec<Edit>, String> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
     let pattern = pattern(query, options)?;
+    let (searched, offset) = match within {
+        Some(range) => {
+            let range = inside(text, range);
+            (&text[range.clone()], range.start)
+        }
+        None => (text, 0),
+    };
     let mut edits = Vec::new();
-    for captures in pattern.captures_iter(text) {
+    for captures in pattern.captures_iter(searched) {
         let Some(whole) = captures.get(0) else {
             continue;
         };
-        if whole.is_empty() || only.is_some_and(|only| only != &whole.range()) {
+        if whole.is_empty() {
+            continue;
+        }
+        let range = offset + whole.start()..offset + whole.end();
+        if only.is_some_and(|only| only != &range) {
             continue;
         }
         let mut replaced = String::new();
@@ -88,7 +164,10 @@ pub fn replacements(
         } else {
             replaced.push_str(replacement);
         }
-        edits.push(Edit::new(whole.range(), replaced));
+        if options.preserve_case {
+            replaced = preserve_case(&text[range.clone()], &replaced);
+        }
+        edits.push(Edit::new(range, replaced));
     }
     Ok(edits)
 }
@@ -102,6 +181,7 @@ mod tests {
         case_sensitive: false,
         whole_word: true,
         regex: false,
+        preserve_case: false,
     };
 
     #[test]
@@ -147,5 +227,66 @@ mod tests {
         assert_eq!(edits, [Edit::new(0..2, "1a"), Edit::new(3..6, "22b")]);
         let one = replacements("a1 b22", r"([a-z])(\d+)", options, "x", Some(&(3..6))).unwrap();
         assert_eq!(one, [Edit::new(3..6, "x")]);
+    }
+
+    #[test]
+    fn preserve_case_takes_the_case_of_the_found_text() {
+        assert_eq!(preserve_case("foo", "bar"), "bar");
+        assert_eq!(preserve_case("Foo", "bar"), "Bar");
+        assert_eq!(preserve_case("FOO", "bar"), "BAR");
+        // A mixed word follows its first letter.
+        assert_eq!(preserve_case("fooBar", "Baz"), "baz");
+        assert_eq!(preserve_case("FooBar", "baz"), "Baz");
+        assert_eq!(preserve_case("123", "bar"), "bar");
+    }
+
+    #[test]
+    fn preserve_case_applies_to_an_expanded_regex() {
+        let options = FindOptions {
+            regex: true,
+            preserve_case: true,
+            ..FindOptions::default()
+        };
+        let edits = replacements(
+            "foo(1) Foo(2) FOO(3)",
+            r"foo\((\d)\)",
+            options,
+            "bar$1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            edits,
+            [
+                Edit::new(0..6, "bar1"),
+                Edit::new(7..13, "Bar2"),
+                Edit::new(14..20, "BAR3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_search_stays_inside_a_range() {
+        let text = "alpha\nbeta\nalpha\nalpha\n";
+        let found = find_in_range(text, "alpha", FindOptions::default(), 0..17).unwrap();
+        assert_eq!(
+            found,
+            [0..5, 11..16],
+            "the match outside the range is left out"
+        );
+
+        let edits = replacements_in(
+            text,
+            "alpha",
+            FindOptions::default(),
+            "omega",
+            None,
+            Some(&(0..17)),
+        )
+        .unwrap();
+        assert_eq!(
+            edits,
+            [Edit::new(0..5, "omega"), Edit::new(11..16, "omega")]
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! What the main window looks like: the layout of the S10 mock on real state.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use crate::appearance::{
 };
 use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
+use crate::split::SplitNode;
 use crate::window::{
     AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_POPUP, BalloonAction, BringAllToFront, BuildProject,
     COMMIT_TOOL, CheckForUpdatesApp, ChooseDebugConfiguration, ChooseRunConfiguration, CloseTab,
@@ -46,6 +48,8 @@ use crate::window::{
 
 /// Wider than the gap itself so that the edge is easy to catch.
 const EDGE_GRIP: f32 = 6.;
+/// The smallest share of a split that a drag leaves to either part.
+const SPLIT_LIMIT: f32 = 0.1;
 /// The border of a window that draws its own title bar, where a press resizes the
 /// window: the width of the border of the system windows of Ubuntu.
 const WINDOW_RESIZE_BORDER: f32 = 6.;
@@ -147,6 +151,19 @@ fn toggle_window_zoom(window: &mut Window, _cx: &mut App) {
 
 #[derive(Clone, Copy)]
 struct DraggedEdge(DockSide);
+
+/// The divider of a split of the editor area, which drags the share of its two parts.
+/// `path` names the split: every step is the child taken at the split above it.
+struct DraggedSplit {
+    path: Vec<usize>,
+}
+
+/// The path of the child `child` of the split at `path`.
+fn child_path(path: &[usize], child: usize) -> Vec<usize> {
+    let mut child_path = path.to_vec();
+    child_path.push(child);
+    child_path
+}
 
 /// Where a menu that a button opens goes: under the button while its area is known,
 /// otherwise at the pointer of the click.
@@ -366,6 +383,57 @@ fn path_parts(root: &Path, path: &Path) -> Vec<String> {
     parts
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
         .collect()
+}
+
+/// One row of the menu a path crumb of the status bar opens.
+struct FolderEntry {
+    label: String,
+    path: PathBuf,
+    folder: bool,
+    icon: &'static str,
+}
+
+/// The files and folders directly under `folder`, from the list of the files of the
+/// project: the folders first, then the files, each in the order of their names.
+fn folder_entries(
+    folder: &Path,
+    files: &[PathBuf],
+    icons: &crate::editor::FileIcons,
+) -> Vec<FolderEntry> {
+    let mut entries: Vec<FolderEntry> = Vec::new();
+    let mut seen: HashSet<(String, bool)> = HashSet::new();
+    for file in files {
+        let Ok(relative) = file.strip_prefix(folder) else {
+            continue;
+        };
+        let mut parts = relative.components();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let label = name.as_os_str().to_string_lossy().into_owned();
+        let is_folder = parts.next().is_some();
+        if !seen.insert((label.clone(), is_folder)) {
+            continue;
+        }
+        let path = if is_folder {
+            folder.join(name.as_os_str())
+        } else {
+            file.clone()
+        };
+        let icon = if is_folder {
+            "nodes/folder"
+        } else {
+            icons.icon_for(&path)
+        };
+        entries.push(FolderEntry {
+            label,
+            path,
+            folder: is_folder,
+            icon,
+        });
+    }
+    entries.sort_by_key(|entry| (!entry.folder, entry.label.to_lowercase()));
+    entries
 }
 
 /// The row a path of the menu of the screen names: the section, then the row, then the row
@@ -1364,6 +1432,11 @@ impl Workspace {
                 this.select_tab(pane, index, window, cx);
                 this.run_command("git.show_file_history", window, cx);
             }),
+            MenuEntry::separator(),
+            workspace_entry(&weak, "Unsplit", move |this, window, cx| {
+                this.select_tab(pane, index, window, cx);
+                this.unsplit(window, cx);
+            }),
         ];
         self.show_menu(position, entries, cx);
     }
@@ -1561,8 +1634,31 @@ impl Workspace {
                 self.command_row_named(&weak, TOGGLE_FULL_SCREEN, full_screen),
                 self.command_row_named(&weak, TOGGLE_ZEN_MODE, zen),
                 MenuEntry::separator(),
-                self.command_row(&weak, editor_keys::TOGGLE_WHITESPACE, "Show Whitespaces"),
-                self.command_row(&weak, editor_keys::TOGGLE_SOFT_WRAP, "Soft-Wrap"),
+                self.command_row_named(
+                    &weak,
+                    editor_keys::TOGGLE_WHITESPACE,
+                    checked_label("Show Whitespaces", settings.show_whitespace),
+                ),
+                self.command_row_named(
+                    &weak,
+                    editor_keys::TOGGLE_SOFT_WRAP,
+                    checked_label("Soft-Wrap", settings.soft_wrap),
+                ),
+                MenuEntry::submenu(
+                    "Active Editor",
+                    vec![
+                        self.command_row_named(
+                            &weak,
+                            "editor.soft_wrap_in_editor",
+                            "Soft-Wrap in This Editor",
+                        ),
+                        self.command_row_named(
+                            &weak,
+                            "editor.show_whitespace_in_editor",
+                            "Show Whitespaces in This Editor",
+                        ),
+                    ],
+                ),
                 MenuEntry::separator(),
                 self.command_row_named(
                     &weak,
@@ -1861,6 +1957,7 @@ impl Workspace {
                 command(editor_keys::RENAME, "Rename..."),
                 command(editor_keys::CHANGE_SIGNATURE, "Change Signature..."),
                 command(editor_keys::MOVE, "Move..."),
+                command("workspace.copy_element", "Copy..."),
                 command(editor_keys::INLINE, "Inline..."),
                 MenuEntry::separator(),
                 MenuEntry::submenu(
@@ -1918,8 +2015,9 @@ impl Workspace {
                 self.action_row("Toggle Breakpoint", ToggleBreakpoint),
                 self.action_row("Toggle Temporary Breakpoint", ToggleTemporaryLineBreakpoint),
                 self.action_row("View Breakpoints...", ViewBreakpoints),
+                command("debug.mute_breakpoints", "Mute Breakpoints"),
                 MenuEntry::separator(),
-                command("debug.attach_jvm", "Attach to JVM..."),
+                command("debug.attach_jvm", "Attach to Process..."),
                 MenuEntry::separator(),
                 command("run.edit_configurations", "Edit Configurations..."),
             ],
@@ -2048,12 +2146,7 @@ impl Workspace {
         sections: &[MenuEntry],
         cx: &mut Context<Self>,
     ) -> usize {
-        // The text grows by itself only where the platform does not grow the window.
-        let font_size = px(UI_SIZE
-            * text_scale(
-                cx.try_global::<Settings>()
-                    .map_or(1., |settings| settings.ui_scale),
-            ));
+        let font_size = px(UI_SIZE);
         let widths: Vec<f32> = sections
             .iter()
             .map(|section| {
@@ -2454,6 +2547,43 @@ impl Workspace {
         }
     }
 
+    /// The menu of a path crumb of the status bar: the folders and files of that level
+    /// of the project. A folder opens its own level, a file opens in the editor.
+    pub(crate) fn show_folder_menu(
+        &mut self,
+        folder: PathBuf,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(files) = self.project_files().map(|files| files.read(cx).clone()) else {
+            return;
+        };
+        let icons = self.icons().clone();
+        let entries: Vec<MenuEntry> = folder_entries(&folder, &files, &icons)
+            .into_iter()
+            .map(|entry| {
+                let weak = cx.weak_entity();
+                let path = entry.path;
+                let is_folder = entry.folder;
+                MenuEntry::new(entry.label, move |window, cx| {
+                    weak.update(cx, |workspace, cx| {
+                        if is_folder {
+                            workspace.show_folder_menu(path.clone(), position, cx);
+                        } else {
+                            workspace.open_file(path.clone(), window, cx);
+                        }
+                    })
+                    .ok();
+                })
+                .icon(entry.icon)
+            })
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        self.show_menu(position, entries, cx);
+    }
+
     /// The menu of the indentation in the status bar: the settings of the project, the
     /// unit of this file and its size until the tab closes.
     fn show_indent_menu(
@@ -2603,7 +2733,6 @@ impl Workspace {
                 .into_any_element(),
             None => body.child(self.welcome(theme)).into_any_element(),
         };
-        let down = self.split_down;
         let bar = if self.distraction_free() {
             div().into_any_element()
         } else {
@@ -2621,28 +2750,147 @@ impl Workspace {
             )
         };
         island(theme)
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .when(down, |this| this.w_full())
-            .when(!down, |this| this.h_full())
             .bg(theme.editor_bg)
             .child(bar)
             .child(body)
     }
 
-    fn editor_area(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let panes: Vec<_> = (0..self.panes.len())
-            .map(|pane| self.pane_view(pane, theme, cx))
-            .collect();
+    /// The splits and the groups of the editor area, the nested splits inside the parts
+    /// of the ones above them.
+    fn split_view(
+        &self,
+        node: &SplitNode,
+        path: Vec<usize>,
+        divider: &mut usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let SplitNode::Split {
+            down,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            let SplitNode::Group(pane) = node else {
+                return div().into_any_element();
+            };
+            return div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(self.pane_view(*pane, theme, cx))
+                .into_any_element();
+        };
+        let index = *divider;
+        *divider += 1;
+        let first = self.split_view(first, child_path(&path, 0), divider, theme, cx);
+        let second = self.split_view(second, child_path(&path, 1), divider, theme, cx);
+        let grab = path.clone();
+        let wanted = path.clone();
+        let ratio = ratio.clamp(SPLIT_LIMIT, 1. - SPLIT_LIMIT);
         div()
+            .id(("split", index))
             .flex()
-            .when(self.split_down, |this| this.flex_col())
+            .when(*down, |this| this.flex_col())
             .flex_1()
             .min_w_0()
+            .min_h_0()
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedSplit>, _, cx| {
+                    if event.drag(cx).path == wanted {
+                        this.drag_split(&wanted, event.event.position, event.bounds, cx);
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_grow(ratio)
+                    .min_w_0()
+                    .min_h_0()
+                    .child(first),
+            )
+            .child(self.split_divider(grab, *down, index, theme))
+            .child(
+                div()
+                    .flex()
+                    .flex_grow(1. - ratio)
+                    .min_w_0()
+                    .min_h_0()
+                    .child(second),
+            )
+            .into_any_element()
+    }
+
+    /// The bar between the two parts of a split: a drag moves the share they take.
+    fn split_divider(
+        &self,
+        path: Vec<usize>,
+        down: bool,
+        index: usize,
+        theme: &Theme,
+    ) -> Stateful<Div> {
+        div()
+            .id(("split-divider", index))
+            .debug_selector(move || format!("split-divider-{index}"))
+            .flex_none()
+            .when(down, |this| {
+                this.w_full().h(px(EDGE_GRIP)).cursor_row_resize()
+            })
+            .when(!down, |this| {
+                this.h_full().w(px(EDGE_GRIP)).cursor_col_resize()
+            })
+            .bg(theme.border)
+            .on_drag(DraggedSplit { path }, |_, _, _, cx| {
+                cx.new(|_| NoDragPreview)
+            })
+    }
+
+    /// Moves the share of the split at `path` to the place of the pointer in it.
+    fn drag_split(
+        &mut self,
+        path: &[usize],
+        position: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(down) = self.splits.split_direction(path) else {
+            return;
+        };
+        let (moved, size) = if down {
+            (position.y - bounds.origin.y, bounds.size.height)
+        } else {
+            (position.x - bounds.origin.x, bounds.size.width)
+        };
+        if size <= px(0.) {
+            return;
+        }
+        if self
+            .splits
+            .set_ratio(path, f32::from(moved) / f32::from(size))
+        {
+            self.layout_changed(cx);
+            cx.notify();
+        }
+    }
+
+    fn editor_area(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut divider = 0;
+        let tree = self.split_view(self.splits.root(), Vec::new(), &mut divider, theme, cx);
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
             .h_full()
-            .gap(px(ISLAND_GAP))
-            .children(panes)
+            .child(tree)
     }
 
     /// Thin area over the gap next to a dock, dragging it resizes the dock.
@@ -2877,12 +3125,7 @@ impl Render for Workspace {
         let gap = px(ISLAND_GAP);
         #[cfg(feature = "test-support")]
         self.apply_test_ui_scale(window);
-        // The text grows by itself only where the platform does not grow the window.
-        let text = text_scale(
-            cx.try_global::<Settings>()
-                .map_or(1., |settings| settings.ui_scale),
-        );
-        window.set_rem_size(px(16. * text));
+        window.set_rem_size(px(16.));
         // The platform looks for the areas of the caption in the frame it drew last, and
         // the title bar is a cached view: the root gives them back on every frame. A
         // window without a caption of its own has none, and the areas of an older frame
@@ -2990,7 +3233,7 @@ impl Render for Workspace {
             .bg(theme.main_bg)
             .text_color(theme.text)
             .font_family(UI_FONT)
-            .text_size(px(UI_SIZE * text))
+            .text_size(px(UI_SIZE))
             .child(
                 // The side buttons of the mouse are the keys of Back and Forward:
                 // pressing one runs the same command wherever the pointer is, even over
@@ -3737,18 +3980,44 @@ impl Render for StatusBarView {
             .flex_1()
             .min_w_0()
             .overflow_hidden();
-        path = path.child(crumb(0usize, Some("nodes/module"), name, &theme));
+        let root_menu = root.clone();
+        path = path.child(
+            crumb(0usize, Some("nodes/module"), name, &theme).on_click(cx.listener(
+                move |this, event: &ClickEvent, _window, cx| {
+                    let folder = root_menu.clone();
+                    let position = event.position();
+                    this.workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_folder_menu(folder, position, cx)
+                        })
+                        .ok();
+                },
+            )),
+        );
         if let Some((file, icon)) = &active {
             let parts = path_parts(&root, file);
             let count = parts.len();
+            let mut folder = root.clone();
             for (index, part) in parts.into_iter().enumerate() {
                 let leading = (index + 1 == count).then_some(*icon);
-                path = path.child(crumb_separator(&theme)).child(crumb(
-                    index + 1,
-                    leading,
-                    part,
-                    &theme,
-                ));
+                let is_file = index + 1 == count;
+                let mut element = crumb(index + 1, leading, part.clone(), &theme);
+                if !is_file {
+                    folder = folder.join(&part);
+                    let child = folder.clone();
+                    element = element.cursor_pointer().on_click(cx.listener(
+                        move |this, event: &ClickEvent, _window, cx| {
+                            let folder = child.clone();
+                            let position = event.position();
+                            this.workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.show_folder_menu(folder, position, cx)
+                                })
+                                .ok();
+                        },
+                    ));
+                }
+                path = path.child(crumb_separator(&theme)).child(element);
             }
         }
         let zoom = zoom_notice.map(|text| {

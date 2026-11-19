@@ -5,13 +5,16 @@ use std::sync::Arc;
 
 use editor_view::{EditorView, Semantic};
 use keymap::{editor as editor_keys, workspace as keys};
+use lang_api::DebugProcess;
 use search::Tab;
+use ui_kit::metrics::*;
+use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, RUN_TOOL, Workspace};
 
 use crate::agents::ASK_AI;
 use crate::choice::{ChoiceDialog, DialogChoice};
-use crate::debug::ActiveDebug;
+use crate::debug::{ActiveDebug, DebugPanel};
 use crate::diff_view::DiffView;
 use crate::documentation::ActiveDocumentation;
 use crate::finder::{ActiveFinder, Finder};
@@ -221,6 +224,12 @@ pub fn register(
         workspace.compile_path(path, window, cx);
     });
     workspace.register_command("debug.attach_jvm", "Attach to JVM…", attach_to_jvm);
+    workspace.register_command("debug.mute_breakpoints", "Mute Breakpoints", |_, _, cx| {
+        if let Some(panel) = cx.try_global::<ActiveDebug>() {
+            let panel = panel.0.clone();
+            panel.update(cx, |panel, cx| panel.toggle_mute(cx));
+        }
+    });
     workspace.register_command("window.database", "Database", |workspace, window, cx| {
         workspace.toggle_tool(DATABASE_TOOL, window, cx)
     });
@@ -270,6 +279,29 @@ pub fn register(
         (editor_keys::TOGGLE_WHITESPACE, "Show Whitespaces"),
     ] {
         workspace.register_command(action, title, move |workspace, _, cx| {
+            workspace.update_settings(
+                |settings| match action {
+                    editor_keys::TOGGLE_SOFT_WRAP => settings.soft_wrap = !settings.soft_wrap,
+                    _ => settings.show_whitespace = !settings.show_whitespace,
+                },
+                cx,
+            );
+        });
+    }
+    // View | Active Editor: the switch of this view alone, until it closes.
+    for (id, title, action) in [
+        (
+            "editor.soft_wrap_in_editor",
+            "Soft-Wrap in This Editor",
+            editor_keys::TOGGLE_SOFT_WRAP,
+        ),
+        (
+            "editor.show_whitespace_in_editor",
+            "Show Whitespaces in This Editor",
+            editor_keys::TOGGLE_WHITESPACE,
+        ),
+    ] {
+        workspace.register_command(id, title, move |workspace, _, cx| {
             let view = workspace.active_view();
             if let Some(view) = view.and_then(|view| view.downcast::<EditorView>().ok()) {
                 view.update(cx, |view, cx| view.run(action, cx));
@@ -469,6 +501,9 @@ pub fn register(
         "Split Right",
         |workspace, window, cx| workspace.split_right(window, cx),
     );
+    workspace.register_command("window.unsplit", "Unsplit", |workspace, window, cx| {
+        workspace.unsplit(window, cx)
+    });
 
     let test_files = files.clone();
     workspace.register_command(
@@ -1638,6 +1673,224 @@ fn parse_endpoint(text: &str) -> Result<(String, u16), String> {
     Ok((host.to_owned(), port))
 }
 
+/// The processes a debugger can attach to, for a language that lists its JVMs. The last
+/// row asks for a `host:port` by hand.
+struct AttachProcessView {
+    debug: Entity<DebugPanel>,
+    runs: Entity<RunPanel>,
+    workspace: WeakEntity<Workspace>,
+    focus: FocusHandle,
+    scroll: ScrollHandle,
+    /// The answer of the language, `None` while the list is being built.
+    processes: Option<Vec<DebugProcess>>,
+    selected: usize,
+}
+
+impl AttachProcessView {
+    fn new(
+        debug: Entity<DebugPanel>,
+        runs: Entity<RunPanel>,
+        workspace: WeakEntity<Workspace>,
+        replies: lang_api::Replies<Vec<DebugProcess>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let view = Self {
+            debug,
+            runs,
+            workspace,
+            focus: cx.focus_handle(),
+            scroll: ScrollHandle::new(),
+            processes: None,
+            selected: 0,
+        };
+        cx.spawn(async move |this, cx| {
+            use futures_util::StreamExt;
+            let mut replies = replies;
+            while let Some(answer) = replies.next().await {
+                let processes = answer.value;
+                this.update(cx, |this, cx| {
+                    this.processes = Some(processes);
+                    this.selected = 0;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+        view
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+
+    fn choose(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let processes = self.processes.clone().unwrap_or_default();
+        if let Some(process) = processes.get(index) {
+            let name = if process.name.is_empty() {
+                format!("process {}", process.pid)
+            } else {
+                process.name.clone()
+            };
+            self.close(window, cx);
+            begin_attach(
+                self.workspace.clone(),
+                window.window_handle(),
+                self.debug.clone(),
+                self.runs.clone(),
+                process.host.clone(),
+                process.port,
+                name,
+                cx,
+            );
+        } else if index == processes.len() {
+            let (debug, runs) = (self.debug.clone(), self.runs.clone());
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.dismiss(window, cx);
+                    ask_endpoint(workspace, window, debug, runs, cx);
+                })
+                .ok();
+        }
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.processes.as_ref().map_or(1, Vec::len) + 1;
+        match event.keystroke.key.as_str() {
+            "up" => {
+                self.selected = self.selected.saturating_sub(1);
+                cx.notify();
+            }
+            "down" => {
+                if self.selected + 1 < count {
+                    self.selected += 1;
+                }
+                cx.notify();
+            }
+            "enter" => self.choose(self.selected, window, cx),
+            "escape" => self.close(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+}
+
+impl Render for AttachProcessView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        match &self.processes {
+            None => rows.push(
+                div()
+                    .px(px(ROW_PADDING_X))
+                    .py(px(SPACE_S))
+                    .text_color(theme.text_secondary)
+                    .child("Looking for processes…")
+                    .into_any_element(),
+            ),
+            Some(processes) if processes.is_empty() => rows.push(
+                div()
+                    .px(px(ROW_PADDING_X))
+                    .py(px(SPACE_S))
+                    .text_color(theme.text_secondary)
+                    .child("No process with a debug agent is running.")
+                    .into_any_element(),
+            ),
+            Some(processes) => {
+                for (index, process) in processes.iter().enumerate() {
+                    let selected = index == self.selected;
+                    let name = if process.name.is_empty() {
+                        format!("process {}", process.pid)
+                    } else {
+                        process.name.clone()
+                    };
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!("attach-process-{index}")))
+                            .debug_selector(move || format!("attach-process-{index}"))
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .px(px(ROW_PADDING_X))
+                            .py(px(SPACE_S))
+                            .cursor_pointer()
+                            .text_color(theme.text)
+                            .when(selected, |row| row.bg(theme.selection))
+                            .when(!selected, |row| row.hover(|row| row.bg(theme.hover)))
+                            .child(div().flex_1().min_w(px(0.)).truncate().child(name))
+                            .child(div().flex_none().text_color(theme.text_secondary).child(
+                                format!("{} · {}:{}", process.pid, process.host, process.port),
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.choose(index, window, cx)
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        let manual = self.processes.as_ref().map_or(0, Vec::len);
+        let selected = manual == self.selected;
+        rows.push(
+            div()
+                .id("attach-process-manual")
+                .debug_selector(|| "attach-process-manual".to_owned())
+                .flex()
+                .items_center()
+                .px(px(ROW_PADDING_X))
+                .py(px(SPACE_S))
+                .cursor_pointer()
+                .text_color(theme.text_secondary)
+                .when(selected, |row| row.bg(theme.selection))
+                .when(!selected, |row| row.hover(|row| row.bg(theme.hover)))
+                .child("Enter host:port…")
+                .on_click(cx.listener(move |this, _, window, cx| this.choose(manual, window, cx)))
+                .into_any_element(),
+        );
+        let body = scrollable(
+            "attach-processes",
+            &self.scroll,
+            surface(&theme)
+                .id("attach-processes")
+                .debug_selector(|| "attach-processes".to_owned())
+                .track_focus(&self.focus)
+                .occlude()
+                .w(px(460.))
+                .max_h(px(420.))
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .p(px(DIALOG_PADDING))
+                .gap(px(2.))
+                .text_size(px(UI_SIZE))
+                .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+                .child(
+                    div()
+                        .px(px(SPACE_M))
+                        .pb(px(SPACE_S))
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_secondary)
+                        .child("Attach to Process"),
+                )
+                .children(rows),
+            &theme,
+            window,
+            cx,
+        );
+        let viewport = window.viewport_size();
+        let width = px(460.);
+        let left = (viewport.width - width) / 2.;
+        let top = viewport.height * 0.2;
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .child(enter("attach-process-enter", body))
+    }
+}
+
 fn attach_to_jvm(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(debug) = cx.try_global::<ActiveDebug>().map(|panel| panel.0.clone()) else {
         return;
@@ -1648,6 +1901,30 @@ fn attach_to_jvm(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
     else {
         return;
     };
+    // A language that lists the JVMs with a debug agent offers them by name; the manual
+    // address stays the last row of that list.
+    if let Some(provider) = cx
+        .try_global::<Semantic>()
+        .and_then(|semantic| semantic.0.debug_processes())
+    {
+        let replies = lang_api::ask(provider, ());
+        let workspace_weak = cx.weak_entity();
+        let view = cx.new(|cx| AttachProcessView::new(debug, runs, workspace_weak, replies, cx));
+        let focus = view.read(cx).focus.clone();
+        workspace.show_overlay(view.into(), focus, window, cx);
+        return;
+    }
+    ask_endpoint(workspace, window, debug, runs, cx);
+}
+
+/// The prompt of a `host:port` the user types, for a language without a process list.
+fn ask_endpoint(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    debug: Entity<DebugPanel>,
+    runs: Entity<RunPanel>,
+    cx: &mut Context<Workspace>,
+) {
     let workspace_weak = cx.weak_entity();
     let handle = window.window_handle();
     let submit = move |text: String, cx: &mut App| {
@@ -1662,42 +1939,17 @@ fn attach_to_jvm(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
                 return;
             }
         };
-        let Some(service) = runs.read(cx).debug_service() else {
-            workspace_weak
-                .update(cx, |workspace, cx| {
-                    workspace.notify_user("Attach to JVM", "The language server is not running", cx)
-                })
-                .ok();
-            return;
-        };
         let name = format!("{host}:{port}");
-        let started = debug.update(cx, |panel, cx| {
-            panel.start_attach(service, host, port, name, None, cx)
-        });
-        match started {
-            Ok(()) => {
-                // The prompt is still in its own update: show the window after it ends.
-                let workspace_weak = workspace_weak.clone();
-                cx.defer(move |cx| {
-                    handle
-                        .update(cx, |_, window, cx| {
-                            workspace_weak
-                                .update(cx, |workspace, cx| {
-                                    workspace.show_tool(workspace::DEBUG_TOOL, window, cx)
-                                })
-                                .ok();
-                        })
-                        .ok();
-                });
-            }
-            Err(error) => {
-                workspace_weak
-                    .update(cx, |workspace, cx| {
-                        workspace.notify_user("Attach to JVM", error, cx)
-                    })
-                    .ok();
-            }
-        }
+        begin_attach(
+            workspace_weak.clone(),
+            handle,
+            debug.clone(),
+            runs.clone(),
+            host,
+            port,
+            name,
+            cx,
+        );
     };
     Prompt::show_with(
         "Attach to JVM",
@@ -1707,6 +1959,54 @@ fn attach_to_jvm(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
         window,
         cx,
     );
+}
+
+/// Starts the session of an attachment and opens the Debug window once it is up.
+#[allow(clippy::too_many_arguments)]
+fn begin_attach(
+    workspace: WeakEntity<Workspace>,
+    handle: AnyWindowHandle,
+    debug: Entity<DebugPanel>,
+    runs: Entity<RunPanel>,
+    host: String,
+    port: u16,
+    name: String,
+    cx: &mut App,
+) {
+    let Some(service) = runs.read(cx).debug_service() else {
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user("Attach to JVM", "The language server is not running", cx)
+            })
+            .ok();
+        return;
+    };
+    let started = debug.update(cx, |panel, cx| {
+        panel.start_attach(service, host, port, name, None, cx)
+    });
+    match started {
+        Ok(()) => {
+            // The caller may still be in its own update: show the window after it ends.
+            cx.defer(move |cx| {
+                handle
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_tool(DEBUG_TOOL, window, cx)
+                            })
+                            .ok();
+                    })
+                    .ok();
+            });
+        }
+        Err(error) => {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user("Attach to JVM", error, cx)
+                })
+                .ok();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -933,8 +933,8 @@ impl BranchPopup {
 
     fn push_action(&self) -> MenuEntry {
         let git = self.git.clone();
-        MenuEntry::new("Push...", move |_, cx| {
-            git.update(cx, |git, cx| git.push(cx));
+        MenuEntry::new("Push...", move |window, cx| {
+            git.update(cx, |git, cx| git.show_push_window(window, cx));
         })
         .icon("general/vcs")
     }
@@ -985,7 +985,7 @@ impl BranchPopup {
             Command::Conflicts => git.open_conflicts(cx),
             Command::Fetch => git.fetch(cx),
             Command::Update => git.update_project(position, cx),
-            Command::Push => git.push(cx),
+            Command::Push => git.show_push_window(window, cx),
             Command::Stash => git.ask_stash_message(window, cx),
             Command::Unstash => git.show_stashes(position, cx),
             Command::GroupByDirectory => {}
@@ -1827,11 +1827,6 @@ impl Render for BranchPopup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let viewport = window.viewport_size();
-        // The text grows by itself only where the platform does not grow the window.
-        let scale = text_scale(
-            cx.try_global::<Settings>()
-                .map_or(1., |settings| settings.ui_scale),
-        );
         let width = px(WIDTH);
         let left = self.position.x.clamp(
             px(SPACE_M),
@@ -2023,7 +2018,7 @@ impl Render for BranchPopup {
             && !self.submenu_entries.is_empty()
             && let Some(bounds) = self.rows_bounds.borrow().get(&row).copied()
         {
-            let size = menu_size(window, &self.submenu_entries, px(UI_SIZE * scale));
+            let size = menu_size(window, &self.submenu_entries, px(UI_SIZE));
             let position = submenu_position(bounds, size, viewport);
             let weak = cx.weak_entity();
             let close = weak.clone();

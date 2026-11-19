@@ -1462,8 +1462,8 @@ impl GitLogPanel {
         };
         let push = {
             let git = git.clone();
-            MenuEntry::new("Push", move |_, cx| {
-                git.update(cx, |git, cx| git.push(cx));
+            MenuEntry::new("Push", move |window, cx| {
+                git.update(cx, |git, cx| git.show_push_window(window, cx));
             })
             .icon("general/upload")
         };
@@ -1538,9 +1538,6 @@ impl GitLogPanel {
             return;
         };
         let id = commit.id.clone();
-        let Some(path) = self.files.get(index) else {
-            return;
-        };
         let prefix = self
             .selected
             .and_then(|selected| self.shown.get(selected))
@@ -1560,10 +1557,12 @@ impl GitLogPanel {
         }) else {
             return;
         };
+        let files: Vec<PathBuf> = self.files.iter().map(|file| root.join(file)).collect();
         DiffView::open_commit(
             self.git.clone(),
             self.workspace.clone(),
-            root.join(path),
+            files,
+            index,
             id,
             window,
             cx,

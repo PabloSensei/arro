@@ -36,6 +36,7 @@ use crate::layout::{
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
 use crate::settings::{DefaultLayout, SETTINGS_FILE, Settings};
+use crate::split::{SplitLayout, SplitTree};
 
 /// Where the README that explains the setup of a language server lives.
 const README_URL: &str = "https://github.com/PabloSensei/arro";
@@ -633,7 +634,11 @@ pub struct Workspace {
     pub(crate) bottom: Dock,
     pub(crate) panes: Vec<Pane>,
     pub(crate) active_pane: usize,
-    /// Groups of tabs sit one under another instead of side by side.
+    /// The shape of the groups: which sit side by side, which one under another.
+    pub(crate) splits: SplitTree,
+    /// Groups of tabs sit one under another instead of side by side. This is the
+    /// direction of the first split, before there is one to take it from, and what a
+    /// layout saved before the groups nested meant.
     pub(crate) split_down: bool,
     /// Files of closed tabs, the latest last, for Ctrl+Shift+T.
     closed: Vec<PathBuf>,
@@ -699,6 +704,8 @@ pub struct Workspace {
     pub(crate) balloon_visible: bool,
     pub(crate) balloon_serial: usize,
     icons: FileIcons,
+    /// The files of the project, for the menus of the path crumbs of the status bar.
+    project_files: Option<Entity<Arc<Vec<PathBuf>>>>,
     editor_factory: Option<EditorFactory>,
     search: Option<SearchHook>,
     config_choose: Option<ConfigChooseHook>,
@@ -1040,6 +1047,7 @@ impl Workspace {
             bottom: Dock::new(bottom),
             panes: vec![Pane::default()],
             active_pane: 0,
+            splits: SplitTree::single(),
             split_down: layout.split_down,
             closed: Vec::new(),
             recent,
@@ -1080,6 +1088,7 @@ impl Workspace {
             balloon_visible: false,
             balloon_serial: 0,
             icons,
+            project_files: None,
             editor_factory: None,
             search: None,
             config_choose: None,
@@ -1487,7 +1496,7 @@ impl Workspace {
             .iter()
             .map(|(path, mode)| (::platform::path_key(path), *mode))
             .collect();
-        let mut panes = Vec::with_capacity(states.len());
+        let mut saved = Vec::with_capacity(states.len());
         let mut seen = HashSet::new();
         for state in &states {
             let mut tabs: Vec<Tab> = Vec::new();
@@ -1516,13 +1525,36 @@ impl Workspace {
                 }
                 tabs.push(tab);
             }
-            if !tabs.is_empty() {
-                panes.push(self.new_pane(tabs, active, cx));
-            }
+            saved.push((!tabs.is_empty()).then(|| self.new_pane(tabs, active, cx)));
         }
-        if !panes.is_empty() {
-            self.active_pane = self.layout.active_pane.min(panes.len() - 1);
+        let keep: Vec<bool> = saved.iter().map(Option::is_some).collect();
+        let count = keep.iter().filter(|kept| **kept).count();
+        if count > 0 {
+            let saved_tree = self
+                .layout
+                .splits
+                .as_ref()
+                .and_then(|layout| SplitTree::from_layout(layout, keep.len()))
+                .unwrap_or_else(|| SplitTree::line(keep.len(), self.split_down));
+            // A group whose files are gone takes no place in the window, and its split
+            // joins the other side.
+            let order = saved_tree.groups();
+            let shape = saved_tree.layout(&keep).unwrap_or(SplitLayout::Group);
+            let mut panes = Vec::with_capacity(count);
+            let mut saved = saved;
+            for old in &order {
+                if let Some(pane) = saved.get_mut(*old).and_then(Option::take) {
+                    panes.push(pane);
+                }
+            }
+            let active = order
+                .iter()
+                .position(|old| *old == self.layout.active_pane)
+                .unwrap_or(0)
+                .min(count - 1);
+            self.active_pane = active;
             self.panes = panes;
+            self.splits = SplitTree::from_layout(&shape, count).unwrap_or_else(SplitTree::single);
             self.renumber_bars(cx);
         }
         self.focus_active(window, cx);
@@ -3182,7 +3214,9 @@ impl Workspace {
         if self.panes.len() == 1 {
             self.split_down = down;
         }
-        let at = (self.active_pane + 1).min(self.panes.len());
+        let Some(at) = self.splits.split(self.active_pane, down) else {
+            return;
+        };
         let pane = self.new_pane(vec![tab], 0, cx);
         self.panes.insert(at, pane);
         self.renumber_bars(cx);
@@ -3269,6 +3303,17 @@ impl Workspace {
     /// The state database of the application, when it opened.
     pub fn store(&self) -> Option<Arc<Store>> {
         self.store.clone()
+    }
+
+    /// The panel layer owns the list of the files of the project: it gives it here for
+    /// the menus of the path crumbs of the status bar.
+    pub fn set_project_files(&mut self, files: Entity<Arc<Vec<PathBuf>>>) {
+        self.project_files = Some(files);
+    }
+
+    /// The files of the project, when the panels have given their list.
+    pub fn project_files(&self) -> Option<&Entity<Arc<Vec<PathBuf>>>> {
+        self.project_files.as_ref()
     }
 
     /// Changes the settings, applies them at once and writes the file in the background.
@@ -3667,8 +3712,18 @@ impl Workspace {
     fn drop_tab(&mut self, pane: usize, index: usize, cx: &mut Context<Self>) -> Tab {
         let tab = self.panes[pane].remove(index);
         if self.panes[pane].tabs.is_empty() && self.panes.len() > 1 {
+            let remaining = self.panes.len() - 1;
+            let fallback = active_after_removal(self.active_pane, pane, remaining);
+            let focus = self.splits.remove(pane);
             self.panes.remove(pane);
-            self.active_pane = active_after_removal(self.active_pane, pane, self.panes.len());
+            self.active_pane = if self.active_pane == pane {
+                focus.unwrap_or(fallback)
+            } else if self.active_pane > pane {
+                self.active_pane - 1
+            } else {
+                self.active_pane
+            };
+            self.active_pane = self.active_pane.min(self.panes.len() - 1);
             self.renumber_bars(cx);
         }
         tab
@@ -3902,9 +3957,10 @@ impl Workspace {
         self.select_tab(target, landed, window, cx);
     }
 
-    /// Opens a new group next to the active one, to the right or below. The first split
-    /// decides the direction of the others. The selected tab goes to the new group when
-    /// the old one keeps another tab, otherwise the new group is empty, ready for a file.
+    /// Opens a new group next to the active one, to the right or below, inside the part
+    /// of the window that group already takes. The selected tab goes to the new group
+    /// when the old one keeps another tab, otherwise the new group is empty, ready for a
+    /// file.
     pub fn split(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.panes.len() == 1 {
             self.split_down = down;
@@ -3917,9 +3973,12 @@ impl Workspace {
         } else {
             self.new_pane(Vec::new(), 0, cx)
         };
-        self.panes.insert(source + 1, pane);
+        let Some(at) = self.splits.split(source, down) else {
+            return;
+        };
+        self.panes.insert(at, pane);
         self.renumber_bars(cx);
-        self.active_pane = source + 1;
+        self.active_pane = at;
         self.tab_serial += 1;
         self.focus_active(window, cx);
         self.layout_changed(cx);
@@ -3934,7 +3993,8 @@ impl Workspace {
         self.split(true, window, cx);
     }
 
-    /// Sends the selected tab to the next group; with one group it splits first.
+    /// Sends the selected tab to the group on the other side of the nearest split; with
+    /// one group it splits first.
     pub fn move_to_other_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.panes[self.active_pane].tabs.is_empty() {
             return;
@@ -3943,10 +4003,52 @@ impl Workspace {
             self.split(self.split_down, window, cx);
             return;
         }
+        let Some(target) = self.splits.opposite(self.active_pane) else {
+            return;
+        };
         let from = (self.active_pane, self.panes[self.active_pane].active);
-        let target = next_tab(self.active_pane, self.panes.len());
         let end = self.panes[target].tabs.len();
         self.move_tab(from, (target, end), window, cx);
+    }
+
+    /// Unsplit: the tabs of the active group go to the group on the other side of its
+    /// nearest split, and that split goes away.
+    pub fn unsplit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.active_pane;
+        if self.panes.len() < 2 {
+            return;
+        }
+        let Some(target) = self.splits.opposite(from) else {
+            return;
+        };
+        let active = self.panes[from].active;
+        let active_path = self.panes[from]
+            .tabs
+            .get(active)
+            .map(|tab| tab.path.clone());
+        let tabs = std::mem::take(&mut self.panes[from].tabs);
+        for tab in tabs {
+            let pane = &mut self.panes[target];
+            pane.insert(pane.tabs.len(), tab);
+        }
+        let remaining = self.panes.len() - 1;
+        let fallback = active_after_removal(self.active_pane, from, remaining);
+        let focus = self.splits.remove(from);
+        self.panes.remove(from);
+        let landed = if from < target { target - 1 } else { target };
+        self.renumber_bars(cx);
+        // The group that was active is gone: the focus is in the one that took its tabs.
+        self.active_pane = landed.min(self.panes.len() - 1);
+        match active_path {
+            Some(path) => {
+                let index = self.panes[landed].position(&path).unwrap_or(0);
+                self.select_tab(landed, index, window, cx);
+            }
+            None => {
+                self.active_pane = focus.unwrap_or(fallback).min(self.panes.len() - 1);
+                self.tab_removed(window, cx);
+            }
+        }
     }
 
     /// Moves the focus to the next group, or to the previous one for a negative `step`.
@@ -4276,9 +4378,19 @@ impl Workspace {
         self.active_pane
     }
 
-    /// Whether groups sit one under another, for scripts and tests.
+    /// Whether the groups around the active one sit one under another, for scripts and
+    /// tests. With one group this is the direction its first split takes.
     pub fn split_is_down(&self) -> bool {
-        self.split_down
+        self.splits
+            .direction(self.active_pane)
+            .unwrap_or(self.split_down)
+    }
+
+    /// The share of the first part of the split at `path`, where every step of the path
+    /// is the child taken at that split, for tests of a dragged divider.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn split_ratio(&self, path: &[usize]) -> Option<f32> {
+        self.splits.ratio(path)
     }
 
     /// Projects opened before, the latest first.
@@ -4436,12 +4548,7 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        // The text grows by itself only where the platform does not grow the window.
-        let scale = text_scale(
-            cx.try_global::<Settings>()
-                .map_or(1., |settings| settings.ui_scale),
-        );
-        let size = menu_size(window, &entries, px(UI_SIZE * scale));
+        let size = menu_size(window, &entries, px(UI_SIZE));
         let position = menu_position(anchor, size, window.viewport_size());
         self.show_menu(position, entries, cx);
     }
@@ -5137,6 +5244,8 @@ impl Workspace {
                 match key {
                     "file.reload_all" => window_key("workspace::Synchronize", keymap::platform()),
                     "editor.indent_selection" => Some("tab"),
+                    // Refactor | Copy runs the same command as the F5 of the tree.
+                    "workspace.copy_element" => Some("f5"),
                     _ => None,
                 }
                 .map(str::to_owned)
@@ -5227,6 +5336,11 @@ impl Workspace {
             .iter()
             .filter(|pane| !pane.tabs.is_empty())
             .count();
+        let keep: Vec<bool> = self
+            .panes
+            .iter()
+            .map(|pane| !pane.tabs.is_empty())
+            .collect();
         let panes = self.panes.iter().filter(|pane| !pane.tabs.is_empty());
         let preview_modes = self
             .panes
@@ -5254,6 +5368,7 @@ impl Workspace {
             panes: panes.map(pane_state).collect(),
             active_pane: before,
             split_down: self.split_down,
+            splits: self.splits.layout(&keep),
             tree_expanded: self.layout.tree_expanded.clone(),
             tree_selected: self.layout.tree_selected.clone(),
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
@@ -5272,7 +5387,7 @@ impl Workspace {
     }
 
     /// Saves a moment after the last change, off the UI thread.
-    fn layout_changed(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn layout_changed(&mut self, cx: &mut Context<Self>) {
         self.save_serial += 1;
         let serial = self.save_serial;
         let delay = cx.background_executor().timer(SAVE_DELAY);

@@ -74,6 +74,7 @@
 "general/moreVertical" = "general/moreVertical"
 "general/openInToolWindow" = "general/openInToolWindow"
 "general/paste" = "general/paste"
+"general/previewOnly" = "general/show"
 "general/refresh" = "general/refresh"
 "general/regex" = "fileTypes/regexp"
 "general/search" = "general/search"

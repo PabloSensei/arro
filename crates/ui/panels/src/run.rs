@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ::base::Cancel;
 use dap_client::ReloadOutcome;
-use editor_view::Semantic;
+use editor_view::{Semantic, Spot};
 use futures_util::StreamExt;
 use lang_api::{DumpQuery, ask};
 use proc_sup::ProcessSpec;
@@ -38,7 +38,10 @@ use workspace_core::Delivery;
 
 use crate::ansi::{Line, OutputBuffers, Style};
 use crate::console_input::{ConsoleInput, ConsoleKey};
+use crate::console_links;
+use crate::console_search::{ConsoleSearch, SearchToggle};
 use crate::mcp_runs::{Answer, Job, Request as ToolRequest, RunBridge};
+use crate::navigation;
 use crate::stack_traces::ActiveStackTrace;
 
 mod tests;
@@ -158,6 +161,10 @@ pub struct RunPanel {
     draining: Vec<DrainingConsole>,
     /// The old console the user is looking at; `None` is the run of this window.
     viewing: Option<usize>,
+    /// The search bar of the console and the lines its filter keeps.
+    console_search: ConsoleSearch,
+    search_focus: FocusHandle,
+    filter_focus: FocusHandle,
     /// Planning in the background, the console comes next.
     starting: bool,
     /// Cancels a debug test start that still waits for its JVM. Stop sets it.
@@ -522,6 +529,9 @@ impl RunPanel {
                 console_running: false,
                 draining: Vec::new(),
                 viewing: None,
+                console_search: ConsoleSearch::default(),
+                search_focus: cx.focus_handle(),
+                filter_focus: cx.focus_handle(),
                 starting: false,
                 starting_tests: None,
                 rerun: false,
@@ -1415,6 +1425,7 @@ impl RunPanel {
         crate::history::put_label(&self.root, format!("Before running {title}"), cx);
         self.title = title.into();
         self.lines.clear();
+        self.console_search.clear();
         self.output = OutputBuffers::default();
         self.console_process = None;
         self.program_pid = None;
@@ -3113,6 +3124,21 @@ impl RunPanel {
     /// A key of the tool window: the console takes it while it waits for a line, the tree
     /// of tests otherwise.
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        if stroke.modifiers.control
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.shift
+            && stroke.key == "f"
+        {
+            cx.stop_propagation();
+            self.open_console_search(window, cx);
+            return;
+        }
+        if self.console_search.open && stroke.key == "f3" {
+            cx.stop_propagation();
+            self.search_step(!stroke.modifiers.shift, cx);
+            return;
+        }
         if self.console_key(event, cx) {
             return;
         }
@@ -3169,9 +3195,13 @@ impl RunPanel {
             .map_or_else(|| px(CODE_LINE_HEIGHT), |size| size.item.height);
         let top = viewport.top() + state.base_handle.offset().y;
         let row = ((position.y - top) / height).floor();
-        (row >= 0.)
-            .then_some(row as usize)
-            .filter(|row| *row < self.console_line_count())
+        if row < 0. {
+            return None;
+        }
+        let total = self.console_line_count();
+        let kept = self.console_search.kept_count(total);
+        let row = row as usize;
+        (row < kept).then(|| self.console_search.line_of_row(total, row))
     }
 
     /// The text of the line of the console on screen at `index`, from zero: the old run
@@ -3189,6 +3219,203 @@ impl RunPanel {
         self.viewing
             .and_then(|view| self.draining.get(view))
             .map_or(self.lines.len(), |drain| drain.lines.len())
+    }
+
+    /// Runs the query of the search bar over the lines on screen.
+    fn rebuild_console_search(&mut self) {
+        let Self {
+            draining,
+            lines,
+            console_search,
+            viewing,
+            ..
+        } = self;
+        let texts = console_texts(viewing.and_then(|view| draining.get(view)), lines);
+        console_search.run(&texts);
+    }
+
+    /// Applies the filter to the lines on screen and runs the query over the lines it
+    /// keeps.
+    fn rebuild_console_filter(&mut self) {
+        let Self {
+            draining,
+            lines,
+            console_search,
+            viewing,
+            ..
+        } = self;
+        let texts = console_texts(viewing.and_then(|view| draining.get(view)), lines);
+        let current = console_search.current_line();
+        console_search.apply_filter(&texts);
+        if console_search.open {
+            console_search.run(&texts);
+            if let Some(line) = current {
+                console_search.focus_line(line);
+            }
+        }
+    }
+
+    /// Ctrl+F: the search bar above the output, ready for a query.
+    fn open_console_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.console_search.open = true;
+        self.rebuild_console_search();
+        window.focus(&self.search_focus, cx);
+        self.scroll_to_match();
+        cx.notify();
+    }
+
+    fn close_console_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.console_search.open = false;
+        self.console_search.clear();
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// The keys of the search bar: Escape, Enter, F3 and the text.
+    fn search_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        if stroke.key == "escape" {
+            cx.stop_propagation();
+            self.close_console_search(window, cx);
+            return;
+        }
+        if stroke.key == "enter" || stroke.key == "f3" {
+            cx.stop_propagation();
+            self.search_step(!stroke.modifiers.shift, cx);
+            return;
+        }
+        if stroke.modifiers.alt && !stroke.modifiers.control {
+            let toggle = match stroke.key.as_str() {
+                "c" => Some(SearchToggle::Case),
+                "w" => Some(SearchToggle::Word),
+                "x" => Some(SearchToggle::Regex),
+                _ => None,
+            };
+            if let Some(toggle) = toggle {
+                cx.stop_propagation();
+                self.toggle_search_option(toggle, window, cx);
+                return;
+            }
+        }
+        if self
+            .console_search
+            .field
+            .key_with_clipboard(event, false, cx)
+        {
+            cx.stop_propagation();
+            self.rebuild_console_search();
+            self.scroll_to_match();
+            cx.notify();
+        }
+    }
+
+    /// F3 and Shift+F3: the next match, or the one before it.
+    fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.console_search.step(forward);
+        self.scroll_to_match();
+        cx.notify();
+    }
+
+    fn scroll_to_match(&self) {
+        let Some(line) = self.console_search.current_line() else {
+            return;
+        };
+        if let Some(row) = self.console_search.row_of_line(line) {
+            self.scroll.scroll_to_item(row, ScrollStrategy::Center);
+        }
+    }
+
+    /// An option of the search bar: the case, the whole word or the regular expression.
+    fn toggle_search_option(
+        &mut self,
+        toggle: SearchToggle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.console_search.toggle(toggle);
+        self.rebuild_console_search();
+        window.focus(&self.search_focus, cx);
+        self.scroll_to_match();
+        cx.notify();
+    }
+
+    /// The funnel of the console toolbar: the field that keeps only the lines with its
+    /// text.
+    fn toggle_console_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.console_search.filter_open = !self.console_search.filter_open;
+        if self.console_search.filter_open {
+            window.focus(&self.filter_focus, cx);
+        } else {
+            self.console_search.clear_filter();
+            self.rebuild_console_filter();
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn filter_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" {
+            cx.stop_propagation();
+            self.toggle_console_filter(window, cx);
+            return;
+        }
+        if self
+            .console_search
+            .filter
+            .key_with_clipboard(event, false, cx)
+        {
+            cx.stop_propagation();
+            self.rebuild_console_filter();
+            cx.notify();
+        }
+    }
+
+    /// Opens a frame of the console or a place of a compiler message.
+    fn open_console_line(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.console_line(index).map(str::to_owned) else {
+            return;
+        };
+        let files = self.file_list(cx);
+        if let Some(site) = console_links::frame_site(&text) {
+            if let Some(path) = site.project_file(&files) {
+                self.open_console_place(path, site.line, window, cx);
+            } else {
+                console_links::open_frame(
+                    &text,
+                    site.extension(),
+                    self.workspace.clone(),
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
+        if let Some((candidate, line)) = console_links::compiler_site(&text)
+            && let Some(path) = console_links::compiler_file(&candidate, &self.root, &files)
+        {
+            self.open_console_place(path, line, window, cx);
+        }
+    }
+
+    fn open_console_place(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let spot = Some(Spot::Line {
+            line: line.saturating_sub(1) as usize,
+            column: 0,
+        });
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    navigation::go_to(workspace, path, spot, true, window, cx)
+                })
+                .ok();
+        });
     }
 
     /// The exception line under `index` with its stack, when the line belongs to one.
@@ -3363,6 +3590,7 @@ impl RunPanel {
         crate::history::put_label(&self.root, format!("Before running {title}"), cx);
         self.title = title.into();
         self.lines.clear();
+        self.console_search.clear();
         self.output = OutputBuffers::default();
         self.console_process = None;
         self.program_pid = None;
@@ -4120,10 +4348,18 @@ impl RunPanel {
             }
         }
         changed |= self.poll_tool_jobs(cx);
+        // The lines of the console changed, so the filter and the query see the new ones.
+        if changed && (self.console_search.open || self.console_search.filtering()) {
+            self.rebuild_console_filter();
+        }
         if changed {
             // The console waits for a line below the last one, so that row is in view too.
-            let last = self.lines.len() + usize::from(self.takes_input());
-            self.scroll.scroll_to_item(last, ScrollStrategy::Bottom);
+            // A search keeps the view on its match instead.
+            if !self.console_search.open {
+                let kept = self.console_search.kept_count(self.console_line_count());
+                let last = kept + usize::from(self.takes_input());
+                self.scroll.scroll_to_item(last, ScrollStrategy::Bottom);
+            }
             self.changed(cx);
         }
         if exited.is_some()
@@ -4623,33 +4859,244 @@ impl RunPanel {
         });
     }
 
+    /// The buttons above the output: the search bar and the filter.
+    fn console_tools(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let filtering = self.console_search.filter_open;
+        div()
+            .id("run-console-tools")
+            .debug_selector(|| "run-console-tools".to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .flex_none()
+            .px(px(SPACE_M))
+            .pt(px(SPACE_S))
+            .child(
+                icon_button(
+                    "run-console-find",
+                    "general/search",
+                    "Find in Console",
+                    Some("Ctrl+F".into()),
+                    theme,
+                )
+                .debug_selector(|| "run-console-find".to_owned())
+                .on_click(cx.listener(|this, _, window, cx| this.open_console_search(window, cx))),
+            )
+            .child(
+                icon_button(
+                    "run-console-filter",
+                    "general/filter",
+                    "Filter Lines",
+                    None,
+                    theme,
+                )
+                .debug_selector(|| "run-console-filter".to_owned())
+                .when(filtering, |button| button.bg(theme.selection))
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.toggle_console_filter(window, cx)),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The search bar of the console: the query, its options, the counter and the moves
+    /// between the matches.
+    fn search_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let search = &self.console_search;
+        let (status, error) = search.status();
+        let case = search_toggle(
+            "run-search-case",
+            "general/caseSensitive",
+            "Match Case",
+            "Alt+C",
+            search.case_sensitive,
+            SearchToggle::Case,
+            theme,
+            cx,
+        );
+        let word = search_toggle(
+            "run-search-word",
+            "general/wholeWord",
+            "Whole Words",
+            "Alt+W",
+            search.whole_word,
+            SearchToggle::Word,
+            theme,
+            cx,
+        );
+        let regex = search_toggle(
+            "run-search-regex",
+            "general/regex",
+            "Regex",
+            "Alt+X",
+            search.regex,
+            SearchToggle::Regex,
+            theme,
+            cx,
+        );
+        let field = div()
+            .id("run-search-field")
+            .track_focus(&self.search_focus)
+            .on_key_down(cx.listener(|this, event, window, cx| this.search_key(event, window, cx)))
+            .flex()
+            .items_center()
+            .flex_1()
+            .h(px(CONTROL_HEIGHT - SPACE_M))
+            .px(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.accent)
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text)
+            .overflow_hidden()
+            .children(crate::console_search::field_parts(
+                "run-search-field",
+                &search.field,
+                theme,
+                true,
+            ))
+            .when(search.field.text.is_empty(), |this| {
+                this.child(div().text_color(theme.text_secondary).child("Find"))
+            });
+        div()
+            .id("run-console-search")
+            .debug_selector(|| "run-console-search".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .mx(px(SPACE_M))
+            .mb(px(SPACE_S))
+            .gap(px(SPACE_S))
+            .child(field)
+            .child(case)
+            .child(word)
+            .child(regex)
+            .child(
+                icon_button(
+                    "run-search-prev",
+                    "general/arrowUp",
+                    "Previous Match",
+                    Some("Shift+F3".into()),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.search_step(false, cx))),
+            )
+            .child(
+                icon_button(
+                    "run-search-next",
+                    "general/arrowDown",
+                    "Next Match",
+                    Some("F3".into()),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.search_step(true, cx))),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "run-search-status".to_owned())
+                    .text_color(if error {
+                        theme.error
+                    } else {
+                        theme.text_secondary
+                    })
+                    .child(status),
+            )
+            .child(
+                icon_button(
+                    "run-search-close",
+                    "general/closeSmall",
+                    "Close Search",
+                    Some("Escape".into()),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.close_console_search(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The field of the filter: only the lines with its text stay on screen.
+    fn filter_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("run-console-filter-row")
+            .debug_selector(|| "run-console-filter-row".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .mx(px(SPACE_M))
+            .mb(px(SPACE_S))
+            .px(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.accent)
+            .track_focus(&self.filter_focus)
+            .on_key_down(cx.listener(|this, event, window, cx| this.filter_key(event, window, cx)))
+            .children(crate::console_search::field_parts(
+                "run-filter-field",
+                &self.console_search.filter,
+                theme,
+                true,
+            ))
+            .when(self.console_search.filter.text.is_empty(), |this| {
+                this.child(div().text_color(theme.text_secondary).child("Filter lines"))
+            })
+            .into_any_element()
+    }
+
     fn rows(
-        &self,
+        &mut self,
         range: std::ops::Range<usize>,
         theme: &Theme,
         view: Option<usize>,
+        cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let total = self.console_line_count();
+        let kept = self.console_search.kept_count(total);
         let drain = view.and_then(|index| self.draining.get(index));
         let current = match drain {
             Some(drain) => drain.output.current(),
             None => self.output.current(),
         };
         let current = current.cloned().unwrap_or_default();
-        let typed = self.takes_input().then_some(self.lines.len() + 1);
+        let typed = (view.is_none() && self.takes_input()).then_some(kept + 1);
         range
-            .map(|index| {
-                if typed == Some(index) {
+            .map(|row| {
+                if typed == Some(row) {
                     return self.console_input.element("run-console-input", theme);
                 }
+                if row >= kept {
+                    // The line the program has not ended yet.
+                    let selector = format!("run-console-line-{total}");
+                    return div()
+                        .debug_selector(move || selector)
+                        .child(line_element(&current, theme))
+                        .into_any_element();
+                }
+                let index = self.console_search.line_of_row(total, row);
                 let line = match drain {
                     Some(drain) => drain.lines.get(index),
                     None => self.lines.get(index),
                 };
-                let line = line.unwrap_or(&current);
+                let Some(line) = line else {
+                    return div().into_any_element();
+                };
+                let ranges = self.console_search.ranges(index);
+                let text = line_element_with_matches(line, theme, ranges);
+                let linked = console_links::looks_like_link(&line.text);
                 let selector = format!("run-console-line-{index}");
-                div()
+                let row = div()
+                    .id(("run-console-line", index))
                     .debug_selector(move || selector)
-                    .child(line_element(line, theme))
+                    .child(text);
+                if !linked {
+                    return row.into_any_element();
+                }
+                row.cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_console_line(index, window, cx)
+                    }))
                     .into_any_element()
             })
             .collect()
@@ -4826,7 +5273,16 @@ pub(crate) fn info(text: impl Into<String>) -> Line {
 }
 
 pub(crate) fn line_element(line: &Line, theme: &Theme) -> AnyElement {
-    let text = highlighted(line, theme);
+    line_element_with_matches(line, theme, &[])
+}
+
+/// A line of a console with the places the search found painted over its own colours.
+pub(crate) fn line_element_with_matches(
+    line: &Line,
+    theme: &Theme,
+    matches: &[std::ops::Range<usize>],
+) -> AnyElement {
+    let text = highlighted(line, theme, matches);
     div()
         .h(px(CODE_LINE_HEIGHT))
         .px(px(LINE_PAD))
@@ -4842,8 +5298,19 @@ pub(crate) fn wrapped_line_element(line: &Line, theme: &Theme) -> AnyElement {
         .min_h(px(CODE_LINE_HEIGHT))
         .px(px(LINE_PAD))
         .whitespace_normal()
-        .child(highlighted(line, theme))
+        .child(highlighted(line, theme, &[]))
         .into_any_element()
+}
+
+/// The finished output lines of the console on screen, in order.
+fn console_texts<'a>(
+    drain: Option<&'a DrainingConsole>,
+    lines: &'a VecDeque<Line>,
+) -> Vec<&'a str> {
+    match drain {
+        Some(drain) => drain.lines.iter().map(|line| line.text.as_str()).collect(),
+        None => lines.iter().map(|line| line.text.as_str()).collect(),
+    }
 }
 
 /// Whether a line of the console is the headline of an exception: a class name that
@@ -4870,24 +5337,88 @@ fn is_stack_line(line: &str) -> bool {
         || text.starts_with("... ")
 }
 
-/// The text of a line in the colours of the console, with no layout of its own.
-fn highlighted(line: &Line, theme: &Theme) -> StyledText {
-    let palette = if theme.dark { &ANSI_DARK } else { &ANSI_LIGHT };
-    let highlights = line.spans.iter().map(|(range, style)| {
-        let color = match (style.input, style.color, style.error) {
-            (true, _, _) => Some(theme.console_input),
-            (false, Some(index), _) => Some(color(palette[usize::from(index)])),
-            (false, None, true) => Some(theme.error),
-            (false, None, false) => None,
+/// The text of a line in the colours of the console, with no layout of its own. The
+/// places a search found are painted over those colours.
+fn highlighted(line: &Line, theme: &Theme, matches: &[std::ops::Range<usize>]) -> StyledText {
+    let mut edges = vec![0, line.text.len()];
+    for (range, _) in &line.spans {
+        edges.push(range.start);
+        edges.push(range.end);
+    }
+    for range in matches {
+        edges.push(range.start.min(line.text.len()));
+        edges.push(range.end.min(line.text.len()));
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let mut highlights = Vec::new();
+    for pair in edges.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end || !line.text.is_char_boundary(start) || !line.text.is_char_boundary(end) {
+            continue;
+        }
+        let found = matches
+            .iter()
+            .any(|range| range.start <= start && range.end >= end);
+        let highlight = if found {
+            HighlightStyle {
+                color: Some(theme.match_text),
+                background_color: Some(theme.match_bg),
+                ..HighlightStyle::default()
+            }
+        } else {
+            line.spans
+                .iter()
+                .find(|(range, _)| range.start <= start && range.end >= end)
+                .map_or_else(HighlightStyle::default, |(_, style)| {
+                    console_highlight(style, theme)
+                })
         };
-        let highlight = HighlightStyle {
-            color,
-            font_weight: style.bold.then_some(FontWeight::BOLD),
-            ..HighlightStyle::default()
-        };
-        (range.clone(), highlight)
-    });
+        highlights.push((start..end, highlight));
+    }
     StyledText::new(line.text.clone()).with_highlights(highlights)
+}
+
+/// The style of one span of the console, in the colours of the theme.
+fn console_highlight(style: &Style, theme: &Theme) -> HighlightStyle {
+    let palette = if theme.dark { &ANSI_DARK } else { &ANSI_LIGHT };
+    let color = match (style.input, style.color, style.error) {
+        (true, _, _) => Some(theme.console_input),
+        (false, Some(index), _) => Some(color(palette[usize::from(index)])),
+        (false, None, true) => Some(theme.error),
+        (false, None, false) => None,
+    };
+    HighlightStyle {
+        color,
+        font_weight: style.bold.then_some(FontWeight::BOLD),
+        ..HighlightStyle::default()
+    }
+}
+
+/// A button of the search bar that turns one option on or off.
+#[allow(clippy::too_many_arguments)]
+fn search_toggle(
+    id: &'static str,
+    icon_name: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    on: bool,
+    toggle: SearchToggle,
+    theme: &Theme,
+    cx: &mut Context<RunPanel>,
+) -> Stateful<Div> {
+    let button = icon_button(id, icon_name, label, Some(hint.into()), theme);
+    let button = if on {
+        button
+            .bg(theme.tab_selected)
+            .border_1()
+            .border_color(theme.tab_selected_border)
+    } else {
+        button
+    };
+    button.on_click(
+        cx.listener(move |this, _, window, cx| this.toggle_search_option(toggle, window, cx)),
+    )
 }
 
 /// One console tab: the current run or an earlier one that still writes.
@@ -4957,10 +5488,8 @@ impl Render for RunPanel {
         workspace::note_view_render(cx, "run");
         let theme = *cx.global::<Theme>();
         let view = self.viewing.filter(|index| *index < self.draining.len());
-        let count = match view {
-            Some(index) => self.draining[index].lines.len() + 1,
-            None => self.lines.len() + 1 + usize::from(self.takes_input()),
-        };
+        let kept = self.console_search.kept_count(self.console_line_count());
+        let count = kept + 1 + usize::from(view.is_none() && self.takes_input());
         let workspace = self.workspace.clone();
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
@@ -5028,6 +5557,12 @@ impl Render for RunPanel {
                     }))
                     .child(icon("general/logs", &theme)),
             )
+            .children(self.tests.has_failures().then(|| {
+                button_frame("run-rerun-failed", "Rerun Failed Tests", None, &theme)
+                    .debug_selector(|| "run-rerun-failed".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.rerun_failed(cx)))
+                    .child(icon("run/restart", &theme))
+            }))
             .children(profiling.then(|| {
                 button_frame("run-stop-snapshot", "Stop and Show Snapshot", None, &theme)
                     .debug_selector(|| "run-stop-snapshot".to_owned())
@@ -5044,6 +5579,7 @@ impl Render for RunPanel {
                 &theme,
                 cx.listener(|this, _, _, cx| {
                     this.viewing = None;
+                    this.rebuild_console_filter();
                     cx.notify();
                 }),
             );
@@ -5056,6 +5592,7 @@ impl Render for RunPanel {
                     &theme,
                     cx.listener(move |this, _, _, cx| {
                         this.viewing = Some(index);
+                        this.rebuild_console_filter();
                         cx.notify();
                     }),
                 )
@@ -5071,6 +5608,15 @@ impl Render for RunPanel {
                 .child(current)
                 .children(old)
         });
+        let tools = self.console_tools(&theme, cx);
+        let search = self
+            .console_search
+            .open
+            .then(|| self.search_row(&theme, cx));
+        let filter = self
+            .console_search
+            .filter_open
+            .then(|| self.filter_row(&theme, cx));
         let console = div()
             .flex()
             .flex_col()
@@ -5089,6 +5635,9 @@ impl Render for RunPanel {
                 }),
             )
             .children(tabs)
+            .child(tools)
+            .children(search)
+            .children(filter)
             .child(
                 scrollable(
                     "run-console",
@@ -5097,7 +5646,9 @@ impl Render for RunPanel {
                         uniform_list(
                             "run-console",
                             count,
-                            cx.processor(move |this, range, _, _| this.rows(range, &theme, view)),
+                            cx.processor(move |this, range, _, cx| {
+                                this.rows(range, &theme, view, cx)
+                            }),
                         )
                         .track_scroll(&self.scroll)
                         .size_full(),

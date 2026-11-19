@@ -1,5 +1,9 @@
 //! Ctrl+Shift+V: what was copied in the window, newest first. A pick is pasted into the
-//! editor that asked.
+//! editor that asked. The list is kept in the folder of the state of the window, so it
+//! survives a restart.
+
+use std::fs;
+use std::path::Path;
 
 use editor_view::EditorView;
 use ui_kit::metrics::*;
@@ -11,6 +15,62 @@ const WIDTH: f32 = 560.;
 const HEIGHT: f32 = 360.;
 /// Characters of the first line shown for an entry.
 const PREVIEW: usize = 90;
+/// The records the folder keeps, the newest first.
+const KEPT: usize = 20;
+/// A copy longer than this many bytes stays in the window alone.
+const LONGEST: usize = 64 * 1024;
+/// The file of the state folder.
+const FILE: &str = "clipboard-history.json";
+
+/// Reads the history of an earlier run and writes every copy of this one, off the UI
+/// thread. Only what was copied in Arro reaches the file: the system clipboard cannot
+/// tell a password from a line of code.
+pub fn open(state_dir: &Path, cx: &mut App) {
+    let file = state_dir.join(FILE);
+    let executor = cx.background_executor().clone();
+    let path = file.clone();
+    editor_view::install_clipboard_history_sink(cx, move |entries| {
+        let entries: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| entry.len() <= LONGEST)
+            .take(KEPT)
+            .collect();
+        let path = path.clone();
+        let executor = executor.clone();
+        executor
+            .spawn(async move {
+                let text = match serde_json::to_string(&entries) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!("the paste history is not saved: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = fs::write(&path, text) {
+                    eprintln!("the paste history is not saved: {error}");
+                }
+            })
+            .detach();
+    });
+    let task = cx
+        .background_executor()
+        .spawn(async move { fs::read_to_string(&file) });
+    cx.spawn(async move |cx| {
+        let Ok(text) = task.await else {
+            return;
+        };
+        let Ok(entries) = serde_json::from_str::<Vec<String>>(&text) else {
+            return;
+        };
+        let entries: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| entry.len() <= LONGEST)
+            .take(KEPT)
+            .collect();
+        cx.update(|cx| editor_view::set_clipboard_history(cx, entries));
+    })
+    .detach();
+}
 
 pub struct ClipboardPopup {
     workspace: WeakEntity<Workspace>,

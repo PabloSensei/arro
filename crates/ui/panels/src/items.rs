@@ -117,6 +117,17 @@ pub struct HeaderButton {
     pub run: HeaderAction,
 }
 
+/// A tab above the list, such as Current File and Project Errors of Problems. The label
+/// carries the count of the tab.
+#[derive(Clone)]
+pub struct PanelTab {
+    pub id: &'static str,
+    pub label: String,
+    pub active: bool,
+    /// What the tab runs.
+    pub run: HeaderAction,
+}
+
 /// Opens `path` with the caret at a place. The caret is set once the file is read.
 pub fn open_at(
     workspace: &mut Workspace,
@@ -150,6 +161,8 @@ pub struct ItemsPanel {
     search_at: Option<Instant>,
     /// The rows of the list, in the order they are drawn.
     rows: Vec<PanelRow>,
+    /// The tabs above the list, in the order they are drawn.
+    tabs: Vec<PanelTab>,
     /// The buttons of the header, in the order they are drawn.
     header_buttons: Vec<HeaderButton>,
     /// The items Delete took out of the result, by item index.
@@ -182,6 +195,7 @@ impl ItemsPanel {
             search: String::new(),
             search_at: None,
             rows: Vec::new(),
+            tabs: Vec::new(),
             header_buttons: Vec::new(),
             excluded: Vec::new(),
             counted_title: None,
@@ -290,6 +304,24 @@ impl ItemsPanel {
     /// The buttons on the right of the title.
     pub fn set_header_buttons(&mut self, buttons: Vec<HeaderButton>, cx: &mut Context<Self>) {
         self.header_buttons = buttons;
+        cx.notify();
+    }
+
+    /// The tabs above the list, each with the count in its label.
+    pub fn set_tabs(&mut self, tabs: Vec<PanelTab>, cx: &mut Context<Self>) {
+        self.tabs = tabs;
+        cx.notify();
+    }
+
+    /// The tabs of the panel, for the tests.
+    #[cfg(test)]
+    pub(crate) fn tabs(&self) -> &[PanelTab] {
+        &self.tabs
+    }
+
+    /// The text of an empty list, such as the one of the current file.
+    pub fn set_empty(&mut self, empty: &str, cx: &mut Context<Self>) {
+        self.empty = empty.to_owned().into();
         cx.notify();
     }
 
@@ -612,6 +644,38 @@ impl Render for ItemsPanel {
                     .tooltip_show_delay(ui_kit::TOOLTIP_CREATE_DELAY)
             })
             .collect();
+        let tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let active = tab.active;
+                let id = tab.id;
+                let run = tab.run.clone();
+                div()
+                    .id(SharedString::from(id))
+                    .debug_selector(move || format!("item-tab-{id}"))
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .h(px(20.))
+                    .px(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .text_color(if active {
+                        theme.text
+                    } else {
+                        theme.text_secondary
+                    })
+                    .when(active, |this| this.bg(theme.tab_selected))
+                    .hover(move |style| style.bg(theme.hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _: &MouseDownEvent, window, cx| run(window, cx)),
+                    )
+                    .child(tab.label.clone())
+            })
+            .collect();
         let header = div()
             .flex()
             .items_center()
@@ -634,6 +698,7 @@ impl Render for ItemsPanel {
                             .font_weight(FontWeight::MEDIUM)
                             .child(self.title.clone()),
                     )
+                    .child(div().flex().items_center().gap(px(2.)).children(tabs))
                     .child(div().flex().items_center().gap(px(2.)).children(buttons)),
             )
             .child(panel_tools(GROUP, hide, &theme));

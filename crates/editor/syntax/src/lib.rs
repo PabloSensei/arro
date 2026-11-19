@@ -6,6 +6,7 @@ mod language;
 mod outline;
 mod service;
 mod symbols;
+mod units;
 
 pub use highlight::{HighlightKind, HighlightSpan, normalize_spans, shift_spans};
 pub use language::{FoldStyle, Injection, LanguageConfig, StatementRules};
@@ -13,3 +14,4 @@ pub use outline::{FoldRange, Region, custom_regions, enclosing_range, indent_aft
 pub use service::{DocumentId, SyntaxService, SyntaxSnapshot};
 pub use symbols::TagSymbols;
 pub use tree_sitter::{Language, Query, Tree};
+pub use units::unit_siblings;

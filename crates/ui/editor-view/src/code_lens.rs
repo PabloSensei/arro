@@ -420,7 +420,7 @@ impl EditorView {
             state.select_range(item.offset..item.offset);
         }
         match kind {
-            CodeLensKind::Usages => self.usage_search(true, cx),
+            CodeLensKind::Usages => self.usage_search(true, false, cx),
             CodeLensKind::Implementations | CodeLensKind::Inheritors => {
                 self.show_implementations(item.offset, cx);
             }

@@ -63,6 +63,17 @@ pub struct IdentifierLines {
     pub lines: Vec<Vec<String>>,
 }
 
+/// One caret's Complete Statement: what the language adds to the statement at a place.
+/// `start` and `end` are byte offsets in the text that was asked about; `text` takes their
+/// place and `caret` is where the caret lands, counted from `start`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatementEdit {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub caret: usize,
+}
+
 /// Reads the words of `text` line by line, from the nearest line above `line` that opens
 /// a brace to `line`. A language with a grammar overrides this with its own tree.
 pub fn identifiers_around(text: &str, line: usize) -> IdentifierLines {
@@ -135,6 +146,19 @@ pub trait SyntaxProvider: Send + Sync {
     /// Alt+Delete: the declaration under `offset`, when there is one.
     fn deletion(&self, text: &str, offset: usize) -> Option<Deletion> {
         let _ = (text, offset);
+        None
+    }
+
+    /// Ctrl+Shift+Enter: the missing parts of the statement whose caret is at `offset`,
+    /// read from the tree of the language. `None` finishes the line by the statement
+    /// rules of the language alone.
+    fn complete_statement(
+        &self,
+        text: &str,
+        offset: usize,
+        indent_unit: &str,
+    ) -> Option<StatementEdit> {
+        let _ = (text, offset, indent_unit);
         None
     }
 

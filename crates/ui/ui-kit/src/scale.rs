@@ -1,15 +1,29 @@
-//! The interface scale: on Windows the platform multiplies the scale factor of every
-//! window by it, so the text, the icons, the rows, the padding and the bars grow together
-//! while the size of the window on screen stays the same. The platforms of macOS and
-//! Linux are not ours to change, so there only the text follows the setting. The font
-//! size of the editor is a setting of its own and does not take part.
+//! The interface scale: the platform multiplies the scale factor of every window by it,
+//! so the text, the icons, the rows, the padding and the bars grow together while the size
+//! of the window on screen stays the same. The windows of the test platform do the same.
+//! The font size of the editor is a setting of its own and does not take part.
 
-#[cfg(windows)]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::cell::RefCell;
-#[cfg(windows)]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::rc::Rc;
 
-#[cfg(windows)]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use gpui_kit::Platform;
 #[cfg(feature = "test-support")]
 use gpui_kit::Window;
@@ -22,9 +36,25 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-/// The platform of the application. On Windows it is built here rather than by
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+thread_local! {
+    /// The platform of the application, kept so that a change of the scale reaches every
+    /// window. It lives on the thread that runs the UI.
+    static PLATFORM: RefCell<Option<Rc<gpui_linux::LinuxPlatform>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// The platform of the application, kept so that a change of the scale reaches every
+    /// window. It lives on the thread that runs the UI.
+    static PLATFORM: RefCell<Option<Rc<gpui_macos::MacPlatform>>> =
+        const { RefCell::new(None) };
+}
+
+/// The platform of the application. It is built here rather than by
 /// `gpui_kit::application`, because the scale of the interface has to reach the windows
-/// the platform opens; elsewhere the platform of the framework is used as it is.
+/// the platform opens.
 #[cfg(windows)]
 pub(crate) fn platform() -> Rc<dyn Platform> {
     let platform = Rc::new(
@@ -34,28 +64,31 @@ pub(crate) fn platform() -> Rc<dyn Platform> {
     platform
 }
 
-/// How much the text grows by itself on top of the scale factor of the window. The
-/// platform of Windows multiplies the scale factor of every window, and the test platform
-/// does the same wherever it runs; the platforms of macOS and Linux are not ours, so
-/// there only the text follows the setting.
-pub fn text_scale(ui_scale: f32) -> f32 {
-    if cfg!(any(windows, feature = "test-support")) {
-        1.
-    } else {
-        ui_scale
-    }
+/// The platform of the application. It is built here rather than by
+/// `gpui_kit::application`, because the scale of the interface has to reach the windows
+/// the platform opens.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) fn platform() -> Rc<dyn Platform> {
+    let platform = Rc::new(gpui_linux::LinuxPlatform::new(
+        gpui_kit::WindowingModes::all(),
+    ));
+    PLATFORM.with(|slot| *slot.borrow_mut() = Some(platform.clone()));
+    platform
 }
 
-/// How much the logical pixels of a window shrink so that it keeps its size on screen
-/// while every pixel grows by the interface scale. Only the platform of Windows grows
-/// the pixels of the window; elsewhere the size on screen follows the logical size.
-pub fn window_scale(ui_scale: f32) -> f32 {
-    if cfg!(windows) { ui_scale } else { 1. }
+/// The platform of the application. It is built here rather than by
+/// `gpui_kit::application`, because the scale of the interface has to reach the windows
+/// the platform opens.
+#[cfg(target_os = "macos")]
+pub(crate) fn platform() -> Rc<dyn Platform> {
+    let platform = Rc::new(gpui_macos::MacPlatform::new(false));
+    PLATFORM.with(|slot| *slot.borrow_mut() = Some(platform.clone()));
+    platform
 }
 
 /// How much every logical pixel of the interface grows: 1 is the size of the display.
-/// The window itself keeps its size on screen. Only the platform of Windows applies it;
-/// on macOS and Linux the call does nothing and `text_scale` carries the setting.
+/// The window itself keeps its size on screen, and every platform applies it to all of
+/// its windows.
 pub fn set_ui_scale(ui_scale: f32) {
     #[cfg(windows)]
     PLATFORM.with(|slot| {
@@ -63,8 +96,31 @@ pub fn set_ui_scale(ui_scale: f32) {
             platform.set_ui_scale(ui_scale);
         }
     });
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    PLATFORM.with(|slot| {
+        if let Some(platform) = slot.borrow().as_ref() {
+            platform.set_ui_scale(ui_scale);
+        }
+    });
+    #[cfg(target_os = "macos")]
+    PLATFORM.with(|slot| {
+        if let Some(platform) = slot.borrow().as_ref() {
+            platform.set_ui_scale(ui_scale);
+        }
+    });
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    )))]
     let _ = ui_scale;
+}
+
+/// How much the logical pixels of a window shrink so that it keeps its size on screen
+/// while every pixel grows by the interface scale.
+pub fn window_scale(ui_scale: f32) -> f32 {
+    ui_scale
 }
 
 /// Applies the interface scale to a window of the test platform, which has no platform

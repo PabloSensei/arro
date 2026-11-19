@@ -160,6 +160,30 @@ class DemoApplication {
     ])
 }
 
+/// The language of a plain Java source without a server: its grammar, its queries and the
+/// edits its tree gives, which is what the editor needs for highlighting, folding and
+/// Complete Statement.
+pub fn plain_source() -> Arc<dyn LanguageSupport> {
+    struct PlainJava(java_lang::JavaSyntax);
+
+    impl LanguageSupport for PlainJava {
+        fn id(&self) -> lang_api::LanguageId {
+            java_lang::LANGUAGE_ID
+        }
+
+        fn matches(&self, path: &Path) -> bool {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
+        }
+
+        fn syntax(&self) -> &dyn lang_api::SyntaxProvider {
+            &self.0
+        }
+    }
+
+    Arc::new(PlainJava(java_lang::JavaSyntax::new()))
+}
+
 /// The support of the configuration files of a project whose class path is known: the
 /// jars and the output folders, for a window test that builds them itself.
 pub fn spring_config(root: &Path, classpath: Vec<PathBuf>) -> Arc<dyn LanguageSupport> {

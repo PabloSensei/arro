@@ -30,6 +30,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 
 use crate::actions::ActionMenu;
+use crate::completion_usage::{CompletionUsage, UsageEntry};
 use crate::refactor::{MoveField, RenameField};
 use crate::state::EditorState;
 use crate::view::{EditorEvent, EditorView};
@@ -338,6 +339,11 @@ pub(crate) struct Completion {
     /// The class of every entry, made once per answer: a member or a local comes before
     /// a type, a name the language prefers before a rare one.
     ranks: Vec<u8>,
+    /// The typed prefix the list filters by, kept for the highlight of the rows.
+    prefix: String,
+    /// What the user chose before, by prefix: an entry of the same class that was taken
+    /// more often and later comes first.
+    usage: Vec<UsageEntry>,
     pub shown: Vec<usize>,
     pub selected: usize,
     /// The first row of the part of the list on screen: the list scrolls under the
@@ -346,6 +352,12 @@ pub(crate) struct Completion {
     /// Whether the server sent every entry that can match the prefix. An incomplete list
     /// is asked again when typing goes on.
     pub complete: bool,
+    /// The second Ctrl+Space was pressed: the list shows every entry of the answer
+    /// rather than the ones the prefix matches.
+    pub expanded: bool,
+    /// The list was opened by Ctrl+Space rather than by typing on its own: only then do
+    /// the further presses of the key cycle through the whole list and the documentation.
+    pub explicit: bool,
 }
 
 /// One completion row: the label split into the text on the left and the type on the
@@ -359,6 +371,7 @@ pub(crate) struct CompletionRow {
 }
 
 impl Completion {
+    #[cfg(test)]
     fn new(
         start: usize,
         entries: Vec<CompletionEntry>,
@@ -366,6 +379,29 @@ impl Completion {
         prefix: &str,
         case: CompletionCase,
         preferred: &'static [&'static str],
+    ) -> Self {
+        Self::with_usage(
+            start,
+            entries,
+            complete,
+            prefix,
+            case,
+            preferred,
+            Vec::new(),
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_usage(
+        start: usize,
+        entries: Vec<CompletionEntry>,
+        complete: bool,
+        prefix: &str,
+        case: CompletionCase,
+        preferred: &'static [&'static str],
+        usage: Vec<UsageEntry>,
+        explicit: bool,
     ) -> Self {
         let keys: Vec<String> = entries.iter().map(completion_key).collect();
         let folded: Vec<String> = keys.iter().map(|key| key.to_lowercase()).collect();
@@ -379,10 +415,14 @@ impl Completion {
             keys,
             folded,
             ranks,
+            prefix: String::new(),
+            usage,
             shown: Vec::new(),
             selected: 0,
             scroll: 0,
             complete,
+            expanded: false,
+            explicit,
         };
         completion.filter_with(prefix, case);
         completion
@@ -394,6 +434,8 @@ impl Completion {
     }
 
     fn filter_with(&mut self, prefix: &str, case: CompletionCase) {
+        self.prefix = prefix.to_owned();
+        self.expanded = false;
         self.shown = order_entries(
             &self.entries,
             &self.keys,
@@ -401,9 +443,46 @@ impl Completion {
             &self.ranks,
             prefix,
             case,
+            &self.usage,
+            false,
         );
         self.selected = 0;
         self.scroll = 0;
+    }
+
+    /// The second Ctrl+Space: every entry of the answer, without the prefix filter, in
+    /// the order of the classes and of the choices the user made before.
+    fn show_all(&mut self) {
+        self.expanded = true;
+        self.shown = order_entries(
+            &self.entries,
+            &self.keys,
+            &self.folded,
+            &self.ranks,
+            &self.prefix,
+            CompletionCase::None,
+            &self.usage,
+            true,
+        );
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Where the typed prefix lands in the label on the left of `row`: a run of letters
+    /// for a prefix or a substring, one range per letter for humps and a typo.
+    pub fn highlights(&self, row: usize, left: &str) -> Vec<Range<usize>> {
+        let Some(index) = self.shown.get(row) else {
+            return Vec::new();
+        };
+        let key = &self.keys[*index];
+        let Some(at) = left.find(key) else {
+            return Vec::new();
+        };
+        match_ranges(&self.prefix, key)
+            .into_iter()
+            .filter(|range| at + range.end <= left.len())
+            .map(|range| at + range.start..at + range.end)
+            .collect()
     }
 
     pub fn label(&self, row: usize) -> CompletionRow {
@@ -713,7 +792,199 @@ pub fn completion_order_with(
         .iter()
         .map(|entry| entry_class(entry, preferred))
         .collect();
-    order_entries(entries, &keys, &folded, &ranks, prefix, case)
+    order_entries(entries, &keys, &folded, &ranks, prefix, case, &[], false)
+}
+
+/// The hump positions of a name: the first letter, a letter after a separator, an
+/// uppercase letter after a lowercase one and the last uppercase of a run before a
+/// lowercase one, so `StringBuilder` gives `S` and `B`.
+fn hump_starts(key: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut previous: Option<char> = None;
+    let chars: Vec<(usize, char)> = key.char_indices().collect();
+    for (at, (byte, character)) in chars.iter().enumerate() {
+        let next = chars.get(at + 1).map(|(_, next)| *next);
+        let boundary = match previous {
+            None => character.is_alphanumeric(),
+            Some(before) => {
+                character.is_alphanumeric()
+                    && (!before.is_alphanumeric()
+                        || (character.is_uppercase()
+                            && (before.is_lowercase()
+                                || before.is_ascii_digit()
+                                || (before.is_uppercase()
+                                    && next.is_some_and(char::is_lowercase)))))
+            }
+        };
+        if boundary {
+            starts.push(*byte);
+        }
+        previous = Some(*character);
+    }
+    starts
+}
+
+/// The letters of `key` the typed prefix matches as humps, or `None` when it does not
+/// match them all. A letter may continue the run it started (`Str` in `String`) or jump
+/// to the next hump (`B` in `StrB`); the case does not matter.
+fn hump_ranges(prefix: &str, key: &str) -> Option<Vec<Range<usize>>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let chars: Vec<(usize, char)> = key.char_indices().collect();
+    let starts = hump_starts(key);
+    let mut humps: Vec<usize> = Vec::new();
+    let mut next = 0;
+    for (at, (byte, _)) in chars.iter().enumerate() {
+        if next < starts.len() && *byte == starts[next] {
+            humps.push(at);
+            next += 1;
+        }
+    }
+    let mut at = 0;
+    let mut hump = 0;
+    let mut ranges = Vec::new();
+    for typed in prefix.chars() {
+        if at < chars.len() && chars[at].1.eq_ignore_ascii_case(&typed) {
+            let (byte, character) = chars[at];
+            ranges.push(byte..byte + character.len_utf8());
+            at += 1;
+            continue;
+        }
+        while hump < humps.len() && humps[hump] < at {
+            hump += 1;
+        }
+        while hump < humps.len() && !chars[humps[hump]].1.eq_ignore_ascii_case(&typed) {
+            hump += 1;
+        }
+        let index = *humps.get(hump)?;
+        let (byte, character) = chars[index];
+        ranges.push(byte..byte + character.len_utf8());
+        at = index + 1;
+        hump += 1;
+    }
+    Some(ranges)
+}
+
+/// Whether the first `length` letters of `key` are within one edit of `prefix`: a
+/// substitution, an inserted letter or a transposition of two neighbours. Only a prefix
+/// of at least [`TYPO_LENGTH`] letters counts, so a short prefix does not match the world.
+fn one_edit_away(prefix: &str, key: &str, length: usize) -> bool {
+    // A prefix with an inner capital spells humps rather than a typed name, so `StrB`
+    // must not be read as a typo of `String`.
+    if prefix.chars().skip(1).any(char::is_uppercase) {
+        return false;
+    }
+    let typed: Vec<char> = prefix
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    let target: Vec<char> = key
+        .chars()
+        .take(length)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    if typed.len() < TYPO_LENGTH || target.len() != length {
+        return false;
+    }
+    if typed.len() == target.len() {
+        let differences: Vec<usize> = typed
+            .iter()
+            .zip(&target)
+            .enumerate()
+            .filter(|(_, (one, other))| one != other)
+            .map(|(at, _)| at)
+            .collect();
+        match differences.as_slice() {
+            // A typo in the last letter is the letter still being typed: it does not
+            // pull a name that merely shares the start of the prefix into the list.
+            [at] => *at + 1 < typed.len(),
+            [first, second] => {
+                *second == *first + 1
+                    && typed[*first] == target[*second]
+                    && typed[*second] == target[*first]
+            }
+            _ => false,
+        }
+    } else if target.len() == typed.len() + 1 {
+        // One letter of the key was left out: the rest matches from that place on.
+        let mut at = 0;
+        while at < typed.len() && typed[at] == target[at] {
+            at += 1;
+        }
+        at + 1 < typed.len() && typed[at..] == target[at + 1..]
+    } else {
+        false
+    }
+}
+
+/// The shortest prefix that tolerates a typo.
+const TYPO_LENGTH: usize = 4;
+
+/// Where in `key` the typed prefix lands: one range for a run of letters, one range per
+/// letter for humps, and the letters compared for a typo.
+fn match_ranges(prefix: &str, key: &str) -> Vec<Range<usize>> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    if let Some(at) = key.find(prefix) {
+        return std::iter::once(at..at + prefix.len()).collect();
+    }
+    if let Some(range) = find_folded(key, prefix) {
+        return std::iter::once(range).collect();
+    }
+    if let Some(ranges) = hump_ranges(prefix, key) {
+        return ranges;
+    }
+    let length = prefix.chars().count();
+    if one_edit_away(prefix, key, length) || one_edit_away(prefix, key, length + 1) {
+        let end = key
+            .char_indices()
+            .nth(length.min(key.chars().count()))
+            .map_or(key.len(), |(byte, _)| byte);
+        return std::iter::once(0..end).collect();
+    }
+    Vec::new()
+}
+
+/// The range of `needle` in `haystack` when only the case of the letters differs.
+fn find_folded(haystack: &str, needle: &str) -> Option<Range<usize>> {
+    let needle: Vec<char> = needle
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let chars: Vec<(usize, char)> = haystack.char_indices().collect();
+    let folded: Vec<char> = chars
+        .iter()
+        .map(|(_, character)| character.to_ascii_lowercase())
+        .collect();
+    let start = folded
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())?;
+    let from = chars[start].0;
+    let (byte, last) = chars[start + needle.len() - 1];
+    Some(from..byte + last.len_utf8())
+}
+
+/// Makes a note of the entry the user took for the typed prefix and keeps the table in
+/// the state folder. A window without the table ranks the entries as before.
+fn remember_completion(prefix: &str, label: &str, cx: &mut App) {
+    if !cx.has_global::<CompletionUsage>() {
+        return;
+    }
+    let saved = {
+        let usage = cx.global_mut::<CompletionUsage>();
+        if !usage.remember(prefix, label) {
+            return;
+        }
+        usage.file()
+    };
+    if let Some((path, body)) = saved {
+        crate::completion_usage::save(path, body, cx);
+    }
 }
 
 /// The text of an entry that the typed prefix is compared with: the server's own filter
@@ -748,9 +1019,12 @@ fn entry_class(entry: &CompletionEntry, preferred: &[&str]) -> u8 {
 
 /// The indices of `entries` in the order the list shows them for `prefix`. An entry that
 /// starts with the prefix and has the same case comes before one that only starts with
-/// it, then one that contains it; within a group a template, a member or a local comes
-/// before a type, and the order of the server's `sortText` decides between equal kinds.
-/// An equal `sortText` puts the shorter name first, so `Alpha` comes before `Alphabet`.
+/// it, then one whose humps the prefix spells, then one that contains it, then a name
+/// that is one typo away; within a group a template, a member or a local comes before a
+/// type, then the entry the user chose more often and later, and the order of the
+/// server's `sortText` decides the rest. An equal `sortText` puts the shorter name first,
+/// so `Alpha` comes before `Alphabet`.
+#[allow(clippy::too_many_arguments)]
 fn order_entries(
     entries: &[CompletionEntry],
     keys: &[String],
@@ -758,6 +1032,8 @@ fn order_entries(
     ranks: &[u8],
     prefix: &str,
     case: CompletionCase,
+    usage: &[UsageEntry],
+    all: bool,
 ) -> Vec<usize> {
     let folded_prefix = prefix.to_lowercase();
     let matches_case = |index: usize, at_start: bool| match case {
@@ -777,7 +1053,8 @@ fn order_entries(
         }
     };
     // The group of an entry by how well the prefix matches: the exact text, the same
-    // case at the start, the text at the start, the same case inside, the text inside.
+    // case at the start, the text at the start, the humps, the same case inside, the
+    // text inside and a name one typo away.
     let bucket = |index: usize| -> Option<u8> {
         let key = &keys[index];
         let folded = &folded[index];
@@ -787,21 +1064,34 @@ fn order_entries(
             Some(1)
         } else if folded.starts_with(&folded_prefix) {
             Some(2)
-        } else if key.contains(prefix) {
+        } else if hump_ranges(prefix, key).is_some() {
             Some(3)
-        } else if folded.contains(&folded_prefix) {
+        } else if key.contains(prefix) {
             Some(4)
+        } else if folded.contains(&folded_prefix) {
+            Some(5)
         } else {
-            None
+            let length = prefix.chars().count();
+            (one_edit_away(prefix, key, length) || one_edit_away(prefix, key, length + 1))
+                .then_some(6)
         }
+    };
+    // What the user chose before for this prefix: the more often, then the later one
+    // first. A group of a better match always stays above it.
+    let chosen = |index: usize| -> (u32, u64) {
+        usage
+            .iter()
+            .find(|entry| entry.prefix == prefix && entry.label == keys[index])
+            .map_or((0, 0), |entry| (entry.count, entry.last))
     };
     let mut shown: Vec<(u8, u8, usize)> = Vec::new();
     for index in 0..entries.len() {
         let starts = keys[index].starts_with(prefix);
-        let Some(bucket) = bucket(index) else {
+        let bucket = if all { Some(2) } else { bucket(index) };
+        let Some(bucket) = bucket else {
             continue;
         };
-        if !matches_case(index, starts) {
+        if !all && !matches_case(index, starts) {
             continue;
         }
         shown.push((bucket, ranks[index], index));
@@ -810,6 +1100,7 @@ fn order_entries(
         bucket_a
             .cmp(bucket_b)
             .then(class_a.cmp(class_b))
+            .then_with(|| chosen(*b).cmp(&chosen(*a)))
             .then_with(|| match (&entries[*a].sort_text, &entries[*b].sort_text) {
                 // Entries without a sort text are the local templates: their own order
                 // stays.
@@ -1142,15 +1433,19 @@ pub(crate) const COMPLETION_DOC_LINES: usize = 8;
 pub(crate) struct CompletionDoc {
     /// The index of the entry in the list, so a late answer for another one is dropped.
     pub entry: usize,
+    /// The markdown of the answer, for the popup of the third Ctrl+Space.
+    pub text: String,
     /// The lines of the markdown, read once: a frame only draws them.
     pub rows: Vec<CompletionDocRow>,
 }
 
 impl CompletionDoc {
     pub(crate) fn new(entry: usize, text: impl AsRef<str>) -> Self {
+        let text = text.as_ref();
         Self {
             entry,
-            rows: completion_doc_rows_of(text.as_ref()),
+            text: text.to_owned(),
+            rows: completion_doc_rows_of(text),
         }
     }
 }
@@ -1500,6 +1795,8 @@ pub(crate) struct Lsp {
     pub completion: Option<Completion>,
     /// The documentation of the selected entry, when it arrived.
     pub completion_doc: Option<CompletionDoc>,
+    /// The third Ctrl+Space asked for the documentation: a late answer opens the popup.
+    pub(crate) completion_doc_wanted: bool,
     /// Ctrl+B found more than one place: the list waits for the user's pick.
     pub navigation_list: Option<NavigationList>,
     /// The places Ctrl+B found in this text, by place and kind. A repeated press answers
@@ -1899,6 +2196,7 @@ impl EditorView {
             received: !follows_diagnostics,
             completion: None,
             completion_doc: None,
+            completion_doc_wanted: false,
             navigation_list: None,
             navigation_cache: HashMap::new(),
             note: None,
@@ -2339,6 +2637,7 @@ impl EditorView {
             if caret < completion.start {
                 lsp.completion = None;
             } else {
+                lsp.completion_doc_wanted = false;
                 let prefix = state.store().slice(completion.start..caret);
                 if prefix.chars().all(is_word) {
                     completion.filter_with(&prefix, case);
@@ -2487,9 +2786,85 @@ impl EditorView {
         }
     }
 
-    /// Ctrl+Space, or typing: asks for entries at the caret.
+    /// Ctrl+Space, or typing: asks for entries at the caret. A Ctrl+Space with the list
+    /// the key opened already does not ask again: the second press shows every entry of
+    /// the answer, the third opens the documentation of the selected row.
     pub(crate) fn complete(&mut self, explicit: bool, cx: &mut Context<Self>) {
+        if explicit && self.expand_completion(cx) {
+            return;
+        }
         self.complete_with(CompletionMode::All, explicit, cx);
+    }
+
+    /// The second and the third Ctrl+Space of a list the key opened. Returns whether the
+    /// key was taken by the list: `false` asks the server for a new list.
+    fn expand_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        let pressed = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.completion.as_ref())
+            .filter(|completion| completion.explicit)
+            .map(|completion| completion.expanded);
+        match pressed {
+            Some(false) => {
+                if let Some(completion) = self.lsp.as_mut().and_then(|lsp| lsp.completion.as_mut())
+                {
+                    completion.show_all();
+                }
+                cx.notify();
+                self.request_completion_doc(cx);
+                true
+            }
+            Some(true) => {
+                self.show_completion_doc(cx);
+                true
+            }
+            // A list that typing opened is not a first Ctrl+Space yet: the key asks the
+            // server again and marks the new list as the explicit one.
+            None => false,
+        }
+    }
+
+    /// The third Ctrl+Space: the documentation of the selected row in the popup. The
+    /// text of an answer already here is shown at once; otherwise the resolve that the
+    /// list would ask for anyway opens it when it arrives.
+    fn show_completion_doc(&mut self, cx: &mut Context<Self>) {
+        let Some((entry, at, text)) = self.lsp.as_ref().and_then(|lsp| {
+            let completion = lsp.completion.as_ref()?;
+            let index = *completion.shown.get(completion.selected)?;
+            let entry = completion.entries.get(index)?.clone();
+            let text = lsp
+                .completion_doc
+                .as_ref()
+                .filter(|doc| doc.entry == index)
+                .map(|doc| doc.text.clone());
+            Some((entry, completion.start, text))
+        }) else {
+            return;
+        };
+        let text = text.or_else(|| {
+            entry
+                .documentation
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        });
+        match text {
+            Some(text) => self.open_completion_doc(at, &text, cx),
+            None => {
+                if let Some(lsp) = &mut self.lsp {
+                    lsp.completion_doc_wanted = true;
+                }
+                self.request_completion_doc(cx);
+            }
+        }
+    }
+
+    /// The documentation popup of an entry of the list, from the text the server sent.
+    fn open_completion_doc(&mut self, at: usize, text: &str, cx: &mut Context<Self>) {
+        let blocks = crate::quick_doc::parse(text);
+        self.show_quick_doc(at, blocks, None, None, cx);
     }
 
     /// Ctrl+Shift+Space and Ctrl+Alt+Space: the usual list narrowed to the expected type
@@ -2519,6 +2894,7 @@ impl EditorView {
             return;
         };
         lsp.completion_doc = None;
+        lsp.completion_doc_wanted = false;
         let start = word_start(&state.store(), caret);
         let line_start = state
             .store()
@@ -2541,14 +2917,20 @@ impl EditorView {
         let asked = lsp.asked;
         lsp.parameter_walk = None;
         let support = lsp.support.clone();
+        let usage = cx
+            .try_global::<CompletionUsage>()
+            .map(CompletionUsage::snapshot)
+            .unwrap_or_default();
         if !local.is_empty() {
-            let completion = Completion::new(
+            let completion = Completion::with_usage(
                 start,
                 local.clone(),
                 true,
                 &state.store().slice(start..caret),
                 case,
                 support.preferred_completion_names(),
+                usage.clone(),
+                explicit,
             );
             lsp.completion = (!completion.shown.is_empty()).then_some(completion);
             cx.notify();
@@ -2612,13 +2994,15 @@ impl EditorView {
                 local.extend(fallback);
                 let entries = visible_entries(list.entries, mode, expected.as_deref());
                 let entries = merge_completions(local, entries);
-                let completion = Completion::new(
+                let completion = Completion::with_usage(
                     start,
                     entries,
                     list.complete,
                     &state.store().slice(start..caret),
                     case,
                     support.preferred_completion_names(),
+                    usage,
+                    explicit,
                 );
                 lsp.completion = (!completion.shown.is_empty()).then_some(completion);
                 cx.notify();
@@ -2634,11 +3018,11 @@ impl EditorView {
     /// dropped. The answer may also carry the additional edits of the entry, which are
     /// kept for the insertion instead of being asked for again.
     fn request_completion_doc(&mut self, cx: &mut Context<Self>) {
-        let Some((entry, index, support)) = self.lsp.as_ref().and_then(|lsp| {
+        let Some((entry, index, at, support)) = self.lsp.as_ref().and_then(|lsp| {
             let completion = lsp.completion.as_ref()?;
             let index = *completion.shown.get(completion.selected)?;
             let entry = completion.entries.get(index)?.clone();
-            Some((entry, index, lsp.support.clone()))
+            Some((entry, index, completion.start, lsp.support.clone()))
         }) else {
             return;
         };
@@ -2652,11 +3036,17 @@ impl EditorView {
         }
         if let Some(documentation) = &entry.documentation {
             let text = documentation.trim();
-            if !text.is_empty()
-                && let Some(lsp) = &mut self.lsp
-            {
-                lsp.completion_doc = Some(CompletionDoc::new(index, text));
-                cx.notify();
+            if !text.is_empty() {
+                let open = if let Some(lsp) = &mut self.lsp {
+                    lsp.completion_doc = Some(CompletionDoc::new(index, text));
+                    cx.notify();
+                    std::mem::take(&mut lsp.completion_doc_wanted)
+                } else {
+                    false
+                };
+                if open {
+                    self.open_completion_doc(at, text, cx);
+                }
             }
             return;
         }
@@ -2693,6 +3083,7 @@ impl EditorView {
                     .as_ref()
                     .and_then(|completion| completion.shown.get(completion.selected).copied());
                 if selected != Some(index) {
+                    lsp.completion_doc_wanted = false;
                     return;
                 }
                 // The edits the server sends with the documentation are used when the
@@ -2706,12 +3097,20 @@ impl EditorView {
                     entry.additional_edits = answer.value.additional_edits.clone();
                 }
                 let text = answer.value.documentation.unwrap_or_default();
-                let text = text.trim();
+                let text = text.trim().to_owned();
                 if text.is_empty() {
                     return;
                 }
-                lsp.completion_doc = Some(CompletionDoc::new(index, text));
+                lsp.completion_doc = Some(CompletionDoc::new(index, &text));
+                let open = std::mem::take(&mut lsp.completion_doc_wanted);
+                let at = lsp
+                    .completion
+                    .as_ref()
+                    .map_or(0, |completion| completion.start);
                 cx.notify();
+                if open {
+                    this.open_completion_doc(at, &text, cx);
+                }
             })
             .ok();
         }));
@@ -2726,6 +3125,9 @@ impl EditorView {
         let Some(lsp) = &mut self.lsp else {
             return false;
         };
+        if matches!(key, "up" | "down" | "pageup" | "pagedown" | "home" | "end") {
+            lsp.completion_doc_wanted = false;
+        }
         let Some(completion) = &mut lsp.completion else {
             return false;
         };
@@ -2774,9 +3176,14 @@ impl EditorView {
         let dot = key == "ctrl-.";
         let complete_statement = key == "ctrl-shift-enter";
         let start = completion.start;
+        let chosen = completion
+            .shown
+            .get(completion.selected)
+            .map(|index| completion_key(&completion.entries[*index]));
         let entry = completion.chosen_entry();
         lsp.completion = None;
         lsp.completion_doc = None;
+        lsp.completion_doc_wanted = false;
         let support = lsp.support.clone();
         self.completion_task = None;
         self.completion_doc_task = None;
@@ -2787,6 +3194,10 @@ impl EditorView {
             return true;
         };
         let caret = state.head();
+        if let Some(chosen) = chosen {
+            let typed = state.store().slice(start.min(caret)..caret);
+            remember_completion(&typed, &chosen, cx);
+        }
         let start = entry
             .span
             .map_or(start, |span| offset_at(&state.store(), span.start))
@@ -2823,7 +3234,11 @@ impl EditorView {
         click_count: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(completion) = self.lsp.as_mut().and_then(|lsp| lsp.completion.as_mut()) else {
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        lsp.completion_doc_wanted = false;
+        let Some(completion) = lsp.completion.as_mut() else {
             return;
         };
         if row >= completion.shown.len() {
@@ -3864,6 +4279,168 @@ mod tests {
             character: 40,
         };
         assert_eq!(offset_at(&store, past), 2);
+    }
+
+    #[test]
+    fn humps_find_a_type_and_a_method_under_a_prefix_that_is_not_a_prefix() {
+        let cases = [
+            ("StrB", "StringBuilder"),
+            ("NPE", "NullPointerException"),
+            ("gTN", "getTypeName"),
+        ];
+        for (prefix, label) in cases {
+            let entries = [entry(label, Some("0000")), entry("Other", Some("0001"))];
+            let labels: Vec<&str> = completion_order(&entries, prefix, &[])
+                .into_iter()
+                .map(|index| entries[index].label.as_str())
+                .collect();
+            assert_eq!(labels.first(), Some(&label), "{prefix}");
+        }
+    }
+
+    #[test]
+    fn an_exact_name_comes_before_a_hump_match() {
+        let entries = [
+            entry("StringBuilder", Some("0000")),
+            entry("StrB", Some("0000")),
+        ];
+        let labels: Vec<&str> = completion_order(&entries, "StrB", &[])
+            .into_iter()
+            .map(|index| entries[index].label.as_str())
+            .collect();
+        assert_eq!(labels, ["StrB", "StringBuilder"]);
+    }
+
+    #[test]
+    fn humps_come_before_a_name_one_typo_away() {
+        let entries = [
+            entry("String", Some("0000")),
+            entry("StringNewGame", Some("0000")),
+        ];
+        let labels: Vec<&str> = completion_order(&entries, "Strng", &[])
+            .into_iter()
+            .map(|index| entries[index].label.as_str())
+            .collect();
+        assert_eq!(labels, ["StringNewGame", "String"]);
+    }
+
+    #[test]
+    fn one_typo_or_a_transposition_matches_a_prefix_of_four_letters() {
+        for prefix in ["Strnig", "Strng", "Stirng"] {
+            let entries = [entry("String", Some("0000"))];
+            let found = completion_order(&entries, prefix, &[]);
+            assert_eq!(found, [0], "{prefix} finds the name");
+        }
+        // A prefix shorter than four letters tolerates no typo.
+        let entries = [entry("Stq", Some("0000"))];
+        assert!(completion_order(&entries, "Str", &[]).is_empty());
+        // An inner capital spells humps, so it is not read as a typo of a name.
+        let entries = [entry("String", Some("0000"))];
+        assert!(completion_order(&entries, "StrB", &[]).is_empty());
+        // A typo in the last letter is the letter still being typed.
+        let entries = [entry("StrictMath", Some("0000"))];
+        assert!(completion_order(&entries, "Strin", &[]).is_empty());
+    }
+
+    #[test]
+    fn the_matched_letters_of_a_hump_match_stand_out_one_by_one() {
+        let entries = [entry("StringBuilder", Some("0000"))];
+        let completion =
+            Completion::new(0, entries.to_vec(), true, "StrB", CompletionCase::None, &[]);
+        let row = completion.label(0);
+        let matched: Vec<&str> = completion
+            .highlights(0, &row.left)
+            .into_iter()
+            .map(|range| &row.left[range])
+            .collect();
+        assert_eq!(matched, ["S", "t", "r", "B"]);
+    }
+
+    #[test]
+    fn the_matched_letters_of_a_prefix_are_one_run() {
+        let entries = [entry("StringBuilder", Some("0000"))];
+        let completion = Completion::new(
+            0,
+            entries.to_vec(),
+            true,
+            "String",
+            CompletionCase::None,
+            &[],
+        );
+        let row = completion.label(0);
+        let matched: Vec<&str> = completion
+            .highlights(0, &row.left)
+            .into_iter()
+            .map(|range| &row.left[range])
+            .collect();
+        assert_eq!(matched, ["String"]);
+    }
+
+    #[test]
+    fn a_frequent_choice_comes_before_an_equal_one() {
+        use crate::completion_usage::UsageEntry;
+
+        let entries = [
+            entry("AbstractList", Some("0001")),
+            entry("ArrayList", Some("0002")),
+        ];
+        let usage = [
+            UsageEntry {
+                prefix: "A".to_owned(),
+                label: "ArrayList".to_owned(),
+                count: 2,
+                last: 9,
+            },
+            UsageEntry {
+                prefix: "A".to_owned(),
+                label: "AbstractList".to_owned(),
+                count: 1,
+                last: 10,
+            },
+        ];
+        let keys: Vec<String> = entries.iter().map(super::completion_key).collect();
+        let folded: Vec<String> = keys.iter().map(|key| key.to_lowercase()).collect();
+        let order = super::order_entries(
+            &entries,
+            &keys,
+            &folded,
+            &[3, 3],
+            "A",
+            CompletionCase::None,
+            &usage,
+            false,
+        );
+        assert_eq!(
+            order,
+            [1, 0],
+            "more choices win over the order the server sent"
+        );
+    }
+
+    #[test]
+    fn a_frequent_choice_does_not_pass_an_exact_name() {
+        use crate::completion_usage::UsageEntry;
+
+        let entries = [entry("A", Some("0000")), entry("ArrayList", Some("0001"))];
+        let usage = [UsageEntry {
+            prefix: "A".to_owned(),
+            label: "ArrayList".to_owned(),
+            count: 50,
+            last: 100,
+        }];
+        let keys: Vec<String> = entries.iter().map(super::completion_key).collect();
+        let folded: Vec<String> = keys.iter().map(|key| key.to_lowercase()).collect();
+        let order = super::order_entries(
+            &entries,
+            &keys,
+            &folded,
+            &[3, 3],
+            "A",
+            CompletionCase::None,
+            &usage,
+            false,
+        );
+        assert_eq!(order, [0, 1], "the exact name stays first");
     }
 
     #[test]

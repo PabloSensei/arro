@@ -161,6 +161,11 @@ impl TestView {
         named.collect()
     }
 
+    /// Whether the last run has a failed test, so the window offers to run it again.
+    pub fn has_failures(&self) -> bool {
+        self.tree.cases().any(is_failed)
+    }
+
     pub fn select(&mut self, id: &str, files: &[PathBuf]) {
         self.selected = Some(id.to_owned());
         self.detail = self
@@ -402,7 +407,7 @@ impl RunPanel {
         self.files = Some(files);
     }
 
-    fn file_list(&self, cx: &App) -> Arc<Vec<PathBuf>> {
+    pub(super) fn file_list(&self, cx: &App) -> Arc<Vec<PathBuf>> {
         self.files
             .as_ref()
             .map_or_else(Default::default, |files| files.read(cx).clone())
@@ -547,43 +552,36 @@ impl RunPanel {
         }
     }
 
-    /// The context menu of a row of the test tree: Fix with AI on a failed test.
-    fn test_row_menu(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let files = self.file_list(cx);
-        self.tests.select(id, &files);
-        cx.notify();
-        if !crate::fix_with_ai::enabled(cx) {
-            return;
-        }
-        let Some((name, message, stack, file)) = self.tests.failure_for_ai(id, &files) else {
-            return;
-        };
-        let message =
-            crate::fix_with_ai::test_failure(&self.root, &name, file.as_deref(), &message, &stack);
-        let workspace = self.workspace.clone();
-        let entry = MenuEntry::new("Fix with AI", move |window, cx| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    crate::fix_with_ai::ask(workspace, message.clone(), window, cx)
-                })
-                .ok();
-        });
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.show_menu(position, vec![entry], cx)
-            })
-            .ok();
+    /// The counter of the search bar of the console.
+    #[cfg(test)]
+    pub(crate) fn console_search_status(&self) -> String {
+        self.console_search.status().0
     }
 
-    /// Debugs the test selected in the tree, or its class when the class is selected.
-    pub(crate) fn debug_selected_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The lines the filter keeps, for the window test of the funnel.
+    #[cfg(test)]
+    pub(crate) fn visible_console_lines(&self) -> Vec<String> {
+        let total = self.console_line_count();
+        (0..self.console_search.kept_count(total))
+            .filter_map(|row| {
+                let index = self.console_search.line_of_row(total, row);
+                self.console_line(index).map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// The request of the test selected in the tree, or of its class when the class is
+    /// selected. `None` says in the window why there is nothing to run.
+    fn selected_test_request(&mut self, verb: &str, cx: &mut Context<Self>) -> Option<TestRequest> {
         let Some(id) = self.tests.selected.clone() else {
-            self.tell("Cannot debug tests", "Select a test in the tree first", cx);
-            return;
+            self.tell(
+                &format!("Cannot {verb} tests"),
+                "Select a test in the tree first",
+                cx,
+            );
+            return None;
         };
-        let Some(node) = self.tests.tree.get(&id) else {
-            return;
-        };
+        let node = self.tests.tree.get(&id)?;
         let suite = node.node.suite.clone().or_else(|| {
             self.tests
                 .request
@@ -597,16 +595,98 @@ impl RunPanel {
             .as_ref()
             .and_then(|request| request.module.clone());
         let Some(suite) = suite else {
-            self.tell("Cannot debug tests", "The selected node is not a test", cx);
-            return;
+            self.tell(
+                &format!("Cannot {verb} tests"),
+                "The selected node is not a test",
+                cx,
+            );
+            return None;
         };
-        let request = TestRequest {
+        Some(TestRequest {
             module,
             suite: Some(suite),
             case,
             ..TestRequest::default()
+        })
+    }
+
+    /// Runs the test selected in the tree, or its class when the class is selected.
+    pub(crate) fn run_selected_test(&mut self, cx: &mut Context<Self>) {
+        if let Some(request) = self.selected_test_request("run", cx) {
+            self.run_tests(request, cx);
+        }
+    }
+
+    /// The context menu of a row of the test tree: Run, Debug and Fix with AI on a
+    /// failure.
+    fn test_row_menu(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let files = self.file_list(cx);
+        self.tests.select(id, &files);
+        cx.notify();
+        let Some(node) = self.tests.tree.get(id) else {
+            return;
         };
-        self.debug_tests(request, window, cx);
+        let name = node.node.name.clone();
+        let is_test = node.node.suite.is_some();
+        let failure = self.tests.failure_for_ai(id, &files);
+        let mut entries = Vec::new();
+        if is_test {
+            let panel = cx.weak_entity();
+            entries.push(
+                MenuEntry::new(format!("Run '{name}'"), move |_, cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.run_selected_test(cx))
+                        .ok();
+                })
+                .icon("run/run"),
+            );
+            let panel = cx.weak_entity();
+            entries.push(
+                MenuEntry::new(format!("Debug '{name}'"), move |window, cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.debug_selected_test(window, cx))
+                        .ok();
+                })
+                .icon("run/debug"),
+            );
+        }
+        if crate::fix_with_ai::enabled(cx)
+            && let Some((name, message, stack, file)) = failure
+        {
+            if !entries.is_empty() {
+                entries.push(MenuEntry::separator());
+            }
+            let message = crate::fix_with_ai::test_failure(
+                &self.root,
+                &name,
+                file.as_deref(),
+                &message,
+                &stack,
+            );
+            let workspace = self.workspace.clone();
+            entries.push(MenuEntry::new("Fix with AI", move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        crate::fix_with_ai::ask(workspace, message.clone(), window, cx)
+                    })
+                    .ok();
+            }));
+        }
+        if entries.is_empty() {
+            return;
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
+    }
+
+    /// Debugs the test selected in the tree, or its class when the class is selected.
+    pub(crate) fn debug_selected_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(request) = self.selected_test_request("debug", cx) {
+            self.debug_tests(request, window, cx);
+        }
     }
 
     /// Runs the failed tests of the last run again.

@@ -113,7 +113,7 @@ impl SpeedLanguage {
         self.complete.store(complete, Ordering::Relaxed);
     }
 
-    fn completions(&self) -> usize {
+    pub(crate) fn completions(&self) -> usize {
         self.completions.load(Ordering::Relaxed)
     }
 
@@ -121,7 +121,7 @@ impl SpeedLanguage {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    fn resolves(&self) -> usize {
+    pub(crate) fn resolves(&self) -> usize {
         self.resolves.load(Ordering::Relaxed)
     }
 

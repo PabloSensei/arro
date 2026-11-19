@@ -99,15 +99,16 @@ impl EditorView {
     /// Whether a popup that holds the focus of the editor is open: the lists and the
     /// note go away with the focus, the pointer popup stays as it is.
     pub(crate) fn list_popups_open(&self) -> bool {
-        [
-            Popup::Completion,
-            Popup::ParameterInfo,
-            Popup::Actions,
-            Popup::Navigation,
-            Popup::Note,
-        ]
-        .into_iter()
-        .any(|popup| self.popup_open(popup))
+        self.crumb_menu.is_some()
+            || [
+                Popup::Completion,
+                Popup::ParameterInfo,
+                Popup::Actions,
+                Popup::Navigation,
+                Popup::Note,
+            ]
+            .into_iter()
+            .any(|popup| self.popup_open(popup))
     }
 
     /// Takes the completion list and everything its request brought away: the
@@ -117,6 +118,7 @@ impl EditorView {
         if let Some(lsp) = &mut self.lsp {
             lsp.completion = None;
             lsp.completion_doc = None;
+            lsp.completion_doc_wanted = false;
         }
         self.completion_task = None;
         self.completion_doc_task = None;
@@ -206,6 +208,7 @@ impl EditorView {
     /// too: its answer belongs to a list nobody waits for now.
     pub(crate) fn dismiss_list_popups(&mut self, cx: &mut Context<Self>) {
         let open = self.list_popups_open();
+        self.crumb_menu = None;
         self.close_completion();
         if !open {
             return;
@@ -226,13 +229,14 @@ impl EditorView {
             || self.popup_open(Popup::Actions)
             || self.popup_open(Popup::Navigation)
             || self.popup_open(Popup::Note);
+        let crumb = self.crumb_menu.take().is_some();
         if let Some(lsp) = &mut self.lsp {
             lsp.actions = None;
             lsp.navigation_list = None;
             lsp.note = None;
         }
         self.close_completion();
-        if open {
+        if open || crumb {
             cx.notify();
         }
     }

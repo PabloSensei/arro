@@ -190,6 +190,12 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The processes of the machine that already listen for a debugger, for Attach to
+    /// Process. A language that cannot list them makes the window ask for an address.
+    fn debug_processes(&self) -> Option<&crate::DebugProcessProvider> {
+        None
+    }
+
     /// The edits of an action the server computes only on resolve.
     fn action_resolve(&self) -> Option<&crate::ActionResolveProvider> {
         None

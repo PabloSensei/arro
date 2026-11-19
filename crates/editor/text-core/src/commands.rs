@@ -42,6 +42,132 @@ pub fn backspace<S: TextStore>(buffer: &mut Buffer<S>, source: EditSource) -> Ch
     buffer.apply(edits, None, source, EditKind::Typing)
 }
 
+/// Backspace in the indentation of a line. A step of the indentation goes at once, and an
+/// empty line drops to its proper indent before it joins the line above:
+///
+/// - in the leading whitespace of a line, the spaces back to the previous step of
+///   `indent.size` columns go;
+/// - an empty line deeper than the line above it goes to the indent of that line, or one
+///   step deeper when that line opens a block;
+/// - an empty line at its proper indent joins the line above.
+pub fn backspace_indent<S: TextStore>(
+    buffer: &mut Buffer<S>,
+    indent: &crate::indent::IndentSettings,
+    source: EditSource,
+) -> Change {
+    let store = buffer.store();
+    let ranges = buffer.selections().iter().map(|selection| {
+        if selection.is_empty() {
+            pair_to_delete(&store, selection.head)
+                .unwrap_or_else(|| indent_range(&store, selection.head, indent))
+        } else {
+            selection.range()
+        }
+    });
+    let edits = deletions(ranges.collect());
+    buffer.apply(edits, None, source, EditKind::Typing)
+}
+
+/// What Backspace takes before `head` when the caret is in the indentation.
+fn indent_range<S: TextStore>(
+    store: &S,
+    head: usize,
+    indent: &crate::indent::IndentSettings,
+) -> Range<usize> {
+    let line = store.offset_to_line(head);
+    let start = store.line_to_offset(line);
+    let before = store.slice(start..head);
+    if !before
+        .chars()
+        .all(|character| character == ' ' || character == '\t')
+    {
+        return store.prev_boundary(head)..head;
+    }
+    let end = store.line_end(line);
+    let blank = head == end
+        && store
+            .slice(start..end)
+            .chars()
+            .all(|character| character == ' ' || character == '\t');
+    if blank {
+        let proper = proper_indent(store, line, indent);
+        let columns = indentation_columns(&before, indent.tab_width);
+        if columns > proper {
+            return start + offset_of_columns(&before, proper, indent.tab_width)..head;
+        }
+        if line > 0 {
+            return start.saturating_sub(1)..head;
+        }
+        return start..head;
+    }
+    let columns = indentation_columns(&before, indent.tab_width);
+    if columns == 0 {
+        return store.prev_boundary(head)..head;
+    }
+    let step = indent.size.max(1);
+    let target = ((columns - 1) / step) * step;
+    start + offset_of_columns(&before, target, indent.tab_width)..head
+}
+
+/// The indent of the block a line sits in: the indent of the nearest line above it that
+/// has text, one step deeper when that line opens a block.
+fn proper_indent<S: TextStore>(
+    store: &S,
+    line: usize,
+    indent: &crate::indent::IndentSettings,
+) -> usize {
+    let mut above = line;
+    while above > 0 {
+        above -= 1;
+        let text = store.line_text(above);
+        let trimmed = text.trim_start_matches([' ', '\t']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let leading = &text[..text.len() - trimmed.len()];
+        let mut columns = indentation_columns(leading, indent.tab_width);
+        if trimmed.trim_end().ends_with(['{', '(', '[']) {
+            columns += indent.size.max(1);
+        }
+        return columns;
+    }
+    0
+}
+
+/// The columns of a run of spaces and tabs, a tab reaching the next stop.
+fn indentation_columns(text: &str, tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut columns = 0;
+    for character in text.chars() {
+        if character == '\t' {
+            columns += tab_width - columns % tab_width;
+        } else {
+            columns += 1;
+        }
+    }
+    columns
+}
+
+/// How many bytes of `text` hold `columns` columns, or the last place before that.
+fn offset_of_columns(text: &str, columns: usize, tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut reached = 0;
+    let mut at = 0;
+    for (index, character) in text.char_indices() {
+        let next = if character == '\t' {
+            reached + tab_width - reached % tab_width
+        } else {
+            reached + 1
+        };
+        if next > columns {
+            break;
+        }
+        reached = next;
+        at = index + character.len_utf8();
+    }
+    at
+}
+
 /// Selections go first; an empty one takes the character after the caret.
 pub fn delete_forward<S: TextStore>(buffer: &mut Buffer<S>, source: EditSource) -> Change {
     let store = buffer.store();

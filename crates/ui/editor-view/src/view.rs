@@ -236,6 +236,14 @@ struct ClipHistory(Vec<String>);
 
 impl Global for ClipHistory {}
 
+/// Writes the history of what was copied, so that it survives a restart. The window
+/// sets it at start; it runs off the UI thread.
+type ClipSaver = std::sync::Arc<dyn Fn(Vec<String>)>;
+
+struct ClipHistorySink(Option<ClipSaver>);
+
+impl Global for ClipHistorySink {}
+
 /// The texts of the editors open in the window, for hippie completion. Each editor puts
 /// its own text here as it changes and reads the others from here.
 #[derive(Default)]
@@ -259,6 +267,25 @@ pub fn clipboard_history(cx: &App) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Puts the history of an earlier run in place, the newest copy first.
+pub fn set_clipboard_history(cx: &mut App, entries: Vec<String>) {
+    let mut history: Vec<String> = Vec::new();
+    for entry in entries {
+        if !entry.is_empty() && !history.contains(&entry) {
+            history.push(entry);
+        }
+        if history.len() == CLIP_HISTORY {
+            break;
+        }
+    }
+    cx.default_global::<ClipHistory>().0 = history;
+}
+
+/// The window saves every copy with this, off the UI thread.
+pub fn install_clipboard_history_sink(cx: &mut App, sink: impl Fn(Vec<String>) + 'static) {
+    cx.set_global(ClipHistorySink(Some(std::sync::Arc::new(sink))));
+}
+
 fn remember_clip(cx: &mut App, text: String) {
     if text.is_empty() {
         return;
@@ -267,6 +294,13 @@ fn remember_clip(cx: &mut App, text: String) {
     history.retain(|kept| *kept != text);
     history.insert(0, text);
     history.truncate(CLIP_HISTORY);
+    let entries = history.clone();
+    if let Some(sink) = cx
+        .try_global::<ClipHistorySink>()
+        .and_then(|sink| sink.0.clone())
+    {
+        sink(entries);
+    }
 }
 
 /// What a declaration is, for the breadcrumbs, the sticky lines and the structure.
@@ -712,6 +746,10 @@ pub enum EditorEvent {
     Usages(Vec<Usage>),
     /// Alt+F7 with the language that tells the kind and the container of a use.
     UsagesDetailed(Vec<DetailedUsage>),
+    /// Ctrl+F7: the uses of the symbol in this file, for the window that lists them.
+    UsagesInFile(Vec<Usage>),
+    /// Ctrl+F7 with the language that tells the kind and the container of a use.
+    UsagesDetailedInFile(Vec<DetailedUsage>),
     /// Ctrl+Alt+F7: the uses of the symbol, for the popup at the caret.
     ShowUsages(UsagesUpdate),
     /// A right click in the text: the window shows the menu of the editor here.
@@ -774,6 +812,33 @@ struct ContextInfo {
     /// The caret when the popup opened; a move closes it.
     head: usize,
     lines: Vec<String>,
+}
+
+/// The list of the neighbours of one declaration, which a click on its breadcrumb opens:
+/// the other members of the same class, or the other declarations of the file.
+pub(crate) struct CrumbMenu {
+    /// The crumb the list belongs to: 0 is the outermost declaration of the file.
+    level: usize,
+    /// Where the list stands, under the crumb that opened it.
+    position: Point<Pixels>,
+    /// The text that narrows the list while the user types.
+    filter: TextField,
+    /// The row the keys act on, counted in the filtered list.
+    selected: usize,
+    scroll: ScrollHandle,
+}
+
+/// The icon of a declaration in the list of a crumb.
+fn crumb_icon(kind: OutlineKind) -> &'static str {
+    match kind {
+        OutlineKind::Module => "nodes/package",
+        OutlineKind::Class => "nodes/class",
+        OutlineKind::Interface => "nodes/interface",
+        OutlineKind::Enum => "nodes/enum",
+        OutlineKind::Function | OutlineKind::Method | OutlineKind::Constructor => "nodes/method",
+        OutlineKind::Field | OutlineKind::Other => "nodes/field",
+        OutlineKind::Constant => "nodes/constant",
+    }
 }
 
 /// A walk through the words of hippie completion: the typed prefix stays, the word that
@@ -885,6 +950,12 @@ pub struct EditorOptions {
     pub markdown_images_from_internet: bool,
     /// Alt+Enter offers Fix with AI on the diagnostic under the caret.
     pub ai_features: bool,
+    /// Long lines break into the rows of the width, as View | Soft-Wrap sets for every
+    /// editor.
+    pub soft_wrap: bool,
+    /// The spaces and tabs of the text show as marks, as View | Show Whitespaces sets
+    /// for every editor.
+    pub show_whitespace: bool,
 }
 
 impl Default for EditorOptions {
@@ -917,6 +988,8 @@ impl Default for EditorOptions {
             render_doc_comments: false,
             markdown_images_from_internet: true,
             ai_features: true,
+            soft_wrap: false,
+            show_whitespace: false,
         }
     }
 }
@@ -944,12 +1017,15 @@ pub struct EditorView {
     pub(crate) quick_serial: u64,
     pub(crate) bar: Option<Bar>,
     pub(crate) last_find: LastFind,
-    column_mode: bool,
     soft_wrap: bool,
+    /// View | Active Editor | Soft-Wrap for this view alone; `None` follows Settings.
+    soft_wrap_override: Option<bool>,
     /// A pane of a comparison keeps its rows on the lines of the other pane, so soft
     /// wrap stays off there.
     wrap_locked: bool,
     show_whitespace: bool,
+    /// View | Active Editor | Show Whitespaces for this view alone; `None` follows Settings.
+    show_whitespace_override: Option<bool>,
     outline: Vec<OutlineItem>,
     /// The declarations whose names start on a line, for the kind of a gutter breakpoint.
     line_declarations: Vec<LineDeclaration>,
@@ -972,6 +1048,8 @@ pub struct EditorView {
     context_info: Option<ContextInfo>,
     /// Ctrl+Alt+.: the regions of the file and the filter over them.
     pub(crate) region_popup: Option<crate::regions::RegionPopup>,
+    /// The list of the neighbours of a crumb, under the crumb that opened it.
+    pub(crate) crumb_menu: Option<CrumbMenu>,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) scroll_top: f32,
     pub(crate) scroll_left: f32,
@@ -1017,6 +1095,9 @@ pub struct EditorView {
     pub(crate) breakpoints: Vec<u32>,
     /// The breakpoints that do not stop the program, painted as a muted point.
     pub(crate) muted_breakpoints: Vec<u32>,
+    /// The breakpoints the window muted: the gutter paints them grey and the program
+    /// does not stop at them.
+    pub(crate) disabled_breakpoints: Vec<u32>,
     /// The breakpoints that go away at the first stop, painted as an outline.
     pub(crate) temporary_breakpoints: Vec<u32>,
     /// Buffer lines of the method breakpoints, painted as a diamond.
@@ -1546,10 +1627,11 @@ impl EditorView {
             quick_serial: 0,
             bar: None,
             last_find: LastFind::default(),
-            column_mode: false,
             soft_wrap: false,
+            soft_wrap_override: None,
             wrap_locked: false,
             show_whitespace: false,
+            show_whitespace_override: None,
             outline: Vec::new(),
             line_declarations: Vec::new(),
             outline_serial: 0,
@@ -1562,6 +1644,7 @@ impl EditorView {
             chords: Vec::new(),
             context_info: None,
             region_popup: None,
+            crumb_menu: None,
             focus_handle: cx.focus_handle(),
             scroll_top: 0.,
             scroll_left: 0.,
@@ -1589,6 +1672,7 @@ impl EditorView {
             coverage: Vec::new(),
             breakpoints: Vec::new(),
             muted_breakpoints: Vec::new(),
+            disabled_breakpoints: Vec::new(),
             temporary_breakpoints: Vec::new(),
             function_breakpoints: Vec::new(),
             field_watchpoints: Vec::new(),
@@ -1681,7 +1765,7 @@ impl EditorView {
         let theme = *cx.global::<Theme>();
         // The find bar stands over the first rows, so a pane beside another one keeps
         // its rows on the same lines while the bar is open.
-        let bar = self.render_bar(cx).map(|bar| {
+        let bar = self.render_bar(window, cx).map(|bar| {
             div()
                 .absolute()
                 .top_0()
@@ -1829,6 +1913,18 @@ impl EditorView {
 
     pub fn muted_breakpoints(&self) -> &[u32] {
         &self.muted_breakpoints
+    }
+
+    /// Replaces the breakpoints the window muted: the gutter paints them grey.
+    pub fn set_disabled_breakpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
+        if self.disabled_breakpoints != lines {
+            self.disabled_breakpoints = lines;
+            cx.notify();
+        }
+    }
+
+    pub fn disabled_breakpoints(&self) -> &[u32] {
+        &self.disabled_breakpoints
     }
 
     /// Replaces the temporary breakpoints in the gutter, the ones an outline marks.
@@ -2122,6 +2218,34 @@ impl EditorView {
     pub fn completion_visible(&self) -> Option<(Vec<String>, Option<String>)> {
         let completion = self.lsp.as_ref()?.completion.as_ref()?;
         Some(completion.visible_labels())
+    }
+
+    /// The documentation of the selected entry of an open completion list, when it has
+    /// arrived. A test reads it; the popup of the third Ctrl+Space uses the same text.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completion_documentation(&self) -> Option<String> {
+        let doc = self.lsp.as_ref()?.completion_doc.as_ref()?;
+        Some(doc.text.clone())
+    }
+
+    /// The label of every row of an open completion list and the letters of it that the
+    /// typed prefix matches. A test reads them; the paint uses the same ranges.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completion_highlighted(&self) -> Option<Vec<(String, Vec<String>)>> {
+        let completion = self.lsp.as_ref()?.completion.as_ref()?;
+        Some(
+            (0..completion.shown.len())
+                .map(|row| {
+                    let parts = completion.label(row);
+                    let matched = completion
+                        .highlights(row, &parts.left)
+                        .into_iter()
+                        .map(|range| parts.left[range].to_owned())
+                        .collect();
+                    (parts.left, matched)
+                })
+                .collect(),
+        )
     }
 
     /// The sections and the labels of an open Alt+Enter list, in the order it shows
@@ -2714,6 +2838,17 @@ impl EditorView {
         let pictures_changed =
             self.options.markdown_images_from_internet != options.markdown_images_from_internet;
         self.options = options;
+        // Settings reach every editor; View | Active Editor holds this one until it closes.
+        if !self.wrap_locked {
+            let soft_wrap = self.soft_wrap_override.unwrap_or(self.options.soft_wrap);
+            if self.soft_wrap != soft_wrap {
+                self.soft_wrap = soft_wrap;
+                self.scroll_left = 0.;
+            }
+        }
+        self.show_whitespace = self
+            .show_whitespace_override
+            .unwrap_or(self.options.show_whitespace);
         if let Some(state) = &mut self.state {
             state.set_save_options(self.options.save);
             if indent_changed {
@@ -3499,6 +3634,34 @@ impl EditorView {
         self.wrap_locked = true;
     }
 
+    /// Lets soft wrap follow the options again after [`Self::lock_soft_wrap`].
+    pub fn unlock_soft_wrap(&mut self) {
+        self.wrap_locked = false;
+        self.soft_wrap = self.soft_wrap_override.unwrap_or(self.options.soft_wrap);
+    }
+
+    /// Collapses the bytes of `range` behind `placeholder`, as a comparison does with the
+    /// lines that did not change. A click on the placeholder shows the lines again.
+    pub fn collapse_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        placeholder: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.state.as_mut() {
+            state.collapse_lines(range, placeholder.into());
+            cx.notify();
+        }
+    }
+
+    /// Shows every folded line again, including the ones a comparison hid.
+    pub fn clear_folds(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.state.as_mut() {
+            state.clear_folds();
+            cx.notify();
+        }
+    }
+
     /// The buffer lines the display has rows for, without the ones a fold hides.
     pub fn shown_lines(&self) -> Vec<usize> {
         self.state.as_ref().map_or_else(Vec::new, |state| {
@@ -3928,6 +4091,10 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
+        if self.crumb_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.bar_active() && self.bar_key(event, cx) {
             cx.stop_propagation();
             return;
@@ -4129,7 +4296,7 @@ impl EditorView {
             }
             actions::NEXT_ERROR => return self.next_error(cx),
             actions::ERROR_DESCRIPTION => return self.error_description(cx),
-            actions::FIND_USAGES_IN_FILE => return self.highlight_usages(cx),
+            actions::FIND_USAGES_IN_FILE => return self.find_usages_in_file(cx),
             actions::NEXT_OCCURRENCE => {
                 if !self.occurrence_step(true, cx) {
                     self.find_step(true, cx);
@@ -4221,6 +4388,7 @@ impl EditorView {
             actions::COPY_REFERENCE => return self.copy_reference(cx),
             actions::SAFE_DELETE => return self.safe_delete(cx),
             actions::UNWRAP => return self.unwrap_remove(cx),
+            actions::COMPLETE_STATEMENT => return self.complete_statement(cx),
             actions::METHOD_HIERARCHY => return self.method_hierarchy(cx),
             actions::SCROLL_TO_CENTER => return self.scroll_to_center(cx),
             actions::MOVE_TO_PAGE_TOP => return self.move_to_page(false, false, cx),
@@ -4281,21 +4449,19 @@ impl EditorView {
                 }
                 return cx.notify();
             }
-            actions::COLUMN_MODE => {
-                self.column_mode = !self.column_mode;
-                return;
-            }
             actions::PASTE_HISTORY => return cx.emit(EditorEvent::PasteHistory),
             actions::PASTE => return self.paste_from_clipboard(cx),
             actions::TOGGLE_SOFT_WRAP => {
                 if !self.wrap_locked {
                     self.soft_wrap = !self.soft_wrap;
+                    self.soft_wrap_override = Some(self.soft_wrap);
                     self.scroll_left = 0.;
                 }
                 return cx.notify();
             }
             actions::TOGGLE_WHITESPACE => {
                 self.show_whitespace = !self.show_whitespace;
+                self.show_whitespace_override = Some(self.show_whitespace);
                 return cx.notify();
             }
             actions::TOGGLE_BOOKMARK => return self.toggle_bookmark(None, cx),
@@ -4319,6 +4485,11 @@ impl EditorView {
             return;
         };
         let change = match action {
+            actions::COLUMN_MODE => {
+                state.toggle_column_mode();
+                cx.notify();
+                return;
+            }
             actions::SAVE => {
                 self.save(cx);
                 cx.emit(EditorEvent::SaveAll);
@@ -4888,7 +5059,7 @@ impl EditorView {
             self.navigate(NavigationKind::Definition, cx);
             return;
         }
-        let block = (modifiers.alt && !modifiers.shift) || self.column_mode;
+        let block = (modifiers.alt && !modifiers.shift) || state.column_mode();
         let add_caret = modifiers.alt;
         let kept = state.carets();
         state.click(
@@ -5265,7 +5436,6 @@ impl EditorView {
             if index > 0 {
                 row = row.child(div().text_color(style.line_number).child("\u{203a}"));
             }
-            let at = item.name_range.start;
             row = row.child(
                 div()
                     .id(("crumb", index))
@@ -5273,10 +5443,269 @@ impl EditorView {
                     .cursor_pointer()
                     .hover(|this| this.text_color(style.code))
                     .child(SharedString::from(item.name.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.go_to(Spot::Offset(at), cx))),
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        // The list filters with the keys, so the click makes sure that
+                        // they reach this view.
+                        window.focus(&this.focus_handle, cx);
+                        this.open_crumb_menu(index, event.position(), cx);
+                    })),
             );
         }
         Some(row)
+    }
+
+    /// The declarations of the level of the crumb at `level`: the members of the
+    /// declaration above it, or the outermost declarations of the file.
+    fn crumb_members(&self, level: usize) -> Vec<OutlineItem> {
+        let around: Vec<(u32, std::ops::Range<usize>)> = self
+            .enclosing()
+            .into_iter()
+            .map(|item| (item.depth, item.range.clone()))
+            .collect();
+        let (depth, parent) = match level.checked_sub(1).and_then(|at| around.get(at)) {
+            Some((depth, range)) => (depth + 1, Some(range.clone())),
+            None => (0, None),
+        };
+        self.outline
+            .iter()
+            .filter(|item| item.depth == depth)
+            .filter(|item| {
+                parent.as_ref().is_none_or(|parent| {
+                    parent.start <= item.range.start && item.range.end <= parent.end
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The rows of the open crumb list after the typed filter, if the list is open.
+    fn crumb_rows(&self) -> Vec<OutlineItem> {
+        let Some(menu) = &self.crumb_menu else {
+            return Vec::new();
+        };
+        let needle = menu.filter.text.to_lowercase();
+        self.crumb_members(menu.level)
+            .into_iter()
+            .filter(|item| needle.is_empty() || item.name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Opens the list of the neighbours of the crumb at `level` under the pointer. The
+    /// current declaration of that level starts selected.
+    fn open_crumb_menu(&mut self, level: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let members = self.crumb_members(level);
+        if members.is_empty() {
+            return;
+        }
+        let current = self
+            .enclosing()
+            .get(level)
+            .map(|item| item.name_range.start);
+        let selected = current
+            .and_then(|at| members.iter().position(|item| item.name_range.start == at))
+            .unwrap_or(0);
+        self.crumb_menu = Some(CrumbMenu {
+            level,
+            position,
+            filter: TextField::default(),
+            selected,
+            scroll: ScrollHandle::new(),
+        });
+        cx.notify();
+    }
+
+    /// The row of the open crumb list that the pointer or the keys pick becomes the caret.
+    fn open_crumb_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        let rows = self.crumb_rows();
+        let Some(item) = rows.get(index) else {
+            return;
+        };
+        let at = item.name_range.start;
+        self.crumb_menu = None;
+        self.go_to(Spot::Offset(at), cx);
+    }
+
+    /// The keys of the open crumb list: Escape closes it, the arrows move the selection,
+    /// Enter goes to the row and typing narrows the list. Returns whether the key
+    /// belonged to the list.
+    fn crumb_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.crumb_menu.is_none() {
+            return false;
+        }
+        let stroke = &event.keystroke;
+        if stroke.modifiers.control || stroke.modifiers.alt {
+            return false;
+        }
+        match stroke.key.as_str() {
+            "escape" => self.crumb_menu = None,
+            "enter" => {
+                let selected = self.crumb_menu.as_ref().map_or(0, |menu| menu.selected);
+                self.open_crumb_row(selected, cx);
+                cx.stop_propagation();
+                return true;
+            }
+            "up" | "down" => {
+                let count = self.crumb_rows().len();
+                if let Some(menu) = &mut self.crumb_menu
+                    && count > 0
+                {
+                    let step = if stroke.key == "up" { -1 } else { 1 };
+                    menu.selected =
+                        (menu.selected as isize + step).clamp(0, count as isize - 1) as usize;
+                }
+            }
+            _ => {
+                let Some(menu) = &mut self.crumb_menu else {
+                    return false;
+                };
+                if !menu.filter.key_with_clipboard(event, false, cx) {
+                    return false;
+                }
+                menu.selected = 0;
+            }
+        }
+        if let Some(menu) = &mut self.crumb_menu {
+            menu.scroll.scroll_to_item(menu.selected);
+        }
+        cx.notify();
+        true
+    }
+
+    /// The list of the open crumb: its filter and the neighbours it found.
+    fn render_crumb_menu(
+        &self,
+        menu: &CrumbMenu,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows: Vec<AnyElement> = self
+            .crumb_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let selected = index == menu.selected;
+                let name = item.name.clone();
+                let detail = item
+                    .signature
+                    .as_deref()
+                    .map(|signature| {
+                        signature
+                            .strip_prefix(item.name.as_str())
+                            .unwrap_or(signature)
+                            .to_owned()
+                    })
+                    .unwrap_or_default();
+                let icon = crumb_icon(item.kind);
+                let hover = theme.selection_hover;
+                div()
+                    .id(("crumb-row", index))
+                    .debug_selector(move || format!("crumb-row-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .flex_none()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .rounded(px(ROW_RADIUS))
+                    .when(selected, |this| this.bg(theme.selection))
+                    .when(!selected, |this| this.hover(move |style| style.bg(hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_crumb_row(index, cx)))
+                    .child(icon_sized(icon, 14., theme))
+                    .child(name)
+                    .when(!detail.is_empty(), |this| {
+                        this.child(div().text_color(theme.text_secondary).child(detail))
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        let filter = div()
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(px(SPACE_XS))
+            .h(px(ROW_HEIGHT))
+            .px(px(ROW_PADDING_X))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(icon_sized("general/filter", 14., theme))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .when(menu.filter.text.is_empty(), |this| {
+                        this.text_color(theme.text_secondary).child("Filter")
+                    })
+                    .children(text_field_children(
+                        &menu.filter,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        14.,
+                        true,
+                    )),
+            );
+        let list = scrollable(
+            "crumb-list",
+            &menu.scroll,
+            div()
+                .id("crumb-list")
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(&menu.scroll)
+                .children(rows),
+            theme,
+            window,
+            cx,
+        );
+        let body = surface(theme)
+            .id("crumb-menu")
+            .debug_selector(|| "crumb-menu".to_owned())
+            .occlude()
+            .min_w(px(240.))
+            .max_w(px(420.))
+            .max_h(px(320.))
+            .py(px(SPACE_XS))
+            .text_size(px(UI_SIZE))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.crumb_menu.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .child(filter)
+            .child(list);
+        deferred(
+            anchored()
+                .position(menu.position)
+                .snap_to_window_with_margin(px(SPACE_M))
+                .child(body),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
+    /// The rows of the open crumb list, for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn crumb_menu_rows(&self) -> Vec<String> {
+        self.crumb_rows()
+            .into_iter()
+            .map(|item| item.name)
+            .collect()
+    }
+
+    /// The row of the open crumb list that the keys act on, for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn crumb_menu_selected(&self) -> Option<String> {
+        let menu = self.crumb_menu.as_ref()?;
+        self.crumb_rows()
+            .get(menu.selected)
+            .map(|item| item.name.clone())
     }
 }
 
@@ -5510,6 +5939,9 @@ impl EditorView {
                 .into_any_element(),
             );
         }
+        if let Some(menu) = &self.crumb_menu {
+            popups.push(self.render_crumb_menu(menu, &theme, window, cx));
+        }
         let Some(lsp) = &self.lsp else {
             return popups;
         };
@@ -5525,22 +5957,36 @@ impl EditorView {
                     let parts = completion.label(row);
                     let kind = completion.kind(row);
                     let selected = row == completion.selected;
-                    let left = if parts.deprecated {
-                        let len = parts.left.len();
-                        StyledText::new(parts.left)
-                            .with_highlights([(
-                                0..len,
-                                HighlightStyle {
-                                    strikethrough: Some(StrikethroughStyle {
-                                        thickness: px(1.),
-                                        color: None,
-                                    }),
-                                    ..HighlightStyle::default()
-                                },
-                            )])
-                            .into_any_element()
-                    } else {
+                    let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+                    if parts.deprecated {
+                        highlights.push((
+                            0..parts.left.len(),
+                            HighlightStyle {
+                                strikethrough: Some(StrikethroughStyle {
+                                    thickness: px(1.),
+                                    color: None,
+                                }),
+                                ..HighlightStyle::default()
+                            },
+                        ));
+                    }
+                    // The letters the typed prefix matches, as the list itself matched
+                    // them: a run of the name, its humps or the letters of a typo.
+                    for range in completion.highlights(row, &parts.left) {
+                        highlights.push((
+                            range,
+                            HighlightStyle {
+                                color: Some(theme.accent),
+                                ..HighlightStyle::default()
+                            },
+                        ));
+                    }
+                    let left = if highlights.is_empty() {
                         parts.left.into_any_element()
+                    } else {
+                        StyledText::new(parts.left)
+                            .with_highlights(highlights)
+                            .into_any_element()
                     };
                     div()
                         .id(("completion-row", row))
@@ -5770,6 +6216,7 @@ impl EditorView {
             for row in menu.window() {
                 let selected = row == menu.selected;
                 let quick_fix = menu.quick_fix(row);
+                let nested = menu.nested(row);
                 if sections && row > 0 && quick_fix != menu.quick_fix(row - 1) {
                     rows.push(
                         div()
@@ -5794,6 +6241,7 @@ impl EditorView {
                     .items_center()
                     .gap(px(SPACE_S))
                     .when(selected, |row| row.bg(theme.selection))
+                    .when(nested, |row| row.pl(px(SPACE_L)))
                     .text_color(theme.text);
                 if sections {
                     item = item.child(icon_sized(
@@ -6422,7 +6870,7 @@ impl Render for EditorView {
         match &self.failed {
             Some(message) => root.p_4().child(message.clone()),
             None => {
-                let bar = self.render_bar(cx);
+                let bar = self.render_bar(window, cx);
                 let toolbar = self.preview_toolbar(cx);
                 let bundle_toolbar = self.bundle_toolbar(cx);
                 let bundle = self.bundle_area(window, cx);

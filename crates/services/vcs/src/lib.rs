@@ -35,8 +35,8 @@ pub use merge::{Segment, SegmentKind, ThreeWay, merge};
 pub use rebase::{RebaseAction, RebasePlan, RebaseReport, RebaseStep};
 pub use repo::{
     Branch, Commit, CommitDetails, CommitOptions, CommitRequest, Compare, ConflictSide,
-    ConflictVersions, FileDiff, Operation, RefKind, RefLabel, Repository, ResetMode, Stash,
-    UpdateMode, UpdateReport,
+    ConflictVersions, FileDiff, Operation, PartialFile, PushRequest, RefKind, RefLabel, Repository,
+    ResetMode, Stash, UpdateMode, UpdateReport,
 };
 pub use shelve::{ShelfDiff, patch_files, patched_text};
 pub use status::{Change, FileStatus, Status, parse_status};

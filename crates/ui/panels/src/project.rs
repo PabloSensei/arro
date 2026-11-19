@@ -18,8 +18,8 @@ use workspace::{
 use crate::file_tree::{Child, FileTree, read_folder};
 use crate::prompt::Prompt;
 use crate::tree_ops::{
-    Creation, FileTemplate, create_on_disk, delete_on_disk, plan_creation_with_template, plan_move,
-    plan_paste, rename_on_disk, renamed, target_folder,
+    Creation, FileTemplate, create_on_disk, delete_on_disk, plan_creation_with_template,
+    plan_drop_copy, plan_move, plan_paste, rename_on_disk, renamed, target_folder,
 };
 
 actions!(
@@ -75,11 +75,14 @@ struct DraggedTree {
 struct TreeDragPreview(SharedString);
 
 impl Render for TreeDragPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        // Ctrl copies instead of moving: the plus shows it while the key is held.
+        let copy = window.modifiers().control;
         div()
             .flex()
             .items_center()
+            .gap(px(SPACE_XS))
             .h(px(24.))
             .px(px(8.))
             .rounded(px(4.))
@@ -87,8 +90,15 @@ impl Render for TreeDragPreview {
             .border_color(theme.tab_selected_border)
             .bg(theme.tab_selected)
             .text_color(theme.text)
+            .when(copy, |this| this.child("+"))
             .child(self.0.clone())
     }
+}
+
+/// Whether the tree shows a chain of folders that have one subfolder each as one row.
+fn compact_middle_packages(cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_none_or(|settings| settings.project_compact_middle_packages)
 }
 
 /// The tree keys and, from the same rows, the table the keymap check reads.
@@ -305,6 +315,9 @@ pub struct ProjectPanel {
     listings: u64,
     /// The migrations of the project, which the tree shows under their own node.
     migrations: MigrationModel,
+    /// Whether the tree watches the run panel, which holds the project model with the
+    /// source roots. The run panel is built after the tree, so it is watched later.
+    runs_watched: bool,
 }
 
 impl ProjectPanel {
@@ -320,6 +333,7 @@ impl ProjectPanel {
             workspace.root().to_path_buf(),
             layout.tree_expanded.iter().cloned(),
         );
+        tree.set_compact(compact_middle_packages(cx));
         // Scratches live outside the project but show up in its tree.
         let scratches = workspace.state_dir().join("scratches");
         tree.add_virtual_child(
@@ -358,7 +372,15 @@ impl ProjectPanel {
                 search_at: None,
                 listings: 0,
                 migrations: MigrationModel::default(),
+                runs_watched: false,
             };
+            // The switch of Compact Middle Packages may also be flipped in the settings.
+            cx.observe_global::<Settings>(|this: &mut Self, cx| {
+                if this.apply_compact(cx) {
+                    cx.notify();
+                }
+            })
+            .detach();
             panel.read_pending(cx);
             panel.load_migrations(cx);
             panel
@@ -719,11 +741,7 @@ impl ProjectPanel {
 
     /// Reads the open folders again: files came and went behind the back of the tree.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let rows = self.tree.rows().iter().filter(|row| row.open);
-        let open: Vec<PathBuf> = rows
-            .map(|row| row.path.clone())
-            .filter(|path| !self.tree.is_virtual_folder(path))
-            .collect();
+        let open: Vec<PathBuf> = self.tree.listed_folders();
         for folder in open {
             let path = folder.clone();
             let read = cx
@@ -756,7 +774,9 @@ impl ProjectPanel {
                     self.select(index, cx);
                 }
             }
-            Err(error) => {
+            // A folder read only for the rows of a compacted chain is not open, so its
+            // failure is not reported.
+            Err(error) if self.tree.is_expanded(&folder) => {
                 let text = format!("{}: {error}", folder.display());
                 self.workspace
                     .update(cx, |workspace, cx| {
@@ -764,6 +784,7 @@ impl ProjectPanel {
                     })
                     .ok();
             }
+            Err(_) => {}
         }
         cx.notify();
     }
@@ -987,43 +1008,7 @@ impl ProjectPanel {
             && !(cut && source.parent() == Some(target.as_path()))
             && let Some(stem) = self.class_stem(source, cx)
         {
-            let default_name = crate::copy_class::default_name(&target, &stem, source.extension());
-            let panel = cx.weak_entity();
-            let handle = window.window_handle();
-            let subject = source.clone();
-            let submit = move |name: String, folder: PathBuf, cx: &mut App| {
-                let (source, panel) = (subject.clone(), panel.clone());
-                cx.defer(move |cx| {
-                    let run = move |_: AnyView, window: &mut Window, cx: &mut App| {
-                        panel
-                            .update(cx, |this, cx| {
-                                this.copy_class_done(
-                                    source.clone(),
-                                    name.clone(),
-                                    folder.clone(),
-                                    cut,
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .ok();
-                    };
-                    handle.update(cx, run).ok();
-                });
-            };
-            let show = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
-                crate::copy_class::CopyClassDialog::show(
-                    source,
-                    &target,
-                    &default_name,
-                    cut,
-                    submit,
-                    workspace,
-                    window,
-                    cx,
-                );
-            };
-            self.workspace.update(cx, show).ok();
+            self.ask_copy_class(source.clone(), target.clone(), stem, cut, window, cx);
             return;
         }
         // A cut beside the source does nothing: the clipboard is kept as it is.
@@ -1375,20 +1360,123 @@ impl ProjectPanel {
     fn show_view_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let panel = cx.weak_entity();
         let on = self.always_select_opened_file(cx);
+        let always_panel = panel.clone();
         let always_select = MenuEntry::new(
             checked_label("Always Select Opened File", on),
             move |window, cx| {
                 let toggle = |this: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
                     this.toggle_always_select(cx)
                 };
+                Self::later(window, always_panel.clone(), cx, toggle);
+            },
+        );
+        let compact = MenuEntry::new(
+            checked_label("Compact Middle Packages", compact_middle_packages(cx)),
+            move |window, cx| {
+                let toggle = |this: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
+                    this.toggle_compact(cx)
+                };
                 Self::later(window, panel.clone(), cx, toggle);
             },
         );
+        let appearance = MenuEntry::submenu("Tree Appearance", vec![compact]);
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_menu(position, vec![always_select], cx)
+                workspace.show_menu(position, vec![always_select, appearance], cx)
             })
             .ok();
+    }
+
+    /// Compact Middle Packages: the switch is a setting, and the settings file keeps it.
+    fn toggle_compact(&mut self, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.update_settings(
+                    |settings| {
+                        settings.project_compact_middle_packages =
+                            !settings.project_compact_middle_packages;
+                    },
+                    cx,
+                )
+            })
+            .ok();
+        self.apply_compact(cx);
+        cx.notify();
+    }
+
+    /// Brings the rows in line with the Compact Middle Packages setting. A selected folder
+    /// that is now one of the folders of a chain selects the row that holds it. Returns
+    /// whether the rows changed.
+    fn apply_compact(&mut self, cx: &mut Context<Self>) -> bool {
+        let on = compact_middle_packages(cx);
+        if self.tree.compact() == on {
+            return false;
+        }
+        self.tree.set_compact(on);
+        let mut selection: Vec<PathBuf> = Vec::new();
+        for path in &self.selection {
+            let shown = match self.tree.index_of(path) {
+                Some(index) => self.tree.rows()[index].path.clone(),
+                None => path.clone(),
+            };
+            if !selection.contains(&shown) {
+                selection.push(shown);
+            }
+        }
+        self.selection = selection;
+        self.anchor = self.selected_index();
+        self.read_pending(cx);
+        true
+    }
+
+    /// Takes the source roots from the project model of the run panel, which names
+    /// the packages of the tree. Without a model the roots stay as they are. Returns whether
+    /// they changed.
+    fn sync_source_roots(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.runs_watched
+            && let Some(runs) = cx
+                .try_global::<crate::script::ActiveRunPanel>()
+                .map(|active| active.0.clone())
+        {
+            cx.observe(&runs, |this, _, cx| {
+                if this.sync_source_roots(cx) {
+                    cx.notify();
+                }
+            })
+            .detach();
+            self.runs_watched = true;
+        }
+        let model = cx
+            .try_global::<crate::script::ActiveRunPanel>()
+            .map(|active| active.0.clone())
+            .and_then(|runs| runs.read(cx).model());
+        let Some(model) = model else {
+            return false;
+        };
+        let roots: Vec<PathBuf> = model
+            .modules
+            .iter()
+            .flat_map(|module| module.units.iter())
+            .flat_map(|unit| unit.source_roots.iter().cloned())
+            .collect();
+        let changed = self.tree.set_source_roots(roots);
+        if changed {
+            self.read_pending(cx);
+        }
+        changed
+    }
+
+    /// Sets the source roots for a test, which has no project model to read them from.
+    #[cfg(test)]
+    pub(crate) fn set_source_roots_for_test(
+        &mut self,
+        roots: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tree.set_source_roots(roots) {
+            self.read_pending(cx);
+        }
+        cx.notify();
     }
 
     /// Always Select Opened File: the switch is a setting, and the settings file keeps it.
@@ -1677,6 +1765,9 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A row is a drop target too: a small drag that ends on the row it started from is
+        // not a copy.
+        let onto_itself = target == dragged.path;
         let target_folder = if target_is_folder {
             target
         } else {
@@ -1684,6 +1775,14 @@ impl ProjectPanel {
                 .parent()
                 .map_or_else(|| self.root_path(), Path::to_path_buf)
         };
+        // Ctrl held at the drop copies the item. The modifiers of the window are those of the
+        // mouse-up that ends the drag.
+        if window.modifiers().control {
+            if onto_itself {
+                return;
+            }
+            return self.copy_dropped(dragged.path, dragged.folder, target_folder, window, cx);
+        }
         let to = match plan_move(&dragged.path, &target_folder, dragged.folder) {
             Ok(Some(to)) => to,
             Ok(None) => return,
@@ -1694,6 +1793,92 @@ impl ProjectPanel {
         } else {
             self.move_file(dragged.path, to, window, cx);
         }
+    }
+
+    /// Ctrl+drop: the item is copied into the folder. A language file goes through the Copy
+    /// Class window, as F5 does. Any other item keeps its name, or takes `name (1)` when that
+    /// name is taken there. The disk is read and written in the background.
+    fn copy_dropped(
+        &mut self,
+        from: PathBuf,
+        folder: bool,
+        target_folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !folder
+            && from.is_file()
+            && let Some(stem) = self.class_stem(&from, cx)
+        {
+            return self.ask_copy_class(from, target_folder, stem, false, window, cx);
+        }
+        let task = cx.background_executor().spawn(async move {
+            let to = plan_drop_copy(&from, &target_folder, folder)?;
+            copy_path(&from, &to).map_err(|error| error.to_string())?;
+            Ok::<PathBuf, String>(to)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, _, cx| match result {
+                Ok(to) => {
+                    this.select_path(&to, cx);
+                    this.reload(cx);
+                }
+                Err(error) => this.report("Cannot copy", error, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The Copy Class window for a language file: the name and the folder come from the
+    /// window, and `cut` says whether the file moves rather than copies.
+    fn ask_copy_class(
+        &mut self,
+        source: PathBuf,
+        target: PathBuf,
+        stem: String,
+        cut: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let default_name = crate::copy_class::default_name(&target, &stem, source.extension());
+        let panel = cx.weak_entity();
+        let handle = window.window_handle();
+        let subject = source.clone();
+        let submit = move |name: String, folder: PathBuf, cx: &mut App| {
+            let (source, panel) = (subject.clone(), panel.clone());
+            cx.defer(move |cx| {
+                let run = move |_: AnyView, window: &mut Window, cx: &mut App| {
+                    panel
+                        .update(cx, |this, cx| {
+                            this.copy_class_done(
+                                source.clone(),
+                                name.clone(),
+                                folder.clone(),
+                                cut,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                };
+                handle.update(cx, run).ok();
+            });
+        };
+        let show = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
+            crate::copy_class::CopyClassDialog::show(
+                &source,
+                &target,
+                &default_name,
+                cut,
+                submit,
+                workspace,
+                window,
+                cx,
+            );
+        };
+        self.workspace.update(cx, show).ok();
     }
 
     /// A file dropped into another folder: the language moves the class and updates the
@@ -2474,6 +2659,9 @@ impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         workspace::note_view_render(cx, "project");
+        // The rows follow the settings and the project model before they are drawn.
+        self.apply_compact(cx);
+        self.sync_source_roots(cx);
         let theme = *cx.global::<Theme>();
         let count = self.tree.rows().len();
         island(&theme)

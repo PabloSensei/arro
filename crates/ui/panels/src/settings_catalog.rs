@@ -305,6 +305,8 @@ pub enum SettingField {
     SqlScriptStopOnError,
     /// Whether Ask AI, Fix with AI and Explain with AI are offered.
     AiEnabled,
+    /// Whether the project tree shows chains of folders with one subfolder each as one row.
+    ProjectCompactMiddlePackages,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -1081,6 +1083,14 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::AiEnabled,
         keywords: "ai assistant ask fix explain agent features",
     },
+    Setting {
+        id: "project_compact_middle_packages",
+        title: "Compact Middle Packages",
+        page: SettingsPage::Project,
+        kind: SettingKind::Toggle,
+        field: SettingField::ProjectCompactMiddlePackages,
+        keywords: "project tree compact middle packages folders chain one subfolder package name dots",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1194,6 +1204,9 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::BuildToolFirstTerminalPath => Some(settings.build_tools.first.terminal_path),
         SettingField::McpEnabled => Some(settings.mcp_enabled),
         SettingField::AiEnabled => Some(settings.ai_enabled),
+        SettingField::ProjectCompactMiddlePackages => {
+            Some(settings.project_compact_middle_packages)
+        }
         SettingField::BuildToolSecondTerminalPath => {
             Some(settings.build_tools.second.terminal_path)
         }
@@ -1353,6 +1366,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             settings.sql_script_stop_on_error = !settings.sql_script_stop_on_error;
         }
         Some(SettingField::AiEnabled) => settings.ai_enabled = !settings.ai_enabled,
+        Some(SettingField::ProjectCompactMiddlePackages) => {
+            settings.project_compact_middle_packages = !settings.project_compact_middle_packages;
+        }
         Some(SettingField::BuildToolSecondTerminalPath) => {
             settings.build_tools.second.terminal_path = !settings.build_tools.second.terminal_path;
         }

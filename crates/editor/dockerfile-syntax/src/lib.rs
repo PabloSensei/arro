@@ -16,6 +16,7 @@ pub fn config() -> LanguageConfig {
         line_comment: Some("#"),
         block_comment: None,
         statements: None,
+        move_units: "",
         indent_unit: "    ",
         file_mask: "Dockerfile",
         injections: Vec::new(),

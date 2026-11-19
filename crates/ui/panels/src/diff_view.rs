@@ -3,25 +3,39 @@
 //! strip between the panes that takes one hunk back. Unified is the other layout: one
 //! list of lines with the same hunk actions.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use editor_view::{EditorEvent, EditorOptions, EditorStyle, EditorView, PaneDecor};
+use editor_view::{
+    EditorEvent, EditorOptions, EditorStyle, EditorView, GutterKind, GutterMark, PaneDecor,
+};
 use text_core::FileFormat;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::{Hunk, TextEdit};
-use workspace::{Settings, Workspace};
+use workspace::{DiffHighlighting, DiffWhitespace, Settings, Workspace};
 
+use crate::commit::CommitDraft;
 use crate::editor_tab::{options_of, style_of};
 use crate::git::{GitState, Kind, relative_of};
 
 const WIDTH: f32 = 1180.;
-const CONTEXT_LINES: usize = 2;
 const LINE_HEIGHT: f32 = 20.;
-const STRIP_WIDTH: f32 = 68.;
+const STRIP_WIDTH: f32 = 96.;
 const CONTEXT: &str = "DiffView";
+/// The widths of the menu of the gear and of the list of files.
+const MENU_WIDTH: f32 = 300.;
+const MENU_ROW_HEIGHT: f32 = 24.;
+/// The unchanged lines the diff keeps around a change when the setting is not there.
+const CONTEXT_LINES: usize = 3;
+/// The values of Context lines the gear offers.
+const CONTEXT_CHOICES: [u32; 5] = [1, 2, 3, 5, 10];
+/// Numbers the tabs of diffs, so that a new diff opens in a tab of its own.
+static NEXT_DIFF_TAB: AtomicU64 = AtomicU64::new(0);
+
 /// The keys of the popup while one of its editors has the focus. The editor is deeper
 /// than the popup in the key contexts, so the keys of the diff win over the keys of the
 /// window there.
@@ -36,7 +50,11 @@ actions!(
         PreviousChange,
         ApplyLeftSide,
         ApplyRightSide,
-        FocusOppositePane
+        FocusOppositePane,
+        JumpToSource,
+        NextFile,
+        PreviousFile,
+        ToggleCollapse
     ]
 );
 
@@ -84,6 +102,9 @@ macro_rules! diff_keys {
 diff_keys![
     ("f7", NextDiff, Some("NextDiff"), None),
     ("shift-f7", PreviousDiff, Some("PreviousDiff"), None),
+    ("f4", JumpToSource, Some("EditSource"), None),
+    ("alt-right", NextFile, Some("NextTab"), None),
+    ("alt-left", PreviousFile, Some("PreviousTab"), None),
     ("alt-shift-right", NextChange, Some("Diff.NextChange"), None),
     (
         "alt-shift-left",
@@ -128,6 +149,40 @@ enum EditorSide {
     Tab,
 }
 
+/// The list the gear or the counter of files opened, drawn inside the diff so that it
+/// does not replace the diff popup with a popup of the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Menu {
+    Settings,
+    Files,
+}
+
+/// One row of a menu of the diff: a section name that takes no click, or a row.
+enum MenuLine {
+    Section(&'static str),
+    Row(MenuRow),
+}
+
+struct MenuRow {
+    label: String,
+    /// The name the tests find the row by.
+    id: String,
+    checked: bool,
+    action: MenuAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuAction {
+    Whitespace(DiffWhitespace),
+    Highlighting(DiffHighlighting),
+    ToggleSynchronize,
+    ToggleLineNumbers,
+    ToggleWrap,
+    Context(u32),
+    OpenInTab,
+    SelectFile(usize),
+}
+
 pub struct DiffView {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
@@ -163,6 +218,26 @@ pub struct DiffView {
     right: Entity<EditorView>,
     /// Side by side when the setting says so, one list otherwise.
     side_by_side: bool,
+    /// What the comparison leaves out of two lines.
+    whitespace: DiffWhitespace,
+    /// What the diff marks inside the lines.
+    highlighting: DiffHighlighting,
+    /// A scroll of one pane moves the other one.
+    synchronize: bool,
+    /// The numbers of the lines show in the gutter of the panes.
+    show_line_numbers: bool,
+    /// Long lines wrap at the edge of the panes.
+    soft_wrap: bool,
+    /// The unchanged lines the diff keeps in sight around a change.
+    context_lines: usize,
+    /// The unchanged lines between changes are folded away.
+    collapse: bool,
+    /// The unchanged gaps a click opened, by the row they start at.
+    expanded: HashSet<usize>,
+    /// The open menu of the gear or of the counter of files.
+    menu: Option<Menu>,
+    /// The diff fills an editor tab rather than a popup over the window.
+    tabbed: bool,
     /// The pane the keys work in.
     pane: Pane,
     /// Tells a late diff answer which edit it belongs to.
@@ -174,6 +249,9 @@ pub struct DiffView {
     subscriptions: Vec<Subscription>,
     /// The notify of the window, for a tab that opens or closes under the diff.
     _workspace: Option<Subscription>,
+    /// The draft of a commit this diff belongs to: every hunk of the working tree has a
+    /// tick that decides whether it goes into the commit.
+    commit: Option<Entity<CommitDraft>>,
 }
 
 /// What the diff is taken from: the working tree, one commit, or the clipboard.
@@ -194,6 +272,7 @@ enum Source {
 
 /// What the file is now and what the last commit has, with `\n` line ends, and the hunks
 /// between them.
+#[derive(Clone)]
 struct Changes {
     current: String,
     base: String,
@@ -217,6 +296,7 @@ impl Changes {
 
 /// One line of one pane: its own number, the text and the words that differ from the
 /// line on the other side.
+#[derive(Clone)]
 pub(crate) struct DiffLine {
     number: usize,
     text: String,
@@ -225,6 +305,7 @@ pub(crate) struct DiffLine {
 
 /// One row of the side-by-side view. A line missing on a side means that side has no
 /// text there, so both sides stay on the same height and the hunks line up.
+#[derive(Clone)]
 pub(crate) struct DiffRow {
     left: Option<DiffLine>,
     right: Option<DiffLine>,
@@ -313,6 +394,123 @@ fn hunk_kind(hunk: &Hunk) -> Kind {
     }
 }
 
+/// One line as the comparison sees it under the whitespace setting.
+fn compared_line(mode: DiffWhitespace, line: &str) -> String {
+    match mode {
+        DiffWhitespace::DoNotIgnore => line.to_owned(),
+        DiffWhitespace::Trim => line.trim().to_owned(),
+        DiffWhitespace::Ignore | DiffWhitespace::IgnoreAndEmptyLines => line
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect(),
+    }
+}
+
+/// The text as the comparison sees it. Every line keeps its place, so a hunk counted on
+/// this text points at the same lines of the text the panes show.
+fn compared_text(mode: DiffWhitespace, text: &str) -> String {
+    text.split('\n')
+        .map(|line| compared_line(mode, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn blank(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+/// The name the tests find a whitespace choice by.
+fn mode_name(mode: DiffWhitespace) -> &'static str {
+    match mode {
+        DiffWhitespace::DoNotIgnore => "do-not-ignore",
+        DiffWhitespace::Trim => "trim",
+        DiffWhitespace::Ignore => "ignore",
+        DiffWhitespace::IgnoreAndEmptyLines => "ignore-empty",
+    }
+}
+
+/// The name the tests find a highlighting choice by.
+fn mode_name_highlight(highlighting: DiffHighlighting) -> &'static str {
+    match highlighting {
+        DiffHighlighting::ByLine => "by-line",
+        DiffHighlighting::ByWord => "by-word",
+        DiffHighlighting::SplitChanges => "split-changes",
+        DiffHighlighting::ByCharacter => "by-character",
+        DiffHighlighting::None => "none",
+    }
+}
+
+/// The hunks of two texts under the whitespace setting: lines that differ only in their
+/// whitespace do not count, and with the last choice neither does a line of nothing but
+/// whitespace.
+pub(crate) fn hunks_with(mode: DiffWhitespace, base: &str, current: &str) -> Vec<Hunk> {
+    if mode == DiffWhitespace::DoNotIgnore {
+        return vcs::line_hunks(base, current);
+    }
+    let base_seen = compared_text(mode, base);
+    let current_seen = compared_text(mode, current);
+    let mut hunks = vcs::line_hunks(&base_seen, &current_seen);
+    if mode == DiffWhitespace::IgnoreAndEmptyLines {
+        let before: Vec<&str> = base.split('\n').collect();
+        let after: Vec<&str> = current.split('\n').collect();
+        hunks.retain(|hunk| {
+            let before_blank = before[hunk.before.start as usize..hunk.before.end as usize]
+                .iter()
+                .all(|line| blank(line));
+            let after_blank = after[hunk.after.start as usize..hunk.after.end as usize]
+                .iter()
+                .all(|line| blank(line));
+            !(before_blank && after_blank)
+        });
+    }
+    hunks
+}
+
+/// The characters that differ between two lines, for the character marks of a changed
+/// line: the common start and the common end stay plain.
+pub(crate) fn character_changes(before: &str, after: &str) -> vcs::WordChanges {
+    let left: Vec<(usize, char)> = before.char_indices().collect();
+    let right: Vec<(usize, char)> = after.char_indices().collect();
+    let mut shared_start = 0;
+    while shared_start < left.len()
+        && shared_start < right.len()
+        && left[shared_start].1 == right[shared_start].1
+    {
+        shared_start += 1;
+    }
+    let mut shared_end = 0;
+    while shared_end < left.len() - shared_start
+        && shared_end < right.len() - shared_start
+        && left[left.len() - 1 - shared_end].1 == right[right.len() - 1 - shared_end].1
+    {
+        shared_end += 1;
+    }
+    let byte = |chars: &[(usize, char)], at: usize| {
+        chars.get(at).map_or_else(
+            || {
+                chars
+                    .last()
+                    .map_or(0, |(index, character)| index + character.len_utf8())
+            },
+            |(index, _)| *index,
+        )
+    };
+    let before_start = byte(&left, shared_start);
+    let before_end = byte(&left, left.len() - shared_end);
+    let after_start = byte(&right, shared_start);
+    let after_end = byte(&right, right.len() - shared_end);
+    vcs::WordChanges {
+        before: (before_start < before_end)
+            .then_some(before_start..before_end)
+            .into_iter()
+            .collect(),
+        after: (after_start < after_end)
+            .then_some(after_start..after_end)
+            .into_iter()
+            .collect(),
+    }
+}
+
 fn line_tint(kind: Option<Kind>, right: bool, theme: &Theme) -> Option<Hsla> {
     match kind? {
         Kind::Added if !right => None,
@@ -334,6 +532,16 @@ fn word_tint(kind: Option<Kind>, right: bool, theme: &Theme) -> Option<Hsla> {
 /// The rows of the side-by-side view: the whole file on both sides, with the lines of
 /// one hunk facing each other and blank lines where a side has none.
 pub(crate) fn rows_of(base: &str, current: &str, hunks: &[Hunk]) -> Vec<DiffRow> {
+    rows_of_with(base, current, hunks, DiffHighlighting::ByWord)
+}
+
+/// The same rows with the marks the highlighting setting asks for.
+pub(crate) fn rows_of_with(
+    base: &str,
+    current: &str,
+    hunks: &[Hunk],
+    highlighting: DiffHighlighting,
+) -> Vec<DiffRow> {
     let before = lines_of(base);
     let after = lines_of(current);
     let line = |number: usize, text: &str| DiffLine {
@@ -392,7 +600,15 @@ pub(crate) fn rows_of(base: &str, current: &str, hunks: &[Hunk]) -> Vec<DiffRow>
                 && let (Some(left), Some(right)) = (&mut left, &mut right)
                 && !same
             {
-                let changes = vcs::word_changes(&left.text, &right.text);
+                let changes = match highlighting {
+                    DiffHighlighting::ByWord | DiffHighlighting::SplitChanges => {
+                        vcs::word_changes(&left.text, &right.text)
+                    }
+                    DiffHighlighting::ByCharacter => character_changes(&left.text, &right.text),
+                    DiffHighlighting::ByLine | DiffHighlighting::None => {
+                        vcs::WordChanges::default()
+                    }
+                };
                 left.words = changes.before;
                 right.words = changes.after;
             }
@@ -580,6 +796,44 @@ pub(crate) fn hunk_row_spans(rows: &[DiffRow], hunks: usize) -> Vec<Option<(usiz
         .collect()
 }
 
+/// One line of the unified list, or the unchanged lines a gap hides.
+pub(crate) enum UnifiedItem {
+    Row(DiffRow),
+    Gap { at: usize, count: usize },
+}
+
+/// Folds the unchanged lines of `rows` away on one side, behind a placeholder that a
+/// click opens again.
+fn collapse_side(
+    editor: &Entity<EditorView>,
+    rows: &[DiffRow],
+    left: bool,
+    starts: &[usize],
+    count: usize,
+    cx: &mut App,
+) {
+    let numbers: Vec<usize> = rows
+        .iter()
+        .filter_map(|row| {
+            let line = if left { &row.left } else { &row.right };
+            line.as_ref().map(|line| line.number - 1)
+        })
+        .collect();
+    let (Some(first), Some(last)) = (numbers.first(), numbers.last()) else {
+        return;
+    };
+    let text_len = editor.read(cx).text().map_or(0, |text| text.len());
+    let from = starts.get(*first).copied().unwrap_or_default();
+    let to = starts.get(last + 1).copied().unwrap_or(text_len);
+    if from >= to {
+        return;
+    }
+    let placeholder = format!("\u{22ef} {count} unchanged lines");
+    editor.update(cx, |editor, cx| {
+        editor.collapse_range(from..to, placeholder, cx)
+    });
+}
+
 impl DiffView {
     /// Reads the diff in the background and opens the popup when it is there.
     pub fn open(
@@ -602,6 +856,32 @@ impl DiffView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        Self::open_working_tree(git, workspace, None, files, index, window, cx);
+    }
+
+    /// The diff of a file of the Commit window: every hunk has a tick, and a hunk without
+    /// one stays out of the commit and in the working tree.
+    pub fn open_commit_list(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        commit: Entity<CommitDraft>,
+        files: Vec<PathBuf>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_working_tree(git, workspace, Some(commit), files, index, window, cx);
+    }
+
+    fn open_working_tree(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        commit: Option<Entity<CommitDraft>>,
+        files: Vec<PathBuf>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let Some(path) = files.get(index).cloned() else {
             return;
         };
@@ -613,6 +893,7 @@ impl DiffView {
             files,
             index,
             None,
+            commit,
             window,
             cx,
         );
@@ -637,28 +918,34 @@ impl DiffView {
             files,
             0,
             Some(line),
+            None,
             window,
             cx,
         );
     }
 
-    /// The diff of a file as one commit changed it, for the Git Log window.
+    /// The diff of a file as one commit changed it, for the Git Log window. The other
+    /// files of the commit are the set the diff keys walk.
     pub fn open_commit(
         git: Entity<GitState>,
         workspace: WeakEntity<Workspace>,
-        path: PathBuf,
+        files: Vec<PathBuf>,
+        index: usize,
         commit: String,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let files = vec![path.clone()];
+        let Some(path) = files.get(index).cloned() else {
+            return;
+        };
         Self::open_source(
             git,
             workspace,
             path,
             Source::Commit(commit),
             files,
-            0,
+            index,
+            None,
             None,
             window,
             cx,
@@ -685,6 +972,7 @@ impl DiffView {
             Source::Branch(branch),
             files,
             index,
+            None,
             None,
             window,
             cx,
@@ -727,6 +1015,7 @@ impl DiffView {
                         FileFormat::default(),
                         diff.base,
                         diff.hunks,
+                        None,
                         window,
                         cx,
                     );
@@ -836,6 +1125,7 @@ impl DiffView {
         files: Vec<PathBuf>,
         index: usize,
         target: Option<u32>,
+        commit: Option<Entity<CommitDraft>>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -882,7 +1172,7 @@ impl DiffView {
                     };
                     Self::show(
                         git, workspace, path, source, files, index, target, current, format,
-                        diff.base, diff.hunks, window, cx,
+                        diff.base, diff.hunks, commit, window, cx,
                     );
                 })
                 .ok();
@@ -921,6 +1211,7 @@ impl DiffView {
                         FileFormat::default(),
                         base,
                         hunks,
+                        None,
                         window,
                         cx,
                     );
@@ -942,28 +1233,38 @@ impl DiffView {
         current: String,
         format: FileFormat,
         base: String,
-        hunks: Vec<Hunk>,
+        _hunks: Vec<Hunk>,
+        commit: Option<Entity<CommitDraft>>,
         window: &mut Window,
         cx: &mut App,
     ) {
         let Some(shared) = workspace.upgrade() else {
             return;
         };
+        let settings = cx.try_global::<Settings>();
+        let whitespace = settings.map_or(DiffWhitespace::DoNotIgnore, |s| s.diff_whitespace);
+        let highlighting = settings.map_or(DiffHighlighting::ByWord, |s| s.diff_highlighting);
+        let synchronize = settings.is_none_or(|s| s.diff_synchronize_scrolling);
+        let show_line_numbers = settings.is_none_or(|s| s.diff_show_line_numbers);
+        let soft_wrap = settings.is_some_and(|s| s.diff_soft_wrap);
+        let context_lines = settings.map_or(CONTEXT_LINES, |s| s.diff_context_lines as usize);
+        let collapse = settings.is_some_and(|s| s.diff_collapse_unchanged);
+        let hunks = hunks_with(whitespace, &base, &current);
         let selected = target
             .and_then(|line| crate::git::hunk_index_at(&hunks, line))
             .unwrap_or(0);
         let weak = workspace.clone();
         let tab = editor_of(&workspace, &path, cx);
-        let side_by_side = cx
-            .try_global::<Settings>()
-            .is_none_or(|settings| settings.diff_side_by_side);
+        let side_by_side = settings.is_none_or(|s| s.diff_side_by_side);
         let pane = if source == Source::WorkingTree {
             Pane::Right
         } else {
             Pane::Left
         };
         let style = style_of(cx);
-        let options = options_of(cx);
+        let mut options = options_of(cx);
+        options.line_numbers = show_line_numbers;
+        options.soft_wrap = soft_wrap;
         let left = {
             let path = path.clone();
             let base = base.clone();
@@ -980,6 +1281,9 @@ impl DiffView {
                     cx,
                 );
                 view.set_options(options, cx);
+                if !soft_wrap {
+                    view.lock_soft_wrap();
+                }
                 view
             })
         };
@@ -1003,7 +1307,9 @@ impl DiffView {
                 cx,
             )
         });
-        left.update(cx, |left, _| left.lock_soft_wrap());
+        if soft_wrap {
+            right.update(cx, |right, _| right.unlock_soft_wrap());
+        }
         let top = right.read(cx).scroll_top();
         left.update(cx, |left, cx| left.scroll_to_top(top, cx));
         let pane_focus = match pane {
@@ -1035,14 +1341,32 @@ impl DiffView {
                 left,
                 right,
                 side_by_side,
+                whitespace,
+                highlighting,
+                synchronize,
+                show_line_numbers,
+                soft_wrap,
+                context_lines,
+                collapse,
+                expanded: HashSet::new(),
+                menu: None,
+                tabbed: false,
                 pane,
                 serial: 0,
                 syncing: false,
                 scroll: ScrollHandle::new(),
                 subscriptions: Vec::new(),
                 _workspace: None,
+                commit,
             });
-            view.update(cx, |view, cx| view.attach(cx));
+            view.update(cx, |view, cx| {
+                view.attach(cx);
+                if view.collapse {
+                    view.apply_collapse(cx);
+                }
+                let theme = *cx.global::<Theme>();
+                view.publish_marks(&theme, cx);
+            });
             let focus = view.read(cx).focus.clone();
             workspace.show_overlay(view.into(), focus, window, cx);
         });
@@ -1057,6 +1381,474 @@ impl DiffView {
 
     fn revertable(&self) -> bool {
         self.source == Source::WorkingTree
+    }
+
+    /// The line the two versions have when the whitespace setting hides every hunk.
+    fn raw_differs(&self) -> bool {
+        !vcs::line_hunks(&self.changes.base, &self.changes.current).is_empty()
+    }
+
+    /// What the toolbar says about the changes: `1 difference`, `No differences`,
+    /// `Contents are identical` or `Only whitespace differences`.
+    fn difference_text(&self) -> String {
+        match self.changes.hunks.len() {
+            1 => "1 difference".to_owned(),
+            count if count > 1 => format!("{count} differences"),
+            _ if self.raw_differs() => "Only whitespace differences".to_owned(),
+            _ if self.changes.base != self.changes.current => "No differences".to_owned(),
+            _ => "Contents are identical".to_owned(),
+        }
+    }
+
+    /// The title of the window or of the tab: `Repository Diff: <file>` for the versions
+    /// of a file, and the names of the two texts for the other comparisons.
+    fn window_title(&self, root: &Path) -> String {
+        let title = relative_of(root, &self.path);
+        match &self.source {
+            Source::WorkingTree | Source::Commit(_) | Source::Shelf(_) => {
+                format!("Repository Diff: {title}")
+            }
+            Source::Branch(branch) => format!("Difference between '{branch}' and {title}"),
+            Source::Clipboard => format!("Difference between the clipboard and {title}"),
+            Source::File(other) => {
+                let other = other.file_name().map_or_else(
+                    || other.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                format!("Difference between {other} and {title}")
+            }
+            Source::Text => "Difference between two responses".to_owned(),
+        }
+    }
+
+    /// The counter of files of the toolbar, `2/4 files`.
+    fn files_text(&self) -> String {
+        format!("{}/{} files", self.index + 1, self.files.len().max(1))
+    }
+
+    /// `true` for the left side, which is always the version before.
+    fn side_locked(&self, left: bool) -> bool {
+        left || self.source != Source::WorkingTree
+    }
+
+    /// The revision of each side: a short hash, a branch, `HEAD`, `Working copy` or the
+    /// name of the other text.
+    pub(crate) fn revisions(&self) -> (String, String) {
+        let short = |hash: &str| hash[..hash.len().min(7)].to_owned();
+        let name = |path: &Path| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        };
+        match &self.source {
+            Source::WorkingTree => ("HEAD".to_owned(), "Working copy".to_owned()),
+            Source::Branch(branch) => (branch.clone(), "Working copy".to_owned()),
+            Source::Commit(commit) => (format!("{}^", short(commit)), short(commit)),
+            Source::Clipboard => ("Clipboard".to_owned(), "Working copy".to_owned()),
+            Source::File(other) => (name(other), name(&self.path)),
+            Source::Shelf(shelf) => ("HEAD".to_owned(), format!("Shelf {shelf}")),
+            Source::Text => ("First response".to_owned(), "Second response".to_owned()),
+        }
+    }
+
+    /// The path each side shows under its revision.
+    fn side_paths(&self) -> (String, String) {
+        let name = |path: &Path| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        };
+        let left = match &self.source {
+            Source::File(other) => name(other),
+            Source::Text => String::new(),
+            _ => name(&self.path),
+        };
+        (left, name(&self.path))
+    }
+
+    /// Keeps a change of the gear in the settings file.
+    fn store(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Settings)) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.update_settings(change, cx))
+            .ok();
+    }
+
+    /// The options of the panes with the choices of the diff over them.
+    fn apply_options(&self, cx: &mut Context<Self>) {
+        let mut options = options_of(cx);
+        options.line_numbers = self.show_line_numbers;
+        options.soft_wrap = self.soft_wrap;
+        let soft_wrap = self.soft_wrap;
+        for editor in [&self.left, &self.right] {
+            editor.update(cx, |editor, cx| {
+                if soft_wrap {
+                    editor.unlock_soft_wrap();
+                } else {
+                    editor.lock_soft_wrap();
+                }
+                editor.set_options(options.clone(), cx);
+            });
+        }
+    }
+
+    fn set_whitespace(&mut self, mode: DiffWhitespace, cx: &mut Context<Self>) {
+        if self.whitespace == mode {
+            return;
+        }
+        self.whitespace = mode;
+        self.changes.hunks = hunks_with(mode, &self.changes.base, &self.changes.current);
+        self.selected = self
+            .selected
+            .min(self.changes.hunks.len().saturating_sub(1));
+        self.expanded.clear();
+        self.store(cx, |settings| settings.diff_whitespace = mode);
+        self.apply_collapse(cx);
+        let theme = *cx.global::<Theme>();
+        self.publish_marks(&theme, cx);
+        cx.notify();
+    }
+
+    fn set_highlighting(&mut self, highlighting: DiffHighlighting, cx: &mut Context<Self>) {
+        self.highlighting = highlighting;
+        self.store(cx, |settings| settings.diff_highlighting = highlighting);
+        cx.notify();
+    }
+
+    fn set_context(&mut self, lines: u32, cx: &mut Context<Self>) {
+        self.context_lines = lines as usize;
+        self.expanded.clear();
+        self.store(cx, |settings| settings.diff_context_lines = lines);
+        self.apply_collapse(cx);
+        cx.notify();
+    }
+
+    fn toggle_collapse(&mut self, cx: &mut Context<Self>) {
+        self.collapse = !self.collapse;
+        let collapse = self.collapse;
+        self.expanded.clear();
+        self.store(cx, |settings| settings.diff_collapse_unchanged = collapse);
+        self.apply_collapse(cx);
+        cx.notify();
+    }
+
+    fn toggle_synchronize(&mut self, cx: &mut Context<Self>) {
+        self.synchronize = !self.synchronize;
+        let synchronize = self.synchronize;
+        self.store(cx, |settings| {
+            settings.diff_synchronize_scrolling = synchronize;
+        });
+        cx.notify();
+    }
+
+    fn toggle_line_numbers(&mut self, cx: &mut Context<Self>) {
+        self.show_line_numbers = !self.show_line_numbers;
+        let show = self.show_line_numbers;
+        self.store(cx, |settings| settings.diff_show_line_numbers = show);
+        self.apply_options(cx);
+        cx.notify();
+    }
+
+    fn toggle_soft_wrap(&mut self, cx: &mut Context<Self>) {
+        self.soft_wrap = !self.soft_wrap;
+        let soft_wrap = self.soft_wrap;
+        self.store(cx, |settings| settings.diff_soft_wrap = soft_wrap);
+        self.apply_options(cx);
+        cx.notify();
+    }
+
+    /// Hides the unchanged lines the diff keeps out of sight, and shows them again when
+    /// the setting is off. A gap the user opened stays open.
+    fn apply_collapse(&mut self, cx: &mut Context<Self>) {
+        self.left.update(cx, |left, cx| left.clear_folds(cx));
+        self.right.update(cx, |right, cx| right.clear_folds(cx));
+        if !self.collapse {
+            return;
+        }
+        let rows = self.rows();
+        let base_starts = line_starts(&self.changes.base);
+        let current_starts = line_starts(&self.changes.current);
+        let keep = self.context_lines;
+        let mut index = 0;
+        while index < rows.len() {
+            if rows[index].hunk.is_some() {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < rows.len() && rows[index].hunk.is_none() {
+                index += 1;
+            }
+            let end = index;
+            if self.expanded.contains(&start) || end - start <= keep * 2 + 1 {
+                continue;
+            }
+            let hidden = &rows[start + keep..end - keep];
+            let count = hidden.len();
+            if count == 0 {
+                continue;
+            }
+            collapse_side(&self.left, hidden, true, &base_starts, count, cx);
+            collapse_side(&self.right, hidden, false, &current_starts, count, cx);
+        }
+    }
+
+    /// The marks of the changes on the bars of both panes.
+    /// Takes the marks off the bars, before the text they describe moves under them.
+    fn clear_marks(&self, cx: &mut Context<Self>) {
+        for editor in [&self.left, &self.right] {
+            editor.update(cx, |editor, cx| editor.set_gutter_marks(Vec::new(), cx));
+        }
+    }
+
+    /// The marks of the changes on the bars of both panes.
+    fn publish_marks(&mut self, theme: &Theme, cx: &mut Context<Self>) {
+        // The marks name lines of one text. A pane that already shows another text takes
+        // no marks: a line past its end would point the bar at a line that is not there.
+        let live = self.right.read(cx).text().map(|text| normalized(&text));
+        if live.as_deref() != Some(self.changes.current.as_str()) {
+            self.clear_marks(cx);
+            return;
+        }
+        if self.changes.hunks.is_empty() {
+            return;
+        }
+        let lines = |text: &str| text.split('\n').count().max(1) as u32;
+        let base_lines = lines(&self.changes.base);
+        // The pane may show text newer than the diff its hunks describe: a mark past the
+        // last line would point the bar at a line that is not there.
+        let current_lines = self
+            .right
+            .read(cx)
+            .text()
+            .map_or_else(|| lines(&self.changes.current), |text| lines(&text));
+        let clamp = |range: Range<u32>, lines: u32| {
+            let start = range.start.min(lines - 1);
+            let end = range.end.min(lines).max(start);
+            start..end
+        };
+        let mark = |lines: Range<u32>, kind: GutterKind| GutterMark {
+            lines,
+            kind,
+            color: match kind {
+                GutterKind::Added => Kind::Added.color(theme),
+                GutterKind::Deleted => Kind::Deleted.color(theme),
+                GutterKind::Modified => Kind::Modified.color(theme),
+            },
+        };
+        let left: Vec<GutterMark> = self
+            .changes
+            .hunks
+            .iter()
+            .map(|hunk| {
+                let kind = if hunk.before.is_empty() {
+                    GutterKind::Added
+                } else if hunk.after.is_empty() {
+                    GutterKind::Deleted
+                } else {
+                    GutterKind::Modified
+                };
+                mark(clamp(hunk.before.clone(), base_lines), kind)
+            })
+            .collect();
+        let right: Vec<GutterMark> = self
+            .changes
+            .hunks
+            .iter()
+            .map(|hunk| {
+                let kind = if hunk.after.is_empty() {
+                    GutterKind::Deleted
+                } else if hunk.before.is_empty() {
+                    GutterKind::Added
+                } else {
+                    GutterKind::Modified
+                };
+                mark(clamp(hunk.after.clone(), current_lines), kind)
+            })
+            .collect();
+        self.left
+            .update(cx, |view, cx| view.set_gutter_marks(left, cx));
+        self.right
+            .update(cx, |view, cx| view.set_gutter_marks(right, cx));
+    }
+
+    /// `true` when the menu of the gear or of the files is open.
+    fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.menu = (self.menu != Some(menu)).then_some(menu);
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn run_menu(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        match action {
+            MenuAction::Whitespace(mode) => self.set_whitespace(mode, cx),
+            MenuAction::Highlighting(highlighting) => self.set_highlighting(highlighting, cx),
+            MenuAction::ToggleSynchronize => self.toggle_synchronize(cx),
+            MenuAction::ToggleLineNumbers => self.toggle_line_numbers(cx),
+            MenuAction::ToggleWrap => self.toggle_soft_wrap(cx),
+            MenuAction::Context(lines) => self.set_context(lines, cx),
+            MenuAction::OpenInTab => self.open_in_tab(window, cx),
+            MenuAction::SelectFile(index) => self.switch_to(index, false, cx),
+        }
+        cx.notify();
+    }
+
+    /// The rows of the open menu. The files come with the counter of the file set, and
+    /// the gear carries the choices of the diff.
+    fn menu_lines(&self) -> Vec<MenuLine> {
+        match self.menu {
+            Some(Menu::Files) => self
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    MenuLine::Row(MenuRow {
+                        label: format!("{}. {name}", index + 1),
+                        id: format!("diff-files-row-{index}"),
+                        checked: index == self.index,
+                        action: MenuAction::SelectFile(index),
+                    })
+                })
+                .collect(),
+            Some(Menu::Settings) => {
+                let mut lines = vec![MenuLine::Section("Ignore whitespaces")];
+                for mode in [
+                    DiffWhitespace::DoNotIgnore,
+                    DiffWhitespace::Trim,
+                    DiffWhitespace::Ignore,
+                    DiffWhitespace::IgnoreAndEmptyLines,
+                ] {
+                    lines.push(MenuLine::Row(MenuRow {
+                        label: mode.label().to_owned(),
+                        id: format!("diff-settings-whitespace-{}", mode_name(mode)),
+                        checked: mode == self.whitespace,
+                        action: MenuAction::Whitespace(mode),
+                    }));
+                }
+                lines.push(MenuLine::Section("Highlighting"));
+                for highlighting in [
+                    DiffHighlighting::ByLine,
+                    DiffHighlighting::ByWord,
+                    DiffHighlighting::SplitChanges,
+                    DiffHighlighting::ByCharacter,
+                    DiffHighlighting::None,
+                ] {
+                    lines.push(MenuLine::Row(MenuRow {
+                        label: highlighting.label().to_owned(),
+                        id: format!(
+                            "diff-settings-highlighting-{}",
+                            mode_name_highlight(highlighting)
+                        ),
+                        checked: highlighting == self.highlighting,
+                        action: MenuAction::Highlighting(highlighting),
+                    }));
+                }
+                lines.push(MenuLine::Row(MenuRow {
+                    label: "Synchronize scrolling".to_owned(),
+                    id: "diff-settings-sync".to_owned(),
+                    checked: self.synchronize,
+                    action: MenuAction::ToggleSynchronize,
+                }));
+                lines.push(MenuLine::Row(MenuRow {
+                    label: "Show line numbers".to_owned(),
+                    id: "diff-settings-line-numbers".to_owned(),
+                    checked: self.show_line_numbers,
+                    action: MenuAction::ToggleLineNumbers,
+                }));
+                lines.push(MenuLine::Row(MenuRow {
+                    label: "Use soft wraps".to_owned(),
+                    id: "diff-settings-soft-wrap".to_owned(),
+                    checked: self.soft_wrap,
+                    action: MenuAction::ToggleWrap,
+                }));
+                lines.push(MenuLine::Section("Context lines"));
+                for lines_shown in CONTEXT_CHOICES {
+                    lines.push(MenuLine::Row(MenuRow {
+                        label: lines_shown.to_string(),
+                        id: format!("diff-settings-context-{lines_shown}"),
+                        checked: lines_shown as usize == self.context_lines,
+                        action: MenuAction::Context(lines_shown),
+                    }));
+                }
+                lines.push(MenuLine::Row(MenuRow {
+                    label: "Open in Editor Tab".to_owned(),
+                    id: "diff-settings-open-in-tab".to_owned(),
+                    checked: false,
+                    action: MenuAction::OpenInTab,
+                }));
+                lines
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// F4: the file of the pane with the keys opens at the line of its caret.
+    fn jump_to_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = match self.pane {
+            Pane::Left => &self.left,
+            Pane::Right => &self.right,
+        };
+        let (line, column) = editor.read(cx).caret();
+        let path = self.path.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                if !self.tabbed {
+                    workspace.dismiss(window, cx);
+                }
+                workspace.open_file(path.clone(), window, cx);
+            })
+            .ok();
+        if let Some(editor) = editor_of(&self.workspace, &self.path, cx) {
+            editor.update(cx, |editor, cx| editor.restore_caret(line, column, cx));
+        }
+    }
+
+    /// Moves the same diff into an editor tab, as Open in Editor Tab of IDEA does.
+    fn open_in_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabbed {
+            return;
+        }
+        self.tabbed = true;
+        self.menu = None;
+        let name = self.path.file_name().map_or_else(
+            || self.path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let root = self
+            .git
+            .read(cx)
+            .repo()
+            .map_or_else(PathBuf::new, |repo| repo.root().to_path_buf());
+        let serial = NEXT_DIFF_TAB.fetch_add(1, Ordering::Relaxed);
+        let tab_path = root.join(".diff").join(format!("{serial}-{name}.diff"));
+        let title = format!("Diff: {name}");
+        let view = cx.entity();
+        let focus = self.focus.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.dismiss(window, cx);
+                workspace.open_view_tab(
+                    tab_path,
+                    title,
+                    "general/diff",
+                    view.into(),
+                    focus,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
     }
 
     /// Subscribes the panes and the tab, and the window, whose notifications bring a tab
@@ -1354,6 +2146,12 @@ impl DiffView {
     fn editor_event(&mut self, from: EditorSide, event: &EditorEvent, cx: &mut Context<Self>) {
         match event {
             EditorEvent::Changed => self.text_changed(from, cx),
+            // The text of a pane is there: the unchanged lines can fold.
+            EditorEvent::Loaded if from != EditorSide::Tab => {
+                if self.collapse {
+                    self.apply_collapse(cx);
+                }
+            }
             // The tab opened again is ready to be a view of the right pane.
             EditorEvent::Loaded if from == EditorSide::Tab => self.adopt_tab(cx),
             // A save of the pane of its own: the reason to stay apart may be gone.
@@ -1379,6 +2177,9 @@ impl DiffView {
         if self.syncing || from == EditorSide::Left {
             return;
         }
+        // The lines the marks name move with the edit: they go until the diff is read
+        // again over the new text.
+        self.clear_marks(cx);
         if from == EditorSide::Right {
             let path = self.path.clone();
             self.workspace
@@ -1414,7 +2215,7 @@ impl DiffView {
 
     /// One pane scrolled: the other one follows, so the hunks stay face to face.
     fn scrolled(&mut self, from: Pane, top: f32, cx: &mut Context<Self>) {
-        if self.syncing {
+        if self.syncing || !self.synchronize {
             return;
         }
         let other = match from {
@@ -1477,7 +2278,15 @@ impl DiffView {
         let line_height = self.right.read(cx).line_height().max(1.);
         let top = (row as f32 * line_height - line_height * 2.).max(0.);
         self.syncing = true;
-        for editor in [&self.left, &self.right] {
+        if self.synchronize {
+            for editor in [&self.left, &self.right] {
+                editor.update(cx, |editor, cx| editor.scroll_to_top(top, cx));
+            }
+        } else {
+            let editor = match self.pane {
+                Pane::Left => &self.left,
+                Pane::Right => &self.right,
+            };
             editor.update(cx, |editor, cx| editor.scroll_to_top(top, cx));
         }
         self.syncing = false;
@@ -1496,7 +2305,20 @@ impl DiffView {
         if next < 0 || next as usize >= self.files.len() {
             return;
         }
-        let index = next as usize;
+        self.switch_to(next as usize, last, cx);
+    }
+
+    /// Shows another file of the set, `last` selects its last hunk, as going back does.
+    fn switch_to(&mut self, index: usize, last: bool, cx: &mut Context<Self>) {
+        if !matches!(
+            self.source,
+            Source::WorkingTree | Source::Commit(_) | Source::Branch(_)
+        ) {
+            return;
+        }
+        if index == self.index {
+            return;
+        }
         let Some(path) = self.files.get(index).cloned() else {
             return;
         };
@@ -1534,15 +2356,16 @@ impl DiffView {
                 if this.serial != serial {
                     return;
                 }
-                let selected = if last {
-                    diff.hunks.len().saturating_sub(1)
-                } else {
-                    0
-                };
                 let current = if matches!(this.source, Source::Commit(_)) {
                     diff.current
                 } else {
                     current
+                };
+                let hunks = hunks_with(this.whitespace, &diff.base, &current);
+                let selected = if last {
+                    hunks.len().saturating_sub(1)
+                } else {
+                    0
                 };
                 this.tab = editor_of(&this.workspace, &path, cx);
                 this.set_text(&path, &diff.base, &current, format, cx);
@@ -1550,10 +2373,16 @@ impl DiffView {
                 this.changes = Changes {
                     current,
                     base: diff.base,
-                    hunks: diff.hunks,
+                    hunks,
                 };
                 this.index = index;
                 this.selected = selected;
+                this.expanded.clear();
+                if this.collapse {
+                    this.apply_collapse(cx);
+                }
+                let theme = *cx.global::<Theme>();
+                this.publish_marks(&theme, cx);
                 if this.side_by_side {
                     let editor = match this.pane {
                         Pane::Left => &this.left,
@@ -1670,8 +2499,14 @@ impl DiffView {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         match (key, modifiers.control, modifiers.alt, modifiers.shift) {
+            ("escape", false, false, false) if self.menu.is_some() => {
+                self.close_menu(cx);
+            }
             ("f7", false, false, false) => self.next_diff(cx),
             ("f7", false, false, true) => self.previous_diff(cx),
+            ("f4", false, false, false) => self.jump_to_source(window, cx),
+            ("right", false, true, false) => self.next_file(cx),
+            ("left", false, true, false) => self.previous_file(cx),
             ("right", false, true, true) => self.next_change(cx),
             ("left", false, true, true) => self.previous_change(cx),
             ("r", true, true, false) => self.apply_left(cx),
@@ -1680,6 +2515,16 @@ impl DiffView {
             _ => return false,
         }
         true
+    }
+
+    /// F7 on the last difference of the last file stays there, as the file set has no
+    /// next file.
+    fn next_file(&mut self, cx: &mut Context<Self>) {
+        self.move_file(1, false, cx);
+    }
+
+    fn previous_file(&mut self, cx: &mut Context<Self>) {
+        self.move_file(-1, true, cx);
     }
 
     /// Gives the keys to the pane the diff works in.
@@ -1743,14 +2588,21 @@ impl DiffView {
                     return;
                 }
                 this.adopt_tab(cx);
+                let hunks = hunks_with(this.whitespace, &diff.base, &current);
                 this.changes = Changes {
                     current,
                     base: diff.base,
-                    hunks: diff.hunks,
+                    hunks,
                 };
                 this.selected = this
                     .selected
                     .min(this.changes.hunks.len().saturating_sub(1));
+                this.expanded.clear();
+                if this.collapse {
+                    this.apply_collapse(cx);
+                }
+                let theme = *cx.global::<Theme>();
+                this.publish_marks(&theme, cx);
                 this.git.update(cx, |git, cx| git.refresh(cx));
                 cx.notify();
             })
@@ -1769,7 +2621,9 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) {
         let style = style_of(cx);
-        let options = options_of(cx);
+        let mut options = options_of(cx);
+        options.line_numbers = self.show_line_numbers;
+        options.soft_wrap = self.soft_wrap;
         let left = text_view(
             path.to_path_buf(),
             base.to_owned(),
@@ -1798,7 +2652,10 @@ impl DiffView {
                 cx,
             )
         });
-        left.update(cx, |left, _| left.lock_soft_wrap());
+        if self.soft_wrap {
+            left.update(cx, |left, _| left.unlock_soft_wrap());
+            right.update(cx, |right, _| right.unlock_soft_wrap());
+        }
         self.left = left;
         self.right = right;
         self.subscribe_editors(cx);
@@ -1853,6 +2710,113 @@ impl DiffView {
     #[cfg(test)]
     pub(crate) fn current(&self) -> &str {
         &self.changes.current
+    }
+
+    /// The counter of differences of the toolbar, for tests.
+    #[cfg(test)]
+    pub(crate) fn counter_text(&self) -> String {
+        self.difference_text()
+    }
+
+    /// The title of the window or of the tab, for tests.
+    #[cfg(test)]
+    pub(crate) fn title_text(&self, cx: &App) -> String {
+        let repo = self.git.read(cx).repo();
+        let root = repo.as_ref().map_or(Path::new(""), |repo| repo.root());
+        self.window_title(root)
+    }
+
+    /// The counter of files of the toolbar, for tests.
+    #[cfg(test)]
+    pub(crate) fn files_label(&self) -> String {
+        self.files_text()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn whitespace_mode(&self) -> DiffWhitespace {
+        self.whitespace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn highlighting_mode(&self) -> DiffHighlighting {
+        self.highlighting
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context(&self) -> usize {
+        self.context_lines
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synchronizes(&self) -> bool {
+        self.synchronize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn line_numbers(&self) -> bool {
+        self.show_line_numbers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wraps(&self) -> bool {
+        self.soft_wrap
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collapses(&self) -> bool {
+        self.collapse
+    }
+
+    #[cfg(test)]
+    pub(crate) fn locked(&self, left: bool) -> bool {
+        self.side_locked(left)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_tab(&self) -> bool {
+        self.tabbed
+    }
+
+    /// The labels of the open menu, for tests.
+    #[cfg(test)]
+    pub(crate) fn menu_labels(&self) -> Vec<String> {
+        self.menu_lines()
+            .into_iter()
+            .map(|line| match line {
+                MenuLine::Section(title) => title.to_owned(),
+                MenuLine::Row(row) => row.label,
+            })
+            .collect()
+    }
+
+    /// The labels of the gaps the unified list folds away, for tests.
+    #[cfg(test)]
+    pub(crate) fn unchanged_labels(&self) -> Vec<String> {
+        self.unified_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                UnifiedItem::Gap { count, .. } => Some(format!("{count} unchanged lines")),
+                UnifiedItem::Row(_) => None,
+            })
+            .collect()
+    }
+
+    /// The gaps the diff shows now, for tests of the collapse switch.
+    #[cfg(test)]
+    pub(crate) fn gap_count(&self) -> usize {
+        self.unchanged_labels().len()
+    }
+
+    /// The first row of every gap the unified list folds away, for tests.
+    #[cfg(test)]
+    pub(crate) fn gap_ids(&self) -> Vec<usize> {
+        self.unified_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                UnifiedItem::Gap { at, .. } => Some(at),
+                UnifiedItem::Row(_) => None,
+            })
+            .collect()
     }
 
     /// The editor of the left pane, for tests.
@@ -1927,16 +2891,55 @@ impl DiffView {
     /// The rows of the side-by-side view: the whole file on both sides, with the lines
     /// of one hunk facing each other and blank lines where a side has none.
     fn rows(&self) -> Vec<DiffRow> {
-        rows_of(
+        rows_of_with(
             &self.changes.base,
             &self.changes.current,
             &self.changes.hunks,
+            self.highlighting,
         )
     }
 
-    fn hunk_rows(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    /// The unified list: every row, with the unchanged gaps the setting folds away
+    /// unless a click opened them.
+    fn unified_items(&self) -> Vec<UnifiedItem> {
+        let rows = self.rows();
+        let mut items = Vec::new();
+        let mut index = 0;
+        while index < rows.len() {
+            if rows[index].hunk.is_some() {
+                items.push(UnifiedItem::Row(rows[index].clone()));
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < rows.len() && rows[index].hunk.is_none() {
+                index += 1;
+            }
+            let end = index;
+            let keep = self.context_lines;
+            if !self.collapse || self.expanded.contains(&start) || end - start <= keep * 2 + 1 {
+                for row in &rows[start..end] {
+                    items.push(UnifiedItem::Row(row.clone()));
+                }
+            } else {
+                for row in &rows[start..start + keep] {
+                    items.push(UnifiedItem::Row(row.clone()));
+                }
+                items.push(UnifiedItem::Gap {
+                    at: start,
+                    count: end - start - keep * 2,
+                });
+                for row in &rows[end - keep..end] {
+                    items.push(UnifiedItem::Row(row.clone()));
+                }
+            }
+        }
+        items
+    }
+
+    /// The header of one hunk of the unified list: its first line and its Revert button.
+    fn hunk_header(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let hunk = &self.changes.hunks[index];
-        let rows = hunk_lines(&self.changes.base, &self.changes.current, hunk, theme);
         let start = (hunk.after.start as usize).min(self.changes.current.split('\n').count());
         let revert = self.revertable().then(|| {
             div()
@@ -1955,25 +2958,130 @@ impl DiffView {
                 .child("Revert")
                 .on_click(cx.listener(move |this, _, _, cx| this.revert(index, cx)))
         });
-        let header = div()
+        div()
             .flex()
+            .flex_none()
             .items_center()
             .justify_between()
             .h(px(CONTROL_HEIGHT))
             .px(px(SPACE_M))
+            .mt(px(SPACE_XS))
             .when(self.selected == index, |this| {
                 this.bg(theme.selection_inactive)
             })
             .when(self.selected != index, |this| this.bg(theme.hover))
             .text_color(theme.text_secondary)
-            .child(format!("Line {}", start + 1))
-            .children(revert);
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .children(self.commit_checkbox(index, theme, cx))
+                    .child(format!("Line {}", start + 1)),
+            )
+            .children(revert)
+    }
+
+    /// One line of the unified list with its number, its sign and the marks of the words
+    /// that differ.
+    fn unified_line(
+        &self,
+        line: Option<&DiffLine>,
+        sign: &'static str,
+        kind: Option<Kind>,
+        right: bool,
+        theme: &Theme,
+    ) -> AnyElement {
+        let Some(line) = line else {
+            return div().into_any_element();
+        };
+        let tint = kind.map(|kind| kind.color(theme));
+        let words = (kind.is_some())
+            .then(|| word_tint(Some(Kind::Modified), right, theme))
+            .flatten();
         div()
             .flex()
-            .flex_col()
-            .mb(px(SPACE_M))
-            .child(header)
-            .child(rows)
+            .flex_none()
+            .h(px(LINE_HEIGHT))
+            .items_center()
+            .when_some(tint, |row, tint| row.bg(tint.opacity(0.18)))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(44.))
+                    .pr(px(SPACE_XS))
+                    .justify_end()
+                    .text_color(theme.text_secondary)
+                    .child(line.number.to_string()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(16.))
+                    .text_color(theme.text_secondary)
+                    .child(sign),
+            )
+            .child(marked_text(&line.text, &line.words, words, theme))
+            .into_any_element()
+    }
+
+    /// The path git names the file by, which the draft of a commit keys its hunks with.
+    fn status_path(&self, cx: &App) -> String {
+        self.git
+            .read(cx)
+            .repo()
+            .map(|repo| relative_of(repo.root(), &self.path))
+            .unwrap_or_default()
+    }
+
+    /// The tick of one hunk in the diff of the Commit window: a hunk without one stays
+    /// out of the commit and in the working tree. None outside that diff.
+    fn commit_checkbox(
+        &self,
+        index: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let draft = self.commit.clone()?;
+        let hunk = self.changes.hunks.get(index)?.clone();
+        let path = self.status_path(cx);
+        let checked = draft.read(cx).hunk_checked(&path, &hunk);
+        let total = self.changes.hunks.len();
+        let click_path = path.clone();
+        let click_hunk = hunk.clone();
+        Some(
+            div()
+                .id(("commit-hunk", index))
+                .debug_selector(move || format!("commit-hunk-{index}"))
+                .flex_none()
+                .size(px(14.))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(if checked {
+                    theme.accent
+                } else {
+                    theme.text_secondary
+                })
+                .when(checked, |this| this.bg(theme.accent))
+                .on_click(cx.listener(move |_this, _, _, cx| {
+                    let now = !draft.read(cx).hunk_checked(&click_path, &click_hunk);
+                    draft.update(cx, |draft, cx| {
+                        draft.set_hunk_checked(&click_path, &click_hunk, now, total);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(checked, |this| {
+                            this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                        }),
+                ),
+        )
     }
 
     /// The empty rows and the backgrounds of both panes, so that the rows of a hunk face
@@ -1982,7 +3090,7 @@ impl DiffView {
     fn decorations(&self, rows: &[DiffRow], theme: &Theme, cx: &App) -> (PaneDecor, PaneDecor) {
         let left_visible = self.left.read(cx).shown_lines();
         let right_visible = self.right.read(cx).shown_lines();
-        decorations_with_visible(
+        let (mut left, mut right) = decorations_with_visible(
             rows,
             &self.changes.base,
             &self.changes.current,
@@ -1990,7 +3098,23 @@ impl DiffView {
             theme,
             &left_visible,
             &right_visible,
-        )
+        );
+        match self.highlighting {
+            DiffHighlighting::ByWord
+            | DiffHighlighting::SplitChanges
+            | DiffHighlighting::ByCharacter => {}
+            DiffHighlighting::ByLine => {
+                left.ranges.clear();
+                right.ranges.clear();
+            }
+            DiffHighlighting::None => {
+                left.lines.clear();
+                left.ranges.clear();
+                right.lines.clear();
+                right.ranges.clear();
+            }
+        }
+        (left, right)
     }
 
     /// The strip between the panes: a band for every hunk and its buttons, at the rows
@@ -1998,12 +3122,18 @@ impl DiffView {
     fn strip(&self, rows: &[DiffRow], theme: &Theme, cx: &mut Context<Self>) -> Div {
         let line_height = self.right.read(cx).line_height().max(1.);
         let top = self.right.read(cx).scroll_top();
-        let mut strip = div()
-            .relative()
-            .flex_none()
-            .w(px(STRIP_WIDTH))
-            .h_full()
-            .overflow_hidden();
+        let shown: HashSet<usize> = self.left.read(cx).shown_lines().into_iter().collect();
+        // The row a buffer row has on screen, counted without the lines a fold hides.
+        let shown_row = |from: usize| {
+            rows[..from]
+                .iter()
+                .filter(|row| match &row.left {
+                    Some(line) => shown.contains(&(line.number - 1)),
+                    None => true,
+                })
+                .count() as f32
+        };
+        let mut spans = Vec::new();
         for hunk in 0..self.changes.hunks.len() {
             let Some(first) = rows.iter().position(|row| row.hunk == Some(hunk)) else {
                 continue;
@@ -2012,20 +3142,66 @@ impl DiffView {
                 .iter()
                 .rposition(|row| row.hunk == Some(hunk))
                 .unwrap_or(first);
-            let y = first as f32 * line_height - top;
-            let height = (last - first + 1) as f32 * line_height;
+            let y = shown_row(first) * line_height - top;
+            let height = (shown_row(last + 1) - shown_row(first)).max(1.) * line_height;
             let kind = hunk_kind(&self.changes.hunks[hunk]);
+            spans.push((y, height, kind.color(theme)));
+        }
+        let connectors = spans.clone();
+        let mut strip = div()
+            .relative()
+            .flex_none()
+            .w(px(STRIP_WIDTH))
+            .h_full()
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |_, _, _| {},
+                    move |bounds, _, window, _| paint_connectors(bounds, &connectors, window),
+                )
+                .absolute()
+                .size_full(),
+            );
+        for (hunk, (y, height, color)) in spans.into_iter().enumerate() {
             strip = strip.child(
                 div()
                     .absolute()
-                    .left(px((STRIP_WIDTH - 4.) / 2.))
+                    .left(px((STRIP_WIDTH - 3.) / 2.))
                     .top(px(y))
-                    .w(px(4.))
+                    .w(px(3.))
                     .h(px(height))
                     .rounded(px(CONTROL_RADIUS))
-                    .bg(kind.color(theme))
-                    .opacity(0.8),
+                    .bg(color)
+                    .opacity(0.5),
             );
+            if let Some(first) = rows.iter().position(|row| row.hunk == Some(hunk)) {
+                let last = rows
+                    .iter()
+                    .rposition(|row| row.hunk == Some(hunk))
+                    .unwrap_or(first);
+                if let Some(line) = rows[first].left.as_ref() {
+                    strip = strip.child(
+                        div()
+                            .absolute()
+                            .left(px(1.))
+                            .top(px(y))
+                            .text_size(px(9.))
+                            .text_color(theme.text_secondary)
+                            .child(line.number.to_string()),
+                    );
+                }
+                if let Some(line) = rows[last].right.as_ref() {
+                    strip = strip.child(
+                        div()
+                            .absolute()
+                            .right(px(1.))
+                            .top(px(y))
+                            .text_size(px(9.))
+                            .text_color(theme.text_secondary)
+                            .child(line.number.to_string()),
+                    );
+                }
+            }
             let apply_left = div()
                 .id(("diff-apply-left", hunk))
                 .debug_selector(move || format!("diff-apply-left-{hunk}"))
@@ -2091,6 +3267,7 @@ impl DiffView {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_XS))
+                    .children(self.commit_checkbox(hunk, theme, cx))
                     .child(apply_left)
                     .child(apply_right)
                     .child(discard),
@@ -2099,52 +3276,377 @@ impl DiffView {
         strip
     }
 
-    /// The title of a side: what the version on that side is.
-    fn side_title(&self, left: bool) -> String {
-        match (&self.source, left) {
-            (Source::WorkingTree, true) => "HEAD".to_owned(),
-            (Source::Branch(branch), true) => branch.clone(),
-            (Source::Commit(commit), true) => {
-                format!("{}^", &commit[..commit.len().min(7)])
+    /// The header of a side: its lock when it is read only, its revision and its path.
+    fn header(&self, left: bool, theme: &Theme) -> Div {
+        let (revision, path) = {
+            let (left_revision, right_revision) = self.revisions();
+            let (left_path, right_path) = self.side_paths();
+            if left {
+                (left_revision, left_path)
+            } else {
+                (right_revision, right_path)
             }
-            (Source::Clipboard, true) => "Clipboard".to_owned(),
-            (Source::File(other), true) => other.file_name().map_or_else(
-                || other.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
-            (Source::Shelf(_), true) => "HEAD".to_owned(),
-            (Source::Text, true) => "First response".to_owned(),
-            (_, false) => self.path.file_name().map_or_else(
-                || self.path.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
-        }
-    }
-
-    fn layout_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
-        let label = if self.side_by_side {
-            "Side-by-side"
+        };
+        let side = if left {
+            "diff-side-left"
         } else {
-            "Unified"
+            "diff-side-right"
+        };
+        let lock_name = if left {
+            "diff-lock-left"
+        } else {
+            "diff-lock-right"
         };
         div()
-            .id("diff-layout")
-            .debug_selector(|| "diff-layout".to_owned())
+            .debug_selector(move || side.to_owned())
             .flex()
+            .flex_1()
+            .min_w_0()
             .items_center()
+            .gap(px(SPACE_XS))
             .h(px(CONTROL_HEIGHT))
             .px(px(SPACE_M))
+            .text_size(px(TEXT_SMALL))
+            .text_color(theme.text_secondary)
+            .when(self.side_locked(left), |header| {
+                header.child(
+                    div()
+                        .debug_selector(move || lock_name.to_owned())
+                        .flex()
+                        .flex_none()
+                        .child(icon_sized("general/lock", 12., theme)),
+                )
+            })
+            .child(div().flex_none().child(revision))
+            .child(div().flex_1().min_w_0().truncate().child(path))
+    }
+
+    fn headers(&self, theme: &Theme) -> Div {
+        div()
+            .debug_selector(|| "diff-headers".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(self.header(true, theme))
+            .child(div().flex_none().w(px(STRIP_WIDTH)))
+            .child(self.header(false, theme))
+    }
+
+    /// The toolbar of the diff, left to right as IDEA has it: the differences, Jump to
+    /// Source, the files of the set, the collapse switch, the counter, the layout and the
+    /// gear.
+    fn toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let files = div()
+            .id("diff-files")
+            .debug_selector(|| "diff-files".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
             .rounded(px(CONTROL_RADIUS))
             .text_size(px(UI_SIZE))
-            .text_color(theme.text_secondary)
+            .text_color(theme.text)
             .hover({
                 let hover = theme.hover;
                 move |style| style.bg(hover)
             })
-            .tooltip(|_, cx| tooltip("Toggle between side-by-side and unified", None, cx))
-            .child(label)
-            .on_click(cx.listener(|this, _, window, cx| this.toggle_layout(window, cx)))
+            .tooltip(|_, cx| tooltip("Files of the diff", None, cx))
+            .child(self.files_text())
+            .child(icon_sized("general/chevronDown", 10., theme))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Files, cx)));
+        let layout = |name: &'static str,
+                      icon: &'static str,
+                      label: &'static str,
+                      active: bool,
+                      cx: &mut Context<Self>| {
+            let id = if name == "side" {
+                "diff-layout".to_owned()
+            } else {
+                format!("diff-layout-{name}")
+            };
+            let selector = id.clone();
+            let button = icon_button(id, icon, label, None, theme)
+                .debug_selector(move || selector.clone())
+                .when(active, |button| button.bg(theme.selection_inactive));
+            button.on_click(cx.listener(|this, _, window, cx| this.toggle_layout(window, cx)))
+        };
+        div()
+            .id("diff-toolbar")
+            .debug_selector(|| "diff-toolbar".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                icon_button(
+                    "diff-prev",
+                    "general/arrowUp",
+                    "Previous Difference",
+                    Some("Shift+F7".into()),
+                    theme,
+                )
+                .debug_selector(|| "diff-prev".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.previous_diff(cx))),
+            )
+            .child(
+                icon_button(
+                    "diff-next",
+                    "general/arrowDown",
+                    "Next Difference",
+                    Some("F7".into()),
+                    theme,
+                )
+                .debug_selector(|| "diff-next".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.next_diff(cx))),
+            )
+            .child(
+                icon_button(
+                    "diff-jump",
+                    "general/locate",
+                    "Jump to Source",
+                    Some("F4".into()),
+                    theme,
+                )
+                .debug_selector(|| "diff-jump".to_owned())
+                .on_click(cx.listener(|this, _, window, cx| this.jump_to_source(window, cx))),
+            )
+            .child(
+                icon_button(
+                    "diff-prev-file",
+                    "general/arrowLeft",
+                    "Previous File",
+                    Some("Alt+Left".into()),
+                    theme,
+                )
+                .debug_selector(|| "diff-prev-file".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.previous_file(cx))),
+            )
+            .child(
+                icon_button(
+                    "diff-next-file",
+                    "general/arrowRight",
+                    "Next File",
+                    Some("Alt+Right".into()),
+                    theme,
+                )
+                .debug_selector(|| "diff-next-file".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.next_file(cx))),
+            )
+            .child(files)
+            .child(
+                icon_button(
+                    "diff-collapse",
+                    "general/collapseAll",
+                    "Collapse Unchanged Fragments",
+                    None,
+                    theme,
+                )
+                .debug_selector(|| "diff-collapse".to_owned())
+                .when(self.collapse, |button| button.bg(theme.selection_inactive))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_collapse(cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .debug_selector(|| "diff-count".to_owned())
+                    .flex_none()
+                    .px(px(SPACE_S))
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child(self.difference_text()),
+            )
+            .child(layout(
+                "side",
+                "general/editorAndPreview",
+                "Side-by-side",
+                self.side_by_side,
+                cx,
+            ))
+            .child(layout(
+                "unified",
+                "general/editorOnly",
+                "Unified",
+                !self.side_by_side,
+                cx,
+            ))
+            .child(
+                icon_button("diff-settings", "general/settings", "Settings", None, theme)
+                    .debug_selector(|| "diff-settings".to_owned())
+                    .when(self.menu == Some(Menu::Settings), |button| {
+                        button.bg(theme.selection_inactive)
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Settings, cx))),
+            )
     }
+
+    /// The menu of the gear or of the counter of files, drawn over the diff.
+    fn menu_panel(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu) = self.menu else {
+            return div().into_any_element();
+        };
+        let name = match menu {
+            Menu::Settings => "diff-settings-menu",
+            Menu::Files => "diff-files-menu",
+        };
+        let mut lines = self.menu_lines();
+        // The choices of the diff do not fit one column of the height of the window: the
+        // colours of the places sit in the first one, the switches and the context in the
+        // second.
+        let second = (menu == Menu::Settings && lines.len() > 11).then(|| lines.split_off(11));
+        let mut columns = Vec::new();
+        columns.push(self.menu_column(lines, theme, cx));
+        if let Some(second) = second {
+            columns.push(self.menu_column(second, theme, cx));
+        }
+        let width = if menu == Menu::Settings { 2. } else { 1. };
+        let panel = popup_frame(theme)
+            .id(name)
+            .debug_selector(move || name.to_owned())
+            .absolute()
+            .top(px(40. + CONTROL_HEIGHT + 2.))
+            .right(px(SPACE_M))
+            .w(px(MENU_WIDTH * width))
+            .max_h(px(560.))
+            .p(px(SPACE_XS))
+            .flex()
+            .flex_row()
+            .items_start()
+            .children(columns);
+        div()
+            .id("diff-menu-backdrop")
+            .debug_selector(|| "diff-menu-backdrop".to_owned())
+            .absolute()
+            .left(px(0.))
+            .top(px(0.))
+            .w_full()
+            .h_full()
+            .on_click(cx.listener(|this, _, _, cx| this.close_menu(cx)))
+            .child(panel)
+            .into_any_element()
+    }
+
+    /// One column of the open menu.
+    fn menu_column(
+        &self,
+        lines: Vec<MenuLine>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut column = div().flex().flex_col().flex_1().min_w_0();
+        for line in lines {
+            match line {
+                MenuLine::Section(title) => {
+                    column = column.child(
+                        div()
+                            .flex_none()
+                            .px(px(SPACE_S))
+                            .pt(px(SPACE_XS))
+                            .pb(px(2.))
+                            .text_size(px(TEXT_SMALL))
+                            .text_color(theme.text_secondary)
+                            .child(title),
+                    );
+                }
+                MenuLine::Row(row) => column = column.child(self.menu_row(row, theme, cx)),
+            }
+        }
+        column.into_any_element()
+    }
+
+    /// One row of the open menu: its check mark, its label and its action.
+    fn menu_row(&self, row: MenuRow, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let action = row.action;
+        div()
+            .id(row.id.clone())
+            .debug_selector({
+                let id = row.id.clone();
+                move || id.clone()
+            })
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .h(px(MENU_ROW_HEIGHT))
+            .px(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text)
+            .hover({
+                let hover = theme.hover;
+                move |style| style.bg(hover)
+            })
+            .child(if row.checked {
+                div()
+                    .flex_none()
+                    .w(px(12.))
+                    .child(icon_sized("general/check", 10., theme))
+                    .into_any_element()
+            } else {
+                div().flex_none().w(px(12.)).into_any_element()
+            })
+            .child(row.label)
+            .on_click(cx.listener(move |this, _, window, cx| this.run_menu(action, window, cx)))
+    }
+}
+
+/// The figures that join the two panes: a band of the colour of the change that curves
+/// from the left edge of the strip to the right one, as IDEA draws them.
+fn paint_connectors(bounds: Bounds<Pixels>, spans: &[(f32, f32, Hsla)], window: &mut Window) {
+    let height = f32::from(bounds.size.height);
+    let left = bounds.left();
+    let right = bounds.right();
+    let middle = left + bounds.size.width / 2.;
+    for (top, rows_height, color) in spans {
+        if *top > height || top + rows_height < 0. {
+            continue;
+        }
+        let top = bounds.top() + px(*top);
+        let bottom = top + px(*rows_height);
+        let mut path = PathBuilder::fill();
+        path.move_to(point(left, top));
+        path.curve_to(point(right, top), point(middle, top - px(5.)));
+        path.line_to(point(right, bottom));
+        path.curve_to(point(left, bottom), point(middle, bottom + px(5.)));
+        path.close();
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color.opacity(0.22));
+        }
+    }
+}
+
+/// A line of text with the ranges that differ painted over it.
+fn marked_text(text: &str, ranges: &[Range<usize>], color: Option<Hsla>, theme: &Theme) -> Div {
+    let mut row = div().flex().whitespace_nowrap().text_color(theme.text);
+    if ranges.is_empty() {
+        return row.child(text.to_owned());
+    }
+    let mut at = 0;
+    for range in ranges {
+        if range.start < at || range.end > text.len() || range.start >= range.end {
+            continue;
+        }
+        if at < range.start {
+            row = row.child(text[at..range.start].to_owned());
+        }
+        row = row.child(
+            div()
+                .when_some(color, |mark, color| mark.bg(color.opacity(0.4)))
+                .child(text[range.clone()].to_owned()),
+        );
+        at = range.end;
+    }
+    if at < text.len() {
+        row = row.child(text[at..].to_owned());
+    }
+    row
 }
 
 fn line(text: &str, sign: &'static str, tint: Option<Hsla>, theme: &Theme) -> Div {
@@ -2204,34 +3706,7 @@ impl Render for DiffView {
         let top = viewport.height * 0.12;
         let repo = self.git.read(cx).repo();
         let root = repo.as_ref().map_or(Path::new(""), |repo| repo.root());
-        let title = relative_of(root, &self.path);
-        let title = match &self.source {
-            Source::WorkingTree => {
-                if self.files.len() > 1 {
-                    format!(
-                        "Changes in {title} ({} of {})",
-                        self.index + 1,
-                        self.files.len()
-                    )
-                } else {
-                    format!("Changes in {title}")
-                }
-            }
-            Source::Commit(commit) => {
-                format!("Changes in {title} at {}", &commit[..commit.len().min(7)])
-            }
-            Source::Branch(branch) => format!("Difference between '{branch}' and {title}"),
-            Source::Clipboard => format!("Difference between the clipboard and {title}"),
-            Source::File(other) => {
-                let other = other.file_name().map_or_else(
-                    || other.display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                );
-                format!("Difference between {other} and {title}")
-            }
-            Source::Shelf(shelf) => format!("HEAD and {title} in shelf {shelf}"),
-            Source::Text => "Difference between two responses".to_owned(),
-        };
+        let title = self.window_title(root);
         let pane: AnyElement = if self.side_by_side {
             let side_rows = self.rows();
             let (left_decor, right_decor) = self.decorations(&side_rows, &theme, cx);
@@ -2242,27 +3717,6 @@ impl Render for DiffView {
                 editor.pane(right_decor, Some(EDITOR_CONTEXT), window, cx)
             });
             let empty = side_rows.is_empty();
-            let header = div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .h(px(CONTROL_HEIGHT))
-                .px(px(SPACE_M))
-                .text_color(theme.text_secondary)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(self.side_title(true)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(self.side_title(false)),
-                );
             let panes = div()
                 .id("diff-side")
                 .debug_selector(|| "diff-side-by-side".to_owned())
@@ -2309,13 +3763,92 @@ impl Render for DiffView {
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .child(header)
                 .child(panes)
                 .into_any_element()
         } else {
-            let rows: Vec<Div> = (0..self.changes.hunks.len())
-                .map(|index| self.hunk_rows(index, &theme, cx))
-                .collect();
+            let mut rows: Vec<AnyElement> = Vec::new();
+            let mut shown_hunk = None;
+            for item in self.unified_items() {
+                match item {
+                    UnifiedItem::Row(row) => {
+                        if let Some(hunk) = row.hunk
+                            && shown_hunk != Some(hunk)
+                        {
+                            shown_hunk = Some(hunk);
+                            rows.push(self.hunk_header(hunk, &theme, cx).into_any_element());
+                        }
+                        if row.kind == Some(Kind::Modified) && row.left.is_some() {
+                            rows.push(self.unified_line(
+                                row.left.as_ref(),
+                                "-",
+                                Some(Kind::Deleted),
+                                false,
+                                &theme,
+                            ));
+                            rows.push(self.unified_line(
+                                row.right.as_ref(),
+                                "+",
+                                Some(Kind::Added),
+                                true,
+                                &theme,
+                            ));
+                        } else if row.kind.is_some() {
+                            if row.left.is_some() {
+                                rows.push(self.unified_line(
+                                    row.left.as_ref(),
+                                    "-",
+                                    Some(Kind::Deleted),
+                                    false,
+                                    &theme,
+                                ));
+                            }
+                            rows.push(self.unified_line(
+                                row.right.as_ref(),
+                                "+",
+                                Some(Kind::Added),
+                                true,
+                                &theme,
+                            ));
+                        } else {
+                            rows.push(self.unified_line(
+                                row.right.as_ref().or(row.left.as_ref()),
+                                " ",
+                                None,
+                                true,
+                                &theme,
+                            ));
+                        }
+                    }
+                    UnifiedItem::Gap { at, count } => {
+                        rows.push(
+                            div()
+                                .id(("diff-gap", at))
+                                .debug_selector(move || format!("diff-unchanged-{at}"))
+                                .flex()
+                                .flex_none()
+                                .h(px(LINE_HEIGHT))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(CONTROL_RADIUS))
+                                .bg(theme.hover)
+                                .text_color(theme.text_secondary)
+                                .text_size(px(TEXT_SMALL))
+                                .hover({
+                                    let pressed = theme.pressed;
+                                    move |style| style.bg(pressed)
+                                })
+                                .tooltip(|_, cx| tooltip("Show these lines", None, cx))
+                                .child(format!("{count} unchanged lines"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.expanded.insert(at);
+                                    this.apply_collapse(cx);
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
             let empty = rows.is_empty();
             scrollable(
                 "diff-list",
@@ -2349,19 +3882,36 @@ impl Render for DiffView {
             .id("diff")
             .track_focus(&self.focus)
             .key_context(CONTEXT)
+            .relative()
             .on_action(cx.listener(|this, _: &NextDiff, _, cx| this.next_diff(cx)))
             .on_action(cx.listener(|this, _: &PreviousDiff, _, cx| this.previous_diff(cx)))
             .on_action(cx.listener(|this, _: &NextChange, _, cx| this.next_change(cx)))
             .on_action(cx.listener(|this, _: &PreviousChange, _, cx| this.previous_change(cx)))
             .on_action(cx.listener(|this, _: &ApplyLeftSide, _, cx| this.apply_left(cx)))
             .on_action(cx.listener(|this, _: &ApplyRightSide, _, cx| this.apply_right(cx)))
+            .on_action(
+                cx.listener(|this, _: &JumpToSource, window, cx| this.jump_to_source(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NextFile, _, cx| this.next_file(cx)))
+            .on_action(cx.listener(|this, _: &PreviousFile, _, cx| this.previous_file(cx)))
+            .on_action(cx.listener(|this, _: &ToggleCollapse, _, cx| this.toggle_collapse(cx)))
             .on_action(cx.listener(|this, _: &FocusOppositePane, window, cx| {
                 this.focus_opposite(window, cx)
             }))
-            .occlude()
-            .w(width)
-            .h(height)
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.menu.is_some() && event.keystroke.key == "escape" {
+                    this.close_menu(cx);
+                    cx.stop_propagation();
+                } else if this.diff_key(event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .when(!self.tabbed, |body| {
+                body.occlude()
+                    .w(width)
+                    .h(height)
+                    .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            })
             .child(
                 div()
                     .debug_selector(|| "diff-title".to_owned())
@@ -2372,21 +3922,28 @@ impl Render for DiffView {
                     .h(px(40.))
                     .px(px(DIALOG_PADDING))
                     .font_weight(FontWeight::MEDIUM)
-                    .child(title)
-                    .child(self.layout_button(&theme, cx)),
+                    .child(title),
             )
-            .child(pane);
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("diff-enter", body))
+            .child(self.toolbar(&theme, cx))
+            .child(self.headers(&theme))
+            .child(pane)
+            .children(self.menu.map(|_| self.menu_panel(&theme, cx)));
+        if self.tabbed {
+            body.flex().flex_col().w_full().h_full().into_any_element()
+        } else {
+            div()
+                .absolute()
+                .left(left)
+                .top(top)
+                .child(enter("diff-enter", body))
+                .into_any_element()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Changes;
+    use super::{Changes, DiffWhitespace, character_changes, hunks_with};
 
     fn apply(mut text: String, edit: vcs::TextEdit) -> String {
         text.replace_range(edit.range, &edit.text);
@@ -2419,5 +3976,37 @@ mod tests {
 
         assert_eq!(changes.revert(0, "a\nB\nC\n"), None);
         assert_eq!(changes.revert(7, current), None);
+    }
+
+    #[test]
+    fn whitespace_choices_hide_only_what_they_leave_out_of_the_comparison() {
+        let base = "alpha\nbeta\n";
+        let current = "alpha\n   beta\n";
+
+        assert_eq!(
+            hunks_with(DiffWhitespace::DoNotIgnore, base, current).len(),
+            1
+        );
+        assert!(hunks_with(DiffWhitespace::Trim, base, current).is_empty());
+        assert!(hunks_with(DiffWhitespace::Ignore, base, current).is_empty());
+        assert!(hunks_with(DiffWhitespace::IgnoreAndEmptyLines, base, current).is_empty());
+
+        // A line of nothing but whitespace is a change unless the last choice is on.
+        let with_blank = "alpha\n\nbeta\n";
+        assert_eq!(
+            hunks_with(DiffWhitespace::Ignore, base, with_blank).len(),
+            1
+        );
+        assert!(hunks_with(DiffWhitespace::IgnoreAndEmptyLines, base, with_blank).is_empty());
+    }
+
+    #[test]
+    fn the_characters_of_a_changed_line_are_marked_around_the_common_ends() {
+        let before = "colour = red";
+        let after = "colour = blue";
+        let changes = character_changes(before, after);
+
+        assert_eq!(changes.before, vec![9..12]);
+        assert_eq!(changes.after, vec![9..13]);
     }
 }

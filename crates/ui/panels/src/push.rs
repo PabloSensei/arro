@@ -1,0 +1,873 @@
+//! The Push window of Ctrl+Shift+K: the commits of the branch on their way on the left,
+//! the files of one of them on the right, the remote and the branch they go to, Push tags
+//! and Force Push with a lease. Nothing is sent until Push is pressed.
+
+use ui_kit::metrics::*;
+use ui_kit::prelude::*;
+use ui_kit::*;
+use vcs::{Commit, PushRequest};
+use workspace::Workspace;
+
+use crate::git::{GitState, short_commit};
+
+const WIDTH: f32 = 780.;
+/// The branch and the remote branch the user last pushed to wait for this long while the
+/// window reads the repository.
+const CONTEXT: &str = "PushWindow";
+
+/// The commits of one branch that Push sends.
+struct PushBranch {
+    name: String,
+    commits: Vec<Commit>,
+}
+
+/// What the window reads before it shows the commits.
+struct OpenedPush {
+    branch: String,
+    upstream: Option<String>,
+    remotes: Vec<String>,
+    commits: Vec<Commit>,
+}
+
+pub(crate) struct PushWindow {
+    git: Entity<GitState>,
+    workspace: WeakEntity<Workspace>,
+    window: AnyWindowHandle,
+    focus: FocusHandle,
+    scroll_commits: ScrollHandle,
+    scroll_files: ScrollHandle,
+    branches: Vec<PushBranch>,
+    remotes: Vec<String>,
+    remote: String,
+    destination: TextField,
+    upstream: Option<String>,
+    current: String,
+    selected_branch: usize,
+    selected_commit: usize,
+    files: Vec<String>,
+    files_loading: bool,
+    tags: bool,
+    force_confirm: bool,
+    force_menu: bool,
+    remote_menu: bool,
+    loading: bool,
+    editing_destination: bool,
+    error: Option<String>,
+}
+
+impl PushWindow {
+    pub(crate) fn open(
+        git: Entity<GitState>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let weak = cx.weak_entity();
+        let handle = window.window_handle();
+        let view = cx.new(|cx| Self {
+            git,
+            workspace: weak,
+            window: handle,
+            focus: cx.focus_handle(),
+            scroll_commits: ScrollHandle::new(),
+            scroll_files: ScrollHandle::new(),
+            branches: Vec::new(),
+            remotes: Vec::new(),
+            remote: String::new(),
+            destination: TextField::default(),
+            upstream: None,
+            current: String::new(),
+            selected_branch: 0,
+            selected_commit: 0,
+            files: Vec::new(),
+            files_loading: false,
+            tags: false,
+            force_confirm: false,
+            force_menu: false,
+            remote_menu: false,
+            loading: true,
+            editing_destination: false,
+            error: None,
+        });
+        let focus = view.read(cx).focus.clone();
+        workspace.show_overlay(view.clone().into(), focus, window, cx);
+        // The overlay opens under an update of the Git state, whose read would fail
+        // here: the first read of the repository waits for the end of that update.
+        cx.defer(move |cx| {
+            view.update(cx, |this, cx| this.reload(cx));
+        });
+    }
+
+    /// Reads the branch, the remotes and the commits the remote does not have.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.git.read(cx).repo() else {
+            self.loading = false;
+            self.error = Some("No Git repository".to_string());
+            return;
+        };
+        self.loading = true;
+        self.error = None;
+        let job = cx.background_executor().spawn(async move {
+            let status = repo.status()?;
+            let remotes = repo.remotes()?;
+            let commits = repo.outgoing_commits(200)?;
+            Ok::<_, std::io::Error>(OpenedPush {
+                branch: status.branch.clone().unwrap_or_else(|| "HEAD".to_string()),
+                upstream: status.upstream.clone(),
+                remotes,
+                commits,
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                this.loading = false;
+                match result {
+                    Ok(opened) => this.opened(opened, cx),
+                    Err(error) => this.error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn opened(&mut self, opened: OpenedPush, cx: &mut Context<Self>) {
+        let (remote, destination) =
+            default_target(&opened.branch, opened.upstream.as_deref(), &opened.remotes);
+        self.current = opened.branch.clone();
+        self.upstream = opened.upstream;
+        self.remotes = opened.remotes;
+        self.remote = remote;
+        self.destination = TextField::from_text(destination);
+        self.branches = (!opened.commits.is_empty())
+            .then_some(PushBranch {
+                name: opened.branch,
+                commits: opened.commits,
+            })
+            .into_iter()
+            .collect();
+        self.selected_branch = 0;
+        self.selected_commit = 0;
+        self.load_files(cx);
+    }
+
+    /// Reads the files of the chosen commit for the right pane.
+    fn load_files(&mut self, cx: &mut Context<Self>) {
+        let Some(commit) = self
+            .branches
+            .get(self.selected_branch)
+            .and_then(|branch| branch.commits.get(self.selected_commit))
+        else {
+            self.files.clear();
+            return;
+        };
+        let id = commit.id.clone();
+        let Some(repo) = self.git.read(cx).repo() else {
+            return;
+        };
+        self.files_loading = true;
+        let job = cx
+            .background_executor()
+            .spawn(async move { repo.commit_files(&id).map_err(|error| error.to_string()) });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                this.files_loading = false;
+                match result {
+                    Ok(files) => this.files = files,
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn select_commit(&mut self, branch: usize, commit: usize, cx: &mut Context<Self>) {
+        if self.selected_branch == branch && self.selected_commit == commit {
+            return;
+        }
+        self.selected_branch = branch;
+        self.selected_commit = commit;
+        self.files.clear();
+        self.load_files(cx);
+        cx.notify();
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        self.window
+            .update(cx, |_, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+                    .ok();
+            })
+            .ok();
+    }
+
+    fn close(&mut self, cx: &mut Context<Self>) {
+        self.dismiss(cx);
+    }
+
+    /// Sends the current branch as the window shows it. The git call runs off the UI
+    /// thread; the window closes when the remote has the commits.
+    fn push(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
+        let destination = self.destination.text.trim().to_string();
+        if self.remotes.is_empty() {
+            self.error = Some("The repository has no remote".to_string());
+            cx.notify();
+            return;
+        }
+        if destination.is_empty() {
+            self.error = Some("Write the branch to push to".to_string());
+            cx.notify();
+            return;
+        }
+        if self.current.is_empty() || self.current == "HEAD" {
+            self.error = Some("Check out a branch to push".to_string());
+            cx.notify();
+            return;
+        }
+        let target = format!("{}/{}", self.remote, destination);
+        let set_upstream = self.upstream.as_deref() != Some(target.as_str());
+        let request = PushRequest {
+            remote: self.remote.clone(),
+            branch: self.current.clone(),
+            destination,
+            set_upstream,
+            tags: self.tags,
+            force,
+        };
+        self.error = None;
+        let me = cx.weak_entity();
+        self.git.update(cx, |git, cx| {
+            git.push_to(
+                request,
+                move |_, cx| {
+                    me.update(cx, |this, cx| this.close(cx)).ok();
+                },
+                cx,
+            )
+        });
+        cx.notify();
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            if self.force_confirm {
+                self.force_confirm = false;
+                cx.notify();
+            } else {
+                self.close(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.editing_destination && self.destination.key_with_clipboard(event, false, cx) {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn label(&self, text: &str, theme: &Theme) -> Div {
+        div()
+            .flex_none()
+            .text_color(theme.text_secondary)
+            .child(text.to_string())
+    }
+
+    fn checkbox(&self, checked: bool, theme: &Theme) -> Div {
+        div()
+            .flex_none()
+            .size(px(14.))
+            .rounded(px(3.))
+            .border_1()
+            .border_color(if checked {
+                theme.accent
+            } else {
+                theme.text_secondary
+            })
+            .when(checked, |this| this.bg(theme.accent))
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(checked, |this| {
+                        this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                    }),
+            )
+    }
+
+    fn commits_panel(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut flat = 0usize;
+        for (branch_index, branch) in self.branches.iter().enumerate() {
+            rows.push(
+                div()
+                    .debug_selector(move || format!("push-branch-{branch_index}"))
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .text_color(theme.text_secondary)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(branch.name.clone())
+                    .into_any_element(),
+            );
+            for (commit_index, commit) in branch.commits.iter().enumerate() {
+                let selected =
+                    self.selected_branch == branch_index && self.selected_commit == commit_index;
+                let selector = flat;
+                flat += 1;
+                rows.push(
+                    div()
+                        .id(("push-commit", selector))
+                        .debug_selector(move || format!("push-commit-{selector}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .flex_none()
+                        .h(px(ROW_HEIGHT))
+                        .px(px(ROW_PADDING_X))
+                        .rounded(px(ROW_RADIUS))
+                        .when(selected, |this| this.bg(theme.selection_inactive))
+                        .hover({
+                            let hover = theme.selection_hover;
+                            move |style| style.bg(hover)
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_commit(branch_index, commit_index, cx)
+                        }))
+                        .child(
+                            div()
+                                .w(px(60.))
+                                .flex_none()
+                                .font_family(MONO_FONT)
+                                .text_color(theme.link)
+                                .child(short_commit(&commit.id)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(commit.subject.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.text_secondary)
+                                .child(commit.author.clone()),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        let empty = rows.is_empty();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .flex()
+                    .items_center()
+                    .text_color(theme.text_secondary)
+                    .child("Commits to push"),
+            )
+            .child(
+                scrollable(
+                    "push-commits",
+                    &self.scroll_commits,
+                    div()
+                        .id("push-commits")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_commits)
+                        .children(rows)
+                        .when(empty && !self.loading, |this| {
+                            this.px(px(SPACE_M))
+                                .py(px(SPACE_M))
+                                .text_color(theme.text_secondary)
+                                .child("Nothing to push")
+                        })
+                        .when(self.loading, |this| {
+                            this.px(px(SPACE_M))
+                                .py(px(SPACE_M))
+                                .text_color(theme.text_secondary)
+                                .child("Reading the repository...")
+                        }),
+                    theme,
+                    window,
+                    cx,
+                )
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element()
+    }
+
+    fn files_panel(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows: Vec<AnyElement> = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                div()
+                    .debug_selector(move || format!("push-file-{index}"))
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .truncate()
+                    .child(file.clone())
+                    .into_any_element()
+            })
+            .collect();
+        let empty = rows.is_empty();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .border_l_1()
+            .border_color(theme.toolbar_border)
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .flex()
+                    .items_center()
+                    .text_color(theme.text_secondary)
+                    .child("Files"),
+            )
+            .child(
+                scrollable(
+                    "push-files",
+                    &self.scroll_files,
+                    div()
+                        .id("push-files")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_files)
+                        .children(rows)
+                        .when(empty && !self.files_loading, |this| {
+                            this.px(px(SPACE_M))
+                                .py(px(SPACE_M))
+                                .text_color(theme.text_secondary)
+                                .child("No files")
+                        }),
+                    theme,
+                    window,
+                    cx,
+                )
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element()
+    }
+
+    fn controls(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let remote = div()
+            .id("push-remote")
+            .debug_selector(|| "push-remote".to_string())
+            .flex()
+            .items_center()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.popup_border)
+            .cursor_pointer()
+            .hover({
+                let hover = theme.hover;
+                move |style| style.bg(hover)
+            })
+            .child(if self.remote.is_empty() {
+                "No remote".to_string()
+            } else {
+                format!("{}  ▾", self.remote)
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.remote_menu = !this.remote_menu;
+                cx.notify();
+            }));
+        let branch = div()
+            .id("push-destination")
+            .debug_selector(|| "push-destination".to_string())
+            .flex()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(if self.editing_destination {
+                theme.accent
+            } else {
+                theme.popup_border
+            })
+            .overflow_hidden()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.editing_destination = true;
+                cx.notify();
+            }))
+            .children(text_field_children(
+                &self.destination,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                16.,
+                self.editing_destination,
+            ));
+        let tags = div()
+            .id("push-tags")
+            .debug_selector(|| "push-tags".to_string())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .cursor_pointer()
+            .hover({
+                let hover = theme.hover;
+                move |style| style.bg(hover)
+            })
+            .child(self.checkbox(self.tags, theme))
+            .child("Push tags")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.tags = !this.tags;
+                cx.notify();
+            }));
+        let remotes: Vec<AnyElement> = if self.remote_menu {
+            self.remotes
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let chosen = name.clone();
+                    div()
+                        .id(("push-remote-choice", index))
+                        .debug_selector(move || format!("push-remote-{index}"))
+                        .flex()
+                        .items_center()
+                        .flex_none()
+                        .h(px(ROW_HEIGHT))
+                        .px(px(SPACE_M))
+                        .rounded(px(ROW_RADIUS))
+                        .when(self.remote == *name, |this| {
+                            this.bg(theme.selection_inactive)
+                        })
+                        .hover({
+                            let hover = theme.selection_hover;
+                            move |style| style.bg(hover)
+                        })
+                        .child(name.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remote = chosen.clone();
+                            this.remote_menu = false;
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .px(px(SPACE_M))
+            .py(px(SPACE_S))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .child(self.label("Remote:", theme))
+                    .child(remote)
+                    .child(self.label("Branch:", theme))
+                    .child(branch)
+                    .child(tags),
+            )
+            .children(remotes)
+            .into_any_element()
+    }
+
+    fn buttons(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let push = div()
+            .id("push-go")
+            .debug_selector(|| "push-go".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(26.))
+            .px(px(12.))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.accent)
+            .text_color(theme.over_accent)
+            .child("Push")
+            .on_click(cx.listener(|this, _, _, cx| this.push(false, cx)));
+        let force = div()
+            .id("push-force")
+            .debug_selector(|| "push-force".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(26.))
+            .px(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.popup_border)
+            .hover({
+                let hover = theme.hover;
+                move |style| style.bg(hover)
+            })
+            .child("Force Push  ▾")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.force_menu = !this.force_menu;
+                cx.notify();
+            }));
+        let force_menu = self.force_menu.then(|| {
+            div()
+                .id("push-force-item")
+                .debug_selector(|| "push-force-item".to_string())
+                .flex()
+                .items_center()
+                .flex_none()
+                .h(px(ROW_HEIGHT))
+                .px(px(SPACE_M))
+                .rounded(px(ROW_RADIUS))
+                .border_1()
+                .border_color(theme.popup_border)
+                .bg(theme.popup_bg)
+                .hover({
+                    let hover = theme.hover;
+                    move |style| style.bg(hover)
+                })
+                .child("Force Push")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.force_menu = false;
+                    this.force_confirm = true;
+                    cx.notify();
+                }))
+        });
+        let cancel = div()
+            .id("push-cancel")
+            .debug_selector(|| "push-cancel".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(26.))
+            .px(px(12.))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.popup_border)
+            .hover({
+                let hover = theme.hover;
+                move |style| style.bg(hover)
+            })
+            .child("Cancel")
+            .on_click(cx.listener(|this, _, _, cx| this.close(cx)));
+        let warning = self.force_confirm.then(|| {
+            div()
+                .debug_selector(|| "push-force-warning".to_string())
+                .flex()
+                .items_center()
+                .flex_1()
+                .min_w_0()
+                .gap(px(SPACE_S))
+                .text_color(theme.stripe_warning)
+                .child("Force Push replaces the remote history.")
+                .child(
+                    div()
+                        .id("push-force-confirm")
+                        .debug_selector(|| "push-force-confirm".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(26.))
+                        .px(px(12.))
+                        .rounded(px(CONTROL_RADIUS))
+                        .border_1()
+                        .border_color(theme.stripe_warning)
+                        .hover({
+                            let hover = theme.hover;
+                            move |style| style.bg(hover)
+                        })
+                        .child("Force Push")
+                        .on_click(cx.listener(|this, _, _, cx| this.push(true, cx))),
+                )
+        });
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(SPACE_S))
+            .px(px(SPACE_M))
+            .py(px(SPACE_M))
+            .children(force_menu)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .children(warning)
+                    .child(div().flex_1())
+                    .child(cancel)
+                    .child(force)
+                    .child(push),
+            )
+            .into_any_element()
+    }
+}
+
+/// The remote and the branch Push chooses before the user changes them: the upstream of
+/// the branch, or the first remote and the name of the branch.
+fn default_target(branch: &str, upstream: Option<&str>, remotes: &[String]) -> (String, String) {
+    if let Some(upstream) = upstream {
+        if let Some((remote, name)) = upstream.split_once('/') {
+            return (remote.to_string(), name.to_string());
+        }
+        if !remotes.is_empty() {
+            return (remotes[0].clone(), upstream.to_string());
+        }
+    }
+    let remote = remotes
+        .iter()
+        .find(|name| name.as_str() == "origin")
+        .or_else(|| remotes.first())
+        .cloned()
+        .unwrap_or_default();
+    (remote, branch.to_string())
+}
+
+impl Render for PushWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let viewport = window.viewport_size();
+        let width = px(WIDTH).min(viewport.width - px(40.));
+        let height = viewport.height * 0.65;
+        let left = (viewport.width - width) / 2.;
+        let top = viewport.height * 0.14;
+        let error = self.error.clone();
+        let body = surface(&theme)
+            .id("push-dialog")
+            .debug_selector(|| "push-dialog".to_string())
+            .key_context(CONTEXT)
+            .track_focus(&self.focus)
+            .occlude()
+            .w(width)
+            .h(height)
+            .flex()
+            .flex_col()
+            .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .flex_none()
+                    .h(px(40.))
+                    .px(px(DIALOG_PADDING))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Push")
+                    .child(
+                        div()
+                            .text_color(theme.text_secondary)
+                            .text_size(px(TEXT_SMALL))
+                            .child(match &self.upstream {
+                                Some(upstream) => format!("Upstream: {upstream}"),
+                                None => "No upstream yet".to_string(),
+                            }),
+                    ),
+            )
+            .child(self.controls(&theme, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.commits_panel(&theme, window, cx))
+                    .child(self.files_panel(&theme, window, cx)),
+            )
+            .children(error.map(|error| {
+                div()
+                    .debug_selector(|| "push-error".to_string())
+                    .flex_none()
+                    .px(px(SPACE_M))
+                    .py(px(SPACE_S))
+                    .text_color(theme.error)
+                    .child(error)
+            }))
+            .child(self.buttons(&theme, cx));
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .child(enter("push", body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_target;
+
+    #[test]
+    fn the_upstream_names_the_remote_and_the_branch() {
+        assert_eq!(
+            default_target("feature", Some("origin/main"), &["origin".to_string()]),
+            ("origin".to_string(), "main".to_string())
+        );
+        assert_eq!(
+            default_target(
+                "feature",
+                None,
+                &["upstream".to_string(), "origin".to_string()]
+            ),
+            ("origin".to_string(), "feature".to_string())
+        );
+        assert_eq!(
+            default_target("feature", None, &["upstream".to_string()]),
+            ("upstream".to_string(), "feature".to_string())
+        );
+    }
+}

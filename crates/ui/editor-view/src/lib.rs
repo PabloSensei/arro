@@ -7,9 +7,11 @@ mod bar;
 mod blocks;
 mod bundle;
 mod code_lens;
+mod completion_usage;
 mod decor;
 mod delete;
 mod element;
+mod find_history;
 mod generate;
 mod hierarchy;
 mod hippie;
@@ -31,10 +33,12 @@ mod view;
 
 pub use annotate::BlameNote;
 pub use bundle::{BundleChanged, BundleHost, BundleMode, BundleModes};
+pub use completion_usage::{CompletionUsage, install_completion_usage};
 pub use decor::PaneDecor;
 pub use element::StripeKind;
 #[cfg(any(test, feature = "test-support"))]
 pub use element::{reset_widest_row_counts, widest_row_counts};
+pub use find_history::{FindHistory, install_find_history};
 pub use live::{KeyUse, LiveTemplates, TemplateList};
 pub use markdown_preview::PreviewMode;
 pub use markdown_preview::PreviewModes;
@@ -65,5 +69,5 @@ pub use view::{
     InlineWatchRow, Languages, LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark,
     PlaceTarget, PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot,
     TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
-    install_keymap,
+    install_clipboard_history_sink, install_keymap, set_clipboard_history,
 };

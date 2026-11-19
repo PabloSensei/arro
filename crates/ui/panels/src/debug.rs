@@ -28,8 +28,11 @@ use workspace::{DEBUG_TOOL, Workspace};
 
 use crate::ansi::OutputBuffers;
 use crate::console_input::{ConsoleInput, ConsoleKey};
+use crate::console_links;
+use crate::console_search::{ConsoleSearch, SearchToggle};
 use crate::mcp_debug::{Answer as ToolAnswer, DebugBridge, Job as ToolJob, Request as ToolRequest};
 use crate::navigation;
+use crate::project_structure::dialog_button;
 use crate::prompt::Prompt;
 
 const CONTEXT: &str = "DebugPanel";
@@ -440,6 +443,9 @@ struct SavedState {
     exception_filters: Vec<String>,
     #[serde(default)]
     inline_watches: Vec<InlineWatchSetting>,
+    /// The window muted the breakpoints; the settings above stay as they are.
+    #[serde(default)]
+    muted: bool,
 }
 
 fn state_key(root: &Path) -> String {
@@ -562,6 +568,8 @@ pub struct DebugPanel {
     watch_input: Option<TextField>,
     /// The watch row Delete removes.
     selected_watch: Option<String>,
+    /// The expressions of the Evaluate window, oldest first.
+    evaluate_history: Vec<String>,
     /// The temporary breakpoint of Run to Cursor.
     temporary: Option<TemporaryBreakpoint>,
     /// The breakpoints Force Step Over turned off until the step ends.
@@ -572,6 +580,9 @@ pub struct DebugPanel {
     /// Smart Step Into waits for the list of calls from the adapter.
     asking_targets: bool,
     asking_targets_window: Option<AnyWindowHandle>,
+    /// The window muted the breakpoints: the gutter greys them and the adapter hears an
+    /// empty list, while the settings stay.
+    muted: bool,
     /// Breakpoints in file and line order, with their properties.
     breakpoints: Vec<BreakpointSetting>,
     /// Method breakpoints, with their properties.
@@ -625,6 +636,12 @@ pub struct DebugPanel {
     seen_console: Vec<ConsoleLine>,
     /// The line the user types into the console, while the program reads input.
     console_input: ConsoleInput,
+    /// The search bar of the console and the lines its filter keeps.
+    console_search: ConsoleSearch,
+    search_focus: FocusHandle,
+    filter_focus: FocusHandle,
+    /// The project files, to find the sources named in the console.
+    files: Option<Entity<Arc<Vec<PathBuf>>>>,
     /// The build step of a debug launch, before the debuggee starts.
     build: Option<Console>,
     /// The unfinished lines of the build process, each stream on its own.
@@ -697,11 +714,13 @@ impl DebugPanel {
             variable_edit: None,
             watch_input: None,
             selected_watch: None,
+            evaluate_history: Vec::new(),
             temporary: None,
             forced_step: None,
             seen_stops: 0,
             asking_targets: false,
             asking_targets_window: None,
+            muted: saved.muted,
             breakpoints: saved.breakpoints,
             function_breakpoints: saved.function_breakpoints,
             data_breakpoints: saved.data_breakpoints,
@@ -727,6 +746,10 @@ impl DebugPanel {
             local_console: Vec::new(),
             seen_console: Vec::new(),
             console_input: ConsoleInput::new(),
+            console_search: ConsoleSearch::default(),
+            search_focus: cx.focus_handle(),
+            filter_focus: cx.focus_handle(),
+            files: None,
             build: None,
             build_output: OutputBuffers::default(),
             build_process: None,
@@ -778,6 +801,32 @@ impl DebugPanel {
     /// The newest snapshot of the session, for scripts and tests.
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// The project files, to find the sources named in the console.
+    pub fn set_files(&mut self, files: Entity<Arc<Vec<PathBuf>>>) {
+        self.files = Some(files);
+    }
+
+    /// Whether the breakpoints are muted.
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Mutes the breakpoints, or brings them back into the program without a restart.
+    pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        self.muted = !self.muted;
+        self.send(Command::SetMuteBreakpoints(self.muted), cx);
+        if !self.muted {
+            // A session that started muted never heard these breakpoints, so the panel
+            // sends every one of them again.
+            for spec in self.all_specs() {
+                self.send(Command::SetBreakpoint(spec), cx);
+            }
+            self.send_function_breakpoints(cx);
+            self.send_data_breakpoints(cx);
+        }
+        self.changed(cx);
     }
 
     /// Connects the tools of the MCP server to this window: their breakpoints, their
@@ -1765,6 +1814,24 @@ impl DebugPanel {
             .collect()
     }
 
+    /// The counter of the search bar of the console, for tests.
+    #[cfg(test)]
+    pub(crate) fn console_search_status(&self) -> String {
+        self.console_search.status().0
+    }
+
+    /// The lines the filter of the console keeps, for tests.
+    #[cfg(test)]
+    pub(crate) fn visible_console_lines(&self) -> Vec<String> {
+        let total = self.local_console.len();
+        (0..self.console_search.kept_count(total))
+            .filter_map(|row| {
+                let index = self.console_search.line_of_row(total, row);
+                self.local_console.get(index).map(|line| line.text.clone())
+            })
+            .collect()
+    }
+
     /// Shows the Debugger tab, for a test whose program takes input and brings the
     /// console to the front.
     #[cfg(test)]
@@ -1978,6 +2045,7 @@ impl DebugPanel {
         self.asking_targets_window = None;
         self.local_console.clear();
         self.seen_console.clear();
+        self.console_search.clear();
         self.console_input.restart();
         self.build = None;
         self.build_output = OutputBuffers::default();
@@ -2623,25 +2691,53 @@ impl DebugPanel {
             .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
     }
 
-    fn specs(&self) -> Vec<BreakpointSpec> {
+    /// Every breakpoint of the window, whether the list is muted or not.
+    fn all_specs(&self) -> Vec<BreakpointSpec> {
         self.breakpoints
             .iter()
             .map(BreakpointSetting::spec)
             .collect()
     }
 
-    fn function_specs(&self) -> Vec<FunctionBreakpointSpec> {
+    /// The breakpoints a started session hears: none while the window mutes them.
+    fn specs(&self) -> Vec<BreakpointSpec> {
+        if self.muted {
+            Vec::new()
+        } else {
+            self.all_specs()
+        }
+    }
+
+    /// Every method breakpoint of the window, whether the list is muted or not.
+    fn all_function_specs(&self) -> Vec<FunctionBreakpointSpec> {
         self.function_breakpoints
             .iter()
             .map(FunctionBreakpointSetting::spec)
             .collect()
     }
 
-    fn data_specs(&self) -> Vec<DataBreakpointSpec> {
+    fn function_specs(&self) -> Vec<FunctionBreakpointSpec> {
+        if self.muted {
+            Vec::new()
+        } else {
+            self.all_function_specs()
+        }
+    }
+
+    /// Every field watchpoint of the window, whether the list is muted or not.
+    fn all_data_specs(&self) -> Vec<DataBreakpointSpec> {
         self.data_breakpoints
             .iter()
             .map(DataBreakpointSetting::spec)
             .collect()
+    }
+
+    fn data_specs(&self) -> Vec<DataBreakpointSpec> {
+        if self.muted {
+            Vec::new()
+        } else {
+            self.all_data_specs()
+        }
     }
 
     fn send_function_breakpoints(&self, cx: &mut Context<Self>) {
@@ -2702,6 +2798,7 @@ impl DebugPanel {
             data_breakpoints: self.data_breakpoints.clone(),
             exception_filters: self.filter_list(),
             inline_watches: self.inline_watches.clone(),
+            muted: self.muted,
         };
         let Ok(json) = serde_json::to_string(&saved) else {
             return;
@@ -2712,6 +2809,10 @@ impl DebugPanel {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        // New output reaches the search bar and the filter before the frame draws.
+        if self.console_search.open || self.console_search.filtering() {
+            self.rebuild_console_filter();
+        }
         let mut build_changed = self.poll_build(cx);
         // The tools answer from the snapshot of this poll, so their jobs come first.
         self.poll_tool_jobs(cx);
@@ -4480,6 +4581,215 @@ impl DebugPanel {
             .into_any_element()
     }
 
+    /// The project files, to find the sources named in the console.
+    fn file_list(&self, cx: &App) -> Arc<Vec<PathBuf>> {
+        self.files
+            .as_ref()
+            .map_or_else(Default::default, |files| files.read(cx).clone())
+    }
+
+    /// Runs the query of the search bar over the lines of the console.
+    fn rebuild_console_search(&mut self) {
+        let Self {
+            local_console,
+            console_search,
+            ..
+        } = self;
+        let texts: Vec<&str> = local_console
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        console_search.run(&texts);
+    }
+
+    /// Applies the filter to the lines of the console and runs the query over the lines
+    /// it keeps.
+    fn rebuild_console_filter(&mut self) {
+        let Self {
+            local_console,
+            console_search,
+            ..
+        } = self;
+        let texts: Vec<&str> = local_console
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        let current = console_search.current_line();
+        console_search.apply_filter(&texts);
+        if console_search.open {
+            console_search.run(&texts);
+            if let Some(line) = current {
+                console_search.focus_line(line);
+            }
+        }
+    }
+
+    /// Ctrl+F: the search bar above the output of the console.
+    fn open_console_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.front = Front::Console;
+        self.console_search.open = true;
+        self.rebuild_console_filter();
+        window.focus(&self.search_focus, cx);
+        self.scroll_to_match();
+        cx.notify();
+    }
+
+    fn close_console_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.console_search.open = false;
+        self.console_search.clear();
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn search_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        if stroke.key == "escape" {
+            cx.stop_propagation();
+            self.close_console_search(window, cx);
+            return;
+        }
+        if stroke.key == "enter" || stroke.key == "f3" {
+            cx.stop_propagation();
+            self.search_step(!stroke.modifiers.shift, cx);
+            return;
+        }
+        if stroke.modifiers.alt && !stroke.modifiers.control {
+            let toggle = match stroke.key.as_str() {
+                "c" => Some(SearchToggle::Case),
+                "w" => Some(SearchToggle::Word),
+                "x" => Some(SearchToggle::Regex),
+                _ => None,
+            };
+            if let Some(toggle) = toggle {
+                cx.stop_propagation();
+                self.toggle_search_option(toggle, window, cx);
+                return;
+            }
+        }
+        if self
+            .console_search
+            .field
+            .key_with_clipboard(event, false, cx)
+        {
+            cx.stop_propagation();
+            self.rebuild_console_search();
+            self.scroll_to_match();
+            cx.notify();
+        }
+    }
+
+    /// F3 and Shift+F3: the next match of the console, or the one before it.
+    fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.console_search.step(forward);
+        self.scroll_to_match();
+        cx.notify();
+    }
+
+    fn scroll_to_match(&self) {
+        let Some(line) = self.console_search.current_line() else {
+            return;
+        };
+        let row = (0..line)
+            .filter(|index| {
+                self.local_console
+                    .get(*index)
+                    .is_some_and(|line| self.console_search.accepts_text(&line.text))
+            })
+            .count();
+        self.scroll_side.scroll_to_item(row);
+    }
+
+    fn toggle_search_option(
+        &mut self,
+        toggle: SearchToggle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.console_search.toggle(toggle);
+        self.rebuild_console_search();
+        window.focus(&self.search_focus, cx);
+        self.scroll_to_match();
+        cx.notify();
+    }
+
+    /// The funnel of the console: only the lines with the text of the field stay.
+    fn toggle_console_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.console_search.filter_open = !self.console_search.filter_open;
+        if self.console_search.filter_open {
+            window.focus(&self.filter_focus, cx);
+        } else {
+            self.console_search.clear_filter();
+            self.rebuild_console_filter();
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn filter_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" {
+            cx.stop_propagation();
+            self.toggle_console_filter(window, cx);
+            return;
+        }
+        if self
+            .console_search
+            .filter
+            .key_with_clipboard(event, false, cx)
+        {
+            cx.stop_propagation();
+            self.rebuild_console_filter();
+            cx.notify();
+        }
+    }
+
+    /// Opens a frame of the console or a place of a compiler message.
+    fn open_console_line(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.local_console.get(index).map(|line| line.text.clone()) else {
+            return;
+        };
+        let files = self.file_list(cx);
+        if let Some(site) = console_links::frame_site(&text) {
+            if let Some(path) = site.project_file(&files) {
+                self.open_console_place(path, site.line, window, cx);
+            } else {
+                console_links::open_frame(
+                    &text,
+                    site.extension(),
+                    self.workspace.clone(),
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
+        if let Some((candidate, line)) = console_links::compiler_site(&text)
+            && let Some(path) = console_links::compiler_file(&candidate, &self.root, &files)
+        {
+            self.open_console_place(path, line, window, cx);
+        }
+    }
+
+    fn open_console_place(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let spot = editor_view::Spot::Line {
+            line: line.saturating_sub(1) as usize,
+            column: 0,
+        };
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    navigation::go_to(workspace, path, Some(spot), true, window, cx)
+                })
+                .ok();
+        });
+    }
+
     /// The Console tab: the output of the build and of the program, and the line the
     /// program reads while it waits for input.
     fn render_console(
@@ -4489,22 +4799,54 @@ impl DebugPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut console_rows: Vec<AnyElement> = Vec::new();
-        for line in &self.local_console {
+        let total = self.local_console.len();
+        let kept = self.console_search.kept_count(total);
+        for row in 0..kept {
+            let index = self.console_search.line_of_row(total, row);
+            let Some(line) = self.local_console.get(index) else {
+                continue;
+            };
             let color = if line.error {
                 theme.warning_mark
             } else {
                 theme.code
             };
-            console_rows.push(
-                div()
-                    .px(px(SPACE_M))
-                    .py(px(SPACE_XS))
-                    .font_family(MONO_FONT)
-                    .text_size(px(CODE_SIZE))
-                    .text_color(color)
-                    .child(line.text.clone())
-                    .into_any_element(),
-            );
+            let text = line.text.clone();
+            let linked = console_links::looks_like_link(&text);
+            let ranges = self.console_search.ranges(index).to_vec();
+            let mut element = div()
+                .id(("debug-console-line", index))
+                .debug_selector(move || format!("debug-console-line-{index}"))
+                .px(px(SPACE_M))
+                .py(px(SPACE_XS))
+                .font_family(MONO_FONT)
+                .text_size(px(CODE_SIZE))
+                .text_color(color)
+                .child(match ranges.is_empty() {
+                    true => text.clone().into_any_element(),
+                    false => {
+                        let highlights = ranges.iter().map(|range| {
+                            let highlight = HighlightStyle {
+                                color: Some(theme.match_text),
+                                background_color: Some(theme.match_bg),
+                                ..HighlightStyle::default()
+                            };
+                            (range.clone(), highlight)
+                        });
+                        StyledText::new(text.clone())
+                            .with_highlights(highlights)
+                            .into_any_element()
+                    }
+                });
+            if linked {
+                element = element
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_console_line(index, window, cx)
+                    }));
+            }
+            console_rows.push(element.into_any_element());
         }
         if console_rows.is_empty() {
             console_rows.push(empty_line("debug-empty-console", "No output", theme));
@@ -4537,6 +4879,15 @@ impl DebugPanel {
         )
         .flex_1()
         .min_h_0();
+        let tools = debug_console_tools(self, theme, cx);
+        let search = self
+            .console_search
+            .open
+            .then(|| debug_search_row(self, theme, cx));
+        let filter = self
+            .console_search
+            .filter_open
+            .then(|| debug_filter_row(self, theme, cx));
         // The line the user types stays at the bottom of the console, so it is at hand
         // however far the output above has scrolled.
         let mut body = div()
@@ -4545,6 +4896,9 @@ impl DebugPanel {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .child(tools)
+            .children(search)
+            .children(filter)
             .child(scrolled);
         if self.takes_input() {
             body = body.child(
@@ -4768,6 +5122,16 @@ impl DebugPanel {
     /// Value, Enter and Escape.
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
+        if key.modifiers.control && !key.modifiers.alt && !key.modifiers.shift && key.key == "f" {
+            cx.stop_propagation();
+            self.open_console_search(window, cx);
+            return;
+        }
+        if self.console_search.open && key.key == "f3" {
+            cx.stop_propagation();
+            self.search_step(!key.modifiers.shift, cx);
+            return;
+        }
         if self.variable_edit.is_some() {
             if key.key == "enter" {
                 let Some(edit) = self.variable_edit.take() else {
@@ -4921,40 +5285,61 @@ impl DebugPanel {
             .ok();
     }
 
+    /// Alt+F8: the Evaluate window, with the selected text of the editor as the first
+    /// expression.
     fn ask_evaluate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let panel = cx.weak_entity();
+        let panel = cx.entity();
         let workspace = self.workspace.clone();
         let handle = window.window_handle();
-        // Alt+F8 comes through the window while it is being updated.
+        // Alt+F8 comes through the window while it is being updated, so the text of the
+        // editor and the overlay wait for that update to end.
         cx.defer(move |cx| {
-            let panel = panel.clone();
+            let workspace = workspace.clone();
             handle
                 .update(cx, |_, window, cx| {
+                    let selected = workspace
+                        .upgrade()
+                        .and_then(|workspace| {
+                            let (_, view) = workspace.read(cx).active_editor()?;
+                            let view = view.downcast::<editor_view::EditorView>().ok()?;
+                            let editor = view.read(cx);
+                            let (range, _) = editor.selection()?;
+                            let text = editor.text()?;
+                            (!range.is_empty()).then(|| text.get(range).map(str::to_owned))?
+                        })
+                        .unwrap_or_default();
+                    let view = cx.new(|cx| {
+                        EvaluateView::new(panel.clone(), workspace.clone(), selected, cx)
+                    });
+                    let focus = view.read(cx).focus.clone();
                     workspace
                         .update(cx, |workspace, cx| {
-                            Prompt::show(
-                                "Evaluate",
-                                "Expression",
-                                move |text, cx| {
-                                    panel
-                                        .update(cx, |panel, cx| {
-                                            let expression = text.trim().to_owned();
-                                            if !expression.is_empty() {
-                                                panel.send(Command::Evaluate(expression), cx);
-                                                cx.notify();
-                                            }
-                                        })
-                                        .ok();
-                                },
-                                workspace,
-                                window,
-                                cx,
-                            )
+                            workspace.show_overlay(view.into(), focus, window, cx)
                         })
                         .ok();
                 })
                 .ok();
         });
+    }
+
+    /// Runs an expression in the selected frame for the Evaluate window and keeps it in
+    /// the history of the window.
+    pub(crate) fn evaluate(&mut self, expression: String, cx: &mut Context<Self>) {
+        let expression = expression.trim().to_owned();
+        if expression.is_empty() {
+            return;
+        }
+        if self.evaluate_history.last() != Some(&expression) {
+            self.evaluate_history.push(expression.clone());
+        }
+        self.send(Command::EvaluateWindow(expression), cx);
+        cx.notify();
+    }
+
+    /// The expressions of the Evaluate window, for a test.
+    #[cfg(test)]
+    pub(crate) fn evaluate_history(&self) -> &[String] {
+        &self.evaluate_history
     }
 }
 
@@ -5210,6 +5595,391 @@ impl Render for QuickEvaluateView {
             .left(self.position.x)
             .top(self.position.y)
             .child(enter("quick-evaluate-enter", body))
+    }
+}
+
+/// The Evaluate window of Alt+F8: an expression, its result with the fields of the value
+/// and the history of the expressions of the session.
+struct EvaluateView {
+    panel: Entity<DebugPanel>,
+    workspace: WeakEntity<Workspace>,
+    focus: FocusHandle,
+    scroll: ScrollHandle,
+    field: TextField,
+    /// The expression of the last answer, `None` before the first run.
+    expression: Option<String>,
+    /// The objects whose fields the window shows.
+    expanded: BTreeSet<i64>,
+    /// The root the window opened by itself, and the expression it belongs to, so a new
+    /// answer opens its own root once.
+    opened: Option<(String, i64)>,
+    _panel: Subscription,
+}
+
+impl EvaluateView {
+    fn new(
+        panel: Entity<DebugPanel>,
+        workspace: WeakEntity<Workspace>,
+        initial: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let _panel = cx.observe(&panel, |this, panel, cx| this.sync(panel, cx));
+        let mut field = TextField::from_text(initial);
+        field.select_all();
+        Self {
+            panel,
+            workspace,
+            focus: cx.focus_handle(),
+            scroll: ScrollHandle::new(),
+            field,
+            expression: None,
+            expanded: BTreeSet::new(),
+            opened: None,
+            _panel,
+        }
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+
+    /// Opens the root of a new answer, so the fields of the value stand under its row as
+    /// they do in the tree of Variables.
+    fn sync(&mut self, panel: Entity<DebugPanel>, cx: &mut Context<Self>) {
+        let Some(expression) = self.expression.clone() else {
+            return;
+        };
+        let reference = panel
+            .read(cx)
+            .snapshot()
+            .evaluation
+            .as_ref()
+            .filter(|evaluation| evaluation.expression == expression)
+            .map_or(0, |evaluation| evaluation.reference);
+        if reference != 0
+            && self.opened.as_ref() != Some(&(expression.clone(), reference))
+            && self.expanded.insert(reference)
+        {
+            self.opened = Some((expression, reference));
+            panel.update(cx, |panel, cx| panel.expand(reference, cx));
+        }
+        cx.notify();
+    }
+
+    fn run(&mut self, cx: &mut Context<Self>) {
+        let expression = self.field.text.trim().to_owned();
+        if expression.is_empty() {
+            return;
+        }
+        self.expression = Some(expression.clone());
+        self.expanded.clear();
+        self.opened = None;
+        self.panel
+            .update(cx, |panel, cx| panel.evaluate(expression, cx));
+        cx.notify();
+    }
+
+    fn add_watch(&mut self, cx: &mut Context<Self>) {
+        let expression = match &self.expression {
+            Some(expression) => expression.clone(),
+            None => self.field.text.trim().to_owned(),
+        };
+        if expression.is_empty() {
+            return;
+        }
+        self.panel
+            .update(cx, |panel, cx| panel.add_watch(expression, cx));
+    }
+
+    fn toggle(&mut self, reference: i64, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&reference) {
+            self.expanded.insert(reference);
+            self.panel
+                .update(cx, |panel, cx| panel.expand(reference, cx));
+        }
+        cx.notify();
+    }
+
+    fn value_rows(
+        &self,
+        reference: i64,
+        depth: usize,
+        rows: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(variables) = self
+            .panel
+            .read(cx)
+            .snapshot()
+            .variables
+            .get(&reference)
+            .cloned()
+        else {
+            return;
+        };
+        let theme = *cx.global::<Theme>();
+        for variable in variables {
+            let open = variable.reference != 0 && self.expanded.contains(&variable.reference);
+            let arrow = if variable.reference == 0 {
+                "  "
+            } else if open {
+                "▾ "
+            } else {
+                "▸ "
+            };
+            let name = variable.name.clone();
+            let child = variable.reference;
+            let selector = format!("evaluate-row-{depth}-{name}");
+            let row = div()
+                .id(SharedString::from(format!("evaluate-row-{depth}-{name}")))
+                .debug_selector(move || selector.clone())
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(ROW_PADDING_X))
+                .py(px(SPACE_XS))
+                .cursor_pointer()
+                .text_color(theme.text)
+                .child(format!(
+                    "{}{}{} = {}",
+                    "  ".repeat(depth),
+                    arrow,
+                    variable.name,
+                    variable.value
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if child != 0 {
+                        this.toggle(child, cx);
+                    }
+                }));
+            rows.push(row.into_any_element());
+            if open {
+                self.value_rows(variable.reference, depth + 1, rows, cx);
+            }
+        }
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = &event.keystroke;
+        if key.key == "escape" {
+            self.close(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if key.key == "enter" && !key.modifiers.control && !key.modifiers.alt {
+            if key.modifiers.shift {
+                self.field.insert_text("\n");
+            } else {
+                self.run(cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.field.key_with_clipboard(event, true, cx) {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+}
+
+impl Render for EvaluateView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let history = self.panel.read(cx).evaluate_history.clone();
+        let evaluation = self.expression.as_ref().and_then(|expression| {
+            self.panel
+                .read(cx)
+                .snapshot()
+                .evaluation
+                .clone()
+                .filter(|evaluation| &evaluation.expression == expression)
+        });
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if let Some(evaluation) = &evaluation {
+            if let Some(error) = &evaluation.error {
+                rows.push(
+                    div()
+                        .px(px(ROW_PADDING_X))
+                        .py(px(SPACE_XS))
+                        .text_color(theme.warning_mark)
+                        .child(error.to_string())
+                        .into_any_element(),
+                );
+            } else {
+                let reference = evaluation.reference;
+                let type_name = if evaluation.type_name.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", evaluation.type_name)
+                };
+                let open = reference != 0 && self.expanded.contains(&reference);
+                let arrow = if reference == 0 {
+                    ""
+                } else if open {
+                    "▾ "
+                } else {
+                    "▸ "
+                };
+                let shown = self.panel.read(cx).display_value(
+                    reference,
+                    &evaluation.type_name,
+                    &evaluation.value,
+                );
+                rows.push(
+                    div()
+                        .id("evaluate-value")
+                        .debug_selector(|| "evaluate-value".to_owned())
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .px(px(ROW_PADDING_X))
+                        .py(px(SPACE_XS))
+                        .cursor_pointer()
+                        .text_color(theme.text)
+                        .child(format!(
+                            "{arrow}{}{type_name} = {shown}",
+                            evaluation.expression
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if reference != 0 {
+                                this.toggle(reference, cx);
+                            }
+                        }))
+                        .into_any_element(),
+                );
+                if open {
+                    self.value_rows(reference, 1, &mut rows, cx);
+                }
+            }
+        }
+        let has_text = !self.field.text.trim().is_empty();
+        let result = scrollable(
+            "evaluate-result",
+            &self.scroll,
+            div().flex().flex_col().gap(px(2.)).children(rows),
+            &theme,
+            window,
+            cx,
+        )
+        .max_h(px(CODE_LINE_HEIGHT * 8.));
+        let field = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .min_h(px(CODE_LINE_HEIGHT * 2.))
+            .px(px(SPACE_S))
+            .py(px(SPACE_XS))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.control_border)
+            .text_color(theme.text)
+            .children(text_field_lines_named(
+                "evaluate-field",
+                &self.field,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                CODE_LINE_HEIGHT,
+                true,
+            ));
+        let history_rows: Vec<AnyElement> = history
+            .iter()
+            .rev()
+            .take(6)
+            .enumerate()
+            .map(|(index, expression)| {
+                let text = expression.clone();
+                div()
+                    .id(SharedString::from(format!("evaluate-history-{index}")))
+                    .debug_selector(move || format!("evaluate-history-{index}"))
+                    .flex()
+                    .items_center()
+                    .px(px(ROW_PADDING_X))
+                    .py(px(SPACE_XS))
+                    .cursor_pointer()
+                    .text_color(theme.text_secondary)
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(expression.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.field = TextField::from_text(text.clone());
+                        this.field.select_all();
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        let body = surface(&theme)
+            .id("evaluate-window")
+            .debug_selector(|| "evaluate-window".to_owned())
+            .track_focus(&self.focus)
+            .occlude()
+            .w(px(560.))
+            .p(px(DIALOG_PADDING))
+            .gap(px(SPACE_S))
+            .text_size(px(CODE_SIZE))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .child(
+                div()
+                    .px(px(SPACE_M))
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child("Evaluate Expression"),
+            )
+            .child(field)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .child(
+                        dialog_button(
+                            "evaluate-run",
+                            "evaluate-run".to_owned(),
+                            "Evaluate",
+                            true,
+                            has_text,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.run(cx))),
+                    )
+                    .child(
+                        dialog_button(
+                            "evaluate-add-watch",
+                            "evaluate-add-watch".to_owned(),
+                            "Add to Watches",
+                            false,
+                            has_text,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.add_watch(cx))),
+                    ),
+            )
+            .child(result)
+            .when(!history.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px(px(SPACE_M))
+                        .pt(px(SPACE_S))
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.line_number)
+                        .child("History"),
+                )
+                .children(history_rows)
+            });
+        let viewport = window.viewport_size();
+        let width = px(560.);
+        let left = (viewport.width - width) / 2.;
+        let top = viewport.height * 0.2;
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .child(enter("evaluate-enter", body))
     }
 }
 
@@ -5525,6 +6295,219 @@ fn tool_button(
     if enabled { button } else { button.opacity(0.4) }
 }
 
+/// The buttons above the console: the search bar and the filter.
+fn debug_console_tools(
+    panel: &DebugPanel,
+    theme: &Theme,
+    cx: &mut Context<DebugPanel>,
+) -> AnyElement {
+    let filtering = panel.console_search.filter_open;
+    div()
+        .id("debug-console-tools")
+        .debug_selector(|| "debug-console-tools".to_owned())
+        .flex()
+        .items_center()
+        .gap(px(SPACE_XS))
+        .flex_none()
+        .px(px(SPACE_M))
+        .pt(px(SPACE_S))
+        .child(
+            icon_button(
+                "debug-console-find",
+                "general/search",
+                "Find in Console",
+                Some("Ctrl+F".into()),
+                theme,
+            )
+            .debug_selector(|| "debug-console-find".to_owned())
+            .on_click(cx.listener(|this, _, window, cx| this.open_console_search(window, cx))),
+        )
+        .child(
+            icon_button(
+                "debug-console-filter",
+                "general/filter",
+                "Filter Lines",
+                None,
+                theme,
+            )
+            .debug_selector(|| "debug-console-filter".to_owned())
+            .when(filtering, |button| button.bg(theme.selection))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_console_filter(window, cx))),
+        )
+        .into_any_element()
+}
+
+/// The search bar of the console: the query, its options, the counter and the moves
+/// between the matches.
+fn debug_search_row(panel: &DebugPanel, theme: &Theme, cx: &mut Context<DebugPanel>) -> AnyElement {
+    let search = &panel.console_search;
+    let (status, error) = search.status();
+    let case = debug_search_toggle(
+        "debug-search-case",
+        "general/caseSensitive",
+        "Match Case",
+        "Alt+C",
+        search.case_sensitive,
+        SearchToggle::Case,
+        theme,
+        cx,
+    );
+    let word = debug_search_toggle(
+        "debug-search-word",
+        "general/wholeWord",
+        "Whole Words",
+        "Alt+W",
+        search.whole_word,
+        SearchToggle::Word,
+        theme,
+        cx,
+    );
+    let regex = debug_search_toggle(
+        "debug-search-regex",
+        "general/regex",
+        "Regex",
+        "Alt+X",
+        search.regex,
+        SearchToggle::Regex,
+        theme,
+        cx,
+    );
+    let field = div()
+        .id("debug-search-field")
+        .track_focus(&panel.search_focus)
+        .on_key_down(cx.listener(|this, event, window, cx| this.search_key(event, window, cx)))
+        .flex()
+        .items_center()
+        .flex_1()
+        .h(px(CONTROL_HEIGHT - SPACE_M))
+        .px(px(SPACE_M))
+        .rounded(px(CONTROL_RADIUS))
+        .border_1()
+        .border_color(theme.accent)
+        .text_size(px(UI_SIZE))
+        .text_color(theme.text)
+        .overflow_hidden()
+        .children(crate::console_search::field_parts(
+            "debug-search-field",
+            &search.field,
+            theme,
+            true,
+        ))
+        .when(search.field.text.is_empty(), |this| {
+            this.child(div().text_color(theme.text_secondary).child("Find"))
+        });
+    div()
+        .id("debug-console-search")
+        .debug_selector(|| "debug-console-search".to_owned())
+        .flex()
+        .items_center()
+        .flex_none()
+        .h(px(CONTROL_HEIGHT))
+        .mx(px(SPACE_M))
+        .mb(px(SPACE_S))
+        .gap(px(SPACE_S))
+        .child(field)
+        .child(case)
+        .child(word)
+        .child(regex)
+        .child(
+            icon_button(
+                "debug-search-prev",
+                "general/arrowUp",
+                "Previous Match",
+                Some("Shift+F3".into()),
+                theme,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.search_step(false, cx))),
+        )
+        .child(
+            icon_button(
+                "debug-search-next",
+                "general/arrowDown",
+                "Next Match",
+                Some("F3".into()),
+                theme,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.search_step(true, cx))),
+        )
+        .child(
+            div()
+                .debug_selector(|| "debug-search-status".to_owned())
+                .text_color(if error {
+                    theme.error
+                } else {
+                    theme.text_secondary
+                })
+                .child(status),
+        )
+        .child(
+            icon_button(
+                "debug-search-close",
+                "general/closeSmall",
+                "Close Search",
+                Some("Escape".into()),
+                theme,
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.close_console_search(window, cx))),
+        )
+        .into_any_element()
+}
+
+/// The field of the filter of the console: only the lines with its text stay.
+fn debug_filter_row(panel: &DebugPanel, theme: &Theme, cx: &mut Context<DebugPanel>) -> AnyElement {
+    div()
+        .id("debug-console-filter-row")
+        .debug_selector(|| "debug-console-filter-row".to_owned())
+        .flex()
+        .items_center()
+        .flex_none()
+        .h(px(CONTROL_HEIGHT))
+        .mx(px(SPACE_M))
+        .mb(px(SPACE_S))
+        .px(px(SPACE_M))
+        .rounded(px(CONTROL_RADIUS))
+        .border_1()
+        .border_color(theme.accent)
+        .track_focus(&panel.filter_focus)
+        .on_key_down(cx.listener(|this, event, window, cx| this.filter_key(event, window, cx)))
+        .children(crate::console_search::field_parts(
+            "debug-filter-field",
+            &panel.console_search.filter,
+            theme,
+            true,
+        ))
+        .when(panel.console_search.filter.text.is_empty(), |this| {
+            this.child(div().text_color(theme.text_secondary).child("Filter lines"))
+        })
+        .into_any_element()
+}
+
+/// A button of the search bar of the console that turns one option on or off.
+#[allow(clippy::too_many_arguments)]
+fn debug_search_toggle(
+    id: &'static str,
+    icon_name: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    on: bool,
+    toggle: SearchToggle,
+    theme: &Theme,
+    cx: &mut Context<DebugPanel>,
+) -> Stateful<Div> {
+    let button = icon_button(id, icon_name, label, Some(hint.into()), theme);
+    let button = if on {
+        button
+            .bg(theme.tab_selected)
+            .border_1()
+            .border_color(theme.tab_selected_border)
+    } else {
+        button
+    };
+    button.on_click(
+        cx.listener(move |this, _, window, cx| this.toggle_search_option(toggle, window, cx)),
+    )
+}
+
 /// The line between two groups of toolbar buttons.
 fn toolbar_divider(theme: &Theme) -> Div {
     div()
@@ -5780,6 +6763,18 @@ impl Render for DebugPanel {
                     &theme,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.show_breakpoints(window, cx))),
+            )
+            .child(
+                tool_button(
+                    "debug-mute",
+                    "debug/breakpointMuted",
+                    "Mute Breakpoints",
+                    None,
+                    true,
+                    &theme,
+                )
+                .when(self.muted, |button| button.bg(theme.selection))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
             )
             .child(
                 tool_button(
@@ -6746,7 +7741,14 @@ pub(crate) fn refresh_breakpoints(
         .filter(|line| *line > 0)
         .map(|line| line - 1)
         .collect();
-    view.set_breakpoints(lines, cx);
+    view.set_breakpoints(lines.clone(), cx);
+    // A muted list is grey in the gutter, as the button of the Debug toolbar greys it.
+    let disabled: Vec<u32> = if panel.read(cx).muted() {
+        lines
+    } else {
+        Vec::new()
+    };
+    view.set_disabled_breakpoints(disabled, cx);
     let muted = panel.read(cx).non_suspending_breakpoint_lines(view.path());
     let muted: Vec<u32> = muted
         .into_iter()
@@ -6970,11 +7972,13 @@ mod tests {
                 variable_edit: None,
                 watch_input: None,
                 selected_watch: None,
+                evaluate_history: Vec::new(),
                 temporary: None,
                 forced_step: None,
                 seen_stops: 0,
                 asking_targets: false,
                 asking_targets_window: None,
+                muted: false,
                 breakpoints: Vec::new(),
                 function_breakpoints: Vec::new(),
                 data_breakpoints: Vec::new(),
@@ -7000,6 +8004,10 @@ mod tests {
                 local_console: Vec::new(),
                 seen_console: Vec::new(),
                 console_input: crate::console_input::ConsoleInput::new(),
+                console_search: Default::default(),
+                search_focus: cx.focus_handle(),
+                filter_focus: cx.focus_handle(),
+                files: None,
                 build: None,
                 build_output: OutputBuffers::default(),
                 build_process: None,
@@ -7048,6 +8056,7 @@ mod tests {
             )],
             exception_filters: vec!["uncaught".into()],
             inline_watches: Vec::new(),
+            muted: false,
         };
         let json = serde_json::to_string(&saved).unwrap();
         let back: SavedState = serde_json::from_str(&json).unwrap();

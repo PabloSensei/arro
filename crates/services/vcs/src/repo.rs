@@ -79,6 +79,28 @@ pub struct CommitRequest {
     pub amend: bool,
 }
 
+/// A file whose changes the user split into hunks: the hunks listed here stay out of the
+/// commit and in the working tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialFile {
+    /// Relative to the root.
+    pub path: String,
+    pub excluded: Vec<Hunk>,
+}
+
+/// Where Push sends the current branch and how.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushRequest {
+    pub remote: String,
+    pub branch: String,
+    /// The branch of the remote the commits go to.
+    pub destination: String,
+    /// The branch gets this remote branch as its upstream, as `-u` does.
+    pub set_upstream: bool,
+    pub tags: bool,
+    pub force: bool,
+}
+
 /// Two branches side by side: the commits only one of them has, and the files they
 /// differ in. `base` is the branch the user compares with the current one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -335,6 +357,128 @@ impl Repository {
         Ok(self.run(["rev-parse", "HEAD"])?.trim().to_owned())
     }
 
+    /// Like [`Repository::commit`], but the files in `partial` take only the hunks the
+    /// user left ticked: the patch of those hunks goes into a temporary index, so the
+    /// hunks left out stay in the working tree and nothing else is staged. A hunk that no
+    /// longer matches the file stops the commit before git writes anything.
+    pub fn commit_partial(
+        &self,
+        request: &CommitRequest,
+        options: &CommitOptions,
+        partial: &[PartialFile],
+    ) -> io::Result<String> {
+        if partial.is_empty() {
+            return self.commit_with(request, options);
+        }
+        let head = self.status()?.head.is_some();
+        let index = temp_path("commit-index");
+        let _ = std::fs::remove_file(&index);
+        let env = [("GIT_INDEX_FILE", index.as_os_str())];
+        let result = self.commit_partial_with(request, options, partial, head, &env);
+        let _ = std::fs::remove_file(&index);
+        result?;
+        // The real index follows the new commit for the chosen files: what went into the
+        // commit stops showing as a change there, and the hunks left out stay unstaged.
+        let mut reset = vec!["reset", "-q", "HEAD", "--"];
+        reset.extend(request.paths.iter().map(String::as_str));
+        let _ = self.git.run(&self.root, &reset);
+        Ok(self.run(["rev-parse", "HEAD"])?.trim().to_owned())
+    }
+
+    /// The body of [`Repository::commit_partial`] with the temporary index in `env`.
+    fn commit_partial_with(
+        &self,
+        request: &CommitRequest,
+        options: &CommitOptions,
+        partial: &[PartialFile],
+        head: bool,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> io::Result<()> {
+        if head {
+            self.run_env_check(&["read-tree", "HEAD"], env)?;
+        } else {
+            self.run_env_check(&["read-tree", "--empty"], env)?;
+        }
+        let partial_paths: HashSet<&str> = partial.iter().map(|file| file.path.as_str()).collect();
+        let mut add = vec!["add", "-A", "--"];
+        for path in &request.paths {
+            if !partial_paths.contains(path.as_str()) {
+                add.push(path);
+            }
+        }
+        if add.len() > 3 {
+            self.run_env_check(&add, env)?;
+        }
+        let mut blobs = self.blobs()?;
+        let mut patch = Vec::new();
+        for file in partial {
+            if !request.paths.contains(&file.path) || file.excluded.is_empty() {
+                continue;
+            }
+            let base_bytes = blobs.read(&format!("HEAD:{}", file.path))?;
+            let base = base_bytes
+                .as_ref()
+                .map(|bytes| text_core::decode(bytes).text)
+                .unwrap_or_default();
+            let current = text_core::read_file(&self.root.join(&file.path))?.text;
+            let hunks = line_hunks(&base, &current);
+            if file
+                .excluded
+                .iter()
+                .any(|excluded| !hunks.contains(excluded))
+            {
+                return Err(io::Error::other(format!(
+                    "the changes of {} changed since the diff was opened; open the diff again",
+                    file.path
+                )));
+            }
+            let selected: Vec<Hunk> = hunks
+                .iter()
+                .filter(|hunk| !file.excluded.contains(hunk))
+                .cloned()
+                .collect();
+            if selected.len() == hunks.len() {
+                self.run_env_check(&["add", "-A", "--", file.path.as_str()], env)?;
+                continue;
+            }
+            if selected.is_empty() {
+                continue;
+            }
+            let target = partial_text(&base, &current, &hunks, &selected);
+            patch.extend(unified_patch(
+                &file.path,
+                base_bytes.is_some(),
+                &base,
+                &target,
+            ));
+        }
+        if !patch.is_empty() {
+            let args = ["apply", "--cached", "--whitespace=nowarn"];
+            self.run_env_with_input(&args, env, Some(&patch))
+                .map_err(|error| {
+                    io::Error::other(format!("the chosen changes do not apply: {error}"))
+                })?;
+        }
+        let mut commit = vec!["commit", "-F", "-"];
+        if request.amend {
+            commit.push("--amend");
+        }
+        if options.sign_off {
+            commit.push("--signoff");
+        }
+        let author = options
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|author| !author.is_empty());
+        if let Some(author) = author {
+            commit.push("--author");
+            commit.push(author);
+        }
+        self.run_env_with_input(&commit, env, Some(request.message.as_bytes()))
+            .map(drop)
+    }
+
     /// Whether the commit belongs to the user of the repository.
     pub fn is_own_commit(&self, commit: &str) -> io::Result<bool> {
         let email = self.run(["show", "-s", "--format=%ae", commit])?;
@@ -498,6 +642,65 @@ impl Repository {
         self.git
             .run(&self.root, ["push", "--set-upstream", remote, "HEAD"])?;
         Ok(())
+    }
+
+    /// The names of the remotes of the repository.
+    pub fn remotes(&self) -> io::Result<Vec<String>> {
+        let output = self.run(["remote"])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// The commits of the current branch the remote does not have: what Push sends.
+    pub fn outgoing_commits(&self, limit: usize) -> io::Result<Vec<Commit>> {
+        let status = self.status()?;
+        if status.head.is_none() {
+            return Ok(Vec::new());
+        }
+        match &status.upstream {
+            Some(upstream) => self.commits_in(&format!("{upstream}..HEAD"), limit),
+            // A branch with no upstream has no remote history to compare with: every
+            // commit of the branch that no remote has is on its way.
+            None => {
+                let limit = format!("--max-count={limit}");
+                let output = self.git.run(
+                    &self.root,
+                    ["log", LOG_FORMAT, &limit, "HEAD", "--not", "--remotes"],
+                )?;
+                Ok(commits_of(&String::from_utf8_lossy(&output)))
+            }
+        }
+    }
+
+    /// Sends the current branch to the chosen remote branch, with the switches of the
+    /// Push window.
+    pub fn push_to(&self, request: &PushRequest) -> io::Result<()> {
+        let mut args = vec!["push"];
+        if request.force {
+            args.push("--force-with-lease");
+        }
+        if request.tags {
+            args.push("--tags");
+        }
+        if request.set_upstream {
+            args.push("--set-upstream");
+        }
+        args.push(request.remote.as_str());
+        let refspec;
+        if request.set_upstream && request.destination == request.branch {
+            args.push(request.branch.as_str());
+        } else {
+            refspec = format!(
+                "refs/heads/{}:refs/heads/{}",
+                request.branch, request.destination
+            );
+            args.push(refspec.as_str());
+        }
+        self.git.run(&self.root, &args).map(drop)
     }
 
     /// Ctrl+T: fetch, then merge the upstream in. Kept for callers that want the default.
@@ -1379,6 +1582,146 @@ fn track_counts(track: &str) -> (u32, u32) {
 
 fn stash_ref(index: usize) -> String {
     format!("stash@{{{index}}}")
+}
+
+/// The text of `current` with only `selected` hunks of `base`: the lines of the other
+/// hunks stay as `base` has them.
+fn partial_text(base: &str, current: &str, hunks: &[Hunk], selected: &[Hunk]) -> String {
+    let before: Vec<&str> = base.split('\n').collect();
+    let after: Vec<&str> = current.split('\n').collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut at = 0usize;
+    for hunk in hunks {
+        if !selected.contains(hunk) {
+            continue;
+        }
+        let start = (hunk.before.start as usize).min(before.len());
+        let end = (hunk.before.end as usize).min(before.len());
+        if start < at {
+            continue;
+        }
+        out.extend_from_slice(&before[at..start]);
+        let first = (hunk.after.start as usize).min(after.len());
+        let last = (hunk.after.end as usize).min(after.len());
+        out.extend_from_slice(&after[first..last]);
+        at = end;
+    }
+    out.extend_from_slice(&before[at..]);
+    out.join("\n")
+}
+
+/// The lines of `text` without the empty last element a final line end leaves, and
+/// whether the text ends with a line end.
+fn physical_lines(text: &str) -> (Vec<&str>, bool) {
+    if text.is_empty() {
+        return (Vec::new(), false);
+    }
+    let ends = text.ends_with('\n');
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if ends {
+        lines.pop();
+    }
+    (lines, ends)
+}
+
+fn patch_name(prefix: &str, path: &str) -> String {
+    let quoted = path
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '"' | '\\'));
+    if !quoted {
+        return format!("{prefix}{path}");
+    }
+    let mut name = format!("{prefix}\"");
+    for character in path.chars() {
+        match character {
+            '"' | '\\' => {
+                name.push('\\');
+                name.push(character);
+            }
+            '\n' => name.push_str("\\n"),
+            '\t' => name.push_str("\\t"),
+            _ => name.push(character),
+        }
+    }
+    name.push('"');
+    name
+}
+
+/// One unified diff of the whole file, so that `git apply --cached` puts the text of a
+/// partial commit into the index. `base_exists` false makes the patch an added file.
+fn unified_patch(path: &str, base_exists: bool, base: &str, target: &str) -> Vec<u8> {
+    if base == target {
+        return Vec::new();
+    }
+    let (old, old_ends) = physical_lines(base);
+    let (new, new_ends) = physical_lines(target);
+    let hunks = line_hunks(base, target);
+    let mut patch = String::new();
+    patch.push_str("diff --git ");
+    patch.push_str(&patch_name("a/", path));
+    patch.push(' ');
+    patch.push_str(&patch_name("b/", path));
+    patch.push('\n');
+    if !base_exists {
+        patch.push_str("new file mode 100644\n--- /dev/null\n");
+    } else {
+        patch.push_str(&format!("--- {}\n", patch_name("a/", path)));
+    }
+    patch.push_str(&format!("+++ {}\n", patch_name("b/", path)));
+    let old_start = if old.is_empty() { 0 } else { 1 };
+    let new_start = if new.is_empty() { 0 } else { 1 };
+    patch.push_str(&format!(
+        "@@ -{old_start},{} +{new_start},{} @@\n",
+        old.len(),
+        new.len()
+    ));
+    let mut old_at = 0usize;
+    let mut new_at = 0usize;
+    let mut push_line = |sign: char, text: &str, old_last: bool, new_last: bool| {
+        patch.push(sign);
+        patch.push_str(text);
+        patch.push('\n');
+        let no_eol = (old_last && !old_ends) || (new_last && !new_ends);
+        if no_eol {
+            patch.push_str("\\ No newline at end of file\n");
+        }
+    };
+    for hunk in &hunks {
+        let start = (hunk.before.start as usize).min(old.len());
+        let end = (hunk.before.end as usize).min(old.len());
+        while old_at < start && new_at < new.len() {
+            push_line(
+                ' ',
+                old[old_at],
+                old_at + 1 == old.len(),
+                new_at + 1 == new.len(),
+            );
+            old_at += 1;
+            new_at += 1;
+        }
+        while old_at < end {
+            push_line('-', old[old_at], old_at + 1 == old.len(), false);
+            old_at += 1;
+        }
+        let first = (hunk.after.start as usize).min(new.len());
+        let last = (hunk.after.end as usize).min(new.len());
+        new_at = first.max(new_at);
+        while new_at < last {
+            push_line('+', new[new_at], false, new_at + 1 == new.len());
+            new_at += 1;
+        }
+    }
+    while old_at < old.len() && new_at < new.len() {
+        push_line(
+            ' ',
+            old[old_at],
+            old_at + 1 == old.len(),
+            new_at + 1 == new.len(),
+        );
+        old_at += 1;
+        new_at += 1;
+    }
+    patch.into_bytes()
 }
 
 /// A unique path in the temporary folder for an index or a script of a reword.

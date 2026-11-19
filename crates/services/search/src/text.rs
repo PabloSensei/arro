@@ -25,6 +25,8 @@ pub struct TextQuery {
     pub regex: bool,
     pub match_case: bool,
     pub whole_words: bool,
+    /// A replacement takes the case of the text it replaces.
+    pub preserve_case: bool,
 }
 
 impl TextQuery {
@@ -246,6 +248,9 @@ pub fn replace_edits(
             captures.expand(replacement, &mut new_text);
         } else {
             new_text.push_str(replacement);
+        }
+        if query.preserve_case {
+            new_text = text_core::find::preserve_case(found.as_str(), &new_text);
         }
         edits.push(Edit::new(found.range(), new_text));
     }

@@ -495,9 +495,41 @@ fn open_brackets(code: &str) -> String {
     stack.into_iter().rev().collect()
 }
 
+/// One caret's Complete Statement: the bytes of the text the edit replaces, the text that
+/// takes their place and the caret inside it, counted from the start of the replaced
+/// range. A language may build the plan from its tree; the editor only applies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatementPlan {
+    pub range: Range<usize>,
+    pub text: String,
+    pub select: Range<usize>,
+}
+
+/// Ctrl+Shift+Enter: finishes the statement of every caret, one step of undo.
+pub fn apply_statement_plans<S: TextStore>(
+    buffer: &mut Buffer<S>,
+    plans: Vec<StatementPlan>,
+    source: EditSource,
+) -> Change {
+    let mut ordered = plans;
+    ordered.sort_by_key(|plan| plan.range.start);
+    // Two carets on one line finish the same statement: the first plan covers both.
+    ordered.dedup_by(|later, earlier| later.range.start < earlier.range.end);
+    let plans = ordered
+        .into_iter()
+        .map(|plan| Plan {
+            range: plan.range,
+            text: plan.text,
+            select: plan.select,
+        })
+        .collect();
+    apply_plans(buffer, plans, source, EditKind::Command)
+}
+
 /// Ctrl+Shift+Enter: finishes the statement on the caret line and starts the next line.
 /// Open brackets are closed; a statement that takes a block gets `{`, an empty line in it
-/// and `}`; any other gets its terminator.
+/// and `}`; any other gets its terminator. A language that reads its tree answers with a
+/// plan of its own per caret and this is only the fallback.
 pub fn complete_statement<S: TextStore>(
     buffer: &mut Buffer<S>,
     terminator: &str,
@@ -506,11 +538,29 @@ pub fn complete_statement<S: TextStore>(
     source: EditSource,
 ) -> Change {
     let store = buffer.snapshot();
-    let head = buffer.selections().primary().head;
+    let plans = buffer
+        .selections()
+        .iter()
+        .map(|selection| {
+            line_statement_plan(&store, selection, terminator, block_words, indent_unit)
+        })
+        .collect();
+    apply_statement_plans(buffer, plans, source)
+}
+
+/// The plan of Complete Statement for one caret, by the text of its line alone.
+pub fn line_statement_plan<S: TextStore>(
+    store: &S,
+    selection: &Selection,
+    terminator: &str,
+    block_words: &[&str],
+    indent_unit: &str,
+) -> StatementPlan {
+    let head = selection.head;
     let line = store.offset_to_line(head);
     let text = store.line_text(line);
     let code = text.trim_end();
-    let indent = line_indent_of(&store, head);
+    let indent = line_indent_of(store, head);
     let start = store.line_to_offset(line);
     let range = start + code.len()..start + text.len();
     let mut finished = code.to_owned();
@@ -550,12 +600,11 @@ pub fn complete_statement<S: TextStore>(
             tail.len() + terminator.len() + 1 + indent.len(),
         )
     };
-    let plan = Plan {
+    StatementPlan {
         range,
         text,
         select: caret..caret,
-    };
-    apply_plans(buffer, vec![plan], source, EditKind::Command)
+    }
 }
 
 /// Shift+Tab: takes one indent off every touched line.

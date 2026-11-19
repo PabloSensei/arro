@@ -320,6 +320,7 @@ impl WindowTools {
             regex: query.regex,
             match_case: false,
             whole_words: false,
+            preserve_case: false,
         };
         let cancel = base::Cancel::new();
         let stop = cancel.clone();
