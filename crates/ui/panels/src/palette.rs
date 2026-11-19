@@ -18,9 +18,9 @@ use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{
-    AI_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL, DEBUG_TOOL, ENDPOINTS_TOOL, FileIcons,
-    HTTP_TOOL, LOG_TOOL, PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL,
-    STRUCTURE_TOOL, Settings, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    AI_TOOL, BUILD_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL, DEBUG_TOOL, ENDPOINTS_TOOL,
+    FileIcons, HTTP_TOOL, LOG_TOOL, PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL,
+    SERVICES_TOOL, STRUCTURE_TOOL, Settings, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
 };
 
 use crate::index::ProjectIndex;
@@ -220,7 +220,7 @@ const TABS: [(Tab, &str); 5] = [
 ];
 
 /// The tool windows the Switcher lists, in the order they appear there.
-const TOOLS: [(&str, &str, &str); 17] = [
+const TOOLS: [(&str, &str, &str); 18] = [
     (PROJECT_TOOL, "Project", "toolwindows/project"),
     (COMMIT_TOOL, "Commit", "toolwindows/commit"),
     (LOG_TOOL, "Git Log", "general/vcs"),
@@ -238,6 +238,7 @@ const TOOLS: [(&str, &str, &str); 17] = [
     (PROFILER_TOOL, "Profiler", "run/profiler"),
     (HTTP_TOOL, "HTTP Response", "toolwindows/http"),
     (ENDPOINTS_TOOL, "Endpoints", "toolwindows/endpoints"),
+    (BUILD_TOOL, "Build", "toolwindows/tasks"),
 ];
 
 /// The commands of Search Everywhere that begin with `/`.

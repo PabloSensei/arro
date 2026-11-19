@@ -337,6 +337,10 @@ pub mod editor {
     pub const EXTRACT_FIELD: &str = "editor.extract_field";
     pub const EXTRACT_CONSTANT: &str = "editor.extract_constant";
     pub const INTRODUCE_PARAMETER: &str = "editor.introduce_parameter";
+    pub const PULL_MEMBERS_UP: &str = "editor.pull_members_up";
+    pub const PUSH_MEMBERS_DOWN: &str = "editor.push_members_down";
+    pub const EXTRACT_SUPERCLASS: &str = "editor.extract_superclass";
+    pub const INTRODUCE_PARAMETER_OBJECT: &str = "editor.introduce_parameter_object";
     pub const INLINE: &str = "editor.inline";
     pub const REFACTOR_THIS: &str = "editor.refactor_this";
     pub const MOVE: &str = "editor.move";

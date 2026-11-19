@@ -333,6 +333,8 @@ pub struct AgentsPanel {
     window: AnyWindowHandle,
     /// A rename an MCP client waits on, with the notification of its preview.
     pub(crate) pending_rename: Option<PendingRename>,
+    /// The file the last delete of a tool removed, with its bytes, for Undo.
+    last_deleted: Option<(PathBuf, Vec<u8>)>,
     /// The last view published to the IDE protocol, so an idle frame does no work.
     view_key: Option<u64>,
     /// Numbers the reads of the hunks, so an older answer does not replace a newer one.
@@ -774,6 +776,7 @@ impl AgentsPanel {
                 edits,
                 window,
                 pending_rename: None,
+                last_deleted: None,
                 view_key: None,
                 marks_generation: 0,
                 focus: cx.focus_handle(),
@@ -954,7 +957,7 @@ impl AgentsPanel {
                     Waiter::Bridge(diff.id),
                     diff.path,
                     diff.base,
-                    diff.proposed,
+                    Some(diff.proposed),
                     cx,
                 ),
                 BridgeEvent::Close(id) => self.drop_proposal(id, cx),
@@ -969,7 +972,7 @@ impl AgentsPanel {
         waiter: Waiter,
         path: PathBuf,
         base: Option<String>,
-        proposed: String,
+        proposed: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let relative = crate::git::relative_of(&self.root, &path);
@@ -977,7 +980,12 @@ impl AgentsPanel {
         self.next_proposal += 1;
         let proposal = Proposal::new(id, waiter, path.clone(), relative, base, proposed);
         if proposal.review.hunks.is_empty() {
-            self.answer_empty(&proposal, cx);
+            if proposal.review.current.is_none() && proposal.review.base.is_some() {
+                self.proposals.push(proposal);
+                self.resolve_proposal(self.proposals.len() - 1, cx);
+            } else {
+                self.answer_empty(&proposal, cx);
+            }
             return;
         }
         self.proposals.push(proposal);
@@ -1292,7 +1300,7 @@ impl AgentsPanel {
         else {
             return;
         };
-        if kept == 0 {
+        if hunks > 0 && kept == 0 {
             match waiter {
                 Waiter::Tool(request) => self.edits.resolve(
                     request,
@@ -1342,10 +1350,23 @@ impl AgentsPanel {
         };
         let written = text.clone();
         let write_path = path.clone();
+        let undo_base = base.clone();
+        let history = crate::history::get(cx);
+        let deleting = written.is_none();
         let job = cx.background_executor().spawn(async move {
             let current = std::fs::read(&write_path).ok();
             if current != base {
                 return Err("the file changed on disk".to_string());
+            }
+            // The Local History keeps what is about to be replaced or removed, so the
+            // window can undo the edit or show it later.
+            if let Some(history) = &history {
+                let cause = if deleting {
+                    local_history::Cause::BeforeDelete
+                } else {
+                    local_history::Cause::BeforeReplace
+                };
+                let _ = history.record_tree(&write_path, cause);
             }
             match written {
                 Some(text) => {
@@ -1358,7 +1379,12 @@ impl AgentsPanel {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                         Err(error.to_string())
                     }
-                    _ => Ok(()),
+                    _ => {
+                        if let Some(history) = &history {
+                            let _ = history.record_removed(&write_path);
+                        }
+                        Ok(())
+                    }
                 },
             }
         });
@@ -1371,6 +1397,13 @@ impl AgentsPanel {
                 }
                 match result {
                     Ok(()) => {
+                        if text.is_none()
+                            && let Some(base) = undo_base
+                        {
+                            let target = path.clone();
+                            this.last_deleted = Some((target.clone(), base));
+                            this.offer_undo_delete(&target, cx);
+                        }
                         match waiter {
                             Waiter::Tool(request) => this.edits.resolve(
                                 request,
@@ -1416,6 +1449,71 @@ impl AgentsPanel {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Offers the Undo of a file the user just deleted, as the notification of the
+    /// window does.
+    fn offer_undo_delete(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let relative = crate::git::relative_of(&self.root, path);
+        let text = format!("Deleted {relative}");
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user_with_commands(
+                    "Delete",
+                    text,
+                    vec![("undo", SharedString::from("Undo"), "ai.mcp.undo-delete")],
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    /// Puts the file of the last delete back, as the Undo of the notification does.
+    pub(crate) fn undo_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((path, bytes)) = self.last_deleted.take() else {
+            return;
+        };
+        if path.exists() {
+            return;
+        }
+        let history = crate::history::get(cx);
+        let write_path = path.clone();
+        let job = cx.background_executor().spawn(async move {
+            if let Some(parent) = write_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&write_path, &bytes).map_err(|error| error.to_string())?;
+            if let Some(history) = &history {
+                let _ = history.record(
+                    &write_path,
+                    Some(&bytes),
+                    local_history::Cause::BeforeRestore,
+                );
+            }
+            Ok::<(), String>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let written = job.await;
+            this.update(cx, |this, cx| {
+                if written.is_ok() {
+                    OpenEditors::reload(&path, cx);
+                    if let Some(panel) = this.tool_workspace_project(cx) {
+                        panel.update(cx, |panel, cx| panel.reload(cx));
+                    }
+                    if let Some(tracker) = this.tracker() {
+                        tracker.refresh();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn tool_workspace_project(&self, cx: &App) -> Option<Entity<crate::project::ProjectPanel>> {
+        cx.try_global::<crate::project::ActiveProjectPanel>()
+            .map(|panel| panel.0.clone())
     }
 
     /// Accept, reject or walk the hunks of a proposed file.

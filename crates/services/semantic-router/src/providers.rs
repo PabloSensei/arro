@@ -102,6 +102,9 @@ pub struct LspProviders {
     refactor_action: Option<&'static str>,
     refactor_edit_request: Option<&'static str>,
     refactor_steps: RefactorSteps,
+    /// The command a server runs to point at the name its refactoring introduced.
+    refactor_rename_command: Option<&'static str>,
+    refactor_selections_request: Option<&'static str>,
     move_destinations_request: Option<&'static str>,
     move_request: Option<&'static str>,
     change_signature_info_request: Option<&'static str>,
@@ -345,6 +348,7 @@ fn action_entry(
     action: lsp::CodeActionOrCommand,
     edit_command: Option<&str>,
     refactor_action: Option<&str>,
+    rename: Option<lang_api::RenamePosition>,
 ) -> Option<ActionEntry> {
     let (title, code, preferred, edit, command) = match &action {
         lsp::CodeActionOrCommand::Command(command) => (
@@ -378,6 +382,7 @@ fn action_entry(
             renames: Vec::new(),
             handle: None,
             resolve: None,
+            rename: None,
         });
     }
     let (edit, handle, resolve) = match (edit, command) {
@@ -421,6 +426,24 @@ fn action_entry(
         renames: change.renames,
         handle,
         resolve,
+        rename,
+    })
+}
+
+/// The name of the element a resolved refactoring introduced, where the server marks the
+/// place for the client's rename with the command the provider named.
+fn rename_position(
+    command: &serde_json::Value,
+    rename_command: Option<&str>,
+) -> Option<lang_api::RenamePosition> {
+    if Some(command.get("command")?.as_str()?) != rename_command {
+        return None;
+    }
+    let place = command.get("arguments")?.as_array()?.first()?;
+    Some(lang_api::RenamePosition {
+        uri: place.get("uri")?.as_str()?.to_owned(),
+        offset: place.get("offset")?.as_u64()? as u32,
+        length: place.get("length")?.as_u64()? as u32,
     })
 }
 
@@ -435,30 +458,31 @@ async fn resolve_action(
     refactor_action: Option<&str>,
     edit_request: Option<&str>,
     steps: RefactorSteps,
-) -> Option<lsp::CodeActionOrCommand> {
+    rename_command: Option<&str>,
+) -> Option<(lsp::CodeActionOrCommand, Option<lang_api::RenamePosition>)> {
     let lsp::CodeActionOrCommand::CodeAction(mut action) = action else {
-        return Some(action);
+        return Some((action, None));
     };
     if action.edit.is_some() {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     }
     let (Some(command), Some(refactor_action), Some(edit_request)) =
         (&action.command, refactor_action, edit_request)
     else {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     };
     if command.command != refactor_action {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     }
     let arguments = command.arguments.clone().unwrap_or_default();
     let Some(name) = arguments.first().and_then(|name| name.as_str()) else {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     };
     let Some(context) = arguments.get(1).cloned() else {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     };
     if steps.needs_a_form(name) {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     }
     let extra = arguments.get(2..).unwrap_or_default();
     let params = serde_json::json!({
@@ -472,8 +496,11 @@ async fn resolve_action(
             let edit = reply
                 .get("edit")
                 .and_then(|edit| serde_json::from_value::<lsp::WorkspaceEdit>(edit.clone()).ok())?;
+            let rename = reply
+                .get("command")
+                .and_then(|command| rename_position(command, rename_command));
             action.edit = Some(edit);
-            Some(lsp::CodeActionOrCommand::CodeAction(action))
+            Some((lsp::CodeActionOrCommand::CodeAction(action), rename))
         }
         // No answer: the row would promise an action that cannot run.
         Err(_) => None,
@@ -487,6 +514,7 @@ async fn action_entries(
     refactor_action: Option<&str>,
     refactor_edit_request: Option<&str>,
     refactor_steps: RefactorSteps,
+    rename_command: Option<&str>,
 ) -> Vec<ActionEntry> {
     let mut entries = Vec::new();
     for action in response.into_iter().flatten() {
@@ -496,10 +524,12 @@ async fn action_entries(
             refactor_action,
             refactor_edit_request,
             refactor_steps,
+            rename_command,
         )
         .await;
-        entries
-            .extend(action.and_then(|action| action_entry(action, edit_command, refactor_action)));
+        entries.extend(action.and_then(|(action, rename)| {
+            action_entry(action, edit_command, refactor_action, rename)
+        }));
     }
     entries
 }
@@ -641,6 +671,7 @@ async fn prompt_entry(
         renames: change.renames,
         handle: None,
         resolve: None,
+        rename: None,
     })
 }
 
@@ -1223,6 +1254,8 @@ impl LspProviders {
             refactor_action: None,
             refactor_edit_request: None,
             refactor_steps: RefactorSteps::default(),
+            refactor_rename_command: None,
+            refactor_selections_request: None,
             move_destinations_request: None,
             move_request: None,
             change_signature_info_request: None,
@@ -1272,6 +1305,18 @@ impl LspProviders {
     /// the ones with a form of the editor and the ones it runs through a picker.
     pub fn with_refactor_steps(mut self, steps: RefactorSteps) -> Self {
         self.refactor_steps = steps;
+        self
+    }
+
+    /// Names the command a server runs to point at the name its refactoring introduced.
+    pub fn with_refactor_rename(mut self, command: &'static str) -> Self {
+        self.refactor_rename_command = Some(command);
+        self
+    }
+
+    /// Names the request that lists the expressions an extract may take under the caret.
+    pub fn with_refactor_selections(mut self, request: &'static str) -> Self {
+        self.refactor_selections_request = Some(request);
         self
     }
 
@@ -1639,6 +1684,7 @@ impl Provider<ActionResolveQuery, Option<ActionEntry>> for LspProviders {
                 lsp::CodeActionOrCommand::CodeAction(action),
                 edit_command,
                 None,
+                None,
             )))
         });
     }
@@ -1652,6 +1698,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for LspProviders {
         let refactor_action = self.refactor_action;
         let refactor_edit_request = self.refactor_edit_request;
         let refactor_steps = self.refactor_steps;
+        let rename_command = self.refactor_rename_command;
         let prompt_sources = self.prompt_sources.clone();
         self.answer(cancel, reply, async move {
             let place = Place {
@@ -1674,6 +1721,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for LspProviders {
                         refactor_action,
                         refactor_edit_request,
                         refactor_steps,
+                        rename_command,
                     )
                     .await
                 }
@@ -2144,6 +2192,57 @@ fn point_of(point: Position) -> TextPoint {
     TextPoint {
         line: point.line,
         character: point.character,
+    }
+}
+
+fn extract_command(kind: lang_api::ExtractKind) -> &'static str {
+    match kind {
+        lang_api::ExtractKind::Method => "extractMethod",
+        lang_api::ExtractKind::Variable => "extractVariable",
+        lang_api::ExtractKind::Constant => "extractConstant",
+        lang_api::ExtractKind::Field => "extractField",
+    }
+}
+
+impl Provider<lang_api::SelectionQuery, Vec<lang_api::SelectionEntry>> for LspProviders {
+    fn start(
+        &self,
+        query: lang_api::SelectionQuery,
+        cancel: Cancel,
+        reply: Reply<Vec<lang_api::SelectionEntry>>,
+    ) {
+        let router = self.router.clone();
+        let Some(request) = self.refactor_selections_request else {
+            self.answer(cancel, reply, async { Some(Ok(Vec::new())) });
+            return;
+        };
+        self.answer(cancel, reply, async move {
+            let place = place(&query.spot)?;
+            let at = position(query.spot.point);
+            let params = serde_json::json!({
+                "command": extract_command(query.kind),
+                "context": {
+                    "textDocument": {"uri": place.uri.as_str()},
+                    "range": {"start": at, "end": at},
+                    "context": {"diagnostics": []},
+                },
+            });
+            let answer = router.extension(request, params).await;
+            Some(answer.map(|value| {
+                value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        Some(lang_api::SelectionEntry {
+                            name: entry.get("name")?.as_str()?.to_owned(),
+                            offset: entry.get("offset")?.as_u64()? as u32,
+                            length: entry.get("length")?.as_u64()? as u32,
+                        })
+                    })
+                    .collect()
+            }))
+        });
     }
 }
 
@@ -3199,6 +3298,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(entry.kind, Some(ActionKind::OrganizeImports));
@@ -3242,6 +3342,7 @@ mod tests {
             })),
             Some("lang.applyEdit"),
             Some("lang.applyRefactoringCommand"),
+            None,
         )
         .unwrap();
         assert_eq!(entry.kind, Some(ActionKind::Refactor));
@@ -3263,6 +3364,7 @@ mod tests {
             })),
             Some("lang.applyEdit"),
             Some("lang.applyRefactor"),
+            None,
         )
         .unwrap();
         assert_eq!(entry.code.as_deref(), Some("refactor.extract.interface"));
@@ -3283,9 +3385,10 @@ mod tests {
                            "end": {"line": 0, "character": 0}},
                  "newText": "import a.C;\n"}]}}],
         });
-        let entry = action_entry(action(command.clone()), Some("lang.applyEdit"), None).unwrap();
+        let entry =
+            action_entry(action(command.clone()), Some("lang.applyEdit"), None, None).unwrap();
         assert_eq!(entry.edits[0].edits[0].text, "import a.C;\n");
-        assert!(action_entry(action(command), None, None).is_none());
+        assert!(action_entry(action(command), None, None, None).is_none());
     }
 
     #[test]

@@ -117,7 +117,7 @@ fn group_keys_walk_the_groups_of_search_everywhere(cx: &mut TestAppContext) {
     // A group that finds nothing is not a step of the walk: the Files group is the only
     // one of this query, so PgDn keeps the first row where it is.
     double_shift(cx, window);
-    type_text(cx, window, "notes");
+    type_text(cx, window, "notes.txt");
     wait_for_signal(cx, "the single group", |cx| {
         let view = palette(cx, window);
         let settled = view.read_with(cx, |palette, _| palette.replies_settled());

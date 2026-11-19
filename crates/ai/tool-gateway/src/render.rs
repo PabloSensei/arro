@@ -9,10 +9,10 @@ use crate::backend::{
     DebugSessionState, DebugStack, DebugStackQuery, DebugStateQuery, DebugValue, DebugVariable,
     DebugVariables, DebugVariablesQuery, DiagnosticsPage, DiagnosticsQuery, DirectoryTree,
     EditorContext, FileActionOutcome, FileText, GitStatus, HierarchyNode, PathPage, PathQuery,
-    ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol, RunConfiguration,
-    RunOutput, RunPointInfo, SearchPage, SearchQuery, SessionScope, Severity, SymbolHit,
-    SymbolInfo, SymbolPage, SymbolQuery, TerminalOutput, TestOutcome, TestsOutcome, TestsRequest,
-    TypeHierarchy, TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges, VcsQuery,
+    ProblemSeverity, ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol,
+    RunConfiguration, RunOutput, RunPointInfo, SearchPage, SearchQuery, SessionScope, Severity,
+    SymbolHit, SymbolInfo, SymbolPage, SymbolQuery, TerminalOutput, TestOutcome, TestsOutcome,
+    TestsRequest, TypeHierarchy, TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges, VcsQuery,
 };
 
 const CONTEXT_LINES: usize = 2;
@@ -351,6 +351,7 @@ pub(crate) fn search(query: &SearchQuery, page: &SearchPage) -> String {
         items,
         total,
         clipped,
+        timed_out,
         files,
     } = page;
     let pattern = &query.pattern;
@@ -374,6 +375,9 @@ pub(crate) fn search(query: &SearchQuery, page: &SearchPage) -> String {
             text,
             "\nclipped: showing {shown} of {total}, raise the limit or narrow the mask\n"
         );
+    }
+    if *timed_out {
+        text.push_str("\nthe time limit stopped the search: the answer is not complete\n");
     }
     text
 }
@@ -685,16 +689,21 @@ pub(crate) fn file_action(outcome: &FileActionOutcome) -> String {
     }
 }
 
-/// A build tool writes its errors as `path:line: message` or `path:[line,column] message`.
+/// A build tool writes its problems as `path:line: message`, `path:[line,column]
+/// message` or `path:line:column: message`, with `error: ` or `warning: ` before the
+/// message of some tools and a `[ERROR]` or `[WARNING]` prefix on the line of others.
 /// This reads those lines without knowing which tool wrote them; a line without a place
 /// in the sources stays out of the list.
 pub fn build_problems(lines: &[String], root: &Path) -> Vec<BuildProblem> {
     let mut problems: Vec<BuildProblem> = Vec::new();
     for line in lines {
-        let text = line.trim().strip_prefix("[ERROR]").unwrap_or(line.trim());
-        let Some((path, number, message)) = split_problem(text.trim()) else {
+        let Some((severity, text)) = marked_severity(line) else {
             continue;
         };
+        let Some((path, number, column, message)) = split_problem(text.trim()) else {
+            continue;
+        };
+        let (severity, message) = named_severity(severity, message);
         let path = Path::new(path);
         let path = if path.is_absolute() {
             path.to_path_buf()
@@ -703,15 +712,21 @@ pub fn build_problems(lines: &[String], root: &Path) -> Vec<BuildProblem> {
         };
         let message = message.trim().to_string();
         if message.is_empty()
-            || problems
-                .iter()
-                .any(|known| known.path == path && known.line == number && known.message == message)
+            || problems.iter().any(|known| {
+                known.path == path
+                    && known.line == number
+                    && known.column == column
+                    && known.severity == severity
+                    && known.message == message
+            })
         {
             continue;
         }
         problems.push(BuildProblem {
             path,
             line: number,
+            column,
+            severity,
             message,
         });
         if problems.len() >= 50 {
@@ -721,7 +736,46 @@ pub fn build_problems(lines: &[String], root: &Path) -> Vec<BuildProblem> {
     problems
 }
 
-fn split_problem(text: &str) -> Option<(&str, u32, &str)> {
+/// The rest of a line whose bracket prefix names the severity. A line without a prefix is
+/// an error from a tool that writes its own `error:` mark or none at all; `None` is for a
+/// prefix that says nothing about a problem, such as `[INFO]`.
+fn marked_severity(line: &str) -> Option<(ProblemSeverity, &str)> {
+    let text = line.trim();
+    let Some(rest) = text.strip_prefix('[') else {
+        return Some((ProblemSeverity::Error, text));
+    };
+    let Some(close) = rest.find(']') else {
+        return Some((ProblemSeverity::Error, text));
+    };
+    let severity = match rest[..close].trim().to_ascii_uppercase().as_str() {
+        "ERROR" => ProblemSeverity::Error,
+        "WARNING" | "WARN" => ProblemSeverity::Warning,
+        _ => return None,
+    };
+    Some((severity, &rest[close + 1..]))
+}
+
+/// The severity the tool wrote before the message, as in `error: cannot find it`.
+fn named_severity(marked: ProblemSeverity, message: &str) -> (ProblemSeverity, &str) {
+    let lower = message.to_ascii_lowercase();
+    if lower.starts_with("warning:") {
+        return (
+            ProblemSeverity::Warning,
+            message["warning:".len()..].trim_start(),
+        );
+    }
+    if lower.starts_with("error:") {
+        return (
+            ProblemSeverity::Error,
+            message["error:".len()..].trim_start(),
+        );
+    }
+    (marked, message)
+}
+
+/// The path, line, column and message of `path:12: message`, `path:[12,5] message` or
+/// `path:12:5: message`.
+fn split_problem(text: &str) -> Option<(&str, u32, Option<u32>, &str)> {
     let bytes = text.as_bytes();
     for (index, byte) in bytes.iter().enumerate() {
         if *byte != b':' {
@@ -744,16 +798,26 @@ fn split_problem(text: &str) -> Option<(&str, u32, &str)> {
         }
         let number: u32 = text[start..at].parse().ok()?;
         let mut rest = &text[at..];
+        let mut column = None;
         if rest.starts_with(',') {
             // The `[line,column]` form of a build tool.
             let close = rest.find(']')?;
+            column = rest[1..close].trim().parse().ok();
             rest = &rest[close + 1..];
+        } else if rest.starts_with(':') {
+            // The `line:column:` form, where a message follows the third number.
+            let digits = &rest[1..];
+            let width = digits.bytes().take_while(u8::is_ascii_digit).count();
+            if width > 0 && digits.as_bytes().get(width) == Some(&b':') {
+                column = digits[..width].parse().ok();
+                rest = &digits[width..];
+            }
         }
         let message = rest.trim_start_matches([':', ' ', ']']).trim();
         if message.is_empty() {
             continue;
         }
-        return Some((path, number, message));
+        return Some((path, number, column, message));
     }
     None
 }
@@ -782,11 +846,20 @@ pub(crate) fn build(request: &BuildRequest, outcome: &BuildOutcome) -> String {
     if outcome.problems.is_empty() {
         return text;
     }
-    let count = outcome.problems.len();
+    let count = outcome
+        .problems
+        .iter()
+        .filter(|problem| problem.severity == ProblemSeverity::Error)
+        .count();
     let _ = writeln!(text, "{count} compile errors:");
     for problem in &outcome.problems {
         let path = problem.path.display();
-        let _ = writeln!(text, "{path}:{}: {}", problem.line, problem.message);
+        let mark = if problem.severity == ProblemSeverity::Warning {
+            "warning: "
+        } else {
+            ""
+        };
+        let _ = writeln!(text, "{path}:{}: {mark}{}", problem.line, problem.message);
     }
     text
 }
@@ -1268,6 +1341,9 @@ pub(crate) fn directory_tree(_scope: &SessionScope, tree: &DirectoryTree) -> Str
     if tree.clipped {
         text.push_str("...\n");
     }
+    if tree.timed_out {
+        text.push_str("the time limit stopped the answer: the list is not complete\n");
+    }
     text
 }
 
@@ -1306,6 +1382,7 @@ pub(crate) fn path_search(scope: &SessionScope, query: &PathQuery, page: &PathPa
         "files": files,
         "total": page.total,
         "more": page.clipped,
+        "timedOut": page.timed_out,
     });
     answer.to_string()
 }
@@ -1331,6 +1408,7 @@ pub(crate) fn search_matches(
         "matches": matches,
         "total": page.total,
         "more": page.clipped,
+        "timedOut": page.timed_out,
     });
     answer.to_string()
 }
@@ -1683,6 +1761,7 @@ mod tests {
             mask: None,
             paths: Vec::new(),
             limit: 1,
+            timeout: None,
         };
         let page = SearchPage {
             items: vec![SearchHit {
@@ -1693,6 +1772,7 @@ mod tests {
             }],
             total: 3,
             clipped: true,
+            timed_out: false,
             files: 2,
         };
 
@@ -1739,13 +1819,84 @@ mod tests {
 
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert_eq!(problems[0].line, 12);
+        assert_eq!(problems[0].column, Some(5));
+        assert_eq!(problems[0].severity, ProblemSeverity::Error);
         assert_eq!(problems[0].message, "cannot find symbol");
         assert_eq!(problems[1].line, 3);
-        assert_eq!(problems[1].message, "error: package does not exist");
+        assert_eq!(problems[1].column, None);
+        assert_eq!(problems[1].message, "package does not exist");
         assert_eq!(
             problems[1].path,
             std::path::Path::new("C:\\work\\demo").join("src\\other\\Moved.txt")
         );
+    }
+
+    #[test]
+    fn a_warning_is_not_an_error() {
+        let lines = vec![
+            "[WARNING] C:\\work\\demo\\src\\Main.txt:[2,1] unused name".to_string(),
+            "/work/demo/src/Other.txt:7: warning: unchecked value".to_string(),
+            "/work/demo/src/Other.txt:9: error: unknown name".to_string(),
+            "[ERROR] /work/demo/src/Other.txt:9: unknown name".to_string(),
+        ];
+
+        let problems = build_problems(&lines, std::path::Path::new("C:\\work\\demo"));
+
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert_eq!(problems[0].severity, ProblemSeverity::Warning);
+        assert_eq!(problems[0].column, Some(1));
+        assert_eq!(problems[0].message, "unused name");
+        assert_eq!(problems[1].severity, ProblemSeverity::Warning);
+        assert_eq!(problems[1].line, 7);
+        assert_eq!(problems[1].message, "unchecked value");
+        assert_eq!(problems[2].severity, ProblemSeverity::Error);
+        assert_eq!(problems[2].message, "unknown name");
+    }
+
+    #[test]
+    fn a_line_without_a_place_stays_out() {
+        let lines = [
+            "The build failed".to_string(),
+            "error: no path here".to_string(),
+            "[ERROR] Failed to execute the goal".to_string(),
+            "/work/demo/src/Main.txt:4: cannot find symbol".to_string(),
+        ];
+
+        let problems = build_problems(&lines, std::path::Path::new("/work/demo"));
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].line, 4);
+    }
+
+    #[test]
+    fn a_problem_of_each_file_keeps_its_own_place() {
+        let lines = [
+            "C:\\work\\demo\\src\\Main.txt:[12,5] cannot find symbol".to_string(),
+            "C:\\work\\demo\\src\\Other.txt:[3,2] warning: unused name".to_string(),
+            "C:\\work\\demo\\src\\Main.txt:[20,1] unknown name".to_string(),
+        ];
+
+        let problems = build_problems(&lines, std::path::Path::new("C:\\work\\demo"));
+
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|problem| problem.path.ends_with("Main.txt"))
+                .count(),
+            2
+        );
+        assert!(problems[1].path.ends_with("Other.txt"));
+        assert_eq!(problems[1].column, Some(2));
+    }
+
+    #[test]
+    fn the_three_number_form_gives_the_column() {
+        let lines = ["src/Main.txt:12:5: unknown name".to_string()];
+        let problems = build_problems(&lines, std::path::Path::new("/work/demo"));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].column, Some(5));
+        assert_eq!(problems[0].message, "unknown name");
     }
 
     #[test]
@@ -1793,6 +1944,8 @@ mod tests {
             problems: vec![BuildProblem {
                 path: "src/Foo.txt".into(),
                 line: 4,
+                column: None,
+                severity: ProblemSeverity::Error,
                 message: "cannot find symbol".to_string(),
             }],
             duration_ms: 1250,

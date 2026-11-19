@@ -117,6 +117,9 @@ actions!(
         Rerun,
         // The IDE actions of M11 added after the first batch.
         Compile,
+        BuildModule,
+        RebuildProject,
+        GenerateSources,
         RerunTests,
         StopBackgroundProcesses,
         Synchronize,
@@ -428,6 +431,8 @@ pub const AI_TOOL: &str = "ai";
 /// tab of the connected MCP clients.
 pub const AI_CLIENTS: &str = "ai.mcp.clients";
 pub const TASKS_TOOL: &str = "tasks";
+/// The output of the last build with the tree of its errors and warnings.
+pub const BUILD_TOOL: &str = "build-output";
 pub const COMMIT_TOOL: &str = "commit";
 pub const STRUCTURE_TOOL: &str = "structure";
 pub const PROBLEMS_TOOL: &str = "problems";
@@ -1912,12 +1917,48 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+F9: builds the project with its build tool and shows the build console.
+    /// Ctrl+F9: builds the project with its build tool and shows the Build window. The
+    /// focus stays in the editor, as IDEA keeps it.
     pub fn build_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(run) = self.run.clone() {
             (run.build)(window, cx);
-            self.show_tool(RUN_TOOL, window, cx);
+            self.show_build(window, cx);
         }
+    }
+
+    /// Build Module: builds the module of `path` with the build tool.
+    pub fn build_module(
+        &mut self,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(run) = self.run.clone() {
+            (run.build_module)(path, window, cx);
+            self.show_build(window, cx);
+        }
+    }
+
+    /// Rebuild Project: builds the whole project again from scratch.
+    pub fn rebuild_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.rebuild)(window, cx);
+            self.show_build(window, cx);
+        }
+    }
+
+    /// Generate Sources and Update Folders: runs the source generator of the build tool.
+    pub fn generate_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.generate_sources)(window, cx);
+            self.show_build(window, cx);
+        }
+    }
+
+    /// Opens the Build window without taking the focus from the editor.
+    fn show_build(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_tool(BUILD_TOOL, window, cx);
+        self.focus_active(window, cx);
     }
 
     /// Ctrl+F5: the last configuration or test request again.
@@ -1937,7 +1978,7 @@ impl Workspace {
     ) {
         if let Some(run) = self.run.clone() {
             (run.compile)(path, window, cx);
-            self.show_tool(RUN_TOOL, window, cx);
+            self.show_build(window, cx);
         }
     }
 

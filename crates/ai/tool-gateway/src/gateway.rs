@@ -262,6 +262,8 @@ struct DirectoryInput {
     directory_path: Option<PathBuf>,
     #[serde(rename = "maxDepth")]
     max_depth: usize,
+    #[serde(default)]
+    timeout: Option<u64>,
 }
 
 impl Default for DirectoryInput {
@@ -269,6 +271,7 @@ impl Default for DirectoryInput {
         Self {
             directory_path: None,
             max_depth: 3,
+            timeout: None,
         }
     }
 }
@@ -292,6 +295,8 @@ struct SkillSearchInput {
     include_excluded: bool,
     #[serde(default = "default_page_for_skill")]
     limit: usize,
+    #[serde(default)]
+    timeout: Option<u64>,
 }
 
 fn default_page_for_skill() -> usize {
@@ -384,6 +389,8 @@ struct SearchInput {
     include_external: bool,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    #[serde(default)]
+    timeout: Option<u64>,
 }
 
 fn default_search_limit() -> usize {
@@ -2390,7 +2397,12 @@ impl ToolGateway {
                 folder.display()
             )));
         }
-        let tree = crate::tree::directory_tree(&folder, scope, input.max_depth.clamp(1, 20));
+        let tree = crate::tree::directory_tree(
+            &folder,
+            scope,
+            input.max_depth.clamp(1, 20),
+            input.timeout,
+        );
         Ok(render::directory_tree(scope, &tree))
     }
 
@@ -2490,6 +2502,7 @@ impl ToolGateway {
             paths: input.paths.clone(),
             include_excluded: input.include_excluded,
             limit: input.limit,
+            timeout: input.timeout,
         }
         .clipped();
         let page = self.backend.find_files(scope, &query)?;
@@ -2507,6 +2520,7 @@ impl ToolGateway {
             mask: None,
             paths: input.paths.clone(),
             limit: input.limit,
+            timeout: input.timeout,
         };
         let page = self.backend.search_text(scope, &query)?;
         let page = filter_search(scope, &query.paths, page);
@@ -2545,6 +2559,9 @@ impl ToolGateway {
         let mut arguments = serde_json::Map::new();
         arguments.insert("q".to_string(), Value::String(input.q));
         arguments.insert("limit".to_string(), Value::from(input.limit));
+        if let Some(timeout) = input.timeout {
+            arguments.insert("timeout".to_string(), Value::from(timeout));
+        }
         if !input.paths.is_empty() {
             arguments.insert(
                 "paths".to_string(),
@@ -2916,6 +2933,7 @@ mod tests {
                 }],
                 total: 1,
                 clipped: false,
+                timed_out: false,
                 files: 1,
             })
         }

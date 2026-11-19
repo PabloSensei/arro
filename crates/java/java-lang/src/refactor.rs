@@ -1,17 +1,27 @@
-//! Refactorings of the server that take values from the user before it computes any
-//! edit: the members and the name of a new interface, the place a field starts.
+//! Refactorings that take values from the user before they compute any edit: the
+//! members and the name of a new interface, the place a field starts, and the four
+//! refactorings that move members or make a type from them.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base::Cancel;
+use futures_util::StreamExt;
 use lang_api::{
     ActionApplyRequest, ActionChoice, ActionField, ActionMember, ActionOutcome, ActionParameters,
-    ActionParametersQuery, Answer, Confidence, Provider, Reply, SourceId,
+    ActionParametersQuery, Answer, Confidence, DocumentSpot, MemberActionForm, MemberActionQuery,
+    MemberActionRequest, MemberRefactoring, Provider, Reply, SourceId, SourceSpan,
 };
 use lsp_client::lsp_types;
-use semantic_router::{Router, workspace_change};
+use lsp_client::uri::file_path;
+use semantic_router::{LspProviders, Router, workspace_change};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
+
+use crate::members::{self, CallSite, SourceFile, TypeFile};
 
 const SOURCE: SourceId = SourceId::new("jdtls");
 
@@ -274,6 +284,388 @@ async fn apply(router: &Router, request: &ActionApplyRequest) -> ActionOutcome {
     ActionOutcome {
         change: workspace_change(edit),
         error: None,
+    }
+}
+
+/// Pull Members Up, Push Members Down, Extract Superclass and Introduce Parameter
+/// Object: the form the window shows and the edits of the filled form.
+#[derive(Clone)]
+pub(crate) struct MemberRefactorings {
+    router: Arc<Router>,
+    runtime: Handle,
+    root: PathBuf,
+    providers: Arc<LspProviders>,
+}
+
+impl MemberRefactorings {
+    pub(crate) fn new(
+        root: PathBuf,
+        router: Arc<Router>,
+        providers: Arc<LspProviders>,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            router,
+            runtime,
+            root,
+            providers,
+        }
+    }
+
+    fn text_of_uri(&self, uri: &str) -> Option<(PathBuf, String)> {
+        let parsed = lsp_client::lsp_types::Uri::from_str(uri).ok()?;
+        let path = file_path(&parsed)?;
+        let text = self
+            .router
+            .text(&parsed)
+            .map(|text| text.to_string())
+            .or_else(|| std::fs::read_to_string(&path).ok())?;
+        Some((path, text))
+    }
+
+    fn file(&self, uri: &str) -> Option<SourceFile> {
+        let (_, text) = self.text_of_uri(uri)?;
+        Some(SourceFile {
+            uri: uri.to_owned(),
+            text,
+        })
+    }
+
+    /// The file a supertype of the source is declared in, through the import when the
+    /// source has one and by a walk of the project otherwise.
+    fn type_file(&self, source_path: &Path, source_text: &str, name: &str) -> Option<TypeFile> {
+        let package = members::package_name(source_text).unwrap_or_default();
+        let root = source_root(source_path, &package);
+        let mut candidates = Vec::new();
+        if let Some(imported) = imported_package(source_text, name) {
+            candidates.push(
+                root.join(imported.replace('.', std::path::MAIN_SEPARATOR_STR))
+                    .join(format!("{name}.java")),
+            );
+        }
+        if let Some(parent) = source_path.parent() {
+            candidates.push(parent.join(format!("{name}.java")));
+        }
+        candidates.push(root.join(format!("{name}.java")));
+        for candidate in candidates {
+            if let Ok(text) = std::fs::read_to_string(&candidate) {
+                return Some(TypeFile {
+                    name: name.to_owned(),
+                    uri: uri_of_path(&candidate)?,
+                    package: members::package_name(&text),
+                    text,
+                });
+            }
+        }
+        members::java_files(&self.root)
+            .into_iter()
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem == name)
+            })
+            .find_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some(TypeFile {
+                    name: name.to_owned(),
+                    uri: uri_of_path(&path)?,
+                    package: members::package_name(&text),
+                    text,
+                })
+            })
+    }
+
+    /// The supertypes of the source up its hierarchy, the nearest first.
+    fn supertype_files(&self, source_path: &Path, source_text: &str) -> Vec<TypeFile> {
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        let mut queue: Vec<(PathBuf, String)> =
+            vec![(source_path.to_path_buf(), source_text.to_owned())];
+        while let Some((path, text)) = queue.pop() {
+            for name in members::direct_supertypes(&text) {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let Some(file) = self.type_file(&path, &text, &name) else {
+                    continue;
+                };
+                let next = lsp_client::lsp_types::Uri::from_str(&file.uri)
+                    .ok()
+                    .and_then(|uri| file_path(&uri))
+                    .unwrap_or_else(|| path.clone());
+                queue.push((next, file.text.clone()));
+                found.push(file);
+            }
+        }
+        found
+    }
+
+    /// The direct subtypes of the source type in the project.
+    fn subtypes(&self, source_path: &Path, source_name: &str) -> Vec<TypeFile> {
+        members::java_files(&self.root)
+            .into_iter()
+            .filter(|path| path != source_path)
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                if !members::extends_or_implements(&text, source_name) {
+                    return None;
+                }
+                Some(TypeFile {
+                    name: members::type_name(&text)?,
+                    uri: uri_of_path(&path)?,
+                    package: members::package_name(&text),
+                    text,
+                })
+            })
+            .collect()
+    }
+}
+
+fn uri_of_path(path: &Path) -> Option<String> {
+    Some(platform::CanonPath::new(path).ok()?.to_uri())
+}
+
+/// The folder a package of `path` starts under.
+fn source_root(path: &Path, package: &str) -> PathBuf {
+    let mut root = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    for _ in package.split('.').filter(|part| !part.is_empty()) {
+        match root.parent() {
+            Some(parent) => root = parent.to_path_buf(),
+            None => return PathBuf::new(),
+        }
+    }
+    root
+}
+
+/// The package of an import of `name`, when the file imports it.
+fn imported_package(text: &str, name: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("import ") && !line.starts_with("import static "))
+        .find(|line| {
+            line.trim_end_matches(';')
+                .rsplit('.')
+                .next()
+                .is_some_and(|last| last == name)
+        })
+        .and_then(|line| {
+            let raw = line["import ".len()..].trim_end_matches(';');
+            raw.rsplit_once('.').map(|(package, _)| package.to_owned())
+        })
+}
+
+fn value_of<'a>(request: &'a MemberActionRequest, key: &str) -> &'a str {
+    request
+        .fields
+        .iter()
+        .find(|field| field.key == key)
+        .map_or("", |field| field.value.trim())
+}
+
+fn done(change: lang_api::WorkspaceChange) -> ActionOutcome {
+    ActionOutcome {
+        change,
+        error: None,
+    }
+}
+
+impl Provider<MemberActionQuery, Option<MemberActionForm>> for MemberRefactorings {
+    fn start(
+        &self,
+        query: MemberActionQuery,
+        _: Cancel,
+        mut reply: Reply<Option<MemberActionForm>>,
+    ) {
+        let this = self.clone();
+        self.runtime.spawn(async move {
+            let form = this.form(&query).await;
+            let confidence = if form.is_some() {
+                Confidence::Certain
+            } else {
+                Confidence::Unknown
+            };
+            let _ = reply.send(Answer::new(form, confidence, SOURCE));
+        });
+    }
+}
+
+impl MemberRefactorings {
+    async fn form(&self, query: &MemberActionQuery) -> Option<MemberActionForm> {
+        let (path, text) = self.text_of_uri(&query.spot.uri)?;
+        let offset = lang_api::offset_in(&text, query.spot.point);
+        let source = SourceFile {
+            uri: query.spot.uri.clone(),
+            text,
+        };
+        match query.refactoring {
+            MemberRefactoring::PullUp => {
+                let targets = self.supertype_files(&path, &source.text);
+                members::pull_up_form(&source, offset, &targets)
+            }
+            MemberRefactoring::PushDown => {
+                let name = members::type_name_at(&source.text, offset)?;
+                let targets = self.subtypes(&path, &name);
+                members::push_down_form(&source, offset, &targets)
+            }
+            MemberRefactoring::ExtractSuperclass => {
+                let name = members::type_name_at(&source.text, offset)?;
+                let package = members::package_name(&source.text).unwrap_or_default();
+                let root = source_root(&path, &package);
+                let mut packages: Vec<String> = members::java_files(&root)
+                    .into_iter()
+                    .filter_map(|file| std::fs::read_to_string(file).ok())
+                    .filter_map(|text| members::package_name(&text))
+                    .collect();
+                packages.sort();
+                packages.dedup();
+                packages.retain(|found| *found != package);
+                packages.insert(0, package);
+                members::extract_superclass_form(
+                    &source,
+                    offset,
+                    &format!("Abstract{name}"),
+                    &packages,
+                )
+            }
+            MemberRefactoring::IntroduceParameterObject => {
+                members::parameter_object_form(&source, offset)
+            }
+        }
+    }
+
+    async fn apply(&self, request: &MemberActionRequest) -> ActionOutcome {
+        let Some((path, text)) = self.text_of_uri(&request.spot.uri) else {
+            return outcome("The file is not open");
+        };
+        let source = SourceFile {
+            uri: request.spot.uri.clone(),
+            text,
+        };
+        let offset = lang_api::offset_in(&source.text, request.spot.point);
+        let result = match request.refactoring {
+            MemberRefactoring::PullUp => {
+                let Some(target) = request.target.as_deref() else {
+                    return outcome("No supertype is chosen");
+                };
+                let Some(target_file) = self.file(target) else {
+                    return outcome("The supertype file is not available");
+                };
+                members::pull_up_apply(&source, &target_file, &request.members)
+            }
+            MemberRefactoring::PushDown => {
+                let Some(name) = members::type_name_at(&source.text, offset) else {
+                    return outcome("The file declares no type");
+                };
+                let targets: Vec<SourceFile> = self
+                    .subtypes(&path, &name)
+                    .into_iter()
+                    .map(|target| SourceFile {
+                        uri: target.uri,
+                        text: target.text,
+                    })
+                    .collect();
+                members::push_down_apply(&source, &targets, &request.members)
+            }
+            MemberRefactoring::ExtractSuperclass => {
+                let name = value_of(request, "name");
+                if name.is_empty() {
+                    return outcome("The superclass name is empty");
+                }
+                let package = request.target.clone().unwrap_or_default();
+                let root = source_root(&path, &package);
+                let mut new_path = root;
+                for part in package.split('.').filter(|part| !part.is_empty()) {
+                    new_path.push(part);
+                }
+                new_path.push(format!("{name}.java"));
+                if new_path.exists() {
+                    return outcome("A file with that name is already there");
+                }
+                let Some(new_uri) = uri_of_path(&new_path) else {
+                    return outcome("The package folder is not reachable");
+                };
+                members::extract_superclass_apply(
+                    &source,
+                    &new_uri,
+                    name,
+                    &package,
+                    &request.members,
+                )
+            }
+            MemberRefactoring::IntroduceParameterObject => {
+                let name = value_of(request, "name");
+                if name.is_empty() {
+                    return outcome("The class name is empty");
+                }
+                let package = members::package_name(&source.text).unwrap_or_default();
+                let mut new_path = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                new_path.push(format!("{name}.java"));
+                if new_path.exists() {
+                    return outcome("A file with that name is already there");
+                }
+                let Some(new_uri) = uri_of_path(&new_path) else {
+                    return outcome("The package folder is not reachable");
+                };
+                let use_record = java_project::language_level(&self.root)
+                    .and_then(|level| level.selected)
+                    .and_then(|level| level.parse::<u32>().ok())
+                    .is_some_and(|level| level >= 16);
+                let calls = self.calls(&request.spot).await;
+                members::parameter_object_apply(members::ParameterObjectRequest {
+                    source: &source,
+                    spot_offset: offset,
+                    class_name: name,
+                    package: &package,
+                    new_uri: &new_uri,
+                    use_record,
+                    selections: &request.members,
+                    calls: &calls,
+                })
+            }
+        };
+        match result {
+            Ok(change) => done(change),
+            Err(error) => outcome(&error),
+        }
+    }
+
+    /// The places a call of the method at `spot` is in, by file, for the new arguments.
+    async fn calls(&self, spot: &DocumentSpot) -> Vec<CallSite> {
+        let provider: &dyn Provider<DocumentSpot, Vec<SourceSpan>> = self.providers.as_ref();
+        let mut replies = lang_api::ask(provider, spot.clone());
+        // A server that is off or still importing must not keep the form busy.
+        let spans = tokio::time::timeout(Duration::from_secs(5), replies.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|answer| answer.value)
+            .unwrap_or_default();
+        let mut calls: Vec<CallSite> = Vec::new();
+        for span in spans {
+            let Some((_, text)) = self.text_of_uri(&span.uri) else {
+                continue;
+            };
+            let offset = lang_api::offset_in(&text, span.span.start);
+            match calls.iter_mut().find(|call| call.uri == span.uri) {
+                Some(call) => call.offsets.push(offset),
+                None => calls.push(CallSite {
+                    uri: span.uri,
+                    text,
+                    offsets: vec![offset],
+                }),
+            }
+        }
+        calls
+    }
+}
+
+impl Provider<MemberActionRequest, ActionOutcome> for MemberRefactorings {
+    fn start(&self, query: MemberActionRequest, _: Cancel, mut reply: Reply<ActionOutcome>) {
+        let this = self.clone();
+        self.runtime.spawn(async move {
+            let answer = this.apply(&query).await;
+            let _ = reply.send(Answer::new(answer, Confidence::Certain, SOURCE));
+        });
     }
 }
 

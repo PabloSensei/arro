@@ -22,15 +22,16 @@ use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
 use crate::split::SplitNode;
 use crate::window::{
-    AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_POPUP, BalloonAction, BringAllToFront, BuildProject,
-    COMMIT_TOOL, CheckForUpdatesApp, ChooseDebugConfiguration, ChooseRunConfiguration, CloseTab,
-    Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug, Dismiss, DockSide, EditBreakpoint,
-    Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto, ForceStepOver,
-    FullyExpandTreeNode, GotoRelated, HTTP_TOOL, HideApp, HideCoverage, HideOtherApps,
-    HideToolWindow, LOG_TOOL, MenuRow, MinimizeWindow, MoveToOtherGroup, NewElementSamePlace,
-    NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL,
-    PinTab, PreviousProblem, PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate,
-    QuitApp, RUN_TOOL, ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown,
+    AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_POPUP, BUILD_TOOL, BalloonAction, BringAllToFront,
+    BuildModule, BuildProject, COMMIT_TOOL, CheckForUpdatesApp, ChooseDebugConfiguration,
+    ChooseRunConfiguration, CloseTab, Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug,
+    Dismiss, DockSide, EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup,
+    ForceRunToCursor, ForceStepInto, ForceStepOver, FullyExpandTreeNode, GenerateSources,
+    GotoRelated, HTTP_TOOL, HideApp, HideCoverage, HideOtherApps, HideToolWindow, LOG_TOOL,
+    MenuRow, MinimizeWindow, MoveToOtherGroup, NewElementSamePlace, NextProblem, NextProjectWindow,
+    NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem,
+    PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate, QuitApp, RUN_TOOL,
+    RebuildProject, ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown,
     ResizeToolWindowLeft, ResizeToolWindowRight, ResizeToolWindowUp, Resume, Run,
     RunTestsWithCoverage, RunTestsWithProfiler, RunToCursor, RunWithCoverage, SERVICES_TOOL,
     STRUCTURE_TOOL, SaveAll, ShowAllApps, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
@@ -490,7 +491,7 @@ impl Workspace {
         &self,
         id: &'static str,
         icon_name: &'static str,
-        label: &'static str,
+        label: impl Into<SharedString>,
         key: Option<&'static str>,
         selected: bool,
         theme: &Theme,
@@ -534,6 +535,7 @@ impl Workspace {
         let structure_open = self.tool_open(STRUCTURE_TOOL);
         let terminal_open = self.tool_open(TERMINAL_TOOL);
         let services_open = self.tool_open(SERVICES_TOOL);
+        let build_open = self.tool_open(BUILD_TOOL);
         div()
             .flex()
             .flex_col()
@@ -615,6 +617,17 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_tool(DEBUG_TOOL, window, cx)
                         })),
+                    )
+                    .child(
+                        button(
+                            "s-build",
+                            "toolwindows/tasks",
+                            "Build",
+                            None,
+                            build_open,
+                            theme,
+                        )
+                        .on_click(toggle(BUILD_TOOL)),
                     )
                     .child(
                         button(
@@ -711,6 +724,10 @@ impl Workspace {
                 .child(kept_spot(scripted, view, format!("stripe-{id}")))
         };
         let separator = div().w(px(ICON)).h(px(DIVIDER_WIDTH)).bg(theme.border);
+        let build_tool = self
+            .run_state(cx)
+            .build_tool
+            .unwrap_or_else(|| "Tasks".into());
         div()
             .flex()
             .flex_col()
@@ -745,14 +762,16 @@ impl Workspace {
             )
             .child(separator)
             .child(
-                button(
+                self.stripe_button(
                     "s-tasks",
                     "toolwindows/tasks",
-                    "Tasks",
+                    build_tool,
                     None,
                     self.tool_open(TASKS_TOOL),
                     theme,
                 )
+                .relative()
+                .child(kept_spot(scripted, view, "stripe-s-tasks".to_string()))
                 .on_click(
                     cx.listener(|this, _, window, cx| this.toggle_tool(TASKS_TOOL, window, cx)),
                 ),
@@ -1827,6 +1846,9 @@ impl Workspace {
                 self.action_row("Database", ToggleDatabase),
                 command("jshell.open", "JShell Console"),
                 self.action_row("Endpoints", ToggleEndpoints),
+                command("window.show_beans", "Beans")
+                    .icon("nodes/class")
+                    .tip("Opens the Beans window with the Spring beans of the project"),
                 self.action_row("Usages", ToggleUsages),
                 self.action_row("TODO", ToggleTodo),
                 self.action_row("Git", ToggleLog),
@@ -1970,18 +1992,54 @@ impl Workspace {
                         command(editor_keys::INTRODUCE_PARAMETER, "Parameter..."),
                     ],
                 ),
+                MenuEntry::separator(),
+                command(editor_keys::PULL_MEMBERS_UP, "Pull Members Up..."),
+                command(editor_keys::PUSH_MEMBERS_DOWN, "Push Members Down..."),
+                command(editor_keys::EXTRACT_SUPERCLASS, "Extract Superclass..."),
+                command(
+                    editor_keys::INTRODUCE_PARAMETER_OBJECT,
+                    "Introduce Parameter Object...",
+                ),
+                MenuEntry::separator(),
                 command(editor_keys::SAFE_DELETE, "Safe Delete..."),
                 command(editor_keys::UNWRAP, "Unwrap/Remove..."),
             ],
         );
 
-        let build = MenuEntry::submenu(
-            "Build",
-            vec![
-                self.action_row("Build Project", BuildProject),
-                self.action_row("Compile", Compile),
-            ],
+        let build_state = self.run_state(cx);
+        let current = self.active_path();
+        let module = self
+            .run
+            .as_ref()
+            .and_then(|run| (run.module_of)(current.as_deref(), cx));
+        let module_label = module.map_or_else(
+            || "Build Module".to_string(),
+            |module| format!("Build Module '{module}'"),
         );
+        let recompile_label = current
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || "Recompile".to_string(),
+                |name| format!("Recompile '{}'", name.to_string_lossy()),
+            );
+        let mut build_rows = vec![
+            self.action_row("Build Project", BuildProject)
+                .tip("Build the project with its build tool"),
+            self.action_row_named(module_label, BuildModule)
+                .tip("Build the module of the current file"),
+            self.action_row_named(recompile_label, Compile)
+                .tip("Compile the module of the current file again"),
+            self.action_row("Rebuild Project", RebuildProject)
+                .tip("Clean the outputs and build the whole project again"),
+        ];
+        if build_state.generates_sources {
+            build_rows.push(
+                self.action_row("Generate Sources and Update Folders", GenerateSources)
+                    .tip("Run the source generator of the build tool"),
+            );
+        }
+        let build = MenuEntry::submenu("Build", build_rows);
 
         let run_state = self.run_state(cx);
         let profile_label = match run_state.selected {
@@ -3361,9 +3419,18 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(|this, _: &Run, window, cx| this.run_selected(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &BuildProject, window, cx| this.build_project(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &BuildProject, window, cx| {
+                this.run_command("workspace.build_project", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &BuildModule, window, cx| {
+                this.run_command("workspace.build_module", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RebuildProject, window, cx| {
+                this.run_command("workspace.rebuild_project", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GenerateSources, window, cx| {
+                this.run_command("workspace.generate_sources", window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Compile, window, cx| {
                 this.run_command("workspace.compile", window, cx);
             }))

@@ -419,6 +419,11 @@ impl BuildSystem for Gradle {
         Ok(self.command(root)?.arg(task))
     }
 
+    fn rebuild(&self, root: &Path, tests: bool) -> Result<ProcessSpec> {
+        let spec = self.command(root)?.arg("clean").arg("classes");
+        Ok(if tests { spec.arg("testClasses") } else { spec })
+    }
+
     fn tasks(&self, _model: &ProjectModel) -> Vec<String> {
         TASKS.iter().map(|task| (*task).to_owned()).collect()
     }

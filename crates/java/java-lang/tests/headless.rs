@@ -1116,3 +1116,99 @@ async fn pull_members_up_has_no_action_in_jdtls() {
     ))
     .await;
 }
+
+/// The member refactorings are computed from the trees of the project, but the
+/// provider lives on `JavaProject`, so this test runs the whole path over a real
+/// jdtls. The method moves as an abstract declaration and the subclass keeps its
+/// body, which is the `make abstract` option of the form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "runs jdtls on a corpus project"]
+async fn pull_members_up_moves_the_method_of_the_java_layer() {
+    let Fixture { probe, config } = fixture("petclinic", ".", &["build.gradle", "settings.gradle"]);
+    let base_path = probe.with_file_name("Base.java");
+    let child_path = probe.with_file_name("Child.java");
+    fs::write(&base_path, BASE).unwrap();
+    fs::write(&child_path, CHILD).unwrap();
+    let project = JavaProject::open(config, Trust::Trusted).unwrap();
+    let mut status = project.status();
+    until(&mut status, |status| status.state == State::Ready).await;
+    let server = project.server().unwrap();
+    let child = Open {
+        project: &project,
+        uri: uri_of(&child_path),
+        text: CHILD.to_owned(),
+        version: 1,
+    };
+    server.open(&uri_of(&base_path), 1, BASE.into());
+    server.open(&child.uri, 1, child.text.as_str().into());
+    wait_error(&project, &child.uri, false).await;
+
+    let form = first(ask(
+        project.member_action_form().unwrap(),
+        lang_api::MemberActionQuery {
+            refactoring: lang_api::MemberRefactoring::PullUp,
+            spot: child.spot("value()", 0),
+        },
+    ))
+    .await
+    .expect("the form arrives")
+    .expect("the form has the members");
+    assert_eq!(form.title, "Pull Members Up");
+    let target = form
+        .targets
+        .iter()
+        .find(|target| target.name == "Base")
+        .expect("the superclass is a target");
+    let member = form
+        .members
+        .iter()
+        .find(|member| member.name == "value")
+        .expect("the method is a member");
+    assert_eq!(member.detail.as_deref(), Some("public int value()"));
+    assert!(member.can_be_abstract);
+
+    let outcome = first(ask(
+        project.apply_member_action().unwrap(),
+        lang_api::MemberActionRequest {
+            refactoring: lang_api::MemberRefactoring::PullUp,
+            spot: child.spot("value()", 0),
+            target: Some(target.value.clone()),
+            members: vec![lang_api::MemberSelection {
+                value: member.value.clone(),
+                is_abstract: true,
+            }],
+            fields: Vec::new(),
+        },
+    ))
+    .await
+    .expect("the edits arrive");
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let base_edits: Vec<_> = outcome
+        .change
+        .edits
+        .iter()
+        .filter(|source| source.uri == uri_of(&base_path))
+        .flat_map(|source| source.edits.clone())
+        .collect();
+    let child_edits: Vec<_> = outcome
+        .change
+        .edits
+        .iter()
+        .filter(|source| source.uri == child.uri)
+        .flat_map(|source| source.edits.clone())
+        .collect();
+    let base = apply_to_text(BASE, &base_edits);
+    assert!(
+        base.contains("public abstract int value();"),
+        "the superclass gets the abstract declaration: {base}"
+    );
+    let child_text = apply_to_text(CHILD, &child_edits);
+    assert!(
+        child_text.contains("public int value()"),
+        "the subclass keeps the implementation: {child_text}"
+    );
+
+    project.stop().await;
+    let _ = fs::remove_file(&base_path);
+    let _ = fs::remove_file(&child_path);
+}

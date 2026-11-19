@@ -185,7 +185,7 @@ fn commit_change_kind(change: Change) -> Option<Kind> {
         Change::Modified | Change::Renamed | Change::Copied | Change::TypeChanged => {
             Some(Kind::Modified)
         }
-        Change::Unmodified | Change::Untracked | Change::Conflicted => None,
+        Change::Unmodified | Change::Untracked | Change::Ignored | Change::Conflicted => None,
     }
 }
 

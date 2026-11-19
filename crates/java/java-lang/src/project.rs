@@ -34,7 +34,7 @@ use crate::debug::DebugExtension;
 use crate::language::{JavaSyntax, LANGUAGE_ID, is_import_line};
 use crate::lombok::LombokSupport;
 use crate::messages::{JavaMessages, MessageBundles};
-use crate::refactor::RefactorForms;
+use crate::refactor::{MemberRefactorings, RefactorForms};
 use crate::spring::SpringConfigSupport;
 use crate::spring_data::{NativeCompletion, NativeNavigation, SpringDataIndex};
 
@@ -116,6 +116,9 @@ pub struct JavaProject {
     pub(crate) debug: DebugExtension,
     /// The refactorings whose values the window asks for before the server edits.
     pub(crate) forms: RefactorForms,
+    /// Pull Members Up, Push Members Down, Extract Superclass and Introduce Parameter
+    /// Object, computed from the trees of the project.
+    pub(crate) members: MemberRefactorings,
     /// The Lombok agent: found in the project dependencies and applied with a restart.
     lombok: Arc<LombokSupport>,
     /// Stack traces and thread dumps: the frames of a trace, and `jcmd` for a running
@@ -555,6 +558,8 @@ impl JavaProject {
                 "java.action.applyRefactoringCommand",
                 "java/getRefactorEdit",
             )
+            // The command of the server that points at the name an extract introduced.
+            .with_refactor_rename("java.action.rename")
             // Extract interface and the two field refactorings need values the user
             // picks: what to extract, the name and the package, where a field starts.
             .with_refactor_steps(semantic_router::RefactorSteps {
@@ -567,6 +572,8 @@ impl JavaProject {
                     "moveStaticMember",
                 ],
             })
+            // The expressions under the caret that an extract may take, innermost first.
+            .with_refactor_selections("java/inferSelection")
             .with_move_requests("java/getMoveDestinations", "java/move")
             .with_import_line(is_import_line)
             .with_change_signature(
@@ -636,6 +643,12 @@ impl JavaProject {
         };
         let debug = DebugExtension::with_router(router.clone(), autobuild);
         let forms = RefactorForms::new(router.clone(), Handle::current());
+        let members = MemberRefactorings::new(
+            root.clone(),
+            router.clone(),
+            providers.clone(),
+            Handle::current(),
+        );
         let stack = crate::stack::StackService::new(
             root.clone(),
             router.clone(),
@@ -665,6 +678,7 @@ impl JavaProject {
             problems,
             debug,
             forms,
+            members,
             lombok,
             stack,
             spring,

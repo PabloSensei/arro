@@ -416,6 +416,10 @@ impl LanguageSupport for JavaProject {
         Some(&self.java_messages)
     }
 
+    fn refactor_selections(&self) -> Option<&lang_api::RefactorSelectionsProvider> {
+        Some(self.providers.as_ref())
+    }
+
     fn debug_processes(&self) -> Option<&lang_api::DebugProcessProvider> {
         Some(&crate::debug::DEBUG_PROCESSES)
     }
@@ -479,6 +483,14 @@ impl LanguageSupport for JavaProject {
 
     fn change_signature(&self) -> Option<&ChangeSignatureProvider> {
         Some(self.providers.as_ref())
+    }
+
+    fn member_action_form(&self) -> Option<&lang_api::MemberActionParametersProvider> {
+        Some(&self.members)
+    }
+
+    fn apply_member_action(&self) -> Option<&lang_api::MemberActionProvider> {
+        Some(&self.members)
     }
 
     fn hierarchy(&self) -> Option<&HierarchyProvider> {

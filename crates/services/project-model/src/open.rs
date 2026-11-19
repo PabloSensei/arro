@@ -80,6 +80,24 @@ pub trait BuildSystem: Send + Sync {
         self.build(root, false)
     }
 
+    /// The command of Rebuild Project: the outputs of the whole project are made again
+    /// from scratch.
+    fn rebuild(&self, root: &Path, tests: bool) -> Result<ProcessSpec> {
+        self.build(root, tests)
+    }
+
+    /// Whether the tool can generate the sources of the project.
+    fn generates_sources(&self) -> bool {
+        false
+    }
+
+    /// The command of Generate Sources and Update Folders, or `None` when the tool has no
+    /// such task.
+    fn generate_sources(&self, root: &Path) -> Result<Option<ProcessSpec>> {
+        let _ = root;
+        Ok(None)
+    }
+
     /// The tasks of the root project as plain names, for scripts.
     fn tasks(&self, _model: &ProjectModel) -> Vec<String> {
         Vec::new()

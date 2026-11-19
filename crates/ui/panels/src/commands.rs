@@ -172,6 +172,24 @@ pub fn register(
         |workspace, window, cx| workspace.build_project(window, cx),
     );
     workspace.register_command(
+        "workspace.build_module",
+        "Build Module",
+        |workspace, window, cx| {
+            let path = current_path(workspace, window, cx);
+            workspace.build_module(path, window, cx);
+        },
+    );
+    workspace.register_command(
+        "workspace.rebuild_project",
+        "Rebuild Project",
+        |workspace, window, cx| workspace.rebuild_project(window, cx),
+    );
+    workspace.register_command(
+        "workspace.generate_sources",
+        "Generate Sources and Update Folders",
+        |workspace, window, cx| workspace.generate_sources(window, cx),
+    );
+    workspace.register_command(
         "workspace.profile",
         "Profile with Profiler",
         |workspace, window, cx| workspace.run_with_profiler(window, cx),
@@ -196,31 +214,8 @@ pub fn register(
             crate::http::copy_as_curl_active(::http_client::Shell::Cmd, workspace, window, cx)
         },
     );
-    workspace.register_command("workspace.compile", "Compile", |workspace, window, cx| {
-        // Ctrl+Shift+F9 in a class with `main` debugs that program, as IDEA does; any
-        // other file compiles the module as before.
-        let view = workspace
-            .active_view()
-            .and_then(|view| view.downcast::<EditorView>().ok());
-        if let Some(config) = view.and_then(|view| marks::launch_at_caret(view.read(cx), cx)) {
-            if let Some(panel) = cx.try_global::<ActiveRunPanel>() {
-                let panel = panel.0.clone();
-                panel.update(cx, |panel, cx| {
-                    panel.choose_configuration(config, cx);
-                    panel.debug(window, cx);
-                });
-            }
-            workspace.show_tool(DEBUG_TOOL, window, cx);
-            return;
-        }
-        let selected = cx.try_global::<ActiveProjectPanel>().and_then(|panel| {
-            panel
-                .0
-                .read(cx)
-                .selected_path()
-                .map(|path| path.to_path_buf())
-        });
-        let path = workspace.active_path().or(selected);
+    workspace.register_command("workspace.compile", "Recompile", |workspace, window, cx| {
+        let path = current_path(workspace, window, cx);
         workspace.compile_path(path, window, cx);
     });
     workspace.register_command("debug.attach_jvm", "Attach to JVM…", attach_to_jvm);
@@ -267,6 +262,25 @@ pub fn register(
         .map(|(_, action)| *action)
     {
         workspace.register_command(action, title_of(action), move |workspace, _, cx| {
+            let view = workspace.active_view();
+            if let Some(view) = view.and_then(|view| view.downcast::<EditorView>().ok()) {
+                view.update(cx, |view, cx| view.run(action, cx));
+            }
+        });
+    }
+
+    // The refactorings of the members have no key in `idea-default.json`, so their
+    // rows name the command and the run of the editor action directly.
+    for (action, title) in [
+        (editor_keys::PULL_MEMBERS_UP, "Pull Members Up..."),
+        (editor_keys::PUSH_MEMBERS_DOWN, "Push Members Down..."),
+        (editor_keys::EXTRACT_SUPERCLASS, "Extract Superclass..."),
+        (
+            editor_keys::INTRODUCE_PARAMETER_OBJECT,
+            "Introduce Parameter Object...",
+        ),
+    ] {
+        workspace.register_command(action, title, move |workspace, _, cx| {
             let view = workspace.active_view();
             if let Some(view) = view.and_then(|view| view.downcast::<EditorView>().ok()) {
                 view.update(cx, |view, cx| view.run(action, cx));

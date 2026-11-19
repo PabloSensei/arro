@@ -62,20 +62,21 @@ pub use settings::{
 };
 pub use split::SplitLayout;
 pub use window::{
-    AI_CLIENTS, AI_TOOL, BEANS_TOOL, BOOKMARKS_POPUP, CALL_HIERARCHY_TOOL, CHECK_LANGUAGE_SETUP,
-    COMMIT_TOOL, COVERAGE_TOOL, CloseTab, CommandFn, DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL,
-    Debug, Dismiss, DockSide, ENDPOINTS_TOOL, Evaluate, HTTP_TOOL, INSPECTION_TOOL, JSHELL_TOOL,
-    LOG_TOOL, METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE, MIN_EDITOR_SIZE, MenuRow, MenuShortcut,
-    NextProblem, NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL,
-    PreviousProblem, ProjectOpener, ProjectStructure, PushChanges, RECENT_PLACES_POPUP, RUN_TOOL,
-    RerunInspection, Resume, RevertChange, Run, SELECTION_HISTORY_TOOL, SERVICES_TOOL,
-    STACK_TRACE_TOOL, STRUCTURE_TOOL, SelectInProject, ShowBranches, ShowCommit, ShowSearch,
-    ShowSettings, SplitRight, StepInto, StepOut, StepOver, Stop, TASKS_TOOL, TERMINAL_TOOL,
-    TODO_TOOL, TabListener, ToggleAi, ToggleBreakpoint, ToggleCommit, ToggleDatabase, ToggleDebug,
-    ToggleEndpoints, ToggleFullScreen, ToggleHttp, ToggleLog, ToggleProject, ToggleRun,
-    ToggleServices, ToggleStructure, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
-    UpdateProject, VcsQuickList, ViewBreakpoints, WINDOW_KEYS, WindowKey, Workspace, bind_keys,
-    bind_keys_for, build_date, build_version, window_key, window_step,
+    AI_CLIENTS, AI_TOOL, BEANS_TOOL, BOOKMARKS_POPUP, BUILD_TOOL, CALL_HIERARCHY_TOOL,
+    CHECK_LANGUAGE_SETUP, COMMIT_TOOL, COVERAGE_TOOL, CloseTab, CommandFn, DATABASE_TOOL,
+    DEBUG_TOOL, DOCUMENTATION_TOOL, Debug, Dismiss, DockSide, ENDPOINTS_TOOL, Evaluate, HTTP_TOOL,
+    INSPECTION_TOOL, JSHELL_TOOL, LOG_TOOL, METHOD_HIERARCHY_TOOL, MIN_DOCK_SIZE, MIN_EDITOR_SIZE,
+    MenuRow, MenuShortcut, NextProblem, NextTab, PERFORMANCE_TOOL, PROBLEMS_TOOL, PROFILER_TOOL,
+    PROJECT_TOOL, PreviousProblem, ProjectOpener, ProjectStructure, PushChanges,
+    RECENT_PLACES_POPUP, RUN_TOOL, RerunInspection, Resume, RevertChange, Run,
+    SELECTION_HISTORY_TOOL, SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL, SelectInProject,
+    ShowBranches, ShowCommit, ShowSearch, ShowSettings, SplitRight, StepInto, StepOut, StepOver,
+    Stop, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, TabListener, ToggleAi, ToggleBreakpoint,
+    ToggleCommit, ToggleDatabase, ToggleDebug, ToggleEndpoints, ToggleFullScreen, ToggleHttp,
+    ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTerminal,
+    ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints,
+    WINDOW_KEYS, WindowKey, Workspace, bind_keys, bind_keys_for, build_date, build_version,
+    window_key, window_step,
 };
 
 #[cfg(any(test, feature = "test-support"))]

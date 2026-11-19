@@ -334,9 +334,10 @@ fn ctrl_f9_builds_the_project_without_debugging(cx: &mut TestAppContext) {
     });
     assert!(
         window
-            .read_with(cx, |workspace, _| workspace.tool_open(workspace::RUN_TOOL))
+            .read_with(cx, |workspace, _| workspace
+                .tool_open(workspace::BUILD_TOOL))
             .unwrap(),
-        "Ctrl+F9 shows the build console"
+        "Ctrl+F9 shows the Build window"
     );
     assert_eq!(
         notification(cx, window),

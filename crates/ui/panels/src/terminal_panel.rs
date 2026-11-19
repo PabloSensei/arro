@@ -390,6 +390,12 @@ impl TerminalPanel {
         self.focus.clone()
     }
 
+    /// The client whose bar the panel shows, for tests.
+    #[cfg(test)]
+    pub(crate) fn suggestion_client(&self) -> Option<mcp_discovery::Client> {
+        self.terminal_suggestion
+    }
+
     /// The session of the tab the user looks at.
     pub fn session(&self) -> Option<&Arc<TerminalSession>> {
         self.tabs.get(self.active)?.pane().session()
@@ -639,7 +645,7 @@ impl TerminalPanel {
         };
         self.suggestion_generation += 1;
         let generation = self.suggestion_generation;
-        let file = client.user_config(&mcp_discovery::home_folder());
+        let file = client.user_config(&crate::settings::mcp_home_folder(cx));
         let read = cx
             .background_executor()
             .spawn(async move { mcp_discovery::has_entry(client, &file).unwrap_or(false) });
@@ -1923,7 +1929,7 @@ impl TerminalPanel {
     }
 
     fn configure_suggestion(&mut self, client: mcp_discovery::Client, cx: &mut Context<Self>) {
-        let home = mcp_discovery::home_folder();
+        let home = crate::settings::mcp_home_folder(cx);
         let project = self.root.clone();
         let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
         let command = crate::settings_catalog::mcp_binary(&settings);

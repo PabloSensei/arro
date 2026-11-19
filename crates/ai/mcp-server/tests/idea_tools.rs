@@ -149,6 +149,7 @@ impl ToolBackend for Fake {
             items,
             total,
             clipped: total > query.limit,
+            timed_out: false,
         })
     }
 
@@ -162,6 +163,7 @@ impl ToolBackend for Fake {
             }],
             total: 1,
             clipped: false,
+            timed_out: false,
             files: 1,
         })
     }

@@ -258,6 +258,23 @@ impl BuildSystem for Maven {
         })
     }
 
+    fn rebuild(&self, root: &Path, tests: bool) -> Result<ProcessSpec> {
+        let spec = self.command(root)?.arg("clean").arg("compile");
+        Ok(if tests {
+            spec.arg("test-compile")
+        } else {
+            spec
+        })
+    }
+
+    fn generates_sources(&self) -> bool {
+        true
+    }
+
+    fn generate_sources(&self, root: &Path) -> Result<Option<ProcessSpec>> {
+        Ok(Some(self.command(root)?.arg("generate-sources")))
+    }
+
     fn tasks(&self, _model: &ProjectModel) -> Vec<String> {
         PHASES.iter().map(|phase| (*phase).to_owned()).collect()
     }

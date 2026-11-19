@@ -9,6 +9,9 @@ pub enum Change {
     Renamed,
     Copied,
     Untracked,
+    /// A file Git leaves out through `.gitignore`; only a status that asks for them has
+    /// any.
+    Ignored,
     Conflicted,
 }
 
@@ -75,6 +78,12 @@ pub fn parse_status(output: &[u8]) -> Status {
                 original: None,
                 index: Change::Unmodified,
                 worktree: Change::Untracked,
+            }),
+            "!" => status.files.push(FileStatus {
+                path: rest.to_owned(),
+                original: None,
+                index: Change::Unmodified,
+                worktree: Change::Ignored,
             }),
             _ => {}
         }
@@ -176,6 +185,7 @@ mod tests {
             renamed,
             file("both.txt", Change::Conflicted, Change::Conflicted),
             file("untracked.txt", Change::Unmodified, Change::Untracked),
+            file("ignored.txt", Change::Unmodified, Change::Ignored),
         ];
         assert_eq!(status.files, expected);
     }

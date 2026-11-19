@@ -695,6 +695,13 @@ pub struct DebugPanel {
     session: Option<Box<dyn DebugSessionToken>>,
     store: Option<Arc<Store>>,
     root: PathBuf,
+    /// The state folder of the window, for the file of the whole console of a tool's
+    /// session.
+    state_dir: PathBuf,
+    /// The file of the whole console of the session a tool started, and how many lines
+    /// of it are already there.
+    tool_output_file: Option<PathBuf>,
+    tool_output_lines: usize,
     title: SharedString,
     scroll_tree: ScrollHandle,
     scroll_side: ScrollHandle,
@@ -733,6 +740,7 @@ impl DebugPanel {
     pub fn create(
         root: PathBuf,
         store: Option<Arc<Store>>,
+        state_dir: PathBuf,
         workspace: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -798,6 +806,9 @@ impl DebugPanel {
             session: None,
             store,
             root,
+            state_dir,
+            tool_output_file: None,
+            tool_output_lines: 0,
             title: "Debug".into(),
             scroll_tree: ScrollHandle::new(),
             scroll_side: ScrollHandle::new(),
@@ -1032,9 +1043,64 @@ impl DebugPanel {
             status: status.to_string(),
             run_configuration: Some(name),
             output_preview: (!preview.is_empty()).then_some(preview),
-            full_output_path: None,
-            exit_code: None,
+            full_output_path: self
+                .tool_output_file
+                .as_ref()
+                .filter(|path| path.is_file())
+                .cloned(),
+            exit_code: self.snapshot.exit_code,
         })
+    }
+
+    /// The file with the whole console of a session a tool started.
+    fn tool_output_path(&self, id: &str) -> PathBuf {
+        self.state_dir
+            .join("debug-output")
+            .join(crate::project_state::project_key(&self.root))
+            .join(format!("{id}.log"))
+    }
+
+    /// Writes the lines of the console that are not in the file of a tool's session yet.
+    fn flush_tool_output(&mut self) {
+        let (Some(_), Some(path)) = (&self.tool_session, &self.tool_output_file) else {
+            return;
+        };
+        let count = self.local_console.len();
+        if count == self.tool_output_lines {
+            return;
+        }
+        let path = path.clone();
+        let lines: Vec<String> = self
+            .local_console
+            .iter()
+            .skip(self.tool_output_lines)
+            .map(|line| line.text.clone())
+            .collect();
+        let rewrite =
+            count < self.tool_output_lines || self.tool_output_lines == 0 || count >= MAX_CONSOLE;
+        if rewrite {
+            let text: String = self
+                .local_console
+                .iter()
+                .map(|line| format!("{}\n", line.text))
+                .collect();
+            if std::fs::write(&path, text).is_ok() {
+                self.tool_output_lines = count;
+            }
+            return;
+        }
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        use std::io::Write as _;
+        let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) else {
+            return;
+        };
+        if file.write_all(text.as_bytes()).is_ok() {
+            self.tool_output_lines = count;
+        }
     }
 
     /// The id of the session a session tool works on, or the reason it cannot.
@@ -1723,12 +1789,26 @@ impl DebugPanel {
             ..Snapshot::default()
         };
         self.tool_session = Some((id.clone(), name.clone()));
+        self.tool_output_lines = 0;
+        self.tool_output_file = Some(self.tool_output_path(&id));
+        if let Some(path) = &self.tool_output_file
+            && let Some(parent) = path.parent()
+        {
+            let _ = std::fs::create_dir_all(parent);
+            let _ = std::fs::write(path, b"");
+        }
         cx.notify();
         Ok(tool_gateway::DebuggerSession {
             id,
             name: name.clone(),
             status: "starting".to_string(),
             run_configuration: Some(name),
+            full_output_path: self
+                .tool_output_file
+                .as_ref()
+                .filter(|path| path.is_file())
+                .cloned(),
+            exit_code: None,
             ..tool_gateway::DebuggerSession::default()
         })
     }
@@ -2848,6 +2928,8 @@ impl DebugPanel {
         self.build_process = None;
         self.pending = None;
         self.session = None;
+        self.tool_output_file = None;
+        self.tool_output_lines = 0;
         self.front = Front::Debugger;
         self.stop_values.clear();
         self.changed_values.clear();
@@ -3676,6 +3758,7 @@ impl DebugPanel {
             self.rebuild_console_filter();
         }
         let mut build_changed = self.poll_build(cx);
+        self.flush_tool_output();
         // The tools answer from the snapshot of this poll, so their jobs come first.
         self.poll_tool_jobs(cx);
         if let Some(reason) = self.debugger.as_ref().and_then(Debugger::take_input_error) {
@@ -3719,6 +3802,7 @@ impl DebugPanel {
         // thousand threads here would be the work the grouping avoids.
         self.snapshot = (*snapshot).clone();
         self.merge_console();
+        self.flush_tool_output();
         self.sync_identities(cx);
         // A program that reads its input needs the line of the console at hand.
         if self.takes_input() && self.front != Front::Console {
@@ -9029,6 +9113,9 @@ mod tests {
                 session: None,
                 store: None,
                 root: PathBuf::new(),
+                state_dir: test_support::scratch("debug-panel-state"),
+                tool_output_file: None,
+                tool_output_lines: 0,
                 title: "Debug".into(),
                 scroll_tree: ScrollHandle::new(),
                 scroll_side: ScrollHandle::new(),

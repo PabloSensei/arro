@@ -49,9 +49,9 @@ fn the_answer_buttons_stay_out_of_the_search_lists(cx: &mut TestAppContext) {
     );
     press(cx, window, "escape");
 
-    // Search Everywhere: `notes` finds the file of the sample, and no Actions group.
+    // Search Everywhere: `notes.txt` finds the file of the sample, and no Actions group.
     open_palette(cx, window, keys::SEARCH_EVERYWHERE);
-    type_text(cx, window, "notes");
+    type_text(cx, window, "notes.txt");
     draw(cx, window);
     let found = rows(cx, window);
     assert!(

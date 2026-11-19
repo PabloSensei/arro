@@ -27,7 +27,7 @@ fn selector(path: &[usize]) -> &'static str {
     Box::leak(format!("menu-{}", parts.join("-")).into_boxed_str())
 }
 
-fn sections(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> Vec<MenuEntry> {
+pub(crate) fn sections(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> Vec<MenuEntry> {
     window
         .update(cx, |workspace, _, cx| workspace.main_menu(cx))
         .unwrap()
@@ -39,7 +39,7 @@ fn bar_selector(index: usize) -> &'static str {
 }
 
 /// Opens the submenu of a section of the menu bar by its item, as a click does.
-fn open_section(cx: &mut TestAppContext, window: WindowHandle<Workspace>, index: usize) {
+pub(crate) fn open_section(cx: &mut TestAppContext, window: WindowHandle<Workspace>, index: usize) {
     click(cx, window, bar_selector(index));
     draw(cx, window);
 }
@@ -60,7 +60,7 @@ fn alt_tap(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
 }
 
 /// The indexes of the rows named by `labels`, from the top section down.
-fn path_to(entries: &[MenuEntry], labels: &[&str]) -> Vec<usize> {
+pub(crate) fn path_to(entries: &[MenuEntry], labels: &[&str]) -> Vec<usize> {
     let mut path = Vec::new();
     let mut level = entries;
     for label in labels {
@@ -74,14 +74,18 @@ fn path_to(entries: &[MenuEntry], labels: &[&str]) -> Vec<usize> {
     path
 }
 
-fn open_parents(cx: &mut TestAppContext, window: WindowHandle<Workspace>, path: &[usize]) {
+pub(crate) fn open_parents(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    path: &[usize],
+) {
     for depth in 1..path.len() {
         click(cx, window, selector(&path[..depth]));
         draw(cx, window);
     }
 }
 
-fn click_row(cx: &mut TestAppContext, window: WindowHandle<Workspace>, path: &[usize]) {
+pub(crate) fn click_row(cx: &mut TestAppContext, window: WindowHandle<Workspace>, path: &[usize]) {
     click(cx, window, selector(path));
     draw(cx, window);
 }

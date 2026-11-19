@@ -16,6 +16,10 @@ pub struct RunState {
     /// The configuration is temporary: it is not in the file and goes away by itself.
     /// The same length as `configs`.
     pub temporary: Vec<bool>,
+    /// The name of the build tool of the project, for the stripe of its tool window.
+    pub build_tool: Option<SharedString>,
+    /// Whether the project can generate its sources.
+    pub generates_sources: bool,
 }
 
 impl RunState {
@@ -41,6 +45,8 @@ type Select = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 type FlagAction = Rc<dyn Fn(bool, &mut Window, &mut App)>;
 /// An action that names a file of the project, such as Compile.
 type FileAction = Rc<dyn Fn(Option<PathBuf>, &mut Window, &mut App)>;
+/// The name of the build module that holds a file, for the labels of the Build menu.
+pub type ModuleOf = Rc<dyn Fn(Option<&std::path::Path>, &App) -> Option<SharedString>>;
 
 #[derive(Clone)]
 pub struct RunControls {
@@ -53,6 +59,14 @@ pub struct RunControls {
     pub build: Action,
     /// Ctrl+Shift+F9: compile the module of the file with the build tool.
     pub compile: FileAction,
+    /// Build Module: compile the module that holds the file.
+    pub build_module: FileAction,
+    /// Rebuild Project: build the whole project from scratch.
+    pub rebuild: Action,
+    /// Generate Sources and Update Folders.
+    pub generate_sources: Action,
+    /// The name of the module that holds a file, for the labels of the Build menu.
+    pub module_of: ModuleOf,
     /// Ctrl+F5: runs the last configuration or test request again.
     pub rerun: Action,
     /// Alt+Shift+R: runs the last test request again.

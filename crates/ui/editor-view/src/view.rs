@@ -668,9 +668,23 @@ pub enum EditorEvent {
     /// Ctrl+S: the window saves every open file, as the IDE does.
     SaveAll,
     /// A refactoring that reaches other files or moves files; the window applies it.
-    ApplyChange(lang_api::WorkspaceChange),
+    /// The label names the refactoring in Local History, when it has one.
+    ApplyChange {
+        change: lang_api::WorkspaceChange,
+        label: Option<String>,
+    },
+    /// Ctrl+Z in the file a refactoring of several files started in: the window takes
+    /// the whole change back, closed files of it included.
+    UndoRefactoring(u64),
+    /// Ctrl+Shift+Z after such an undo: the window applies the whole change again.
+    RedoRefactoring(u64),
     /// Ctrl+F6: the window shows the Change Signature form for this place.
     ChangeSignature(lang_api::DocumentSpot),
+    /// Pull Members Up and the like: the window shows their form for this place.
+    MemberRefactoring {
+        refactoring: lang_api::MemberRefactoring,
+        spot: lang_api::DocumentSpot,
+    },
     /// Refactor This picked an action of the server that needs values: the window shows
     /// its form, and the handle names the action for the language.
     RefactorForm(String),
@@ -2450,6 +2464,39 @@ impl EditorView {
         self.changed(change, cx);
     }
 
+    /// Applies the last undone edit again, as the redo key of the editor does.
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        self.catch_up(cx);
+        let change = self
+            .state
+            .as_mut()
+            .and_then(|state| state.perform(keymap::editor::REDO, 1));
+        self.changed(change, cx);
+    }
+
+    /// The change of several files the window keeps as one step, if any.
+    pub fn workspace_undo(&self) -> Option<u64> {
+        self.lsp.as_ref()?.workspace_undo
+    }
+
+    pub fn workspace_redo(&self) -> Option<u64> {
+        self.lsp.as_ref()?.workspace_redo
+    }
+
+    /// The window names the step of its history that this file takes back.
+    pub fn set_workspace_undo(&mut self, group: Option<u64>) {
+        if let Some(lsp) = &mut self.lsp {
+            lsp.workspace_undo = group;
+        }
+    }
+
+    /// The window names the step of its history that this file applies again.
+    pub fn set_workspace_redo(&mut self, group: Option<u64>) {
+        if let Some(lsp) = &mut self.lsp {
+            lsp.workspace_redo = group;
+        }
+    }
+
     fn loaded(&mut self, result: Result<EditorState, LoadError>, cx: &mut Context<Self>) {
         match result {
             Ok(mut state) => {
@@ -3361,6 +3408,12 @@ impl EditorView {
         // The menu of Alt+Enter belongs to the text and the word it opened on.
         if change.is_some() {
             self.dismiss_actions_popup(cx);
+            // An edit of this file is newer than the refactoring of the window: its
+            // undo step no longer follows this text.
+            if let Some(lsp) = &mut self.lsp {
+                lsp.workspace_undo = None;
+                lsp.workspace_redo = None;
+            }
         } else {
             self.follow_actions_popup(cx);
         }
@@ -4230,6 +4283,10 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
+        if plain && self.name_key(&stroke.key, cx) {
+            cx.stop_propagation();
+            return;
+        }
         // Enter expands a template that chose Enter, when its abbreviation ends here and
         // no list of a popup is open.
         if plain && stroke.key == "enter" && self.template_expand_key(ExpandWith::Enter, cx) {
@@ -4321,6 +4378,20 @@ impl EditorView {
 
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
+        // A refactoring of several files is one step of the window's history: this file
+        // asks the window for it instead of taking back its own buffer alone.
+        if action == actions::UNDO
+            && let Some(group) = self.workspace_undo()
+        {
+            cx.emit(EditorEvent::UndoRefactoring(group));
+            return;
+        }
+        if action == actions::REDO
+            && let Some(group) = self.workspace_redo()
+        {
+            cx.emit(EditorEvent::RedoRefactoring(group));
+            return;
+        }
         // A command counts its edits from the carets and folds here, so the changes of
         // the other view of the document come in first.
         self.catch_up(cx);
@@ -4450,6 +4521,19 @@ impl EditorView {
             actions::INLINE => return self.refactor(Refactoring::Inline, cx),
             actions::INTRODUCE_PARAMETER => {
                 return self.refactor(Refactoring::IntroduceParameter, cx);
+            }
+            actions::PULL_MEMBERS_UP => {
+                return self.member_refactoring(lang_api::MemberRefactoring::PullUp, cx);
+            }
+            actions::PUSH_MEMBERS_DOWN => {
+                return self.member_refactoring(lang_api::MemberRefactoring::PushDown, cx);
+            }
+            actions::EXTRACT_SUPERCLASS => {
+                return self.member_refactoring(lang_api::MemberRefactoring::ExtractSuperclass, cx);
+            }
+            actions::INTRODUCE_PARAMETER_OBJECT => {
+                return self
+                    .member_refactoring(lang_api::MemberRefactoring::IntroduceParameterObject, cx);
             }
             actions::REFACTOR_THIS => return self.refactor_this(cx),
             actions::GENERATE => return self.generate_menu(cx),
@@ -6512,6 +6596,48 @@ impl EditorView {
                         .summary
                         .clone()
                         .map(|text| div().text_color(theme.text_muted).child(text)),
+                );
+            popups.push(
+                deferred(
+                    anchored()
+                        .position(position)
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
+        if let Some(field) = &lsp.name
+            && let Some(position) = self.below(field.at)
+        {
+            let body = surface(&theme)
+                .debug_selector(|| "extract-name-popup".to_owned())
+                .min_w(px(280.))
+                .max_w(px(640.))
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_size(px(self.style.font_size))
+                .child(div().text_color(theme.text_muted).child(field.label))
+                .child(
+                    div()
+                        .font_family(self.style.font_family.clone())
+                        .text_color(theme.text)
+                        .child(format!("{}|", field.text)),
+                )
+                .children(field.visibility_line().map(|visibility| {
+                    div()
+                        .debug_selector(|| "extract-name-visibility".to_owned())
+                        .text_color(theme.text_muted)
+                        .child(format!("Visibility: {visibility} (Up/Down)"))
+                }))
+                .child(
+                    div()
+                        .debug_selector(|| "extract-name-preview".to_owned())
+                        .text_color(theme.text_muted)
+                        .child(field.preview()),
                 );
             popups.push(
                 deferred(

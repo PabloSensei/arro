@@ -373,6 +373,8 @@ pub struct SearchPage {
     pub items: Vec<SearchHit>,
     pub total: usize,
     pub clipped: bool,
+    /// The time limit stopped the search before it read every file.
+    pub timed_out: bool,
     /// How many files the hits come from.
     pub files: usize,
 }
@@ -395,6 +397,9 @@ pub struct SearchQuery {
     pub paths: Vec<String>,
     #[serde(default = "default_page")]
     pub limit: usize,
+    /// Milliseconds the search may take; the answer carries what it found by then.
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 impl SearchQuery {
@@ -1052,6 +1057,9 @@ pub struct PathQuery {
     pub include_excluded: bool,
     #[serde(default = "default_path_limit")]
     pub limit: usize,
+    /// Milliseconds the search may take; the answer carries what it found by then.
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 fn default_path_limit() -> usize {
@@ -1071,6 +1079,8 @@ pub struct PathPage {
     pub items: Vec<PathBuf>,
     pub total: usize,
     pub clipped: bool,
+    /// The time limit stopped the search before it looked at every file.
+    pub timed_out: bool,
 }
 
 /// One file of a directory tree, a folder when it has children.
@@ -1089,6 +1099,8 @@ pub struct DirectoryTree {
     pub entries: Vec<TreeEntry>,
     /// A folder below the requested depth was not read.
     pub clipped: bool,
+    /// The time limit stopped the read before every folder was listed.
+    pub timed_out: bool,
 }
 
 /// One gutter mark of a file.
@@ -1363,6 +1375,7 @@ pub trait ToolBackend: Send + Sync {
             items,
             total,
             clipped: total > limit,
+            timed_out: false,
         })
     }
 
@@ -1737,12 +1750,23 @@ pub struct BuildRequest {
     pub timeout: Option<u64>,
 }
 
-/// One error the build tool reported, with the place in the sources it named.
+/// How serious the build tool thinks a problem is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProblemSeverity {
+    #[default]
+    Error,
+    Warning,
+}
+
+/// One problem the build tool reported, with the place in the sources it named.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuildProblem {
     pub path: PathBuf,
     /// 1-based.
     pub line: u32,
+    /// 1-based, when the tool named one.
+    pub column: Option<u32>,
+    pub severity: ProblemSeverity,
     pub message: String,
 }
 

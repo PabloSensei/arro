@@ -1,5 +1,6 @@
 //! A refactoring that reaches several files: an open file changes through its buffer,
-//! one undo step each, a closed one on disk. Moved files move after their edits.
+//! a closed one on disk, and the window keeps the whole change as one step of its
+//! history. Moved files move after their edits.
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +19,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn open_view(workspace: &Workspace, path: &Path) -> Option<Entity<EditorView>> {
+pub(crate) fn open_view(workspace: &Workspace, path: &Path) -> Option<Entity<EditorView>> {
     let tabs = workspace.open_tabs().into_iter().flatten();
     let open = tabs.into_iter().find(|tab| same_file(tab, path))?;
     workspace.view_of(&open)?.downcast::<EditorView>().ok()
@@ -28,15 +29,36 @@ struct PendingFile {
     path: PathBuf,
     text: String,
     format: text_core::FileFormat,
+    /// The text the file held before the change; `None` for a file it brings into being.
+    before: Option<String>,
+    before_format: text_core::FileFormat,
     /// The change brings the file into being, so there is no text to keep around it.
     new: bool,
+}
+
+/// A closed file a change wrote, with what it held before: the window keeps this to
+/// take the whole change back in one step.
+#[derive(Clone)]
+pub(crate) struct WrittenFile {
+    pub path: PathBuf,
+    pub before: Option<String>,
+    pub before_format: text_core::FileFormat,
+    pub after: String,
+    pub after_format: text_core::FileFormat,
 }
 
 /// Applies the edits of closed files to their text on disk: every file keeps its
 /// encoding, byte order mark and line ends, and either all of them change or none do.
 /// A file that does not exist yet is created from the text of its edits; a failure
 /// takes the new files away again. Returns the files that could not be applied.
+#[cfg(test)]
 fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
+    apply_to_files_with(files).0
+}
+
+/// The same, with the text every file held before and after, for the undo of the whole
+/// change.
+fn apply_to_files_with(files: &[(PathBuf, Vec<DocumentEdit>)]) -> (Vec<String>, Vec<WrittenFile>) {
     let mut pending: Vec<PendingFile> = Vec::with_capacity(files.len());
     let mut failed = Vec::new();
     for (path, edits) in files {
@@ -52,7 +74,9 @@ fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
             Ok(decoded) => pending.push(PendingFile {
                 path: path.clone(),
                 text: apply_to_text(&decoded.text, edits),
-                format: decoded.format,
+                format: decoded.format.clone(),
+                before: Some(decoded.text),
+                before_format: decoded.format,
                 new: false,
             }),
             // An extract interface and the like bring a file into being: its edits are
@@ -62,6 +86,8 @@ fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
                     path: path.clone(),
                     text: apply_to_text("", edits),
                     format: text_core::FileFormat::default(),
+                    before: None,
+                    before_format: text_core::FileFormat::default(),
                     new: true,
                 });
             }
@@ -69,7 +95,7 @@ fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
         }
     }
     if !failed.is_empty() {
-        return failed;
+        return (failed, Vec::new());
     }
     // The new files come first: nothing of the old ones has changed if one fails, and
     // a failure of the old ones takes the new files away again.
@@ -84,7 +110,10 @@ fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
             Ok(()) => created.push(file.path.clone()),
             Err(error) => {
                 remove_files(&created);
-                return vec![format!("{}: {error}", file.path.display())];
+                return (
+                    vec![format!("{}: {error}", file.path.display())],
+                    Vec::new(),
+                );
             }
         }
     }
@@ -97,13 +126,27 @@ fn apply_to_files(files: &[(PathBuf, Vec<DocumentEdit>)]) -> Vec<String> {
             format: &file.format,
         })
         .collect();
-    match text_core::write_files(&updates) {
+    let result = match text_core::write_files(&updates) {
         Ok(()) => Vec::new(),
         Err(error) => {
             remove_files(&created);
             vec![error.to_string()]
         }
+    };
+    if !result.is_empty() {
+        return (result, Vec::new());
     }
+    let written = pending
+        .into_iter()
+        .map(|file| WrittenFile {
+            path: file.path,
+            before: file.before,
+            before_format: file.before_format,
+            after: file.text,
+            after_format: file.format,
+        })
+        .collect();
+    (Vec::new(), written)
 }
 
 fn remove_files(paths: &[PathBuf]) {
@@ -194,6 +237,8 @@ trait Buffers {
     fn apply(&mut self, path: &Path, batches: Vec<Vec<DocumentEdit>>);
     /// Moves the tabs of a file that has moved on disk.
     fn moved(&mut self, from: &Path, to: &Path);
+    /// A closed file reached the disk, with what it held before.
+    fn written(&mut self, _file: &WrittenFile) {}
 }
 
 /// Applies a change so that a failure leaves no half refactoring: every path and
@@ -225,9 +270,12 @@ fn apply_plan(
     for (path, _) in &plan.closed {
         buffers.snapshot(path);
     }
-    let closed = apply_to_files(&plan.closed);
+    let (closed, written) = apply_to_files_with(&plan.closed);
     if !closed.is_empty() {
         return closed;
+    }
+    for file in &written {
+        buffers.written(file);
     }
     for (path, batches) in plan.open {
         buffers.apply(&path, batches);
@@ -258,6 +306,12 @@ struct LiveBuffers<'a, 'c> {
     workspace: &'a mut Workspace,
     window: &'a mut Window,
     cx: &'a mut Context<'c, Workspace>,
+    /// The open files the change applied to, in the order it named them.
+    open: Vec<PathBuf>,
+    /// The closed files that reached the disk.
+    written: Vec<WrittenFile>,
+    /// The files that moved.
+    renames: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Buffers for LiveBuffers<'_, '_> {
@@ -276,6 +330,7 @@ impl Buffers for LiveBuffers<'_, '_> {
     }
 
     fn apply(&mut self, path: &Path, batches: Vec<Vec<DocumentEdit>>) {
+        self.open.push(path.to_path_buf());
         let Some(view) = open_view(self.workspace, path) else {
             return;
         };
@@ -287,7 +342,12 @@ impl Buffers for LiveBuffers<'_, '_> {
     }
 
     fn moved(&mut self, from: &Path, to: &Path) {
+        self.renames.push((from.to_path_buf(), to.to_path_buf()));
         self.workspace.paths_moved(from, to, self.window, self.cx);
+    }
+
+    fn written(&mut self, file: &WrittenFile) {
+        self.written.push(file.clone());
     }
 }
 
@@ -297,28 +357,49 @@ pub(crate) fn apply(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    apply_from(workspace, change, None, None, window, cx);
+}
+
+/// Applies a change that a refactoring started in `origin`, whose name `label` gives to
+/// Local History. A change of several files becomes one entry of the window's history:
+/// its undo takes every file back, closed ones on disk and created ones away.
+pub(crate) fn apply_from(
+    workspace: &mut Workspace,
+    change: WorkspaceChange,
+    origin: Option<Entity<EditorView>>,
+    label: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let files = change
         .edits
         .iter()
         .filter(|source| !source.edits.is_empty() && uri_path(&source.uri).is_some())
         .count();
-    let renames: Vec<(PathBuf, PathBuf)> = change
-        .renames
-        .iter()
-        .filter_map(|rename| Some((uri_path(&rename.from)?, uri_path(&rename.to)?)))
-        .collect();
     let open: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
     let is_open = |path: &Path| open.iter().any(|known| same_file(known, path));
-    let mut buffers = LiveBuffers {
-        workspace,
-        window,
-        cx,
+    let origin_path = origin
+        .as_ref()
+        .map(|view| view.read(cx).path().to_path_buf());
+    let (failed, applied, written, moved) = {
+        let mut buffers = LiveBuffers {
+            workspace,
+            window,
+            cx,
+            open: Vec::new(),
+            written: Vec::new(),
+            renames: Vec::new(),
+        };
+        let failed = apply_plan(change, &is_open, &mut buffers);
+        (failed, buffers.open, buffers.written, buffers.renames)
     };
-    let failed = apply_plan(change, &is_open, &mut buffers);
     if !failed.is_empty() {
         let text = format!("Not applied: {}", failed.join(", "));
         workspace.notify_user("Refactoring", text, cx);
         return;
+    }
+    if let Some(label) = &label {
+        crate::history::put_label(workspace.root(), label.clone(), cx);
     }
     if let Some(panel) = cx
         .try_global::<crate::project::ActiveProjectPanel>()
@@ -326,11 +407,29 @@ pub(crate) fn apply(
     {
         // The window is being updated while the change is applied, so the rows follow
         // once it is free.
+        let rows = moved.clone();
         cx.defer(move |cx| {
-            for (from, to) in renames {
+            for (from, to) in rows {
                 panel.update(cx, |panel, cx| panel.paths_moved(&from, &to, cx));
             }
         });
+    }
+    // A moved file takes its tab along, which the undo of the text alone cannot put
+    // back: such a change stays with the undo of each buffer.
+    let touched = applied.len() + written.len() + moved.len();
+    if touched > 1 && moved.is_empty() {
+        let group = crate::refactor_undo::Group {
+            origin: origin_path.or_else(|| applied.first().cloned()),
+            open: applied,
+            closed: written,
+        };
+        let origin = origin.or_else(|| {
+            group
+                .origin
+                .as_deref()
+                .and_then(|path| open_view(workspace, path))
+        });
+        crate::refactor_undo::push(workspace, group, origin, cx);
     }
     if files > 1 {
         let text = format!("Changed {files} files");

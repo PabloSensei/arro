@@ -16,6 +16,7 @@ mod jshell;
 mod language;
 mod live_templates;
 mod lombok;
+mod members;
 mod messages;
 mod migrations;
 pub mod newproject;

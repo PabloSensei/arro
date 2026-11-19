@@ -321,6 +321,8 @@ pub struct Snapshot {
     pub exception_filters: Vec<ExceptionFilter>,
     /// The process id the adapter reported for the debuggee, when it did.
     pub process_id: Option<u32>,
+    /// The exit code of the debuggee, when the adapter reported one.
+    pub exit_code: Option<i32>,
     /// The places Smart Step Into offers, `None` before it asked.
     pub step_targets: Option<Vec<StepTarget>>,
     /// The last Quick Evaluate answer.

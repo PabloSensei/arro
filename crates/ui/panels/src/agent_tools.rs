@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use project_model::{EnvironmentProvider, ProjectModel, TEST_UNIT};
 use tool_gateway::{
@@ -58,6 +60,8 @@ struct State {
 pub struct WindowTools {
     languages: Arc<LanguageTools>,
     root: PathBuf,
+    /// The folders the project index leaves out, such as build output.
+    excludes: Vec<PathBuf>,
     environment: Option<Arc<dyn EnvironmentProvider>>,
     state: Arc<State>,
     /// The edits that wait for the window, and the threads that wait for their answers.
@@ -82,12 +86,14 @@ impl WindowTools {
     pub fn new(
         languages: Arc<LanguageTools>,
         root: PathBuf,
+        excludes: Vec<PathBuf>,
         environment: Option<Arc<dyn EnvironmentProvider>>,
         edits: Arc<EditRequests>,
     ) -> Self {
         Self {
             languages,
             root,
+            excludes,
             environment,
             state: Arc::new(State::default()),
             edits,
@@ -180,6 +186,10 @@ impl WindowTools {
     }
 
     fn find_files(&self, query: &PathQuery) -> PathPage {
+        let deadline = query
+            .timeout
+            .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
+        let mut timed_out = false;
         let mut items: Vec<PathBuf> = self
             .files()
             .iter()
@@ -190,7 +200,20 @@ impl WindowTools {
             })
             .cloned()
             .collect();
+        if query.include_excluded && !timed_out {
+            // The index leaves the build output out; a search that asks for the excluded
+            // folders reads them from the disk.
+            for folder in &self.excludes {
+                if folder.starts_with(&self.root) {
+                    self.walk_excluded(folder, query, deadline, &mut items, &mut timed_out);
+                }
+                if timed_out {
+                    break;
+                }
+            }
+        }
         items.sort();
+        items.dedup();
         let total = items.len();
         let limit = query.limit.max(1);
         items.truncate(limit);
@@ -198,6 +221,50 @@ impl WindowTools {
             items,
             total,
             clipped: total > limit,
+            timed_out,
+        }
+    }
+
+    /// Adds the files under one excluded folder that the query asks for. Stops at
+    /// `deadline` and says so through `timed_out`.
+    fn walk_excluded(
+        &self,
+        folder: &Path,
+        query: &PathQuery,
+        deadline: Option<Instant>,
+        items: &mut Vec<PathBuf>,
+        timed_out: &mut bool,
+    ) {
+        let mut pending = vec![folder.to_path_buf()];
+        while let Some(folder) = pending.pop() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                *timed_out = true;
+                return;
+            }
+            let Ok(read) = std::fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    if entry.file_name() != ".git" {
+                        pending.push(path);
+                    }
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                let relative = crate::git::relative_of(&self.root, &path);
+                if tool_gateway::path_allowed(&query.paths, &relative)
+                    && tool_gateway::matches_glob(&query.pattern, &relative)
+                {
+                    items.push(path);
+                }
+            }
         }
     }
 
@@ -233,7 +300,7 @@ impl WindowTools {
             }
         }
         let status = repo
-            .status()
+            .status_with_ignored(query.include_ignored)
             .map_err(|error| ToolError::Failed(format!("git status failed: {error}")))?;
         let mut files: Vec<GitFileEntry> = status
             .files
@@ -241,6 +308,10 @@ impl WindowTools {
             .filter(|file| {
                 query.include_untracked
                     || (file.index != Change::Untracked && file.worktree != Change::Untracked)
+            })
+            .filter(|file| {
+                query.include_ignored
+                    || (file.index != Change::Ignored && file.worktree != Change::Ignored)
             })
             .map(|file| GitFileEntry {
                 path: file.path.replace('\\', "/"),
@@ -498,9 +569,29 @@ impl WindowTools {
         };
         let cancel = base::Cancel::new();
         let stop = cancel.clone();
+        let deadline = query
+            .timeout
+            .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let watchdog = deadline.map(|deadline| {
+            let stop = cancel.clone();
+            let timed_out = timed_out.clone();
+            let (done, wait) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if matches!(
+                    wait.recv_timeout(left),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    timed_out.store(true, Ordering::Relaxed);
+                    stop.cancel();
+                }
+            });
+            (done, handle)
+        });
         let seen = std::sync::atomic::AtomicUsize::new(0);
         let found = std::sync::Mutex::new(Vec::new());
-        search::find_in_files(&text_query, &files, &open, &cancel, &|file| {
+        let result = search::find_in_files(&text_query, &files, &open, &cancel, &|file| {
             let lines = file.lines.len();
             found
                 .lock()
@@ -510,8 +601,13 @@ impl WindowTools {
             if seen >= MAX_MATCHES {
                 stop.cancel();
             }
-        })
-        .map_err(|error| ToolError::BadInput(error.to_string()))?;
+        });
+        if let Some((done, handle)) = watchdog {
+            let _ = done.send(());
+            let _ = handle.join();
+        }
+        result.map_err(|error| ToolError::BadInput(error.to_string()))?;
+        let timed_out = timed_out.load(Ordering::Relaxed);
         let found = found
             .into_inner()
             .unwrap_or_else(|error| error.into_inner());
@@ -548,6 +644,7 @@ impl WindowTools {
             items,
             total,
             clipped,
+            timed_out,
             files: found_files,
         })
     }
@@ -727,6 +824,7 @@ fn status_of(file: &FileStatus) -> &'static str {
         Change::Renamed => "renamed",
         Change::Copied => "copied",
         Change::Untracked => "untracked",
+        Change::Ignored => "ignored",
         Change::Conflicted => "conflicted",
     }
 }
@@ -742,6 +840,7 @@ fn code_of(change: Change) -> String {
         Change::Renamed => "R",
         Change::Copied => "C",
         Change::Untracked => "?",
+        Change::Ignored => "!",
         Change::Conflicted => "U",
     };
     code.to_string()
@@ -1032,19 +1131,36 @@ impl ToolBackend for WindowTools {
                     query.path.display()
                 )));
             }
-            std::fs::remove_file(&query.path).map_err(|error| {
-                ToolError::Failed(format!(
-                    "could not remove {}: {error}",
-                    query.path.display()
-                ))
-            })?;
-            return Ok(ProposedEdit {
+            let base = Some(self.text_of(&query.path)?.0);
+            return match self.edits.ask(EditKind::Propose {
                 path: query.path.clone(),
-                outcome: EditOutcome::Accepted,
-                text: None,
-                hunks: 1,
-                kept: 1,
-            });
+                base,
+                proposed: None,
+            }) {
+                EditReply::Proposal {
+                    outcome,
+                    text,
+                    hunks,
+                    kept,
+                } => Ok(ProposedEdit {
+                    path: query.path.clone(),
+                    outcome,
+                    text,
+                    hunks,
+                    kept,
+                }),
+                EditReply::NoDecision => Ok(ProposedEdit {
+                    path: query.path.clone(),
+                    outcome: EditOutcome::NoDecision,
+                    text: None,
+                    hunks: 0,
+                    kept: 0,
+                }),
+                EditReply::Failed(message) => Err(ToolError::Failed(message)),
+                _ => Err(ToolError::Failed(
+                    "the window answered a delete the wrong way".to_string(),
+                )),
+            };
         }
         let base = if query.path.exists() {
             Some(self.text_of(&query.path)?.0)
@@ -1078,7 +1194,7 @@ impl ToolBackend for WindowTools {
         match self.edits.ask(EditKind::Propose {
             path: query.path.clone(),
             base,
-            proposed,
+            proposed: Some(proposed),
         }) {
             EditReply::Proposal {
                 outcome,

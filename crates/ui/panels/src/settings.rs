@@ -170,7 +170,7 @@ pub(crate) fn default_settings_file() -> PathBuf {
 
 /// The home folder the MCP client rows read: the profile of the user, or the one a test
 /// set for itself.
-fn mcp_home_folder(cx: &App) -> PathBuf {
+pub(crate) fn mcp_home_folder(cx: &App) -> PathBuf {
     #[cfg(not(test))]
     let _ = cx;
     #[cfg(test)]

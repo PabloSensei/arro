@@ -177,6 +177,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for DailyLanguage {
             renames: Vec::new(),
             handle: None,
             resolve: None,
+            rename: None,
         };
         let _ = reply.send(self.answer(vec![entry]));
     }

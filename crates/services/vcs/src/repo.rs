@@ -278,14 +278,23 @@ impl Repository {
     }
 
     pub fn status(&self) -> io::Result<Status> {
+        self.status_with_ignored(false)
+    }
+
+    /// The status of the working tree. With `include_ignored`, the files `.gitignore`
+    /// leaves out are listed too, with the `!` code of `git status`.
+    pub fn status_with_ignored(&self, include_ignored: bool) -> io::Result<Status> {
         self.status_reads.fetch_add(1, Ordering::Relaxed);
-        let args = [
+        let mut args = vec![
             "status",
             "--porcelain=v2",
             "-z",
             "--branch",
             "--untracked-files=all",
         ];
+        if include_ignored {
+            args.push("--ignored=traditional");
+        }
         Ok(parse_status(&self.git.run(&self.root, args)?))
     }
 

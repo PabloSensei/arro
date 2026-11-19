@@ -10,6 +10,7 @@ mod ansi;
 mod beans;
 mod branches;
 mod build;
+mod build_output;
 mod bundle_editor;
 mod call_hierarchy;
 mod change_signature;
@@ -70,6 +71,7 @@ mod mcp_database;
 mod mcp_debug;
 mod mcp_edits;
 mod mcp_runs;
+mod member_form;
 mod merge_view;
 mod method_hierarchy;
 mod navigation;
@@ -89,6 +91,7 @@ mod prompt;
 mod proposal;
 mod push;
 mod refactor_form;
+mod refactor_undo;
 mod reformat;
 mod run;
 mod run_configs;
@@ -187,6 +190,8 @@ mod window_tests_library_sources;
 mod window_tests_live;
 #[cfg(test)]
 mod window_tests_log_graph;
+#[cfg(test)]
+mod window_tests_member;
 
 #[cfg(test)]
 mod window_tests_appearance;
@@ -212,6 +217,8 @@ mod window_tests_real_actions_on_save;
 mod window_tests_real_drag;
 #[cfg(test)]
 mod window_tests_refactor_copy;
+#[cfg(test)]
+mod window_tests_refactor_extract;
 #[cfg(test)]
 mod window_tests_refactor_this;
 #[cfg(test)]
@@ -721,10 +728,11 @@ use lang_api::{FileChange, LanguageSupport, ProjectProblemsQuery, ask};
 use tool_gateway::LanguageTools;
 use ui_kit::*;
 use workspace::{
-    AI_TOOL, BEANS_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL,
-    DockSide, ENDPOINTS_TOOL, INSPECTION_TOOL, LOG_TOOL, Launch, OpenRequests, PERFORMANCE_TOOL,
-    PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL, SELECTION_HISTORY_TOOL, SERVICES_TOOL,
-    STACK_TRACE_TOOL, STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    AI_TOOL, BEANS_TOOL, BUILD_TOOL, COMMIT_TOOL, COVERAGE_TOOL, DATABASE_TOOL, DEBUG_TOOL,
+    DOCUMENTATION_TOOL, DockSide, ENDPOINTS_TOOL, INSPECTION_TOOL, LOG_TOOL, Launch, OpenRequests,
+    PERFORMANCE_TOOL, PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, RUN_TOOL, SELECTION_HISTORY_TOOL,
+    SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL,
+    USAGES_TOOL, Workspace,
 };
 
 use crate::index::{IndexEvent, ProjectIndex};
@@ -1298,7 +1306,13 @@ fn install(
     jshell_panel::install(workspace, weak.clone(), cx);
 
     let root = workspace.root().to_path_buf();
-    let runs = run::RunPanel::create(root, project.clone(), weak.clone(), cx);
+    let runs = run::RunPanel::create(
+        root,
+        project.clone(),
+        workspace.state_dir().to_path_buf(),
+        weak.clone(),
+        cx,
+    );
     let focus = runs.read(cx).focus();
     workspace.set_dock(
         DockSide::Bottom,
@@ -1310,6 +1324,17 @@ fn install(
     workspace.set_run_controls(run::RunPanel::controls(&runs));
     cx.set_global(script::ActiveRunPanel(runs.clone()));
     run::bind_actions(workspace);
+    let build_output = build_output::BuildOutputPanel::create(runs.clone(), weak.clone(), cx);
+    let focus = build_output.read(cx).focus();
+    workspace.set_dock(
+        DockSide::Bottom,
+        BUILD_TOOL,
+        build_output.clone().into(),
+        Some(focus),
+        cx,
+    );
+    #[cfg(test)]
+    cx.set_global(build_output::ActiveBuildOutput(build_output));
     services.update(cx, |services, cx| services.set_runs(runs.clone(), cx));
     let coverage_source = runs.clone();
     let profiler_source = runs.clone();
@@ -1317,6 +1342,7 @@ fn install(
     let debug = debug::DebugPanel::create(
         workspace.root().to_path_buf(),
         workspace.store(),
+        workspace.state_dir().to_path_buf(),
         weak.clone(),
         cx,
     );
@@ -1366,6 +1392,7 @@ fn install(
     let tools = Arc::new(agent_tools::WindowTools::new(
         languages.clone(),
         workspace.root().to_path_buf(),
+        search.excludes.clone(),
         project.environment.clone(),
         edits,
     ));
@@ -1887,4 +1914,15 @@ fn disk_changed(workspace: &Workspace, changes: &[FsChange], cx: &mut Context<Wo
 }
 
 #[cfg(test)]
+mod window_tests_build_output;
+#[cfg(test)]
+mod window_tests_mcp_idea_tails;
+#[cfg(test)]
+mod window_tests_mcp_terminal;
+#[cfg(test)]
 mod window_tests_run_console;
+
+#[cfg(test)]
+mod window_tests_beans_menu;
+#[cfg(test)]
+mod window_tests_generate_list;

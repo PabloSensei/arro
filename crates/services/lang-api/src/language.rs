@@ -7,11 +7,12 @@ use crate::{
     CompletionResolveProvider, DefinitionPreviewProvider, DependencyUpdatesProvider,
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
     GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
-    MethodHierarchyProvider, MoveDestinationProvider, MoveProvider, NavigationProvider,
-    OverridableMethodsProvider, PrepareDiagnosticsProvider, ProjectProblemsProvider,
-    RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
-    SemanticServer, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
-    WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
+    MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
+    MoveDestinationProvider, MoveProvider, NavigationProvider, OverridableMethodsProvider,
+    PrepareDiagnosticsProvider, ProjectProblemsProvider, RangeFormatProvider,
+    ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer, SignatureProvider,
+    SourceTextProvider, SymbolProvider, SyntaxProvider, WorkspaceDiagnosticsProvider,
+    WorkspaceSymbolProvider,
 };
 use crate::{
     ExpectedTypeProvider, ExternalDocProvider, LibraryClassProvider, SignatureInfoProvider,
@@ -190,6 +191,12 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The expressions under the caret that an extract may take, when the server names
+    /// more than the one its action would use.
+    fn refactor_selections(&self) -> Option<&crate::RefactorSelectionsProvider> {
+        None
+    }
+
     /// The processes of the machine that already listen for a debugger, for Attach to
     /// Process. A language that cannot list them makes the window ask for an address.
     fn debug_processes(&self) -> Option<&crate::DebugProcessProvider> {
@@ -237,6 +244,17 @@ pub trait LanguageSupport: Send + Sync {
     }
 
     fn change_signature(&self) -> Option<&ChangeSignatureProvider> {
+        None
+    }
+
+    /// Pull Members Up, Push Members Down, Extract Superclass and Introduce Parameter
+    /// Object: the members and the places the form offers.
+    fn member_action_form(&self) -> Option<&MemberActionParametersProvider> {
+        None
+    }
+
+    /// The edits of a filled member refactoring form.
+    fn apply_member_action(&self) -> Option<&MemberActionProvider> {
         None
     }
 

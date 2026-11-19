@@ -467,6 +467,11 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
                         "description": "Folders to search, a leading ! excludes",
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Milliseconds; the answer keeps what was found by then",
+                    },
                     "projectPath": {
                         "type": "string",
                         "description": "The project of the window, when the agent knows it",
@@ -1218,7 +1223,7 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
             name: SEARCH_FILE,
             description: "The files of the project whose path matches a glob such as `**/*.txt`. \
                           `paths` keeps the search in the named folders and a leading `!` excludes \
-                          one. The answer is JSON: `files`, `total` and `more`.",
+                          one. The answer is JSON: `files`, `total`, `more` and `timedOut`.",
             class: ToolClass::Read,
             input_schema: json!({
                 "type": "object",
@@ -1227,6 +1232,7 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "Folders to search, a leading ! excludes"},
                     "includeExcluded": {"type": "boolean", "description": "Look in folders the project excludes too"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                    "timeout": {"type": "integer", "minimum": 0, "description": "Milliseconds; the answer keeps what was found by then"},
                     "projectPath": {"type": "string", "description": "The project of the window, when the agent knows it"}
                 },
                 "required": ["q"],
@@ -1237,7 +1243,8 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
             name: SEARCH_REGEX,
             description: "The matches of a regular expression with the text of their line and from 1 \
                           the line and the column. `paths` keeps the search in the named folders and a \
-                          leading `!` excludes one. The answer is JSON: `matches`, `total` and `more`.",
+                          leading `!` excludes one. The answer is JSON: `matches`, `total`, `more` and \
+                          `timedOut`.",
             class: ToolClass::Read,
             input_schema: json!({
                 "type": "object",
@@ -1245,6 +1252,7 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
                     "q": {"type": "string", "description": "A regular expression"},
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "Folders to search, a leading ! excludes"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "timeout": {"type": "integer", "minimum": 0, "description": "Milliseconds; the answer keeps what was found by then"},
                     "projectPath": {"type": "string", "description": "The project of the window, when the agent knows it"}
                 },
                 "required": ["q"],
@@ -1285,6 +1293,7 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
                     "include_external": {"type": "boolean", "description": "Only for symbol"},
                     "includeExcluded": {"type": "boolean", "description": "Only for file"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                    "timeout": {"type": "integer", "minimum": 0, "description": "Milliseconds; the answer keeps what was found by then"},
                     "projectPath": {"type": "string", "description": "The project of the window, when the agent knows it"}
                 },
                 "required": ["mode", "q"],

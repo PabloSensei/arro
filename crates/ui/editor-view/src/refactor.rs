@@ -8,15 +8,16 @@ use ::platform;
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt;
 use lang_api::{
-    ActionEntry, ActionKind, Confidence, DocumentSpot, HierarchyDirection, HierarchyQuery,
-    MoveDestination, MoveKind, MoveQuery, MoveRequest, RenameQuery, SourceSpan, SymbolEntry,
-    WorkspaceChange, ask,
+    ActionEntry, ActionKind, Confidence, DocumentEdit, DocumentSpot, ExtractKind,
+    HierarchyDirection, HierarchyQuery, MoveDestination, MoveKind, MoveQuery, MoveRequest,
+    RenamePosition, RenameQuery, SelectionQuery, SourceSpan, SymbolEntry, TextSpan,
+    WorkspaceChange, apply_to_text, ask,
 };
 use text_core::TextStore;
 use ui_kit::*;
 
 use crate::actions::{Own, Pick};
-use crate::semantic::{MAX_SHOWN, NO_ANSWER, first, is_word, offset_at, uri_path};
+use crate::semantic::{MAX_SHOWN, NO_ANSWER, first, is_word, offset_at, point_at, uri_path};
 use crate::view::{DetailedUsage, EditorEvent, EditorView, Usage, UsagesUpdate};
 use keymap::editor as editor_actions;
 
@@ -76,6 +77,35 @@ fn is_typed_key(key: &str) -> bool {
                 | "bracketleft"
                 | "bracketright"
         )
+}
+
+/// The byte offset of a place the server names in UTF-16 units.
+fn byte_at_utf16(text: &str, units: u32) -> Option<usize> {
+    let mut seen = 0u32;
+    for (at, character) in text.char_indices() {
+        if seen == units {
+            return Some(at);
+        }
+        seen += character.len_utf16() as u32;
+        if seen > units {
+            return None;
+        }
+    }
+    (seen == units).then_some(text.len())
+}
+
+/// The text a place of the server covers in a text.
+fn name_at(text: &str, position: &RenamePosition) -> Option<String> {
+    let start = byte_at_utf16(text, position.offset)?;
+    let end = byte_at_utf16(text, position.offset + position.length)?;
+    text.get(start..end).map(str::to_owned)
+}
+
+/// The text of the file after the edits of the entry, or `None` when the entry has no
+/// edits for it.
+fn text_after(entry: &ActionEntry, uri: &str, text: &str) -> Option<String> {
+    let source = entry.edits.iter().find(|source| source.uri == uri)?;
+    Some(apply_to_text(text, &source.edits))
 }
 
 /// Shift+F6: the new name is typed here, not into the text. The first Enter asks
@@ -154,8 +184,76 @@ impl MoveField {
     }
 }
 
+/// How visible the method an extract introduces is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    Private,
+    Protected,
+    Package,
+    Public,
+}
+
+impl Visibility {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Protected => "protected",
+            Self::Package => "package-private",
+            Self::Public => "public",
+        }
+    }
+
+    /// The modifier the text of a method starts with, and the word a package-private
+    /// method has none of.
+    fn modifier(self) -> Option<&'static str> {
+        match self {
+            Self::Private => Some("private"),
+            Self::Protected => Some("protected"),
+            Self::Package => None,
+            Self::Public => Some("public"),
+        }
+    }
+
+    fn next(self, forward: bool) -> Self {
+        let steps = [Self::Private, Self::Protected, Self::Package, Self::Public];
+        let at = steps.iter().position(|step| *step == self).unwrap_or(0);
+        let len = steps.len();
+        steps[(at + if forward { 1 } else { len - 1 }) % len]
+    }
+}
+
+/// The field over an extract: the name the server chose, ready to be typed over, and
+/// the visibility of a new method. Enter applies the refactoring with that name.
+pub(crate) struct ExtractNameField {
+    pub at: usize,
+    pub label: &'static str,
+    pub text: String,
+    /// The first typed character replaces the name of the server instead of following it.
+    selected: bool,
+    entry: ActionEntry,
+    version: i32,
+    rename: RenamePosition,
+    default_name: String,
+    /// Extract Method has a visibility of its own; the other extracts do not.
+    visibility: Option<Visibility>,
+}
+
+impl ExtractNameField {
+    /// The line under the name: what Enter writes into the code.
+    pub fn preview(&self) -> String {
+        match self.visibility {
+            Some(visibility) => format!("{} {}(...)", visibility.label(), self.text),
+            None => format!("Name: {}", self.text),
+        }
+    }
+
+    pub fn visibility_line(&self) -> Option<&'static str> {
+        self.visibility.map(Visibility::label)
+    }
+}
+
 /// What a refactoring key asks the server for: a prefix of the kind of its action.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refactoring {
     ExtractMethod,
     ExtractVariable,
@@ -182,6 +280,36 @@ impl Refactoring {
             Self::Inline => "Nothing to inline here",
             Self::IntroduceParameter => "Select an expression to introduce as a parameter",
             _ => "Select an expression or statements to extract",
+        }
+    }
+
+    /// The name the window gives the entry of Local History.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ExtractMethod => "Extract Method",
+            Self::ExtractVariable => "Extract Variable",
+            Self::ExtractField => "Extract Field",
+            Self::ExtractConstant => "Extract Constant",
+            Self::IntroduceParameter => "Introduce Parameter",
+            Self::Inline => "Inline",
+        }
+    }
+
+    fn from_code(code: &str) -> &'static str {
+        if code.starts_with("refactor.extract.function") {
+            "Extract Method"
+        } else if code.starts_with("refactor.extract.variable") {
+            "Extract Variable"
+        } else if code.starts_with("refactor.extract.constant") {
+            "Extract Constant"
+        } else if code.starts_with("refactor.extract.field") {
+            "Extract Field"
+        } else if code.starts_with("refactor.introduce.parameter") {
+            "Introduce Parameter"
+        } else if code.starts_with("refactor.inline") {
+            "Inline"
+        } else {
+            "Refactoring"
         }
     }
 }
@@ -720,6 +848,7 @@ impl EditorView {
             lsp.actions = None;
             lsp.note = None;
             lsp.move_to = None;
+            lsp.name = None;
             lsp.rename = Some(RenameField {
                 at: start,
                 spot,
@@ -761,7 +890,7 @@ impl EditorView {
             "enter" => match field.preview.take() {
                 Some((version, change)) => {
                     lsp.rename = None;
-                    self.apply_change(version, change, cx);
+                    self.apply_change_labeled(version, change, Some("Rename"), cx);
                 }
                 None => self.ask_rename(cx),
             },
@@ -815,12 +944,310 @@ impl EditorView {
         .detach();
     }
 
+    /// Whether the change stays in the text of this file.
+    fn local_change(&self, change: &WorkspaceChange) -> bool {
+        let Some(lsp) = &self.lsp else {
+            return false;
+        };
+        change.renames.is_empty()
+            && change
+                .edits
+                .iter()
+                .all(|source| source.uri == lsp.uri || source.edits.is_empty())
+    }
+
+    /// Opens the field of the name the server introduced, with the name it chose as the
+    /// text: the user types over it, as IDEA renames the new name in place. An action
+    /// without such a place applies as it is.
+    pub(crate) fn start_extract_name(
+        &mut self,
+        version: i32,
+        entry: ActionEntry,
+        label: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        let apply = |this: &mut Self, cx: &mut Context<Self>| {
+            let change = WorkspaceChange {
+                edits: entry.edits.clone(),
+                renames: entry.renames.clone(),
+            };
+            this.apply_change_labeled(version, change, label, cx);
+        };
+        let Some(rename) = entry.rename.clone() else {
+            apply(self, cx);
+            return;
+        };
+        let Some(lsp) = &self.lsp else {
+            return;
+        };
+        if rename.uri != lsp.uri
+            || !self.local_change(&WorkspaceChange {
+                edits: entry.edits.clone(),
+                renames: entry.renames.clone(),
+            })
+        {
+            apply(self, cx);
+            return;
+        }
+        let Some(state) = &self.state else {
+            return;
+        };
+        let Some(after) = text_after(&entry, &lsp.uri, &state.text()) else {
+            apply(self, cx);
+            return;
+        };
+        let Some(default_name) = name_at(&after, &rename) else {
+            apply(self, cx);
+            return;
+        };
+        if default_name.is_empty() {
+            apply(self, cx);
+            return;
+        }
+        let at = state.selections().primary().head;
+        let label = label
+            .unwrap_or_else(|| Refactoring::from_code(entry.code.as_deref().unwrap_or_default()));
+        let method = entry
+            .code
+            .as_deref()
+            .is_some_and(|code| code.starts_with("refactor.extract.function"));
+        if let Some(lsp) = &mut self.lsp {
+            lsp.completion = None;
+            lsp.actions = None;
+            lsp.note = None;
+            lsp.rename = None;
+            lsp.move_to = None;
+            lsp.name = Some(ExtractNameField {
+                at,
+                label,
+                text: default_name.clone(),
+                selected: true,
+                entry,
+                version,
+                rename,
+                default_name,
+                visibility: method.then_some(Visibility::Private),
+            });
+        }
+        cx.notify();
+    }
+
+    /// Typed text goes to an open extract name field. The first character replaces the
+    /// name of the server.
+    pub(crate) fn name_typed(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(field) = self.lsp.as_mut().and_then(|lsp| lsp.name.as_mut()) else {
+            return false;
+        };
+        if field.selected {
+            field.text.clear();
+            field.selected = false;
+        }
+        field.text.push_str(text.trim_end_matches(['\r', '\n']));
+        cx.notify();
+        true
+    }
+
+    /// Keys of an open extract name field. Returns whether the key was taken.
+    pub(crate) fn name_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(lsp) = &mut self.lsp else {
+            return false;
+        };
+        let Some(field) = lsp.name.as_mut() else {
+            return false;
+        };
+        match key {
+            "escape" => lsp.name = None,
+            "backspace" => {
+                if field.selected {
+                    field.text.clear();
+                    field.selected = false;
+                } else {
+                    field.text.pop();
+                }
+            }
+            "up" | "down" => {
+                if let Some(visibility) = field.visibility.as_mut() {
+                    *visibility = visibility.next(key == "down");
+                }
+            }
+            "enter" => {
+                let name = lsp.name.take().expect("the name field is open");
+                self.finish_extract_name(name, cx);
+                return true;
+            }
+            // A typed character goes through text input, where `name_typed` writes it.
+            _ => return !is_typed_key(key),
+        }
+        cx.notify();
+        true
+    }
+
+    /// Applies the refactoring with the typed name, then puts the name into every place
+    /// the server introduced, as one step of undo.
+    fn finish_extract_name(&mut self, field: ExtractNameField, cx: &mut Context<Self>) {
+        let ExtractNameField {
+            at,
+            label,
+            text,
+            entry,
+            version,
+            rename,
+            default_name,
+            visibility,
+            ..
+        } = field;
+        let change = WorkspaceChange {
+            edits: entry.edits.clone(),
+            renames: entry.renames.clone(),
+        };
+        if !self.local_change(&change) {
+            let message =
+                "The refactoring reached other files, so the name stays as the server chose it";
+            self.apply_change_labeled(version, change, Some(label), cx);
+            self.show_note(at, message, cx);
+            return;
+        }
+        self.apply_change_labeled(version, change, Some(label), cx);
+        let Some(name_start) = self
+            .state
+            .as_ref()
+            .and_then(|state| byte_at_utf16(&state.text(), rename.offset))
+        else {
+            return;
+        };
+        let mut steps = 1;
+        let mut shift = 0isize;
+        if let Some(visibility) = visibility {
+            shift = self.apply_visibility(name_start, visibility, cx);
+            if shift != 0 {
+                steps += 1;
+            }
+        }
+        let name = text.trim().to_owned();
+        if name.is_empty() || name == default_name {
+            self.merge_undo_steps(steps);
+            return;
+        }
+        let start = (name_start as isize + shift).max(0) as usize;
+        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.rename()) else {
+            self.merge_undo_steps(steps);
+            return;
+        };
+        let Some(spot) = self.spot_at(start) else {
+            self.merge_undo_steps(steps);
+            return;
+        };
+        let asked = spot.version;
+        let replies = ask(
+            provider,
+            RenameQuery {
+                spot,
+                new_name: name.clone(),
+            },
+        );
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| match answer {
+                Some((change, Confidence::Certain)) if !change.is_empty() => {
+                    this.apply_change_labeled(asked, change, Some(label), cx);
+                    this.merge_undo_steps(steps + 1);
+                }
+                Some((_, Confidence::Unknown)) => {
+                    this.merge_undo_steps(steps);
+                    this.show_note(at, NO_ANSWER, cx);
+                }
+                Some(_) => {
+                    this.merge_undo_steps(steps);
+                    this.show_note(at, "Cannot rename the new name", cx);
+                }
+                None => this.merge_undo_steps(steps),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The step of undo per change: the extract and the name it introduced are one press.
+    fn merge_undo_steps(&mut self, count: usize) {
+        if count > 1
+            && let Some(state) = &mut self.state
+        {
+            state.merge_last_undo(count);
+        }
+    }
+
+    /// Replaces the modifier of the method the extract introduced. Returns how far the
+    /// text moved, in bytes.
+    fn apply_visibility(
+        &mut self,
+        name_start: usize,
+        visibility: Visibility,
+        cx: &mut Context<Self>,
+    ) -> isize {
+        let Some(state) = &self.state else {
+            return 0;
+        };
+        let text = state.text();
+        if name_start > text.len() {
+            return 0;
+        }
+        let line_start = text[..name_start].rfind('\n').map_or(0, |at| at + 1);
+        let head = &text[line_start..name_start];
+        let trimmed = head.trim_start();
+        let indent = head.len() - trimmed.len();
+        let Some(old) = ["private", "protected", "public"]
+            .into_iter()
+            .find(|word| trimmed.starts_with(word))
+        else {
+            return 0;
+        };
+        let start = line_start + indent;
+        let mut end = start + old.len();
+        if !matches!(text[end..].chars().next(), Some(' ' | '\t')) {
+            return 0;
+        }
+        let replacement = visibility.modifier().unwrap_or_default();
+        if old == replacement {
+            return 0;
+        }
+        // The space after the modifier goes with it only when nothing takes its place.
+        if replacement.is_empty() {
+            end += 1;
+        }
+        let shift = replacement.len() as isize - (end - start) as isize;
+        let span = TextSpan {
+            start: point_at(&state.store(), start),
+            end: point_at(&state.store(), end),
+        };
+        self.apply_document_edits(
+            vec![DocumentEdit {
+                span,
+                text: replacement.to_owned(),
+            }],
+            cx,
+        );
+        shift
+    }
+
     /// Ctrl+F6: the window shows the signature of the place and edits it.
     pub(crate) fn change_signature(&mut self, cx: &mut Context<Self>) {
         let Some((spot, _)) = self.spot() else {
             return;
         };
         cx.emit(EditorEvent::ChangeSignature(spot));
+    }
+
+    /// Pull Members Up, Push Members Down, Extract Superclass and Introduce Parameter
+    /// Object: the window asks the language for the members and the places.
+    pub(crate) fn member_refactoring(
+        &mut self,
+        refactoring: lang_api::MemberRefactoring,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((spot, _)) = self.spot() else {
+            return;
+        };
+        cx.emit(EditorEvent::MemberRefactoring { refactoring, spot });
     }
 
     /// F6: asks where the file can go and shows the destinations in a searchable list.
@@ -958,7 +1385,7 @@ impl EditorView {
                     this.show_note(caret, error, cx);
                 }
                 Some((outcome, _)) if !outcome.change.is_empty() => {
-                    this.apply_change(version, outcome.change, cx);
+                    this.apply_change_labeled(version, outcome.change, Some("Move"), cx);
                 }
                 Some(_) => this.show_note(caret, "Cannot move this", cx),
                 None => {}
@@ -1077,6 +1504,16 @@ impl EditorView {
             Own::ExtractField => self.refactor(Refactoring::ExtractField, cx),
             Own::ExtractConstant => self.refactor(Refactoring::ExtractConstant, cx),
             Own::IntroduceParameter => self.refactor(Refactoring::IntroduceParameter, cx),
+            Own::PullMembersUp => self.member_refactoring(lang_api::MemberRefactoring::PullUp, cx),
+            Own::PushMembersDown => {
+                self.member_refactoring(lang_api::MemberRefactoring::PushDown, cx)
+            }
+            Own::ExtractSuperclass => {
+                self.member_refactoring(lang_api::MemberRefactoring::ExtractSuperclass, cx)
+            }
+            Own::IntroduceParameterObject => {
+                self.member_refactoring(lang_api::MemberRefactoring::IntroduceParameterObject, cx)
+            }
             Own::Inline => self.refactor(Refactoring::Inline, cx),
         }
     }
@@ -1155,6 +1592,34 @@ impl EditorView {
                 Some("refactor.introduce.parameter"),
             ),
             (
+                Own::PullMembersUp,
+                "Pull Members Up",
+                editor_actions::PULL_MEMBERS_UP,
+                "PullUp",
+                Some("refactor.pull.up"),
+            ),
+            (
+                Own::PushMembersDown,
+                "Push Members Down",
+                editor_actions::PUSH_MEMBERS_DOWN,
+                "PushDown",
+                Some("refactor.push.down"),
+            ),
+            (
+                Own::ExtractSuperclass,
+                "Extract Superclass",
+                editor_actions::EXTRACT_SUPERCLASS,
+                "ExtractSuperclass",
+                Some("refactor.extract.superclass"),
+            ),
+            (
+                Own::IntroduceParameterObject,
+                "Introduce Parameter Object",
+                editor_actions::INTRODUCE_PARAMETER_OBJECT,
+                "IntroduceParameterObject",
+                Some("refactor.introduce.parameter.object"),
+            ),
+            (
                 Own::Inline,
                 "Inline",
                 editor_actions::INLINE,
@@ -1209,10 +1674,87 @@ impl EditorView {
     }
 
     /// Ctrl+Alt+M, V, F, C, P and Ctrl+Alt+N: the action of that kind for the selection.
+    /// An extract with no selection first asks the server which expressions are under
+    /// the caret, as IDEA lists them.
     pub(crate) fn refactor(&mut self, refactoring: Refactoring, cx: &mut Context<Self>) {
         let Some(span) = self.selection_span() else {
             return;
         };
+        let kind = match refactoring {
+            Refactoring::ExtractMethod => Some(ExtractKind::Method),
+            Refactoring::ExtractVariable => Some(ExtractKind::Variable),
+            Refactoring::ExtractConstant => Some(ExtractKind::Constant),
+            Refactoring::ExtractField => Some(ExtractKind::Field),
+            Refactoring::IntroduceParameter | Refactoring::Inline => None,
+        };
+        let empty = span.start == span.end;
+        let provider = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.support.refactor_selections());
+        let (Some(kind), true, Some(provider)) = (kind, empty, provider) else {
+            self.refactor_span(refactoring, span, cx);
+            return;
+        };
+        let Some((spot, caret)) = self.spot() else {
+            return;
+        };
+        let replies = ask(provider, SelectionQuery { spot, kind });
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let Some((entries, _)) = answer else {
+                    this.refactor_span(refactoring, span, cx);
+                    return;
+                };
+                let Some(state) = &this.state else {
+                    return;
+                };
+                let text = state.text();
+                let found: Vec<(String, TextSpan)> = entries
+                    .into_iter()
+                    .filter(|entry| entry.length > 0)
+                    .filter_map(|entry| {
+                        let start = byte_at_utf16(&text, entry.offset)?;
+                        let end = byte_at_utf16(&text, entry.offset + entry.length)?;
+                        Some((
+                            entry.name,
+                            TextSpan {
+                                start: point_at(&state.store(), start),
+                                end: point_at(&state.store(), end),
+                            },
+                        ))
+                    })
+                    .collect();
+                match found.as_slice() {
+                    [] => this.refactor_span(refactoring, span, cx),
+                    [(_, found)] => this.refactor_span(refactoring, *found, cx),
+                    _ => {
+                        let rows = found
+                            .into_iter()
+                            .map(|(label, span)| Pick::Expression {
+                                label,
+                                span,
+                                refactoring,
+                            })
+                            .collect();
+                        this.show_picks(caret, rows, refactoring.missing(), cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The action of the refactoring for the span, which an extract with a choice of
+    /// expressions takes from the row the user picked.
+    pub(crate) fn refactor_span(
+        &mut self,
+        refactoring: Refactoring,
+        span: TextSpan,
+        cx: &mut Context<Self>,
+    ) {
         let only = Some(ActionKind::Refactor);
         self.ask_actions(span, only, cx, move |this, version, caret, entries, cx| {
             let mut found: Vec<ActionEntry> = entries
@@ -1232,25 +1774,53 @@ impl EditorView {
                         cx.emit(EditorEvent::RefactorForm(handle));
                         return;
                     }
-                    let change = WorkspaceChange {
-                        edits: entry.edits,
-                        renames: entry.renames,
-                    };
-                    this.apply_change(version, change, cx);
+                    this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
                 }
                 _ => {
-                    // Some of the rows ask for values first, in a form of the window.
+                    // An extract of a value has two rows of the server, this place and
+                    // every place: they say what they replace before they run.
+                    let replacing = refactoring == Refactoring::ExtractVariable
+                        && found.iter().all(|entry| {
+                            entry
+                                .code
+                                .as_deref()
+                                .is_some_and(|code| code.starts_with("refactor.extract.variable"))
+                        });
+                    let mut all = false;
                     let rows = found
                         .into_iter()
-                        .filter_map(|entry| match entry.handle {
-                            Some(handle) => Some(Pick::Form {
-                                label: entry.title,
-                                handle,
-                            }),
-                            None if !entry.edits.is_empty() || !entry.renames.is_empty() => {
-                                Some(Pick::Action(entry))
+                        .filter_map(|entry| {
+                            let mut entry = entry;
+                            if replacing {
+                                let every = entry.title.to_lowercase().contains("all");
+                                if every && all {
+                                    return None;
+                                }
+                                all |= every;
+                                entry.title = if every {
+                                    // The declaration the extract inserts is a place
+                                    // without text, not an occurrence it replaces.
+                                    let places: usize = entry
+                                        .edits
+                                        .iter()
+                                        .flat_map(|source| &source.edits)
+                                        .filter(|edit| edit.span.start != edit.span.end)
+                                        .count();
+                                    format!("Replace all {places} occurrences")
+                                } else {
+                                    "Replace this occurrence only".to_owned()
+                                };
                             }
-                            None => None,
+                            match entry.handle {
+                                Some(handle) => Some(Pick::Form {
+                                    label: entry.title,
+                                    handle,
+                                }),
+                                None if !entry.edits.is_empty() || !entry.renames.is_empty() => {
+                                    Some(Pick::Action(entry))
+                                }
+                                None => None,
+                            }
                         })
                         .collect();
                     this.show_picks(caret, rows, refactoring.missing(), cx);
