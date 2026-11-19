@@ -312,6 +312,11 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The gutter marks of a file: the programs and the tests a Run or a Debug starts.
+    fn run_points(&self) -> Option<&crate::RunPointsProvider> {
+        None
+    }
+
     /// Starts the server again after it stopped, for example for low memory. False
     /// when there is no stopped server to start.
     fn restart_server(&self) -> bool {

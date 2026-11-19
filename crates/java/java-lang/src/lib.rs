@@ -22,6 +22,7 @@ pub mod newproject;
 mod problems;
 mod project;
 mod refactor;
+mod run_points;
 mod sequence;
 mod session;
 mod setup;

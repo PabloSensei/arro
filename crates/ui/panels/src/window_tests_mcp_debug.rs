@@ -15,7 +15,7 @@ use proc_sup::ProcessSpec;
 use project_model::ProjectModel;
 use runner::{RunPlan, TestListen, TestProvider, TestRequest};
 use serde_json::{Value, json};
-use tool_gateway::{AuditLog, SessionScope, ToolGateway};
+use tool_gateway::{AuditLog, SessionScope, ToolExposure, ToolGateway};
 use ui_kit::gpui;
 use ui_kit::gpui::TestAppContext;
 
@@ -44,7 +44,26 @@ fn gateway(cx: &mut TestAppContext) -> (Arc<ToolGateway>, Arc<crate::mcp_approva
         AuditLog::default(),
         approvals.clone(),
     ));
+    // The debugger rows start router-only; these tests call the debugger by name, so the
+    // table of the page is not between them and the call.
+    gateway.set_exposure(direct_exposure());
     (gateway, approvals)
+}
+
+/// Every tool on and callable by name: the debugger rows start router-only, and the tests
+/// that call the debugger by name keep the table of the page out of their way.
+pub(crate) fn direct_exposure() -> ToolExposure {
+    let mut exposure = ToolExposure::default();
+    for name in tool_gateway::TOOL_NAMES {
+        exposure.set_state(
+            name,
+            tool_gateway::ToolState {
+                enabled: true,
+                router_only: false,
+            },
+        );
+    }
+    exposure
 }
 
 /// Calls a tool on its own thread, as the server does, and waits for the answer.

@@ -51,14 +51,14 @@ pub use layout::{DockState, Layout, PaneState, WindowPlacement};
 pub use native_menu::ScreenMenus;
 pub use run::{DebugControls, DebugRunState, RunControls, RunState};
 pub use settings::{
-    COMPLETION_DELAY_STEP_MS, CompletionCase, DEFAULT_DATABASE_PAGE_ROWS,
+    AnnotateNames, COMPLETION_DELAY_STEP_MS, CompletionCase, DEFAULT_DATABASE_PAGE_ROWS,
     DEFAULT_HTTP_TIMEOUT_SECONDS, DEFAULT_RIGHT_MARGIN, DefaultLayout, DiffHighlighting,
     DiffWhitespace, GitUpdateMethod, InlayParameterNames, LINE_SPACING_STEP,
     MAX_COMPLETION_DELAY_MS, MAX_DATABASE_PAGE_ROWS, MAX_DIFF_CONTEXT_LINES, MAX_FONT_SIZE,
     MAX_HTTP_TIMEOUT_SECONDS, MAX_INDENT_SIZE, MAX_LINE_SPACING, MAX_RIGHT_MARGIN, MAX_UI_SCALE,
     MIN_FONT_SIZE, MIN_LINE_SPACING, MIN_RIGHT_MARGIN, MIN_UI_SCALE, McpExecutePermission,
-    RIGHT_MARGIN_STEP, ReformatScope, SETTINGS_FILE, Settings, SqlKeywordCase,
-    TrimTrailingWhitespace, UI_SCALE_STEP,
+    McpRouterScope, McpToolChoice, RIGHT_MARGIN_STEP, ReformatScope, SETTINGS_FILE, Settings,
+    SqlKeywordCase, TrimTrailingWhitespace, UI_SCALE_STEP,
 };
 pub use split::SplitLayout;
 pub use window::{

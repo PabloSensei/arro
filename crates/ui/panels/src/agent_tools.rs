@@ -10,16 +10,18 @@ use std::sync::{Arc, RwLock};
 
 use project_model::{EnvironmentProvider, ProjectModel, TEST_UNIT};
 use tool_gateway::{
-    BreakpointId, BreakpointInfo, BreakpointQuery, BuildOutcome, BuildRequest, CallHierarchy,
-    CallHierarchyQuery, DebugEvaluateQuery, DebugRunOutcome, DebugRunRequest, DebugSessionState,
-    DebugStack, DebugStackQuery, DebugStepQuery, DebugValue, DebugVariables, DebugVariablesQuery,
-    DebugWaitQuery, DiagnosticsPage, DiagnosticsQuery, EditOutcome, EditorContext,
-    FileActionOutcome, FileActionQuery, FileText, LanguageTools, Position, ProjectStructure,
-    ProjectStructureQuery, ProposeEditQuery, ProposedEdit, ReadFileQuery, RenameSymbolQuery,
-    RenamedSymbol, RunConfiguration, RunOutput, SearchHit, SearchPage, SearchQuery, SessionScope,
-    StartRunRequest, SymbolInfo, SymbolPage, SymbolQuery, TestsOutcome, TestsRequest, ToolBackend,
-    ToolError, TypeHierarchy, TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges, VcsDiff,
-    VcsFile, VcsHunk, VcsQuery,
+    AnalyzeCallsQuery, BreakpointId, BreakpointInfo, BreakpointQuery, BuildOutcome, BuildRequest,
+    CallHierarchy, CallHierarchyQuery, CallTree, DebugEvaluateQuery, DebugRunOutcome,
+    DebugRunRequest, DebugSessionState, DebugStack, DebugStackQuery, DebugStepQuery, DebugValue,
+    DebugVariables, DebugVariablesQuery, DebugWaitQuery, DiagnosticsPage, DiagnosticsQuery,
+    EditOutcome, EditorContext, ExecuteRunQuery, FileActionOutcome, FileActionQuery, FileContent,
+    FileText, GitFileEntry, GitRepositoryStatus, GitStatus, GitStatusQuery, LanguageTools,
+    PathPage, PathQuery, Position, ProjectStructure, ProjectStructureQuery, ProposeEditQuery,
+    ProposedEdit, ReadFileQuery, RenameSymbolQuery, RenamedSymbol, RunConfiguration, RunOutput,
+    RunPointInfo, RunPointQuery, SearchHit, SearchPage, SearchQuery, SessionScope, StartRunRequest,
+    SymbolInfo, SymbolPage, SymbolQuery, TerminalOutput, TerminalQuery, TestsOutcome, TestsRequest,
+    ToolBackend, ToolError, TypeHierarchy, TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges,
+    VcsDiff, VcsFile, VcsHunk, VcsQuery,
 };
 use ui_kit::Global;
 use vcs::{Change, FileStatus, GitRunner, Repository};
@@ -166,6 +168,178 @@ impl WindowTools {
             ToolError::Failed(format!("could not read {}: {error}", path.display()))
         })?;
         Ok((text, false))
+    }
+
+    fn file_content(&self, path: &Path) -> Result<FileContent, ToolError> {
+        let (text, dirty) = self.text_of(path)?;
+        Ok(FileContent {
+            path: path.to_path_buf(),
+            text,
+            dirty,
+        })
+    }
+
+    fn find_files(&self, query: &PathQuery) -> PathPage {
+        let mut items: Vec<PathBuf> = self
+            .files()
+            .iter()
+            .filter(|path| {
+                let relative = crate::git::relative_of(&self.root, path);
+                tool_gateway::path_allowed(&query.paths, &relative)
+                    && tool_gateway::matches_glob(&query.pattern, &relative)
+            })
+            .cloned()
+            .collect();
+        items.sort();
+        let total = items.len();
+        let limit = query.limit.max(1);
+        items.truncate(limit);
+        PathPage {
+            items,
+            total,
+            clipped: total > limit,
+        }
+    }
+
+    fn repositories_of(&self) -> Result<Vec<PathBuf>, ToolError> {
+        let git = GitRunner::from_env()
+            .ok_or_else(|| ToolError::Failed("git is not on PATH".to_string()))?;
+        let repo = Repository::open(git, &self.root).map_err(|error| {
+            ToolError::Failed(format!(
+                "{} is not inside a git repository: {error}",
+                self.root.display()
+            ))
+        })?;
+        Ok(vec![repo.root().to_path_buf()])
+    }
+
+    fn git_status_inner(&self, query: &GitStatusQuery) -> Result<GitStatus, ToolError> {
+        let git = GitRunner::from_env()
+            .ok_or_else(|| ToolError::Failed("git is not on PATH".to_string()))?;
+        let repo = Repository::open(git, &self.root).map_err(|error| {
+            ToolError::Failed(format!(
+                "{} is not inside a git repository: {error}",
+                self.root.display()
+            ))
+        })?;
+        let root = repo.root().to_path_buf();
+        if let Some(wanted) = &query.repository_path_relative_to_project {
+            let relative = crate::git::relative_of(&self.root, &root);
+            let wanted = wanted.to_string_lossy().replace('\\', "/");
+            if !wanted.is_empty() && wanted != "." && wanted != relative {
+                return Ok(GitStatus {
+                    repositories: Vec::new(),
+                });
+            }
+        }
+        let status = repo
+            .status()
+            .map_err(|error| ToolError::Failed(format!("git status failed: {error}")))?;
+        let mut files: Vec<GitFileEntry> = status
+            .files
+            .iter()
+            .filter(|file| {
+                query.include_untracked
+                    || (file.index != Change::Untracked && file.worktree != Change::Untracked)
+            })
+            .map(|file| GitFileEntry {
+                path: file.path.replace('\\', "/"),
+                index: code_of(file.index),
+                worktree: code_of(file.worktree),
+            })
+            .collect();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let total = files.len();
+        let limit = query.limit.max(1);
+        files.truncate(limit);
+        Ok(GitStatus {
+            repositories: vec![GitRepositoryStatus {
+                path: crate::git::relative_of(&self.root, &root),
+                branch: status.branch,
+                files,
+                total,
+                clipped: total > limit,
+            }],
+        })
+    }
+
+    fn execute_terminal_inner(
+        &self,
+        scope: &SessionScope,
+        query: &TerminalQuery,
+    ) -> Result<TerminalOutput, ToolError> {
+        let mut command = if query.execute_in_shell {
+            let mut command = std::process::Command::new(shell_program());
+            command.args(shell_arguments(&query.command));
+            command
+        } else {
+            let mut parts = query.command.split_whitespace();
+            let program = parts
+                .next()
+                .ok_or_else(|| ToolError::BadInput("the command has no program".to_string()))?;
+            let mut command = std::process::Command::new(program);
+            command.args(parts);
+            command
+        };
+        command
+            .current_dir(&scope.cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| ToolError::Failed(format!("the command did not start: {error}")))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let out_reader = stdout.map(|mut out| {
+            std::thread::spawn(move || {
+                let mut buffer = String::new();
+                use std::io::Read;
+                let _ = out.read_to_string(&mut buffer);
+                buffer
+            })
+        });
+        let err_reader = stderr.map(|mut err| {
+            std::thread::spawn(move || {
+                let mut buffer = String::new();
+                use std::io::Read;
+                let _ = err.read_to_string(&mut buffer);
+                buffer
+            })
+        });
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(60_000));
+        let mut timed_out = false;
+        let exit_code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) if started.elapsed() >= timeout => {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(error) => {
+                    return Err(ToolError::Failed(format!(
+                        "the command did not answer: {error}"
+                    )));
+                }
+            }
+        };
+        let mut text = out_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let errors = err_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        text.push_str(&errors);
+        let (text, truncated) = truncate_lines(&text, query.max_lines_count, &query.truncate_mode);
+        Ok(TerminalOutput {
+            output: text,
+            exit_code,
+            timed_out,
+            truncated,
+        })
     }
 
     fn files(&self) -> Arc<Vec<PathBuf>> {
@@ -557,6 +731,67 @@ fn status_of(file: &FileStatus) -> &'static str {
     }
 }
 
+/// The porcelain code of one side of a change.
+fn code_of(change: Change) -> String {
+    let code = match change {
+        Change::Unmodified => " ",
+        Change::Modified => "M",
+        Change::TypeChanged => "T",
+        Change::Added => "A",
+        Change::Deleted => "D",
+        Change::Renamed => "R",
+        Change::Copied => "C",
+        Change::Untracked => "?",
+        Change::Conflicted => "U",
+    };
+    code.to_string()
+}
+
+#[cfg(windows)]
+fn shell_program() -> &'static str {
+    "cmd"
+}
+
+#[cfg(windows)]
+fn shell_arguments(command: &str) -> [&str; 3] {
+    ["/d", "/c", command]
+}
+
+#[cfg(not(windows))]
+fn shell_program() -> &'static str {
+    "sh"
+}
+
+#[cfg(not(windows))]
+fn shell_arguments(command: &str) -> [&str; 2] {
+    ["-c", command]
+}
+
+/// The first, middle or last lines of an answer, as `truncateMode` asks.
+fn truncate_lines(text: &str, max: usize, mode: &str) -> (String, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    if mode == "none" {
+        return (text.to_string(), false);
+    }
+    if lines.len() <= max {
+        return (text.to_string(), false);
+    }
+    let kept: Vec<&str> = match mode {
+        "start" => lines[..max].to_vec(),
+        "middle" => {
+            let first = max / 2;
+            let last = max - first;
+            let mut kept = lines[..first].to_vec();
+            kept.extend_from_slice(&lines[lines.len() - last..]);
+            kept
+        }
+        _ => lines[lines.len() - max..].to_vec(),
+    };
+    let mut shown = kept.join("\n");
+    shown.push('\n');
+    (shown, true)
+}
+
 impl ToolBackend for WindowTools {
     fn editor_context(&self, scope: &SessionScope) -> Result<EditorContext, ToolError> {
         self.languages.editor_context(scope)
@@ -644,6 +879,139 @@ impl ToolBackend for WindowTools {
         Ok(self.range_of(&query.path, &text, start, end, dirty))
     }
 
+    fn file_text(&self, _: &SessionScope, path: &Path) -> Result<FileContent, ToolError> {
+        self.file_content(path)
+    }
+
+    fn find_files(&self, _: &SessionScope, query: &PathQuery) -> Result<PathPage, ToolError> {
+        Ok(self.find_files(query))
+    }
+
+    fn search_symbols(
+        &self,
+        scope: &SessionScope,
+        query: &SymbolQuery,
+    ) -> Result<SymbolPage, ToolError> {
+        self.languages.search_symbols(scope, query)
+    }
+
+    fn analyze_calls(
+        &self,
+        scope: &SessionScope,
+        query: &AnalyzeCallsQuery,
+    ) -> Result<CallTree, ToolError> {
+        self.languages.analyze_calls(scope, query)
+    }
+
+    fn run_points(
+        &self,
+        scope: &SessionScope,
+        query: &RunPointQuery,
+    ) -> Result<Vec<RunPointInfo>, ToolError> {
+        self.languages.run_points(scope, query)
+    }
+
+    fn source_text(&self, scope: &SessionScope, uri: &str) -> Result<String, ToolError> {
+        self.languages.source_text(scope, uri)
+    }
+
+    fn open_file(&self, _: &SessionScope, path: &Path) -> Result<(), ToolError> {
+        match self.edits.ask(EditKind::Open {
+            path: path.to_path_buf(),
+        }) {
+            EditReply::Applied { .. } => Ok(()),
+            EditReply::NoDecision => Err(ToolError::Failed(
+                "the window did not open the file in time".to_string(),
+            )),
+            EditReply::Failed(message) => Err(ToolError::Failed(message)),
+            _ => Err(ToolError::Failed(
+                "the window answered an open request the wrong way".to_string(),
+            )),
+        }
+    }
+
+    fn open_files(&self, _: &SessionScope) -> Result<Vec<PathBuf>, ToolError> {
+        let open = self
+            .state
+            .open
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(open.keys().cloned().collect())
+    }
+
+    fn repositories(&self, _: &SessionScope) -> Result<Vec<PathBuf>, ToolError> {
+        self.repositories_of()
+    }
+
+    fn git_status(&self, _: &SessionScope, query: &GitStatusQuery) -> Result<GitStatus, ToolError> {
+        self.git_status_inner(query)
+    }
+
+    fn execute_terminal(
+        &self,
+        scope: &SessionScope,
+        query: &TerminalQuery,
+    ) -> Result<TerminalOutput, ToolError> {
+        self.execute_terminal_inner(scope, query)
+    }
+
+    fn start_temporary_run(
+        &self,
+        scope: &SessionScope,
+        query: &ExecuteRunQuery,
+        client: Option<&str>,
+    ) -> Result<String, ToolError> {
+        let Some(file) = &query.file_path else {
+            return Err(ToolError::BadInput(
+                "a temporary configuration needs filePath".to_string(),
+            ));
+        };
+        let line = query.line.unwrap_or(0);
+        let points = self.languages.run_points(
+            scope,
+            &RunPointQuery {
+                file_path: file.clone(),
+            },
+        )?;
+        let point = points
+            .iter()
+            .rfind(|point| point.kind == "program" && point.line <= line)
+            .or_else(|| points.iter().find(|point| point.kind == "program"))
+            .ok_or_else(|| {
+                ToolError::Failed(format!(
+                    "{} has no program to start at line {line}",
+                    file.display()
+                ))
+            })?;
+        let simple = point
+            .container
+            .rsplit(['.', '$'])
+            .next()
+            .unwrap_or(&point.container);
+        let configurations = self.languages.run_configurations(scope)?;
+        let Some(configuration) = configurations
+            .iter()
+            .find(|configuration| {
+                configuration.name == simple
+                    || configuration.name == point.container
+                    || configuration.name == point.name
+            })
+            .cloned()
+        else {
+            return Err(ToolError::Failed(format!(
+                "the project has no configuration for {}",
+                point.container
+            )));
+        };
+        let request = StartRunRequest {
+            name: configuration.name,
+            program_arguments: query.program_arguments.clone(),
+            working_directory: query.working_directory.clone(),
+            envs: query.envs.clone(),
+        };
+        self.languages.start_run(scope, &request, client)
+    }
+
     fn vcs_changes(
         &self,
         _scope: &SessionScope,
@@ -657,6 +1025,27 @@ impl ToolBackend for WindowTools {
         _scope: &SessionScope,
         query: &ProposeEditQuery,
     ) -> Result<ProposedEdit, ToolError> {
+        if query.delete {
+            if !query.path.exists() {
+                return Err(ToolError::BadInput(format!(
+                    "{} does not exist",
+                    query.path.display()
+                )));
+            }
+            std::fs::remove_file(&query.path).map_err(|error| {
+                ToolError::Failed(format!(
+                    "could not remove {}: {error}",
+                    query.path.display()
+                ))
+            })?;
+            return Ok(ProposedEdit {
+                path: query.path.clone(),
+                outcome: EditOutcome::Accepted,
+                text: None,
+                hunks: 1,
+                kept: 1,
+            });
+        }
         let base = if query.path.exists() {
             Some(self.text_of(&query.path)?.0)
         } else {
@@ -669,6 +1058,23 @@ impl ToolBackend for WindowTools {
                 &query.replacements,
             )?,
         };
+        if base.is_none() && proposed.is_empty() {
+            if let Some(parent) = query.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    ToolError::Failed(format!("could not make {}: {error}", parent.display()))
+                })?;
+            }
+            std::fs::write(&query.path, b"").map_err(|error| {
+                ToolError::Failed(format!("could not write {}: {error}", query.path.display()))
+            })?;
+            return Ok(ProposedEdit {
+                path: query.path.clone(),
+                outcome: EditOutcome::Accepted,
+                text: Some(String::new()),
+                hunks: 0,
+                kept: 0,
+            });
+        }
         match self.edits.ask(EditKind::Propose {
             path: query.path.clone(),
             base,
@@ -864,6 +1270,22 @@ impl ToolBackend for WindowTools {
 
     fn debug_stop(&self, scope: &SessionScope) -> Result<(), ToolError> {
         self.languages.debug_stop(scope)
+    }
+
+    fn debug_sessions(
+        &self,
+        scope: &SessionScope,
+        query: &tool_gateway::DebugQuery,
+    ) -> Result<tool_gateway::DebugAnswer, ToolError> {
+        self.languages.debug_sessions(scope, query)
+    }
+
+    fn database(
+        &self,
+        scope: &SessionScope,
+        query: &tool_gateway::DatabaseQuery,
+    ) -> Result<tool_gateway::DatabaseAnswer, ToolError> {
+        self.languages.database(scope, query)
     }
 }
 

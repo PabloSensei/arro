@@ -539,6 +539,10 @@ impl LanguageSupport for JavaProject {
         Some(self)
     }
 
+    fn run_points(&self) -> Option<&lang_api::RunPointsProvider> {
+        Some(self)
+    }
+
     fn restart_server(&self) -> bool {
         self.restart()
     }

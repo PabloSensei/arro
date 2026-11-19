@@ -83,7 +83,7 @@ fn head(git: &GitRunner, root: &Path) -> String {
         .to_owned()
 }
 
-fn open_log(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
+pub(crate) fn open_log(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     press(cx, window, "alt-9");
     wait_for(cx, "the log", |cx| has_selector(cx, window, "log-commit-0"));
     cx.executor().advance_clock(Duration::from_millis(5000));
@@ -91,7 +91,10 @@ fn open_log(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     draw(cx, window);
 }
 
-fn log<T>(cx: &TestAppContext, read: impl FnOnce(&crate::git_log::GitLogPanel) -> T) -> T {
+pub(crate) fn log<T>(
+    cx: &TestAppContext,
+    read: impl FnOnce(&crate::git_log::GitLogPanel) -> T,
+) -> T {
     cx.read(|cx| read(cx.global::<ActiveGitLog>().0.read(cx)))
 }
 

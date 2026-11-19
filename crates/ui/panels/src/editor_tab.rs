@@ -837,10 +837,9 @@ fn open(
                         .ok();
                 }
                 EditorEvent::ContextMenu(position) => {
-                    let gutter = view.read(cx).gutter_menu_at(*position);
                     let model = runner
                         .read_with(cx, |workspace, _| {
-                            crate::editor_menu::MenuModel::of(workspace).in_gutter(gutter)
+                            crate::editor_menu::MenuModel::of(workspace)
                         })
                         .ok();
                     if let Some(model) = model {
@@ -852,6 +851,24 @@ fn open(
                             cx,
                         );
                     }
+                }
+                EditorEvent::GutterMenu { position, line } => {
+                    crate::gutter_menu::show_gutter(
+                        view.clone(),
+                        runner.clone(),
+                        *position,
+                        *line,
+                        cx,
+                    );
+                }
+                EditorEvent::BlameMenu { position, line } => {
+                    crate::gutter_menu::show_blame(
+                        view.clone(),
+                        runner.clone(),
+                        *position,
+                        *line,
+                        cx,
+                    );
                 }
                 EditorEvent::AddInlineWatch { line, expression } => {
                     let path = view.read(cx).path().to_path_buf();

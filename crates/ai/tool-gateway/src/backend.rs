@@ -7,12 +7,23 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::database_tools::{DatabaseAnswer, DatabaseQuery};
+use crate::xdebug::{DebugAnswer, DebugQuery};
+
 /// Which session a call belongs to. Comes from the token of the connection, never from the agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionScope {
     pub session: String,
     pub project: PathBuf,
     pub cwd: PathBuf,
+}
+
+impl SessionScope {
+    /// Whether the session belongs to an ACP agent rather than to a client outside the
+    /// window: the window names those sessions `acp-<agent>`.
+    pub fn is_acp(&self) -> bool {
+        self.session == "acp" || self.session.starts_with("acp-")
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -371,7 +382,7 @@ pub struct SearchPage {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchQuery {
-    #[serde(default)]
+    #[serde(default, alias = "q")]
     pub pattern: String,
     /// Treat the pattern as a regular expression instead of plain text.
     #[serde(default)]
@@ -379,6 +390,9 @@ pub struct SearchQuery {
     /// File patterns, as Find in Files takes them: `*.txt` or `!*Test.txt`.
     #[serde(default)]
     pub mask: Option<String>,
+    /// Folders of the project the search stays in, a leading `!` excludes one.
+    #[serde(default)]
+    pub paths: Vec<String>,
     #[serde(default = "default_page")]
     pub limit: usize,
 }
@@ -415,6 +429,16 @@ pub struct ReadFileQuery {
     /// 1-based and inclusive, [`READ_LINE_LIMIT`] lines by default.
     #[serde(default)]
     pub end_line: Option<u32>,
+}
+
+/// The whole text of a file as the editor has it, for the tools that work on all of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileContent {
+    pub path: PathBuf,
+    /// The lines without their line ends, joined by `\n`.
+    pub text: String,
+    /// The editor holds edits that are not on disk.
+    pub dirty: bool,
 }
 
 impl ReadFileQuery {
@@ -478,6 +502,9 @@ pub struct ProposeEditQuery {
     /// Replacements of the text on disk, applied one after another.
     #[serde(default)]
     pub replacements: Vec<TextReplacement>,
+    /// Removes the file instead of writing it; `new_text` and `replacements` stay empty.
+    #[serde(default)]
+    pub delete: bool,
 }
 
 /// How the user took a proposed edit.
@@ -927,6 +954,303 @@ impl DebugStepQuery {
     }
 }
 
+/// What a call tree follows: the calls that reach a symbol, or the calls it makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CallDirection {
+    IncomingCalls,
+    OutgoingCalls,
+}
+
+impl CallDirection {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::IncomingCalls => "INCOMING_CALLS",
+            Self::OutgoingCalls => "OUTGOING_CALLS",
+        }
+    }
+}
+
+/// A call tree the agent asks for by the fully qualified name of a symbol.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzeCallsQuery {
+    #[serde(rename = "symbolFqn")]
+    pub symbol_fqn: String,
+    #[serde(rename = "analysisKind")]
+    pub analysis_kind: CallDirection,
+    #[serde(default = "default_call_depth")]
+    pub depth: usize,
+    #[serde(default = "default_call_children", rename = "maxChildren")]
+    pub max_children: usize,
+    #[serde(default = "default_call_nodes", rename = "maxNodes")]
+    pub max_nodes: usize,
+    /// The path of the node the answer starts at; the root is empty.
+    #[serde(default, rename = "treePath")]
+    pub tree_path: Vec<usize>,
+    #[serde(default, rename = "childOffset")]
+    pub child_offset: usize,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+fn default_call_depth() -> usize {
+    5
+}
+
+fn default_call_children() -> usize {
+    50
+}
+
+fn default_call_nodes() -> usize {
+    1_000
+}
+
+impl AnalyzeCallsQuery {
+    pub fn clipped(mut self) -> Self {
+        self.depth = self.depth.min(20);
+        self.max_children = self.max_children.clamp(1, 200);
+        self.max_nodes = self.max_nodes.clamp(1, 5_000);
+        self
+    }
+}
+
+/// One node of a call tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallNode {
+    pub name: String,
+    pub detail: Option<String>,
+    /// The file the call stands in, when the language service named it.
+    pub file_path: Option<PathBuf>,
+    /// 1-based.
+    pub line: u32,
+    /// The place of the node among its siblings: the root is empty.
+    pub tree_path: Vec<usize>,
+    pub children: Vec<CallNode>,
+}
+
+/// The call tree of one symbol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallTree {
+    pub symbol: String,
+    pub direction: CallDirection,
+    pub root: Option<CallNode>,
+    /// More nodes exist than the answer carries.
+    pub more: bool,
+}
+
+/// A file search: a glob, optional folders and exclusions, and a page size.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathQuery {
+    #[serde(rename = "q")]
+    pub pattern: String,
+    /// Folders the search visits, a leading `!` excludes one.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default, rename = "includeExcluded")]
+    pub include_excluded: bool,
+    #[serde(default = "default_path_limit")]
+    pub limit: usize,
+}
+
+fn default_path_limit() -> usize {
+    100
+}
+
+impl PathQuery {
+    pub fn clipped(mut self) -> Self {
+        self.limit = self.limit.clamp(1, 1_000);
+        self
+    }
+}
+
+/// A file the search found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathPage {
+    pub items: Vec<PathBuf>,
+    pub total: usize,
+    pub clipped: bool,
+}
+
+/// One file of a directory tree, a folder when it has children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// Relative to the project, with `/`.
+    pub path: String,
+    pub name: String,
+    pub directory: bool,
+    /// The depth from the folder the answer starts at, zero for its children.
+    pub depth: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryTree {
+    pub entries: Vec<TreeEntry>,
+    /// A folder below the requested depth was not read.
+    pub clipped: bool,
+}
+
+/// One gutter mark of a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunPointQuery {
+    pub file_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunPointInfo {
+    /// `program` or `test`.
+    pub kind: String,
+    pub name: String,
+    pub container: String,
+    pub file: PathBuf,
+    /// 1-based.
+    pub line: u32,
+    pub framework: bool,
+}
+
+/// One changed file with the codes of the index and the working tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitFileEntry {
+    /// Relative to the repository root, with `/`.
+    pub path: String,
+    /// The porcelain code of the index side: `M`, `A`, `D`, `R`, `?` and so on.
+    pub index: String,
+    /// The porcelain code of the working tree side.
+    pub worktree: String,
+}
+
+/// The status of one repository of the project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRepositoryStatus {
+    /// Relative to the project, empty for the root repository.
+    pub path: String,
+    pub branch: Option<String>,
+    pub files: Vec<GitFileEntry>,
+    pub total: usize,
+    pub clipped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitStatus {
+    pub repositories: Vec<GitRepositoryStatus>,
+}
+
+/// How much of a repository status the agent wants.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitStatusQuery {
+    #[serde(rename = "repositoryPathRelativeToProject")]
+    pub repository_path_relative_to_project: Option<PathBuf>,
+    #[serde(rename = "includeUntracked")]
+    pub include_untracked: bool,
+    #[serde(rename = "includeIgnored")]
+    pub include_ignored: bool,
+    pub limit: usize,
+}
+
+impl Default for GitStatusQuery {
+    fn default() -> Self {
+        Self {
+            repository_path_relative_to_project: None,
+            include_untracked: true,
+            include_ignored: false,
+            limit: 200,
+        }
+    }
+}
+
+impl GitStatusQuery {
+    pub fn clipped(mut self) -> Self {
+        self.limit = self.limit.clamp(1, 1_000);
+        self
+    }
+}
+
+/// One command for the terminal of the window.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalQuery {
+    pub command: String,
+    /// Run the line through the shell; a plain program otherwise. True by default.
+    #[serde(default = "default_true", rename = "executeInShell")]
+    pub execute_in_shell: bool,
+    #[serde(default, rename = "reuseExistingTerminalWindow")]
+    pub reuse_existing_terminal_window: bool,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default = "default_terminal_lines", rename = "maxLinesCount")]
+    pub max_lines_count: usize,
+    /// `start`, `middle`, `end` or `none`.
+    #[serde(default = "default_truncate", rename = "truncateMode")]
+    pub truncate_mode: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_terminal_lines() -> usize {
+    2_000
+}
+
+fn default_truncate() -> String {
+    "end".to_string()
+}
+
+impl TerminalQuery {
+    pub fn clipped(mut self) -> Self {
+        self.max_lines_count = self.max_lines_count.clamp(1, 20_000);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalOutput {
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    /// The output was longer than `maxLinesCount` and was cut.
+    pub truncated: bool,
+}
+
+/// What `execute_run_configuration` asks for.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecuteRunQuery {
+    #[serde(rename = "configurationName")]
+    pub configuration_name: Option<String>,
+    /// A temporary configuration at this place, when no name is given.
+    #[serde(rename = "filePath")]
+    pub file_path: Option<PathBuf>,
+    /// 1-based.
+    pub line: Option<u32>,
+    /// Milliseconds.
+    pub timeout: Option<u64>,
+    #[serde(rename = "waitForExit")]
+    pub wait_for_exit: bool,
+    #[serde(rename = "programArguments")]
+    pub program_arguments: Option<String>,
+    #[serde(rename = "workingDirectory")]
+    pub working_directory: Option<PathBuf>,
+    pub envs: Vec<String>,
+}
+
+impl Default for ExecuteRunQuery {
+    fn default() -> Self {
+        Self {
+            configuration_name: None,
+            file_path: None,
+            line: None,
+            timeout: None,
+            wait_for_exit: true,
+            program_arguments: None,
+            working_directory: None,
+            envs: Vec::new(),
+        }
+    }
+}
+
 pub trait ToolBackend: Send + Sync {
     fn editor_context(&self, scope: &SessionScope) -> Result<EditorContext, ToolError>;
 
@@ -1005,6 +1329,120 @@ pub trait ToolBackend: Send + Sync {
         _query: &ReadFileQuery,
     ) -> Result<FileText, ToolError> {
         Err(not_connected("the editor"))
+    }
+
+    /// The whole text of a file as the editor sees it, for the tools that need every line.
+    fn file_text(&self, _scope: &SessionScope, path: &Path) -> Result<FileContent, ToolError> {
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            ToolError::Failed(format!("could not read {}: {error}", path.display()))
+        })?;
+        Ok(FileContent {
+            path: path.to_path_buf(),
+            text,
+            dirty: false,
+        })
+    }
+
+    /// The files of the project the pattern names, for the file search of an agent.
+    fn find_files(&self, scope: &SessionScope, query: &PathQuery) -> Result<PathPage, ToolError> {
+        let mut found = Vec::new();
+        collect_files(&scope.project, &mut found);
+        let mut items: Vec<PathBuf> = found
+            .into_iter()
+            .filter(|path| {
+                let relative = crate::relative_path(&scope.project, path);
+                crate::path_allowed(&query.paths, &relative)
+                    && crate::matches_glob(&query.pattern, &relative)
+            })
+            .collect();
+        items.sort();
+        let total = items.len();
+        let limit = query.limit.max(1);
+        items.truncate(limit);
+        Ok(PathPage {
+            items,
+            total,
+            clipped: total > limit,
+        })
+    }
+
+    /// The symbols the language service knows by a part of a name.
+    fn search_symbols(
+        &self,
+        scope: &SessionScope,
+        query: &SymbolQuery,
+    ) -> Result<SymbolPage, ToolError> {
+        self.find_symbol(scope, query)
+    }
+
+    /// The calls that reach a symbol or the calls it makes.
+    fn analyze_calls(
+        &self,
+        _scope: &SessionScope,
+        _query: &AnalyzeCallsQuery,
+    ) -> Result<CallTree, ToolError> {
+        Err(not_connected("the language server"))
+    }
+
+    /// The gutter marks of a file: the programs and the tests it can start.
+    fn run_points(
+        &self,
+        _scope: &SessionScope,
+        _query: &RunPointQuery,
+    ) -> Result<Vec<RunPointInfo>, ToolError> {
+        Err(not_connected("the language"))
+    }
+
+    /// Opens a file in an editor of the window.
+    fn open_file(&self, _scope: &SessionScope, _path: &Path) -> Result<(), ToolError> {
+        Err(not_connected("the window"))
+    }
+
+    /// The files open in the editors of the window.
+    fn open_files(&self, scope: &SessionScope) -> Result<Vec<PathBuf>, ToolError> {
+        Ok(self.editor_context(scope)?.open_files)
+    }
+
+    /// The text of a class or a source the language service can show, such as a `jdt://` one.
+    fn source_text(&self, _scope: &SessionScope, _uri: &str) -> Result<String, ToolError> {
+        Err(ToolError::Failed(
+            "no decompiler is connected for this file".to_string(),
+        ))
+    }
+
+    /// The roots of the repositories of the project.
+    fn repositories(&self, _scope: &SessionScope) -> Result<Vec<PathBuf>, ToolError> {
+        Err(not_connected("the version control"))
+    }
+
+    /// The status of the repositories of the project, with the porcelain codes.
+    fn git_status(
+        &self,
+        _scope: &SessionScope,
+        _query: &GitStatusQuery,
+    ) -> Result<GitStatus, ToolError> {
+        Err(not_connected("the version control"))
+    }
+
+    /// Runs a line in the terminal of the window and captures what it printed.
+    fn execute_terminal(
+        &self,
+        _scope: &SessionScope,
+        _query: &TerminalQuery,
+    ) -> Result<TerminalOutput, ToolError> {
+        Err(not_connected("the terminal"))
+    }
+
+    /// Starts a configuration made from a place in a file, such as a `main` method.
+    fn start_temporary_run(
+        &self,
+        _scope: &SessionScope,
+        _query: &ExecuteRunQuery,
+        _client: Option<&str>,
+    ) -> Result<String, ToolError> {
+        Err(ToolError::Failed(
+            "temporary run configurations are not connected yet".to_string(),
+        ))
     }
 
     /// The changed files of the repository and the diff of one of them.
@@ -1196,10 +1634,66 @@ pub trait ToolBackend: Send + Sync {
     fn debug_stop(&self, _scope: &SessionScope) -> Result<(), ToolError> {
         Err(not_connected("the debug window"))
     }
+
+    /// The session tools of IDEA: several sessions of the debug window, their threads and
+    /// values, a step that waits for a pause and points that name their owner. A window
+    /// that answers one of them implements this method; [`Self::debug`] reaches it.
+    fn debug_sessions(
+        &self,
+        _scope: &SessionScope,
+        _query: &DebugQuery,
+    ) -> Result<DebugAnswer, ToolError> {
+        Err(not_connected("the debug window"))
+    }
+
+    /// The tools of the Database window: its connections, the schemas of the driver and
+    /// the statements of its console.
+    fn database(
+        &self,
+        _scope: &SessionScope,
+        _query: &DatabaseQuery,
+    ) -> Result<DatabaseAnswer, ToolError> {
+        Err(not_connected("the Database window"))
+    }
 }
 
 fn not_connected(what: &str) -> ToolError {
     ToolError::Failed(format!("{what} is not connected yet"))
+}
+
+/// A path relative to `root` with `/`, or the whole path when it is outside.
+pub(crate) fn relative_path(root: &Path, path: &Path) -> String {
+    let root_text = root.to_string_lossy().replace('\\', "/");
+    let text = path.to_string_lossy().replace('\\', "/");
+    if text.eq_ignore_ascii_case(&root_text) {
+        return String::new();
+    }
+    let prefix = format!("{}/", root_text.trim_end_matches('/'));
+    if text.len() > prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+        return text[prefix.len()..].to_string();
+    }
+    text
+}
+
+/// Every file under a folder, without the metadata folder of the tools.
+fn collect_files(folder: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            collect_files(&path, out);
+        } else if kind.is_file() {
+            out.push(path);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1208,6 +1702,8 @@ pub enum ToolError {
     BadInput(String),
     Denied(String),
     Failed(String),
+    /// The window is there, but this debugger or this adapter does not do it.
+    Unsupported(String),
 }
 
 impl fmt::Display for ToolError {
@@ -1217,6 +1713,7 @@ impl fmt::Display for ToolError {
             Self::BadInput(message) => write!(f, "bad input: {message}"),
             Self::Denied(message) => write!(f, "denied: {message}"),
             Self::Failed(message) => f.write_str(message),
+            Self::Unsupported(message) => write!(f, "not supported: {message}"),
         }
     }
 }
@@ -1231,6 +1728,13 @@ pub struct Unavailable;
 #[serde(default, deny_unknown_fields)]
 pub struct BuildRequest {
     pub module: Option<String>,
+    /// Build every module again instead of the changed ones.
+    pub rebuild: bool,
+    /// Only these files of the project; `rebuild` does not act then.
+    #[serde(rename = "filesToRebuild")]
+    pub files_to_rebuild: Vec<PathBuf>,
+    /// Milliseconds.
+    pub timeout: Option<u64>,
 }
 
 /// One error the build tool reported, with the place in the sources it named.
@@ -1313,12 +1817,25 @@ pub struct RunConfiguration {
     pub name: String,
     /// What kind of run it is: a program, a task, several configurations at once.
     pub kind: String,
+    /// The line the run starts, when the project knows it.
+    pub command_line: Option<String>,
+    /// The folder the program starts in, relative to the project when it is inside it.
+    pub working_directory: Option<String>,
+    /// Variables the run sets.
+    pub environment: Vec<(String, String)>,
+    /// Whether a single run may change its arguments, folder and variables.
+    pub supports_dynamic_launch_overrides: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct StartRunRequest {
     pub name: String,
+    #[serde(rename = "programArguments")]
+    pub program_arguments: Option<String>,
+    #[serde(rename = "workingDirectory")]
+    pub working_directory: Option<PathBuf>,
+    pub envs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1337,6 +1854,8 @@ pub struct RunOutput {
     pub running: bool,
     pub exit_code: Option<i32>,
     pub lines: Vec<String>,
+    /// The file with the whole log, when the window keeps one.
+    pub full_output_path: Option<PathBuf>,
 }
 
 /// What the debug window of a project offers beyond the snapshot `debug_get_state`
@@ -1392,6 +1911,23 @@ pub trait DebugControl: Send + Sync {
     ) -> Result<DebugSessionState, ToolError>;
 
     fn stop(&self, scope: &SessionScope) -> Result<(), ToolError>;
+
+    /// The session tools of IDEA, which the earlier helpers above do not carry: several
+    /// sessions, their threads, the values of a frame and the points with an owner.
+    fn call(&self, _scope: &SessionScope, _query: &DebugQuery) -> Result<DebugAnswer, ToolError> {
+        Err(not_connected("the debug session tools"))
+    }
+}
+
+/// What the Database window of a project offers: its connections, the schema the driver
+/// answered and the statements of its console. A window registers one when its Database
+/// panel opens; every call blocks the worker thread until the panel answers.
+pub trait DatabaseControl: Send + Sync {
+    fn call(
+        &self,
+        scope: &SessionScope,
+        query: &DatabaseQuery,
+    ) -> Result<DatabaseAnswer, ToolError>;
 }
 
 /// What the run window of a project offers: the build tool, the tests and the stored

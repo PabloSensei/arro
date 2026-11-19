@@ -1,7 +1,7 @@
 //! The Git Log tool window: the commits of the branch or of one file, the files a commit
 //! changed, the diff of one of them and the actions a right click on a commit opens.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ui_kit::metrics::*;
@@ -9,15 +9,15 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::graph;
 use vcs::{
-    Branch, CommandRecord, Commit, CommitDetails, RebaseAction, RebasePlan, RefKind, RefLabel,
-    Repository, ResetMode,
+    Branch, Change, CommandRecord, Commit, CommitDetails, RebaseAction, RebasePlan, RefKind,
+    RefLabel, Repository, ResetMode,
 };
-use workspace::{LOG_TOOL, Workspace};
+use workspace::{FileIcons, LOG_TOOL, Workspace};
 
 use crate::ansi::AnsiParser;
 use crate::commit::CommitPanel;
 use crate::diff_view::DiffView;
-use crate::git::{GitState, relative_of, short_commit};
+use crate::git::{GitState, Kind, relative_of, short_commit};
 use crate::prompt::{Prompt, TextField};
 use crate::run::wrapped_line_element;
 
@@ -171,6 +171,24 @@ struct FileRow {
     file: Option<usize>,
 }
 
+/// The prefix of the keys of the folders in the tree of the changed files.
+const FILES_TREE: &str = "files";
+/// The icon of a folder in the tree of the changed files.
+const FOLDER_ICON: &str = "nodes/folder";
+
+/// The colour kind of a file a commit changed, as Commit colours the same change: a new
+/// file is green, a deleted one grey, and every other change, a move included, blue.
+fn commit_change_kind(change: Change) -> Option<Kind> {
+    match change {
+        Change::Added => Some(Kind::Added),
+        Change::Deleted => Some(Kind::Deleted),
+        Change::Modified | Change::Renamed | Change::Copied | Change::TypeChanged => {
+            Some(Kind::Modified)
+        }
+        Change::Unmodified | Change::Untracked | Change::Conflicted => None,
+    }
+}
+
 /// The divider between two panes that the pointer moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitKind {
@@ -286,6 +304,9 @@ pub struct GitLogPanel {
     /// The indices of `commits` that the filter keeps.
     shown: Vec<usize>,
     files: Vec<String>,
+    /// The kind of each changed file of the selected commit by its path, for the colour of
+    /// its name. A file without a kind keeps the colour of the text.
+    file_kinds: HashMap<String, Kind>,
     selected: Option<usize>,
     /// The file of the right tree the pointer chose, for Diff and Revert.
     selected_file: Option<usize>,
@@ -383,6 +404,7 @@ impl GitLogPanel {
                 lanes: 0,
                 shown: Vec::new(),
                 files: Vec::new(),
+                file_kinds: HashMap::new(),
                 selected: None,
                 selected_file: None,
                 files_collapsed: HashSet::new(),
@@ -1026,9 +1048,9 @@ impl GitLogPanel {
                 .into_iter()
                 .find(|(root, _)| *root == prefix)
                 .map_or_else(|| repo.fork(), |(_, repository)| repository);
-            let files = repository.commit_files(&job_id)?;
+            let changes = repository.commit_changes(&job_id)?;
             let details = repository.commit_details(&job_id)?;
-            Ok::<_, std::io::Error>((files, details))
+            Ok::<_, std::io::Error>((changes, details))
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -1041,8 +1063,15 @@ impl GitLogPanel {
                     return;
                 }
                 match result {
-                    Ok((files, details)) => {
-                        this.files = files;
+                    Ok((changes, details)) => {
+                        this.file_kinds = changes
+                            .iter()
+                            .filter_map(|change| {
+                                commit_change_kind(change.change)
+                                    .map(|kind| (change.path.clone(), kind))
+                            })
+                            .collect();
+                        this.files = changes.into_iter().map(|change| change.path).collect();
                         this.details = Some(details);
                     }
                     Err(message) => this
@@ -2260,14 +2289,16 @@ impl GitLogPanel {
             .enumerate()
             .map(|(index, path)| (path.clone(), index))
             .collect();
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // The keys of the folders carry the prefix of the tree, so a count finds its folder.
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for path in &self.files {
             let parts: Vec<&str> = path.split('/').collect();
             for depth in 1..parts.len() {
-                *counts.entry(parts[..depth].join("/")).or_default() += 1;
+                let key = format!("{FILES_TREE}/{}", parts[..depth].join("/"));
+                *counts.entry(key).or_default() += 1;
             }
         }
-        crate::branches::tree_rows(&entries, "files", 0, &self.files_collapsed)
+        crate::branches::tree_rows(&entries, FILES_TREE, 0, &self.files_collapsed)
             .into_iter()
             .map(|row| match row {
                 crate::branches::TreeRow::Folder { key, label, depth } => {
@@ -2291,46 +2322,68 @@ impl GitLogPanel {
             .collect()
     }
 
+    /// The icons of the files, as the workspace gives them to the tabs and the project tree.
+    fn file_icons(&self, cx: &App) -> FileIcons {
+        self.workspace
+            .read_with(cx, |workspace, _| workspace.icons().clone())
+            .unwrap_or_default()
+    }
+
+    /// The icon of a row of the Changed files tree: a folder has the folder icon, and a file
+    /// the icon of its type.
+    fn row_icon(&self, icons: &FileIcons, entry: &FileRow) -> &'static str {
+        match entry.file {
+            Some(index) => match self.files.get(index) {
+                Some(path) => icons.icon_for(Path::new(path)),
+                None => icons.fallback,
+            },
+            None => FOLDER_ICON,
+        }
+    }
+
+    /// The label and the icon of each row of the Changed files tree, in the order of the rows.
+    #[cfg(test)]
+    pub(crate) fn tree_icons(&self, cx: &App) -> Vec<(String, &'static str)> {
+        let icons = self.file_icons(cx);
+        self.file_tree_rows()
+            .iter()
+            .map(|entry| (entry.label.clone(), self.row_icon(&icons, entry)))
+            .collect()
+    }
+
     fn file_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let icons = self.file_icons(cx);
         self.file_tree_rows()
             .into_iter()
             .enumerate()
             .map(|(row, entry)| {
-                let depth = entry.depth;
                 let selected = entry.file.is_some() && self.selected_file == entry.file;
-                let label = entry.label.clone();
                 let debug = entry.file.map_or_else(
                     || format!("log-folder-{row}"),
                     |file| format!("log-file-{file}"),
                 );
+                // A file takes the colour of its change, as Commit colours it; a folder keeps
+                // the colour of the text.
+                let kind = entry
+                    .file
+                    .and_then(|file| self.files.get(file))
+                    .and_then(|path| self.file_kinds.get(path))
+                    .copied();
                 let file = entry.file;
                 let key = entry.key.clone();
-                let icon = if entry.count.is_some() {
-                    if self.files_collapsed.contains(&entry.key) {
-                        "general/chevronRight"
-                    } else {
-                        "general/chevronDown"
-                    }
-                } else {
-                    "fileTypes/text"
+                let node = TreeRow {
+                    id: ("log-file-row", row).into(),
+                    depth: entry.depth,
+                    label: entry.label.clone().into(),
+                    hint: entry.count.map(|count| format!("({count})").into()),
+                    icon: self.row_icon(&icons, &entry),
+                    expandable: file.is_none(),
+                    open: !self.files_collapsed.contains(&key),
+                    selected,
                 };
-                let count = entry.count;
-                div()
-                    .id(("log-file-row", row))
+                tree_row(node, theme)
                     .debug_selector(move || debug)
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .flex_none()
-                    .h(px(ROW_HEIGHT))
-                    .pl(px(ROW_PADDING_X + depth as f32 * SPACE_L))
-                    .pr(px(ROW_PADDING_X))
-                    .rounded(px(ROW_RADIUS))
-                    .when(selected, |this| this.bg(theme.selection_inactive))
-                    .hover({
-                        let hover = theme.selection_hover;
-                        move |style| style.bg(hover)
-                    })
+                    .when_some(kind, |this, kind| this.text_color(kind.color(theme)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if let Some(file) = file {
                             this.selected_file = Some(file);
@@ -2344,19 +2397,6 @@ impl GitLogPanel {
                         } else {
                             cx.notify();
                         }
-                    }))
-                    .child(icon_sized(icon, TEXT_SMALL, theme))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(label),
-                    )
-                    .children(count.map(|count| {
-                        div()
-                            .text_color(theme.text_secondary)
-                            .child(format!("({count})"))
                     }))
             })
             .collect()
@@ -2406,7 +2446,7 @@ impl GitLogPanel {
         self.files_collapsed.clear();
         if !open {
             for row in self.file_tree_rows() {
-                if row.count.is_some() {
+                if row.file.is_none() {
                     self.files_collapsed.insert(row.key);
                 }
             }

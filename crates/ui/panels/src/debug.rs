@@ -18,8 +18,12 @@ use runner::{Console, ConsoleEvent, RunPlan, Step, Stream};
 use serde::{Deserialize, Serialize};
 use store::Store;
 use tool_gateway::{
-    BreakpointInfo, DebugFrame, DebugScope, DebugSessionState, DebugSnapshotSource, DebugStack,
-    DebugThread, DebugValue, DebugVariable, DebugVariables,
+    BreakpointInfo, BreakpointOwner, DebugAnswer, DebugBreakpoint, DebugBreakpointQuery,
+    DebugControlAction, DebugControlOutcome, DebugExpressionQuery, DebugFrame, DebugQuery,
+    DebugRemoveBreakpointsQuery, DebugScope, DebugSessionState, DebugSetVariableOutcome,
+    DebugSetVariableQuery, DebugSnapshotSource, DebugStack, DebugStartQuery, DebugThread,
+    DebugThreadInfo, DebugThreadPage, DebugThreadsQuery, DebugValue, DebugValueNode, DebugVariable,
+    DebugVariables,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -182,6 +186,10 @@ struct BreakpointSetting {
     /// A breakpoint that goes away at the first stop.
     #[serde(default)]
     temporary: bool,
+    /// Whether an agent or the user set the point. An agent sees its own points in an
+    /// answer with `owner: agent`; the editor paints them apart.
+    #[serde(default)]
+    owner: BreakpointOwner,
 }
 
 fn enabled() -> bool {
@@ -249,6 +257,7 @@ impl BreakpointSetting {
             log_expression: None,
             log_message: None,
             temporary: false,
+            owner: BreakpointOwner::User,
         }
     }
 
@@ -555,6 +564,30 @@ struct PendingVariables {
     deadline: Instant,
 }
 
+/// What a session tool waits for before it answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolControlKind {
+    /// The program pauses, or the session ends.
+    WaitForPause,
+    /// The program moves and then pauses, ends or keeps running.
+    Step,
+    /// The program runs on and then pauses, ends or keeps running.
+    Resume,
+    /// A line is reached, the session ends, or the time is over.
+    RunToLine,
+}
+
+/// A session tool that waits for the program while the window keeps drawing.
+struct PendingToolControl {
+    job: ToolJob,
+    session: String,
+    kind: ToolControlKind,
+    /// The stops of the session before the step, so a stop left over from before does not
+    /// end the wait.
+    stops: u64,
+    deadline: Instant,
+}
+
 pub struct DebugPanel {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -685,6 +718,10 @@ pub struct DebugPanel {
     /// The client whose tool asked for the session that is about to start, until the
     /// console says so.
     tool_client: Option<String>,
+    /// The id and the name a tool gave the session it started.
+    tool_session: Option<(String, String)>,
+    /// The session tools that wait for the program to pause or end.
+    tool_controls: Vec<PendingToolControl>,
 }
 
 impl EventEmitter<BreakpointsChanged> for DebugPanel {}
@@ -776,6 +813,8 @@ impl DebugPanel {
             tool_variables: Vec::new(),
             next_tool_session: 0,
             tool_client: None,
+            tool_session: None,
+            tool_controls: Vec::new(),
         });
         let polling = panel.downgrade();
         cx.spawn(async move |cx| {
@@ -931,6 +970,7 @@ impl DebugPanel {
                 });
             }
             ToolRequest::Evaluate(query) => self.evaluate_for_tool(job, query, cx),
+            ToolRequest::Debug(query) => self.take_debug_job(job, query, cx),
             ToolRequest::Stop => {
                 if self.debugger.is_none()
                     || matches!(
@@ -945,6 +985,752 @@ impl DebugPanel {
                 job.answer(ToolAnswer::Stopped);
             }
         }
+    }
+
+    /// The sessions of the window as `xdebug_get_debugger_status` names them. The window
+    /// runs one session at a time; a session a tool started keeps the id it got.
+    fn tool_sessions(&self) -> tool_gateway::DebuggerStatus {
+        let Some(entry) = self.tool_session_entry() else {
+            return tool_gateway::DebuggerStatus::default();
+        };
+        tool_gateway::DebuggerStatus {
+            active_session_id: Some(entry.id.clone()),
+            sessions: vec![entry],
+        }
+    }
+
+    fn tool_session_entry(&self) -> Option<tool_gateway::DebuggerSession> {
+        let status = match &self.snapshot.state {
+            DebugState::Inactive | DebugState::Terminated => return None,
+            DebugState::Starting => "starting",
+            DebugState::Running => "running",
+            DebugState::Stopped { .. } => "paused",
+        };
+        // A session of the Run window may be on its way: the tools see it as starting
+        // before the debugger of the window exists.
+        if self.debugger.is_none() && status != "starting" {
+            return None;
+        }
+        let (id, name) = self
+            .tool_session
+            .clone()
+            .unwrap_or_else(|| ("debug-current".to_string(), "Debug session".to_string()));
+        let preview = self
+            .local_console
+            .iter()
+            .rev()
+            .take(20)
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(tool_gateway::DebuggerSession {
+            id,
+            name: name.clone(),
+            status: status.to_string(),
+            run_configuration: Some(name),
+            output_preview: (!preview.is_empty()).then_some(preview),
+            full_output_path: None,
+            exit_code: None,
+        })
+    }
+
+    /// The id of the session a session tool works on, or the reason it cannot.
+    fn tool_session_id(&self, requested: &Option<String>) -> Result<String, String> {
+        let Some(entry) = self.tool_session_entry() else {
+            return Err("no debug session is running".to_string());
+        };
+        match requested {
+            Some(id) if id != &entry.id => Err(format!("no debug session has the id {id}")),
+            _ => Ok(entry.id),
+        }
+    }
+
+    fn console_tail(&self, limit: usize) -> Vec<String> {
+        self.local_console
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
+    fn breakpoint_errors_tail(&self, limit: usize) -> Vec<String> {
+        self.snapshot
+            .breakpoints
+            .iter()
+            .filter(|breakpoint| !breakpoint.verified)
+            .map(|breakpoint| {
+                let message = breakpoint
+                    .message
+                    .as_deref()
+                    .unwrap_or("the adapter did not accept the place");
+                format!(
+                    "{}:{}: {message}",
+                    breakpoint.file.display(),
+                    breakpoint.line
+                )
+            })
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
+    /// The state a control tool answers with.
+    fn tool_control_outcome(
+        &self,
+        session: &str,
+        events_limit: usize,
+        tail: bool,
+    ) -> DebugControlOutcome {
+        let (status, paused, reason) = match &self.snapshot.state {
+            DebugState::Stopped { reason } => ("paused".to_string(), true, Some(reason.clone())),
+            DebugState::Running => ("running".to_string(), false, None),
+            DebugState::Starting => ("running".to_string(), false, None),
+            DebugState::Inactive | DebugState::Terminated => ("stopped".to_string(), false, None),
+        };
+        DebugControlOutcome {
+            session_id: session.to_string(),
+            status,
+            paused,
+            reason,
+            frame_values: Vec::new(),
+            breakpoint_errors_tail: if tail {
+                self.breakpoint_errors_tail(events_limit)
+            } else {
+                Vec::new()
+            },
+            tracepoint_outputs_tail: if tail {
+                self.console_tail(events_limit)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn take_debug_job(&mut self, job: ToolJob, query: DebugQuery, cx: &mut Context<Self>) {
+        match query {
+            DebugQuery::Status => {
+                job.answer(ToolAnswer::Debug(DebugAnswer::Status(self.tool_sessions())));
+            }
+            DebugQuery::Start(query) => match self.start_tool_session(&query, cx) {
+                Ok(session) => job.answer(ToolAnswer::Debug(DebugAnswer::Started(session))),
+                Err(message) => job.fail(message),
+            },
+            DebugQuery::Control(query) => self.control_tool_session(job, query, cx),
+            DebugQuery::RunToLine(query) => {
+                let session = match self.tool_session_id(&query.session_id) {
+                    Ok(session) => session,
+                    Err(message) => return job.fail(message),
+                };
+                if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+                    return job.fail("the program is not stopped");
+                }
+                let stops = self.snapshot.stops;
+                self.start_run_to_cursor(query.file.clone(), query.line, false, cx);
+                self.tool_controls.push(PendingToolControl {
+                    job,
+                    session,
+                    kind: ToolControlKind::RunToLine,
+                    stops,
+                    deadline: Instant::now() + Duration::from_millis(query.timeout_ms.min(600_000)),
+                });
+            }
+            DebugQuery::Threads(query) => {
+                let page = self.tool_threads(&query);
+                job.answer(ToolAnswer::Debug(DebugAnswer::Threads(page)));
+            }
+            DebugQuery::Evaluate(query) => self.evaluate_tree_for_tool(job, query, cx),
+            DebugQuery::SetVariable(query) => self.set_variable_for_tool(job, query, cx),
+            DebugQuery::Breakpoints(file) => {
+                let points = self.tool_breakpoints_in(file.as_deref());
+                job.answer(ToolAnswer::Debug(DebugAnswer::Breakpoints(points)));
+            }
+            DebugQuery::SetBreakpoint(query) => match self.set_tool_point(&query, cx) {
+                Ok(point) => job.answer(ToolAnswer::Debug(DebugAnswer::Breakpoint(point))),
+                Err(message) => job.fail(message),
+            },
+            DebugQuery::RemoveBreakpoints(query) => {
+                let removed = self.remove_tool_points(&query, cx);
+                job.answer(ToolAnswer::Debug(DebugAnswer::Removed(removed)));
+            }
+            // The bridge reads the frames and the values through the older helpers.
+            DebugQuery::Frames(_) | DebugQuery::Values(_) => {
+                job.fail("the bridge answers the frames and the values of a frame");
+            }
+        }
+    }
+
+    fn control_tool_session(
+        &mut self,
+        job: ToolJob,
+        query: tool_gateway::DebugControlQuery,
+        cx: &mut Context<Self>,
+    ) {
+        let session = match self.tool_session_id(&query.session_id) {
+            Ok(session) => session,
+            Err(message) => return job.fail(message),
+        };
+        let deadline = Instant::now() + Duration::from_millis(query.timeout_ms.min(600_000));
+        let stopped = matches!(self.snapshot.state, DebugState::Stopped { .. });
+        let running =
+            self.debugger.is_some() || matches!(self.snapshot.state, DebugState::Starting);
+        let events_limit = query.events_limit;
+        match query.action {
+            DebugControlAction::DrainEvents => {
+                let mut outcome = self.tool_control_outcome(&session, events_limit, true);
+                outcome.frame_values.clear();
+                job.answer(ToolAnswer::Debug(DebugAnswer::Controlled(outcome)));
+            }
+            DebugControlAction::Stop => {
+                if !running {
+                    return job.fail("debugging is not running");
+                }
+                self.stop(cx);
+                let outcome = self.tool_control_outcome(&session, events_limit, false);
+                job.answer(ToolAnswer::Debug(DebugAnswer::Controlled(outcome)));
+            }
+            DebugControlAction::Pause => {
+                if !running {
+                    return job.fail("debugging is not running");
+                }
+                self.send(Command::Pause, cx);
+                let outcome = self.tool_control_outcome(&session, events_limit, false);
+                job.answer(ToolAnswer::Debug(DebugAnswer::Controlled(outcome)));
+            }
+            DebugControlAction::Resume
+            | DebugControlAction::StepInto
+            | DebugControlAction::StepOver
+            | DebugControlAction::StepOut => {
+                if !stopped {
+                    return job.fail("the program is not stopped");
+                }
+                let stops = self.snapshot.stops;
+                self.run_away(cx);
+                let command = match query.action {
+                    DebugControlAction::StepInto => Command::StepIn,
+                    DebugControlAction::StepOver => Command::Next,
+                    DebugControlAction::StepOut => Command::StepOut,
+                    _ => Command::Continue,
+                };
+                self.send(command, cx);
+                let kind = if matches!(
+                    query.action,
+                    DebugControlAction::StepInto
+                        | DebugControlAction::StepOver
+                        | DebugControlAction::StepOut
+                ) {
+                    ToolControlKind::Step
+                } else {
+                    ToolControlKind::Resume
+                };
+                self.tool_controls.push(PendingToolControl {
+                    job,
+                    session,
+                    kind,
+                    stops,
+                    deadline,
+                });
+            }
+            DebugControlAction::WaitForPause => {
+                if stopped {
+                    let outcome = self.tool_control_outcome(&session, events_limit, false);
+                    job.answer(ToolAnswer::Debug(DebugAnswer::Controlled(outcome)));
+                    return;
+                }
+                if !running {
+                    return job.fail("debugging is not running");
+                }
+                self.tool_controls.push(PendingToolControl {
+                    job,
+                    session,
+                    kind: ToolControlKind::WaitForPause,
+                    stops: self.snapshot.stops,
+                    deadline,
+                });
+            }
+        }
+    }
+
+    /// Answers the session tools whose program moved.
+    fn answer_tool_controls(&mut self, now: Instant) {
+        let controls = std::mem::take(&mut self.tool_controls);
+        let mut keep = Vec::new();
+        for control in controls {
+            let stopped = matches!(self.snapshot.state, DebugState::Stopped { .. });
+            let over = matches!(
+                self.snapshot.state,
+                DebugState::Terminated | DebugState::Inactive
+            ) || (self.debugger.is_none()
+                && !matches!(self.snapshot.state, DebugState::Starting));
+            let moved = stopped && self.snapshot.stops > control.stops;
+            let reached = match control.kind {
+                ToolControlKind::WaitForPause | ToolControlKind::Step => moved || over,
+                ToolControlKind::Resume => moved || over || now >= control.deadline,
+                ToolControlKind::RunToLine => moved || over,
+            };
+            if reached || now >= control.deadline {
+                let tail = matches!(
+                    control.kind,
+                    ToolControlKind::RunToLine | ToolControlKind::Step
+                );
+                let mut outcome = self.tool_control_outcome(&control.session, 100, tail);
+                if !reached && matches!(control.kind, ToolControlKind::RunToLine) {
+                    // IDEA names the end of the wait of Run to Line a timeout.
+                    outcome.status = "timeout".to_string();
+                }
+                control
+                    .job
+                    .answer(ToolAnswer::Debug(DebugAnswer::Controlled(outcome)));
+            } else {
+                keep.push(control);
+            }
+        }
+        self.tool_controls = keep;
+    }
+
+    fn tool_threads(&self, query: &DebugThreadsQuery) -> DebugThreadPage {
+        let current = self.snapshot.current_thread;
+        let state = match &self.snapshot.state {
+            DebugState::Running | DebugState::Starting => "running",
+            DebugState::Stopped { .. } => "paused",
+            _ => "unknown",
+        };
+        let total = self.snapshot.threads.len();
+        let threads = self
+            .snapshot
+            .threads
+            .iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .map(|thread| {
+                let virtual_thread = dap_client::is_virtual_thread(&thread.name);
+                DebugThreadInfo {
+                    id: thread.id,
+                    name: thread.name.clone(),
+                    state: state.to_string(),
+                    is_current: current == Some(thread.id),
+                    additional_info: virtual_thread.then(|| "virtual".to_string()),
+                    additional_info_tooltip: virtual_thread
+                        .then(|| "A virtual thread of the runtime".to_string()),
+                    frame_count: if current == Some(thread.id) {
+                        self.snapshot.frames.len()
+                    } else {
+                        0
+                    },
+                }
+            })
+            .collect();
+        DebugThreadPage { threads, total }
+    }
+
+    fn evaluate_tree_for_tool(
+        &mut self,
+        job: ToolJob,
+        query: DebugExpressionQuery,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(debugger) = self.debugger.clone() else {
+            return job.fail("debugging is not running");
+        };
+        if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            return job.fail("the program is not stopped");
+        }
+        let index = query.frame_index.unwrap_or(0);
+        let Some(frame) = self.snapshot.frames.get(index).map(|frame| frame.id) else {
+            return job.fail("the stack has no such frame");
+        };
+        let expression = query.expression;
+        let depth = query.depth;
+        cx.spawn(async move |this, cx| {
+            let arguments = serde_json::json!({
+                "expression": expression,
+                "frameId": frame,
+                "context": "repl",
+            });
+            let answer = debugger.request("evaluate", arguments).await;
+            let (mut node, reference) = match answer {
+                Ok(body) => dap_value(&expression, &body),
+                Err(error) => {
+                    this.update(cx, |_, cx| {
+                        job.fail(format!(
+                            "the program could not evaluate the expression: {error}"
+                        ));
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            fill_tree(&debugger, &mut node, reference, depth).await;
+            this.update(cx, |_, cx| {
+                job.answer(ToolAnswer::Debug(DebugAnswer::Value(node)));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_variable_for_tool(
+        &mut self,
+        job: ToolJob,
+        query: DebugSetVariableQuery,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(debugger) = self.debugger.clone() else {
+            return job.fail("debugging is not running");
+        };
+        if !matches!(self.snapshot.state, DebugState::Stopped { .. }) {
+            return job.fail("the program is not stopped");
+        }
+        let Some(frame) = self
+            .snapshot
+            .frames
+            .get(query.frame_index)
+            .map(|frame| frame.id)
+        else {
+            return job.fail("the stack has no such frame");
+        };
+        let Some((name, reference)) = self.value_reference(&query.path) else {
+            return job.fail(format!(
+                "the frame has no variable {}",
+                expression_of(&query.path)
+            ));
+        };
+        let parent = parent_expression(&query.path);
+        let expression = expression_of(&query.path);
+        let value = query.new_value;
+        let old_value = self.value_text(&query.path);
+        cx.spawn(async move |this, cx| {
+            let mut holder = reference;
+            if holder.is_none()
+                && let Some(parent) = parent
+                && let Ok(body) = debugger
+                    .request(
+                        "evaluate",
+                        serde_json::json!({
+                            "expression": parent,
+                            "frameId": frame,
+                            "context": "repl",
+                        }),
+                    )
+                    .await
+            {
+                holder = body
+                    .get("variablesReference")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|reference| *reference > 0);
+            }
+            let mut changed = None;
+            let mut error = None;
+            if let Some(reference) = holder {
+                match debugger
+                    .request(
+                        "setVariable",
+                        serde_json::json!({
+                            "variablesReference": reference,
+                            "name": name,
+                            "value": value,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(body) => changed = Some(body),
+                    Err(reason) => error = Some(reason),
+                }
+            }
+            if changed.is_none() {
+                match debugger
+                    .request(
+                        "setExpression",
+                        serde_json::json!({
+                            "expression": expression,
+                            "value": value,
+                            "frameId": frame,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(body) => changed = Some(body),
+                    Err(reason) => error = Some(reason),
+                }
+            }
+            let answer = match changed {
+                Some(body) => {
+                    let new_value = body
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(&value)
+                        .to_string();
+                    Ok(DebugSetVariableOutcome {
+                        old_value,
+                        new_value,
+                        applied: true,
+                    })
+                }
+                None => Err(format!(
+                    "the adapter could not set the value: {}",
+                    error.unwrap_or_else(|| "no answer".to_string())
+                )),
+            };
+            this.update(cx, |_, cx| {
+                match answer {
+                    Ok(outcome) => job.answer(ToolAnswer::Debug(DebugAnswer::Set(outcome))),
+                    Err(message) => job.fail(message),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The group that holds the first name of a path and the value of the name, for the
+    /// request that sets a variable of it.
+    fn value_reference(&self, path: &[String]) -> Option<(String, Option<i64>)> {
+        let first = path.first()?;
+        if path.len() > 1 {
+            return Some((path.last()?.trim_matches(['[', ']']).to_string(), None));
+        }
+        let name = first.trim_matches(['[', ']']).to_string();
+        for scope in &self.snapshot.scopes {
+            let Some(variables) = self.snapshot.variables.get(&scope.reference) else {
+                continue;
+            };
+            if variables.iter().any(|variable| variable.name == name) {
+                return Some((name, Some(scope.reference)));
+            }
+        }
+        Some((name, None))
+    }
+
+    /// The value a path names in the loaded tree of the frame.
+    fn value_text(&self, path: &[String]) -> Option<String> {
+        let first = path.first()?.trim_matches(['[', ']']);
+        let mut current = self
+            .snapshot
+            .scopes
+            .iter()
+            .filter_map(|scope| self.snapshot.variables.get(&scope.reference))
+            .flat_map(|variables| variables.iter())
+            .find(|variable| variable.name == first)?;
+        let mut text = current.value.clone();
+        for step in &path[1..] {
+            let inner = step.trim_matches(['[', ']']);
+            let children = self.snapshot.variables.get(&current.reference)?;
+            current = children
+                .iter()
+                .find(|variable| variable.name == inner || variable.name == format!("[{inner}]"))?;
+            text = current.value.clone();
+        }
+        Some(text)
+    }
+
+    fn tool_breakpoints_in(&self, file: Option<&Path>) -> Vec<DebugBreakpoint> {
+        self.breakpoints
+            .iter()
+            .filter(|setting| file.is_none_or(|file| setting.file == file))
+            .map(|setting| self.tool_point(setting))
+            .collect()
+    }
+
+    fn tool_point(&self, setting: &BreakpointSetting) -> DebugBreakpoint {
+        let is_log =
+            !setting.suspend && (setting.log_expression.is_some() || setting.log_message.is_some());
+        DebugBreakpoint {
+            id: tool_gateway::breakpoint_id(&setting.file, setting.line),
+            kind: "LINE".to_string(),
+            file: setting.file.clone(),
+            line: setting.line,
+            enabled: setting.enabled,
+            verified: self.verified_breakpoint(&setting.file, setting.line),
+            owner: setting.owner,
+            condition: setting.condition.clone(),
+            is_log_message: is_log,
+            is_log_stack: false,
+            temporary: setting.temporary,
+            suspend_policy: if setting.suspend { "ALL" } else { "NONE" }.to_string(),
+            hit_count: setting
+                .hit_condition
+                .as_deref()
+                .and_then(hit_count_of)
+                .unwrap_or(0),
+            line_text: line_text(&setting.file, setting.line),
+        }
+    }
+
+    fn set_tool_point(
+        &mut self,
+        query: &DebugBreakpointQuery,
+        cx: &mut Context<Self>,
+    ) -> Result<DebugBreakpoint, String> {
+        let file = query
+            .file_path
+            .clone()
+            .ok_or_else(|| "a breakpoint needs a file".to_string())?;
+        let line = query
+            .line
+            .filter(|line| *line > 0)
+            .ok_or_else(|| "lines start at 1".to_string())?;
+        let existing = self
+            .breakpoints
+            .iter()
+            .position(|breakpoint| breakpoint.file == file && breakpoint.line == line);
+        let mut setting = match existing {
+            Some(index) => self.breakpoints.remove(index),
+            None => BreakpointSetting::new(file.clone(), line),
+        };
+        if let Some(condition) = &query.condition {
+            setting.condition = condition
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+        }
+        if let Some(log) = query.is_log_message {
+            if log {
+                setting.suspend = false;
+                setting.hit_message = false;
+                setting.log_expression = setting.condition.clone();
+            } else {
+                setting.suspend = true;
+                setting.log_expression = None;
+            }
+        }
+        if let Some(policy) = &query.suspend_policy {
+            match policy.as_str() {
+                "ALL" => {
+                    setting.suspend = true;
+                    setting.hit_message = false;
+                }
+                "NONE" => {
+                    setting.suspend = false;
+                    setting.hit_message = true;
+                    setting.log_expression = None;
+                }
+                other => return Err(format!("suspendPolicy is ALL or NONE, not {other}")),
+            }
+        }
+        if let Some(count) = query.hit_count {
+            if count == 0 {
+                return Err("hitCount starts at 1".to_string());
+            }
+            setting.hit_condition = Some(format!(">= {count}"));
+        }
+        if let Some(temporary) = query.temporary {
+            setting.temporary = temporary;
+        }
+        if let Some(enabled) = query.enabled {
+            setting.enabled = enabled;
+        }
+        setting.owner = query.owner.unwrap_or(BreakpointOwner::Agent);
+        let spec = setting.spec();
+        self.send(Command::SetBreakpoint(spec), cx);
+        let point = self.tool_point(&setting);
+        self.breakpoints.push(setting);
+        self.breakpoints
+            .sort_by(|left, right| (&left.file, left.line).cmp(&(&right.file, right.line)));
+        self.changed(cx);
+        Ok(point)
+    }
+
+    fn remove_tool_points(
+        &mut self,
+        query: &DebugRemoveBreakpointsQuery,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let mut removed = Vec::new();
+        self.breakpoints.retain(|setting| {
+            let owner = query.owner.is_none_or(|owner| setting.owner == owner);
+            let id = query
+                .breakpoint_id
+                .as_ref()
+                .is_none_or(|id| tool_gateway::breakpoint_id(&setting.file, setting.line) == *id);
+            let file = query
+                .file_path
+                .as_ref()
+                .is_none_or(|file| &setting.file == file);
+            let line = query.line.is_none_or(|line| setting.line == line);
+            if owner && id && file && line {
+                removed.push((setting.file.clone(), setting.line));
+                false
+            } else {
+                true
+            }
+        });
+        for (file, line) in &removed {
+            self.send(
+                Command::RemoveBreakpoint {
+                    file: file.clone(),
+                    line: *line,
+                },
+                cx,
+            );
+        }
+        if !removed.is_empty() {
+            self.changed(cx);
+        }
+        removed.len()
+    }
+
+    fn start_tool_session(
+        &mut self,
+        query: &DebugStartQuery,
+        cx: &mut Context<Self>,
+    ) -> Result<tool_gateway::DebuggerSession, String> {
+        if self.debugger.is_some()
+            && !matches!(
+                self.snapshot.state,
+                DebugState::Terminated | DebugState::Inactive
+            )
+        {
+            return Err("a debug session is already running".to_string());
+        }
+        let Some(name) = query.configuration_name.clone() else {
+            return Err("the debug start needs the name of a configuration".to_string());
+        };
+        let runs = cx
+            .try_global::<crate::script::ActiveRunPanel>()
+            .map(|panel| panel.0.clone())
+            .ok_or_else(|| "the Run window is not connected yet".to_string())?;
+        runs.update(cx, |runs, cx| {
+            runs.debug_configuration_from_tool_with(
+                &name,
+                query.program_arguments.as_deref(),
+                query.working_directory.as_deref(),
+                &query.envs,
+                query.client.as_deref(),
+                cx,
+            )
+        })?;
+        self.next_tool_session += 1;
+        let id = format!("debug-{}", self.next_tool_session);
+        self.tool_client = query.client.clone();
+        if self.debugger.is_some() {
+            self.reset_session();
+        }
+        self.snapshot = Snapshot {
+            state: DebugState::Starting,
+            ..Snapshot::default()
+        };
+        self.tool_session = Some((id.clone(), name.clone()));
+        cx.notify();
+        Ok(tool_gateway::DebuggerSession {
+            id,
+            name: name.clone(),
+            status: "starting".to_string(),
+            run_configuration: Some(name),
+            ..tool_gateway::DebuggerSession::default()
+        })
     }
 
     /// Sets a breakpoint of the tool as the gutter sets one: the editor and the
@@ -973,6 +1759,9 @@ impl DebugPanel {
         setting.condition = condition.clone();
         setting.suspend = log_message.is_none();
         setting.enabled = true;
+        // The point came from a tool, and the editor paints it apart from the ones of the
+        // user.
+        setting.owner = BreakpointOwner::Agent;
         let spec = setting.spec();
         self.send(Command::SetBreakpoint(spec), cx);
         let info = BreakpointInfo {
@@ -1051,12 +1840,18 @@ impl DebugPanel {
         started?;
         self.next_tool_session += 1;
         let session = format!("debug-{}", self.next_tool_session);
+        let name = request
+            .configuration
+            .clone()
+            .or_else(|| request.suite.clone())
+            .unwrap_or_else(|| "Debug session".to_string());
         self.tool_client = client.map(str::to_string);
         // A session that ended is gone before the new one starts, so a stop of the old
         // session cannot answer the wait of the new one.
         if self.debugger.is_some() {
             self.reset_session();
         }
+        self.tool_session = Some((session.clone(), name));
         // The start of the Run window is asynchronous. The session counts as starting
         // at once, so a tool that waits for the first stop does not read the end of the
         // previous session.
@@ -1142,6 +1937,7 @@ impl DebugPanel {
         self.answer_tool_steps(now);
         self.answer_tool_stacks(now);
         self.answer_tool_variables(now, cx);
+        self.answer_tool_controls(now);
     }
 
     fn answer_tool_waits(&mut self, now: Instant) {
@@ -2114,6 +2910,26 @@ impl DebugPanel {
         lines
     }
 
+    /// The lines of the breakpoints an agent set in this file, from one.
+    pub fn agent_breakpoint_lines(&self, file: &Path) -> Vec<u32> {
+        let mut lines: Vec<u32> = self
+            .breakpoints
+            .iter()
+            .filter(|breakpoint| {
+                breakpoint.file == file && breakpoint.owner == BreakpointOwner::Agent
+            })
+            .map(|breakpoint| breakpoint.line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// The owner of the breakpoint on the line, for the dialog and tests.
+    pub fn breakpoint_owner(&self, file: &Path, line: u32) -> Option<BreakpointOwner> {
+        self.setting(file, line).map(|setting| setting.owner)
+    }
+
     /// Whether the breakpoint on the line is on, for the properties popup and tests.
     pub fn breakpoint_enabled(&self, file: &Path, line: u32) -> Option<bool> {
         self.setting(file, line).map(|setting| setting.enabled)
@@ -2221,6 +3037,52 @@ impl DebugPanel {
             .retain(|breakpoint| breakpoint.file != file || breakpoint.line != line);
         self.send(Command::RemoveBreakpoint { file, line }, cx);
         self.changed(cx);
+    }
+
+    /// The row of the gutter menu that adds a breakpoint with a condition.
+    pub fn add_conditional_breakpoint(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.setting(&file, line).is_none() {
+            self.toggle_breakpoint(file.clone(), line, cx);
+        }
+        self.ask_condition(file, line, window, cx);
+    }
+
+    /// The row of the gutter menu that adds a breakpoint which logs instead of stopping.
+    pub fn add_logging_breakpoint(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.setting(&file, line).is_none() {
+            self.toggle_non_suspending_breakpoint(file.clone(), line, cx);
+        }
+        self.ask_log_expression(file, line, window, cx);
+    }
+
+    /// The row of the gutter menu that opens the properties of the breakpoint there.
+    pub fn edit_breakpoint_at(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.setting(&file, line).is_some() {
+            self.show_breakpoint_popup(file, line, window, cx);
+        }
+    }
+
+    /// The row of the gutter menu that turns the breakpoint off without removing it.
+    pub fn disable_breakpoint(&mut self, file: PathBuf, line: u32, cx: &mut Context<Self>) {
+        self.set_enabled(file, line, false, cx);
     }
 
     /// Shift+click on the gutter: a breakpoint that does not stop the program and says
@@ -7134,6 +7996,7 @@ impl Render for BreakpointsView {
                 .or_else(|| setting.log_message.clone())
                 .unwrap_or_default();
             let line = setting.line;
+            let from_agent = setting.owner == BreakpointOwner::Agent;
             let enable_file = setting.file.clone();
             let condition_file = setting.file.clone();
             let hit_file = setting.file.clone();
@@ -7174,7 +8037,11 @@ impl Render for BreakpointsView {
                         .w(px(210.))
                         .truncate()
                         .text_color(if on { theme.text } else { theme.text_disabled })
-                        .child(format!("{name}:{line}")),
+                        .child(if from_agent {
+                            format!("{name}:{line} (agent)")
+                        } else {
+                            format!("{name}:{line}")
+                        }),
                 )
                 .child(
                     div()
@@ -7726,6 +8593,142 @@ impl Render for BreakpointsView {
     }
 }
 
+/// A path of a value as the language writes it, such as `items[0].name`.
+fn expression_of(path: &[String]) -> String {
+    let mut text = String::new();
+    for step in path {
+        if step.starts_with('[') || text.is_empty() {
+            text.push_str(step);
+        } else {
+            text.push('.');
+            text.push_str(step);
+        }
+    }
+    text
+}
+
+/// The expression that names the value that holds the last step of a path.
+fn parent_expression(path: &[String]) -> Option<String> {
+    (path.len() > 1).then(|| expression_of(&path[..path.len() - 1]))
+}
+
+/// The hit count a tool set, from the condition the adapter got.
+fn hit_count_of(text: &str) -> Option<u32> {
+    let text = text.trim().trim_start_matches(['>', '=', '<', ' ']);
+    text.parse().ok()
+}
+
+/// The text of a line of a file, when the file is on disk.
+fn line_text(file: &Path, line: u32) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    text.lines()
+        .nth(line.saturating_sub(1) as usize)
+        .map(|line| line.trim_end_matches('\r').to_string())
+}
+
+/// A value the adapter answered, with the handle of its children.
+fn dap_value(expression: &str, body: &serde_json::Value) -> (DebugValueNode, i64) {
+    let value = body
+        .get("result")
+        .or_else(|| body.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let type_name = body
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reference = body
+        .get("variablesReference")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    (
+        DebugValueNode {
+            name: expression.to_string(),
+            value,
+            type_name,
+            children: Vec::new(),
+        },
+        reference,
+    )
+}
+
+/// The node a path of child indexes names.
+fn node_at_mut<'a>(root: &'a mut DebugValueNode, path: &[usize]) -> &'a mut DebugValueNode {
+    let mut node = root;
+    for index in path {
+        node = &mut node.children[*index];
+    }
+    node
+}
+
+/// Fills the children of a value down to `depth`, one request per level, as the tree of
+/// the window would be expanded.
+async fn fill_tree(debugger: &Debugger, root: &mut DebugValueNode, reference: i64, depth: usize) {
+    if depth == 0 || reference == 0 {
+        return;
+    }
+    let mut queue = vec![(Vec::<usize>::new(), reference, depth)];
+    while let Some((path, reference, remaining)) = queue.pop() {
+        if remaining == 0 || reference == 0 {
+            continue;
+        }
+        let Ok(body) = debugger
+            .request(
+                "variables",
+                serde_json::json!({ "variablesReference": reference }),
+            )
+            .await
+        else {
+            continue;
+        };
+        let list = body
+            .get("variables")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut children = Vec::with_capacity(list.len());
+        let mut references = Vec::new();
+        for item in &list {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let value = item
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let type_name = item
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let handle = item
+                .get("variablesReference")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if handle > 0 {
+                references.push((children.len(), handle));
+            }
+            children.push(DebugValueNode {
+                name,
+                value,
+                type_name,
+                children: Vec::new(),
+            });
+        }
+        node_at_mut(root, &path).children = children;
+        for (index, handle) in references {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            queue.push((child_path, handle, remaining - 1));
+        }
+    }
+}
+
 /// Puts the breakpoints of the panel into the gutter of `view`.
 pub(crate) fn refresh_breakpoints(
     view: &mut editor_view::EditorView,
@@ -7763,6 +8766,13 @@ pub(crate) fn refresh_breakpoints(
         .map(|line| line - 1)
         .collect();
     view.set_temporary_breakpoints(temporary, cx);
+    let agent = panel.read(cx).agent_breakpoint_lines(view.path());
+    let agent: Vec<u32> = agent
+        .into_iter()
+        .filter(|line| *line > 0)
+        .map(|line| line - 1)
+        .collect();
+    view.set_agent_breakpoints(agent, cx);
     let function = panel.read(cx).function_breakpoint_lines(view.path());
     let function: Vec<u32> = function
         .into_iter()
@@ -8034,6 +9044,8 @@ mod tests {
                 tool_variables: Vec::new(),
                 next_tool_session: 0,
                 tool_client: None,
+                tool_session: None,
+                tool_controls: Vec::new(),
             })
         })
     }

@@ -4580,10 +4580,12 @@ name = "mcp-server"
 version = "0.1.23"
 dependencies = [
  "axum",
+ "futures-core",
  "getrandom 0.3.4",
  "http",
  "rmcp",
  "serde_json",
+ "test-support",
  "tokio",
  "tool-gateway",
 ]

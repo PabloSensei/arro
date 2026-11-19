@@ -16,6 +16,7 @@ use ui_kit::*;
 use workspace::{Settings, ToggleTerminal, Workspace};
 
 use crate::navigation;
+use crate::project_structure::dialog_button;
 use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
     CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, is_paste, pressed,
@@ -186,6 +187,24 @@ pub struct TerminalPanel {
     bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// Whether a harness held the IDE protocol when the panel last looked.
     ide_connected: bool,
+    /// The client whose command started in the shell and whose settings have no entry of
+    /// Arro, for the bar above the grid.
+    terminal_suggestion: Option<mcp_discovery::Client>,
+    /// Numbers the reads behind the bar, so a later command wins.
+    suggestion_generation: u64,
+}
+
+/// The client a command line of the prompt starts, when it is `claude` or `codex`.
+fn client_of_command(line: &str) -> Option<mcp_discovery::Client> {
+    let command = line.rsplit(['$', '>', '#', '%']).next()?.trim_start();
+    let word = command.split_whitespace().next()?;
+    let program = word.rsplit(['\\', '/']).next().unwrap_or(word);
+    let program = program.strip_suffix(".exe").unwrap_or(program);
+    match program {
+        "claude" => Some(mcp_discovery::Client::ClaudeCode),
+        "codex" => Some(mcp_discovery::Client::Codex),
+        _ => None,
+    }
 }
 
 /// The shell sees what the user sees in any console, plus the terminal variables and the
@@ -354,6 +373,8 @@ impl TerminalPanel {
                 dragging_split: None,
                 bounds: Rc::new(RefCell::new(None)),
                 ide_connected: false,
+                terminal_suggestion: None,
+                suggestion_generation: 0,
             };
             for tab in 0..panel.tabs.len() {
                 for pane in 0..panel.tabs[tab].panes.len() {
@@ -589,9 +610,50 @@ impl TerminalPanel {
             }
             return;
         }
+        if stroke.key == "enter" && !modifiers.control && !modifiers.alt {
+            self.note_terminal_command(cx);
+        }
         if send_key(&session, stroke, cx) {
             cx.stop_propagation();
         }
+    }
+
+    /// The command line the prompt holds, for the bar of the MCP clients: `claude` and
+    /// `codex` start without an entry of Arro, so the window offers to write one.
+    fn note_terminal_command(&mut self, cx: &mut Context<Self>) {
+        let enabled = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.mcp_terminal_suggestions);
+        if !enabled {
+            return;
+        }
+        let Some(session) = self.session().cloned() else {
+            return;
+        };
+        let screen = session.screen();
+        let Some((row, _)) = screen.cursor else {
+            return;
+        };
+        let Some(client) = client_of_command(&screen.line(row)) else {
+            return;
+        };
+        self.suggestion_generation += 1;
+        let generation = self.suggestion_generation;
+        let file = client.user_config(&mcp_discovery::home_folder());
+        let read = cx
+            .background_executor()
+            .spawn(async move { mcp_discovery::has_entry(client, &file).unwrap_or(false) });
+        cx.spawn(async move |this, cx| {
+            let configured = read.await;
+            this.update(cx, |this, cx| {
+                if this.suggestion_generation == generation {
+                    this.terminal_suggestion = (!configured).then_some(client);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The presses of the search bar, before the ones of the terminal.
@@ -1751,10 +1813,11 @@ impl TerminalPanel {
         )
     }
 
-    fn panes(&self, focused: bool, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn panes(&mut self, focused: bool, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let Some(chosen) = self.tabs.get(self.active) else {
             return div();
         };
+        let suggestion = self.terminal_suggestion;
         let body = div()
             .debug_selector(|| "terminal-panes".to_owned())
             .flex()
@@ -1778,7 +1841,7 @@ impl TerminalPanel {
                     cx.notify();
                 }),
             );
-        match chosen.split {
+        let grid = match chosen.split {
             None => body
                 .flex_col()
                 .child(self.pane_element(self.active, 0, focused, theme, cx)),
@@ -1794,7 +1857,104 @@ impl TerminalPanel {
                     .child(self.divider(way, theme, cx))
                     .child(second.flex_grow(1. - ratio))
             }
+        };
+        match suggestion {
+            Some(client) => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(self.suggestion_bar(client, theme, cx))
+                .child(grid),
+            None => grid,
         }
+    }
+
+    /// The bar above the grid that offers the entry of Arro to a client which just started
+    /// in the shell.
+    fn suggestion_bar(
+        &mut self,
+        client: mcp_discovery::Client,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let configure = dialog_button(
+            "terminal-mcp-suggestion-configure",
+            "terminal-mcp-suggestion-configure".to_owned(),
+            "Auto-Configure",
+            true,
+            true,
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.configure_suggestion(client, cx);
+        }));
+        let close = icon_button(
+            "terminal-mcp-suggestion-close",
+            "general/close",
+            "Hide the suggestion",
+            None,
+            theme,
+        )
+        .debug_selector(|| "terminal-mcp-suggestion-close".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.terminal_suggestion = None;
+            cx.notify();
+        }));
+        div()
+            .id("terminal-mcp-suggestion")
+            .debug_selector(|| "terminal-mcp-suggestion".to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_M))
+            .px(px(SPACE_M))
+            .h(px(32.))
+            .flex_none()
+            .bg(theme.island_bg)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().flex_1().text_size(px(TEXT_SMALL)).child(format!(
+                "Configure Arro for {} to give it the tools of the project",
+                client.title()
+            )))
+            .child(configure)
+            .child(close)
+    }
+
+    fn configure_suggestion(&mut self, client: mcp_discovery::Client, cx: &mut Context<Self>) {
+        let home = mcp_discovery::home_folder();
+        let project = self.root.clone();
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let command = crate::settings_catalog::mcp_binary(&settings);
+        self.terminal_suggestion = None;
+        cx.notify();
+        let write = cx.background_executor().spawn(async move {
+            mcp_discovery::configure(
+                client,
+                mcp_discovery::Scope::User,
+                mcp_discovery::Transport::Stdio,
+                &mcp_discovery::Server {
+                    command,
+                    url: None,
+                    token: None,
+                },
+                &home,
+                &project,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let written = write.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = written {
+                    this.terminal_suggestion = None;
+                    let _ = error;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 

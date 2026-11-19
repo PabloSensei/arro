@@ -78,6 +78,7 @@ impl MenuModel {
     }
 
     /// The same menu for a right click in the gutter, where the blame column rows belong.
+    #[cfg(test)]
     pub(crate) fn in_gutter(mut self, gutter: bool) -> Self {
         self.gutter = gutter;
         self

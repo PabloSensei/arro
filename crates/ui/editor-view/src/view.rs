@@ -754,6 +754,18 @@ pub enum EditorEvent {
     ShowUsages(UsagesUpdate),
     /// A right click in the text: the window shows the menu of the editor here.
     ContextMenu(Point<Pixels>),
+    /// A right click in the gutter of the line numbers: the window shows the menu of the
+    /// gutter for this line, counted from zero.
+    GutterMenu {
+        position: Point<Pixels>,
+        line: u32,
+    },
+    /// A right click in the blame column: the window shows the menu of the column for
+    /// this line, counted from zero.
+    BlameMenu {
+        position: Point<Pixels>,
+        line: u32,
+    },
     /// Alt+Enter chose to turn a check off in the settings of the project.
     DisableInspection {
         id: String,
@@ -1070,6 +1082,16 @@ pub struct EditorView {
     stripe_hint: Option<(String, Point<Pixels>)>,
     /// The hint of the blame label under the pointer, and where it stands.
     annotate_hint: Option<(String, Point<Pixels>)>,
+    /// The commit whose labels the pointer rests on: every line of it takes the stronger
+    /// background.
+    pub(crate) annotate_hovered: Option<String>,
+    /// The width of the blame column of the last frame, and the longest label it was
+    /// measured for, so that the column follows the labels of the view.
+    pub(crate) annotation_room: f32,
+    pub(crate) annotation_chars: usize,
+    /// The line whose bookmark the next typed key names, when the command came from a
+    /// menu rather than from the caret.
+    awaiting_mnemonic_line: Option<usize>,
     /// The hint of the coverage stripe under the pointer, and where it stands.
     coverage_hint: Option<(String, Point<Pixels>)>,
     /// The hint of a badge of the gutter under the pointer, and where it stands.
@@ -1100,6 +1122,8 @@ pub struct EditorView {
     pub(crate) disabled_breakpoints: Vec<u32>,
     /// The breakpoints that go away at the first stop, painted as an outline.
     pub(crate) temporary_breakpoints: Vec<u32>,
+    /// The breakpoints an agent set, painted in the colour of the accent.
+    pub(crate) agent_breakpoints: Vec<u32>,
     /// Buffer lines of the method breakpoints, painted as a diamond.
     pub(crate) function_breakpoints: Vec<u32>,
     /// Buffer lines of the field watchpoints, painted as an eye.
@@ -1656,6 +1680,10 @@ impl EditorView {
             scrollbar_drag: None,
             stripe_hint: None,
             annotate_hint: None,
+            annotate_hovered: None,
+            annotation_room: ANNOTATE_WIDTH,
+            annotation_chars: 0,
+            awaiting_mnemonic_line: None,
             coverage_hint: None,
             place_hint: None,
             change_mark_hovered: None,
@@ -1674,6 +1702,7 @@ impl EditorView {
             muted_breakpoints: Vec::new(),
             disabled_breakpoints: Vec::new(),
             temporary_breakpoints: Vec::new(),
+            agent_breakpoints: Vec::new(),
             function_breakpoints: Vec::new(),
             field_watchpoints: Vec::new(),
             gutter_marks: Vec::new(),
@@ -1937,6 +1966,18 @@ impl EditorView {
 
     pub fn temporary_breakpoints(&self) -> &[u32] {
         &self.temporary_breakpoints
+    }
+
+    /// Replaces the breakpoints an agent set in the gutter, painted in the accent colour.
+    pub fn set_agent_breakpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
+        if self.agent_breakpoints != lines {
+            self.agent_breakpoints = lines;
+            cx.notify();
+        }
+    }
+
+    pub fn agent_breakpoints(&self) -> &[u32] {
+        &self.agent_breakpoints
     }
 
     /// Replaces the method breakpoints in the gutter, painted as diamonds.
@@ -2557,6 +2598,7 @@ impl EditorView {
         {
             state.clear_annotations();
             self.annotate_hint = None;
+            self.annotate_hovered = None;
             cx.notify();
         }
     }
@@ -2576,10 +2618,16 @@ impl EditorView {
             .unwrap_or_default()
     }
 
-    /// The room of the blame column left of the text, from zero when it is off.
+    /// The blame of a line from zero, for the menu of the column.
+    pub fn blame_note_at_line(&self, line: usize) -> Option<BlameNote> {
+        self.state.as_ref()?.annotation_label_at(line).cloned()
+    }
+
+    /// The room of the blame column left of the text, from zero when it is off. The width
+    /// follows the longest label of the column.
     pub(crate) fn annotation_width(&self) -> f32 {
         if self.has_annotations() {
-            ANNOTATE_WIDTH
+            self.annotation_room
         } else {
             0.
         }
@@ -3704,6 +3752,33 @@ impl EditorView {
         cx.notify();
     }
 
+    /// A menu of the gutter toggles the bookmark of `line` from zero, not of the caret.
+    pub fn toggle_bookmark_at_line(
+        &mut self,
+        line: usize,
+        mnemonic: Option<char>,
+        cx: &mut Context<Self>,
+    ) {
+        self.catch_up(cx);
+        if let Some(state) = &mut self.state {
+            state.toggle_bookmark_at_line(line, mnemonic);
+        }
+        self.sync_bookmarks(cx);
+        cx.notify();
+    }
+
+    /// Ctrl+F11 from a menu: the next typed key names the bookmark of `line`.
+    pub fn await_mnemonic_bookmark_at(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.awaiting_mnemonic = true;
+        self.awaiting_mnemonic_line = Some(line);
+        cx.notify();
+    }
+
+    /// The bookmark of a line from zero, `Some(None)` for one without a mnemonic.
+    pub fn bookmark_at_line(&self, line: usize) -> Option<Option<char>> {
+        self.state.as_ref()?.bookmark_at_line(line)
+    }
+
     /// Tells the window-wide list where the bookmarks of this file are now.
     fn sync_bookmarks(&mut self, cx: &mut Context<Self>) {
         let Some(state) = &self.state else {
@@ -4082,8 +4157,13 @@ impl EditorView {
                 .as_deref()
                 .and_then(|text| text.chars().next());
             if let Some(letter) = typed.filter(|c| c.is_alphanumeric() && !modifiers.control) {
-                self.toggle_bookmark(Some(letter.to_ascii_uppercase()), cx);
+                let letter = letter.to_ascii_uppercase();
+                match self.awaiting_mnemonic_line.take() {
+                    Some(line) => self.toggle_bookmark_at_line(line, Some(letter), cx),
+                    None => self.toggle_bookmark(Some(letter), cx),
+                }
             }
+            self.awaiting_mnemonic_line = None;
             cx.stop_propagation();
             return;
         }
@@ -4635,6 +4715,18 @@ impl EditorView {
             && position.x < layout.bounds.left() + px(self.gutter_width + width)
     }
 
+    /// The line from zero under `position`, whichever column it falls in. Rows of a
+    /// block speak for the line under them.
+    fn line_at(&self, position: Point<Pixels>) -> Option<u32> {
+        let layout = self.layout.as_ref()?;
+        let line_height = px(self.style.line_height);
+        let shown = layout
+            .rows
+            .iter()
+            .find(|laid_out| position.y >= laid_out.y && position.y < laid_out.y + line_height)?;
+        Some(shown.buffer_line as u32)
+    }
+
     /// The label of the blame column under `position`, the line it belongs to and where
     /// the label stands.
     fn annotation_under(
@@ -5086,9 +5178,22 @@ impl EditorView {
     /// selection, and then asks the window for the menu of the editor.
     pub(crate) fn right_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.dismiss_click_popups(cx);
-        // The blame column has no text: the menu opens and the caret stays where it is.
+        // The blame column and the line numbers have menus of their own: the rows of the
+        // editor belong to the text alone.
         if self.in_annotations(event.position) {
-            cx.emit(EditorEvent::ContextMenu(event.position));
+            let line = self.line_at(event.position);
+            cx.emit(EditorEvent::BlameMenu {
+                position: event.position,
+                line: line.unwrap_or(0),
+            });
+            return;
+        }
+        if self.in_gutter(event.position) {
+            let line = self.line_at(event.position);
+            cx.emit(EditorEvent::GutterMenu {
+                position: event.position,
+                line: line.unwrap_or(0),
+            });
             return;
         }
         let Some(offset) = self.offset_at(event.position) else {
@@ -5179,6 +5284,14 @@ impl EditorView {
         let annotate_hint = self.annotate_hint_at(event.position);
         if annotate_hint != self.annotate_hint {
             self.annotate_hint = annotate_hint;
+            cx.notify();
+        }
+        let annotate_hovered = self
+            .annotation_under(event.position)
+            .map(|(note, _, _)| note.commit.clone())
+            .filter(|commit| !commit.is_empty());
+        if annotate_hovered != self.annotate_hovered {
+            self.annotate_hovered = annotate_hovered;
             cx.notify();
         }
 

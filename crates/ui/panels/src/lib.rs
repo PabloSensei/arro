@@ -50,6 +50,7 @@ mod folder_compare;
 mod git;
 mod git_history;
 mod git_log;
+mod gutter_menu;
 pub mod heap_dump;
 mod history;
 mod history_view;
@@ -65,6 +66,7 @@ mod library_sources;
 mod live_panel;
 mod marks;
 mod mcp_approval;
+mod mcp_database;
 mod mcp_debug;
 mod mcp_edits;
 mod mcp_runs;
@@ -457,9 +459,18 @@ mod window_tests_mcp;
 #[cfg(test)]
 mod window_tests_mcp_approval;
 #[cfg(test)]
+mod window_tests_mcp_database;
+#[cfg(test)]
 mod window_tests_mcp_debug;
 #[cfg(test)]
+mod window_tests_mcp_idea;
+#[cfg(test)]
 mod window_tests_mcp_runs;
+#[cfg(test)]
+mod window_tests_mcp_settings;
+
+#[cfg(test)]
+mod window_tests_mcp_xdebug;
 
 #[cfg(test)]
 mod window_tests_release;
@@ -688,6 +699,12 @@ mod window_tests_project_compact;
 
 #[cfg(test)]
 mod window_tests_daily;
+
+#[cfg(test)]
+mod window_tests_annotate_idea;
+
+#[cfg(test)]
+mod window_tests_git_log_icons;
 
 mod choice;
 mod invalidate;
@@ -1333,6 +1350,14 @@ fn install(
     let project_root = workspace.root().to_path_buf();
     languages.register_debug(project_root.clone(), hub.clone());
     languages.register_debug_control(project_root.clone(), debug_tools);
+    let database_tools = crate::mcp_database::DatabaseBridge::new();
+    if let Some(database) = cx.try_global::<database_panel::ActiveDatabase>() {
+        let database = database.0.clone();
+        database.update(cx, |panel, cx| {
+            panel.set_tool_database(database_tools.clone(), cx)
+        });
+    }
+    languages.register_database_control(project_root.clone(), database_tools);
     let run_tools = crate::mcp_runs::RunBridge::new();
     runs.update(cx, |panel, _| panel.set_tool_runs(run_tools.clone()));
     languages.register_project(project_root, run_tools);

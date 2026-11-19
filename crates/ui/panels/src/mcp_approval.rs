@@ -51,6 +51,8 @@ pub(crate) struct McpApprovals {
     answered: Condvar,
     /// Whether the settings let a trusted project run without a question.
     allow_trusted: Mutex<bool>,
+    /// Brave mode: every `Execute` call runs without a question.
+    brave: Mutex<bool>,
     /// The project of the window and the list the trust dialog writes.
     project: Option<PathBuf>,
     trust: Option<TrustList>,
@@ -63,6 +65,7 @@ impl Default for McpApprovals {
             state: Mutex::new(State::default()),
             answered: Condvar::new(),
             allow_trusted: Mutex::new(false),
+            brave: Mutex::new(false),
             project: None,
             trust: None,
             timeout: ANSWER_TIMEOUT,
@@ -93,6 +96,21 @@ impl McpApprovals {
             .allow_trusted
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = allow;
+    }
+
+    /// Brave mode of the MCP settings page: no call of the class `Execute` asks.
+    pub fn set_brave(&self, brave: bool) {
+        *self
+            .brave
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = brave;
+    }
+
+    fn is_brave(&self) -> bool {
+        *self
+            .brave
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// A trusted project whose settings allow it runs without a question.
@@ -164,7 +182,7 @@ impl Approval for McpApprovals {
     }
 
     fn ask_with(&self, request: &ApprovalRequest, detail: &str) -> ApprovalAnswer {
-        if self.trusted_project() {
+        if self.is_brave() || self.trusted_project() {
             return ApprovalAnswer::Once;
         }
         let mut state = self.lock();

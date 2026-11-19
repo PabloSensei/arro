@@ -32,6 +32,8 @@ pub enum EditKind {
     },
     /// Formatting or Organize Imports: applied at once, with no question of its own.
     Apply { change: WorkspaceChange },
+    /// Opens a file in an editor of the window, for `open_file_in_editor`.
+    Open { path: PathBuf },
 }
 
 /// What became of one request. A request that times out says so and leaves the file as it

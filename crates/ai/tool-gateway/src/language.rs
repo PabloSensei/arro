@@ -19,16 +19,19 @@ use lang_api::{
 use platform::{CanonPath, path_from_uri};
 
 use crate::backend::{
-    BreakpointId, BreakpointInfo, BreakpointQuery, BuildOutcome, BuildRequest, CallHierarchy,
-    CallHierarchyQuery, Confidence, DebugControl, DebugEvaluateQuery, DebugRunOutcome,
-    DebugRunRequest, DebugSessionState, DebugSnapshotSource, DebugStack, DebugStackQuery,
-    DebugStepQuery, DebugValue, DebugVariables, DebugVariablesQuery, DebugWaitQuery, Diagnostic,
-    DiagnosticsPage, DiagnosticsQuery, EditorContext, FileText, HierarchyNode, Location, Position,
-    ProjectRunner, READ_LINE_LIMIT, ReadFileQuery, RenameSymbolQuery, RunConfiguration, RunOutput,
-    SessionScope, Severity, StartRunRequest, SymbolInfo, SymbolPage, SymbolQuery, TestsOutcome,
-    TestsRequest, ToolBackend, ToolError, TypeHierarchy, TypeHierarchyQuery, Usage, UsagePage,
-    UsagesQuery,
+    AnalyzeCallsQuery, BreakpointId, BreakpointInfo, BreakpointQuery, BuildOutcome, BuildRequest,
+    CallHierarchy, CallHierarchyQuery, CallNode, CallTree, Confidence, DatabaseControl,
+    DebugControl, DebugEvaluateQuery, DebugRunOutcome, DebugRunRequest, DebugSessionState,
+    DebugSnapshotSource, DebugStack, DebugStackQuery, DebugStepQuery, DebugValue, DebugVariables,
+    DebugVariablesQuery, DebugWaitQuery, Diagnostic, DiagnosticsPage, DiagnosticsQuery,
+    EditorContext, FileContent, FileText, HierarchyNode, Location, Position, ProjectRunner,
+    READ_LINE_LIMIT, ReadFileQuery, RenameSymbolQuery, RunConfiguration, RunOutput, RunPointInfo,
+    RunPointQuery, SessionScope, Severity, StartRunRequest, SymbolInfo, SymbolPage, SymbolQuery,
+    TestsOutcome, TestsRequest, ToolBackend, ToolError, TypeHierarchy, TypeHierarchyQuery, Usage,
+    UsagePage, UsagesQuery,
 };
+use crate::database_tools::{DatabaseAnswer, DatabaseQuery};
+use crate::xdebug::{DebugAnswer, DebugQuery};
 
 /// How long a tool waits for the first answer of the server.
 const ANSWER_WAIT: Duration = Duration::from_secs(10);
@@ -178,6 +181,7 @@ pub struct LanguageTools {
     languages: RwLock<Vec<Arc<dyn LanguageSupport>>>,
     debug: RwLock<Vec<(PathBuf, Arc<dyn DebugSnapshotSource>)>>,
     debug_controls: RwLock<Vec<(PathBuf, Arc<dyn DebugControl>)>>,
+    databases: RwLock<Vec<(PathBuf, Arc<dyn DatabaseControl>)>>,
     projects: RwLock<Vec<(PathBuf, Arc<dyn ProjectRunner>)>>,
     wait: Option<Duration>,
 }
@@ -282,6 +286,43 @@ impl LanguageTools {
             .ok_or_else(|| {
                 ToolError::Failed(format!(
                     "the Debug window of {} is not connected yet",
+                    project.display()
+                ))
+            })
+    }
+
+    /// Makes the database tools reach the Database window of this project. Replaces an
+    /// earlier control of the same project.
+    pub fn register_database_control(&self, project: PathBuf, control: Arc<dyn DatabaseControl>) {
+        let mut controls = self
+            .databases
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        controls.retain(|(known, _)| !same_project(known, &project));
+        controls.push((project, control));
+    }
+
+    pub fn unregister_database_control(&self, project: &Path) {
+        let mut controls = self
+            .databases
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        controls.retain(|(known, _)| !same_project(known, project));
+    }
+
+    fn database_control_for(&self, project: &Path) -> Result<Arc<dyn DatabaseControl>, ToolError> {
+        let controls = self
+            .databases
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        controls
+            .iter()
+            .rev()
+            .find(|(known, _)| same_project(known, project))
+            .map(|(_, control)| control.clone())
+            .ok_or_else(|| {
+                ToolError::Failed(format!(
+                    "the Database window of {} is not connected yet",
                     project.display()
                 ))
             })
@@ -586,6 +627,19 @@ fn missing(what: &str) -> ToolError {
     ToolError::Failed(format!("this language has no {what}"))
 }
 
+/// The node at a `treePath` of the roots, with the path's place among the siblings.
+fn take_tree_path(mut nodes: Vec<CallNode>, path: &[usize]) -> Option<CallNode> {
+    if path.is_empty() {
+        return nodes.drain(..).next();
+    }
+    let mut nodes = nodes.drain(..);
+    let mut node = nodes.nth(*path.first()?)?;
+    for index in &path[1..] {
+        node = node.children.into_iter().nth(*index)?;
+    }
+    Some(node)
+}
+
 impl ToolBackend for LanguageTools {
     fn editor_context(&self, _: &SessionScope) -> Result<EditorContext, ToolError> {
         Err(ToolError::Failed(format!(
@@ -815,6 +869,159 @@ impl ToolBackend for LanguageTools {
         Ok(self.range_of(&query.path, &text, query))
     }
 
+    fn file_text(&self, _: &SessionScope, path: &Path) -> Result<FileContent, ToolError> {
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            ToolError::Failed(format!("could not read {}: {error}", path.display()))
+        })?;
+        Ok(FileContent {
+            path: path.to_path_buf(),
+            text,
+            dirty: false,
+        })
+    }
+
+    fn search_symbols(
+        &self,
+        _: &SessionScope,
+        query: &SymbolQuery,
+    ) -> Result<SymbolPage, ToolError> {
+        let language = self.language_with_symbols()?;
+        let provider = language
+            .workspace_symbols()
+            .ok_or_else(|| missing("symbol search"))?;
+        let outcome = first_answer(
+            lang_api::ask(provider, LangSymbolQuery(query.query.clone())),
+            self.wait(),
+        );
+        let (entries, confidence, source) = value_of(outcome, "symbol search")?;
+        let mut hits = Vec::new();
+        for entry in entries {
+            let Some(place) = entry.place else {
+                continue;
+            };
+            let location = self.location_of(&place);
+            hits.push(crate::backend::SymbolHit {
+                name: entry.name,
+                kind: entry.container.unwrap_or_else(|| "symbol".to_string()),
+                path: location.path,
+                line: location.line,
+                content: location.content,
+                before: Vec::new(),
+                after: Vec::new(),
+            });
+        }
+        let total = hits.len();
+        let limit = query.limit.max(1);
+        let clipped = total > limit;
+        hits.truncate(limit);
+        Ok(SymbolPage {
+            hits,
+            source,
+            confidence,
+            next: clipped.then(|| limit.to_string()),
+        })
+    }
+
+    fn analyze_calls(
+        &self,
+        _: &SessionScope,
+        query: &AnalyzeCallsQuery,
+    ) -> Result<CallTree, ToolError> {
+        let language = self.language_with_symbols()?;
+        let spot = self.declaration_spot_for(language.as_ref(), &query.symbol_fqn)?;
+        let provider = language
+            .call_hierarchy()
+            .ok_or_else(|| missing("call hierarchy"))?;
+        let outcome = first_answer(
+            lang_api::ask(provider, LangCallHierarchy::Roots(spot)),
+            self.wait(),
+        );
+        let (roots, _, _) = value_of(outcome, "call hierarchy")?;
+        let direction = match query.analysis_kind {
+            crate::backend::CallDirection::IncomingCalls => lang_api::CallDirection::Incoming,
+            crate::backend::CallDirection::OutgoingCalls => lang_api::CallDirection::Outgoing,
+        };
+        let mut more = false;
+        let mut budget = query.max_nodes;
+        let root_items = roots
+            .into_iter()
+            .skip(query.child_offset)
+            .take(query.max_children);
+        let mut nodes = Vec::new();
+        for (index, item) in root_items.enumerate() {
+            if budget == 0 {
+                more = true;
+                break;
+            }
+            nodes.push(self.call_node(
+                provider,
+                item,
+                direction,
+                query.depth,
+                query.max_children,
+                &mut budget,
+                &mut more,
+                vec![index],
+            )?);
+        }
+        let root = take_tree_path(nodes, &query.tree_path);
+        Ok(CallTree {
+            symbol: query.symbol_fqn.clone(),
+            direction: query.analysis_kind,
+            root,
+            more,
+        })
+    }
+
+    fn run_points(
+        &self,
+        _: &SessionScope,
+        query: &RunPointQuery,
+    ) -> Result<Vec<RunPointInfo>, ToolError> {
+        let language = self.language_for(&query.file_path)?;
+        let provider = language.run_points().ok_or_else(|| missing("run points"))?;
+        let outcome = first_answer(
+            lang_api::ask(provider, lang_api::RunPointQuery(query.file_path.clone())),
+            self.wait(),
+        );
+        let (points, _, _) = value_of(outcome, "run points")?;
+        Ok(points
+            .into_iter()
+            .map(|point| RunPointInfo {
+                kind: point.kind.name().to_string(),
+                name: point.name,
+                container: point.container,
+                file: point.file,
+                line: point.line,
+                framework: point.framework,
+            })
+            .collect())
+    }
+
+    fn source_text(&self, _: &SessionScope, uri: &str) -> Result<String, ToolError> {
+        let languages = self
+            .languages
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let provider = languages
+            .iter()
+            .find_map(|language| language.source_text())
+            .ok_or_else(|| {
+                ToolError::Failed("no decompiler is connected for this file".to_string())
+            })?;
+        let outcome = first_answer(
+            lang_api::ask(provider, lang_api::SourceTextQuery(uri.to_string())),
+            self.wait(),
+        );
+        let (text, _, _) = value_of(outcome, "source text")?;
+        if text.is_empty() {
+            return Err(ToolError::Failed(format!(
+                "the language service has no text for {uri}"
+            )));
+        }
+        Ok(text)
+    }
+
     fn build_project(
         &self,
         scope: &SessionScope,
@@ -926,9 +1133,130 @@ impl ToolBackend for LanguageTools {
     fn debug_stop(&self, scope: &SessionScope) -> Result<(), ToolError> {
         self.debug_control_for(&scope.project)?.stop(scope)
     }
+
+    fn debug_sessions(
+        &self,
+        scope: &SessionScope,
+        query: &DebugQuery,
+    ) -> Result<DebugAnswer, ToolError> {
+        self.debug_control_for(&scope.project)?.call(scope, query)
+    }
+
+    fn database(
+        &self,
+        scope: &SessionScope,
+        query: &DatabaseQuery,
+    ) -> Result<DatabaseAnswer, ToolError> {
+        self.database_control_for(&scope.project)?
+            .call(scope, query)
+    }
 }
 
 impl LanguageTools {
+    /// The place of a declaration by its fully qualified name or its simple name.
+    fn declaration_spot_for(
+        &self,
+        language: &dyn LanguageSupport,
+        fqn: &str,
+    ) -> Result<DocumentSpot, ToolError> {
+        let provider = language
+            .workspace_symbols()
+            .ok_or_else(|| missing("symbol search"))?;
+        let outcome = first_answer(
+            lang_api::ask(provider, LangSymbolQuery(fqn.to_string())),
+            self.wait(),
+        );
+        let (entries, _, _) = value_of(outcome, "symbol search")?;
+        let simple = fqn.rsplit(['.', '#', ':']).next().unwrap_or(fqn);
+        let found = entries
+            .into_iter()
+            .find(|entry| {
+                entry.name == fqn
+                    || entry.container.as_deref().is_some_and(|container| {
+                        format!("{container}.{}", entry.name) == fqn
+                            || format!("{container}#{}", entry.name) == fqn
+                    })
+                    || (entry.name == simple && entry.place.is_some())
+            })
+            .and_then(|entry| entry.place);
+        let Some(place) = found else {
+            return Err(ToolError::Failed(format!(
+                "no declaration named {fqn} was found"
+            )));
+        };
+        let server = language
+            .server()
+            .ok_or_else(|| missing("language server"))?;
+        let version = server.version(&place.uri).ok_or_else(|| {
+            ToolError::Failed(format!(
+                "the declaration of {fqn} is at {}, which is not open in the editor",
+                place.uri
+            ))
+        })?;
+        Ok(DocumentSpot {
+            uri: place.uri,
+            version,
+            point: place.span.start,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_node(
+        &self,
+        provider: &dyn lang_api::Provider<LangCallHierarchy, Vec<CallHierarchyItem>>,
+        item: CallHierarchyItem,
+        direction: lang_api::CallDirection,
+        remaining: usize,
+        max_children: usize,
+        budget: &mut usize,
+        more: &mut bool,
+        tree_path: Vec<usize>,
+    ) -> Result<CallNode, ToolError> {
+        *budget = budget.saturating_sub(1);
+        let place = item.place.as_ref().map(|place| self.location_of(place));
+        let mut node = CallNode {
+            name: item.name.clone(),
+            detail: item.detail.clone(),
+            file_path: place.as_ref().map(|place| place.path.clone()),
+            line: place.as_ref().map_or(0, |place| place.line),
+            tree_path: tree_path.clone(),
+            children: Vec::new(),
+        };
+        if remaining == 0 || *budget == 0 {
+            if *budget == 0 {
+                *more = true;
+            }
+            return Ok(node);
+        }
+        let outcome = first_answer(
+            lang_api::ask(provider, LangCallHierarchy::Calls { item, direction }),
+            self.wait(),
+        );
+        let (children, _, _) = value_of(outcome, "call hierarchy")?;
+        if children.len() > max_children {
+            *more = true;
+        }
+        for (index, child) in children.into_iter().take(max_children).enumerate() {
+            if *budget == 0 {
+                *more = true;
+                break;
+            }
+            let mut child_path = tree_path.clone();
+            child_path.push(index);
+            node.children.push(self.call_node(
+                provider,
+                child,
+                direction,
+                remaining - 1,
+                max_children,
+                budget,
+                more,
+                child_path,
+            )?);
+        }
+        Ok(node)
+    }
+
     fn hierarchy_nodes(
         &self,
         entries: Vec<lang_api::SymbolEntry>,

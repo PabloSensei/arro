@@ -124,6 +124,26 @@ const ANSI_LIGHT: [u32; 16] = [
     0x000000, 0xc7222d, 0x067d17, 0x9e880d, 0x0033b3, 0x871094, 0x0f7b8a, 0x6f737a, 0x818594,
     0xe55765, 0x2e9c3b, 0xb59b1b, 0x3574f0, 0xb350bf, 0x1996a6, 0x1e1f22,
 ];
+/// The field of a configuration that carries an override of a debug start, by the words
+/// of its key. A provider that declares none refuses the override.
+fn override_of(
+    fields: &[runner::ConfigField],
+    words: &[&str],
+    value: &str,
+    what: &str,
+) -> Result<(String, String), String> {
+    let found = fields.iter().find(|field| {
+        let key = field.key.to_ascii_lowercase();
+        words.iter().any(|word| key.contains(word))
+    });
+    match found {
+        Some(field) => Ok((field.key.to_string(), value.to_string())),
+        None => Err(format!(
+            "the configuration does not allow {what} from a tool"
+        )),
+    }
+}
+
 fn color(hex: u32) -> Hsla {
     rgb(hex).into()
 }
@@ -2643,6 +2663,18 @@ impl RunPanel {
                     .map(|config| RunConfiguration {
                         name: config.name.clone(),
                         kind: config.provider.clone(),
+                        command_line: config
+                            .settings
+                            .get("programArguments")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        working_directory: config
+                            .settings
+                            .get("workingDirectory")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        environment: Vec::new(),
+                        supports_dynamic_launch_overrides: !config.is_compound(),
                     })
                     .collect();
                 let _ = job.reply.send(Ok(Answer::Configurations(configurations)));
@@ -2877,6 +2909,7 @@ impl RunPanel {
             running,
             exit_code: exit,
             lines: self.line_tail(),
+            full_output_path: None,
         };
         self.store_tool_output(output);
         if program && !running {
@@ -2954,6 +2987,7 @@ impl RunPanel {
                     running: false,
                     exit_code: Some(if success { 0 } else { 1 }),
                     lines: self.line_tail(),
+                    full_output_path: None,
                 });
                 let outcome = BuildOutcome {
                     success,
@@ -3006,6 +3040,7 @@ impl RunPanel {
                     running: false,
                     exit_code: Some(if failed > 0 { 1 } else { 0 }),
                     lines: self.line_tail(),
+                    full_output_path: None,
                 });
                 let outcome = TestsOutcome {
                     passed: counts.passed,
@@ -3778,6 +3813,95 @@ impl RunPanel {
         }
         if !self.select_named(name, cx) {
             return Err(format!("the project has no run configuration {name}"));
+        }
+        let handle = cx.active_window();
+        self.start_debug(handle, client, cx);
+        Ok(())
+    }
+
+    /// Starts a configuration under the debugger for a tool call, with the arguments, the
+    /// directory and the variables of the call in place of the ones the configuration
+    /// keeps. A configuration whose provider does not declare a field refuses the change.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn debug_configuration_from_tool_with(
+        &mut self,
+        name: &str,
+        program_arguments: Option<&str>,
+        working_directory: Option<&std::path::Path>,
+        envs: &[String],
+        client: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.debug_service.is_none() {
+            return Err("the language server is not running".to_string());
+        }
+        if self
+            .session
+            .as_ref()
+            .and_then(ProjectSession::model)
+            .is_none()
+        {
+            return Err("the project is still loading".to_string());
+        }
+        if self.starting || self.busy() {
+            return Err("the Run window is busy".to_string());
+        }
+        if !self.select_named(name, cx) {
+            return Err(format!("the project has no run configuration {name}"));
+        }
+        if let Some(index) = self.selected {
+            let config = self.configs[index].clone();
+            let Some(provider) = self
+                .providers
+                .iter()
+                .find(|provider| provider.id() == config.provider)
+                .cloned()
+            else {
+                return Err("the configuration has no provider".to_string());
+            };
+            let fields = provider.fields(&config);
+            let mut changes = Vec::new();
+            if let Some(arguments) = program_arguments
+                && !arguments.trim().is_empty()
+            {
+                changes.push(override_of(
+                    &fields,
+                    &["arg"],
+                    arguments,
+                    "program arguments",
+                )?);
+            }
+            if let Some(directory) = working_directory {
+                changes.push(override_of(
+                    &fields,
+                    &["work", "dir"],
+                    &directory.to_string_lossy(),
+                    "a working directory",
+                )?);
+            }
+            if !envs.is_empty() {
+                changes.push(override_of(
+                    &fields,
+                    &["env"],
+                    &envs.join(";"),
+                    "environment variables",
+                )?);
+            }
+            if !changes.is_empty() {
+                // The overrides live in a temporary configuration, so the one of the
+                // user keeps the arguments and the directory it had.
+                let target = format!("{name} (tool)");
+                self.temporary.retain(|config| config.name != target);
+                self.configs.retain(|config| config.name != target);
+                if let Some(index) = self.configs.iter().position(|config| config.name == name) {
+                    let mut config = self.configs[index].clone();
+                    config.name = target;
+                    for (key, value) in changes {
+                        config.settings.insert(key, value.into());
+                    }
+                    self.choose_configuration(config, cx);
+                }
+            }
         }
         let handle = cx.active_window();
         self.start_debug(handle, client, cx);

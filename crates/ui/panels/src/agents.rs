@@ -201,6 +201,14 @@ impl Mcp {
             .map(|published| published.entry.clone())
     }
 
+    /// The address and the token a client of the settings page copies, while the window
+    /// publishes its entry point.
+    pub(crate) fn endpoint(&self) -> Option<(String, String)> {
+        self.published()
+            .as_ref()
+            .map(|published| (published.entry.url.clone(), published.entry.token.clone()))
+    }
+
     fn published(&self) -> MutexGuard<'_, Option<Published>> {
         self.published
             .lock()
@@ -351,6 +359,27 @@ pub struct AgentsPanel {
     /// The Agents tab shows only the calls that run something of the project.
     pub(crate) clients_only_actions: bool,
     pub(crate) clients_scroll: ScrollHandle,
+}
+
+/// The Exposed Tools table of the settings, as the gateway applies it.
+fn tool_exposure(settings: &Settings) -> tool_gateway::ToolExposure {
+    let mut exposure = tool_gateway::ToolExposure::default();
+    for (name, choice) in &settings.mcp_tool_settings {
+        exposure.set_state(
+            name,
+            tool_gateway::ToolState {
+                enabled: choice.enabled,
+                router_only: choice.router_only,
+            },
+        );
+    }
+    if settings.mcp_router_only_mode {
+        exposure.set_router_only(Some(match settings.mcp_router_only_scope {
+            workspace::McpRouterScope::AllAgents => tool_gateway::RouterScope::AllAgents,
+            workspace::McpRouterScope::AcpOnly => tool_gateway::RouterScope::AcpOnly,
+        }));
+    }
+    exposure
 }
 
 /// A short stable name for the state of one project.
@@ -778,7 +807,11 @@ impl AgentsPanel {
         let allow_trusted = cx.try_global::<Settings>().is_some_and(|settings| {
             settings.mcp_execute_permission == workspace::McpExecutePermission::TrustedProjects
         });
+        let brave = cx.try_global::<Settings>().is_some_and(|settings| {
+            settings.mcp_execute_permission == workspace::McpExecutePermission::WithoutConfirmation
+        });
         self.approvals.set_allow_trusted(allow_trusted);
+        self.approvals.set_brave(brave);
         match (enabled, self.mcp.clone()) {
             (true, None) => {
                 let started = open_mcp(
@@ -802,6 +835,14 @@ impl AgentsPanel {
             }
             (false, Some(mcp)) => mcp.unpublish(),
             (false, None) => {}
+        }
+        // The Exposed Tools table of the settings decides what every client already
+        // connected sees, so it reaches the gateway of the open server at once.
+        if let Some(mcp) = &self.mcp {
+            let exposure = cx
+                .try_global::<Settings>()
+                .map_or_else(tool_gateway::ToolExposure::default, tool_exposure);
+            mcp.gateway.set_exposure(exposure);
         }
         cx.notify();
     }
@@ -895,6 +936,7 @@ impl AgentsPanel {
                         || !change.renames.is_empty();
                     self.defer_apply(request.id, change, EditReply::Applied { changed }, cx);
                 }
+                EditKind::Open { path } => self.defer_open(request.id, path, cx),
             }
         }
     }
@@ -1058,6 +1100,31 @@ impl AgentsPanel {
         };
         self.defer_apply(pending.id, pending.change, reply, cx);
         cx.notify();
+    }
+
+    /// Opens a file of a tool after the current update: an editor cannot open while the
+    /// window is being updated.
+    fn defer_open(&self, id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        let window = self.window;
+        let workspace = self.workspace.clone();
+        let edits = self.edits.clone();
+        cx.defer(move |cx| {
+            let opened = window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.open_file(path, window, cx))
+                        .ok()
+                })
+                .ok()
+                .flatten()
+                .is_some();
+            let reply = if opened {
+                EditReply::Applied { changed: false }
+            } else {
+                EditReply::Failed("the window is gone".to_string())
+            };
+            edits.resolve(id, reply);
+        });
     }
 
     /// Applies a change of the language service after the current update is over: an edit

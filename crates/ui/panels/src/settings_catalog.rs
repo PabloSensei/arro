@@ -307,6 +307,12 @@ pub enum SettingField {
     AiEnabled,
     /// Whether the project tree shows chains of folders with one subfolder each as one row.
     ProjectCompactMiddlePackages,
+    /// Whether `execute_tool` is the only tool a client sees.
+    McpRouterOnlyMode,
+    /// The clients the router-only mode covers.
+    McpRouterOnlyScope,
+    /// Whether a terminal suggests the setup of a client that starts in it.
+    McpTerminalSuggestions,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -1037,11 +1043,11 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         id: "mcp_enabled",
-        title: "Share the MCP server with other programs",
+        title: "Enable MCP Server",
         page: SettingsPage::Mcp,
         kind: SettingKind::Toggle,
         field: SettingField::McpEnabled,
-        keywords: "mcp server ai agents claude codex cursor integrate tools",
+        keywords: "mcp server enable ai agents claude codex cursor integrate tools",
     },
     Setting {
         id: "mcp_binary",
@@ -1053,11 +1059,11 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         id: "mcp_execute_permission",
-        title: "Permission to build, test and run",
+        title: "Run shell commands or run configurations without confirmation (brave mode)",
         page: SettingsPage::Mcp,
         kind: SettingKind::Choice,
         field: SettingField::McpExecutePermission,
-        keywords: "mcp permission ask allow trusted project build test run agent",
+        keywords: "mcp brave mode permission confirmation allow ask trusted project build test run terminal agent",
     },
     Setting {
         id: "sql_keyword_case",
@@ -1090,6 +1096,30 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Toggle,
         field: SettingField::ProjectCompactMiddlePackages,
         keywords: "project tree compact middle packages folders chain one subfolder package name dots",
+    },
+    Setting {
+        id: "mcp_router_only_mode",
+        title: "Enable router-only mode",
+        page: SettingsPage::Mcp,
+        kind: SettingKind::Toggle,
+        field: SettingField::McpRouterOnlyMode,
+        keywords: "mcp router only mode execute_tool exposed tools agents acp",
+    },
+    Setting {
+        id: "mcp_router_only_scope",
+        title: "Router-only mode for",
+        page: SettingsPage::Mcp,
+        kind: SettingKind::Choice,
+        field: SettingField::McpRouterOnlyScope,
+        keywords: "mcp router only mode scope agents acp all",
+    },
+    Setting {
+        id: "mcp_terminal_suggestions",
+        title: "Show setup suggestions for Codex and Claude terminal sessions",
+        page: SettingsPage::Mcp,
+        kind: SettingKind::Toggle,
+        field: SettingField::McpTerminalSuggestions,
+        keywords: "mcp terminal codex claude setup suggestion configure auto",
     },
 ];
 
@@ -1203,6 +1233,8 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::BuildToolFirstOffline => Some(settings.build_tools.first.offline),
         SettingField::BuildToolFirstTerminalPath => Some(settings.build_tools.first.terminal_path),
         SettingField::McpEnabled => Some(settings.mcp_enabled),
+        SettingField::McpRouterOnlyMode => Some(settings.mcp_router_only_mode),
+        SettingField::McpTerminalSuggestions => Some(settings.mcp_terminal_suggestions),
         SettingField::AiEnabled => Some(settings.ai_enabled),
         SettingField::ProjectCompactMiddlePackages => {
             Some(settings.project_compact_middle_packages)
@@ -1273,6 +1305,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::IconSet
         | SettingField::McpBinary
         | SettingField::McpExecutePermission
+        | SettingField::McpRouterOnlyScope
         | SettingField::SqlKeywordCase => None,
     }
 }
@@ -1362,6 +1395,12 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             settings.build_tools.first.terminal_path = !settings.build_tools.first.terminal_path;
         }
         Some(SettingField::McpEnabled) => settings.mcp_enabled = !settings.mcp_enabled,
+        Some(SettingField::McpRouterOnlyMode) => {
+            settings.mcp_router_only_mode = !settings.mcp_router_only_mode;
+        }
+        Some(SettingField::McpTerminalSuggestions) => {
+            settings.mcp_terminal_suggestions = !settings.mcp_terminal_suggestions;
+        }
         Some(SettingField::SqlScriptStopOnError) => {
             settings.sql_script_stop_on_error = !settings.sql_script_stop_on_error;
         }
@@ -1462,6 +1501,7 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::IconSet
             | SettingField::McpBinary
             | SettingField::McpExecutePermission
+            | SettingField::McpRouterOnlyScope
             | SettingField::SqlKeywordCase,
         )
         | None => {
@@ -1696,6 +1736,7 @@ pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
             home_kind_label(settings.build_tools.first.home_kind).to_owned()
         }
         SettingField::McpExecutePermission => settings.mcp_execute_permission.label().to_owned(),
+        SettingField::McpRouterOnlyScope => settings.mcp_router_only_scope.label().to_owned(),
         SettingField::SqlKeywordCase => settings.sql_keyword_case.label().to_owned(),
         _ => return None,
     };
@@ -1754,6 +1795,9 @@ pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
         Some(SettingField::McpExecutePermission) => {
             settings.mcp_execute_permission = settings.mcp_execute_permission.next();
         }
+        Some(SettingField::McpRouterOnlyScope) => {
+            settings.mcp_router_only_scope = settings.mcp_router_only_scope.next();
+        }
         Some(SettingField::SqlKeywordCase) => {
             settings.sql_keyword_case = settings.sql_keyword_case.next();
         }
@@ -1791,19 +1835,19 @@ pub fn mcp_binary(settings: &Settings) -> String {
 
 /// The three ways to point an MCP client at the window, ready to paste into its own
 /// settings. Arro itself runs none of them.
-pub fn mcp_lines(settings: &Settings) -> [String; 3] {
-    let binary = mcp_binary(settings);
-    let claude = format!("claude mcp add arro -- \"{binary}\"");
-    let toml = format!("[mcp_servers.arro]\ncommand = \"{}\"", toml_string(&binary));
-    // The path goes through the JSON writer, so a backslash of Windows is escaped.
-    let path = serde_json::json!(binary).to_string();
-    let json = format!("{{\"mcpServers\": {{\"arro\": {{\"command\": {path}}}}}}}");
-    [claude, toml, json]
-}
-
-/// A basic string of TOML: backslashes and quotes carry an escape there.
-fn toml_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+pub fn mcp_config(
+    settings: &Settings,
+    transport: mcp_discovery::Transport,
+    url: Option<&str>,
+    token: Option<&str>,
+) -> String {
+    let server = mcp_discovery::Server {
+        command: mcp_binary(settings),
+        url: url.map(str::to_owned),
+        token: token.map(str::to_owned),
+    };
+    mcp_discovery::snippet(mcp_discovery::Client::ClaudeCode, transport, &server)
+        .unwrap_or_else(|error| error.to_string())
 }
 
 #[cfg(test)]

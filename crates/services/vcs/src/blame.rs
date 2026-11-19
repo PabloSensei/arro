@@ -144,10 +144,25 @@ const MESSAGE_CHUNK: usize = 50;
 impl Repository {
     /// The commit that last changed every line of `path`, as the working tree has it.
     pub fn blame(&self, path: &str) -> io::Result<Vec<BlameLine>> {
-        let output = self
-            .git()
-            .run(self.root(), ["blame", "--porcelain", "--", path])?;
+        self.blame_revision(path, None)
+    }
+
+    /// The commit that last changed every line of `path` at `revision`, or in the working
+    /// tree when `revision` is `None`.
+    pub fn blame_revision(&self, path: &str, revision: Option<&str>) -> io::Result<Vec<BlameLine>> {
+        let mut args = vec!["blame", "--porcelain"];
+        if let Some(revision) = revision {
+            args.push(revision);
+        }
+        args.extend(["--", path]);
+        let output = self.git().run(self.root(), &args)?;
         Ok(parse_blame(&String::from_utf8_lossy(&output)))
+    }
+
+    /// The first parent of `commit`, `None` for a root commit.
+    pub fn first_parent(&self, commit: &str) -> io::Result<Option<String>> {
+        let output = self.run(["rev-list", "--parents", "-n", "1", commit])?;
+        Ok(output.split_whitespace().nth(1).map(str::to_owned))
     }
 
     /// The full message of every commit of `commits`, by id, for the hint of a label.

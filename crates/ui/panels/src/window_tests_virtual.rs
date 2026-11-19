@@ -55,7 +55,9 @@ fn mock_gateway(project: &std::path::Path, snapshot: Arc<Snapshot>) -> ToolGatew
     hub.set(snapshot);
     let tools = Arc::new(LanguageTools::new());
     tools.register_debug(project.to_path_buf(), hub);
-    ToolGateway::new(tools, AuditLog::default())
+    let gateway = ToolGateway::new(tools, AuditLog::default());
+    gateway.set_exposure(crate::window_tests_mcp_debug::direct_exposure());
+    gateway
 }
 
 /// Ten thousand virtual threads in the thread list do not become ten thousand requests:

@@ -4,14 +4,15 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::backend::{
-    BreakpointId, BreakpointInfo, BuildOutcome, BuildProblem, BuildRequest, CallHierarchy,
-    CallHierarchyQuery, DebugFrame, DebugRunOutcome, DebugRunRequest, DebugSessionState,
-    DebugStack, DebugStackQuery, DebugStateQuery, DebugValue, DebugVariable, DebugVariables,
-    DebugVariablesQuery, DiagnosticsPage, DiagnosticsQuery, EditorContext, FileActionOutcome,
-    FileText, HierarchyNode, ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol,
-    RunConfiguration, RunOutput, SearchPage, SearchQuery, SymbolHit, SymbolInfo, SymbolPage,
-    SymbolQuery, TestOutcome, TestsOutcome, TestsRequest, TypeHierarchy, TypeHierarchyQuery,
-    UsagePage, UsagesQuery, VcsChanges, VcsQuery,
+    AnalyzeCallsQuery, BreakpointId, BreakpointInfo, BuildOutcome, BuildProblem, BuildRequest,
+    CallHierarchy, CallHierarchyQuery, CallTree, DebugFrame, DebugRunOutcome, DebugRunRequest,
+    DebugSessionState, DebugStack, DebugStackQuery, DebugStateQuery, DebugValue, DebugVariable,
+    DebugVariables, DebugVariablesQuery, DiagnosticsPage, DiagnosticsQuery, DirectoryTree,
+    EditorContext, FileActionOutcome, FileText, GitStatus, HierarchyNode, PathPage, PathQuery,
+    ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol, RunConfiguration,
+    RunOutput, RunPointInfo, SearchPage, SearchQuery, SessionScope, Severity, SymbolHit,
+    SymbolInfo, SymbolPage, SymbolQuery, TerminalOutput, TestOutcome, TestsOutcome, TestsRequest,
+    TypeHierarchy, TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges, VcsQuery,
 };
 
 const CONTEXT_LINES: usize = 2;
@@ -1038,6 +1039,384 @@ pub(crate) fn debug_value(value: &DebugValue) -> String {
     format!("{} = {}{type_name}\n", value.expression, value.value)
 }
 
+/// The text of a class or a source the language service decompiled.
+pub(crate) fn source_text(text: &str) -> String {
+    let mut answer = String::from("source:\n");
+    answer.push_str(text);
+    if !answer.ends_with('\n') {
+        answer.push('\n');
+    }
+    answer
+}
+
+fn call_node_json(node: &crate::backend::CallNode) -> serde_json::Value {
+    let children: Vec<serde_json::Value> = node.children.iter().map(call_node_json).collect();
+    serde_json::json!({
+        "name": node.name,
+        "detail": node.detail,
+        "filePath": node.file_path.as_ref().map(|path| path.display().to_string()),
+        "line": node.line,
+        "treePath": node.tree_path,
+        "children": children,
+    })
+}
+
+pub(crate) fn call_tree(query: &AnalyzeCallsQuery, tree: &CallTree) -> String {
+    let root = tree.root.as_ref().map(call_node_json);
+    let answer = serde_json::json!({
+        "symbol": tree.symbol,
+        "analysisKind": tree.direction.name(),
+        "depth": query.depth,
+        "root": root,
+        "more": tree.more,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn file_problems(path: &Path, page: &DiagnosticsPage) -> String {
+    let problems: Vec<serde_json::Value> = page
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "severity": item.severity.name(),
+                "description": item.message,
+                "line": item.line,
+                "column": item.column,
+                "code": item.code,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "filePath": path.display().to_string(),
+        "problems": problems,
+        "more": page.next.is_some(),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn lint_results(
+    _scope: &SessionScope,
+    _severity: Severity,
+    reports: &[(std::path::PathBuf, Result<DiagnosticsPage, String>)],
+) -> String {
+    let files: Vec<serde_json::Value> = reports
+        .iter()
+        .map(|(path, report)| match report {
+            Ok(page) => {
+                let problems: Vec<serde_json::Value> = page
+                    .items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "severity": item.severity.name(),
+                            "description": item.message,
+                            "line": item.line,
+                            "column": item.column,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "filePath": path.display().to_string(),
+                    "problems": problems,
+                    "more": page.next.is_some(),
+                })
+            }
+            Err(message) => serde_json::json!({
+                "filePath": path.display().to_string(),
+                "notAnalyzedReason": message,
+                "problems": [],
+            }),
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "files": files,
+        "more": reports
+            .iter()
+            .any(|(_, report)| report.as_ref().is_ok_and(|page: &DiagnosticsPage| page.next.is_some())),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn project_dependencies(structure: &ProjectStructure) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for module in &structure.modules {
+        for dependency in &module.dependencies {
+            if !names.contains(dependency) {
+                names.push(dependency.clone());
+            }
+        }
+    }
+    let dependencies: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            let modules: Vec<&str> = structure
+                .modules
+                .iter()
+                .filter(|module| module.dependencies.contains(name))
+                .map(|module| module.name.as_str())
+                .collect();
+            serde_json::json!({"name": name, "modules": modules})
+        })
+        .collect();
+    serde_json::json!({
+        "dependencies": dependencies,
+        "resolved": structure.resolved,
+    })
+    .to_string()
+}
+
+pub(crate) fn project_modules(structure: &ProjectStructure) -> String {
+    let modules: Vec<serde_json::Value> = structure
+        .modules
+        .iter()
+        .map(|module| {
+            serde_json::json!({
+                "name": module.name,
+                "type": "module",
+                "path": module.path.display().to_string(),
+                "sourceRoots": module.source_roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "testRoots": module.test_roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "modules": modules,
+        "more": structure.clipped,
+    })
+    .to_string()
+}
+
+pub(crate) fn run_points(scope: &SessionScope, points: &[RunPointInfo]) -> String {
+    let points: Vec<serde_json::Value> = points
+        .iter()
+        .map(|point| {
+            serde_json::json!({
+                "kind": point.kind,
+                "name": point.name,
+                "container": point.container,
+                "filePath": crate::relative_path(&scope.project, &point.file),
+                "line": point.line,
+                "framework": point.framework,
+            })
+        })
+        .collect();
+    serde_json::json!({"runPoints": points}).to_string()
+}
+
+pub(crate) fn run_configurations_details(
+    scope: &SessionScope,
+    configurations: &[RunConfiguration],
+) -> String {
+    let configurations: Vec<serde_json::Value> = configurations
+        .iter()
+        .map(|configuration| {
+            serde_json::json!({
+                "name": configuration.name,
+                "kind": configuration.kind,
+                "commandLine": configuration.command_line,
+                "workingDirectory": configuration.working_directory.as_ref().map(|path| crate::relative_path(&scope.project, Path::new(path))),
+                "envs": configuration.environment.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>(),
+                "supportsDynamicLaunchOverrides": configuration.supports_dynamic_launch_overrides,
+            })
+        })
+        .collect();
+    serde_json::json!({"configurations": configurations}).to_string()
+}
+
+pub(crate) fn executed_run(output: &RunOutput, timed_out: bool) -> String {
+    let answer = serde_json::json!({
+        "id": output.id,
+        "running": output.running,
+        "exitCode": output.exit_code,
+        "fullOutputPath": output.full_output_path.as_ref().map(|path| path.display().to_string()),
+        "timedOut": timed_out,
+        "output": output.lines.join("\n"),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn created_file(scope: &SessionScope, edit: &ProposedEdit) -> String {
+    let answer = serde_json::json!({
+        "filePath": crate::relative_path(&scope.project, &edit.path),
+        "created": edit.outcome == crate::backend::EditOutcome::Accepted,
+        "outcome": edit.outcome.name(),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn opened_file(scope: &SessionScope, path: &Path) -> String {
+    serde_json::json!({"filePath": crate::relative_path(&scope.project, path), "opened": true})
+        .to_string()
+}
+
+pub(crate) fn open_paths(scope: &SessionScope, files: &[std::path::PathBuf]) -> String {
+    let files: Vec<String> = files
+        .iter()
+        .map(|path| crate::relative_path(&scope.project, path))
+        .collect();
+    serde_json::json!({"files": files}).to_string()
+}
+
+pub(crate) fn directory_tree(_scope: &SessionScope, tree: &DirectoryTree) -> String {
+    let mut text = String::new();
+    for entry in &tree.entries {
+        let indent = "  ".repeat(entry.depth);
+        let mark = if entry.directory { "/" } else { "" };
+        let _ = writeln!(text, "{indent}{}{mark}", entry.name);
+    }
+    if tree.clipped {
+        text.push_str("...\n");
+    }
+    text
+}
+
+pub(crate) fn patch_outcome(edit: &ProposedEdit) -> String {
+    edit.outcome.name().to_string()
+}
+
+pub(crate) fn patch_results(
+    scope: &SessionScope,
+    results: &[(std::path::PathBuf, String)],
+) -> String {
+    let files: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(path, outcome)| {
+            serde_json::json!({
+                "filePath": path.display().to_string(),
+                "outcome": outcome,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "projectPath": scope.project.display().to_string(),
+        "files": files,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn path_search(scope: &SessionScope, query: &PathQuery, page: &PathPage) -> String {
+    let files: Vec<String> = page
+        .items
+        .iter()
+        .map(|path| crate::relative_path(&scope.project, path))
+        .collect();
+    let answer = serde_json::json!({
+        "q": query.pattern,
+        "files": files,
+        "total": page.total,
+        "more": page.clipped,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn search_matches(
+    scope: &SessionScope,
+    _query: &SearchQuery,
+    page: &SearchPage,
+) -> String {
+    let matches: Vec<serde_json::Value> = page
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "filePath": crate::relative_path(&scope.project, &item.path),
+                "line": item.line,
+                "column": item.column,
+                "text": item.content,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "matches": matches,
+        "total": page.total,
+        "more": page.clipped,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn symbol_search(
+    scope: &SessionScope,
+    query: &SymbolQuery,
+    page: &SymbolPage,
+    paths: &[String],
+) -> String {
+    let symbols: Vec<serde_json::Value> = page
+        .hits
+        .iter()
+        .filter(|hit| {
+            paths.is_empty()
+                || crate::path_allowed(paths, &crate::relative_path(&scope.project, &hit.path))
+        })
+        .map(|hit| {
+            serde_json::json!({
+                "name": hit.name,
+                "kind": hit.kind,
+                "filePath": crate::relative_path(&scope.project, &hit.path),
+                "line": hit.line,
+                "text": hit.content,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "q": query.query,
+        "symbols": symbols,
+        "total": symbols.len(),
+        "more": page.next.is_some(),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn terminal_output(output: &TerminalOutput) -> String {
+    let answer = serde_json::json!({
+        "output": output.output,
+        "exitCode": output.exit_code,
+        "timedOut": output.timed_out,
+        "truncated": output.truncated,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn repositories(scope: &SessionScope, roots: &[std::path::PathBuf]) -> String {
+    let repositories: Vec<String> = roots
+        .iter()
+        .map(|path| crate::relative_path(&scope.project, path))
+        .collect();
+    serde_json::json!({"repositories": repositories}).to_string()
+}
+
+pub(crate) fn git_status(scope: &SessionScope, status: &GitStatus) -> String {
+    let repositories: Vec<serde_json::Value> = status
+        .repositories
+        .iter()
+        .map(|repository| {
+            let files: Vec<serde_json::Value> = repository
+                .files
+                .iter()
+                .map(|file| {
+                    serde_json::json!({
+                        "path": file.path,
+                        "index": file.index,
+                        "worktree": file.worktree,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "path": repository.path,
+                "branch": repository.branch,
+                "files": files,
+                "total": repository.total,
+                "more": repository.clipped,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "repositories": repositories,
+        "root": scope.project.display().to_string(),
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::backend::{
@@ -1302,6 +1681,7 @@ mod tests {
             pattern: "foo".to_string(),
             regex: false,
             mask: None,
+            paths: Vec::new(),
             limit: 1,
         };
         let page = SearchPage {
@@ -1481,6 +1861,7 @@ mod tests {
             running: false,
             exit_code: Some(0),
             lines: vec!["hello from run".to_string()],
+            full_output_path: None,
         };
 
         let text = run_output(&output);
@@ -1493,6 +1874,7 @@ mod tests {
             running: true,
             exit_code: None,
             lines: Vec::new(),
+            full_output_path: None,
         });
         assert!(
             empty.contains("running") && empty.contains("no output"),

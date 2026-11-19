@@ -1734,11 +1734,12 @@ impl PlatformWindow for MacWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        let (position, ui_scale) = {
-            let lock = self.0.lock();
-            (lock.native_window().mouseLocationOutsideOfEventStream(), lock.ui_scale)
-        };
-        convert_mouse_position(position, self.content_size().height, ui_scale)
+        let position = self
+            .0
+            .lock()
+            .native_window()
+            .mouseLocationOutsideOfEventStream();
+        convert_mouse_position(position, self.content_size().height, self.ui_scale)
     }
 
     fn modifiers(&self) -> Modifiers {

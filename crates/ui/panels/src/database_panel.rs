@@ -25,12 +25,18 @@ use lang_api::{
     MigrationHistory, MigrationHistoryRows, MigrationKind, MigrationModel, MigrationState,
     MigrationSupport, MigrationTool,
 };
+use tool_gateway::{
+    DatabaseAnswer, DatabaseConnection, DatabaseDescription, DatabaseIntrospection, DatabaseObject,
+    DatabaseObjectKind, DatabaseQuery, DatabaseRecentQuery, DatabaseRows, DatabaseSchema,
+    DatabaseTestResult,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{DATABASE_TOOL, Settings, Stop, Workspace};
 
 use crate::database_data::DatabaseDataView;
+use crate::mcp_database::{DatabaseBridge, Job as DatabaseJob};
 
 /// The panel of the window, for scripts and for tests.
 pub struct ActiveDatabase(pub Entity<DatabasePanel>);
@@ -771,6 +777,14 @@ pub struct DatabasePanel {
     scripted_closed: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     tree_scroll: ScrollHandle,
     result_scroll: ScrollHandle,
+    /// The connections were read from the state folder; a tool may not write before.
+    sources_loaded: bool,
+    /// The bridge of the MCP database tools, taken in every poll.
+    tool_database: Option<Arc<DatabaseBridge>>,
+    /// The statements a tool asked for, by the id of their query, until the answer.
+    tool_queries: HashMap<u64, DatabaseJob>,
+    /// The job of a tool whose statement the console is about to take.
+    pending_tool_job: Option<DatabaseJob>,
 }
 
 impl DatabasePanel {
@@ -851,6 +865,10 @@ impl DatabasePanel {
                 scripted_closed: Arc::new(Mutex::new(None)),
                 tree_scroll: ScrollHandle::new(),
                 result_scroll: ScrollHandle::new(),
+                sources_loaded: false,
+                tool_database: None,
+                tool_queries: HashMap::new(),
+                pending_tool_job: None,
             };
             panel.load_sources(cx);
             panel.load_migrations(cx);
@@ -904,6 +922,507 @@ impl DatabasePanel {
     /// The tables and views of one source, as the tree shows them.
     pub fn tables(&self, source: &SourceId) -> Vec<Table> {
         self.tables.get(source).cloned().unwrap_or_default()
+    }
+
+    /// Connects the tools of the MCP server to this window: their statements run through
+    /// the same console and the same drivers as the ones of the user.
+    pub(crate) fn set_tool_database(
+        &mut self,
+        bridge: Arc<DatabaseBridge>,
+        cx: &mut Context<Self>,
+    ) {
+        self.tool_database = Some(bridge);
+        // The queue has to be read even while no connection is open, so a tool that
+        // lists the connections gets an answer.
+        let polling = cx.weak_entity();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL).await;
+                if polling
+                    .update(cx, |panel, cx| {
+                        let _ = this;
+                        panel.poll_tool_jobs(cx);
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Takes the jobs the MCP tools left and answers the ones the cache can answer.
+    fn poll_tool_jobs(&mut self, cx: &mut Context<Self>) {
+        let Some(bridge) = self.tool_database.clone() else {
+            return;
+        };
+        while let Some(job) = bridge.take_job() {
+            self.take_database_job(job, cx);
+        }
+    }
+
+    fn take_database_job(&mut self, job: DatabaseJob, cx: &mut Context<Self>) {
+        let query = job.query.clone();
+        match query {
+            DatabaseQuery::ListConnections => job.answer(DatabaseAnswer::Connections(
+                self.sources
+                    .iter()
+                    .map(|source| self.connection_of(source))
+                    .collect(),
+            )),
+            DatabaseQuery::TestConnection { id } => {
+                match self.test_connection(&SourceId::new(id)) {
+                    Ok(result) => job.answer(DatabaseAnswer::Tested(result)),
+                    Err(message) => job.fail(message),
+                }
+            }
+            DatabaseQuery::CreateConnection {
+                name,
+                dbms,
+                url,
+                need_to_check,
+            } => match self.create_connection(&name, &dbms, &url, need_to_check, cx) {
+                Ok(answer) => job.answer(answer),
+                Err(message) => job.fail(message),
+            },
+            DatabaseQuery::EditConnection {
+                connection_id,
+                dbms,
+                url,
+                need_to_check,
+            } => {
+                match self.edit_connection(&connection_id, dbms.as_deref(), &url, need_to_check, cx)
+                {
+                    Ok(answer) => job.answer(answer),
+                    Err(message) => job.fail(message),
+                }
+            }
+            DatabaseQuery::ListSchemas {
+                connection_id,
+                selected_only,
+            } => {
+                let source = SourceId::new(connection_id);
+                let tables = self.tables(&source);
+                let mut schemas: Vec<DatabaseSchema> = Vec::new();
+                for table in &tables {
+                    let name = table.schema.clone();
+                    if name.is_empty() || schemas.iter().any(|known| known.name == name) {
+                        continue;
+                    }
+                    schemas.push(DatabaseSchema {
+                        name,
+                        database: None,
+                    });
+                }
+                if selected_only && let Some(selected) = self.default_schemas.get(&source) {
+                    schemas.retain(|schema| &schema.name == selected);
+                }
+                job.answer(DatabaseAnswer::Schemas(schemas));
+            }
+            DatabaseQuery::Introspect {
+                connection_id,
+                database_name,
+                schema_name,
+            } => {
+                let source = SourceId::new(connection_id);
+                if !self.sources.iter().any(|known| known.id == source) {
+                    return job.fail(format!("no connection has the id {source}"));
+                }
+                let status = if self.sessions.contains_key(&source) {
+                    self.request_schema(source.clone(), cx);
+                    "started"
+                } else {
+                    "failed"
+                };
+                job.answer(DatabaseAnswer::Introspected(DatabaseIntrospection {
+                    connection_id: source.as_str().to_string(),
+                    database_name,
+                    schema_name,
+                    status: status.to_string(),
+                    tables: self.tables(&source).len(),
+                    partial: false,
+                }));
+            }
+            DatabaseQuery::ObjectKinds { connection_id } => {
+                let source = SourceId::new(connection_id);
+                let mut kinds: Vec<DatabaseObjectKind> = Vec::new();
+                for table in self.tables(&source) {
+                    let code = match table.kind {
+                        database::TableKind::View => "VIEW",
+                        database::TableKind::Table => "TABLE",
+                    };
+                    if !kinds.iter().any(|known| known.code == code) {
+                        kinds.push(DatabaseObjectKind {
+                            code: code.to_string(),
+                            name: if code == "VIEW" { "Views" } else { "Tables" }.to_string(),
+                        });
+                    }
+                }
+                job.answer(DatabaseAnswer::Kinds(kinds));
+            }
+            DatabaseQuery::ListObjects {
+                connection_id,
+                schema_name,
+                database_name,
+                kind,
+            } => {
+                let source = SourceId::new(connection_id);
+                let objects = self
+                    .tables(&source)
+                    .into_iter()
+                    .filter(|table| {
+                        schema_name
+                            .as_deref()
+                            .is_none_or(|schema| table.schema == schema)
+                    })
+                    .filter(|table| {
+                        kind.as_deref().is_none_or(|kind| {
+                            kind.eq_ignore_ascii_case(match table.kind {
+                                database::TableKind::View => "VIEW",
+                                database::TableKind::Table => "TABLE",
+                            })
+                        })
+                    })
+                    .map(|table| DatabaseObject {
+                        name: table.name,
+                        kind: match table.kind {
+                            database::TableKind::View => "VIEW",
+                            database::TableKind::Table => "TABLE",
+                        }
+                        .to_string(),
+                        schema: (!table.schema.is_empty()).then_some(table.schema),
+                        database: database_name.clone(),
+                    })
+                    .collect();
+                job.answer(DatabaseAnswer::Objects(objects));
+            }
+            DatabaseQuery::Describe {
+                connection_id,
+                database_name,
+                schema_name,
+                kind: _,
+                object_name,
+            } => {
+                let source = SourceId::new(connection_id);
+                let Some(table) = self.tables(&source).into_iter().find(|table| {
+                    table.name == object_name
+                        && schema_name
+                            .as_deref()
+                            .is_none_or(|schema| table.schema == schema)
+                }) else {
+                    return job.fail(format!(
+                        "the window has no object {object_name} of {source}"
+                    ));
+                };
+                job.answer(DatabaseAnswer::Described(DatabaseDescription {
+                    name: table.name.clone(),
+                    kind: match table.kind {
+                        database::TableKind::View => "VIEW",
+                        database::TableKind::Table => "TABLE",
+                    }
+                    .to_string(),
+                    schema: (!table.schema.is_empty()).then_some(table.schema),
+                    database: database_name,
+                    columns: table
+                        .columns
+                        .iter()
+                        .map(|column| tool_gateway::DescriptionColumn {
+                            name: column.name.clone(),
+                            type_name: column.type_name.clone(),
+                            nullable: column.nullable,
+                            primary_key: column.primary_key,
+                        })
+                        .collect(),
+                    indexes: table
+                        .indexes
+                        .iter()
+                        .map(|index| tool_gateway::DescriptionIndex {
+                            name: index.name.clone(),
+                            unique: index.unique,
+                            columns: index.columns.clone(),
+                        })
+                        .collect(),
+                    foreign_keys: table
+                        .foreign_keys
+                        .iter()
+                        .map(|key| tool_gateway::DescriptionKey {
+                            name: key.name.clone(),
+                            columns: key.columns.clone(),
+                            referenced_table: key.referenced_table.clone(),
+                            referenced_columns: key.referenced_columns.clone(),
+                        })
+                        .collect(),
+                    partial: table.partial,
+                }));
+            }
+            DatabaseQuery::Execute {
+                connection_id,
+                query_text,
+            } => self.start_tool_statement(job, &connection_id, query_text, None, cx),
+            DatabaseQuery::PreviewTable {
+                connection_id,
+                schema_name,
+                database_name,
+                table_name,
+                max_row_count,
+            } => {
+                let source = SourceId::new(connection_id);
+                let kind = self
+                    .sources
+                    .iter()
+                    .find(|known| known.id == source)
+                    .map(|known| known.kind)
+                    .unwrap_or_default();
+                let dialect = Dialect::of(kind);
+                let table = TableRef::new(schema_name.unwrap_or_default(), table_name);
+                let sql = format!("SELECT * FROM {}", table.qualified(dialect));
+                let _ = database_name;
+                self.start_tool_statement(job, source.as_str(), sql, Some(max_row_count), cx)
+            }
+            DatabaseQuery::RecentQueries { connection_id } => {
+                let source = SourceId::new(connection_id);
+                let mut queries: Vec<DatabaseRecentQuery> = Vec::new();
+                if let Some(active) = self.query_ids.get(&source)
+                    && let Some(index) = self.tab_of(*active)
+                    && let Some(tab) = self.results.get(index)
+                {
+                    queries.push(DatabaseRecentQuery {
+                        sql: tab.statement.clone(),
+                        state: "running".to_string(),
+                        elapsed_ms: tab.started.elapsed().as_millis() as u64,
+                        connection_id: source.as_str().to_string(),
+                    });
+                }
+                for sql in &self.console_history {
+                    queries.push(DatabaseRecentQuery {
+                        sql: sql.clone(),
+                        state: "finished".to_string(),
+                        elapsed_ms: 0,
+                        connection_id: source.as_str().to_string(),
+                    });
+                }
+                job.answer(DatabaseAnswer::Recent(queries));
+            }
+            DatabaseQuery::Cancel { session_id } => {
+                let source = SourceId::new(session_id);
+                let cancelled = self
+                    .query_ids
+                    .get(&source)
+                    .and_then(|id| {
+                        self.sessions
+                            .get(&source)
+                            .map(|session| session.send(Command::Cancel { id: *id }).is_ok())
+                    })
+                    .unwrap_or(false);
+                job.answer(DatabaseAnswer::Cancelled(cancelled));
+            }
+        }
+    }
+
+    fn connection_of(&self, source: &Source) -> DatabaseConnection {
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.kind == source.kind)
+            .map(|driver| driver.label.clone());
+        DatabaseConnection {
+            id: source.id.as_str().to_string(),
+            name: source.name.clone(),
+            dbms: source.kind.title().to_string(),
+            driver,
+            url: tool_gateway::hide_secrets(&source.url),
+        }
+    }
+
+    fn test_connection(&self, source: &SourceId) -> Result<DatabaseTestResult, String> {
+        let Some(known) = self.sources.iter().find(|known| &known.id == source) else {
+            return Err(format!("no connection has the id {source}"));
+        };
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.kind == known.kind)
+            .map(|driver| driver.label.clone())
+            .or_else(|| {
+                known
+                    .driver_jar
+                    .as_ref()
+                    .map(|jar| jar.to_string_lossy().into_owned())
+            });
+        if self.sessions.contains_key(source) {
+            return Ok(DatabaseTestResult {
+                problem: false,
+                dbms: known.kind.title().to_string(),
+                version: self
+                    .status
+                    .clone()
+                    .and_then(|status| status.strip_prefix("Connected to ").map(str::to_string)),
+                driver,
+                result: self
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "Connected".to_string()),
+            });
+        }
+        Err(format!(
+            "{} is not connected in the Database window: open it there to test the driver \
+             and the password",
+            known.name
+        ))
+    }
+
+    fn create_connection(
+        &mut self,
+        name: &str,
+        dbms: &str,
+        url: &str,
+        need_to_check: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<DatabaseAnswer, String> {
+        let Some(kind) = driver_kind(dbms) else {
+            return Err(format!("unknown DBMS {dbms}"));
+        };
+        if !self.sources_loaded {
+            return Err("the connections of the window are still loading".to_string());
+        }
+        if url.trim().is_empty() {
+            return Err("the address of a connection is required".to_string());
+        }
+        let name = if name.trim().is_empty() {
+            source_name(url)
+        } else {
+            name.trim().to_string()
+        };
+        let id = self.unique_id(&name);
+        let source = Source {
+            id: id.clone(),
+            name: name.clone(),
+            kind,
+            // The address a project file keeps carries no password.
+            url: tool_gateway::without_password(url),
+            user: String::new(),
+            module: None,
+            driver_jar: None,
+        };
+        self.sources.push(source.clone());
+        self.selected = Some(id.clone());
+        self.save_sources(cx);
+        let check = need_to_check
+            .then(|| self.test_connection(&id).ok())
+            .flatten();
+        cx.notify();
+        Ok(DatabaseAnswer::Saved(self.connection_of(&source), check))
+    }
+
+    fn edit_connection(
+        &mut self,
+        connection_id: &str,
+        dbms: Option<&str>,
+        url: &str,
+        need_to_check: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<DatabaseAnswer, String> {
+        let source = SourceId::new(connection_id);
+        let kind = match dbms {
+            Some(dbms) => Some(driver_kind(dbms).ok_or_else(|| format!("unknown DBMS {dbms}"))?),
+            None => None,
+        };
+        if !self.sources_loaded {
+            return Err("the connections of the window are still loading".to_string());
+        }
+        if url.trim().is_empty() {
+            return Err("the address of a connection is required".to_string());
+        }
+        let Some(index) = self.sources.iter().position(|known| known.id == source) else {
+            return Err(format!("no connection has the id {connection_id}"));
+        };
+        let changed = self.sources[index].url != url
+            || kind.is_some_and(|kind| kind != self.sources[index].kind);
+        self.sources[index].url = tool_gateway::without_password(url);
+        if let Some(kind) = kind {
+            self.sources[index].kind = kind;
+        }
+        if changed {
+            // The address of a live connection is gone: the helper reads a new one on
+            // the next open, and the schema of the old address must not be shown.
+            self.sessions.remove(&source);
+            self.tables.remove(&source);
+            self.errors.remove(&source);
+        }
+        self.save_sources(cx);
+        let saved = self.sources[index].clone();
+        let check = need_to_check
+            .then(|| self.test_connection(&source).ok())
+            .flatten();
+        cx.notify();
+        Ok(DatabaseAnswer::Saved(self.connection_of(&saved), check))
+    }
+
+    /// Runs a statement for a tool on the console of its connection and keeps the job
+    /// until the console has the result.
+    fn start_tool_statement(
+        &mut self,
+        job: DatabaseJob,
+        connection_id: &str,
+        sql: String,
+        max_rows: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let source = SourceId::new(connection_id);
+        if !self.sources.iter().any(|known| known.id == source) {
+            return job.fail(format!("no connection has the id {connection_id}"));
+        }
+        if sql.trim().is_empty() {
+            return job.fail("the statement is empty");
+        }
+        if !self.sessions.contains_key(&source) && self.scripted.is_none() {
+            return job.fail(format!(
+                "{} is not connected in the Database window",
+                source
+            ));
+        }
+        // The statement makes its own id; the job waits for it there.
+        self.pending_tool_job = Some(job);
+        let _ = self.start_statement(source, sql, max_rows, Vec::new(), false, cx);
+    }
+
+    fn tool_rows(&self, index: usize) -> Option<DatabaseRows> {
+        let tab = self.results.get(index)?;
+        let result = tab.result.clone().unwrap_or_default();
+        Some(DatabaseRows {
+            columns: result
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            rows: result
+                .rows
+                .iter()
+                .map(|row| row.iter().map(Value::text).collect())
+                .collect(),
+            update_count: result.update_count,
+            truncated: result.truncated,
+            elapsed_ms: tab
+                .elapsed
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+            error: tab.error.clone(),
+        })
+    }
+
+    /// Answers a statement a tool asked for, by the tab the console finished.
+    fn answer_tool_query(&mut self, query: u64) {
+        let Some(job) = self.tool_queries.remove(&query) else {
+            return;
+        };
+        let Some(index) = self.tab_of(query) else {
+            return job.fail("the console has no tab for the statement");
+        };
+        match self.tool_rows(index) {
+            Some(rows) => job.answer(DatabaseAnswer::Rows(rows)),
+            None => job.fail("the statement left no result"),
+        }
     }
 
     /// The last result of the console or of a double-clicked table: the tab the grid
@@ -1532,6 +2051,7 @@ impl DatabasePanel {
                 if this.selected.is_none() {
                     this.selected = this.sources.first().map(|source| source.id.clone());
                 }
+                this.sources_loaded = true;
                 cx.notify();
             })
             .ok();
@@ -1691,8 +2211,17 @@ impl DatabasePanel {
         }
         for source in gone {
             if self.sessions.remove(&source).is_some() {
-                self.errors
-                    .insert(source, "The connection to the helper is closed.".into());
+                self.errors.insert(
+                    source.clone(),
+                    "The connection to the helper is closed.".into(),
+                );
+                // A statement of a tool cannot finish without its helper.
+                let waiting: Vec<u64> = self.tool_queries.keys().copied().collect();
+                for query in waiting {
+                    if let Some(job) = self.tool_queries.remove(&query) {
+                        job.fail(format!("the connection to {source} is closed"));
+                    }
+                }
                 cx.notify();
             }
         }
@@ -1825,6 +2354,9 @@ impl DatabasePanel {
                     tab.cancelled = cancelled;
                     tab.error = Some(text.clone());
                     tab.result = None;
+                    // A statement a tool asked for is answered with the error the driver
+                    // gave, before the tab loses its place.
+                    self.answer_tool_query(id);
                     self.tabs_by_query.remove(&id);
                     if self.query_ids.get(&source) == Some(&id) {
                         self.query_ids.remove(&source);
@@ -2655,6 +3187,9 @@ impl DatabasePanel {
         cx: &mut Context<Self>,
     ) -> bool {
         let id = self.next();
+        if let Some(job) = self.pending_tool_job.take() {
+            self.tool_queries.insert(id, job);
+        }
         let tab = if explain {
             ConsoleResult::explain(id, sql.clone(), source.clone())
         } else {
@@ -2757,6 +3292,16 @@ impl DatabasePanel {
         }
         if changed && !self.auto_commit(source) {
             *self.pending.entry(source.clone()).or_insert(0) += 1;
+        }
+        // A statement a tool asked for is answered by the tab the console finished.
+        let tab_id = self.results.get(index).map(|tab| tab.id);
+        if let Some(query) = tab_id.and_then(|tab_id| {
+            self.tabs_by_query
+                .iter()
+                .find(|(_, tab)| **tab == tab_id)
+                .map(|(query, _)| *query)
+        }) {
+            self.answer_tool_query(query);
         }
         cx.notify();
     }
@@ -6559,6 +7104,20 @@ fn source_name(url: &str) -> String {
         "source".to_owned()
     } else {
         name.to_owned()
+    }
+}
+
+/// The product a tool names, in the kinds the Database window offers.
+fn driver_kind(name: &str) -> Option<DriverKind> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "h2" => Some(DriverKind::H2),
+        "postgresql" | "postgres" => Some(DriverKind::PostgreSql),
+        "mysql" => Some(DriverKind::MySql),
+        "mariadb" => Some(DriverKind::MariaDb),
+        "sqlite" => Some(DriverKind::Sqlite),
+        "oracle" => Some(DriverKind::Oracle),
+        "sqlserver" | "sql server" | "mssql" => Some(DriverKind::SqlServer),
+        _ => None,
     }
 }
 

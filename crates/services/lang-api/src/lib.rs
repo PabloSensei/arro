@@ -20,6 +20,7 @@ mod inspection;
 mod language;
 mod migrations;
 mod profile;
+mod run_points;
 mod semantic;
 mod sequence;
 mod sources;
@@ -84,6 +85,7 @@ pub use profile::{
     ProfileFrame, ProfileMethod, ProfileNode, ProfileRecording, ProfileReport, ProfileSample,
     ProfileSamples, ProfileSnapshot, ProfileType, ProfileTypeTree, ProfileUnit, bytes_text,
 };
+pub use run_points::{RunPoint, RunPointKind, RunPointQuery, RunPointsProvider};
 pub use semantic::{
     ActionApplyProvider, ActionApplyRequest, ActionChoice, ActionEntry, ActionField, ActionKind,
     ActionMember, ActionOutcome, ActionParameters, ActionParametersProvider, ActionParametersQuery,

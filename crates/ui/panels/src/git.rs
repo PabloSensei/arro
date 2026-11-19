@@ -152,6 +152,9 @@ pub struct GitState {
     autostash: bool,
     /// The message a merge commit starts with.
     merge_message: String,
+    /// The revision the column of an open editor stands at, when Annotate Previous
+    /// Revision moved it there; a file without an entry shows the working tree.
+    annotated_revisions: HashMap<PathBuf, String>,
     /// The conflicted files whose bytes are not text, by path relative to the root: Merge
     /// has three versions to show only for a text file.
     binary_conflicts: HashSet<String>,
@@ -222,6 +225,7 @@ impl GitState {
             operation: Operation::None,
             autostash: false,
             merge_message: String::new(),
+            annotated_revisions: HashMap::new(),
             binary_conflicts: HashSet::new(),
             recent: Vec::new(),
             last_deleted: None,
@@ -532,10 +536,10 @@ impl GitState {
             .iter()
             .filter_map(|(path, view)| Some((path.clone(), view.read(cx).text()?)))
             .collect();
-        let annotated: Vec<PathBuf> = editors
+        let annotated: Vec<(PathBuf, Option<String>)> = editors
             .iter()
             .filter(|(_, view)| view.read(cx).has_annotations())
-            .map(|(path, _)| path.clone())
+            .map(|(path, _)| (path.clone(), self.annotated_revisions.get(path).cloned()))
             .collect();
         let job = cx.background_executor().spawn(async move {
             let mut roots = vec![(String::new(), repo.clone())];
@@ -623,7 +627,7 @@ impl GitState {
                     hunks.insert(path, diff.hunks);
                 }
             }
-            for path in annotated {
+            for (path, revision) in annotated {
                 let relative = relative_of(repo.root(), &path);
                 let root = read
                     .iter()
@@ -637,7 +641,7 @@ impl GitState {
                     continue;
                 };
                 let relative = relative_of(root.repo.root(), &path);
-                if let Ok(lines) = root.repo.blame(&relative) {
+                if let Ok(lines) = root.repo.blame_revision(&relative, revision.as_deref()) {
                     let messages = messages_of(&root.repo, &lines);
                     blames.insert(path, (lines, messages));
                 }
@@ -739,7 +743,13 @@ impl GitState {
         }
         for (path, view) in editors {
             if let Some((lines, messages)) = blames.get(&path) {
-                let notes = crate::annotate::notes(lines, messages);
+                let options = crate::annotate::AnnotateView::of(cx.global::<Settings>());
+                let notes = crate::annotate::notes(
+                    lines,
+                    messages,
+                    options,
+                    crate::annotate::now_seconds(),
+                );
                 view.update(cx, |view, cx| view.set_annotations(&notes, cx));
             }
             let marks = hunks.get(&path).map(|hunks| marks_of(hunks, &theme));
@@ -2861,17 +2871,24 @@ impl GitState {
             self.report("Annotate", message, cx);
             return;
         }
+        self.annotated_revisions.remove(&path);
         let relative = relative_of(repo.root(), &path);
         let job = cx.background_executor().spawn(async move {
             let lines = repo.blame(&relative).map_err(|error| error.to_string())?;
             let messages = messages_of(&repo, &lines);
             Ok::<_, String>((lines, messages))
         });
+        let options = crate::annotate::AnnotateView::of(cx.global::<Settings>());
         cx.spawn(async move |this, cx| {
             let result = job.await;
             match result {
                 Ok((lines, messages)) => {
-                    let notes = crate::annotate::notes(&lines, &messages);
+                    let notes = crate::annotate::notes(
+                        &lines,
+                        &messages,
+                        options,
+                        crate::annotate::now_seconds(),
+                    );
                     view.update(cx, |view, cx| view.set_annotations(&notes, cx));
                 }
                 Err(message) => {
@@ -2883,9 +2900,69 @@ impl GitState {
         .detach();
     }
 
+    /// Annotate Previous Revision: the column of `path` moves to the parent of the commit
+    /// it stands at, or of `from` when the column shows the working tree.
+    pub fn annotate_previous_revision(
+        &mut self,
+        path: PathBuf,
+        view: Entity<EditorView>,
+        from: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let base = self.annotated_revisions.get(&path).cloned().or(from);
+        let Some(base) = base else {
+            return;
+        };
+        let relative = relative_of(repo.root(), &path);
+        let job = cx.background_executor().spawn(async move {
+            let parent = repo
+                .first_parent(&base)
+                .map_err(|error| error.to_string())?;
+            let Some(parent) = parent else {
+                return Ok::<_, String>(None);
+            };
+            let lines = repo
+                .blame_revision(&relative, Some(&parent))
+                .map_err(|error| error.to_string())?;
+            let messages = messages_of(&repo, &lines);
+            Ok(Some((parent, lines, messages)))
+        });
+        let options = crate::annotate::AnnotateView::of(cx.global::<Settings>());
+        cx.spawn(async move |this, cx| match job.await {
+            Ok(Some((revision, lines, messages))) => {
+                let notes = crate::annotate::notes(
+                    &lines,
+                    &messages,
+                    options,
+                    crate::annotate::now_seconds(),
+                );
+                view.update(cx, |view, cx| view.set_annotations(&notes, cx));
+                this.update(cx, |this, _| {
+                    this.annotated_revisions.insert(path, revision);
+                })
+                .ok();
+            }
+            Ok(None) => {}
+            Err(message) => {
+                this.update(cx, |this, cx| this.report("Annotate", message, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The revision the column of `path` stands at, `None` for the working tree.
+    pub fn annotated_revision(&self, path: &Path) -> Option<&str> {
+        self.annotated_revisions.get(path).map(String::as_str)
+    }
+
     /// Close Annotations: takes the blame column of the active editor away.
     pub fn close_annotations(&mut self, cx: &mut Context<Self>) {
-        if let Some((_, view)) = self.active_editor(cx) {
+        if let Some((path, view)) = self.active_editor(cx) {
+            self.annotated_revisions.remove(&path);
             view.update(cx, |view, cx| view.clear_annotations(cx));
         }
     }

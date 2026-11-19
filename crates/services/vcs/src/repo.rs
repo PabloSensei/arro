@@ -42,6 +42,14 @@ pub struct Commit {
     pub committer: String,
 }
 
+/// A file a commit changed and the change the commit made to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitChange {
+    /// Relative to the repository root, with `/`. A renamed file has its new name.
+    pub path: String,
+    pub change: Change,
+}
+
 /// What the details pane of the log shows about one commit besides the fields of
 /// [`Commit`]: the whole message and the branches the commit belongs to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1013,6 +1021,55 @@ impl Repository {
             .filter(|path| !path.is_empty())
             .map(str::to_owned)
             .collect())
+    }
+
+    /// The files a commit changed against its first parent, each with its change. Renames
+    /// are found, so a moved file is one entry under its new name.
+    pub fn commit_changes(&self, commit: &str) -> io::Result<Vec<CommitChange>> {
+        let line = self.run(["rev-list", "--parents", "-n", "1", commit])?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let mut args = vec![
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-M",
+            "-z",
+        ];
+        match fields.get(1) {
+            Some(parent) => {
+                args.push(parent);
+                args.push(commit);
+            }
+            None => {
+                args.push("--root");
+                args.push(commit);
+            }
+        }
+        let output = self.git.run(&self.root, &args)?;
+        // With -z every field ends with a NUL: the change, then the path. A rename or a copy
+        // names the old path before the new one, and the new one is the file's path.
+        let mut records = output
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty());
+        let mut changes = Vec::new();
+        while let Some(status) = records.next() {
+            let letter = status.first().copied().unwrap_or_default();
+            let path = if matches!(letter, b'R' | b'C') {
+                records.next();
+                records.next()
+            } else {
+                records.next()
+            };
+            let Some(path) = path else {
+                break;
+            };
+            changes.push(CommitChange {
+                path: String::from_utf8_lossy(path).into_owned(),
+                change: Change::from_letter(letter),
+            });
+        }
+        Ok(changes)
     }
 
     /// The text of `path` at `commit` against its first parent, for the diff popup.

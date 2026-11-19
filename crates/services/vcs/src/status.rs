@@ -13,7 +13,7 @@ pub enum Change {
 }
 
 impl Change {
-    fn from_letter(letter: u8) -> Self {
+    pub(crate) fn from_letter(letter: u8) -> Self {
         match letter {
             b'M' => Self::Modified,
             b'T' => Self::TypeChanged,

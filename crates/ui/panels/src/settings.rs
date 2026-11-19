@@ -12,7 +12,7 @@ use project_model::RuntimeInfo;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{Settings, Workspace};
+use workspace::{McpToolChoice, Settings, Workspace};
 
 use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog, dialog_button};
 use crate::prompt::TextField;
@@ -25,6 +25,15 @@ const MIN_WIDTH: f32 = 640.;
 const MIN_HEIGHT: f32 = 420.;
 /// The grab area of the edge and the corner that change the size.
 const RESIZE_GRIP: f32 = 8.;
+
+/// The home folder the MCP client rows read, for a test that keeps its own: the profile of
+/// the user of the machine is neither read nor written there.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestMcpHome(pub PathBuf);
+
+#[cfg(test)]
+impl Global for TestMcpHome {}
 
 /// Where the Settings window sits and how large it is, for this session only.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +168,25 @@ pub(crate) fn default_settings_file() -> PathBuf {
     home_folder().join(".m2").join("settings.xml")
 }
 
+/// The home folder the MCP client rows read: the profile of the user, or the one a test
+/// set for itself.
+fn mcp_home_folder(cx: &App) -> PathBuf {
+    #[cfg(not(test))]
+    let _ = cx;
+    #[cfg(test)]
+    if let Some(home) = cx.try_global::<TestMcpHome>() {
+        return home.0.clone();
+    }
+    mcp_discovery::home_folder()
+}
+
+/// The address and the token of the MCP server of the project while the window publishes
+/// them.
+fn mcp_endpoint(cx: &App) -> Option<(String, String)> {
+    let panel = cx.try_global::<crate::agents::ActiveAgents>()?.0.clone();
+    panel.read(cx).mcp.as_ref().and_then(|mcp| mcp.endpoint())
+}
+
 /// The repository a settings file names, or the default one of the first build tool.
 /// Blocks on the disk: not for the UI thread.
 fn local_repository(settings_file: &Path) -> String {
@@ -227,6 +255,21 @@ pub struct SettingsView {
     project_style: Option<text_core::StyleSource>,
     /// The user turned the project style off for this project.
     project_style_off: bool,
+    /// The home folder the MCP client rows read, in a test one of its own.
+    mcp_home: PathBuf,
+    /// The MCP clients of the user and of the project, read in the background.
+    mcp_clients: Vec<mcp_discovery::ClientState>,
+    mcp_project_clients: Vec<mcp_discovery::ClientState>,
+    mcp_clients_loads: u64,
+    mcp_clients_loaded: u64,
+    /// The client whose menu of transports is open, and whether it writes the project file.
+    mcp_open_client: Option<(mcp_discovery::Client, bool)>,
+    /// The transport the menu of a client picks.
+    mcp_transport: mcp_discovery::Transport,
+    /// The Enable MCP Server question of the page stands over the settings.
+    mcp_confirm_enable: bool,
+    /// The last failure of an MCP client file, shown under the rows.
+    mcp_error: Option<String>,
     /// The SDKs the pages offer where a choice among them is needed.
     runtimes: Vec<RuntimeInfo>,
     /// The local repository the settings file names, read in the background.
@@ -308,6 +351,7 @@ impl SettingsView {
         let templates_page = crate::settings_templates::page(weak.clone());
         let project_style = text_core::style_source(&root);
         let project_style_off = root.join(text_core::idea_style::DISABLED_FILE).is_file();
+        let mcp_home = mcp_home_folder(cx);
         let view = cx.new(|cx| Self {
             workspace: weak,
             focus: cx.focus_handle(),
@@ -338,6 +382,15 @@ impl SettingsView {
             sdk: "not set".to_owned(),
             project_style,
             project_style_off,
+            mcp_home,
+            mcp_clients: Vec::new(),
+            mcp_project_clients: Vec::new(),
+            mcp_clients_loads: 0,
+            mcp_clients_loaded: 0,
+            mcp_open_client: None,
+            mcp_transport: mcp_discovery::Transport::Stdio,
+            mcp_confirm_enable: false,
+            mcp_error: None,
             runtimes: Vec::new(),
             repository: String::new(),
             git_version: None,
@@ -396,6 +449,9 @@ impl SettingsView {
         })
         .detach();
         let focus = view.read(cx).focus.clone();
+        if page == SettingsPage::Mcp {
+            view.update(cx, |view, cx| view.load_mcp_clients(cx));
+        }
         workspace.show_overlay(view.into(), focus, window, cx);
     }
 
@@ -421,6 +477,37 @@ impl SettingsView {
         self.draft != self.saved
             || self.plugins != self.saved_plugins
             || self.inspection_settings != self.saved_inspections
+    }
+
+    /// The draft the page holds, for a test of a switch.
+    #[cfg(test)]
+    pub(crate) fn draft_settings(&self) -> &Settings {
+        &self.draft
+    }
+
+    /// Flips a row of the Exposed Tools table, for a test of the table.
+    #[cfg(test)]
+    pub(crate) fn set_tool_switch(
+        &mut self,
+        name: &'static str,
+        enabled: bool,
+        router_only: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.change(
+            move |settings| {
+                let entry = tool_choice_entry(settings, name);
+                entry.enabled = enabled;
+                entry.router_only = router_only;
+            },
+            cx,
+        );
+    }
+
+    /// Turns the router-only mode on or off, for a test of the table.
+    #[cfg(test)]
+    pub(crate) fn set_router_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.change(|settings| settings.mcp_router_only_mode = on, cx);
     }
 
     /// The line the Code Style page shows above the window settings: which file of the
@@ -1753,59 +1840,809 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// The three strings that point a client outside the window at this one. Arro only
-    /// copies them: it runs none of them.
-    fn mcp_section(&self, settings: &Settings, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
-        let lines = settings_catalog::mcp_lines(settings);
-        let rows: [(&'static str, &'static str, String); 3] = [
-            ("claude", "Claude Code", lines[0].clone()),
-            ("codex", "Codex (config.toml)", lines[1].clone()),
-            ("json", "Any MCP client (JSON)", lines[2].clone()),
-        ];
+    /// The MCP Server page of IDEA: the switch of the server, the clients it can configure
+    /// itself, the strings to copy, the brave mode, the terminal suggestions and the table
+    /// of the exposed tools.
+    fn mcp_section(
+        &mut self,
+        settings: &Settings,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Div> {
         let mut content = vec![
-            note(
-                "Changes on this page apply at once. Copy a line into your client; Arro \
-                 only copies it.",
-                theme,
-            ),
-            heading("Use Arro from another program", theme),
+            note("Changes on this page apply at once.", theme),
+            heading("Enable MCP Server", theme),
+            self.mcp_enable_row(theme, cx),
         ];
-        for (id, title, text) in rows {
-            let selector = format!("settings-mcp-copy-{id}");
-            let button = icon_button(
-                SharedString::from(selector.clone()),
-                "general/copy",
-                format!("Copy for {title}"),
+        if self.mcp_confirm_enable {
+            content.push(self.mcp_enable_question(theme, cx));
+        }
+        content.push(heading("Clients Auto-Configuration", theme));
+        content.extend(self.mcp_client_rows(false, theme, cx));
+        content.push(heading("Project Clients Auto-Configuration", theme));
+        content.extend(self.mcp_client_rows(true, theme, cx));
+        content.push(heading("Manual Client Configuration", theme));
+        content.extend(self.mcp_manual_rows(settings, theme, cx));
+        content.push(heading("Command execution", theme));
+        content.push(self.mcp_permission_row(settings, theme, cx));
+        content.push(heading("Terminal Sessions", theme));
+        content.push(self.mcp_terminal_row(settings, theme, cx));
+        content.push(heading("Exposed Tools", theme));
+        content.push(self.mcp_router_row(settings, theme, cx));
+        content.extend(self.mcp_tool_rows(settings, theme, cx));
+        if let Some(error) = &self.mcp_error {
+            content.push(note_owned(error.clone(), theme));
+        }
+        content
+    }
+
+    fn mcp_enable_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let on = self.draft.mcp_enabled;
+        let toggle = pill(
+            "settings-mcp-enabled",
+            if on { "On" } else { "Off" },
+            on,
+            theme,
+        )
+        .debug_selector(|| "settings-mcp-enabled".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            if this.draft.mcp_enabled {
+                this.change(|settings| settings.mcp_enabled = false, cx);
+            } else {
+                this.mcp_confirm_enable = true;
+                this.search_editing = false;
+                cx.notify();
+            }
+        }));
+        row("Enable MCP Server", toggle, theme)
+    }
+
+    /// The question of IDEA before the server of the window opens to other programs.
+    fn mcp_enable_question(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let yes = dialog_button(
+            "settings-mcp-enable-yes",
+            "settings-mcp-enable-yes".to_owned(),
+            "Enable",
+            true,
+            true,
+            theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.change(|settings| settings.mcp_enabled = true, cx);
+            this.mcp_confirm_enable = false;
+            cx.notify();
+        }));
+        let no = dialog_button(
+            "settings-mcp-enable-no",
+            "settings-mcp-enable-no".to_owned(),
+            "Cancel",
+            false,
+            true,
+            theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.mcp_confirm_enable = false;
+            cx.notify();
+        }));
+        div().child(
+            div()
+                .id("settings-mcp-enable-confirm")
+                .debug_selector(|| "settings-mcp-enable-confirm".to_owned())
+                .flex()
+                .flex_col()
+                .gap(px(SPACE_S))
+                .p(px(SPACE_M))
+                .rounded(px(CONTROL_RADIUS))
+                .border_1()
+                .border_color(theme.accent)
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Enable the MCP server of this window?"),
+                )
+                .child(
+                    div()
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_secondary)
+                        .child(
+                            "Other programs on this computer will be able to call the tools of \
+                         Arro while the project is open.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(SPACE_M))
+                        .child(yes)
+                        .child(no),
+                ),
+        )
+    }
+
+    fn mcp_client_state(
+        &self,
+        client: mcp_discovery::Client,
+        project: bool,
+    ) -> Option<&mcp_discovery::ClientState> {
+        let rows = if project {
+            &self.mcp_project_clients
+        } else {
+            &self.mcp_clients
+        };
+        rows.iter().find(|state| state.client == client)
+    }
+
+    fn mcp_client_rows(
+        &mut self,
+        project: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Div> {
+        let mut rows = Vec::new();
+        for client in mcp_discovery::CLIENTS {
+            rows.extend(self.mcp_client_row(client, project, theme, cx));
+        }
+        rows
+    }
+
+    /// One client of the page: its state, Auto-Configure when the client is on this
+    /// machine, and the menu of the transports under the chevron.
+    fn mcp_client_row(
+        &mut self,
+        client: mcp_discovery::Client,
+        project: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Div> {
+        let state = self.mcp_client_state(client, project).cloned();
+        let status = match &state {
+            None => "Reading...",
+            Some(state) => match state.status {
+                mcp_discovery::Status::Missing => "Not detected",
+                mcp_discovery::Status::Damaged => "Damaged settings file",
+                mcp_discovery::Status::Found if state.configured => "Configured",
+                mcp_discovery::Status::Found => "Not configured",
+            },
+        };
+        let found = state
+            .as_ref()
+            .is_some_and(|state| state.status == mcp_discovery::Status::Found);
+        let prefix = if project {
+            "settings-mcp-project-client"
+        } else {
+            "settings-mcp-client"
+        };
+        let id = client.id();
+        let open = self.mcp_open_client == Some((client, project));
+
+        let mut controls = div().flex().items_center().gap(px(SPACE_S)).flex_none();
+        if found {
+            controls = controls.child(
+                pill(format!("{prefix}-{id}-auto"), "Auto-Configure", true, theme)
+                    .debug_selector(move || format!("{prefix}-{id}-auto"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let transport = this.mcp_transport;
+                        this.configure_mcp_client(client, project, transport, cx);
+                    })),
+            );
+        }
+        let chevron = if open {
+            "general/chevronDown"
+        } else {
+            "general/chevronRight"
+        };
+        controls = controls.child(
+            icon_button(
+                SharedString::from(format!("{prefix}-{id}-menu")),
+                chevron,
+                "Transports, settings file and config",
                 None,
                 theme,
             )
-            .debug_selector(move || selector.clone());
-            let copied = text.clone();
-            let button = button.on_click(cx.listener(move |_, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
-            }));
-            let line = div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(TEXT_SMALL))
-                .text_color(theme.text)
-                .children(text.lines().map(|part| div().child(part.to_owned())))
-                .debug_selector(move || format!("settings-mcp-line-{id}"));
-            content.push(
+            .debug_selector(move || format!("{prefix}-{id}-menu"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.mcp_open_client = if open { None } else { Some((client, project)) };
+                this.search_editing = false;
+                cx.notify();
+            })),
+        );
+
+        let row = div()
+            .debug_selector(move || format!("{prefix}-{id}"))
+            .flex()
+            .items_center()
+            .gap(px(SPACE_M))
+            .min_h(px(30.))
+            .px(px(ROW_PADDING_X))
+            .child(div().w(px(160.)).flex_none().child(client.title()))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(if state.as_ref().is_some_and(|state| state.configured) {
+                        theme.text
+                    } else {
+                        theme.text_secondary
+                    })
+                    .child(status),
+            )
+            .child(controls);
+
+        let mut rows = vec![row];
+        if open {
+            rows.push(self.mcp_client_menu(client, project, prefix, id, theme, cx));
+        }
+        rows
+    }
+
+    fn mcp_client_menu(
+        &mut self,
+        client: mcp_discovery::Client,
+        project: bool,
+        prefix: &'static str,
+        id: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut menu = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(SPACE_S))
+            .px(px(ROW_PADDING_X + SPACE_L))
+            .py(px(SPACE_XS));
+        for transport in [
+            mcp_discovery::Transport::HttpStream,
+            mcp_discovery::Transport::Stdio,
+            mcp_discovery::Transport::Sse,
+        ] {
+            let kind = transport_id(transport);
+            let chosen = self.mcp_transport == transport;
+            menu = menu.child(
+                pill(
+                    format!("{prefix}-{id}-{kind}"),
+                    transport.title(),
+                    chosen,
+                    theme,
+                )
+                .debug_selector(move || format!("{prefix}-{id}-{kind}"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.mcp_transport = transport;
+                    this.configure_mcp_client(client, project, transport, cx);
+                })),
+            );
+        }
+        let open_selector = format!("{prefix}-{id}-open");
+        menu = menu.child(
+            dialog_button(
+                open_selector.clone(),
+                open_selector.clone(),
+                "Open Client Settings File",
+                false,
+                true,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_mcp_client_file(client, project, window, cx);
+            })),
+        );
+        let copy_selector = format!("{prefix}-{id}-copy");
+        menu = menu.child(
+            dialog_button(
+                copy_selector.clone(),
+                copy_selector.clone(),
+                "Copy Config",
+                false,
+                true,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let transport = this.mcp_transport;
+                this.copy_mcp_client(client, transport, cx);
+            })),
+        );
+        let remove_selector = format!("{prefix}-{id}-remove");
+        menu.child(
+            dialog_button(
+                remove_selector.clone(),
+                remove_selector.clone(),
+                "Remove",
+                false,
+                true,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.remove_mcp_client(client, project, cx);
+            })),
+        )
+    }
+
+    fn mcp_manual_rows(
+        &mut self,
+        settings: &Settings,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Div> {
+        let endpoint = mcp_endpoint(cx);
+        let mut rows = Vec::new();
+        for (transport, selector, title) in [
+            (
+                mcp_discovery::Transport::HttpStream,
+                "settings-mcp-copy-http",
+                "Copy HTTP Stream Config",
+            ),
+            (
+                mcp_discovery::Transport::Stdio,
+                "settings-mcp-copy-stdio",
+                "Copy Stdio Config",
+            ),
+            (
+                mcp_discovery::Transport::Sse,
+                "settings-mcp-copy-sse",
+                "Copy SSE Config",
+            ),
+        ] {
+            let available = transport == mcp_discovery::Transport::Stdio || endpoint.is_some();
+            let url = endpoint.as_ref().map(|(url, _)| mcp_url(transport, url));
+            let token = endpoint.as_ref().map(|(_, token)| token.clone());
+            let config =
+                settings_catalog::mcp_config(settings, transport, url.as_deref(), token.as_deref());
+            let button = dialog_button(
+                selector,
+                selector.to_owned(),
+                title,
+                false,
+                available,
+                theme,
+            );
+            let button = if available {
+                button.on_click(cx.listener(move |_, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(config.clone()));
+                }))
+            } else {
+                button
+            };
+            rows.push(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(SPACE_M))
                     .px(px(ROW_PADDING_X))
-                    .py(px(SPACE_XS))
-                    .child(div().w(px(150.)).flex_none().child(title))
-                    .child(line)
-                    .child(button),
+                    .child(button)
+                    .when(!available, |this| {
+                        this.child(note("Enable MCP Server first", theme))
+                    }),
             );
         }
-        content
+        rows.push(self.mcp_binary_row(theme, cx));
+        rows
+    }
+
+    fn mcp_binary_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let id = "mcp_binary";
+        let current = self.draft.mcp_binary.clone();
+        let active = self.editing == Some(id);
+        let start = current.clone();
+        let typed;
+        let value = if active {
+            &self.text_field
+        } else {
+            typed = TextField::from_text(current);
+            &typed
+        };
+        let input = field(id, value, "Next to Arro", active, theme)
+            .debug_selector(|| "settings-mcp-binary".to_owned())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.editing = Some(id);
+                this.search_editing = false;
+                this.text_field = TextField::from_text(start.clone());
+                cx.notify();
+            }));
+        row("Path to arro-mcp", input, theme)
+    }
+
+    fn mcp_permission_row(
+        &self,
+        settings: &Settings,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let label = settings.mcp_execute_permission.label();
+        let choice = pill("settings-mcp-brave-mode", label, true, theme)
+            .debug_selector(|| "settings-mcp-brave-mode".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.change(
+                    |settings| {
+                        settings.mcp_execute_permission = settings.mcp_execute_permission.next();
+                    },
+                    cx,
+                )
+            }));
+        row(
+            "Run shell commands or run configurations without confirmation (brave mode)",
+            choice,
+            theme,
+        )
+    }
+
+    fn mcp_terminal_row(&self, settings: &Settings, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let on = settings.mcp_terminal_suggestions;
+        let toggle = pill(
+            "settings-mcp-terminal",
+            if on { "On" } else { "Off" },
+            on,
+            theme,
+        )
+        .debug_selector(|| "settings-mcp-terminal".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.change(
+                |settings| {
+                    settings.mcp_terminal_suggestions = !settings.mcp_terminal_suggestions;
+                },
+                cx,
+            )
+        }));
+        row(
+            "Show setup suggestions for Codex and Claude terminal sessions",
+            toggle,
+            theme,
+        )
+    }
+
+    fn mcp_router_row(&self, settings: &Settings, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let on = settings.mcp_router_only_mode;
+        let toggle = pill(
+            "settings-mcp-router-only",
+            if on { "On" } else { "Off" },
+            on,
+            theme,
+        )
+        .debug_selector(|| "settings-mcp-router-only".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.change(
+                |settings| settings.mcp_router_only_mode = !settings.mcp_router_only_mode,
+                cx,
+            )
+        }));
+        let scope = pill(
+            "settings-mcp-router-scope",
+            settings.mcp_router_only_scope.label(),
+            true,
+            theme,
+        )
+        .debug_selector(|| "settings-mcp-router-scope".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.change(
+                |settings| settings.mcp_router_only_scope = settings.mcp_router_only_scope.next(),
+                cx,
+            )
+        }));
+        div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_M))
+            .min_h(px(30.))
+            .px(px(ROW_PADDING_X))
+            .child(div().flex_1().child("Enable router-only mode"))
+            .child(scope)
+            .child(toggle)
+    }
+
+    fn mcp_tool_rows(
+        &mut self,
+        settings: &Settings,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Div> {
+        let mut rows = vec![
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_M))
+                .px(px(ROW_PADDING_X))
+                .pb(px(SPACE_XS))
+                .text_size(px(TEXT_SMALL))
+                .text_color(theme.text_secondary)
+                .child(div().flex_1().child("Tool"))
+                .child(div().w(px(80.)).child("Enabled"))
+                .child(div().w(px(90.)).child("Router-only")),
+        ];
+        for group in tool_gateway::TOOL_GROUPS {
+            rows.push(heading(group, theme));
+            for spec in tool_gateway::all_tools()
+                .iter()
+                .filter(|spec| tool_gateway::group_of(spec.name) == group)
+            {
+                let choice = tool_choice(settings, spec.name);
+                let name = spec.name;
+                let enabled = pill(
+                    format!("settings-mcp-tool-{name}-enabled"),
+                    "Enabled",
+                    choice.enabled,
+                    theme,
+                )
+                .debug_selector(move || format!("settings-mcp-tool-{name}-enabled"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change(
+                        move |settings| {
+                            let entry = tool_choice_entry(settings, name);
+                            entry.enabled = !entry.enabled;
+                        },
+                        cx,
+                    )
+                }));
+                let router = pill(
+                    format!("settings-mcp-tool-{name}-router"),
+                    "Router-only",
+                    choice.router_only,
+                    theme,
+                )
+                .debug_selector(move || format!("settings-mcp-tool-{name}-router"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change(
+                        move |settings| {
+                            let entry = tool_choice_entry(settings, name);
+                            entry.router_only = !entry.router_only;
+                        },
+                        cx,
+                    )
+                }));
+                rows.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_M))
+                        .min_h(px(28.))
+                        .px(px(ROW_PADDING_X))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(name)
+                                .child(
+                                    div()
+                                        .text_size(px(TEXT_SMALL))
+                                        .text_color(theme.text_secondary)
+                                        .child(spec.description.lines().next().unwrap_or_default()),
+                                ),
+                        )
+                        .child(div().w(px(80.)).child(enabled))
+                        .child(div().w(px(90.)).child(router)),
+                );
+            }
+        }
+        rows
+    }
+
+    /// Reads the clients of the machine off the UI thread. A test names its own home
+    /// folder, so the profile of the user is not touched.
+    fn load_mcp_clients(&mut self, cx: &mut Context<Self>) {
+        self.mcp_clients_loads += 1;
+        let generation = self.mcp_clients_loads;
+        let home = self.mcp_home.clone();
+        let project = self.inspection_root.clone();
+        let read = cx.background_executor().spawn(async move {
+            let mut user = Vec::new();
+            let mut in_project = Vec::new();
+            for client in mcp_discovery::CLIENTS {
+                user.push(mcp_discovery::state(
+                    client,
+                    mcp_discovery::Scope::User,
+                    &home,
+                    &project,
+                ));
+                in_project.push(mcp_discovery::state(
+                    client,
+                    mcp_discovery::Scope::Project,
+                    &home,
+                    &project,
+                ));
+            }
+            (user, in_project)
+        });
+        cx.spawn(async move |this, cx| {
+            let (user, project) = read.await;
+            this.update(cx, |view, cx| {
+                if view.mcp_clients_loads == generation {
+                    view.mcp_clients = user;
+                    view.mcp_project_clients = project;
+                    view.mcp_clients_loaded = generation;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn configure_mcp_client(
+        &mut self,
+        client: mcp_discovery::Client,
+        project: bool,
+        transport: mcp_discovery::Transport,
+        cx: &mut Context<Self>,
+    ) {
+        let home = self.mcp_home.clone();
+        let root = self.inspection_root.clone();
+        let (url, token) = match mcp_endpoint(cx) {
+            Some((url, token)) => (Some(mcp_url(transport, &url)), Some(token)),
+            None => (None, None),
+        };
+        let server = mcp_discovery::Server {
+            command: settings_catalog::mcp_binary(&self.draft),
+            url,
+            token,
+        };
+        let scope = if project {
+            mcp_discovery::Scope::Project
+        } else {
+            mcp_discovery::Scope::User
+        };
+        let write = cx.background_executor().spawn(async move {
+            mcp_discovery::configure(client, scope, transport, &server, &home, &root)
+        });
+        cx.spawn(async move |this, cx| {
+            let written = write.await;
+            this.update(cx, |view, cx| {
+                view.mcp_error = written.err().map(|error| error.to_string());
+                view.load_mcp_clients(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remove_mcp_client(
+        &mut self,
+        client: mcp_discovery::Client,
+        project: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let home = self.mcp_home.clone();
+        let root = self.inspection_root.clone();
+        let scope = if project {
+            mcp_discovery::Scope::Project
+        } else {
+            mcp_discovery::Scope::User
+        };
+        let removed = cx
+            .background_executor()
+            .spawn(async move { mcp_discovery::remove(client, scope, &home, &root) });
+        cx.spawn(async move |this, cx| {
+            let removed = removed.await;
+            this.update(cx, |view, cx| {
+                view.mcp_error = removed.err().map(|error| error.to_string());
+                view.load_mcp_clients(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_mcp_client_file(
+        &mut self,
+        client: mcp_discovery::Client,
+        project: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = if project {
+            client.project_config(&self.inspection_root)
+        } else {
+            client.user_config(&self.mcp_home)
+        };
+        let created = path.clone();
+        let write = cx.background_executor().spawn(async move {
+            if let Some(parent) = created.parent() {
+                std::fs::create_dir_all(parent).ok()?;
+            }
+            if !created.is_file() {
+                let text = if client.is_toml() {
+                    ""
+                } else {
+                    "{}
+"
+                };
+                std::fs::write(&created, text).ok()?;
+            }
+            Some(created)
+        });
+        let workspace = self.workspace.clone();
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let file = write.await;
+            if let Some(path) = file {
+                handle
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.open_file(path, window, cx);
+                            })
+                            .ok();
+                    })
+                    .ok();
+            } else {
+                this.update(cx, |view, cx| {
+                    view.mcp_error =
+                        Some("the settings file of the client did not open".to_owned());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn copy_mcp_client(
+        &self,
+        client: mcp_discovery::Client,
+        transport: mcp_discovery::Transport,
+        cx: &mut Context<Self>,
+    ) {
+        let (url, token) = match mcp_endpoint(cx) {
+            Some((url, token)) => (Some(mcp_url(transport, &url)), Some(token)),
+            None => (None, None),
+        };
+        let server = mcp_discovery::Server {
+            command: settings_catalog::mcp_binary(&self.draft),
+            url,
+            token,
+        };
+        let text = mcp_discovery::snippet(client, transport, &server)
+            .unwrap_or_else(|error| error.to_string());
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+}
+
+/// The switch of one row of the Exposed Tools table, as the settings have it.
+fn tool_choice(settings: &Settings, name: &str) -> McpToolChoice {
+    settings
+        .mcp_tool_settings
+        .get(name)
+        .copied()
+        .unwrap_or_else(|| {
+            let state = tool_gateway::default_state(name);
+            McpToolChoice {
+                enabled: state.enabled,
+                router_only: state.router_only,
+            }
+        })
+}
+
+/// The row of a tool, made when the user first changes it.
+fn tool_choice_entry<'a>(settings: &'a mut Settings, name: &'static str) -> &'a mut McpToolChoice {
+    let state = tool_gateway::default_state(name);
+    settings
+        .mcp_tool_settings
+        .entry(name.to_string())
+        .or_insert(McpToolChoice {
+            enabled: state.enabled,
+            router_only: state.router_only,
+        })
+}
+
+/// The address of the endpoint of one transport: the SSE event stream sits next to the
+/// Streamable HTTP endpoint of the same window.
+fn mcp_url(transport: mcp_discovery::Transport, url: &str) -> String {
+    if transport == mcp_discovery::Transport::Sse {
+        return url
+            .strip_suffix("/mcp")
+            .map_or_else(|| format!("{url}/sse"), |base| format!("{base}/sse"));
+    }
+    url.to_owned()
+}
+
+/// The part of the selector of a transport.
+fn transport_id(transport: mcp_discovery::Transport) -> &'static str {
+    match transport {
+        mcp_discovery::Transport::HttpStream => "http",
+        mcp_discovery::Transport::Stdio => "stdio",
+        mcp_discovery::Transport::Sse => "sse",
     }
 }
 
@@ -1816,6 +2653,14 @@ fn colour_strip(color: Hsla) -> Div {
 
 /// A line that says a control of the page does not wait for Apply.
 fn note(text: &'static str, theme: &Theme) -> Div {
+    div()
+        .text_size(px(TEXT_SMALL))
+        .text_color(theme.text_secondary)
+        .child(text)
+}
+
+/// [`note`] for a text that comes from the page rather than from a literal.
+fn note_owned(text: String, theme: &Theme) -> Div {
     div()
         .text_size(px(TEXT_SMALL))
         .text_color(theme.text_secondary)
@@ -1875,6 +2720,9 @@ impl Render for SettingsView {
                         this.highlight = None;
                         this.editing = None;
                         this.search_editing = false;
+                        if this.page == SettingsPage::Mcp && this.mcp_clients_loaded == 0 {
+                            this.load_mcp_clients(cx);
+                        }
                         cx.notify();
                     }))
                     .child(page.title())
@@ -1966,6 +2814,20 @@ impl Render for SettingsView {
                     if entry.field == SettingField::IconSet {
                         // The Icons section above draws the choices as cards, as the
                         // themes are drawn: a click applies the set at once.
+                        continue;
+                    }
+                    if self.page == SettingsPage::Mcp
+                        && matches!(
+                            entry.field,
+                            SettingField::McpEnabled
+                                | SettingField::McpBinary
+                                | SettingField::McpExecutePermission
+                                | SettingField::McpRouterOnlyMode
+                                | SettingField::McpRouterOnlyScope
+                                | SettingField::McpTerminalSuggestions
+                        )
+                    {
+                        // The MCP page draws these itself, in the order of IDEA.
                         continue;
                     }
                     let section = settings_catalog::section_of(entry.id);

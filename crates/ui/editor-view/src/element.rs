@@ -66,6 +66,33 @@ fn snapped_size(size: f32, scale_factor: f32) -> f32 {
     (size * 0.6 * scale_factor).round() / 0.6 / scale_factor
 }
 
+/// The background of a blame label: the hue of the commit holds its lines together, and
+/// an older commit is paler. The line of the commit under the pointer takes the stronger
+/// shade.
+fn annotation_tint(commit: &str, time: i64, now: i64, dark: bool, hovered: bool) -> Hsla {
+    let mut hash: u64 = 14_695_981_039_346_656_037;
+    for byte in commit.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    let hue = (hash % 360) as f32 / 360.;
+    let age_days = (now - time).max(0) as f32 / 86_400.;
+    let freshness = (1. - (age_days / 365.).min(1.)).clamp(0.2, 1.);
+    Hsla {
+        h: hue,
+        s: 0.55,
+        l: if dark { 0.5 } else { 0.6 },
+        a: if hovered { 0.24 } else { 0.12 * freshness },
+    }
+}
+
+/// The time of this frame, in seconds since 1970, for the age of a commit.
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
 pub(crate) struct LaidOutRow {
     pub row: usize,
     pub(crate) buffer_line: usize,
@@ -89,8 +116,10 @@ pub(crate) struct LaidOutRow {
     action: Option<(SharedString, Hsla)>,
     /// A bookmark without a name takes the place of the line number.
     bookmark: bool,
-    /// The label of the blame column on this row, on the first line of a run of a commit.
+    /// The label of the blame column on this row.
     annotation: Option<ShapedLine>,
+    /// The commit of the label and its time, for the colour and the age of the row.
+    annotation_commit: Option<(String, i64)>,
     current: bool,
     indent: usize,
     /// The row is a block above the text and holds no line of the buffer.
@@ -790,7 +819,31 @@ impl Element for EditorElement {
             .width();
         let line_height = style.line_height;
 
-        let annotate = self.view.read(cx).annotation_width();
+        let (annotate, annotation_chars) = {
+            let view = self.view.read(cx);
+            let chars = view
+                .state
+                .as_ref()
+                .map_or(0, |state| state.annotation_max_chars());
+            let room = if view.has_annotations() {
+                if chars == view.annotation_chars {
+                    view.annotation_room
+                } else if chars == 0 {
+                    ANNOTATE_INSET * 2. + 8.
+                } else {
+                    let zeros = "0".repeat(chars);
+                    let runs = [run(zeros.len(), &code_font, style.line_number, false)];
+                    f32::from(
+                        text_system
+                            .shape_line(zeros.into(), px(NUMBER_SIZE), &runs, None)
+                            .width(),
+                    ) + ANNOTATE_INSET * 2.
+                }
+            } else {
+                0.
+            };
+            (room, chars)
+        };
         // The column of the numbers follows the count of them: a file that crosses 999,
         // 9999 or 99999 lines grows it and a shorter one gives it back. The width of a
         // digit comes from the font of the numbers, not from a guess.
@@ -839,6 +892,10 @@ impl Element for EditorElement {
             view.viewport = bounds.size;
             view.center_inset = center;
             view.gutter_width = gutter_width(f32::from(number_width));
+            if view.has_annotations() && view.annotation_chars != annotation_chars {
+                view.annotation_chars = annotation_chars;
+                view.annotation_room = annotate;
+            }
             if let Some(state) = &mut view.state
                 && state.wrap() != wrap
             {
@@ -1208,25 +1265,30 @@ impl Element for EditorElement {
                     .then(|| view.rendered_doc_at_line(buffer_line))
                     .flatten();
                 let doc_range = display.doc_range(row);
-                let annotation = if annotate > 0. && !block && doc_row.is_none() && !continuation {
-                    state.annotation_label_at(buffer_line).map(|note| {
-                        let runs = [crate::element::run(
-                            note.label.len(),
-                            &code_font,
-                            style.line_number,
-                            false,
-                        )];
-                        let used = if note.label.is_empty() { 0 } else { 1 };
-                        text_system.shape_line(
-                            note.label.clone().into(),
-                            px(NUMBER_SIZE),
-                            &runs[..used],
-                            None,
-                        )
-                    })
-                } else {
-                    None
-                };
+                let annotation_note =
+                    if annotate > 0. && !block && doc_row.is_none() && !continuation {
+                        state.annotation_label_at(buffer_line)
+                    } else {
+                        None
+                    };
+                let annotation = annotation_note.map(|note| {
+                    let runs = [crate::element::run(
+                        note.label.len(),
+                        &code_font,
+                        style.line_number,
+                        false,
+                    )];
+                    let used = if note.label.is_empty() { 0 } else { 1 };
+                    text_system.shape_line(
+                        note.label.clone().into(),
+                        px(NUMBER_SIZE),
+                        &runs[..used],
+                        None,
+                    )
+                });
+                let annotation_commit = annotation_note
+                    .map(|note| (note.commit.clone(), note.time))
+                    .filter(|(commit, _)| !commit.is_empty());
                 // The values of the stopped frame stand after the line in grey italics,
                 // and in the accent colour when they changed since the previous stop.
                 let tail = if block || continuation || doc_row.is_some() {
@@ -1303,6 +1365,7 @@ impl Element for EditorElement {
                     action,
                     bookmark: !block && matches!(bookmark, Some(None)),
                     annotation,
+                    annotation_commit,
                     current,
                     indent,
                     is_block: block || doc_row.is_some(),
@@ -1877,6 +1940,8 @@ impl Element for EditorElement {
         );
         window.set_cursor_style(CursorStyle::IBeam, &prepaint.text_hitbox);
         let annotate = self.view.read(cx).annotation_width();
+        let annotate_hovered = self.view.read(cx).annotate_hovered.clone();
+        let annotation_now = now_seconds();
         let marks = self.view.read(cx).gutter_marks.clone();
         let agent_marks = self.view.read(cx).agent_marks.clone();
         let coverage = self.view.read(cx).coverage.clone();
@@ -1884,6 +1949,7 @@ impl Element for EditorElement {
         let muted_breakpoints = self.view.read(cx).muted_breakpoints.clone();
         let disabled_breakpoints = self.view.read(cx).disabled_breakpoints.clone();
         let temporary_breakpoints = self.view.read(cx).temporary_breakpoints.clone();
+        let agent_breakpoints = self.view.read(cx).agent_breakpoints.clone();
         let function_breakpoints = self.view.read(cx).function_breakpoints.clone();
         let field_watchpoints = self.view.read(cx).field_watchpoints.clone();
         let show_whitespace = self.view.read(cx).show_whitespace();
@@ -2081,13 +2147,18 @@ impl Element for EditorElement {
                             style.dark,
                             13.,
                         );
+                        let muted_color = if agent_breakpoints.contains(&line) {
+                            style.accent
+                        } else {
+                            style.error
+                        };
                         window
                             .paint_svg(
                                 mark,
                                 path,
                                 None,
                                 TransformationMatrix::unit(),
-                                style.error,
+                                muted_color,
                                 cx,
                             )
                             .ok();
@@ -2097,9 +2168,13 @@ impl Element for EditorElement {
                             size(px(9.), px(9.)),
                         );
                         // A breakpoint the window muted keeps its shape and loses its
-                        // colour, so the user sees where the program would have stopped.
+                        // colour, so the user sees where the program would have stopped;
+                        // a point an agent set wears the colour of the accent, so the
+                        // user sees which ones came from a tool.
                         let color = if disabled_breakpoints.contains(&line) {
                             style.line_number
+                        } else if agent_breakpoints.contains(&line) {
+                            style.accent
                         } else {
                             style.error
                         };
@@ -2261,6 +2336,13 @@ impl Element for EditorElement {
                             cx,
                         )
                         .ok();
+                }
+                if let Some((commit, time)) = &shown.annotation_commit {
+                    let hovered = annotate_hovered.as_deref() == Some(commit.as_str());
+                    window.paint_quad(fill(
+                        Bounds::new(point(gutter_right, shown.y), size(px(annotate), height)),
+                        annotation_tint(commit, *time, annotation_now, style.dark, hovered),
+                    ));
                 }
                 if let Some(label) = &shown.annotation {
                     label
