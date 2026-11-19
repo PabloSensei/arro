@@ -136,7 +136,7 @@ impl BuildOutputPanel {
     }
 
     /// The grey marks of the visible tree, next to the row that has them, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn hints(&self, cx: &App) -> Vec<(String, String)> {
         self.rows(cx)
             .into_iter()
@@ -145,13 +145,13 @@ impl BuildOutputPanel {
     }
 
     /// The problems of the last build the tree shows, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn problems(&self, cx: &App) -> Vec<BuildProblem> {
         self.run.read(cx).build_view().problems.clone()
     }
 
     /// Selects a line as a click does, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.rows(cx).len() {
             self.selected = Some(index);
@@ -159,17 +159,17 @@ impl BuildOutputPanel {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn only_errors(&self) -> bool {
         self.only_errors
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn restart_now(&mut self, cx: &mut Context<Self>) {
         self.run.update(cx, |run, cx| run.restart_build(cx));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn stop_now(&mut self, cx: &mut Context<Self>) {
         self.run.update(cx, |run, cx| run.stop_build(cx));
     }
