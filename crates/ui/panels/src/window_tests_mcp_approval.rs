@@ -94,8 +94,13 @@ fn an_answer_command_reaches_the_waiting_call(cx: &mut TestAppContext) {
         tool: "run_tests".to_string(),
     };
     let call = thread::spawn(move || waiting.ask_with(&request, "demo.Vitest"));
-    wait_for_signal(cx, "the question of the tool", |_| {
+    // The question reaches the window on its next turn, after the call is pending.
+    wait_for_signal(cx, "the question of the tool", |cx| {
         approvals.pending().is_some()
+            && window
+                .read_with(cx, |workspace, _| workspace.last_notification())
+                .unwrap()
+                .is_some()
     });
     draw(cx, window);
 
