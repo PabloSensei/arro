@@ -659,6 +659,9 @@ pub enum EditorEvent {
     },
     /// F6 on a member: the window shows the form that moves it into another type.
     MoveMembers(lang_api::DocumentSpot),
+    /// F6 on an instance method: the window shows the form that moves it to one of the
+    /// places around it.
+    MoveTargets(lang_api::DocumentSpot),
     /// Refactor This picked an action of the server that needs values: the window shows
     /// its form, and the handle names the action for the language.
     RefactorForm(String),

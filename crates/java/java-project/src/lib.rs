@@ -40,7 +40,10 @@ pub use gradle::{
     Gradle, GradleHome, GradleOrigin, MissingGradle, bundled_home as bundled_gradle, find_gradle,
     find_gradle_home, gradle_supports, wrapper_version,
 };
-pub use jdk::{Jdk, Requested, choose_jdk, feature_of, find_jdks, requested_jdk};
+pub use jdk::{
+    Family, Jdk, Places, Requested, choose_jdk, feature_of, find_jdks, home_in, homes_under,
+    requested_jdk, roots_for,
+};
 pub use level::set_language_level;
 pub use lombok::{
     LOMBOK_ARTIFACT, LOMBOK_GROUP, LocalRepositories, Lombok, LombokDependency, find_lombok,

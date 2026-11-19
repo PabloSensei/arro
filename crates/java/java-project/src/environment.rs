@@ -8,7 +8,7 @@ use base::Result;
 use project_model::{LanguageLevelInfo, RuntimeInfo, RuntimeReason};
 use serde::{Deserialize, Serialize};
 
-use crate::jdk::{Jdk, Requested, choose_jdk, feature_of, find_jdks, requested_jdk};
+use crate::jdk::{Family, Jdk, Requested, choose_jdk, feature_of, find_jdks, requested_jdk};
 use crate::pom::read_pom;
 
 /// The folder of the project that keeps the IDE's own files.
@@ -161,13 +161,19 @@ pub fn project_jdk(root: &Path) -> Result<Jdk> {
 }
 
 fn same_home(one: &Path, other: &Path) -> bool {
-    let canonical = |path: &Path| {
-        fs::canonicalize(path)
-            .unwrap_or_else(|_| path.to_owned())
-            .to_string_lossy()
-            .to_lowercase()
+    same_home_on(Family::current(), one, other)
+}
+
+/// Windows and macOS ignore the case of a path, the other systems keep it: two folders
+/// that differ in case only are two folders on Linux. `family` is a parameter, so a test
+/// checks every system on any machine.
+fn same_home_on(family: Family, one: &Path, other: &Path) -> bool {
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let key = |path: &Path| match family {
+        Family::Windows | Family::MacOs => PathBuf::from(path.to_string_lossy().to_lowercase()),
+        Family::Unix => path.to_path_buf(),
     };
-    canonical(one) == canonical(other)
+    key(&canonical(one)) == key(&canonical(other))
 }
 
 /// What the SDKs page shows for one SDK.
@@ -485,5 +491,16 @@ mod tests {
         let root = scratch("no-level");
 
         assert!(language_level(&root).is_none());
+    }
+
+    #[test]
+    fn only_windows_and_mac_ignore_the_case_of_a_folder() {
+        let one = Path::new("/jdks/Temurin");
+        let other = Path::new("/jdks/temurin");
+
+        assert!(!same_home_on(Family::Unix, one, other));
+        assert!(same_home_on(Family::Windows, one, other));
+        assert!(same_home_on(Family::MacOs, one, other));
+        assert!(same_home_on(Family::Unix, one, one));
     }
 }

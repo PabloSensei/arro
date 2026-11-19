@@ -582,6 +582,36 @@ public class StaticUser {
 }
 "#;
 
+const INSTANCE_MOVER: &str = r#"package probe;
+
+public class InstanceMover {
+
+    public String describe(InstanceTarget target, String text) {
+        return target.label(text);
+    }
+}
+"#;
+
+const INSTANCE_TARGET: &str = r#"package probe;
+
+public class InstanceTarget {
+
+    public String label(String text) {
+        return "target:" + text;
+    }
+}
+"#;
+
+const INSTANCE_USER: &str = r#"package probe;
+
+public class InstanceUser {
+
+    public String use(InstanceMover mover, InstanceTarget target) {
+        return mover.describe(target, "x");
+    }
+}
+"#;
+
 fn uri_of(path: &Path) -> String {
     file_uri(&CanonPath::new(path).unwrap())
         .unwrap()
@@ -1293,10 +1323,11 @@ async fn move_members_moves_a_static_method_between_two_classes() {
         lang_api::MovePlace::Member
     );
     let instance = mover.text.find("instance").unwrap();
-    assert!(matches!(
+    assert_eq!(
         project.move_place(&mover.text, instance),
-        lang_api::MovePlace::Unmovable(_)
-    ));
+        lang_api::MovePlace::InstanceMethod,
+        "F6 on an instance method asks for the places around it"
+    );
     let form = first(ask(
         project.move_members_form().unwrap(),
         lang_api::MoveMembersQuery {
@@ -1366,6 +1397,120 @@ async fn move_members_moves_a_static_method_between_two_classes() {
     assert!(
         user.text.contains("StaticTarget.greet"),
         "the call follows the method: {}",
+        user.text
+    );
+    wait_error(&project, &mover.uri, false).await;
+    wait_error(&project, &target.uri, false).await;
+    wait_error(&project, &user.uri, false).await;
+
+    project.stop().await;
+    let _ = fs::remove_file(&mover_path);
+    let _ = fs::remove_file(&target_path);
+    let _ = fs::remove_file(&user_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "runs jdtls on a corpus project"]
+async fn move_targets_moves_an_instance_method_to_a_parameter() {
+    let Fixture { probe, config } = fixture("petclinic", ".", &["build.gradle", "settings.gradle"]);
+    let mover_path = probe.with_file_name("InstanceMover.java");
+    let target_path = probe.with_file_name("InstanceTarget.java");
+    let user_path = probe.with_file_name("InstanceUser.java");
+    fs::write(&mover_path, INSTANCE_MOVER).unwrap();
+    fs::write(&target_path, INSTANCE_TARGET).unwrap();
+    fs::write(&user_path, INSTANCE_USER).unwrap();
+    let project = JavaProject::open(config, Trust::Trusted).unwrap();
+    let mut status = project.status();
+    until(&mut status, |status| status.state == State::Ready).await;
+    let server = project.server().unwrap();
+    let mut mover = Open {
+        project: &project,
+        uri: uri_of(&mover_path),
+        text: INSTANCE_MOVER.to_owned(),
+        version: 1,
+    };
+    let mut target = Open {
+        project: &project,
+        uri: uri_of(&target_path),
+        text: INSTANCE_TARGET.to_owned(),
+        version: 1,
+    };
+    let mut user = Open {
+        project: &project,
+        uri: uri_of(&user_path),
+        text: INSTANCE_USER.to_owned(),
+        version: 1,
+    };
+    server.open(&mover.uri, 1, mover.text.as_str().into());
+    server.open(&target.uri, 1, target.text.as_str().into());
+    server.open(&user.uri, 1, user.text.as_str().into());
+    wait_error(&project, &mover.uri, false).await;
+    wait_error(&project, &target.uri, false).await;
+    wait_error(&project, &user.uri, false).await;
+
+    // F6 on an instance method asks for the places around it, and the parameter of the
+    // project type is one of them.
+    let describe = mover.text.find("describe").unwrap();
+    assert_eq!(
+        project.move_place(&mover.text, describe),
+        lang_api::MovePlace::InstanceMethod
+    );
+    let form = first(ask(
+        project.move_targets_form().unwrap(),
+        lang_api::MoveTargetsQuery {
+            spot: mover.spot("describe", 0),
+            kind: MoveKind::InstanceMethod,
+        },
+    ))
+    .await
+    .expect("the form arrives")
+    .expect("the form has the places");
+    assert!(form.title.contains("describe"), "{}", form.title);
+    let destination = form
+        .targets
+        .iter()
+        .find(|target| target.name == "target")
+        .expect("the parameter of the project type is a place")
+        .clone();
+    assert_eq!(destination.detail.as_deref(), Some("InstanceTarget"));
+
+    let outcome = first(ask(
+        project.move_file().unwrap(),
+        MoveRequest {
+            spot: mover.spot("describe", 0),
+            kind: MoveKind::InstanceMethod,
+            destination,
+            update_references: true,
+        },
+    ))
+    .await
+    .expect("the edits arrive");
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let changed = |path: &Path| {
+        outcome
+            .change
+            .edits
+            .iter()
+            .any(|source| source.uri == uri_of(path) && !source.edits.is_empty())
+    };
+    assert!(changed(&mover_path), "{outcome:?}");
+    assert!(changed(&target_path), "{outcome:?}");
+    assert!(changed(&user_path), "{outcome:?}");
+
+    apply_change(&mut [&mut mover, &mut target, &mut user], &outcome.change);
+    assert!(
+        !mover.text.contains("String describe"),
+        "the method left its type: {}",
+        mover.text
+    );
+    assert!(
+        target.text.contains("describe("),
+        "the target type took the method: {}",
+        target.text
+    );
+    assert!(
+        user.text.contains("target.describe("),
+        "the call follows the method to its new receiver: {}",
         user.text
     );
     wait_error(&project, &mover.uri, false).await;

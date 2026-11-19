@@ -221,6 +221,19 @@ impl Gradle {
             None => self.tool_jdk(root, &gradle)?,
         };
         let timeout = daemon_idle_timeout(root);
+        // A wrapper that came without the execute bit, from an archive made on Windows or
+        // from a copy, is made runnable here and the output of the build says so. The client
+        // of a wrapper starts from its jar, so a script whose bits cannot be changed only
+        // brings a line; a program the build starts itself has to be runnable.
+        let note = match gradle.origin {
+            GradleOrigin::Wrapper => match crate::wrapper::prepare(&gradle.program) {
+                Ok(note) => note,
+                Err(error) => Some(format!(
+                    "{error}; Gradle starts from the wrapper jar without the script"
+                )),
+            },
+            _ => crate::wrapper::prepare(&gradle.program)?,
+        };
         let spec = match gradle.origin {
             GradleOrigin::Wrapper => {
                 let wrapper = root.join(WRAPPER_JAR);
@@ -249,6 +262,9 @@ impl Gradle {
             .class(ProcessClass::Client)
             .args(COMMON_ARGS)
             .label("Build tool");
+        if let Some(note) = note {
+            spec = spec.note(note);
+        }
         if settings.offline {
             spec = spec.arg("--offline");
         }

@@ -8,11 +8,12 @@ use crate::{
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
     GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
     MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider, NavigationProvider,
-    OverridableMethodsProvider, PrepareDiagnosticsProvider, ProjectProblemsProvider,
-    RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
-    SemanticServer, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
-    TypeHierarchyProvider, WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
+    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
+    MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
+    PrepareDiagnosticsProvider, ProjectProblemsProvider, RangeFormatProvider,
+    ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer, SignatureProvider,
+    SourceTextProvider, SymbolProvider, SyntaxProvider, TypeHierarchyProvider,
+    WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use crate::{
     ExpectedTypeProvider, ExternalDocProvider, LibraryClassProvider, SignatureInfoProvider,
@@ -241,6 +242,12 @@ pub trait LanguageSupport: Send + Sync {
     /// F6 on a member: the members its type gives away and the types of the project
     /// that can take them.
     fn move_members_form(&self) -> Option<&MoveMembersFormProvider> {
+        None
+    }
+
+    /// F6 on a symbol whose new receiver is one of the places around it: the form with
+    /// the places the language offers.
+    fn move_targets_form(&self) -> Option<&MoveTargetsFormProvider> {
         None
     }
 

@@ -2,6 +2,7 @@
 //! caret. Expanding a row asks the language for the next level; the window shows the
 //! root at once and never waits on the server.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ::base::Cancel;
@@ -11,6 +12,7 @@ use lang_api::{
     Confidence, DocumentSpot, HierarchyDirection, LanguageSupport, TypeHierarchyItem,
     TypeHierarchyQuery, TypeKind, ask,
 };
+use project_model::TEST_UNIT;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -35,6 +37,44 @@ pub enum HierarchyView {
     Supertypes,
     /// The selected type and the types that extend or implement it.
     Subtypes,
+}
+
+/// Which folders of the project the window shows types from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HierarchyScope {
+    /// Every type, wherever it lives.
+    All,
+    /// The types of the source folders, without the tests.
+    Production,
+    /// The types of the test folders only.
+    Test,
+}
+
+impl HierarchyScope {
+    fn title(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Production => "Production",
+            Self::Test => "Test",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::All => "Show types of the whole project",
+            Self::Production => "Show types of the source folders",
+            Self::Test => "Show types of the test folders",
+        }
+    }
+}
+
+/// The folders that make a type a source type or a test type, from the project model.
+/// The folders are compared as [`platform::path_key`] does, so the case and the
+/// separators of a model path and a server URI do not matter.
+#[derive(Clone, Debug, Default)]
+struct ScopeRoots {
+    source: Vec<PathBuf>,
+    test: Vec<PathBuf>,
 }
 
 struct Node {
@@ -71,6 +111,9 @@ pub struct TypeHierarchyPanel {
     support: Option<Arc<dyn LanguageSupport>>,
     spot: Option<DocumentSpot>,
     view: HierarchyView,
+    /// The folders the scope filters the rows by, from the model of the project.
+    scope: HierarchyScope,
+    scope_roots: ScopeRoots,
     nodes: Vec<Node>,
     roots: Vec<usize>,
     selected: Option<usize>,
@@ -97,6 +140,8 @@ impl TypeHierarchyPanel {
             support: None,
             spot: None,
             view: HierarchyView::Type,
+            scope: HierarchyScope::All,
+            scope_roots: ScopeRoots::default(),
             nodes: Vec::new(),
             roots: Vec::new(),
             selected: None,
@@ -117,6 +162,12 @@ impl TypeHierarchyPanel {
         self.view
     }
 
+    /// The scope the header has picked.
+    #[allow(dead_code)]
+    pub fn scope(&self) -> HierarchyScope {
+        self.scope
+    }
+
     /// Ctrl+H: the hierarchy of the type at `spot`, in the Type view.
     pub fn start(&mut self, spot: DocumentSpot, cx: &mut Context<Self>) {
         self.support = cx
@@ -125,6 +176,7 @@ impl TypeHierarchyPanel {
         if self.support.is_none() {
             return;
         }
+        self.refresh_scope_roots(cx);
         self.spot = Some(spot);
         self.view = HierarchyView::Type;
         self.load(cx);
@@ -137,6 +189,56 @@ impl TypeHierarchyPanel {
         }
         self.view = view;
         self.load(cx);
+    }
+
+    /// A button of the header: which folders of the project the rows come from. The
+    /// filter works over the rows that are already here, without a new request.
+    pub fn set_scope(&mut self, scope: HierarchyScope, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        self.refresh_scope_roots(cx);
+        if self
+            .selected
+            .is_some_and(|selected| !self.visible().iter().any(|(index, _)| *index == selected))
+        {
+            self.selected = self.visible().first().map(|(index, _)| *index);
+        }
+        cx.notify();
+    }
+
+    /// Reads the source and test folders of the project from the model of the window.
+    /// Without a model the scope keeps every type, as no folder is known to be a test one.
+    fn refresh_scope_roots(&mut self, cx: &App) {
+        let model = cx
+            .try_global::<crate::script::ActiveRunPanel>()
+            .map(|active| active.0.clone())
+            .and_then(|runs| runs.read(cx).model());
+        let Some(model) = model else {
+            self.scope_roots = ScopeRoots::default();
+            return;
+        };
+        let mut roots = ScopeRoots::default();
+        for module in &model.modules {
+            for unit in &module.units {
+                let roots = if unit.name == TEST_UNIT {
+                    &mut roots.test
+                } else {
+                    &mut roots.source
+                };
+                roots.extend(
+                    unit.source_roots
+                        .iter()
+                        .map(|root| ::platform::path_key(root)),
+                );
+            }
+        }
+        roots.source.sort();
+        roots.source.dedup();
+        roots.test.sort();
+        roots.test.dedup();
+        self.scope_roots = roots;
     }
 
     /// Ctrl+Equal: every branch opens and its children are loaded down to [`MAX_DEPTH`].
@@ -451,24 +553,63 @@ impl TypeHierarchyPanel {
         self.selected = Some(selected);
     }
 
-    /// The node indices on screen, depth first, and their depths.
+    /// The node indices on screen, depth first, and their depths. A row the scope hides
+    /// takes its whole branch with it.
     fn visible(&self) -> Vec<(usize, usize)> {
-        fn add(nodes: &[Node], index: usize, found: &mut Vec<(usize, usize)>) {
-            let Some(node) = nodes.get(index) else {
+        fn add(panel: &TypeHierarchyPanel, index: usize, found: &mut Vec<(usize, usize)>) {
+            let Some(node) = panel.nodes.get(index) else {
                 return;
             };
+            if !panel.in_scope(node) {
+                return;
+            }
             found.push((index, node.depth));
             if node.expanded {
                 for child in &node.children {
-                    add(nodes, *child, found);
+                    add(panel, *child, found);
                 }
             }
         }
         let mut found = Vec::new();
         for root in &self.roots {
-            add(&self.nodes, *root, &mut found);
+            add(self, *root, &mut found);
         }
         found
+    }
+
+    /// Whether the scope keeps a row. A type outside the project, such as one of the JDK
+    /// or a library, has no folder of the model and stays in every scope.
+    fn in_scope(&self, node: &Node) -> bool {
+        if self.scope == HierarchyScope::All
+            || self.scope_roots.source.is_empty() && self.scope_roots.test.is_empty()
+        {
+            return true;
+        }
+        let Some(path) = node
+            .item
+            .place
+            .as_ref()
+            .and_then(|place| editor_view::uri_path(&place.uri))
+        else {
+            return true;
+        };
+        let path = ::platform::path_key(&path);
+        let in_test = self
+            .scope_roots
+            .test
+            .iter()
+            .any(|root| path.starts_with(root));
+        let in_source = !in_test
+            && self
+                .scope_roots
+                .source
+                .iter()
+                .any(|root| path.starts_with(root));
+        match self.scope {
+            HierarchyScope::All => true,
+            HierarchyScope::Production => !in_test,
+            HierarchyScope::Test => !in_source,
+        }
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -622,9 +763,35 @@ fn view_button(
         .child(label)
 }
 
+/// One of the scope buttons of the header, with the hint of what it keeps.
+fn scope_button(scope: HierarchyScope, active: bool, theme: &Theme) -> Stateful<Div> {
+    let id = match scope {
+        HierarchyScope::All => "type-hierarchy-scope-all",
+        HierarchyScope::Production => "type-hierarchy-scope-production",
+        HierarchyScope::Test => "type-hierarchy-scope-test",
+    };
+    let text = if active {
+        theme.accent
+    } else {
+        theme.text_secondary
+    };
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .px(px(SPACE_S))
+        .py(px(SPACE_XS))
+        .rounded(px(CONTROL_RADIUS))
+        .text_size(px(TEXT_SMALL))
+        .text_color(text)
+        .when(active, |button| button.bg(theme.hover))
+        .tooltip(move |_, cx| tooltip(scope.hint(), None, cx))
+        .child(scope.title())
+}
+
 impl Render for TypeHierarchyPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        self.refresh_scope_roots(cx);
         let workspace = self.workspace.clone();
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
@@ -634,6 +801,7 @@ impl Render for TypeHierarchyPanel {
                 .ok();
         };
         let view = self.view;
+        let scope = self.scope;
         let switch = div()
             .flex()
             .items_center()
@@ -670,6 +838,32 @@ impl Render for TypeHierarchyPanel {
                 .on_click(cx.listener(|this, _, _, cx| this.set_view(HierarchyView::Subtypes, cx))),
             )
             .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child("Scope"),
+            )
+            .child(
+                scope_button(HierarchyScope::All, scope == HierarchyScope::All, &theme).on_click(
+                    cx.listener(|this, _, _, cx| this.set_scope(HierarchyScope::All, cx)),
+                ),
+            )
+            .child(
+                scope_button(
+                    HierarchyScope::Production,
+                    scope == HierarchyScope::Production,
+                    &theme,
+                )
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.set_scope(HierarchyScope::Production, cx)),
+                ),
+            )
+            .child(
+                scope_button(HierarchyScope::Test, scope == HierarchyScope::Test, &theme).on_click(
+                    cx.listener(|this, _, _, cx| this.set_scope(HierarchyScope::Test, cx)),
+                ),
+            )
             .child(
                 icon_button(
                     "type-hierarchy-expand-all",
@@ -731,7 +925,7 @@ impl Render for TypeHierarchyPanel {
                     )))
             })
             .collect();
-        let empty = self.nodes.is_empty();
+        let empty = rows.is_empty();
         island(&theme)
             .id("type-hierarchy-panel")
             .debug_selector(|| "type-hierarchy-panel".to_owned())

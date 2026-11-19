@@ -302,8 +302,9 @@ fn type_at(text: &str, offset: usize) -> Option<ParsedType> {
     (file.node_range == node.byte_range()).then_some(file)
 }
 
-/// What F6 moves at a byte offset of a file: the file, a member the form takes, or a
-/// member that this move cannot take.
+/// What F6 moves at a byte offset of a file: the file, a member the form takes, an
+/// instance method that moves to a place around it, or a member that this move cannot
+/// take.
 pub(crate) fn move_place(text: &str, offset: usize) -> MovePlace {
     let Some(tree) = parse(text) else {
         return MovePlace::File;
@@ -321,6 +322,17 @@ pub(crate) fn move_place(text: &str, offset: usize) -> MovePlace {
                     "A static initializer cannot move to another type".to_owned(),
                 );
             }
+            // An initializer without the static modifier is a plain block in the body
+            // of the type.
+            "block"
+                if node.parent().is_some_and(|parent| {
+                    matches!(parent.kind(), "class_body" | "enum_body" | "record_body")
+                }) =>
+            {
+                return MovePlace::Unmovable(
+                    "An initializer cannot move to another type".to_owned(),
+                );
+            }
             "method_declaration" | "field_declaration" | "constant_declaration" => {
                 let field = matches!(node.kind(), "field_declaration" | "constant_declaration");
                 // The fields of an interface are constants without the modifier.
@@ -332,10 +344,14 @@ pub(crate) fn move_place(text: &str, offset: usize) -> MovePlace {
                         )
                     });
                 let modifiers = modifiers_of(text, node);
-                return if has_word(modifiers, "static") || implicit {
-                    MovePlace::Member
-                } else {
+                if has_word(modifiers, "static") || implicit {
+                    return MovePlace::Member;
+                }
+                return if field {
                     MovePlace::Unmovable("Move Members moves static members only".to_owned())
+                } else {
+                    // An instance method moves to a parameter or a field of its type.
+                    MovePlace::InstanceMethod
                 };
             }
             kind if TYPE_KINDS.contains(&kind) => return MovePlace::File,
@@ -345,6 +361,19 @@ pub(crate) fn move_place(text: &str, offset: usize) -> MovePlace {
             return MovePlace::File;
         };
         node = parent;
+    }
+}
+
+/// The name of the method declaration at a byte offset of a file.
+pub(crate) fn method_name(text: &str, offset: usize) -> Option<String> {
+    let tree = parse(text)?;
+    let mut node = node_at(&tree, offset);
+    loop {
+        if node.kind() == "method_declaration" {
+            let name = node.child_by_field_name("name")?;
+            return Some(text_of(text, name).to_owned());
+        }
+        node = node.parent()?;
     }
 }
 
@@ -1614,11 +1643,16 @@ mod move_tests {
     const CLASS: &str = "package a;\n\nclass Owner {\n    static void save() {\n    }\n\n    String name() {\n        return \"\";\n    }\n}\n";
 
     #[test]
-    fn a_static_member_moves_and_an_instance_member_says_why_not() {
+    fn a_static_member_moves_and_an_instance_method_asks_for_its_places() {
         let save = CLASS.find("save").unwrap();
         assert_eq!(move_place(CLASS, save), MovePlace::Member);
         let name = CLASS.find("name").unwrap();
-        assert!(matches!(move_place(CLASS, name), MovePlace::Unmovable(_)));
+        assert_eq!(move_place(CLASS, name), MovePlace::InstanceMethod);
+        let field = "package a;\n\nclass Owner {\n    String note;\n}\n";
+        assert!(matches!(
+            move_place(field, field.find("note").unwrap()),
+            MovePlace::Unmovable(_)
+        ));
         let file = CLASS.find("Owner").unwrap();
         assert_eq!(move_place(CLASS, file), MovePlace::File);
     }

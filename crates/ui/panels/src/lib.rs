@@ -75,6 +75,7 @@ mod member_form;
 mod merge_view;
 mod method_hierarchy;
 mod move_members;
+mod move_targets;
 mod navigation;
 mod new_project;
 mod outline;
@@ -2056,3 +2057,12 @@ mod window_tests_bookmarks;
 
 #[cfg(test)]
 mod window_tests_move_members;
+
+#[cfg(test)]
+mod window_tests_move_targets;
+
+#[cfg(test)]
+mod window_tests_type_hierarchy_scope;
+
+#[cfg(test)]
+mod window_tests_macos_keys;

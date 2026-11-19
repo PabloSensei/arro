@@ -79,9 +79,21 @@ pub fn capture(spec: &ProcessSpec, cancel: &Cancel) -> Result<Captured, CaptureE
     while start.elapsed() < DRAIN && !(stdout.is_done() && stderr.is_done()) {
         sleep(POLL);
     }
+    let mut text = stdout.text();
+    if !spec.notes().is_empty() {
+        // The lines the owner explains go first, so a failure that quotes the output
+        // shows them too.
+        let mut notes = String::new();
+        for note in spec.notes() {
+            notes.push_str(note);
+            notes.push('\n');
+        }
+        notes.push_str(&text);
+        text = notes;
+    }
     Ok(Captured {
         status,
-        stdout: stdout.text(),
+        stdout: text,
         stderr: stderr.text(),
     })
 }

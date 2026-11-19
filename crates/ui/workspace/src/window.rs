@@ -751,6 +751,9 @@ pub struct Workspace {
     /// settings.
     icon_sets: IconCatalog,
     keymap: Keymap,
+    /// The keyboard platform the window was opened with. The application chooses it once
+    /// before the first window, and a window keeps it for the keys it was bound with.
+    keys_platform: keymap::Platform,
     /// The actions the keymap knows: the default ones and the plugin commands.
     keymap_actions: ActionRegistry,
     /// What the user adds to and removes from the default layout.
@@ -954,6 +957,9 @@ impl Workspace {
         let right_stripe_view = ChromeView::right_stripe(chrome_weak.clone(), cx);
         let bounds = cx.observe_window_bounds(window, |this, window, cx| {
             this.placement = placement_of(window, cx).or(this.placement);
+            // The window changes its screen without the command of the window, by its
+            // green button or the key of the system: the menu follows the window.
+            this.sync_full_screen(window, cx);
             this.layout_changed(cx);
         });
         // Leaving the window for another program writes what is unsaved, as the IDE does.
@@ -961,6 +967,7 @@ impl Workspace {
             if window.is_window_active() {
                 // The menu of the screen follows what the window holds: recent projects,
                 // run configurations, the tabs of the window.
+                this.sync_full_screen(window, cx);
                 this.refresh_platform_menus(cx);
             } else if autosave_on(cx) && save_actions_on(cx) {
                 this.save_all(cx);
@@ -1036,7 +1043,10 @@ impl Workspace {
         cx.set_global(icon_sets.clone());
 
         let keymap_path = settings_dir.join(KEYMAP_FILE);
-        let (keymap_actions, keymap) = keymap::default_keymap();
+        // The application chooses the keyboard platform once, before the first window; the
+        // window keeps the one its keys are bound with.
+        let keys_platform = keymap::platform();
+        let (keymap_actions, keymap) = keymap::default_keymap_for(keys_platform);
 
         let mut workspace = Self {
             name,
@@ -1121,6 +1131,7 @@ impl Workspace {
             themes,
             icon_sets,
             keymap,
+            keys_platform,
             keymap_actions,
             keymap_file: KeymapFile::default(),
             keymap_path,
@@ -2504,9 +2515,38 @@ impl Workspace {
         self.full_screen
     }
 
+    /// The keyboard platform the window follows: Command leads on macOS, Control elsewhere.
+    pub fn keys_platform(&self) -> keymap::Platform {
+        self.keys_platform
+    }
+
+    /// Takes the keys of `platform` for this window alone. A window of the application
+    /// chooses its platform once at start; a test of the other platform uses this rather
+    /// than the platform of the whole process, which would reach the windows beside it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn use_keys_of(&mut self, platform: keymap::Platform, cx: &mut Context<Self>) {
+        if self.keys_platform == platform {
+            return;
+        }
+        self.keys_platform = platform;
+        self.rebuild_keymap(cx);
+    }
+
     /// Ctrl+Cmd+F on macOS: the window fills the screen or comes back.
     pub fn toggle_full_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_full_screen(!self.full_screen, window);
+        self.refresh_platform_menus(cx);
+        cx.notify();
+    }
+
+    /// Reads the full screen of the window: the green button and the key of the system
+    /// change it without the command of the window, and the menu follows the window.
+    fn sync_full_screen(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let full = window.is_fullscreen();
+        if self.full_screen == full {
+            return;
+        }
+        self.full_screen = full;
         self.refresh_platform_menus(cx);
         cx.notify();
     }
@@ -3676,7 +3716,7 @@ impl Workspace {
 
     /// The default layout with the file of the user on top, then the plugin keys.
     fn rebuild_keymap(&mut self, cx: &mut Context<Self>) {
-        let (_, base) = keymap::default_keymap();
+        let (_, base) = keymap::default_keymap_for(self.keys_platform);
         let mut keymap = match self.keymap_file.apply(&self.keymap_actions, &base) {
             Ok(keymap) => keymap,
             Err(error) => {
@@ -5227,7 +5267,7 @@ impl Workspace {
         let modifiers = event.keystroke.modifiers;
         // Command is the primary modifier of macOS; the Super key of the other systems is
         // not ours and never reaches the keymap.
-        if (modifiers.platform && !cfg!(target_os = "macos"))
+        if (modifiers.platform && !self.keys_platform.uses_command())
             || matches!(
                 key,
                 "shift" | "control" | "alt" | "platform" | "cmd" | "command"

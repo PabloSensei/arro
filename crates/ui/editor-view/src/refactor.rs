@@ -1255,6 +1255,10 @@ impl EditorView {
                 cx.emit(EditorEvent::MoveMembers(spot));
                 return;
             }
+            MovePlace::InstanceMethod => {
+                cx.emit(EditorEvent::MoveTargets(spot));
+                return;
+            }
             MovePlace::Unmovable(reason) => {
                 self.show_note(caret, reason, cx);
                 return;

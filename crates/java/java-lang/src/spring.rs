@@ -58,6 +58,8 @@ const READY_STEP: Duration = Duration::from_millis(25);
 const CHECK_DELAY: Duration = Duration::from_millis(120);
 /// The most source files the placeholders of `@Value` are looked in.
 const MAX_PLACEHOLDER_FILES: usize = 20_000;
+/// The longest chain of supertypes a member of a configuration class is looked for in.
+const MAX_SUPERTYPE_DEPTH: usize = 5;
 
 unsafe extern "C" fn no_grammar() -> *const () {
     std::ptr::null()
@@ -2463,16 +2465,112 @@ fn source_span(snapshot: &Snapshot, key: &str, sources: &[PathBuf]) -> Option<So
     let text = std::fs::read_to_string(&path).ok()?;
     let file = java_syntax::spring_file(&text);
     let kind = type_in_file(&file, source_type);
-    let span = kind
-        .and_then(|kind| member_span(kind, member.as_deref(), source_method, &text))
-        .or_else(|| kind.map(|kind| type_span(kind, &text)))
-        .unwrap_or_default();
+    let source = ParsedSource {
+        file: &file,
+        path: &path,
+        text: &text,
+    };
+    let found = kind.and_then(|kind| {
+        member_in_supertypes(kind, &source, member.as_deref(), source_method, sources, 0)
+    });
+    let (path, span) = match found {
+        Some(found) => found,
+        None => (
+            path,
+            kind.map(|kind| type_span(kind, &text)).unwrap_or_default(),
+        ),
+    };
     let canonical = CanonPath::new(&path).ok()?;
     let uri = file_uri(&canonical)?;
     Some(SourceSpan {
         uri: uri.as_str().to_owned(),
         span,
     })
+}
+
+/// A parsed source file and where it lives.
+struct ParsedSource<'a> {
+    file: &'a java_syntax::SpringFile,
+    path: &'a Path,
+    text: &'a str,
+}
+
+/// The member of a configuration class or of a superclass of the project, with the file
+/// that declares it. A member the class does not declare is looked for in the types it
+/// extends, up to [`MAX_SUPERTYPE_DEPTH`] levels above it.
+fn member_in_supertypes(
+    kind: &java_syntax::Type,
+    source: &ParsedSource<'_>,
+    member: Option<&str>,
+    source_method: Option<&str>,
+    sources: &[PathBuf],
+    depth: usize,
+) -> Option<(PathBuf, TextSpan)> {
+    if let Some(span) = member_span(kind, member, source_method, source.text) {
+        return Some((source.path.to_path_buf(), span));
+    }
+    let member = member?;
+    if depth >= MAX_SUPERTYPE_DEPTH {
+        return None;
+    }
+    for super_name in &kind.supers {
+        let Some((super_path, super_text)) = super_source(super_name, source.file, sources) else {
+            continue;
+        };
+        let super_file = java_syntax::spring_file(&super_text);
+        let Some(super_kind) = type_in_file(&super_file, super_name) else {
+            continue;
+        };
+        let super_source = ParsedSource {
+            file: &super_file,
+            path: &super_path,
+            text: &super_text,
+        };
+        if let Some(found) = member_in_supertypes(
+            super_kind,
+            &super_source,
+            Some(member),
+            source_method,
+            sources,
+            depth + 1,
+        ) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The source file and text of a supertype a declaration names. The package and the
+/// imports of the file that extends it give the name to look for.
+fn super_source(
+    super_name: &str,
+    file: &java_syntax::SpringFile,
+    sources: &[PathBuf],
+) -> Option<(PathBuf, String)> {
+    let mut candidates = Vec::new();
+    if super_name.contains('.') {
+        candidates.push(super_name.to_owned());
+    }
+    let imports = file.imports();
+    if let Some(package) = imports.get(super_name) {
+        candidates.push(format!("{package}.{super_name}"));
+    }
+    if !file.package.is_empty() {
+        candidates.push(format!("{}.{}", file.package, super_name));
+    }
+    for (name, package) in &file.imports {
+        if name == "*" {
+            candidates.push(format!("{package}.{super_name}"));
+        }
+    }
+    for candidate in candidates {
+        let Some(path) = source_file(&candidate, sources) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path).ok()?;
+        return Some((path, text));
+    }
+    None
 }
 
 /// The places a key leads to: its lines in the configuration files, or the member of the
@@ -3499,6 +3597,33 @@ mod tests {
         assert_eq!(
             span.span.start,
             point_in(server, server.find("setPort").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_key_of_an_inherited_field_leads_to_the_superclass_field() {
+        let folder = test_support::TempDir::new("spring-inherited");
+        let root = folder.path().join("src").join("main").join("java");
+        let base = "package com.example;\n\nclass BaseProperties {\n    private int port;\n}\n";
+        let child = "package com.example;\n\nclass ServerProperties extends BaseProperties {\n}\n";
+        write_source(&root, "com/example/BaseProperties.java", base);
+        write_source(&root, "com/example/ServerProperties.java", child);
+        let snapshot = snapshot(MEMBERS);
+        let span = source_span(&snapshot, "server.port", &[root]).unwrap();
+        assert!(
+            span.uri.ends_with("BaseProperties.java"),
+            "the field is in the superclass: {}",
+            span.uri
+        );
+        assert_eq!(
+            span.span.start,
+            point_in(base, base.find("port;").unwrap()),
+            "the caret goes to the inherited field"
+        );
+        assert_eq!(
+            span.span.end.character - span.span.start.character,
+            "port".len() as u32,
+            "the span is the name of the field"
         );
     }
 

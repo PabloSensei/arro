@@ -8,13 +8,13 @@ use lang_api::{
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
     GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
     InlayHintProvider, InlayHintSettings, LanguageId, LanguageSupport, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider, NavigationProvider,
-    OverridableMethodsProvider, PrepareDiagnosticsProvider, ProjectProblemsProvider, Queries,
-    RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
-    SemanticServer, SemanticTokensProvider, SignatureProvider, SourceTextProvider, StructuralEdit,
-    StructuralMatch, StructuralQuery, StructuralSearchProvider, StructuralTemplate, SymbolProvider,
-    SyntaxProvider, TypeHierarchyProvider, UnwrapEdit, WorkspaceDiagnosticsProvider,
-    WorkspaceSymbolProvider,
+    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
+    MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
+    PrepareDiagnosticsProvider, ProjectProblemsProvider, Queries, RangeFormatProvider,
+    ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer,
+    SemanticTokensProvider, SignatureProvider, SourceTextProvider, StructuralEdit, StructuralMatch,
+    StructuralQuery, StructuralSearchProvider, StructuralTemplate, SymbolProvider, SyntaxProvider,
+    TypeHierarchyProvider, UnwrapEdit, WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use lang_api::{ExpectedTypeProvider, ExternalDocProvider, SignatureInfoProvider};
 use tree_sitter_language::LanguageFn;
@@ -480,6 +480,10 @@ impl LanguageSupport for JavaProject {
 
     fn move_members_form(&self) -> Option<&MoveMembersFormProvider> {
         Some(&self.move_members)
+    }
+
+    fn move_targets_form(&self) -> Option<&MoveTargetsFormProvider> {
+        Some(&self.move_targets)
     }
 
     /// F6 on the declaration of a member moves the member, and on anything else the

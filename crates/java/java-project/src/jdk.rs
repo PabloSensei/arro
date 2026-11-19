@@ -9,8 +9,7 @@ use base::program::{executable, home_dir};
 use crate::pom::read_pom;
 
 /// Vendors install into these directories, each holds one JDK per subdirectory.
-#[cfg(windows)]
-const INSTALL_ROOTS: &[&str] = &[
+const WINDOWS_VENDORS: &[&str] = &[
     "Java",
     "Eclipse Adoptium",
     "Amazon Corretto",
@@ -19,6 +18,155 @@ const INSTALL_ROOTS: &[&str] = &[
     "BellSoft",
     "Semeru",
 ];
+
+/// The family of systems a list of JDK folders is made for. The search passes the one it
+/// runs on and a test passes each of them, so every list is checked on any machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    Windows,
+    MacOs,
+    Unix,
+}
+
+impl Family {
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Windows
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacOs
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Self::Unix
+        }
+    }
+}
+
+/// The folders of the machine a list of JDK install roots is built from. A test passes a
+/// table of its own; the search fills it from the variables of the process.
+#[derive(Clone, Debug, Default)]
+pub struct Places {
+    /// The home folder of the user.
+    pub home: Option<PathBuf>,
+    /// The folders where the vendors of Windows install: `ProgramW6432` and
+    /// `ProgramFiles`, which a 32-bit process sees differently.
+    pub program_files: Vec<PathBuf>,
+    /// `LOCALAPPDATA`, where the per-user installs of Windows go.
+    pub local_app_data: Option<PathBuf>,
+}
+
+impl Places {
+    pub fn from_env() -> Self {
+        let mut program_files: Vec<PathBuf> = ["ProgramW6432", "ProgramFiles"]
+            .iter()
+            .filter_map(|variable| env::var_os(variable).map(PathBuf::from))
+            .collect();
+        // On a 64-bit process both variables name one folder.
+        program_files.dedup();
+        Self {
+            home: home_dir(),
+            program_files,
+            local_app_data: env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        }
+    }
+}
+
+/// The folders whose subdirectories are JDK installs, in the order to search. The project
+/// SDK and the JDK that runs the language server read the same list, so a JDK found by the
+/// one is found by the other. Pure: `family` and `places` decide, and nothing is read.
+pub fn roots_for(family: Family, places: &Places) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    match family {
+        Family::Windows => {
+            for base in &places.program_files {
+                roots.extend(WINDOWS_VENDORS.iter().map(|vendor| base.join(vendor)));
+            }
+            if let Some(base) = &places.local_app_data {
+                roots.push(base.join("Programs"));
+            }
+            if let Some(home) = &places.home {
+                roots.push(home.join(".jdks"));
+            }
+        }
+        Family::MacOs => {
+            // A JDK of macOS is a bundle under one of these folders, as
+            // `/usr/libexec/java_home` reports them.
+            roots.push(
+                Path::new("/Library")
+                    .join("Java")
+                    .join("JavaVirtualMachines"),
+            );
+            if let Some(home) = &places.home {
+                roots.push(
+                    home.join("Library")
+                        .join("Java")
+                        .join("JavaVirtualMachines"),
+                );
+                roots.push(home.join(".sdkman").join("candidates").join("java"));
+                roots.push(home.join(".jdks"));
+            }
+            // Homebrew links every formula into `opt`; the JDKs there are named `openjdk`.
+            roots.push(Path::new("/opt").join("homebrew").join("opt"));
+            roots.push(Path::new("/usr").join("local").join("opt"));
+        }
+        Family::Unix => {
+            roots.push(Path::new("/usr").join("lib").join("jvm"));
+            if let Some(home) = &places.home {
+                roots.push(home.join(".sdkman").join("candidates").join("java"));
+                roots.push(home.join(".jdks"));
+            }
+            roots.push(
+                Path::new("/home")
+                    .join("linuxbrew")
+                    .join(".linuxbrew")
+                    .join("opt"),
+            );
+        }
+    }
+    roots
+}
+
+/// The home folder an entry of an install root names. A JDK of macOS is a bundle whose
+/// `Contents/Home` is the home, and Homebrew keeps that bundle under `libexec`; the other
+/// systems name the home itself. Pure apart from the look at the disk that tells a bundle
+/// from a plain folder, so a test checks the bundles of macOS on any system.
+pub fn home_in(family: Family, entry: PathBuf) -> PathBuf {
+    if family != Family::MacOs {
+        return entry;
+    }
+    let homebrew = entry
+        .join("libexec")
+        .join("openjdk.jdk")
+        .join("Contents")
+        .join("Home");
+    if homebrew.is_dir() {
+        return homebrew;
+    }
+    let bundle = entry.join("Contents").join("Home");
+    if bundle.is_dir() {
+        return bundle;
+    }
+    entry
+}
+
+/// The JDK homes under one install root, sorted by name: a root that is not there holds
+/// none, and an entry that is not a folder is not a home.
+pub fn homes_under(family: Family, root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut homes: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|path| home_in(family, path))
+        .collect();
+    homes.sort();
+    homes
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Jdk {
@@ -91,42 +239,9 @@ fn candidates() -> Vec<PathBuf> {
             }
         }
     }
-    #[cfg(windows)]
-    {
-        let mut roots = Vec::new();
-        for variable in ["ProgramW6432", "ProgramFiles"] {
-            if let Some(base) = env::var_os(variable).map(PathBuf::from) {
-                roots.extend(INSTALL_ROOTS.iter().map(|root| base.join(root)));
-            }
-        }
-        if let Some(base) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-            roots.push(base.join("Programs"));
-        }
-        if let Some(base) = home_dir() {
-            roots.push(base.join(".jdks"));
-        }
-        homes.extend(homes_under(roots));
-    }
-    #[cfg(unix)]
-    {
-        let mut roots = vec![PathBuf::from("/usr/lib/jvm")];
-        if let Some(home) = home_dir() {
-            roots.push(home.join(".sdkman").join("candidates").join("java"));
-            roots.push(home.join(".jdks"));
-        }
-        homes.extend(homes_under(roots));
-    }
-    homes
-}
-
-/// One JDK per subdirectory of every root that can be read.
-fn homes_under(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut homes = Vec::new();
-    for root in roots {
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        homes.extend(entries.flatten().map(|entry| entry.path()));
+    let family = Family::current();
+    for root in roots_for(family, &Places::from_env()) {
+        homes.extend(homes_under(family, &root));
     }
     homes
 }
@@ -346,5 +461,93 @@ mod tests {
             number_after("JavaVersion.VERSION_1_8;", "JavaVersion.VERSION_"),
             Some(8)
         );
+    }
+
+    #[test]
+    fn every_system_has_its_own_install_roots() {
+        let places = Places {
+            home: Some(PathBuf::from("/home/user")),
+            program_files: Vec::new(),
+            local_app_data: None,
+        };
+
+        let mac = roots_for(Family::MacOs, &places);
+        assert!(
+            mac.iter()
+                .any(|root| root.as_path() == Path::new("/Library/Java/JavaVirtualMachines")),
+            "{mac:?}"
+        );
+        assert!(
+            mac.iter()
+                .any(|root| root.as_path()
+                    == Path::new("/home/user/Library/Java/JavaVirtualMachines"))
+        );
+        assert!(
+            mac.iter()
+                .any(|root| root.as_path() == Path::new("/opt/homebrew/opt")),
+            "{mac:?}"
+        );
+        assert!(
+            mac.iter()
+                .any(|root| root.as_path() == Path::new("/usr/local/opt"))
+        );
+
+        let linux = roots_for(Family::Unix, &places);
+        assert!(
+            linux
+                .iter()
+                .any(|root| root.as_path() == Path::new("/usr/lib/jvm"))
+        );
+        assert!(
+            linux
+                .iter()
+                .any(|root| root.as_path() == Path::new("/home/user/.sdkman/candidates/java"))
+        );
+        assert!(
+            !linux
+                .iter()
+                .any(|root| root.as_path() == Path::new("/Library/Java/JavaVirtualMachines"))
+        );
+
+        let windows = roots_for(
+            Family::Windows,
+            &Places {
+                program_files: vec![PathBuf::from(r"C:\Program Files")],
+                local_app_data: Some(PathBuf::from(r"C:\Users\user\AppData\Local")),
+                ..places.clone()
+            },
+        );
+        assert!(
+            windows
+                .iter()
+                .any(|root| root.as_path() == Path::new(r"C:\Program Files\Java"))
+        );
+        assert!(
+            windows
+                .iter()
+                .any(|root| root.as_path() == Path::new(r"C:\Users\user\AppData\Local\Programs"))
+        );
+    }
+
+    #[test]
+    fn a_mac_jdk_is_a_bundle_that_homebrew_keeps_under_libexec() {
+        let bundle = temp_dir("bundle");
+        std::fs::create_dir_all(bundle.join("Contents").join("Home")).unwrap();
+
+        assert_eq!(
+            home_in(Family::MacOs, bundle.clone()),
+            bundle.join("Contents").join("Home")
+        );
+        assert_eq!(home_in(Family::Unix, bundle.clone()), bundle);
+
+        let brew = temp_dir("brew");
+        let nested = brew
+            .join("libexec")
+            .join("openjdk.jdk")
+            .join("Contents")
+            .join("Home");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(home_in(Family::MacOs, brew), nested);
     }
 }

@@ -129,12 +129,18 @@ impl Maven {
     pub(crate) fn command(&self, root: &Path) -> Result<ProcessSpec> {
         let settings = &self.env.build_tools.first;
         let maven = self.resolve(root)?.program;
+        // A wrapper that came without the execute bit, from an archive made on Windows or
+        // from a copy, is made runnable here and the output of the build says so.
+        let note = crate::wrapper::prepare(&maven)?;
         let jdk = self.env.project_jdk(root)?;
         let selection = crate::build_selection::load_selection(root);
         let mut spec = ProcessSpec::new(maven)
             .cwd(root)
             .args(["-B", "-ntp"])
             .label("Build tool");
+        if let Some(note) = note {
+            spec = spec.note(note);
+        }
         if settings.offline {
             spec = spec.arg("-o");
         }
@@ -1065,6 +1071,41 @@ mod tests {
 
         assert_eq!(found.origin, MavenOrigin::Wrapper);
         assert_eq!(found.program, root.path().join(cmd_script("mvnw")));
+    }
+
+    /// The wrapper of a project that came without the execute bit is made runnable before
+    /// the build starts, and the build output carries the line about it.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_without_the_execute_bit_is_made_runnable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_support::TempDir::new("maven-wrapper-bit");
+        let script = root.path().join(cmd_script("mvnw"));
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let home = root.path().join("jdk");
+        fs::create_dir_all(home.join("bin")).unwrap();
+        fs::write(home.join("bin").join("javac"), "").unwrap();
+        fs::write(home.join("bin").join("java"), "").unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.2\"\n").unwrap();
+        let jdk = crate::Jdk::at(&home).unwrap();
+        let data = test_support::TempDir::new("maven-wrapper-bit-data");
+        let tool = Maven::new(BuildEnv {
+            jdk: Some(jdk),
+            data_dir: Some(data.path().to_path_buf()),
+            ..BuildEnv::default()
+        });
+
+        let spec = tool.command(root.path()).unwrap();
+
+        assert!(
+            spec.notes().iter().any(|note| note.contains("mvnw")),
+            "{:?}",
+            spec.notes()
+        );
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111);
     }
 
     #[test]

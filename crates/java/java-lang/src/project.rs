@@ -121,6 +121,8 @@ pub struct JavaProject {
     pub(crate) members: MemberRefactorings,
     /// Move Members: the members of a type and the types of the project that take them.
     pub(crate) move_members: crate::move_members::MoveMembers,
+    /// A move to a parameter or a field of the type of a method.
+    pub(crate) move_targets: crate::move_targets::MoveTargets,
     /// The Lombok agent: found in the project dependencies and applied with a restart.
     lombok: Arc<LombokSupport>,
     /// Stack traces and thread dumps: the frames of a trace, and `jcmd` for a running
@@ -581,6 +583,7 @@ impl JavaProject {
             // The expressions under the caret that an extract may take, innermost first.
             .with_refactor_selections("java/inferSelection")
             .with_move_requests("java/getMoveDestinations", "java/move", "moveStaticMember")
+            .with_move_targets_kind("moveInstanceMethod")
             .with_import_line(is_import_line)
             .with_change_signature(
                 "java/getChangeSignatureInfo",
@@ -657,6 +660,11 @@ impl JavaProject {
         );
         let move_members =
             crate::move_members::MoveMembers::new(root.clone(), router.clone(), Handle::current());
+        let move_targets = crate::move_targets::MoveTargets::new(
+            router.clone(),
+            providers.clone(),
+            Handle::current(),
+        );
         let stack = crate::stack::StackService::new(
             root.clone(),
             router.clone(),
@@ -688,6 +696,7 @@ impl JavaProject {
             forms,
             members,
             move_members,
+            move_targets,
             lombok,
             stack,
             spring,

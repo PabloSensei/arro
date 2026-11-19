@@ -411,6 +411,29 @@ fn open(
                             .ok();
                     });
                 }
+                EditorEvent::MoveTargets(spot) => {
+                    let spot = spot.clone();
+                    let origin = view.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::move_targets::MoveTargetsDialog::show(
+                                            spot,
+                                            Some(origin),
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
                 EditorEvent::RefactorForm(handle_text) => {
                     let handle_text = handle_text.clone();
                     let workspace = runner.clone();

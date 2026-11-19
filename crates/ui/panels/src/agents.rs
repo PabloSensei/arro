@@ -2026,7 +2026,7 @@ impl AgentsPanel {
                 cx.stop_propagation();
                 return;
             }
-            if !terminal.is_closed() && send_key(&terminal, stroke, cx) {
+            if !terminal.is_closed() && send_key(&terminal, stroke, keymap::platform(), cx) {
                 // What the user types takes the selection away, as it does in a terminal.
                 self.clear_grid_selection();
                 cx.stop_propagation();

@@ -744,11 +744,13 @@ pub struct RenameQuery {
 
 /// What F6 moves. A file holds its type, so moving it into another package moves the
 /// type with every reference and its `package` line. A member leaves its type and the
-/// target type takes it with every reference.
+/// target type takes it with every reference. An instance method leaves its type too,
+/// but its new receiver is one of the places around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveKind {
     File,
     Member,
+    InstanceMethod,
 }
 
 /// What F6 works on at a place of a file, as the language sees it.
@@ -758,6 +760,8 @@ pub enum MovePlace {
     File,
     /// A member that moves into another type.
     Member,
+    /// An instance method that moves to one of the places around it.
+    InstanceMethod,
     /// A member that this move cannot take, with the reason the window shows.
     Unmovable(String),
 }
@@ -787,6 +791,21 @@ pub struct MoveMembersForm {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MoveMembersQuery {
     pub spot: DocumentSpot,
+}
+
+/// The form of a move of one symbol into a place around it: where the language says it
+/// can go, the first one chosen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoveTargetsForm {
+    pub title: String,
+    pub targets: Vec<MoveDestination>,
+}
+
+/// F6 on a symbol that moves into one of the places around it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveTargetsQuery {
+    pub spot: DocumentSpot,
+    pub kind: MoveKind,
 }
 
 /// F6: where the file at `spot` can go.
@@ -989,6 +1008,7 @@ pub type RenameProvider = dyn Provider<RenameQuery, WorkspaceChange>;
 pub type MoveDestinationProvider = dyn Provider<MoveQuery, Vec<MoveDestination>>;
 pub type MoveProvider = dyn Provider<MoveRequest, MoveOutcome>;
 pub type MoveMembersFormProvider = dyn Provider<MoveMembersQuery, Option<MoveMembersForm>>;
+pub type MoveTargetsFormProvider = dyn Provider<MoveTargetsQuery, Option<MoveTargetsForm>>;
 pub type ChangeSignatureInfoProvider = dyn Provider<DocumentSpot, ChangeSignatureInfo>;
 pub type ChangeSignatureProvider = dyn Provider<ChangeSignatureRequest, ChangeSignatureOutcome>;
 pub type HierarchyProvider = dyn Provider<HierarchyQuery, Vec<SymbolEntry>>;

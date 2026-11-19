@@ -20,6 +20,7 @@ mod members;
 mod messages;
 mod migrations;
 mod move_members;
+mod move_targets;
 pub mod newproject;
 mod problems;
 mod project;

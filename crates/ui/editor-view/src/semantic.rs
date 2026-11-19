@@ -2796,6 +2796,21 @@ impl EditorView {
         }
     }
 
+    /// A message at a place of the document, for a window that found nothing to offer
+    /// there.
+    pub fn note_at(
+        &mut self,
+        point: TextPoint,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let at = offset_in(&state.text(), point);
+        self.show_note(at, text, cx);
+    }
+
     /// Ctrl+Space, or typing: asks for entries at the caret. A Ctrl+Space with the list
     /// the key opened already does not ask again: the second press shows every entry of
     /// the answer, the third opens the documentation of the selected row.

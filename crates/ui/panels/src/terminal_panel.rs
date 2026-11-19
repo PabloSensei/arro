@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use keymap::Platform;
 use project_model::EnvironmentProvider;
 use terminal::{SearchMatch, SearchQuery, ShiftEnter, SpawnSpec, TERM_VARS, TerminalSession};
 use ui_kit::metrics::*;
@@ -19,7 +20,7 @@ use crate::navigation;
 use crate::project_structure::dialog_button;
 use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
-    CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, is_paste, pressed,
+    CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, pressed,
     scroll_lines, send_key,
 };
 use crate::term_links::{LinkKind, LinkText};
@@ -177,6 +178,8 @@ pub struct TerminalPanel {
     store: Option<Arc<store::Store>>,
     tabs: Vec<Tab>,
     active: usize,
+    /// The keyboard platform the panel was opened with: Command leads on macOS.
+    keys_platform: Platform,
     focus: FocusHandle,
     search_focus: FocusHandle,
     /// The tab whose name is being typed, and the field of the new name.
@@ -282,18 +285,121 @@ fn prepend_path(env: &mut Vec<(String, String)>, bin: &Path) {
     }
 }
 
+/// A press the terminal takes for itself instead of writing it into the shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalCommand {
+    NewTab,
+    CloseTab,
+    Find,
+    Copy,
+    /// Copies a selection and otherwise goes to the shell, where Ctrl+C interrupts.
+    CopyIfSelected,
+    Paste,
+}
+
+/// The keys of the terminal that act on the window rather than reach the shell. macOS
+/// takes them with Command, as IDEA does, and leaves Control to the shell: Ctrl+C there
+/// interrupts the program. The other systems keep the Control keys of IDEA.
+struct TerminalKeys {
+    new_tab: &'static [&'static str],
+    close_tab: &'static [&'static str],
+    find: &'static [&'static str],
+    copy: &'static [&'static str],
+    copy_selection: &'static [&'static str],
+    paste: &'static [&'static str],
+}
+
+const TERMINAL_KEYS_WINDOWS: TerminalKeys = TerminalKeys {
+    new_tab: &["ctrl-shift-t"],
+    close_tab: &["ctrl-f4", "ctrl-shift-f4"],
+    find: &["ctrl-f"],
+    copy: &["ctrl-shift-c"],
+    copy_selection: &["ctrl-c"],
+    paste: &["ctrl-shift-v", "ctrl-v", "shift-insert"],
+};
+
+const TERMINAL_KEYS_MACOS: TerminalKeys = TerminalKeys {
+    new_tab: &["cmd-t", "cmd-shift-t"],
+    close_tab: &["cmd-w"],
+    find: &["cmd-f"],
+    copy: &["cmd-c"],
+    // Control belongs to the shell on macOS: Ctrl+C keeps interrupting the program.
+    copy_selection: &[],
+    paste: &["cmd-v"],
+};
+
+/// The keys of the terminal of one platform, for the bindings and the press handler.
+fn terminal_keys(platform: Platform) -> &'static TerminalKeys {
+    if platform.uses_command() {
+        &TERMINAL_KEYS_MACOS
+    } else {
+        &TERMINAL_KEYS_WINDOWS
+    }
+}
+
+/// Whether a press is the key of `shortcut`, as the keymap writes it.
+fn is_key(stroke: &Keystroke, shortcut: &str) -> bool {
+    let Ok(wanted) = keymap::Keystroke::parse(shortcut) else {
+        return false;
+    };
+    let modifiers = stroke.modifiers;
+    wanted.key == stroke.key
+        && wanted.ctrl == modifiers.control
+        && wanted.alt == modifiers.alt
+        && wanted.shift == modifiers.shift
+        && wanted.cmd == modifiers.platform
+}
+
+/// What a press means to the terminal of `platform`, `None` when the shell gets it.
+fn terminal_command(stroke: &Keystroke, platform: Platform) -> Option<TerminalCommand> {
+    let keys = terminal_keys(platform);
+    let any = |shortcuts: &[&str]| shortcuts.iter().any(|shortcut| is_key(stroke, shortcut));
+    if any(keys.new_tab) {
+        Some(TerminalCommand::NewTab)
+    } else if any(keys.close_tab) {
+        Some(TerminalCommand::CloseTab)
+    } else if any(keys.find) {
+        Some(TerminalCommand::Find)
+    } else if any(keys.copy) {
+        Some(TerminalCommand::Copy)
+    } else if any(keys.copy_selection) {
+        Some(TerminalCommand::CopyIfSelected)
+    } else if any(keys.paste) {
+        Some(TerminalCommand::Paste)
+    } else {
+        None
+    }
+}
+
 /// The keys of the terminal that the window would take for a tab of the editor or for
 /// going back: in the terminal they mean the sessions, as in IDEA.
 pub(crate) fn bind_keys(cx: &mut App) {
+    bind_keys_for(cx, keymap::platform());
+}
+
+/// Binds the terminal keys of one platform, so that a test reads the macOS keys on every
+/// runner.
+pub(crate) fn bind_keys_for(cx: &mut App, platform: Platform) {
+    let keys = terminal_keys(platform);
     let context = Some("Terminal");
+    for key in keys.new_tab {
+        cx.bind_keys([KeyBinding::new(key, NewTab, context)]);
+    }
+    for key in keys.close_tab {
+        cx.bind_keys([KeyBinding::new(key, CloseTab, context)]);
+    }
+    for key in keys.find {
+        cx.bind_keys([KeyBinding::new(key, Find, context)]);
+    }
+    for key in keys.copy {
+        cx.bind_keys([KeyBinding::new(key, CopySelection, context)]);
+    }
+    for key in keys.paste {
+        cx.bind_keys([KeyBinding::new(key, PasteText, context)]);
+    }
     cx.bind_keys([
-        KeyBinding::new("ctrl-shift-t", NewTab, context),
-        KeyBinding::new("ctrl-f", Find, context),
-        KeyBinding::new("ctrl-f4", CloseTab, context),
         KeyBinding::new("alt-left", PreviousTab, context),
         KeyBinding::new("alt-right", NextTab, context),
-        KeyBinding::new("ctrl-shift-c", CopySelection, context),
-        KeyBinding::new("ctrl-shift-v", PasteText, context),
     ]);
 }
 
@@ -366,6 +472,7 @@ impl TerminalPanel {
                 store,
                 tabs,
                 active,
+                keys_platform: keymap::platform(),
                 focus: cx.focus_handle(),
                 search_focus: cx.focus_handle(),
                 renaming: None,
@@ -548,15 +655,39 @@ impl TerminalPanel {
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
         let modifiers = stroke.modifiers;
-        if modifiers.control && modifiers.shift && stroke.key == "t" {
-            cx.stop_propagation();
-            self.new_tab(None, window, cx);
-            return;
-        }
-        if modifiers.control && !modifiers.alt && stroke.key == "f4" {
-            cx.stop_propagation();
-            self.close_tab(self.active, window, cx);
-            return;
+        match terminal_command(stroke, self.keys_platform) {
+            Some(TerminalCommand::NewTab) => {
+                cx.stop_propagation();
+                self.new_tab(None, window, cx);
+                return;
+            }
+            Some(TerminalCommand::CloseTab) => {
+                cx.stop_propagation();
+                self.close_tab(self.active, window, cx);
+                return;
+            }
+            Some(TerminalCommand::Find) => {
+                cx.stop_propagation();
+                self.open_search(window, cx);
+                return;
+            }
+            Some(TerminalCommand::Copy) => {
+                cx.stop_propagation();
+                self.copy_selection(cx);
+                return;
+            }
+            Some(TerminalCommand::CopyIfSelected) => {
+                if self.copy_selection(cx) {
+                    cx.stop_propagation();
+                }
+                // Without a selection the press goes to the shell, where Ctrl+C interrupts.
+            }
+            Some(TerminalCommand::Paste) => {
+                cx.stop_propagation();
+                self.paste(window, cx);
+                return;
+            }
+            None => {}
         }
         if modifiers.alt
             && !modifiers.control
@@ -572,30 +703,6 @@ impl TerminalPanel {
         {
             cx.stop_propagation();
             self.step_tab(1, window, cx);
-            return;
-        }
-        if modifiers.control && !modifiers.alt && !modifiers.shift && stroke.key == "f" {
-            cx.stop_propagation();
-            self.open_search(window, cx);
-            return;
-        }
-        if modifiers.control && modifiers.shift && stroke.key == "c" {
-            cx.stop_propagation();
-            self.copy_selection(cx);
-            return;
-        }
-        if modifiers.control
-            && !modifiers.shift
-            && !modifiers.alt
-            && stroke.key == "c"
-            && self.copy_selection(cx)
-        {
-            cx.stop_propagation();
-            return;
-        }
-        if is_paste(stroke) || (modifiers.control && modifiers.shift && stroke.key == "v") {
-            cx.stop_propagation();
-            self.paste(window, cx);
             return;
         }
         if self.search_open() && matches!(stroke.key.as_str(), "f3") {
@@ -619,7 +726,7 @@ impl TerminalPanel {
         if stroke.key == "enter" && !modifiers.control && !modifiers.alt {
             self.note_terminal_command(cx);
         }
-        if send_key(&session, stroke, cx) {
+        if send_key(&session, stroke, self.keys_platform, cx) {
             cx.stop_propagation();
         }
     }
@@ -2085,6 +2192,12 @@ pub(crate) fn message(text: impl Into<SharedString>, theme: &Theme) -> Div {
 
 #[cfg(test)]
 impl TerminalPanel {
+    /// Takes the keys of `platform` for this panel alone: a test of the macOS keys does
+    /// not choose the platform of the whole process.
+    pub(crate) fn use_keys_of(&mut self, platform: Platform) {
+        self.keys_platform = platform;
+    }
+
     pub(crate) fn tabs_len(&self) -> usize {
         self.tabs.len()
     }
@@ -2148,5 +2261,95 @@ impl TerminalPanel {
                 .collect(),
             active: self.active,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TerminalCommand, terminal_command};
+    use keymap::Platform;
+    use ui_kit::gpui::Keystroke;
+
+    fn stroke(text: &'static str) -> Keystroke {
+        Keystroke::parse(text).expect("the test keystroke parses")
+    }
+
+    /// macOS takes the window keys with Command and leaves Control to the shell: Ctrl+C
+    /// interrupts the program there, so the terminal does not copy it.
+    #[test]
+    fn the_macos_terminal_takes_command_and_leaves_control_to_the_shell() {
+        assert_eq!(
+            terminal_command(&stroke("cmd-c"), Platform::MacOs),
+            Some(TerminalCommand::Copy)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-c"), Platform::MacOs),
+            None,
+            "Ctrl+C goes to the shell"
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-v"), Platform::MacOs),
+            Some(TerminalCommand::Paste)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-v"), Platform::MacOs),
+            None,
+            "Ctrl+V goes to the shell"
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-t"), Platform::MacOs),
+            Some(TerminalCommand::NewTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-shift-t"), Platform::MacOs),
+            Some(TerminalCommand::NewTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-w"), Platform::MacOs),
+            Some(TerminalCommand::CloseTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-f"), Platform::MacOs),
+            Some(TerminalCommand::Find)
+        );
+    }
+
+    /// Windows keeps the Control keys of the terminal, and Ctrl+C without a selection goes
+    /// to the shell when nothing is selected.
+    #[test]
+    fn the_windows_terminal_keeps_its_control_keys() {
+        assert_eq!(
+            terminal_command(&stroke("ctrl-shift-c"), Platform::Windows),
+            Some(TerminalCommand::Copy)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-c"), Platform::Windows),
+            Some(TerminalCommand::CopyIfSelected)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-shift-v"), Platform::Windows),
+            Some(TerminalCommand::Paste)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-v"), Platform::Windows),
+            Some(TerminalCommand::Paste)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-shift-t"), Platform::Windows),
+            Some(TerminalCommand::NewTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-f4"), Platform::Windows),
+            Some(TerminalCommand::CloseTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-f"), Platform::Windows),
+            Some(TerminalCommand::Find)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-c"), Platform::Windows),
+            None,
+            "the Super key is not ours"
+        );
     }
 }

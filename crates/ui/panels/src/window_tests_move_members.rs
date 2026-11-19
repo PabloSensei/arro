@@ -131,7 +131,7 @@ impl Provider<MoveRequest, MoveOutcome> for MoveLanguage {
     fn start(&self, query: MoveRequest, _: base::Cancel, mut reply: lang_api::Reply<MoveOutcome>) {
         self.applied.lock().unwrap().push(query.clone());
         match query.kind {
-            MoveKind::Member => {
+            MoveKind::Member | MoveKind::InstanceMethod => {
                 let outcome = self.member_outcome.lock().unwrap().clone();
                 let _ = reply.send(self.answer(outcome));
             }

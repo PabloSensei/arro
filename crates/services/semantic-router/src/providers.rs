@@ -110,6 +110,8 @@ pub struct LspProviders {
     move_request: Option<&'static str>,
     /// The `moveKind` a member move asks for, named by the language that has one.
     move_member_kind: Option<&'static str>,
+    /// The `moveKind` a move to one of the places around a symbol asks for.
+    move_targets_kind: Option<&'static str>,
     change_signature_info_request: Option<&'static str>,
     change_signature_edit_request: Option<&'static str>,
     change_signature_command: Option<&'static str>,
@@ -1262,6 +1264,7 @@ impl LspProviders {
             move_destinations_request: None,
             move_request: None,
             move_member_kind: None,
+            move_targets_kind: None,
             change_signature_info_request: None,
             change_signature_edit_request: None,
             change_signature_command: None,
@@ -1334,6 +1337,12 @@ impl LspProviders {
         self.move_destinations_request = Some(destinations);
         self.move_request = Some(move_request);
         self.move_member_kind = Some(member_kind);
+        self
+    }
+
+    /// Names the `moveKind` of a move to one of the places around a symbol.
+    pub fn with_move_targets_kind(mut self, kind: &'static str) -> Self {
+        self.move_targets_kind = Some(kind);
         self
     }
 
@@ -2268,6 +2277,7 @@ impl LspProviders {
         match kind {
             MoveKind::File => Some("moveResource"),
             MoveKind::Member => self.move_member_kind,
+            MoveKind::InstanceMethod => self.move_targets_kind,
         }
     }
 }
@@ -2290,10 +2300,20 @@ impl Provider<MoveQuery, Vec<MoveDestination>> for LspProviders {
         };
         self.answer(cancel, reply, async move {
             let place = place(&query.spot)?;
-            let params = serde_json::json!({
+            let mut params = serde_json::json!({
                 "moveKind": kind,
                 "sourceUris": [place.uri.as_str()],
             });
+            if query.kind == MoveKind::InstanceMethod {
+                // The server finds the method by the range of the request, as it does for
+                // a move, and lists the places around it that can take it.
+                let at = position(query.spot.point);
+                params["params"] = serde_json::json!({
+                    "textDocument": {"uri": place.uri.as_str()},
+                    "range": {"start": at, "end": at},
+                    "context": {"diagnostics": []},
+                });
+            }
             let answer = router.extension(request, params).await;
             Some(answer.map(|value| {
                 value
@@ -2302,13 +2322,22 @@ impl Provider<MoveQuery, Vec<MoveDestination>> for LspProviders {
                     .into_iter()
                     .flatten()
                     .filter_map(|destination| {
-                        let name = destination.get("displayName")?.as_str()?.to_owned();
+                        // A file destination names a package, a place around a symbol
+                        // names a parameter or a field with the name of its type.
+                        let name = destination
+                            .get("displayName")
+                            .or_else(|| destination.get("name"))?
+                            .as_str()?
+                            .to_owned();
                         let project = destination.get("project").and_then(|v| v.as_str());
                         let path = destination.get("path").and_then(|v| v.as_str());
                         let detail = match (project, path) {
                             (Some(project), Some(path)) => Some(format!("{project}  {path}")),
                             (Some(project), None) => Some(project.to_owned()),
-                            _ => None,
+                            _ => destination
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
                         };
                         let folder = destination_folder(destination);
                         Some(MoveDestination {
@@ -2352,9 +2381,10 @@ impl Provider<MoveRequest, MoveOutcome> for LspProviders {
                 "destination": destination,
                 "updateReferences": query.update_references,
             });
-            if query.kind == MoveKind::Member {
-                // A member move names the member under the caret in the context of the
-                // action, and the server takes the member that is there.
+            if query.kind != MoveKind::File {
+                // A move of a member or of an instance method names the symbol under the
+                // caret in the context of the action, and the server takes the symbol
+                // that is there.
                 let at = position(query.spot.point);
                 params["params"] = serde_json::json!({
                     "textDocument": {"uri": place.uri.as_str()},

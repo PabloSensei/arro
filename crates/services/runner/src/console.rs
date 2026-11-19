@@ -190,7 +190,9 @@ impl OutputWatch {
 /// What the keeper of a console runs.
 enum Work {
     Plan {
-        plan: RunPlan,
+        /// Boxed, so the two shapes of the console stay close in size: a plan holds two
+        /// commands where a single step holds one.
+        plan: Box<RunPlan>,
         /// The before launch steps of the configuration, in order. Each must end with
         /// success before the next one starts.
         steps: Vec<ProcessSpec>,
@@ -219,7 +221,7 @@ impl Work {
 impl Console {
     pub fn start(plan: RunPlan) -> Self {
         Self::spawn(Work::Plan {
-            plan,
+            plan: Box::new(plan),
             steps: Vec::new(),
             stop_before_start: false,
         })
@@ -231,7 +233,7 @@ impl Console {
     pub fn start_with_steps(plan: RunPlan, steps: Vec<ProcessSpec>, stop: Cancel) -> Self {
         Self::spawn_with(
             Work::Plan {
-                plan,
+                plan: Box::new(plan),
                 steps,
                 stop_before_start: true,
             },
@@ -379,7 +381,7 @@ fn keep(
             plan,
             steps,
             stop_before_start,
-        } => keep_plan(plan, steps, stop_before_start, stop, events, watch, input),
+        } => keep_plan(*plan, steps, stop_before_start, stop, events, watch, input),
         Work::Single { spec, step, grace } => {
             let end = run_step(&spec, step, grace, stop, events, watch, None);
             let _ = events.send(ConsoleEvent::Exited {
@@ -482,6 +484,15 @@ fn run_step(
     watch: &Arc<OutputWatch>,
     input: Option<InputWriter>,
 ) -> StepEnd {
+    // The lines the owner of the command explains, such as a file it had to make
+    // executable, come first in the output of the step.
+    for note in spec.notes() {
+        let _ = events.send(ConsoleEvent::Output {
+            process: 0,
+            stream: Stream::Stdout,
+            text: format!("{note}\n"),
+        });
+    }
     let mut process = match spec.start() {
         Ok(process) => process,
         Err(error) => {
@@ -762,6 +773,23 @@ mod tests {
         assert!(matches!(first, ConsoleEvent::Failed { .. }), "{first:?}");
         let (_, code, _) = to_end(&console);
         assert_eq!(code, None);
+    }
+
+    #[test]
+    fn a_note_of_the_command_comes_before_its_output() {
+        let program = ProcessSpec::new("no-such-program.exe").note("the file is ready");
+        let console = Console::start(plan(None, program));
+
+        let first = console.events().recv_timeout(PATIENCE).unwrap();
+
+        assert_eq!(
+            first,
+            ConsoleEvent::Output {
+                process: 0,
+                stream: Stream::Stdout,
+                text: "the file is ready\n".to_owned(),
+            }
+        );
     }
 
     #[cfg(windows)]
