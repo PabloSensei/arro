@@ -391,7 +391,7 @@ impl TerminalPanel {
     }
 
     /// The client whose bar the panel shows, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn suggestion_client(&self) -> Option<mcp_discovery::Client> {
         self.terminal_suggestion
     }
