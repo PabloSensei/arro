@@ -1871,12 +1871,12 @@ mod tests {
     #[test]
     fn a_problem_of_each_file_keeps_its_own_place() {
         let lines = [
-            "C:\\work\\demo\\src\\Main.txt:[12,5] cannot find symbol".to_string(),
-            "C:\\work\\demo\\src\\Other.txt:[3,2] warning: unused name".to_string(),
-            "C:\\work\\demo\\src\\Main.txt:[20,1] unknown name".to_string(),
+            "/work/demo/src/Main.txt:[12,5] cannot find symbol".to_string(),
+            "/work/demo/src/Other.txt:[3,2] warning: unused name".to_string(),
+            "/work/demo/src/Main.txt:[20,1] unknown name".to_string(),
         ];
 
-        let problems = build_problems(&lines, std::path::Path::new("C:\\work\\demo"));
+        let problems = build_problems(&lines, std::path::Path::new("/work/demo"));
 
         assert_eq!(problems.len(), 3, "{problems:?}");
         assert_eq!(

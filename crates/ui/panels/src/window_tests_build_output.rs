@@ -109,6 +109,8 @@ fn labels(
     panel.read_with(cx, |panel, cx| panel.labels(cx))
 }
 
+// The stand-in build runs `cmd`.
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn a_build_shows_its_errors_and_enter_opens_the_line(cx: &mut TestAppContext) {
     let root = sample_project("build-output-errors");
@@ -203,6 +205,8 @@ fn a_build_shows_its_errors_and_enter_opens_the_line(cx: &mut TestAppContext) {
     });
 }
 
+// The stand-in build runs `cmd`.
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn a_message_opens_on_its_column(cx: &mut TestAppContext) {
     let root = sample_project("build-output-column");
@@ -238,6 +242,8 @@ fn a_message_opens_on_its_column(cx: &mut TestAppContext) {
     });
 }
 
+// The stand-in build runs `cmd`.
+#[cfg(windows)]
 #[ui_kit::gpui::test]
 fn stopping_a_build_keeps_its_output(cx: &mut TestAppContext) {
     let root = sample_project("build-output-stop");
