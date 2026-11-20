@@ -5,8 +5,10 @@
 //! the source that always arrives; the diagnostic, when it comes, names the same
 //! file and line.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use base::program::executable;
 use lsp_client::lsp_types::{Diagnostic, DiagnosticSeverity, Uri};
@@ -46,6 +48,10 @@ pub struct ImportFailure {
     pub jdk: Option<PathBuf>,
     /// The tool that failed, when the report names it.
     pub tool: Option<BuildTool>,
+    /// One more import of the same project may clear this failure without the user
+    /// seeing it. Set for the first failure of a server session that names an
+    /// initialization script the server asks for before it unpacks it.
+    pub retry: bool,
 }
 
 impl ImportFailure {
@@ -58,6 +64,7 @@ impl ImportFailure {
             message,
             jdk: None,
             tool: tool_of(&diagnostic.message, file),
+            retry: false,
         }
     }
 }
@@ -207,6 +214,7 @@ fn from_log(message: &str) -> Option<ImportFailure> {
         summary,
         message: message.to_owned(),
         jdk,
+        retry: false,
     })
 }
 
@@ -243,86 +251,172 @@ pub fn is_build_file(path: &Path) -> bool {
         .is_some_and(|name| BUILD_FILES.contains(&name))
 }
 
-/// Takes the failure out of the messages of the server: the error and warning lines of
-/// the log, the error and warning balloons, and the diagnostics on a build script. A new
-/// import of the project clears the failure, so that an old failure is not shown while
-/// the new one is not known yet. A project status of `OK` does not clear it: the server
-/// sends that status for the project it imported before a reimport fails, so a failure
-/// that arrives while a project is still known would vanish at once.
-pub(crate) fn observe(
-    method: &str,
-    params: &Value,
-    failures: &watch::Sender<Option<ImportFailure>>,
-) {
-    if method == "$/progress" {
-        if import_started(params) && failures.borrow().is_some() {
-            failures.send_replace(None);
-        }
-        return;
-    }
-    // The server reports the failed import of a Gradle project as a warning, not as an
-    // error, so every type of a log line can carry one.
-    if method == "window/logMessage" {
-        let Some(message) = params.get("message").and_then(Value::as_str) else {
-            return;
-        };
-        store(from_log(message), failures);
-        return;
-    }
-    if method == "window/showMessage" {
-        let Some(severity) = params.get("type").and_then(Value::as_i64) else {
-            return;
-        };
-        if !matches!(severity, 1 | 2) {
-            return;
-        }
-        let Some(message) = params.get("message").and_then(Value::as_str) else {
-            return;
-        };
-        store(from_log(message), failures);
-        return;
-    }
-    if method != "textDocument/publishDiagnostics" {
-        return;
-    }
-    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(file) = Uri::from_str(uri).ok().as_ref().and_then(file_path) else {
-        return;
-    };
-    if !is_build_file(&file) {
-        return;
-    }
-    let Some(diagnostics) = params.get("diagnostics").cloned() else {
-        return;
-    };
-    let Ok(diagnostics) = serde_json::from_value::<Vec<Diagnostic>>(diagnostics) else {
-        return;
-    };
-    let failure = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
-        .map(|diagnostic| ImportFailure::from_diagnostic(&file, diagnostic));
-    let current = failures.borrow().clone();
-    match failure {
-        Some(failure) if current.as_ref() != Some(&failure) => {
-            failures.send_replace(Some(failure));
-        }
-        None if current.is_some_and(|current| current.file == file) => {
-            failures.send_replace(None);
-        }
-        _ => {}
-    }
+/// The failures of the imports of the server, and the imports that run now.
+///
+/// The status bar reads both: a failure says why the project is not ready, and an
+/// import in flight says `importing` instead of a line the server left behind.
+pub(crate) struct ImportState {
+    failures: watch::Sender<Option<ImportFailure>>,
+    /// The tokens of the Gradle imports whose progress began and has not ended.
+    running: Mutex<HashSet<String>>,
+    running_now: watch::Sender<bool>,
 }
 
-/// Stores a failure found in a message, and does nothing when the message carries none.
-fn store(failure: Option<ImportFailure>, failures: &watch::Sender<Option<ImportFailure>>) {
-    let Some(failure) = failure else {
-        return;
-    };
-    if failures.borrow().as_ref() != Some(&failure) {
-        failures.send_replace(Some(failure));
+impl ImportState {
+    pub(crate) fn new() -> Self {
+        let (failures, _) = watch::channel(None);
+        let (running_now, _) = watch::channel(false);
+        Self {
+            failures,
+            running: Mutex::new(HashSet::new()),
+            running_now,
+        }
+    }
+
+    pub(crate) fn watch_failure(&self) -> watch::Receiver<Option<ImportFailure>> {
+        self.failures.subscribe()
+    }
+
+    /// Whether a Gradle import runs now. A retry of a failed import shows `importing`
+    /// on this line, the way the first start of the project does.
+    pub(crate) fn watch_running(&self) -> watch::Receiver<bool> {
+        self.running_now.subscribe()
+    }
+
+    /// A new server imports the project again, so an old failure says nothing.
+    pub(crate) fn reset(&self) {
+        self.failures.send_replace(None);
+        self.running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        self.running_now.send_replace(false);
+    }
+
+    /// Takes the failure out of the messages of the server: the error and warning lines
+    /// of the log, the error and warning balloons, and the diagnostics on a build script.
+    /// A new import of the project clears the failure, so that an old failure is not
+    /// shown while the new one is not known yet. A project status of `OK` does not clear
+    /// it: the server sends that status for the project it imported before a reimport
+    /// fails, so a failure that arrives while a project is still known would vanish at
+    /// once.
+    pub(crate) fn observe(&self, method: &str, params: &Value) {
+        if method == "$/progress" {
+            self.progress(params);
+            return;
+        }
+        // The server reports the failed import of a Gradle project as a warning, not as
+        // an error, so every type of a log line can carry one.
+        if method == "window/logMessage" {
+            let Some(message) = params.get("message").and_then(Value::as_str) else {
+                return;
+            };
+            self.store(from_log(message));
+            return;
+        }
+        if method == "window/showMessage" {
+            let Some(severity) = params.get("type").and_then(Value::as_i64) else {
+                return;
+            };
+            if !matches!(severity, 1 | 2) {
+                return;
+            }
+            let Some(message) = params.get("message").and_then(Value::as_str) else {
+                return;
+            };
+            self.store(from_log(message));
+            return;
+        }
+        if method != "textDocument/publishDiagnostics" {
+            return;
+        }
+        let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(file) = Uri::from_str(uri).ok().as_ref().and_then(file_path) else {
+            return;
+        };
+        if !is_build_file(&file) {
+            return;
+        }
+        let Some(diagnostics) = params.get("diagnostics").cloned() else {
+            return;
+        };
+        let Ok(diagnostics) = serde_json::from_value::<Vec<Diagnostic>>(diagnostics) else {
+            return;
+        };
+        let failure = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|diagnostic| ImportFailure::from_diagnostic(&file, diagnostic));
+        let current = self.failures.borrow().clone();
+        match failure {
+            Some(failure) if current.as_ref() != Some(&failure) => {
+                self.failures.send_replace(Some(failure));
+            }
+            None if current.is_some_and(|current| current.file == file) => {
+                self.failures.send_replace(None);
+            }
+            _ => {}
+        }
+    }
+
+    /// A Gradle import keeps the line at `importing` from its begin to its end, and a
+    /// new import makes the failure of the old one say nothing.
+    fn progress(&self, params: &Value) {
+        let Some(value) = params.get("value") else {
+            return;
+        };
+        let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(token) = params.get("token") else {
+            return;
+        };
+        let token = token.to_string();
+        match kind {
+            "begin" => {
+                if !import_started(params) {
+                    return;
+                }
+                self.set_running(&token, true);
+                if self.failures.borrow().is_some() {
+                    self.failures.send_replace(None);
+                }
+            }
+            "end" => self.set_running(&token, false),
+            _ => {}
+        }
+    }
+
+    fn set_running(&self, token: &str, running: bool) {
+        let now = {
+            let mut active = self
+                .running
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if running {
+                active.insert(token.to_owned());
+            } else {
+                active.remove(token);
+            }
+            !active.is_empty()
+        };
+        self.running_now.send_if_modified(|flag| {
+            let changed = *flag != now;
+            *flag = now;
+            changed
+        });
+    }
+
+    /// Stores a failure found in a message, and does nothing when the message carries none.
+    fn store(&self, failure: Option<ImportFailure>) {
+        let Some(failure) = failure else {
+            return;
+        };
+        if self.failures.borrow().as_ref() != Some(&failure) {
+            self.failures.send_replace(Some(failure));
+        }
     }
 }
 
@@ -330,10 +424,13 @@ fn store(failure: Option<ImportFailure>, failures: &watch::Sender<Option<ImportF
 mod tests {
     use std::path::Path;
 
-    use serde_json::json;
-    use tokio::sync::watch;
+    use serde_json::{Value, json};
 
-    use super::{ImportFailure, observe};
+    use super::{ImportFailure, ImportState};
+
+    fn observe(method: &str, params: &Value, state: &ImportState) {
+        state.observe(method, params);
+    }
 
     fn diagnostics(uri: &str, diagnostics: serde_json::Value) -> serde_json::Value {
         json!({"uri": uri, "diagnostics": diagnostics})
@@ -369,7 +466,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_error_on_a_build_script_names_the_file_line_and_cause() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         observe(
             "textDocument/publishDiagnostics",
             &diagnostics(
@@ -381,7 +478,7 @@ mod tests {
             ),
             &failures,
         );
-        let failure = watch.borrow().clone().unwrap();
+        let failure = failures.failures.borrow().clone().unwrap();
         assert!(
             failure.file.ends_with("build.gradle.kts"),
             "{:?}",
@@ -395,7 +492,7 @@ mod tests {
 
     #[test]
     fn diagnostics_of_sources_and_of_warnings_are_not_import_failures() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         observe(
             "textDocument/publishDiagnostics",
             &diagnostics("file:///c:/p/src/App.java", json!([error("bad", 3)])),
@@ -416,19 +513,21 @@ mod tests {
             ),
             &failures,
         );
-        assert!(watch.borrow().is_none());
+        assert!(failures.failures.borrow().is_none());
     }
 
     #[cfg(windows)]
     #[test]
     fn an_empty_list_of_a_script_clears_its_failure_and_keeps_another() {
-        let (failures, watch) = watch::channel(Some(ImportFailure {
+        let failures = ImportState::new();
+        failures.failures.send_replace(Some(ImportFailure {
             file: "C:\\p\\build.gradle.kts".into(),
             line: 4,
             message: "old".into(),
             summary: "old".into(),
             jdk: None,
             tool: None,
+            retry: false,
         }));
 
         observe(
@@ -436,15 +535,16 @@ mod tests {
             &diagnostics("file:///c:/p/build.gradle.kts", json!([])),
             &failures,
         );
-        assert!(watch.borrow().is_none());
+        assert!(failures.failures.borrow().is_none());
 
-        failures.send_replace(Some(ImportFailure {
+        failures.failures.send_replace(Some(ImportFailure {
             file: "C:\\p\\pom.xml".into(),
             line: 1,
             message: "old".into(),
             summary: "old".into(),
             jdk: None,
             tool: None,
+            retry: false,
         }));
         observe(
             "textDocument/publishDiagnostics",
@@ -452,7 +552,8 @@ mod tests {
             &failures,
         );
         assert!(
-            watch
+            failures
+                .failures
                 .borrow()
                 .as_ref()
                 .is_some_and(|failure| failure.file.ends_with("pom.xml"))
@@ -462,7 +563,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_marker_report_in_the_log_names_the_script_its_line_and_cause() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         let message = "Nov 6, 2026 Error occured while building workspace. Details: \r\n \
              message: The supplied phased action failed with an exception.\r\n\
              Build file 'C:\\p\\build.gradle.kts' line: 25\r\n\
@@ -473,7 +574,7 @@ mod tests {
             &json!({"type": 1, "message": message}),
             &failures,
         );
-        let failure = watch.borrow().clone().unwrap();
+        let failure = failures.failures.borrow().clone().unwrap();
         assert!(failure.file.ends_with("build.gradle.kts"));
         assert_eq!(failure.line, 24);
         assert_eq!(
@@ -484,7 +585,7 @@ mod tests {
 
     #[test]
     fn a_stack_trace_without_an_import_report_is_ignored() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         observe(
             "window/logMessage",
             &json!({
@@ -493,13 +594,13 @@ mod tests {
             }),
             &failures,
         );
-        assert!(watch.borrow().is_none());
+        assert!(failures.failures.borrow().is_none());
     }
 
     #[cfg(windows)]
     #[test]
     fn a_report_without_the_marker_names_the_script_line_and_deepest_cause() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         let message = "Nov 6, 2026, 7:04:17 PM Could not fetch model of type 'Map' using \
              connection to Gradle distribution 'https://services.gradle.org/distributions/gradle-9.7.1-bin.zip'.\n\
              org.gradle.tooling.BuildException: Could not fetch model\r\n\
@@ -515,7 +616,7 @@ mod tests {
             &json!({"type": 1, "message": message}),
             &failures,
         );
-        let failure = watch.borrow().clone().unwrap();
+        let failure = failures.failures.borrow().clone().unwrap();
         assert!(failure.file.ends_with("build.gradle"));
         assert_eq!(failure.line, 4);
         assert_eq!(
@@ -526,7 +627,7 @@ mod tests {
 
     #[test]
     fn the_start_of_a_gradle_import_clears_a_failure_from_the_log() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         let message = "Nov 6, 2026 Error occured while building workspace. Details: \r\n \
              Build file 'C:\\p\\build.gradle.kts' line: 25\r\n \
              Task with name 'postRelease' not found in root project 'demo'.; \
@@ -536,7 +637,7 @@ mod tests {
             &json!({"type": 1, "message": message}),
             &failures,
         );
-        assert!(watch.borrow().is_some());
+        assert!(failures.failures.borrow().is_some());
 
         observe(
             "$/progress",
@@ -546,18 +647,20 @@ mod tests {
             }),
             &failures,
         );
-        assert!(watch.borrow().is_none());
+        assert!(failures.failures.borrow().is_none());
     }
 
     #[test]
     fn other_progress_and_source_diagnostics_keep_a_failure() {
-        let (failures, watch) = watch::channel(Some(ImportFailure {
+        let failures = ImportState::new();
+        failures.failures.send_replace(Some(ImportFailure {
             file: "C:\\p\\build.gradle.kts".into(),
             line: 4,
             message: "old".into(),
             summary: "old".into(),
             jdk: None,
             tool: None,
+            retry: false,
         }));
         observe(
             "$/progress",
@@ -574,12 +677,12 @@ mod tests {
             &diagnostics("file:///c:/p/src/App.java", json!([error("bad", 3)])),
             &failures,
         );
-        assert!(watch.borrow().is_some());
+        assert!(failures.failures.borrow().is_some());
     }
 
     #[test]
     fn a_warning_of_a_gradle_import_names_the_removed_jdk() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         let message = "Nov 19, 2026, 7:43:43 PM Synchronize project petclinic failed due to \
              an error connecting to the Gradle build.\n\
              org.gradle.tooling.GradleConnectionException: Could not run phased build action.\n\
@@ -593,7 +696,7 @@ mod tests {
             &json!({"type": 2, "message": message}),
             &failures,
         );
-        let failure = watch.borrow().clone().unwrap();
+        let failure = failures.failures.borrow().clone().unwrap();
         assert_eq!(failure.tool, Some(super::BuildTool::Gradle));
         assert_eq!(
             failure.jdk.as_deref(),
@@ -616,7 +719,7 @@ mod tests {
 
     #[test]
     fn a_project_status_of_ok_does_not_hide_a_failure_of_a_reimport() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         let message = "Could not fetch model of type 'Map' using connection to Gradle \
              distribution 'https://services.gradle.org/distributions/gradle-9.7.1-bin.zip'.\n\
              Caused by: Task with name 'noSuchTask' not found in root project 'demo'.";
@@ -625,7 +728,7 @@ mod tests {
             &json!({"type": 1, "message": message}),
             &failures,
         );
-        assert!(watch.borrow().is_some());
+        assert!(failures.failures.borrow().is_some());
         // The server reports `OK` for the project it imported before the failed reimport,
         // so the failure must stay until a new import starts.
         observe(
@@ -633,7 +736,7 @@ mod tests {
             &json!({"type": "ProjectStatus", "message": "OK"}),
             &failures,
         );
-        assert!(watch.borrow().is_some());
+        assert!(failures.failures.borrow().is_some());
 
         observe(
             "$/progress",
@@ -644,14 +747,14 @@ mod tests {
             &failures,
         );
         assert!(
-            watch.borrow().is_none(),
+            failures.failures.borrow().is_none(),
             "a new import clears the old failure"
         );
     }
 
     #[test]
     fn an_error_balloon_can_carry_the_failure_too() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         let message = "Could not fetch model of type 'Map'.\n\
              Caused by: java.lang.IllegalStateException: the build cannot start";
         observe(
@@ -659,18 +762,65 @@ mod tests {
             &json!({"type": 1, "message": message}),
             &failures,
         );
-        let failure = watch.borrow().clone().unwrap();
+        let failure = failures.failures.borrow().clone().unwrap();
         assert_eq!(failure.summary, "the build cannot start");
     }
 
     #[test]
     fn another_method_is_ignored() {
-        let (failures, watch) = watch::channel(None);
+        let failures = ImportState::new();
         observe(
             "window/logMessage",
             &json!({"type": 1, "message": "Build file 'C:\\p\\build.gradle' line: 2"}),
             &failures,
         );
-        assert!(watch.borrow().is_none());
+        assert!(failures.failures.borrow().is_none());
+    }
+
+    #[test]
+    fn a_gradle_import_runs_from_its_begin_to_its_end() {
+        let failures = ImportState::new();
+        let running = failures.watch_running();
+        observe(
+            "$/progress",
+            &json!({
+                "token": "1",
+                "value": {"kind": "begin", "title": "Importing Gradle project(s)"}
+            }),
+            &failures,
+        );
+        assert!(*running.borrow(), "the import began");
+
+        observe(
+            "$/progress",
+            &json!({"token": "1", "value": {"kind": "report", "message": "half"}}),
+            &failures,
+        );
+        assert!(*running.borrow(), "a report does not end the import");
+
+        observe(
+            "$/progress",
+            &json!({"token": "1", "value": {"kind": "end"}}),
+            &failures,
+        );
+        assert!(!*running.borrow(), "the import ended");
+    }
+
+    #[test]
+    fn another_progress_does_not_count_as_an_import() {
+        let failures = ImportState::new();
+        let running = failures.watch_running();
+        observe(
+            "$/progress",
+            &json!({"token": "1", "value": {"kind": "begin", "title": "Building"}}),
+            &failures,
+        );
+        assert!(!*running.borrow());
+        observe(
+            "$/progress",
+            &json!({"token": "1", "value": {"kind": "end"}}),
+            &failures,
+        );
+        assert!(!*running.borrow());
     }
 }

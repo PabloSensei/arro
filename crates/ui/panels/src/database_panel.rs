@@ -4344,6 +4344,20 @@ impl DatabasePanel {
         }
     }
 
+    /// Data Sources and Drivers from Find Action: the window opens on the first connection, or on
+    /// a new one when there is none. The panel learns its window when it is drawn, and it is not
+    /// drawn before the Database tool has been shown, so the command passes its own window on.
+    pub(crate) fn open_data_sources_from(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = window.window_handle().downcast::<Workspace>() {
+            self.window = Some(handle);
+        }
+        let opening = self
+            .sources
+            .first()
+            .map_or(Opening::New, |source| Opening::Edit(source.id.clone()));
+        self.open_data_sources(opening, cx);
+    }
+
     /// Opens the Data Sources window on a new connection, or on the connection `opening` names.
     /// The window is built after the update of the panel is over, so it may read the panel.
     pub(crate) fn open_data_sources(&mut self, opening: Opening, cx: &mut Context<Self>) {

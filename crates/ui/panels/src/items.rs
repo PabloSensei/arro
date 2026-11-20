@@ -325,6 +325,12 @@ impl ItemsPanel {
         cx.notify();
     }
 
+    /// The text of an empty list, for the tests.
+    #[cfg(test)]
+    pub(crate) fn empty_text(&self) -> String {
+        self.empty.to_string()
+    }
+
     /// The buttons of the header, for the tests.
     #[cfg(test)]
     pub(crate) fn header_buttons(&self) -> &[HeaderButton] {

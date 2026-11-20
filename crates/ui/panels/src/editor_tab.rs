@@ -1248,6 +1248,26 @@ fn open(
                 })
                 .ok();
         }
+        EditorEvent::UsagesWaiting {
+            name,
+            in_file,
+            cancel,
+        } => {
+            let Some(hub) = cx.try_global::<ActiveUsages>() else {
+                return;
+            };
+            let hub = hub.0.clone();
+            let (name, in_file, cancel) = (name.clone(), *in_file, cancel.clone());
+            hub.update(cx, |hub, cx| hub.wait_for_search(name, in_file, cancel, cx));
+            let workspace = reports.clone();
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_tool(USAGES_TOOL, window, cx))
+                        .ok();
+                })
+                .ok();
+        }
         EditorEvent::ShowUsages(update) => {
             let update = update.clone();
             let current = view.read(cx).path().to_path_buf();

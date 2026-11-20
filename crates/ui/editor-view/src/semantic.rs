@@ -37,7 +37,14 @@ use crate::view::{EditorEvent, EditorView};
 use crate::{DocBlock, DocInline};
 
 pub(crate) const NO_ANSWER: &str = "The language server did not answer, try again";
+/// The note of a question that needs the language server while the server imports.
+pub(crate) const WAITING_NOTE: &str =
+    "Waiting for the language server to finish importing the project…";
+/// The line of the completion list while the server imports: its entries are not all there.
+pub(crate) const IMPORTING_RESULTS: &str = "The project is still importing, results are incomplete";
 pub(crate) const MAX_SHOWN: usize = 12;
+/// The most words of the file a completion list takes while the server imports.
+const MAX_IMPORTING_WORDS: usize = 200;
 
 /// The wait before the semantic tokens are asked for after an edit, in milliseconds.
 const TOKENS_DELAY_MS: u64 = 250;
@@ -147,6 +154,12 @@ pub(crate) fn offset_at(store: &RopeStore, point: TextPoint) -> usize {
 
 pub(crate) fn is_word(character: char) -> bool {
     character.is_alphanumeric() || character == '_' || character == '$'
+}
+
+/// Whether a name starts right at `offset`, so the caret stands in front of a name it may
+/// replace, as in `pet.|getName()`.
+pub(crate) fn identifier_after(store: &RopeStore, offset: usize) -> bool {
+    store.char_at(offset).is_some_and(is_word)
 }
 
 /// The start of the word that ends at `offset`.
@@ -740,6 +753,30 @@ fn completion_keys(entry: &CompletionEntry) -> Vec<String> {
     keys
 }
 
+/// The words of the file that a list takes while the server imports: the words that start
+/// with the typed prefix, except the word under the caret and the labels the list has.
+fn importing_words(
+    text: &str,
+    prefix: &str,
+    caret: usize,
+    known: &[CompletionEntry],
+) -> Vec<CompletionEntry> {
+    let known: HashSet<&str> = known.iter().map(|entry| entry.label.as_str()).collect();
+    let mut seen = HashSet::new();
+    crate::hippie::all(text, prefix)
+        .into_iter()
+        .filter(|range| !(range.start <= caret && caret <= range.end))
+        .map(|range| &text[range])
+        .filter(|word| *word != prefix && !known.contains(*word) && seen.insert(*word))
+        .take(MAX_IMPORTING_WORDS)
+        .map(|word| CompletionEntry {
+            label: word.to_owned(),
+            kind: CompletionKind::Text,
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Local templates and the server may offer the same key; the local one, which has no
 /// `sort_text`, stays and the server entry goes. Only the server's own templates are
 /// dropped (snippets without a call in the label): a field or a method that happens to
@@ -1000,21 +1037,27 @@ fn completion_key(entry: &CompletionEntry) -> String {
 }
 
 /// Where an entry stands when the prefix matches it equally well: a template of the
-/// editor, a member or a local, then a type. Among types a name the language prefers
-/// comes before a rare one and before a type of a library.
+/// editor, a member or a local, then a postfix template after the members of the
+/// expression, then a type. Among types a name the language prefers comes before a rare
+/// one and before a type of a library.
 fn entry_class(entry: &CompletionEntry, preferred: &[&str]) -> u8 {
+    let is_type =
+        entry.kind.is_type() || (entry.kind == CompletionKind::Unknown && looks_like_type(entry));
+    // A postfix template lists after the members of the expression before it, as in IDEA,
+    // whether the editor or the server offers it.
+    if !is_type && is_postfix_snippet(entry) {
+        return 2;
+    }
     // Entries without a `sortText` are the local templates, which stay in front.
     if entry.sort_text.is_none() {
         return 0;
     }
-    let is_type =
-        entry.kind.is_type() || (entry.kind == CompletionKind::Unknown && looks_like_type(entry));
     if !is_type {
         return 1;
     }
     let name = entry.label.split(" - ").next().unwrap_or(&entry.label);
     let name = name.split('(').next().unwrap_or(name).trim();
-    if preferred.contains(&name) { 2 } else { 3 }
+    if preferred.contains(&name) { 3 } else { 4 }
 }
 
 /// The indices of `entries` in the order the list shows them for `prefix`. An entry that
@@ -1814,6 +1857,11 @@ pub(crate) struct Lsp {
     pub rename: Option<RenameField>,
     /// Shift+F6 changes the name in the text of this file itself.
     pub rename_in_place: Option<crate::rename::RenameInPlace>,
+    /// Counts the modes of Shift+F6, so that an answer for an earlier mode is dropped.
+    pub(crate) rename_session: u64,
+    /// The name the mode changed is renamed across the project: the rename waits for the
+    /// answer of the language, and typing in the meantime says so.
+    pub(crate) rename_pending: bool,
     /// The name an extract introduced, ready to be typed over.
     pub name: Option<crate::refactor::ExtractNameField>,
     pub move_to: Option<MoveField>,
@@ -2219,6 +2267,8 @@ impl EditorView {
             actions: None,
             rename: None,
             rename_in_place: None,
+            rename_session: 0,
+            rename_pending: false,
             name: None,
             move_to: None,
             workspace_undo: None,
@@ -2756,6 +2806,13 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.show_note(at, text, cx);
+        self.linger_note(cx);
+    }
+
+    /// Takes the note on screen away after a while, unless another message replaced it by
+    /// then. A note set without `show_note`, such as one beside a list that stays open,
+    /// lingers the same way.
+    pub(crate) fn linger_note(&mut self, cx: &mut Context<Self>) {
         let shown = self
             .lsp
             .as_ref()
@@ -2781,6 +2838,24 @@ impl EditorView {
             })
             .ok();
         }));
+    }
+
+    /// The note of a key that asks the language server while the server imports the
+    /// project. It shows at once, so the key never looks dead.
+    pub(crate) fn importing_note(&mut self, at: usize, cx: &mut Context<Self>) {
+        if !self.server_ready() {
+            self.show_transient_note(at, WAITING_NOTE, cx);
+        }
+    }
+
+    /// The note of a question the server did not answer. While the server imports, the
+    /// note says so instead, and it fades as the notes of a waiting question do.
+    pub(crate) fn show_unanswered(&mut self, at: usize, transient: bool, cx: &mut Context<Self>) {
+        match (self.server_ready(), transient) {
+            (true, true) => self.show_transient_note(at, NO_ANSWER, cx),
+            (true, false) => self.show_note(at, NO_ANSWER, cx),
+            (false, _) => self.show_transient_note(at, WAITING_NOTE, cx),
+        }
     }
 
     /// A command that found nothing to do says so in the status bar of the window, not at
@@ -2924,12 +2999,20 @@ impl EditorView {
         self.completion_task = None;
         self.completion_doc_task = None;
         let case = self.options.completion_case;
+        // While the server imports it gives no answer yet, so the list says so at once.
+        let ready = self.server_ready();
+        if !ready && explicit {
+            self.show_transient_note(caret, IMPORTING_RESULTS, cx);
+        }
         // A server that offers postfix snippets knows the types better than the local
-        // templates; they are a fallback for a language without such a server.
-        let server_postfix = self
-            .lsp
-            .as_ref()
-            .is_some_and(|lsp| lsp.support.completion().is_some());
+        // templates; they are a fallback for a language without such a server, and the
+        // local templates stand in while the server imports.
+        let server_postfix = ready
+            && self
+                .lsp
+                .as_ref()
+                .is_some_and(|lsp| lsp.support.completion().is_some());
+        let postfix_local = mode == CompletionMode::All && !server_postfix;
         let (Some(lsp), Some(state)) = (&mut self.lsp, &self.state) else {
             return;
         };
@@ -2952,6 +3035,14 @@ impl EditorView {
         };
         if mode == CompletionMode::All && !server_postfix {
             local.extend(self.live.postfix_completions(state));
+        }
+        // While the server imports, the words of the file stand in for the entries it has
+        // not given yet, as IDEA's cyclic expand word offers them.
+        if mode == CompletionMode::All && !ready {
+            let prefix = state.store().slice(start..caret);
+            let text = state.text();
+            let words = importing_words(&text, &prefix, caret, &local);
+            local.extend(words);
         }
         lsp.asked += 1;
         let asked = lsp.asked;
@@ -3008,6 +3099,7 @@ impl EditorView {
                 // A server that sends no postfix snippets leaves that part of the list to
                 // the templates of the editor, which carry their descriptions.
                 let fallback = if mode == CompletionMode::All
+                    && !postfix_local
                     && !list.entries.iter().any(is_postfix_snippet)
                 {
                     this.state
@@ -3024,7 +3116,8 @@ impl EditorView {
                 if lsp.asked != asked || caret < start {
                     return;
                 }
-                if confidence == Confidence::Unknown && explicit {
+                // While the server imports, the note that says so is already on screen.
+                if confidence == Confidence::Unknown && explicit && ready {
                     lsp.note = Some(Note {
                         at: caret,
                         text: NO_ANSWER.into(),
@@ -3032,7 +3125,13 @@ impl EditorView {
                 }
                 let mut local = local;
                 local.extend(fallback);
-                let entries = visible_entries(list.entries, mode, expected.as_deref());
+                let mut server = list.entries;
+                // A postfix template of the server is not offered with a name right after
+                // the caret either, as the editor's own templates are not.
+                if identifier_after(&state.store(), caret) {
+                    server.retain(|entry| !is_postfix_snippet(entry));
+                }
+                let entries = visible_entries(server, mode, expected.as_deref());
                 let entries = merge_completions(local, entries);
                 let completion = Completion::with_usage(
                     start,
@@ -3631,6 +3730,7 @@ impl EditorView {
             None => return,
         };
         let replies = ask(provider, NavigationQuery { kind, spot });
+        self.importing_note(caret, cx);
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
             this.update(cx, |this, cx| {
@@ -3671,12 +3771,10 @@ impl EditorView {
                         if let Some(target) = lookup(&word) {
                             this.go_to_location(&target, cx);
                         } else {
-                            this.show_transient_note(caret, NO_ANSWER, cx);
+                            this.show_unanswered(caret, true, cx);
                         }
                     }
-                    Some((_, Confidence::Unknown)) => {
-                        this.show_transient_note(caret, NO_ANSWER, cx)
-                    }
+                    Some((_, Confidence::Unknown)) => this.show_unanswered(caret, true, cx),
                     Some(_) if fallback.is_some() => {
                         let (lookup, word) = fallback.unwrap();
                         if let Some(target) = lookup(&word) {
@@ -3860,6 +3958,7 @@ impl EditorView {
             return;
         };
         let replies = ask(provider, spot);
+        self.importing_note(caret, cx);
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
             this.update(cx, |this, cx| match answer {
@@ -3868,13 +3967,29 @@ impl EditorView {
                     let diagnostic = this.diagnostic_at(caret);
                     this.show_quick_doc(caret, blocks, diagnostic, None, cx);
                 }
-                Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
+                Some((_, Confidence::Unknown)) => this.show_unanswered(caret, false, cx),
                 Some(_) => this.show_note(caret, "No documentation found", cx),
                 None => {}
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Ctrl+P. While the server imports, the note says so. The requests that follow a typed
+    /// bracket or an accepted entry call `parameter_info` directly and raise no note.
+    pub(crate) fn parameter_info_key(&mut self, cx: &mut Context<Self>) {
+        let Some((_, caret)) = self.spot() else {
+            return;
+        };
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.support.signature_info().is_some())
+        {
+            self.importing_note(caret, cx);
+        }
+        self.parameter_info(cx);
     }
 
     /// Ctrl+P: the overloads of the call around the caret, the active parameter bold.
@@ -3928,6 +4043,14 @@ impl EditorView {
                 {
                     popup.selected = found;
                     maybe_clamp_parameter(popup);
+                }
+                // The signatures take the place of the note that said the server imports.
+                if lsp
+                    .note
+                    .as_ref()
+                    .is_some_and(|note| note.text.as_ref() == WAITING_NOTE)
+                {
+                    lsp.note = None;
                 }
                 lsp.signatures = popup;
                 cx.notify();

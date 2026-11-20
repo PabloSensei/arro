@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 
+use lang_api::{Confidence, PrepareRename};
 use text_core::{Change, Edit, EditKind, Selection, SelectionSet};
 
 use crate::actions::word_ranges;
@@ -26,6 +27,55 @@ pub(crate) struct RenameInPlace {
     version: u64,
     /// The first typed character replaces the whole name, which starts selected.
     selected: bool,
+    /// The mode of one Shift+F6, as `Lsp::rename_session` counts it: a late answer for
+    /// another mode is dropped.
+    pub(crate) session: u64,
+    /// The language has not answered about the name yet, so Enter waits for it.
+    pub(crate) waiting: bool,
+    /// Enter came while the language was asked: the rename runs when the answer comes.
+    pub(crate) finish_when_ready: bool,
+}
+
+/// The message while the language has not answered about the name.
+pub(crate) const WAITING_FOR_LANGUAGE: &str = "Waiting for the language server…";
+/// The message when the language cannot rename the name across the project yet.
+pub(crate) const NOT_READY: &str =
+    "The language server is not ready, the rename stays in this file";
+/// The message when the language refuses the name.
+pub(crate) const REFUSED: &str = "This name cannot be renamed";
+
+/// What the language's answer about the name at the caret means for the mode.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PrepareOutcome {
+    /// The language renames the name here: the mode goes on.
+    Accepted,
+    /// The language refuses the name: the text goes back and the status bar says so.
+    Refused,
+    /// No answer arrived, most likely because the text changed under the question.
+    Stale,
+    /// The language did not answer: it is not running, busy, or unsure.
+    NotReady,
+}
+
+/// The outcome of the answer to the question about the name at the caret.
+pub(crate) fn prepare_outcome(
+    answer: &Option<(Option<PrepareRename>, Confidence)>,
+) -> PrepareOutcome {
+    match answer {
+        Some((Some(_), Confidence::Certain)) => PrepareOutcome::Accepted,
+        Some((None, Confidence::Certain)) => PrepareOutcome::Refused,
+        Some(_) => PrepareOutcome::NotReady,
+        None => PrepareOutcome::Stale,
+    }
+}
+
+/// Whether the word at the caret can start the mode without the language: a name, not a
+/// number and not a word the language reserves.
+pub(crate) fn can_rename_in_place(name: &str, reserved: bool) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|character| is_word(character) && !character.is_ascii_digit())
+        && !reserved
 }
 
 fn problem_for(name: &str, reserved: bool) -> Option<&'static str> {
@@ -72,6 +122,9 @@ impl RenameInPlace {
             problem: None,
             version: state.version(),
             selected: true,
+            session: 0,
+            waiting: false,
+            finish_when_ready: false,
         })
     }
 
@@ -105,6 +158,12 @@ impl RenameInPlace {
         self.write(state, &text, reserved)
     }
 
+    /// Replaces every occurrence with `text`, as one step of undo. The name the language
+    /// did not rename goes back into the places it left this way.
+    pub(crate) fn replace_all(&mut self, state: &mut EditorState, text: &str) -> Option<Change> {
+        self.write(state, text, false)
+    }
+
     /// Deletes the last typed character from every occurrence.
     pub(crate) fn backspace(&mut self, state: &mut EditorState, reserved: bool) -> Option<Change> {
         if self.selected {
@@ -115,15 +174,18 @@ impl RenameInPlace {
         self.write(state, &text, reserved)
     }
 
-    /// Escape: the original name comes back into every occurrence.
+    /// Escape: the original name comes back into every occurrence. The revert is an edit
+    /// of its own, so the buffer would look changed: when the text is the saved one again,
+    /// the buffer is clean.
     pub(crate) fn cancel(&mut self, state: &mut EditorState) -> Option<Change> {
-        if self.text == self.original {
-            self.selected = false;
-            return None;
-        }
-        let original = self.original.clone();
-        let change = self.replace(state, &original, false);
+        let change = if self.text == self.original {
+            None
+        } else {
+            let original = self.original.clone();
+            self.replace(state, &original, false)
+        };
         self.selected = false;
+        state.settle_saved_text();
         change
     }
 
@@ -216,8 +278,9 @@ mod tests {
     use keymap::editor as actions;
     use text_core::FileFormat;
 
-    use super::RenameInPlace;
+    use super::{NOT_READY, PrepareOutcome, RenameInPlace, can_rename_in_place, prepare_outcome};
     use crate::state::EditorState;
+    use lang_api::{Confidence, PrepareRename};
 
     fn state(text: &str) -> EditorState {
         EditorState::new(text, FileFormat::default(), None, false)
@@ -312,5 +375,67 @@ mod tests {
             Some("A reserved word cannot be a name")
         );
         assert_eq!(super::problem_for("value", false), None);
+    }
+
+    #[test]
+    fn typing_changes_every_occurrence_before_the_language_answers() {
+        let mut state = state("alpha beta alpha\n");
+        let mut rename = rename(&state, 0..5);
+        rename.waiting = true;
+
+        type_in(&mut rename, &mut state, "delta");
+
+        assert_eq!(state.text(), "delta beta delta\n");
+        assert!(rename.waiting, "the typing does not wait for the answer");
+    }
+
+    #[test]
+    fn a_late_refusal_puts_the_original_name_back_and_leaves_the_buffer_clean() {
+        let mut state = state("alpha beta alpha\n");
+        let mut rename = rename(&state, 0..5);
+        type_in(&mut rename, &mut state, "de");
+        assert!(state.is_dirty());
+
+        assert_eq!(
+            prepare_outcome(&Some((None, Confidence::Certain))),
+            PrepareOutcome::Refused
+        );
+        rename.cancel(&mut state);
+
+        assert_eq!(state.text(), "alpha beta alpha\n");
+        assert!(!state.is_dirty(), "the text is the saved one again");
+    }
+
+    #[test]
+    fn the_answer_of_the_language_decides_what_the_mode_does() {
+        assert_eq!(
+            prepare_outcome(&Some((
+                Some(PrepareRename { span: None }),
+                Confidence::Certain
+            ))),
+            PrepareOutcome::Accepted
+        );
+        assert_eq!(
+            prepare_outcome(&Some((None, Confidence::Unknown))),
+            PrepareOutcome::NotReady
+        );
+        assert_eq!(prepare_outcome(&None), PrepareOutcome::Stale);
+    }
+
+    #[test]
+    fn a_number_or_a_reserved_word_does_not_start_the_mode() {
+        assert!(can_rename_in_place("pet", false));
+        assert!(can_rename_in_place("_pet2", false));
+        assert!(!can_rename_in_place("42", false));
+        assert!(!can_rename_in_place("for", true));
+        assert!(!can_rename_in_place("", false));
+    }
+
+    #[test]
+    fn the_message_when_the_language_is_not_ready_says_the_name_stays() {
+        assert_eq!(
+            NOT_READY,
+            "The language server is not ready, the rename stays in this file"
+        );
     }
 }

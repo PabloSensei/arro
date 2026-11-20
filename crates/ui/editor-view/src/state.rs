@@ -641,6 +641,14 @@ impl EditorState {
         }
     }
 
+    /// The buffer is clean when its text is the saved text again. The history cannot say
+    /// so after an edit that brings the text back, so this asks the text itself.
+    pub(crate) fn settle_saved_text(&mut self) {
+        if self.buffer.text() == self.saved_text {
+            self.buffer.mark_saved();
+        }
+    }
+
     /// The file changed on disk and was read again. A clean buffer takes the new text as
     /// one external edit, so undo can take it back. A dirty buffer keeps its edits and
     /// `Err` comes back: the user decides.

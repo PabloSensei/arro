@@ -232,6 +232,7 @@ fn failure(root: &Path, log: PathBuf) -> ProjectProblem {
         summary: "Task with name 'postRelease' not found.".to_owned(),
         log: Some(log),
         tool: Some(1),
+        retry: false,
     }
 }
 

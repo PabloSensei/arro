@@ -32,6 +32,7 @@ use crate::blocks::{brace_pairs, enclosing_block};
 use crate::element::{ANNOTATE_WIDTH, EditorElement, GUTTER_WIDTH, Layout, StripeKind, TEXT_INSET};
 use crate::live::LiveTemplates;
 use crate::refactor::Refactoring;
+use crate::rename::WAITING_FOR_LANGUAGE;
 use crate::scrollbar::{Axis, Drag};
 use crate::semantic::{
     CompletionMode, Lsp, Reveals, completion_doc_rows, completion_kind_icon, location_label,
@@ -753,6 +754,13 @@ pub enum EditorEvent {
     UsagesDetailedInFile(Vec<DetailedUsage>),
     /// Ctrl+Alt+F7: the uses of the symbol, for the popup at the caret.
     ShowUsages(UsagesUpdate),
+    /// Alt+F7 or Ctrl+F7 while the language server imports: the Usages window opens with a
+    /// waiting line. The search runs by itself when the server is ready; `cancel` ends the wait.
+    UsagesWaiting {
+        name: String,
+        in_file: bool,
+        cancel: ::base::Cancel,
+    },
     /// A right click in the text: the window shows the menu of the editor here.
     ContextMenu(Point<Pixels>),
     /// A right click in the gutter of the line numbers: the window shows the menu of the
@@ -1402,7 +1410,7 @@ impl EditorView {
                 .as_ref()
                 .is_some_and(|lsp| lsp.rename_in_place.is_some())
             {
-                view.finish_rename_in_place(cx);
+                view.leave_rename_in_place(cx);
             }
         })
         .detach();
@@ -2276,6 +2284,13 @@ impl EditorView {
     pub fn completion_rows(&self) -> Option<Vec<String>> {
         let completion = self.lsp.as_ref()?.completion.as_ref()?;
         Some(completion.labels())
+    }
+
+    /// The text of the note under the caret, when one is on screen. A test reads it; nothing
+    /// else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_text(&self) -> Option<String> {
+        Some(self.lsp.as_ref()?.note.as_ref()?.text.to_string())
     }
 
     /// The rows of an open completion list on screen and the selected one. A test reads
@@ -4482,7 +4497,7 @@ impl EditorView {
             actions::EXTERNAL_DOC => return self.external_doc(cx),
             actions::HIPPIE_COMPLETION => return self.hippie(true, cx),
             actions::HIPPIE_BACKWARD_COMPLETION => return self.hippie(false, cx),
-            actions::PARAMETER_INFO => return self.parameter_info(cx),
+            actions::PARAMETER_INFO => return self.parameter_info_key(cx),
             actions::GOTO_DECLARATION => return self.navigate(NavigationKind::Definition, cx),
             actions::GOTO_IMPLEMENTATION => {
                 return self.navigate(NavigationKind::Implementation, cx);
@@ -5047,7 +5062,7 @@ impl EditorView {
             .as_ref()
             .is_some_and(|lsp| lsp.rename_in_place.is_some())
         {
-            self.finish_rename_in_place(cx);
+            self.leave_rename_in_place(cx);
         }
         self.cancel_hover();
         self.close_quick_doc(cx);
@@ -6508,7 +6523,11 @@ impl EditorView {
                     .gap(px(SPACE_S))
                     .when(selected, |row| row.bg(theme.selection))
                     .when(nested, |row| row.pl(px(SPACE_L)))
-                    .text_color(theme.text);
+                    .text_color(if menu.rows[row].is_waiting() {
+                        theme.text_muted
+                    } else {
+                        theme.text
+                    });
                 if sections {
                     item = item.child(icon_sized(
                         if quick_fix {
@@ -6686,9 +6705,11 @@ impl EditorView {
             && let Some((position, anchor)) =
                 self.popup_position(rename.main_start(), self.style.line_height + 2. * SPACE_S)
         {
-            let hint = rename
-                .problem
-                .unwrap_or("Enter to rename, Escape to cancel · Shift+F6 for more options");
+            let hint = rename.problem.unwrap_or(if rename.waiting {
+                WAITING_FOR_LANGUAGE
+            } else {
+                "Enter to rename, Escape to cancel · Shift+F6 for more options"
+            });
             let body = surface(&theme)
                 .debug_selector(|| "rename-in-place-hint".to_owned())
                 .max_w(px(720.))

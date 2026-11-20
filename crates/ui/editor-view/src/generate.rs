@@ -12,6 +12,9 @@ use crate::actions::Pick;
 use crate::semantic::{NO_ANSWER, first};
 use crate::view::{EditorEvent, EditorView};
 
+/// The status bar line of a row that asks the language server while the server is not ready.
+const SERVER_NOT_READY: &str = "The language server is not ready yet";
+
 /// The popup with a checkbox for each field or method a generation may include.
 pub(crate) struct GeneratePopup {
     pub at: usize,
@@ -154,6 +157,9 @@ impl EditorView {
         };
         let text = state.text();
         let path = self.path().to_path_buf();
+        // A server that imports or has failed answers late or not at all, so its questions are
+        // not asked then: the rows come from the symbols of the class, as when it does not know.
+        let ready = support.server_ready();
         let version = spot.version;
         cx.spawn(async move |this, cx| {
             // The symbols block, so they are read off the UI thread.
@@ -172,16 +178,20 @@ impl EditorView {
                 return;
             };
             // Every question starts before the first answer is awaited, so they run together.
-            let asked: Vec<_> = kinds
-                .iter()
-                .map(|kind| {
-                    let query = GenerateQuery {
-                        spot: spot.clone(),
-                        kind: *kind,
-                    };
-                    (*kind, ask(provider, query))
-                })
-                .collect();
+            let asked: Vec<_> = if ready {
+                kinds
+                    .iter()
+                    .map(|kind| {
+                        let query = GenerateQuery {
+                            spot: spot.clone(),
+                            kind: *kind,
+                        };
+                        (*kind, ask(provider, query))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let mut answers = Vec::with_capacity(asked.len());
             for (kind, replies) in asked {
                 answers.push((kind, known(first(replies).await)));
@@ -227,8 +237,19 @@ impl EditorView {
         });
     }
 
+    /// Whether the language server answers now. A row that asks it says so while it cannot.
+    pub(crate) fn server_ready(&self) -> bool {
+        self.lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.support.server_ready())
+    }
+
     /// A row of the Generate list is chosen.
     pub(crate) fn start_generation(&mut self, kind: GenerateKind, cx: &mut Context<Self>) {
+        if !self.server_ready() {
+            self.report_status(SERVER_NOT_READY, cx);
+            return;
+        }
         if kind == GenerateKind::OverrideMethods {
             return self.override_methods(false, cx);
         }
@@ -376,6 +397,10 @@ impl EditorView {
         handles: Vec<String>,
         cx: &mut Context<Self>,
     ) {
+        if !self.server_ready() {
+            self.report_status(SERVER_NOT_READY, cx);
+            return;
+        }
         let Some(provider) = self
             .lsp
             .as_ref()

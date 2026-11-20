@@ -99,6 +99,9 @@ struct RenameLanguage {
     rename_queries: Mutex<Vec<RenameQuery>>,
     closed: Mutex<Option<PathBuf>>,
     refuse: Mutex<bool>,
+    /// The preparation questions the language keeps open while it is silent.
+    held: Mutex<Vec<lang_api::Reply<Option<PrepareRename>>>>,
+    silent: Mutex<bool>,
 }
 
 impl RenameLanguage {
@@ -109,12 +112,26 @@ impl RenameLanguage {
             rename_queries: Mutex::new(Vec::new()),
             closed: Mutex::new(None),
             refuse: Mutex::new(false),
+            held: Mutex::new(Vec::new()),
+            silent: Mutex::new(false),
         })
     }
 
     /// The language no longer prepares a name: the editor must not start the mode.
     fn refuse_rename(&self) {
         *self.refuse.lock().unwrap() = true;
+    }
+
+    /// The language does not answer the preparation until `answer_held` gives it an answer.
+    fn be_silent(&self) {
+        *self.silent.lock().unwrap() = true;
+    }
+
+    /// Answers the last preparation question the language kept open.
+    fn answer_held(&self, answer: Option<PrepareRename>, confidence: Confidence) {
+        if let Some(mut reply) = self.held.lock().unwrap().pop() {
+            let _ = reply.send(Answer::new(answer, confidence, SOURCE));
+        }
     }
 
     /// A file the rename changes without it being open in a tab.
@@ -169,6 +186,10 @@ impl Provider<DocumentSpot, Option<PrepareRename>> for RenameLanguage {
         _: base::Cancel,
         mut reply: lang_api::Reply<Option<PrepareRename>>,
     ) {
+        if *self.silent.lock().unwrap() {
+            self.held.lock().unwrap().push(reply);
+            return;
+        }
         if *self.refuse.lock().unwrap() {
             let _ = reply.send(Answer::new(None, Confidence::Certain, SOURCE));
             return;
@@ -450,6 +471,222 @@ fn a_name_the_language_refuses_leaves_the_text_alone_and_says_so_in_the_status_b
             .unwrap()
             .as_deref(),
         Some("This name cannot be renamed"),
+        "the status bar says why nothing happened"
+    );
+}
+
+/// The method the silent tests change: the loop variable and the argument are `pet`.
+const METHOD: &str =
+    "void visit(List<Pet> pets) {\n    for (Pet pet : pets) {\n        feed(pet);\n    }\n}\n";
+/// `METHOD` once the name `pet` became `Zz` in every place.
+const RENAMED: &str =
+    "void visit(List<Pet> pets) {\n    for (Pet Zz : pets) {\n        feed(Zz);\n    }\n}\n";
+
+#[ui_kit::gpui::test]
+fn typing_changes_every_place_of_the_name_while_the_language_is_silent(cx: &mut TestAppContext) {
+    let root = project("rename-in-place-silent", &[("src/Owner.txt", METHOD)]);
+    let owner = root.join("src").join("Owner.txt");
+    let language = RenameLanguage::new();
+    language.be_silent();
+    let window = open_window(cx, root.clone(), language.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &owner);
+    let view = editor_of(cx, window, &owner);
+    view.update(cx, |view, cx| view.restore_caret(1, 13, cx));
+    draw(cx, window);
+
+    press(cx, window, "shift-f6");
+    draw(cx, window);
+    assert!(
+        shown(cx, window, "rename-in-place-hint"),
+        "Shift+F6 starts at once, without an answer of the language"
+    );
+
+    type_text(cx, window, "Zz");
+    draw(cx, window);
+    assert_eq!(
+        buffer_of(cx, &view),
+        RENAMED,
+        "every place of the name follows the typing"
+    );
+
+    press(cx, window, "escape");
+    draw(cx, window);
+    assert_eq!(buffer_of(cx, &view), METHOD, "Escape puts the text back");
+    assert!(
+        !view.read_with(&*cx, |view, _| view.is_dirty()),
+        "the file is not changed"
+    );
+    assert_eq!(fs::read_to_string(&owner).unwrap(), METHOD);
+    assert!(language.queries().is_empty(), "nothing was asked to rename");
+}
+
+#[ui_kit::gpui::test]
+fn a_late_refusal_puts_the_text_back_and_says_so_in_the_status_bar(cx: &mut TestAppContext) {
+    let root = project("rename-in-place-late-refusal", &[("src/Owner.txt", METHOD)]);
+    let owner = root.join("src").join("Owner.txt");
+    let language = RenameLanguage::new();
+    language.be_silent();
+    let window = open_window(cx, root.clone(), language.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &owner);
+    let view = editor_of(cx, window, &owner);
+    view.update(cx, |view, cx| view.restore_caret(1, 13, cx));
+    draw(cx, window);
+
+    press(cx, window, "shift-f6");
+    type_text(cx, window, "Zz");
+    draw(cx, window);
+    assert_eq!(buffer_of(cx, &view), RENAMED);
+
+    language.answer_held(None, Confidence::Certain);
+    cx.run_until_parked();
+    draw(cx, window);
+
+    assert!(
+        !shown(cx, window, "rename-in-place-hint"),
+        "the refusal ends the mode"
+    );
+    assert_eq!(buffer_of(cx, &view), METHOD, "the text goes back");
+    assert!(
+        !view.read_with(&*cx, |view, _| view.is_dirty()),
+        "the text is the saved one again"
+    );
+    assert_eq!(
+        window
+            .read_with(cx, |workspace, _| {
+                workspace.language_status().map(ToString::to_string)
+            })
+            .unwrap()
+            .as_deref(),
+        Some("This name cannot be renamed"),
+        "the status bar says why"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn enter_waits_for_the_language_and_renames_across_the_project_once_it_answers(
+    cx: &mut TestAppContext,
+) {
+    let root = project(
+        "rename-in-place-waits",
+        &[("src/Owner.txt", METHOD), ("src/Other.txt", "feed pet\n")],
+    );
+    let owner = root.join("src").join("Owner.txt");
+    let other = root.join("src").join("Other.txt");
+    let language = RenameLanguage::new();
+    language.set_closed(other.clone());
+    language.be_silent();
+    let window = open_window(cx, root.clone(), language.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &owner);
+    let view = editor_of(cx, window, &owner);
+    view.update(cx, |view, cx| view.restore_caret(1, 13, cx));
+    draw(cx, window);
+
+    press(cx, window, "shift-f6");
+    type_text(cx, window, "Zz");
+    press(cx, window, "enter");
+    draw(cx, window);
+    assert!(
+        language.queries().is_empty(),
+        "Enter does not ask the language before it answers"
+    );
+    assert_eq!(
+        buffer_of(cx, &view),
+        RENAMED,
+        "the name stays as it is typed while Enter waits"
+    );
+    assert!(
+        shown(cx, window, "rename-in-place-hint"),
+        "the mode waits for the answer"
+    );
+
+    language.answer_held(Some(PrepareRename { span: None }), Confidence::Certain);
+    wait_for_signal(cx, "the rename of the other file", |_| {
+        fs::read_to_string(&other).is_ok_and(|text| text == "feed Zz\n")
+    });
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let queries = language.queries();
+    assert_eq!(queries.len(), 1, "the language was asked once");
+    assert_eq!(queries[0].new_name, "Zz");
+    assert_eq!(buffer_of(cx, &view), RENAMED);
+    assert!(
+        !shown(cx, window, "rename-in-place-hint"),
+        "the rename is done"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn enter_while_the_language_cannot_answer_keeps_the_name_and_says_so(cx: &mut TestAppContext) {
+    let root = project("rename-in-place-not-ready", &[("src/Owner.txt", METHOD)]);
+    let owner = root.join("src").join("Owner.txt");
+    let language = RenameLanguage::new();
+    language.be_silent();
+    let window = open_window(cx, root.clone(), language.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &owner);
+    let view = editor_of(cx, window, &owner);
+    view.update(cx, |view, cx| view.restore_caret(1, 13, cx));
+    draw(cx, window);
+
+    press(cx, window, "shift-f6");
+    type_text(cx, window, "Zz");
+    press(cx, window, "enter");
+    draw(cx, window);
+    assert!(language.queries().is_empty());
+
+    language.answer_held(None, Confidence::Unknown);
+    cx.run_until_parked();
+    draw(cx, window);
+
+    assert!(language.queries().is_empty(), "no rename was asked");
+    assert_eq!(buffer_of(cx, &view), RENAMED, "the name stays in this file");
+    assert!(!shown(cx, window, "rename-in-place-hint"), "the mode ends");
+    assert!(
+        shown(cx, window, "lsp-note"),
+        "a note says the language is not ready"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn shift_f6_between_two_spaces_says_so_in_the_status_bar(cx: &mut TestAppContext) {
+    let root = project(
+        "rename-in-place-no-name",
+        &[("src/Open.txt", "alpha  beta\n")],
+    );
+    let open = root.join("src").join("Open.txt");
+    let language = RenameLanguage::new();
+    let window = open_window(cx, root.clone(), language);
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &open);
+    let view = editor_of(cx, window, &open);
+    view.update(cx, |view, cx| view.restore_caret(0, 6, cx));
+    draw(cx, window);
+
+    press(cx, window, "shift-f6");
+    draw(cx, window);
+
+    assert!(
+        !shown(cx, window, "rename-in-place-hint"),
+        "no mode starts without a name"
+    );
+    assert_eq!(buffer_of(cx, &view), "alpha  beta\n");
+    assert_eq!(
+        window
+            .read_with(cx, |workspace, _| workspace
+                .status_message()
+                .map(ToString::to_string))
+            .unwrap()
+            .as_deref(),
+        Some("Put the caret on a name to rename"),
         "the status bar says why nothing happened"
     );
 }

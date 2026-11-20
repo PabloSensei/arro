@@ -343,11 +343,12 @@ impl EditorView {
             .and_then(|state| state.language().cloned());
         let syntax = self.syntax.clone();
         let replies = ask(provider, DefinitionPreviewQuery(spot));
+        self.importing_note(caret, cx);
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
             let opened = this.update(cx, |this, cx| match answer {
                 Some((_, Confidence::Unknown)) => {
-                    this.show_note(caret, NO_ANSWER, cx);
+                    this.show_unanswered(caret, false, cx);
                     None
                 }
                 Some((preview, _)) if preview.text.trim().is_empty() => {
@@ -480,7 +481,7 @@ impl EditorView {
 
     /// Ctrl+Alt+H: the window shows the call hierarchy of the place.
     pub(crate) fn call_hierarchy(&mut self, cx: &mut Context<Self>) {
-        let Some((spot, _)) = self.spot() else {
+        let Some((spot, caret)) = self.spot() else {
             return;
         };
         if self
@@ -491,6 +492,7 @@ impl EditorView {
         {
             return;
         }
+        self.importing_note(caret, cx);
         cx.emit(EditorEvent::CallHierarchy(spot));
     }
 

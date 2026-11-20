@@ -1114,8 +1114,24 @@ fn connect_project_problems(
         };
         let mut replies = ask(provider, ProjectProblemsQuery);
         let mut notified = String::new();
+        // One repeat per session of the server. A failure that the language says another
+        // import alone clears is imported again instead of shown, and the same failure
+        // after that is a real error.
+        let mut retried = false;
         while let Some(answer) = replies.next().await {
-            let problems = answer.value;
+            let mut problems = answer.value;
+            let retry = problems.first().is_some_and(|problem| problem.retry);
+            if retry && !retried {
+                // The request behind Reload Project, which the user does not have to press.
+                if let Some(server) = support.server() {
+                    server.reimport();
+                    retried = true;
+                }
+            }
+            if retry && retried {
+                // It is on its way out: neither a notification nor a row in Problems.
+                problems.retain(|problem| !problem.retry);
+            }
             let first = problems.first().cloned();
             *last.lock().unwrap_or_else(|poison| poison.into_inner()) = first.clone();
             match &first {
@@ -2187,3 +2203,17 @@ mod window_tests_find_action_tools;
 mod window_tests_generate_status;
 #[cfg(test)]
 mod window_tests_run_idle;
+
+#[cfg(test)]
+mod window_tests_database_copy;
+#[cfg(test)]
+mod window_tests_editor_importing;
+#[cfg(test)]
+mod window_tests_find_action_data;
+#[cfg(test)]
+mod window_tests_generate_server;
+#[cfg(test)]
+mod window_tests_import_retry;
+
+#[cfg(test)]
+mod window_tests_completion_members;

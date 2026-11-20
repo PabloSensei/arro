@@ -13,8 +13,7 @@ use lang_api::{Severity, SourceSpan, TextPoint, TextSpan};
 use platform::CanonPath;
 use ui_kit::gpui;
 use ui_kit::gpui::{
-    AppContext, AsKeystroke, KeyBindingContextPredicate, OperatingSystem, TestAppContext,
-    VisualTestContext, WindowHandle,
+    AppContext, AsKeystroke, OperatingSystem, TestAppContext, VisualTestContext, WindowHandle,
 };
 use ui_kit::prelude::*;
 use ui_kit::{Modifiers, Theme, point, px};
@@ -1403,10 +1402,9 @@ fn app_bindings(cx: &mut TestAppContext) -> Vec<Bound> {
                 action: binding.action().name(),
                 context: binding
                     .predicate()
-                    .and_then(|predicate| match predicate.as_ref() {
-                        KeyBindingContextPredicate::Identifier(name) => Some(name.to_string()),
-                        _ => None,
-                    }),
+                    // A compound predicate is its own context: it never matches where the bare
+                    // key does, so it is no conflict with a global binding.
+                    .map(|predicate| predicate.to_string()),
             })
             .collect()
     })

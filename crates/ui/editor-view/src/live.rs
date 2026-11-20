@@ -17,7 +17,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 
 use crate::element::TEXT_INSET;
-use crate::semantic::point_at;
+use crate::semantic::{identifier_after, point_at};
 use crate::state::EditorState;
 use crate::view::{EditorView, TemplateSettings};
 
@@ -697,7 +697,8 @@ impl LiveTemplates {
 
     /// The postfix templates that fit after the expression before the caret, as entries
     /// of the completion list. Each one replaces the expression and the typed key with
-    /// its expansion and carries the description and a preview of that expansion.
+    /// its expansion and carries the description and a preview of that expansion. Nothing
+    /// when a name starts right after the caret: the list then shows the members only.
     pub fn postfix_completions(&self, state: &EditorState) -> Vec<CompletionEntry> {
         let Some(language) = self.language else {
             return Vec::new();
@@ -705,6 +706,9 @@ impl LiveTemplates {
         let Some(caret) = lone_caret(state) else {
             return Vec::new();
         };
+        if identifier_after(&state.store(), caret) {
+            return Vec::new();
+        }
         let (line, start) = line_before(state, caret);
         let Some((receivers, typed, _)) = postfix_typed(&line, language.receiver_prefixes) else {
             return Vec::new();

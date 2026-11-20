@@ -165,6 +165,8 @@ pub enum Mode {
 struct ActionEntry {
     id: &'static str,
     title: String,
+    /// The text the query is matched against: the title, and the alias of the command.
+    search: String,
     /// The main shortcut, spelled as the menus spell it.
     shortcut: Option<String>,
     /// The icon the menu row of the command shows, or `""`.
@@ -251,8 +253,9 @@ const TOOLS: [(&str, &str, &str); 18] = [
 
 /// The commands that open a tool window, with the icon of that window: the icon of its stripe
 /// button, or of its row in the Switcher. Beans has neither, so it takes the leaf of the
-/// Spring icons. Every other command keeps the icon of its menu row, or none.
-const TOOL_COMMAND_ICONS: [(&str, &str); 11] = [
+/// Spring icons. Data Sources opens a dialog of the Database tool, so it takes that icon too.
+/// Every other command keeps the icon of its menu row, or none.
+const TOOL_COMMAND_ICONS: [(&str, &str); 12] = [
     ("window.show_bookmarks", "toolwindows/bookmarks"),
     ("window.toggle_project", "toolwindows/project"),
     ("window.toggle_terminal", "toolwindows/terminal"),
@@ -264,7 +267,20 @@ const TOOL_COMMAND_ICONS: [(&str, &str); 11] = [
     ("git.show_log", "general/vcs"),
     ("git.show_file_history", "general/vcs"),
     ("git.show_console", "general/vcs"),
+    ("database.data_sources", "toolwindows/database"),
 ];
+
+/// The words, besides its title, that Find Action matches a command by. The Data Sources window
+/// is also called Data Sources and Drivers, and IDEA's search finds it by that name.
+const COMMAND_ALIASES: [(&str, &str); 1] = [("database.data_sources", "Data Sources and Drivers")];
+
+/// The text that Find Action matches a command against: its title, and its alias if it has one.
+fn search_text(id: &str, title: &str) -> String {
+    match COMMAND_ALIASES.iter().find(|(command, _)| *command == id) {
+        Some((_, alias)) => format!("{title} {alias}"),
+        None => title.to_owned(),
+    }
+}
 
 /// The commands of Search Everywhere that begin with `/`.
 const COMMANDS: [(&str, &str); 8] = [
@@ -389,6 +405,7 @@ impl Palette {
             .map(|command| ActionEntry {
                 id: command.id,
                 title: command.title.clone(),
+                search: search_text(command.id, &command.title),
                 shortcut: workspace.shortcut_of_key(command.id),
                 icon: tool_command_icon(command.id)
                     .or_else(|| menu_icons.get(command.id).copied())
@@ -742,7 +759,7 @@ impl Palette {
             matcher,
             &self.query.text,
             self.actions.iter(),
-            |action| &action.title,
+            |action| &action.search,
             self.actions.len(),
         );
         // The commands with the same score come alphabetically, not by the length of their

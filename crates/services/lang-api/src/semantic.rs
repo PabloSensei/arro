@@ -392,6 +392,10 @@ pub struct ProjectProblem {
     /// The build tool of the project that the problem concerns, by the index of its
     /// Settings page, when the language names one.
     pub tool: Option<usize>,
+    /// Another import of the project alone may clear this problem, and the window runs
+    /// it once instead of showing the problem. The language sets this only for the
+    /// first such problem of a server session.
+    pub retry: bool,
 }
 
 /// The problems of the project itself. The stream stays open and sends the current

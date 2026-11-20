@@ -2275,7 +2275,12 @@ impl Provider<DocumentSpot, Option<PrepareRename>> for LspProviders {
     fn start(&self, spot: DocumentSpot, cancel: Cancel, reply: Reply<Option<PrepareRename>>) {
         let router = self.router.clone();
         self.answer(cancel, reply, async move {
-            let answer = router.prepare_rename(place(&spot)?).await;
+            let answer = match router.prepare_rename(place(&spot)?).await {
+                // An error reply is the server's refusal, as a null answer is. A server that
+                // is not ready or does not answer in time stays unknown.
+                Err(RouteError::Server(_)) => Ok(None),
+                answer => answer,
+            };
             Some(answer.map(|accepted| {
                 accepted.map(|range| PrepareRename {
                     span: range.map(span),
