@@ -91,16 +91,18 @@ fn without_the_sync_the_page_marks_the_chosen_theme_and_the_row_names_it(cx: &mu
     assert_eq!(chosen.theme_dark, "nord", "the card filled its slot");
     assert!(!chosen.theme_sync_with_os, "the sync stays off");
 
-    // The Theme row walks the themes of the list when the window does not sync.
+    // The Theme row opens the list of themes: the chosen one applies at once.
     click(cx, window, "settings-theme");
+    draw(cx, window);
+    click(cx, window, "settings-choice-option-nord");
     draw(cx, window);
     assert_eq!(
         marked_themes(cx, &view),
-        ["mocha"],
-        "the next theme of the list is marked"
+        ["nord"],
+        "the chosen theme of the list is marked"
     );
-    assert_eq!(theme_row_label(cx, &view), "Mocha");
-    assert_eq!(settings(cx).theme, "mocha", "the row changed the theme");
+    assert_eq!(theme_row_label(cx, &view), "Nord");
+    assert_eq!(settings(cx).theme, "nord", "the list changed the theme");
 }
 
 #[gpui::test]

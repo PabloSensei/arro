@@ -355,6 +355,18 @@ fn build(
         }
     }
 
+    let terminal_workspace = workspace.clone();
+    entries.push(MenuEntry::new(
+        "Run Selection in Terminal",
+        move |window, cx| {
+            terminal_workspace
+                .update(cx, |workspace, cx| {
+                    workspace.run_command(workspace_keys::RUN_IN_TERMINAL, window, cx);
+                })
+                .ok();
+        },
+    ));
+
     entries.push(MenuEntry::separator());
     let history_workspace = workspace.clone();
     entries.push(MenuEntry::new("Local History", move |window, cx| {

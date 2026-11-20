@@ -627,6 +627,9 @@ impl Render for RunConfigDialog {
         let items = self.items.iter().enumerate().map(|(index, item)| {
             let selected = self.selected == Some(index);
             let temporary = item.temporary;
+            let kind = self
+                .provider_of(&item.config)
+                .map_or("run/run", |provider| provider.icon(&item.config));
             let label: SharedString = item.config.name.clone().into();
             div()
                 .id(("run-config-item", index))
@@ -651,7 +654,7 @@ impl Render for RunConfigDialog {
                     div()
                         .flex_none()
                         .when(temporary, |this| this.opacity(0.45))
-                        .child(icon("run/run", &theme)),
+                        .child(icon(kind, &theme)),
                 )
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
@@ -1185,27 +1188,21 @@ impl Render for RunConfigDialog {
         )
         .on_click(cx.listener(|this, _, window, cx| this.apply(false, window, cx)));
 
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("run-configs")
             .debug_selector(|| "run-configs".to_owned())
             .key_context("RunConfigs")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .flex_none()
-                    .child("Run/Debug Configurations"),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .child(
                 div()
                     .flex()
@@ -1323,12 +1320,26 @@ impl Render for RunConfigDialog {
                     .child(apply)
                     .child(ok),
             );
-
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("run-configs-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "run-configs",
+                title: "Run/Debug Configurations".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (640., 400.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

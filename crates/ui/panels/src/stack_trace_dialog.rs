@@ -142,28 +142,23 @@ impl Render for StackTraceDialog {
                 )
                 .size_full(),
             );
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("stack-trace-dialog")
             .debug_selector(|| "stack-trace-dialog".to_owned())
             .key_context("StackTraceDialog")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
             .on_key_down(
                 cx.listener(|this, event: &KeyDownEvent, window, cx| this.key(event, window, cx)),
-            )
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Analyze Stack Trace"),
-            )
+            );
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .child(
                 div()
                     .text_color(theme.text_secondary)
@@ -198,10 +193,25 @@ impl Render for StackTraceDialog {
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("stack-trace-dialog-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "stack-trace",
+                title: "Analyze Stack Trace".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

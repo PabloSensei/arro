@@ -3926,7 +3926,7 @@ impl Render for DiffView {
             .min_h_0()
             .into_any_element()
         };
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("diff")
             .track_focus(&self.focus)
             .key_context(CONTEXT)
@@ -3953,38 +3953,65 @@ impl Render for DiffView {
                 } else if this.diff_key(event, window, cx) {
                     cx.stop_propagation();
                 }
-            }))
-            .when(!self.tabbed, |body| {
-                body.occlude()
-                    .w(width)
-                    .h(height)
-                    .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            })
-            .child(
-                div()
-                    .debug_selector(|| "diff-title".to_owned())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .h(px(40.))
-                    .px(px(DIALOG_PADDING))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
-            )
-            .child(self.toolbar(&theme, cx))
-            .child(self.headers(&theme))
-            .child(pane)
-            .children(self.menu.map(|_| self.menu_panel(&theme, cx)));
+            }));
+        let toolbar = self.toolbar(&theme, cx);
+        let headers = self.headers(&theme);
+        let menu = self.menu.map(|_| self.menu_panel(&theme, cx));
         if self.tabbed {
-            body.flex().flex_col().w_full().h_full().into_any_element()
-        } else {
-            div()
-                .absolute()
-                .left(left)
-                .top(top)
-                .child(enter("diff-enter", body))
+            // A tab keeps its title row; the window of a dialog takes the title into its frame.
+            shell
+                .flex()
+                .flex_col()
+                .w_full()
+                .h_full()
+                .child(
+                    div()
+                        .debug_selector(|| "diff-title".to_owned())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .flex_none()
+                        .h(px(40.))
+                        .px(px(DIALOG_PADDING))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(title),
+                )
+                .child(toolbar)
+                .child(headers)
+                .child(pane)
+                .children(menu)
                 .into_any_element()
+        } else {
+            let contents = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(toolbar)
+                .child(headers)
+                .child(pane)
+                .children(menu);
+            let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+            dialog_window(
+                DialogSpec {
+                    key: "diff",
+                    title: title.into(),
+                    extra: None,
+                    place: DialogPlace {
+                        left: f32::from(left),
+                        top: f32::from(top),
+                        width: f32::from(width),
+                        height: Some(f32::from(height)),
+                    },
+                    min: (480., 320.),
+                },
+                shell,
+                window,
+                cx,
+                close,
+                contents,
+            )
+            .into_any_element()
         }
     }
 }

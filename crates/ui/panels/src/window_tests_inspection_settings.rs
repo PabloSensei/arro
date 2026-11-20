@@ -123,6 +123,8 @@ fn the_page_searches_turns_a_check_off_changes_its_level_and_resets(cx: &mut Tes
 
     click(cx, window, "settings-inspection-level-0");
     draw(cx, window);
+    click(cx, window, "settings-choice-option-weak-warning");
+    draw(cx, window);
     click(cx, window, "settings-ok");
     cx.run_until_parked();
     wait_for_signal(cx, "the level of the check", |_| {

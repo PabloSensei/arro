@@ -167,14 +167,18 @@ fn the_appearance_page_offers_the_system_theme(cx: &mut TestAppContext) {
     // The two choices name the themes of the system looks.
     click(cx, window, "settings-theme-light");
     draw(cx, window);
+    click(cx, window, "settings-choice-option-dark");
+    draw(cx, window);
     click(cx, window, "settings-apply");
     draw(cx, window);
-    assert_eq!(settings(cx).theme_light, "dark", "the choice goes round");
+    assert_eq!(settings(cx).theme_light, "dark", "the list picks the slot");
     click(cx, window, "settings-theme-dark");
     draw(cx, window);
+    click(cx, window, "settings-choice-option-light");
+    draw(cx, window);
     click(cx, window, "settings-apply");
     draw(cx, window);
-    assert_eq!(settings(cx).theme_dark, "light", "the choice goes round");
+    assert_eq!(settings(cx).theme_dark, "light", "the list picks the slot");
 }
 
 #[test]

@@ -152,28 +152,24 @@ impl Render for ReformatDialog {
                 .child(if on { "●" } else { "○" })
                 .child(label)
         };
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("reformat-dialog")
             .debug_selector(|| "reformat-dialog".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(WIDTH))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(
                 div()
                     .debug_selector(|| "reformat-title".to_owned())
                     .flex()
                     .flex_col()
                     .gap(px(SPACE_XS))
-                    .child(
-                        div()
-                            .text_size(px(TEXT_TITLE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Reformat File"),
-                    )
                     .child(
                         div()
                             .text_color(theme.text_secondary)
@@ -260,11 +256,26 @@ impl Render for ReformatDialog {
                             .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("reformat-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "reformat-file",
+                title: "Reformat File".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(px(WIDTH)),
+                    height: None,
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -320,7 +331,7 @@ pub(crate) fn run(workspace: &mut Workspace, window: &mut Window, cx: &mut Conte
             }],
             renames: Vec::new(),
         };
-        crate::changes::apply(workspace, change, window, cx);
+        crate::changes::apply_reformat(workspace, change, window, cx);
         return;
     }
     if settings.reformat_only_changed {
@@ -511,7 +522,7 @@ fn start(
         };
         workspace
             .update_in(cx, |workspace, window, cx| {
-                crate::changes::apply(workspace, change, window, cx)
+                crate::changes::apply_reformat(workspace, change, window, cx)
             })
             .ok();
     })
@@ -728,28 +739,24 @@ impl Render for PathsDialog {
         } else {
             only
         };
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("reformat-dialog")
             .debug_selector(|| "reformat-dialog".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(WIDTH))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(
                 div()
                     .debug_selector(|| "reformat-title".to_owned())
                     .flex()
                     .flex_col()
                     .gap(px(SPACE_XS))
-                    .child(
-                        div()
-                            .text_size(px(TEXT_TITLE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Reformat Code"),
-                    )
                     .child(
                         div()
                             .text_color(theme.text_secondary)
@@ -814,11 +821,26 @@ impl Render for PathsDialog {
                             .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("reformat-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "reformat-code",
+                title: "Reformat Code".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(px(WIDTH)),
+                    height: None,
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

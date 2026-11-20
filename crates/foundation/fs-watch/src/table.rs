@@ -27,6 +27,9 @@ pub struct FileTable {
     root: PathBuf,
     excludes: Vec<PathBuf>,
     ignores: Vec<Gitignore>,
+    /// Names of files and folders the user leaves out, such as `*.class` and
+    /// `node_modules`.
+    ignored: Vec<String>,
     /// Sorted by path.
     files: Vec<FileEntry>,
 }
@@ -36,13 +39,55 @@ fn is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
         || excludes.iter().any(|folder| path.starts_with(folder))
 }
 
-fn walk(root: &Path, excludes: &[PathBuf]) -> (Vec<FileEntry>, Vec<PathBuf>) {
+/// Whether a file or folder name matches a mask of the user: `*` is any run of characters
+/// and `?` one character, case ignored.
+fn is_ignored(path: &Path, ignored: &[String]) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    ignored
+        .iter()
+        .any(|mask| mask_matches(name.as_bytes(), mask.as_bytes()))
+}
+
+fn mask_matches(name: &[u8], mask: &[u8]) -> bool {
+    let name: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+    let mask: Vec<u8> = mask.iter().map(u8::to_ascii_lowercase).collect();
+    let (mut at, mut part) = (0, 0);
+    let mut star = None;
+    let mut restart = 0;
+    while at < name.len() {
+        if part < mask.len() && (mask[part] == b'?' || mask[part] == name[at]) {
+            at += 1;
+            part += 1;
+        } else if part < mask.len() && mask[part] == b'*' {
+            star = Some(part);
+            restart = at;
+            part += 1;
+        } else if let Some(star) = star {
+            restart += 1;
+            at = restart;
+            part = star + 1;
+        } else {
+            return false;
+        }
+    }
+    while part < mask.len() && mask[part] == b'*' {
+        part += 1;
+    }
+    part == mask.len()
+}
+
+fn walk(root: &Path, excludes: &[PathBuf], ignored: &[String]) -> (Vec<FileEntry>, Vec<PathBuf>) {
     let skip = excludes.to_vec();
+    let masks = ignored.to_vec();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .require_git(false)
         .git_global(false)
-        .filter_entry(move |entry| !is_excluded(entry.path(), &skip))
+        .filter_entry(move |entry| {
+            !is_excluded(entry.path(), &skip) && !is_ignored(entry.path(), &masks)
+        })
         .build();
     let mut files = Vec::new();
     let mut ignore_files = Vec::new();
@@ -64,17 +109,38 @@ fn walk(root: &Path, excludes: &[PathBuf]) -> (Vec<FileEntry>, Vec<PathBuf>) {
 impl FileTable {
     /// Walks `root`. Blocks.
     pub fn scan(root: impl Into<PathBuf>, excludes: Vec<PathBuf>) -> io::Result<Self> {
+        Self::scan_with_ignored(root, excludes, Vec::new())
+    }
+
+    /// Walks `root` and leaves out the names that match one of the masks of the user.
+    /// Blocks.
+    pub fn scan_with_ignored(
+        root: impl Into<PathBuf>,
+        excludes: Vec<PathBuf>,
+        ignored: Vec<String>,
+    ) -> io::Result<Self> {
         let root = root.into();
         fs::metadata(&root)?;
-        let (files, ignore_files) = walk(&root, &excludes);
+        let (files, ignore_files) = walk(&root, &excludes, &ignored);
         let ignores = ignore_files.iter().map(|path| Gitignore::new(path).0);
         let ignores = ignores.collect();
         Ok(Self {
             root,
             excludes,
             ignores,
+            ignored,
             files,
         })
+    }
+
+    /// Takes the masks of the user and walks again. Gives what the list of files lost or
+    /// gained, as [`FileTable::rescan`] does.
+    pub fn set_ignored(&mut self, ignored: Vec<String>) -> Vec<FsChange> {
+        if self.ignored == ignored {
+            return Vec::new();
+        }
+        self.ignored = ignored;
+        self.rescan()
     }
 
     pub fn root(&self) -> &Path {
@@ -115,6 +181,7 @@ impl FileTable {
     fn is_tracked(&self, path: &Path, folder: bool) -> bool {
         path.starts_with(&self.root)
             && !is_excluded(path, &self.excludes)
+            && !is_ignored(path, &self.ignored)
             && !self.ignores.iter().any(|ignore| {
                 path.starts_with(ignore.path())
                     && ignore.matched_path_or_any_parents(path, folder).is_ignore()
@@ -167,7 +234,7 @@ impl FileTable {
             if !self.is_tracked(&path, true) {
                 return;
             }
-            for entry in walk(&path, &self.excludes).0 {
+            for entry in walk(&path, &self.excludes, &self.ignored).0 {
                 if self.is_tracked(&entry.path, false) && !self.contains(&entry.path) {
                     applied.push(FsChange::Created(entry.path.clone()));
                     self.insert(entry);
@@ -196,7 +263,7 @@ impl FileTable {
 
     /// Walks again and reports what differs. Blocks. Catches whatever the watcher missed.
     pub fn rescan(&mut self) -> Vec<FsChange> {
-        let (fresh, ignore_files) = walk(&self.root, &self.excludes);
+        let (fresh, ignore_files) = walk(&self.root, &self.excludes, &self.ignored);
         let known: HashSet<&Path> = fresh.iter().map(|entry| entry.path.as_path()).collect();
         let mut changes: Vec<FsChange> = self
             .files

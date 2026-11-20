@@ -48,6 +48,8 @@ pub const COMPLETION_DELAY_STEP_MS: u32 = 100;
 pub const DEFAULT_DATABASE_PAGE_ROWS: u32 = 500;
 /// The most rows one page of a data tab reads.
 pub const MAX_DATABASE_PAGE_ROWS: u32 = 10_000;
+/// The masks a new installation leaves out of the project tree and the file index.
+pub const DEFAULT_IGNORED_FILES: &[&str] = &[".git", "node_modules", "*.class"];
 
 /// What a save does with the spaces and tabs at the end of a line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +553,10 @@ pub struct Settings {
     pub todo_group_packages: bool,
     pub todo_group_modules: bool,
     pub todo_flatten_packages: bool,
+    /// The patterns the TODO window looks for, in the order its filter offers them.
+    pub todo_templates: Vec<String>,
+    /// The TODO window matches the patterns with their case.
+    pub todo_case_sensitive: bool,
     /// Looks for a newer release once a day after the window opens.
     pub updates_check_automatically: bool,
     /// The tool window layout Restore Default Layout goes back to; `None` is the layout
@@ -641,6 +647,9 @@ pub struct Settings {
     /// `com.example.demo` below a source root and `a/b/c` elsewhere, as the Compact Middle
     /// Packages switch of its view options says.
     pub project_compact_middle_packages: bool,
+    /// The file and folder masks the project tree and the file index leave out, such as
+    /// `*.class`, `.git` and `node_modules`.
+    pub ignored_files: Vec<String>,
     /// The AI features of the window are on: Ask AI, Fix with AI and Explain with AI
     /// offer the problem at hand to the agent. The AI Sessions window itself stays.
     pub ai_enabled: bool,
@@ -729,6 +738,8 @@ impl Default for Settings {
             todo_group_packages: false,
             todo_group_modules: false,
             todo_flatten_packages: false,
+            todo_templates: vec!["TODO".to_owned(), "FIXME".to_owned()],
+            todo_case_sensitive: true,
             updates_check_automatically: true,
             default_layout: None,
             right_margin: DEFAULT_RIGHT_MARGIN,
@@ -772,6 +783,10 @@ impl Default for Settings {
             sql_script_stop_on_error: true,
             project_always_select_opened_file: false,
             project_compact_middle_packages: true,
+            ignored_files: DEFAULT_IGNORED_FILES
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
             ai_enabled: true,
             mcp_enabled: true,
             mcp_binary: String::new(),
@@ -886,6 +901,17 @@ impl Settings {
         self.indent_size = self.indent_size.clamp(1, MAX_INDENT_SIZE as u32);
         self.right_margin = self.right_margin.clamp(MIN_RIGHT_MARGIN, MAX_RIGHT_MARGIN);
         self.completion_delay_ms = self.completion_delay_ms.min(MAX_COMPLETION_DELAY_MS);
+        self.ignored_files = self
+            .ignored_files
+            .iter()
+            .map(|pattern| pattern.trim())
+            .filter(|pattern| !pattern.is_empty())
+            .fold(Vec::new(), |mut kept, pattern| {
+                if !kept.iter().any(|known| known == pattern) {
+                    kept.push(pattern.to_owned());
+                }
+                kept
+            });
         self.diff_context_lines = self.diff_context_lines.min(MAX_DIFF_CONTEXT_LINES);
         self.http_timeout_seconds = self.http_timeout_seconds.clamp(1, MAX_HTTP_TIMEOUT_SECONDS);
         self

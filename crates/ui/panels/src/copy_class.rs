@@ -348,25 +348,22 @@ impl Render for CopyClassDialog {
                 .child(error)
                 .into_any_element()
         });
-        let body = surface(&theme)
+        let title = self.title.clone();
+        let shell = surface(&theme)
             .id("copy-class")
             .debug_selector(|| "copy-class".to_owned())
             .key_context("CopyClass")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.title.clone()),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .child(labelled("Name", name, &theme))
             .child(labelled(
                 "Destination package or folder",
@@ -374,11 +371,26 @@ impl Render for CopyClassDialog {
                 &theme,
             ))
             .children(error);
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("copy-class-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "copy-class",
+                title,
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

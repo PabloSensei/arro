@@ -4714,11 +4714,12 @@ impl Workspace {
     fn show_menu_inner(
         &mut self,
         position: Point<Pixels>,
-        entries: Vec<MenuEntry>,
+        mut entries: Vec<MenuEntry>,
         keys: Vec<MenuShortcut>,
         bar: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        crate::chrome::with_menu_icons(&mut entries);
         self.overlay_serial += 1;
         self.menu_task = None;
         self.action_menu_anchor.borrow_mut().take();

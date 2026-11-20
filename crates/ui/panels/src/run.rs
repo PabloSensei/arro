@@ -61,6 +61,12 @@ pub(crate) struct ConfigsChanged;
 
 impl EventEmitter<ConfigsChanged> for RunPanel {}
 
+/// The model of the project was read or replaced: the modules and the folders they
+/// exclude are new.
+pub(crate) struct ProjectModelChanged;
+
+impl EventEmitter<ProjectModelChanged> for RunPanel {}
+
 /// The coverage of the last run changed, or was hidden: the stripes of the editors and
 /// the rows of the Coverage window follow it.
 pub struct CoverageChanged;
@@ -553,6 +559,8 @@ impl RunPanel {
             // A compound configuration belongs to the window itself: its children are the
             // configurations of this list, whatever the language.
             providers.push(Arc::new(runner::CompoundProvider));
+            // A line the user typed in the terminal runs here as a configuration too.
+            providers.push(Arc::new(runner::CommandProvider));
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(POLL).await;
@@ -5026,6 +5034,9 @@ impl RunPanel {
             self.run_tests(request, cx);
         } else if start_waiting && std::mem::take(&mut self.waiting) {
             self.start(cx);
+        }
+        if model_changed {
+            cx.emit(ProjectModelChanged);
         }
         changed
     }

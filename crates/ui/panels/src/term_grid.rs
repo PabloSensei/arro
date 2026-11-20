@@ -391,6 +391,11 @@ pub fn copy_selection(
     true
 }
 
+/// The key held over a link: Control, or Command on macOS, as IDEA shows links.
+fn link_modifier(modifiers: &Modifiers) -> bool {
+    modifiers.control || (cfg!(target_os = "macos") && modifiers.platform)
+}
+
 /// The pointer of a grid: who hears it and where its cells are.
 struct Pointer<H: GridPanel> {
     host: Entity<H>,
@@ -430,9 +435,7 @@ impl<H: GridPanel> Pointer<H> {
             if event.button != MouseButton::Left {
                 return;
             }
-            let link = event
-                .modifiers
-                .control
+            let link = link_modifier(&event.modifiers)
                 .then(|| target.read(cx).link_at(pane, position))
                 .flatten();
             match link {
@@ -454,7 +457,7 @@ impl<H: GridPanel> Pointer<H> {
             let inside = hovered.bounds.contains(&event.position);
             let position = inside.then(|| metrics.position(event.position)).flatten();
             let over_link = moved.update(cx, |panel, cx| {
-                panel.grid_moved(pane, position, event.modifiers.control, cx)
+                panel.grid_moved(pane, position, link_modifier(&event.modifiers), cx)
             });
             if over_link {
                 window.set_cursor_style(CursorStyle::PointingHand, &hovered);

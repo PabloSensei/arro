@@ -755,6 +755,14 @@ fn menu_level(
                     div()
                         .size(px(MENU_ICON_WIDTH))
                         .flex_none()
+                        .debug_selector({
+                            let path = path.clone();
+                            move || {
+                                let parts: Vec<String> =
+                                    path.iter().map(|index| index.to_string()).collect();
+                                format!("menu-icon-{}", parts.join("-"))
+                            }
+                        })
                         .children(entry.icon.map(|name| icon(name, theme).grayscale(true))),
                 )
                 .child(entry.label.clone()),

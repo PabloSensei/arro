@@ -142,6 +142,24 @@ pub fn style_source(root: &Path) -> Option<StyleSource> {
         .then_some(StyleSource::ProjectXml)
 }
 
+/// The style of one `.idea` code style text, taken from the first language section that
+/// names an indentation. The settings of another IDE are imported without a language of
+/// their own, so the caller needs no name here.
+pub fn parse_style_text(text: &str) -> Option<ProjectStyle> {
+    let document = Document::parse(text).ok()?;
+    let section = document
+        .descendants()
+        .find(|node| node.has_tag_name("codeStyleSettings") && indentation_of(*node).is_some());
+    let right_margin = section
+        .and_then(|section| number_option(section, "RIGHT_MARGIN"))
+        .or_else(|| number_option(document.root_element(), "RIGHT_MARGIN"));
+    let indentation = section.and_then(indentation_of);
+    (indentation.is_some() || right_margin.is_some()).then_some(ProjectStyle {
+        right_margin,
+        indentation,
+    })
+}
+
 /// The `.idea` style of one `Project.xml` text for one language.
 fn parse_project(text: &str, language: Option<&str>) -> Option<ProjectStyle> {
     let document = Document::parse(text).ok()?;

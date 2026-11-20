@@ -62,6 +62,8 @@ enum Command {
     Disk(Vec<FsChange>),
     /// The settings file the window reads, changed by another program.
     Settings,
+    /// The masks of the user changed: walk again with them.
+    Ignored(Vec<String>),
     /// Walk again: the window came back to the front.
     Rescan,
     /// The window let the index go: the thread stops and its watchers go with it.
@@ -95,13 +97,24 @@ impl Drop for IndexOwner {
 }
 
 impl ProjectIndex {
-    /// Starts the thread. The receiver gives the events for the window to read. A
-    /// settings file is watched in its own folder too, so that an edit of another
-    /// program reaches the window without a clock.
+    /// Starts the thread without masks, for the tests of the index.
+    #[cfg(test)]
     pub fn start(
         root: PathBuf,
         settings: Vec<PathBuf>,
         setup: SearchSetup,
+    ) -> (Self, UnboundedReceiver<IndexEvent>) {
+        Self::start_with_ignored(root, settings, setup, Vec::new())
+    }
+
+    /// Starts the thread. The receiver gives the events for the window to read. A
+    /// settings file is watched in its own folder too, so that an edit of another
+    /// program reaches the window without a clock. `ignored` holds the masks of the user.
+    pub fn start_with_ignored(
+        root: PathBuf,
+        settings: Vec<PathBuf>,
+        setup: SearchSetup,
+        ignored: Vec<String>,
     ) -> (Self, UnboundedReceiver<IndexEvent>) {
         let symbols = Arc::new(RwLock::new(SymbolIndex::new()));
         let mut sources: Vec<Arc<SymbolSource>> =
@@ -127,6 +140,7 @@ impl ProjectIndex {
                     root,
                     settings,
                     setup,
+                    ignored,
                     symbols,
                     commands,
                     inbox,
@@ -143,6 +157,11 @@ impl ProjectIndex {
 
     pub fn rescan(&self) {
         let _ = self.commands.send(Command::Rescan);
+    }
+
+    /// Takes the file and folder masks of the user; the thread walks the project again.
+    pub fn set_ignored(&self, ignored: Vec<String>) {
+        let _ = self.commands.send(Command::Ignored(ignored));
     }
 
     /// How many lists of files the index has published. A test waits for this to grow
@@ -198,6 +217,7 @@ fn run(
     root: PathBuf,
     settings: Vec<PathBuf>,
     setup: SearchSetup,
+    ignored: Vec<String>,
     symbols: Arc<RwLock<SymbolIndex>>,
     commands: Sender<Command>,
     inbox: Receiver<Command>,
@@ -250,7 +270,7 @@ fn run(
             .ok()
         });
     let started = Instant::now();
-    let mut table = match FileTable::scan(&root, setup.excludes.clone()) {
+    let mut table = match FileTable::scan_with_ignored(&root, setup.excludes.clone(), ignored) {
         Ok(table) => table,
         Err(error) => {
             eprintln!("{} is not scanned: {error}", root.display());
@@ -291,7 +311,7 @@ fn run(
         // tells the repository metadata changed.
         let metadata = match &command {
             Command::Disk(batch) => batch.iter().any(is_repository_change),
-            Command::Settings | Command::Rescan | Command::Stop => false,
+            Command::Settings | Command::Ignored(_) | Command::Rescan | Command::Stop => false,
         };
         let (changes, watched) = match command {
             Command::Disk(batch) => {
@@ -302,6 +322,7 @@ fn run(
                 let _ = events.unbounded_send(IndexEvent::Settings);
                 continue;
             }
+            Command::Ignored(ignored) => (table.set_ignored(ignored), None),
             Command::Rescan => (table.rescan(), Some(vec![FsChange::Rescan])),
             Command::Stop => break,
         };

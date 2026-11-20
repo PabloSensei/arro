@@ -4539,6 +4539,17 @@ impl DatabasePanel {
         .detach();
     }
 
+    /// The key that copies the cell, as the panel reads it: Ctrl+C, or Cmd+C on macOS.
+    /// The Copy Cell button names it in its tooltip.
+    pub(crate) fn copy_cell_key() -> String {
+        let text = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        keymap::shortcut_label(text, keymap::platform())
+    }
+
     fn copy_cell(&mut self, cx: &mut Context<Self>) {
         let Some((row, column)) = self.selected_cell else {
             return;
@@ -6596,11 +6607,19 @@ impl DatabasePanel {
             );
         }
         bar = bar.child(
-            small_button("database-copy-cell", "Copy cell", theme)
-                .on_click(cx.listener(|this, _, _, cx| this.copy_cell(cx))),
+            icon_button(
+                "database-copy-cell",
+                "general/copy",
+                "Copy Cell",
+                Some(DatabasePanel::copy_cell_key().into()),
+                theme,
+            )
+            .debug_selector(|| "database-copy-cell".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| this.copy_cell(cx))),
         );
         bar = bar.child(
-            small_button("database-copy-row", "Copy row", theme)
+            icon_button("database-copy-row", "general/copy", "Copy Row", None, theme)
+                .debug_selector(|| "database-copy-row".to_owned())
                 .on_click(cx.listener(|this, _, _, cx| this.copy_row(cx))),
         );
         let _ = window;

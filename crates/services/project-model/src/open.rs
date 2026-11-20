@@ -53,6 +53,12 @@ pub trait BuildSystem: Send + Sync {
         false
     }
 
+    /// The icon of a task of this tool in the Run/Debug Configurations window, a name of the
+    /// icon set of the window.
+    fn task_icon(&self) -> &'static str {
+        "run/run"
+    }
+
     /// The command that makes the outputs of the project current.
     fn assemble(&self, root: &Path) -> Result<ProcessSpec>;
 

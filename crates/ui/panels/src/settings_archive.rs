@@ -320,32 +320,24 @@ impl Render for ImportSettingsDialog {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(index, cx)))
             })
             .collect::<Vec<_>>();
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("settings-import")
             .debug_selector(|| "settings-import".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(WIDTH))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(SPACE_XS))
-                    .child(
-                        div()
-                            .text_size(px(TEXT_TITLE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Import Settings"),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_secondary)
-                            .child("Choose the parts to restore."),
-                    ),
+                div().flex().flex_col().gap(px(SPACE_XS)).child(
+                    div()
+                        .text_color(theme.text_secondary)
+                        .child("Choose the parts to restore."),
+                ),
             )
             .child(div().flex().flex_col().children(rows))
             .child(
@@ -381,10 +373,25 @@ impl Render for ImportSettingsDialog {
                             .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("settings-import-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "settings-import",
+                title: "Import Settings".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(px(WIDTH)),
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

@@ -765,6 +765,11 @@ impl UsagesHub {
         rows.sort_by(|a, b| {
             (&a.0, &a.2.path, a.2.line, a.2.column).cmp(&(&b.0, &b.2.path, b.2.line, b.2.column))
         });
+        let icons = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).icons().clone())
+            .unwrap_or_default();
         let mut items = Vec::with_capacity(rows.len());
         let mut panel_rows = Vec::new();
         let mut sources = Vec::with_capacity(rows.len());
@@ -775,11 +780,19 @@ impl UsagesHub {
                 .zip(&keys)
                 .take_while(|(left, right)| left == right)
                 .count();
+            // The group of the file, when the rows group by file, has the icon of its type.
+            let file = settings
+                .usage_group_file_structure
+                .then(|| display_path(item.path.strip_prefix(&self.root).unwrap_or(&item.path)));
             for (depth, key) in keys.iter().enumerate().skip(common) {
+                let icon = match &file {
+                    Some(file) if file == key => icons.icon_for(&item.path),
+                    _ => "general/folder",
+                };
                 panel_rows.push(PanelRow::Group {
                     label: key.clone(),
                     depth,
-                    icon: "general/folder",
+                    icon,
                 });
             }
             previous = keys;

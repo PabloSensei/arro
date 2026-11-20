@@ -2670,26 +2670,14 @@ impl GitLogPanel {
     ) -> AnyElement {
         let rows = self.file_rows(theme, cx);
         let has_file = self.selected_file.is_some();
-        let button = |id: &'static str, label: &'static str, enabled: bool, theme: &Theme| {
-            div()
-                .id(id)
+        let button = |id: &'static str,
+                      name: &'static str,
+                      label: &'static str,
+                      enabled: bool,
+                      theme: &Theme| {
+            icon_button(id, name, label, None, theme)
                 .debug_selector(move || id.to_owned())
-                .flex()
-                .items_center()
-                .flex_none()
-                .h(px(CONTROL_HEIGHT))
-                .px(px(SPACE_S))
-                .rounded(px(CONTROL_RADIUS))
-                .text_color(if enabled {
-                    theme.text
-                } else {
-                    theme.text_muted
-                })
-                .when(enabled, |this| {
-                    let hover = theme.hover;
-                    this.cursor_pointer().hover(move |style| style.bg(hover))
-                })
-                .child(label)
+                .when(!enabled, |this| this.opacity(0.4))
         };
         div()
             .id("log-files")
@@ -2724,21 +2712,45 @@ impl GitLogPanel {
                             .flex()
                             .items_center()
                             .gap(px(SPACE_XS))
-                            .child(button("log-files-diff", "Diff", has_file, theme).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_selected_diff(window, cx)
-                                }),
-                            ))
                             .child(
-                                button("log-files-revert", "Revert", has_file, theme).on_click(
+                                button("log-files-diff", "general/diff", "Diff", has_file, theme)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_selected_diff(window, cx)
+                                    })),
+                            )
+                            .child(
+                                button(
+                                    "log-files-revert",
+                                    "general/rollback",
+                                    "Revert",
+                                    has_file,
+                                    theme,
+                                )
+                                .on_click(
                                     cx.listener(|this, _, _, cx| this.revert_selected_file(cx)),
                                 ),
                             )
-                            .child(button("log-files-expand", "Expand", true, theme).on_click(
-                                cx.listener(|this, _, _, cx| this.expand_files(true, cx)),
-                            ))
                             .child(
-                                button("log-files-collapse", "Collapse", true, theme).on_click(
+                                button(
+                                    "log-files-expand",
+                                    "general/expandAll",
+                                    "Expand",
+                                    true,
+                                    theme,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.expand_files(true, cx)),
+                                ),
+                            )
+                            .child(
+                                button(
+                                    "log-files-collapse",
+                                    "general/collapseAll",
+                                    "Collapse",
+                                    true,
+                                    theme,
+                                )
+                                .on_click(
                                     cx.listener(|this, _, _, cx| this.expand_files(false, cx)),
                                 ),
                             ),
@@ -3578,53 +3590,29 @@ impl GitLogPanel {
                         })),
                     )
                     .child(
-                        div()
-                            .id("log-refresh")
+                        icon_button("log-refresh", "general/refresh", "Refresh", None, theme)
                             .debug_selector(|| "log-refresh".to_owned())
-                            .flex()
-                            .items_center()
-                            .flex_none()
-                            .h(px(CONTROL_HEIGHT))
-                            .px(px(SPACE_S))
-                            .rounded(px(CONTROL_RADIUS))
-                            .cursor_pointer()
-                            .hover({
-                                let hover = theme.hover;
-                                move |style| style.bg(hover)
-                            })
-                            .child("Refresh")
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
                     .child(
-                        div()
-                            .id("log-cherry-pick")
-                            .debug_selector(|| "log-cherry-pick".to_owned())
-                            .flex()
-                            .items_center()
-                            .flex_none()
-                            .h(px(CONTROL_HEIGHT))
-                            .px(px(SPACE_S))
-                            .rounded(px(CONTROL_RADIUS))
-                            .text_color(if can_cherry {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            })
-                            .when(can_cherry, |this| {
-                                let hover = theme.hover;
-                                this.cursor_pointer().hover(move |style| style.bg(hover))
-                            })
-                            .child("Cherry-pick")
-                            .when(can_cherry, |this| {
-                                this.on_click(cx.listener(|this, _, _, cx| {
-                                    let commits = this.picked_ids();
-                                    if !commits.is_empty() {
-                                        this.git.update(cx, |git, cx| {
-                                            git.cherry_pick_many(commits, cx)
-                                        });
-                                    }
-                                }))
-                            }),
+                        icon_button(
+                            "log-cherry-pick",
+                            "general/cherryPick",
+                            "Cherry-pick",
+                            None,
+                            theme,
+                        )
+                        .debug_selector(|| "log-cherry-pick".to_owned())
+                        .when(!can_cherry, |this| this.opacity(0.4))
+                        .when(can_cherry, |this| {
+                            this.on_click(cx.listener(|this, _, _, cx| {
+                                let commits = this.picked_ids();
+                                if !commits.is_empty() {
+                                    this.git
+                                        .update(cx, |git, cx| git.cherry_pick_many(commits, cx));
+                                }
+                            }))
+                        }),
                     )
                     .child(
                         icon_button(
@@ -4186,41 +4174,51 @@ impl Render for ResetView {
         .into_iter()
         .map(|(mode, selector)| self.row(mode, selector, &theme, cx))
         .collect();
-        let body = surface(&theme)
+        let title = format!("Reset Current Branch to {short}");
+        let shell = surface(&theme)
             .id("reset-view")
             .debug_selector(|| "reset-view".to_owned())
             .key_context("ResetCurrentBranch")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(POPUP_PADDING))
-            .flex()
-            .flex_col()
-            .gap(px(SPACE_S))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     this.close(window, cx);
                     cx.stop_propagation();
                 }
-            }))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("Reset Current Branch to {short}")),
-            )
+            }));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(POPUP_PADDING))
+            .gap(px(SPACE_S))
             .child(
                 div()
                     .text_color(theme.text_secondary)
                     .child("The current branch and HEAD move to the chosen commit."),
             )
             .children(rows);
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("reset-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "reset-branch",
+                title: title.into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -4665,37 +4663,25 @@ impl Render for RebaseView {
             .first()
             .map(|step| short_commit(&step.id))
             .unwrap_or_default();
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("rebase-view")
             .debug_selector(|| "rebase-view".to_owned())
             .key_context("Rebase")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .p(px(POPUP_PADDING))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(POPUP_PADDING))
             .gap(px(SPACE_M))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_none()
-                    .gap(px(SPACE_XS))
-                    .child(
-                        div()
-                            .text_size(px(TEXT_TITLE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Rebase"),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_secondary)
-                            .child(format!("{count} commit(s) from {oldest} to HEAD")),
-                    ),
+                div().flex().flex_col().flex_none().gap(px(SPACE_XS)).child(
+                    div()
+                        .text_color(theme.text_secondary)
+                        .child(format!("{count} commit(s) from {oldest} to HEAD")),
+                ),
             )
             .child(
                 scrollable(
@@ -4737,11 +4723,26 @@ impl Render for RebaseView {
                             .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("rebase-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "rebase",
+                title: "Interactive Rebase".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

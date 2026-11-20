@@ -398,6 +398,12 @@ pub trait RunConfigProvider: Send + Sync {
         None
     }
 
+    /// The icon the Run/Debug Configurations window draws beside a configuration of this
+    /// provider: a name of the icon set of the window. A program keeps the run icon.
+    fn icon(&self, _config: &RunConfig) -> &'static str {
+        "run/run"
+    }
+
     /// Whether [`RunConfigProvider::coverage_plan`] makes a plan. The menus offer Run
     /// with Coverage only for a provider that has it.
     fn supports_coverage(&self) -> bool {

@@ -1211,7 +1211,7 @@ impl Render for MergeView {
             .h(px(40.))
             .px(px(DIALOG_PADDING))
             .font_weight(FontWeight::MEDIUM)
-            .child(div().flex_1().min_w_0().truncate().child(title))
+            .child(div().flex_1().min_w_0())
             .child(
                 div()
                     .flex()
@@ -1330,16 +1330,17 @@ impl Render for MergeView {
         let question = self
             .question
             .map(|question| self.question_band(question, &theme, cx));
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("merge")
             .track_focus(&self.focus)
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &NextConflict, _, cx| this.next_conflict(cx)))
-            .on_action(cx.listener(|this, _: &PreviousConflict, _, cx| this.previous_conflict(cx)))
-            .occlude()
-            .w(width)
-            .h(height)
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.cancel(window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousConflict, _, cx| this.previous_conflict(cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .child(header)
             .children(question)
             .child(titles)
@@ -1380,10 +1381,25 @@ impl Render for MergeView {
                             .child(theirs_pane),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("merge-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.cancel(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "merge",
+                title: title.into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (560., 360.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

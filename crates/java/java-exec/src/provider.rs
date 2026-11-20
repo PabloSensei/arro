@@ -222,6 +222,14 @@ impl RunConfigProvider for JavaProvider {
         PROVIDER_ID
     }
 
+    fn icon(&self, config: &RunConfig) -> &'static str {
+        if Self::target(config).spring_boot {
+            "run/springBoot"
+        } else {
+            "run/application"
+        }
+    }
+
     fn discover(&self, model: &ProjectModel) -> Result<Vec<RunConfig>> {
         let jdk = self.jdk(model)?;
         let mut configs = Vec::new();

@@ -10,7 +10,9 @@ use search::Tab;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, RUN_TOOL, Workspace};
+use workspace::{
+    DATABASE_TOOL, DEBUG_TOOL, DOCUMENTATION_TOOL, DockSide, RUN_TOOL, TERMINAL_TOOL, Workspace,
+};
 
 use crate::agents::ASK_AI;
 use crate::choice::{ChoiceDialog, DialogChoice};
@@ -35,6 +37,7 @@ use crate::run_configs::RunConfigDialog;
 use crate::script::{ActiveCommitPanel, ActiveRunPanel};
 use crate::stack_trace_dialog::StackTraceDialog;
 use crate::structural::StructuralSearch;
+use crate::terminal_panel::ActiveTerminal;
 use crate::todo::ActiveTodo;
 use crate::usages::{self, ActiveUsages};
 
@@ -137,6 +140,11 @@ pub fn register(
     }
 
     workspace.register_command(keys::RUN_CLASS, "Run Test at Caret", marks::run_at_caret);
+    workspace.register_command(
+        keys::RUN_IN_TERMINAL,
+        "Run Selection in Terminal",
+        run_selection_in_terminal,
+    );
     for (id, title) in [
         (keys::CONSOLE_EXECUTE, "Execute Console Command"),
         (keys::CONSOLE_EXECUTE_MULTILINE, "Execute Console Command"),
@@ -1110,6 +1118,45 @@ pub(crate) fn popup_anchor(workspace: &Workspace, window: &Window, cx: &App) -> 
     window.mouse_position()
 }
 
+/// Run Selection in Terminal: the selection of the editor, or the line of the caret
+/// when nothing is selected, goes to the active tab of the terminal. A closed terminal
+/// opens with a new tab in the root of the project.
+fn run_selection_in_terminal(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(view) = workspace
+        .active_view()
+        .and_then(|view| view.downcast::<EditorView>().ok())
+    else {
+        return;
+    };
+    let text = {
+        let view = view.read(cx);
+        view.selected_text()
+            .or_else(|| view.line_text(view.caret().0))
+    };
+    let Some(text) = text else {
+        return;
+    };
+    let lines: Vec<String> = text.lines().map(ToString::to_string).collect();
+    if lines.iter().all(|line| line.trim().is_empty()) {
+        return;
+    }
+    let Some(terminal) = cx
+        .try_global::<ActiveTerminal>()
+        .map(|terminal| terminal.0.clone())
+    else {
+        return;
+    };
+    let opened = !workspace.tool_open(TERMINAL_TOOL);
+    if opened {
+        workspace.show_tool(TERMINAL_TOOL, window, cx);
+    }
+    terminal.update(cx, |panel, cx| panel.run_lines(lines, opened, window, cx));
+}
+
 /// The file the active tab or the selected row of the project tree points at.
 fn current_path(workspace: &Workspace, window: &Window, cx: &App) -> Option<PathBuf> {
     if let Some(panel) = cx.try_global::<ActiveProjectPanel>() {
@@ -1988,31 +2035,25 @@ impl Render for AttachProcessView {
                 .on_click(cx.listener(move |this, _, window, cx| this.choose(manual, window, cx)))
                 .into_any_element(),
         );
-        let body = scrollable(
+        let shell = surface(&theme)
+            .id("attach-processes")
+            .debug_selector(|| "attach-processes".to_owned())
+            .track_focus(&self.focus)
+            .text_size(px(UI_SIZE))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = scrollable(
             "attach-processes",
             &self.scroll,
-            surface(&theme)
-                .id("attach-processes")
-                .debug_selector(|| "attach-processes".to_owned())
-                .track_focus(&self.focus)
-                .occlude()
-                .w(px(460.))
-                .max_h(px(420.))
+            div()
+                .id("attach-processes-list")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .gap(px(2.))
+                .p(px(DIALOG_PADDING))
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
-                .p(px(DIALOG_PADDING))
-                .gap(px(2.))
-                .text_size(px(UI_SIZE))
-                .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-                .child(
-                    div()
-                        .px(px(SPACE_M))
-                        .pb(px(SPACE_S))
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.text_secondary)
-                        .child("Attach to Process"),
-                )
                 .children(rows),
             &theme,
             window,
@@ -2022,11 +2063,26 @@ impl Render for AttachProcessView {
         let width = px(460.);
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.2;
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("attach-process-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "attach-process",
+                title: "Attach to Process".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

@@ -623,6 +623,11 @@ impl StructuralSearch {
 
     /// Puts the places of the search into the Find window, grouped by file.
     fn publish(&mut self, cx: &mut Context<Self>) {
+        let icons = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).icons().clone())
+            .unwrap_or_default();
         let mut items = Vec::new();
         let mut rows = Vec::new();
         for (path, (text, matches)) in &self.results {
@@ -630,7 +635,7 @@ impl StructuralSearch {
             rows.push(PanelRow::Group {
                 label: relative.display().to_string(),
                 depth: 0,
-                icon: "general/folder",
+                icon: icons.icon_for(path),
             });
             for found in matches {
                 let line_start = text[..found.start.min(text.len())]
@@ -1550,40 +1555,37 @@ impl Render for StructuralSearch {
                 .on_click(cx.listener(|this, _, _, cx| this.replace_all(cx)))
         });
 
-        let body = surface(&theme)
+        let title: SharedString = if self.replace_mode {
+            "Replace Structurally"
+        } else {
+            "Search Structurally"
+        }
+        .into();
+        let shell = surface(&theme)
             .id("structural-search")
             .debug_selector(|| "structural-search".to_owned())
             .key_context(CONTEXT)
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .p(px(POPUP_PADDING))
-            .gap(px(POPUP_PADDING))
             .on_key_down(cx.listener(|this, event, window, cx| {
                 this.key(event, window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &workspace::Dismiss, window, cx| this.dismiss(window, cx)),
-            )
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
+            );
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(POPUP_PADDING))
+            .gap(px(POPUP_PADDING))
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(TEXT_TITLE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(if self.replace_mode {
-                                "Replace Structurally"
-                            } else {
-                                "Search Structurally"
-                            }),
-                    )
+                    .child(div().flex_1())
                     .children(replace_button),
             )
             .child(
@@ -1648,10 +1650,25 @@ impl Render for StructuralSearch {
                     ),
             );
 
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("structural-search-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.dismiss(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "structural-search",
+                title,
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

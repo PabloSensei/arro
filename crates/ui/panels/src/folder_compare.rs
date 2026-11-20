@@ -627,17 +627,26 @@ impl Render for FolderCompareView {
         } else {
             "Show Identical Files"
         };
-        let body = surface(&theme)
+        let title = heading.clone();
+        let shell = surface(&theme)
             .id("folder-compare")
             .debug_selector(|| "folder-compare".to_owned())
             .track_focus(&self.focus)
             .key_context(CONTEXT)
-            .occlude()
-            .w(width)
-            .h(height)
-            .p(px(POPUP_PADDING))
+            .on_action(cx.listener(|this, _: &OpenDiff, window, cx| this.open_selected(window, cx)))
+            .on_action(cx.listener(|this, _: &CancelCompare, window, cx| this.escape(window, cx)))
+            .on_action(cx.listener(|this, _: &NextDiff, _, cx| this.next_diff(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousDiff, _, cx| this.next_diff(-1, cx)))
+            .on_action(cx.listener(|this, _: &SynchronizeDiff, _, cx| this.synchronize(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &SynchronizeDiffAll, _, cx| this.synchronize(true, cx)),
+            );
+        let contents = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(POPUP_PADDING))
             .gap(px(SPACE_S))
             .child(
                 div()
@@ -652,8 +661,7 @@ impl Render for FolderCompareView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(TEXT_TITLE))
-                            .child(heading),
+                            .text_size(px(TEXT_TITLE)),
                     )
                     .child(
                         icon_button(
@@ -741,21 +749,27 @@ impl Render for FolderCompareView {
                                 .child("Enter to confirm, Escape to cancel"),
                         ),
                 )
-            })
-            .on_action(cx.listener(|this, _: &NextDiff, _, cx| this.next_diff(1, cx)))
-            .on_action(cx.listener(|this, _: &PreviousDiff, _, cx| this.next_diff(-1, cx)))
-            .on_action(cx.listener(|this, _: &SynchronizeDiff, _, cx| this.synchronize(false, cx)))
-            .on_action(
-                cx.listener(|this, _: &SynchronizeDiffAll, _, cx| this.synchronize(true, cx)),
-            )
-            .on_action(cx.listener(|this, _: &OpenDiff, window, cx| this.open_selected(window, cx)))
-            .on_action(cx.listener(|this, _: &CancelCompare, window, cx| this.escape(window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)));
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("folder-compare-enter", body))
+            });
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "folder-compare",
+                title: title.into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

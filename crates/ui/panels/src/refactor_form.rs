@@ -586,25 +586,22 @@ impl Render for RefactorFormDialog {
             })
         };
 
-        let body = surface(&theme)
+        let title = self.title.clone();
+        let shell = surface(&theme)
             .id("refactor-form")
             .debug_selector(|| "refactor-form".to_owned())
             .key_context("RefactorForm")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.title.clone()),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .children((!member_rows.is_empty()).then(|| {
                 div()
                     .font_weight(FontWeight::MEDIUM)
@@ -648,10 +645,25 @@ impl Render for RefactorFormDialog {
                     ),
             );
 
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("refactor-form-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "refactor-form",
+                title: title.into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

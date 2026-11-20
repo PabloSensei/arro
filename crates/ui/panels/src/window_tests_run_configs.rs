@@ -104,7 +104,7 @@ fn read_args(config: &RunConfig) -> String {
 /// The planned configurations of a test and the window that runs them.
 type Planned = Arc<Mutex<Vec<RunConfig>>>;
 
-fn open_run(
+pub(crate) fn open_run(
     cx: &mut TestAppContext,
     name: &str,
 ) -> (
@@ -180,7 +180,7 @@ fn click_menu(cx: &mut TestAppContext, window: WindowHandle<Workspace>, label: &
     click_selector(cx, window, &format!("menu-{index}"));
 }
 
-fn open_dialog(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
+pub(crate) fn open_dialog(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     click(cx, window, "t-config");
     click_menu(cx, window, "Edit Configurations...");
     draw(cx, window);

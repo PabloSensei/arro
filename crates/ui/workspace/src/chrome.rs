@@ -486,6 +486,57 @@ fn action_entry<A: Action + Clone + 'static>(label: &'static str, action: A) -> 
     .id(id)
 }
 
+/// The icons IDEA shows beside these rows of its menus, by the name the row shows before
+/// any quoted configuration name. A row with an icon of its own keeps it.
+const MENU_ICONS: &[(&str, &str)] = &[
+    ("Run", "run/run"),
+    ("Debug", "run/debug"),
+    ("Run with Coverage", "run/coverage"),
+    ("Profile", "run/profiler"),
+    ("Stop", "run/stop"),
+    ("Step Over", "debug/stepOver"),
+    ("Step Into", "debug/stepInto"),
+    ("Step Out", "debug/stepOut"),
+    ("Resume", "run/run"),
+    ("Toggle Breakpoint", "debug/breakpoints"),
+    ("Commit", "toolwindows/commit"),
+    ("Commit...", "toolwindows/commit"),
+    ("Push...", "general/upload"),
+    ("Update Project...", "general/refresh"),
+    ("Fetch", "general/download"),
+    ("Show History", "general/history"),
+    ("Local History...", "general/history"),
+    ("Rollback", "general/rollback"),
+    ("Cut", "general/cut"),
+    ("Copy", "general/copy"),
+    ("Paste", "general/paste"),
+    ("Delete", "general/delete"),
+    ("Delete...", "general/delete"),
+    ("Find...", "general/search"),
+    ("Replace...", "general/replace"),
+    ("Settings...", "general/settings"),
+    ("New File", "general/newFile"),
+    ("New Directory", "general/newFolder"),
+    ("Refresh", "general/refresh"),
+];
+
+/// Gives the rows of `entries`, and of their submenus, the icon of [`MENU_ICONS`] by their
+/// label, where a row has none. A row with a submenu keeps none: it names a section. A row
+/// without an icon keeps the empty place of one, so the labels of a menu stand in a column.
+pub(crate) fn with_menu_icons(entries: &mut [MenuEntry]) {
+    for entry in entries {
+        if entry.icon.is_none() && entry.submenu.is_empty() {
+            let label = entry.label.as_ref();
+            let name = label.split(" '").next().unwrap_or(label);
+            entry.icon = MENU_ICONS
+                .iter()
+                .find(|(row, _)| *row == name)
+                .map(|(_, icon)| *icon);
+        }
+        with_menu_icons(&mut entry.submenu);
+    }
+}
+
 impl Workspace {
     fn stripe_button(
         &self,
@@ -1759,6 +1810,10 @@ impl Workspace {
                         command("settings.import", "Import Settings..."),
                     ],
                 ),
+                command(
+                    "settings.import_idea",
+                    "Import Settings from IntelliJ IDEA...",
+                ),
             ],
         );
 
@@ -2214,9 +2269,13 @@ impl Workspace {
             ],
         );
 
-        vec![
+        // The rows carry their icons here as well as when a menu is shown, so the sections
+        // that the native menus and the tests read hold the rows the screen draws.
+        let mut sections = vec![
             file, edit, view, navigate, code, refactor, build, run, git, window, help,
-        ]
+        ];
+        with_menu_icons(&mut sections);
+        sections
     }
 
     /// The width of `text` in the toolbar font.

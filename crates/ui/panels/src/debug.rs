@@ -6509,38 +6509,47 @@ impl Render for QuickEvaluateView {
                     .into_any_element(),
             );
         }
-        let body = scrollable(
+        let shell = surface(&theme)
+            .id("quick-evaluate")
+            .debug_selector(|| "quick-evaluate".to_owned());
+        let contents = scrollable(
             "quick-evaluate",
             &self.scroll,
-            surface(&theme)
-                .id("quick-evaluate")
-                .debug_selector(|| "quick-evaluate".to_owned())
-                .occlude()
-                .w(px(420.))
+            div()
+                .id("quick-evaluate-list")
+                .flex()
+                .flex_col()
                 .max_h(px(320.))
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
                 .p(px(POPUP_PADDING))
                 .gap(px(2.))
                 .text_size(px(CODE_SIZE))
-                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-                .child(
-                    div()
-                        .px(px(SPACE_M))
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.text_secondary)
-                        .child("Quick Evaluate"),
-                )
                 .children(rows),
             &theme,
             window,
             cx,
         );
-        div()
-            .absolute()
-            .left(self.position.x)
-            .top(self.position.y)
-            .child(enter("quick-evaluate-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "quick-evaluate",
+                title: "Quick Evaluate".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(self.position.x),
+                    top: f32::from(self.position.y),
+                    width: 420.,
+                    height: None,
+                },
+                min: (280., 120.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -6858,24 +6867,17 @@ impl Render for EvaluateView {
                     .into_any_element()
             })
             .collect();
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("evaluate-window")
             .debug_selector(|| "evaluate-window".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(560.))
-            .p(px(DIALOG_PADDING))
-            .gap(px(SPACE_S))
             .text_size(px(CODE_SIZE))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .px(px(SPACE_M))
-                    .text_size(px(TEXT_SMALL))
-                    .text_color(theme.text_secondary)
-                    .child("Evaluate Expression"),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(DIALOG_PADDING))
             .child(field)
             .child(
                 div()
@@ -6921,11 +6923,26 @@ impl Render for EvaluateView {
         let width = px(560.);
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.2;
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("evaluate-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "evaluate",
+                title: "Evaluate Expression".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -7009,25 +7026,18 @@ impl Render for StepTargetsView {
                 .child(label)
                 .on_click(cx.listener(move |this, _, window, cx| this.choose(index, window, cx)))
         });
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("step-targets")
             .debug_selector(|| "step-targets".to_owned())
             .track_focus(&self.focus)
             .key_context("StepTargets")
-            .occlude()
-            .w(px(360.))
-            .p(px(SPACE_M))
-            .gap(px(SPACE_S))
             .text_size(px(UI_SIZE))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .px(px(SPACE_M))
-                    .text_size(px(TEXT_SMALL))
-                    .text_color(theme.text_secondary)
-                    .child(format!("Step Into ({total} calls)")),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(SPACE_M))
             .children(rows)
             .child(
                 div()
@@ -7040,11 +7050,26 @@ impl Render for StepTargetsView {
         let viewport = window.viewport_size();
         let left = (viewport.width - px(360.)) / 2.;
         let top = viewport.height * 0.25;
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("step-targets-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "step-targets",
+                title: format!("Step Into ({total} calls)").into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: 360.,
+                    height: None,
+                },
+                min: (280., 120.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -7907,23 +7932,15 @@ impl Render for BreakpointPopup {
         } else {
             format!("Evaluate and log: {log_expression}")
         };
-        let body = surface(&theme)
+        let title = format!("Breakpoint at {name}:{line}");
+        let shell = surface(&theme)
             .id("breakpoint-popup")
             .debug_selector(|| "breakpoint-popup".to_owned())
-            .track_focus(&self.focus)
-            .occlude()
-            .w(px(420.))
+            .track_focus(&self.focus);
+        let contents = div()
+            .flex()
+            .flex_col()
             .pb(px(SPACE_S))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(34.))
-                    .px(px(SPACE_M))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("Breakpoint at {name}:{line}")),
-            )
             .child(
                 Self::row("breakpoint-popup-condition", condition_text, &theme).on_click(
                     cx.listener(move |this, _, window, cx| {
@@ -7998,11 +8015,26 @@ impl Render for BreakpointPopup {
         let width = px(420.);
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.2;
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("breakpoint-popup-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "breakpoint-popup",
+                title: title.into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (320., 120.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -8623,30 +8655,30 @@ impl Render for BreakpointsView {
                     .into_any_element(),
             );
         }
-        let body = scrollable(
+        let shell = surface(&theme)
+            .id("breakpoints-dialog")
+            .debug_selector(|| "breakpoints-dialog".to_owned())
+            .track_focus(&self.focus)
+            .text_color(theme.text)
+            .text_size(px(UI_SIZE))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close(window, cx);
+                    cx.stop_propagation();
+                }
+            }));
+        let contents = scrollable(
             "breakpoints-dialog",
             &self.scroll,
-            surface(&theme)
-                .id("breakpoints-dialog")
-                .debug_selector(|| "breakpoints-dialog".to_owned())
-                .track_focus(&self.focus)
-                .occlude()
-                .w(px(760.))
+            div()
+                .id("breakpoints-list")
+                .flex()
+                .flex_col()
                 .max_h(px(640.))
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
                 .p(px(DIALOG_PADDING))
                 .gap(px(SPACE_M))
-                .text_size(px(UI_SIZE))
-                .text_color(theme.text)
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.close(window, cx);
-                        cx.stop_propagation();
-                    }
-                }))
-                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Breakpoints"))
                 .children(rows)
                 .child(
                     div().flex().justify_end().child(
@@ -8669,11 +8701,26 @@ impl Render for BreakpointsView {
         let width = px(760.);
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.15;
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("breakpoints-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "breakpoints-dialog",
+                title: "Breakpoints".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (480., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

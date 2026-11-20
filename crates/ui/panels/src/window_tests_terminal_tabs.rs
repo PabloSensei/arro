@@ -59,7 +59,7 @@ pub(crate) fn session_of(
 
 /// Types a command line that prints `line` and waits until the screen shows it. The
 /// command is the same in every shell of the tests: `echo`.
-fn print_line(
+pub(crate) fn print_line(
     cx: &mut TestAppContext,
     terminal: &gpui::Entity<TerminalPanel>,
     line: &str,
@@ -81,14 +81,14 @@ fn print_line(
 }
 
 /// One turn of the simulated clock.
-fn tick(cx: &mut TestAppContext) {
+pub(crate) fn tick(cx: &mut TestAppContext) {
     cx.executor().advance_clock(Duration::from_millis(50));
     cx.run_until_parked();
 }
 
 /// Where a cell of the grid sits on the screen. The cell width is not known before the
 /// frame, so a click aims inside the first columns of the row.
-fn cell_position(
+pub(crate) fn cell_position(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     row: usize,
@@ -101,7 +101,7 @@ fn cell_position(
 }
 
 /// The row of the screen that shows `needle`, the latest one.
-fn row_of(session: &TerminalSession, needle: &str) -> usize {
+pub(crate) fn row_of(session: &TerminalSession, needle: &str) -> usize {
     let lines = session.screen().lines();
     lines
         .iter()

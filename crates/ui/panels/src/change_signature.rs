@@ -763,25 +763,21 @@ impl Render for ChangeSignatureDialog {
             })
         };
 
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("change-signature")
             .debug_selector(|| "change-signature".to_owned())
             .key_context("ChangeSignature")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Change Signature"),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .child(labelled("Name", name, &theme))
             .child(labelled("Visibility", visibility, &theme))
             .child(labelled("Return type", return_type, &theme))
@@ -841,10 +837,25 @@ impl Render for ChangeSignatureDialog {
                     ),
             );
 
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("change-signature-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "change-signature",
+                title: "Change Signature".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

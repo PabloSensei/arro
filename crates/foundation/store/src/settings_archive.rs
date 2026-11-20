@@ -158,6 +158,47 @@ pub fn read_part(archive: &Path, part: &Part) -> Result<String, String> {
     Ok(text)
 }
 
+/// The text entries of a zip whose names `wanted` accepts, as `(name, text)`. Only those
+/// entries are opened: an entry of another kind is never read.
+pub fn read_wanted_texts(
+    archive: &Path,
+    wanted: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, String)>, String> {
+    let file =
+        std::fs::File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
+    let mut files =
+        ZipArchive::new(file).map_err(|_| format!("{} is not an archive", archive.display()))?;
+    let names: Vec<String> = files
+        .file_names()
+        .filter_map(Result::ok)
+        .filter(|name| wanted(name))
+        .map(|name| name.into_owned())
+        .collect();
+    let mut texts = Vec::with_capacity(names.len());
+    for name in names {
+        let mut entry = files
+            .by_name(&name)
+            .map_err(|_| format!("{} has no {name}", archive.display()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        if entry.size() > MAX_PART_BYTES {
+            return Err(format!("{name} is too large"));
+        }
+        let mut text = String::new();
+        entry
+            .by_ref()
+            .take(MAX_PART_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|error| format!("{name}: {error}"))?;
+        if text.len() as u64 > MAX_PART_BYTES {
+            return Err(format!("{name} is too large"));
+        }
+        texts.push((name, text));
+    }
+    Ok(texts)
+}
+
 /// Writes the selected parts of an archive into `settings_dir` and gives their ids. A
 /// part the user did not select is left alone, as is every file the manifest does not
 /// name.

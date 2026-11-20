@@ -16,10 +16,17 @@ use store::{BlobStore, Entry, Log};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
     Saved,
+    /// A changed buffer that has not been saved yet.
+    Auto,
     BeforeReload,
     BeforeRename,
     BeforeReplace,
+    BeforeRefactoring,
+    BeforeReformat,
+    BeforeOptimizeImports,
     BeforeGitRevert,
+    BeforeGitCheckout,
+    BeforeGitPull,
     BeforeDelete,
     BeforeRevert,
     BeforeRestore,
@@ -27,12 +34,18 @@ pub enum Cause {
 }
 
 impl Cause {
-    const ALL: [Cause; 9] = [
+    const ALL: [Cause; 15] = [
         Cause::Saved,
+        Cause::Auto,
         Cause::BeforeReload,
         Cause::BeforeRename,
         Cause::BeforeReplace,
+        Cause::BeforeRefactoring,
+        Cause::BeforeReformat,
+        Cause::BeforeOptimizeImports,
         Cause::BeforeGitRevert,
+        Cause::BeforeGitCheckout,
+        Cause::BeforeGitPull,
         Cause::BeforeDelete,
         Cause::BeforeRevert,
         Cause::BeforeRestore,
@@ -42,10 +55,16 @@ impl Cause {
     fn key(self) -> &'static str {
         match self {
             Cause::Saved => "saved",
+            Cause::Auto => "auto",
             Cause::BeforeReload => "reload",
             Cause::BeforeRename => "rename",
             Cause::BeforeReplace => "replace",
+            Cause::BeforeRefactoring => "refactoring",
+            Cause::BeforeReformat => "reformat",
+            Cause::BeforeOptimizeImports => "imports",
             Cause::BeforeGitRevert => "git-revert",
+            Cause::BeforeGitCheckout => "git-checkout",
+            Cause::BeforeGitPull => "git-pull",
             Cause::BeforeDelete => "delete",
             Cause::BeforeRevert => "revert",
             Cause::BeforeRestore => "restore",
@@ -61,10 +80,16 @@ impl Cause {
     pub fn title(self) -> &'static str {
         match self {
             Cause::Saved => "Saved",
+            Cause::Auto => "Auto",
             Cause::BeforeReload => "Before an external change",
             Cause::BeforeRename => "Before rename",
             Cause::BeforeReplace => "Before Replace All",
+            Cause::BeforeRefactoring => "Refactoring",
+            Cause::BeforeReformat => "Reformat",
+            Cause::BeforeOptimizeImports => "Optimize Imports",
             Cause::BeforeGitRevert => "Before Git rollback",
+            Cause::BeforeGitCheckout => "Git: checkout",
+            Cause::BeforeGitPull => "Git: pull",
             Cause::BeforeDelete => "Before delete",
             Cause::BeforeRevert => "Before revert from history",
             Cause::BeforeRestore => "Before restore from history",

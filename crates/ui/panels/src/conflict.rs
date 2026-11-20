@@ -322,40 +322,17 @@ impl Render for ConflictView {
                 .text_color(theme.text_secondary)
                 .child("Local changes will be restored when the operation ends.")
         });
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("conflicts")
             .debug_selector(|| "conflicts".to_owned())
             .key_context("Conflicts ToolWindow")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .h(px(40.))
-                    .px(px(DIALOG_PADDING))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title)
-                    .child(
-                        div()
-                            .id("conflict-close")
-                            .debug_selector(|| "conflict-close".to_owned())
-                            .px(px(8.))
-                            .rounded(px(CONTROL_RADIUS))
-                            .hover({
-                                let hover = theme.hover;
-                                move |style| style.bg(hover)
-                            })
-                            .child("Close")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                    ),
-            )
+            .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .child(
                 scrollable(
                     "conflict-files",
@@ -386,10 +363,25 @@ impl Render for ConflictView {
                     .children(stash_note)
                     .children(abort),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("conflicts-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "conflict",
+                title: title.into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
