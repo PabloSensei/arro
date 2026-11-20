@@ -14,6 +14,7 @@ mod build_output;
 mod bundle_editor;
 mod call_hierarchy;
 mod change_signature;
+mod change_tree;
 mod changelists;
 mod changes;
 mod chat;
@@ -57,6 +58,7 @@ mod history;
 mod history_view;
 mod http;
 mod hunk_popup;
+mod idea_import;
 mod index;
 mod inspect;
 mod inspection;
@@ -104,6 +106,7 @@ mod sequence_layout;
 mod settings;
 mod settings_archive;
 mod settings_catalog;
+mod settings_file_types;
 mod settings_keymap;
 mod settings_templates;
 mod shelf;
@@ -501,6 +504,8 @@ mod window_tests_create_test;
 #[cfg(test)]
 mod window_tests_diff_shared;
 #[cfg(test)]
+mod window_tests_terminal_actions;
+#[cfg(test)]
 mod window_tests_terminal_leak;
 #[cfg(test)]
 mod window_tests_terminal_tabs;
@@ -575,6 +580,8 @@ mod window_tests_stack_traces;
 mod window_tests_database_polish;
 #[cfg(test)]
 mod window_tests_idea_import;
+#[cfg(test)]
+mod window_tests_idea_settings;
 #[cfg(test)]
 mod window_tests_run_configurations;
 #[cfg(test)]
@@ -1125,14 +1132,16 @@ fn connect_project_problems(
                 Some(_) => {}
                 None => notified.clear(),
             }
-            let updated = workspace.update(cx, |_, cx| {
-                if let Some(active) = cx.try_global::<ActiveProblems>() {
-                    let hub = active.0.clone();
-                    hub.update(cx, |hub, cx| hub.set_project_problems(&problems, cx));
-                }
-            });
-            if updated.is_err() {
+            // The hub reads the workspace for the icons of its rows, so it is updated while
+            // the workspace is free: a lease of the workspace here would panic in that read.
+            let Ok(hub) = workspace.read_with(cx, |_, app| {
+                app.try_global::<ActiveProblems>()
+                    .map(|active| active.0.clone())
+            }) else {
                 break;
+            };
+            if let Some(hub) = hub {
+                hub.update(cx, |hub, cx| hub.set_project_problems(&problems, cx));
             }
         }
     })
@@ -1672,8 +1681,16 @@ fn install(
 
     let keymap_file = workspace.keymap_path().to_path_buf();
     let templates_file = workspace.settings_dir().join(templates::TEMPLATES_FILE);
-    let (index, events) =
-        ProjectIndex::start(root.clone(), vec![keymap_file, templates_file], search);
+    let ignored = cx
+        .try_global::<workspace::Settings>()
+        .map(|settings| settings.ignored_files.clone())
+        .unwrap_or_default();
+    let (index, events) = ProjectIndex::start_with_ignored(
+        root.clone(),
+        vec![keymap_file, templates_file],
+        search,
+        ignored,
+    );
     cx.set_global(crate::index::ActiveIndex(index.clone()));
     let lookup = index.clone();
     cx.set_global(editor_view::SymbolLookup(Some(Arc::new(
@@ -1801,6 +1818,7 @@ fn install(
     );
     cx.set_global(bookmarks::ActiveBookmarks(bookmarks));
     settings_archive::bind_commands(workspace, cx);
+    idea_import::bind_commands(workspace, cx);
     release_on_close(window, cx);
 }
 
@@ -2056,6 +2074,8 @@ mod window_tests_import_failure;
 mod window_tests_bookmarks;
 
 #[cfg(test)]
+mod window_tests_history_todo;
+#[cfg(test)]
 mod window_tests_move_members;
 
 #[cfg(test)]
@@ -2071,6 +2091,24 @@ mod window_tests_macos_keys;
 mod window_tests_log_menu_git;
 
 #[cfg(test)]
+mod window_tests_dialog_frame;
+#[cfg(test)]
 mod window_tests_inspect_scope;
 #[cfg(test)]
 mod window_tests_reformat_scope;
+
+#[cfg(test)]
+mod window_tests_push_cancel;
+
+#[cfg(test)]
+mod window_tests_push_tree;
+
+#[cfg(test)]
+mod window_tests_commit_tree;
+
+#[cfg(test)]
+mod window_tests_finder_polish;
+#[cfg(test)]
+mod window_tests_icons;
+#[cfg(test)]
+mod window_tests_settings_polish;

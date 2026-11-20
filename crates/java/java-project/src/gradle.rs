@@ -306,6 +306,10 @@ pub fn bundled_home(data_dir: &Path) -> Option<PathBuf> {
 }
 
 impl BuildSystem for Gradle {
+    fn task_icon(&self) -> &'static str {
+        "run/gradle"
+    }
+
     fn detect(&self, root: &Path) -> bool {
         BUILD_FILES.iter().any(|name| root.join(name).is_file())
     }

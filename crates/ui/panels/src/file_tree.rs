@@ -61,6 +61,8 @@ pub struct FileTree {
     source_roots: Vec<PathBuf>,
     /// Folders whose listing the rows need and that have none yet.
     missing: Vec<PathBuf>,
+    /// File and folder masks the user leaves out of the tree.
+    ignored: Vec<String>,
     rows: Vec<Row>,
 }
 
@@ -77,6 +79,7 @@ impl FileTree {
             compact: false,
             source_roots: Vec::new(),
             missing: Vec::new(),
+            ignored: Vec::new(),
             rows: Vec::new(),
         };
         tree.rebuild();
@@ -200,6 +203,24 @@ impl FileTree {
         self.compact
     }
 
+    /// Sets the masks the rows leave out, such as `*.class` and `node_modules`. Returns
+    /// whether the rows changed.
+    pub fn set_ignored(&mut self, patterns: Vec<String>) -> bool {
+        if self.ignored == patterns {
+            return false;
+        }
+        self.ignored = patterns;
+        self.rebuild();
+        true
+    }
+
+    /// Whether a row of the disk matches one of the masks of the user.
+    fn is_ignored(&self, child: &Child) -> bool {
+        self.ignored
+            .iter()
+            .any(|mask| mask_matches(&child.name, mask))
+    }
+
     /// Sets the source roots of the project model. Returns whether they changed.
     pub fn set_source_roots(&mut self, roots: Vec<PathBuf>) -> bool {
         if self.source_roots == roots {
@@ -305,7 +326,9 @@ impl FileTree {
         missing: &mut Vec<PathBuf>,
     ) {
         for child in self.listings.get(folder).into_iter().flatten() {
-            self.push_child(child, false, depth, rows, missing);
+            if !self.is_ignored(child) {
+                self.push_child(child, false, depth, rows, missing);
+            }
         }
         for child in self.virtuals.get(folder).into_iter().flatten() {
             self.push_child(child, true, depth, rows, missing);
@@ -381,6 +404,10 @@ impl FileTree {
             {
                 return Some(tail);
             }
+            let children: Vec<&Child> = children
+                .iter()
+                .filter(|child| !self.is_ignored(child))
+                .collect();
             let [only] = children.as_slice() else {
                 return Some(tail);
             };
@@ -421,6 +448,36 @@ impl FileTree {
             .skip(1)
             .any(|ancestor| self.is_source_root(ancestor))
     }
+}
+
+/// Whether a name matches a mask with `*` for any run and `?` for one character. The
+/// case of the two sides is ignored, as the file systems of Windows and macOS do.
+fn mask_matches(name: &str, mask: &str) -> bool {
+    let name: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
+    let mask: Vec<char> = mask.chars().flat_map(char::to_lowercase).collect();
+    let (mut at, mut part) = (0, 0);
+    let mut star = None;
+    let mut restart = 0;
+    while at < name.len() {
+        if part < mask.len() && (mask[part] == '?' || mask[part] == name[at]) {
+            at += 1;
+            part += 1;
+        } else if part < mask.len() && mask[part] == '*' {
+            star = Some(part);
+            restart = at;
+            part += 1;
+        } else if let Some(star) = star {
+            restart += 1;
+            at = restart;
+            part = star + 1;
+        } else {
+            return false;
+        }
+    }
+    while part < mask.len() && mask[part] == '*' {
+        part += 1;
+    }
+    part == mask.len()
 }
 
 /// The names of the folders from `head` down to `tail`, as the row shows them.
@@ -665,5 +722,35 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["zeta", "alpha.txt", "Beta.txt"]);
+    }
+
+    #[test]
+    fn the_masks_of_the_user_hide_rows_and_cut_a_chain() {
+        let mut tree = FileTree::new(PathBuf::from("/p"), []);
+        tree.set_ignored(vec!["*.class".to_owned(), "gone".to_owned()]);
+        tree.set_listing(
+            PathBuf::from("/p"),
+            vec![
+                child("/p/App.class", false),
+                child("/p/gone", true),
+                child("/p/src", true),
+            ],
+        );
+        assert_eq!(names(&tree), [(0, "p"), (1, "src")]);
+
+        tree.set_ignored(Vec::new());
+        assert_eq!(
+            names(&tree),
+            [(0, "p"), (1, "App.class"), (1, "gone"), (1, "src")]
+        );
+    }
+
+    #[test]
+    fn a_mask_matches_a_name_of_any_case() {
+        assert!(mask_matches("App.CLASS", "*.class"));
+        assert!(mask_matches("node_modules", "node_*"));
+        assert!(mask_matches("x", "?"));
+        assert!(!mask_matches("notes", "*.class"));
+        assert!(!mask_matches("node", "node_modules"));
     }
 }

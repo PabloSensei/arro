@@ -42,7 +42,7 @@ const APP_ICONS: [(&str, &str); 4] = [
 
 /// A repository whose Log opens on a commit that removes the files of the first one from
 /// the working copy.
-fn repository(name: &str) -> PathBuf {
+pub(crate) fn repository(name: &str) -> PathBuf {
     let root = scratch(name);
     let git = git();
     git.run(&root, ["init"]).unwrap();
@@ -66,7 +66,10 @@ fn repository(name: &str) -> PathBuf {
 
 /// A window whose file icons are the application's, so the class and XML files of the
 /// project have the icons they have there.
-fn open_window_with_icons(cx: &mut TestAppContext, root: PathBuf) -> WindowHandle<Workspace> {
+pub(crate) fn open_window_with_icons(
+    cx: &mut TestAppContext,
+    root: PathBuf,
+) -> WindowHandle<Workspace> {
     cx.executor().allow_parking();
     let state_dir = scratch("log-icons-state");
     let store = store::Store::open(&state_dir.join("state.sqlite"))

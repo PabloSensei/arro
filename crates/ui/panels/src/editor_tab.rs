@@ -153,6 +153,46 @@ fn status_of(view: &EditorView) -> EditorStatus {
     }
 }
 
+/// Once in a while, records a buffer that has changed and is not saved yet, so that a
+/// crash or a command that rewrites the file loses no more than one interval of work. The
+/// version of the document tells whether the text changed since the last snapshot.
+fn watch_unsaved(view: &Entity<EditorView>, cx: &mut App) {
+    let weak = view.downgrade();
+    cx.spawn(async move |cx| {
+        let mut last = None;
+        loop {
+            let interval = cx.update(|cx| crate::history::auto_interval(cx));
+            cx.background_executor().timer(interval).await;
+            let next = weak.update(cx, |view, cx| {
+                if !view.is_dirty() {
+                    return None;
+                }
+                let version = view.version()?;
+                if last == Some(version) {
+                    return None;
+                }
+                // The history opens in the background: an interval that passes before it
+                // is ready leaves the version for the next one.
+                crate::history::get(cx)?;
+                let path = view.path().to_path_buf();
+                crate::history::snapshot_bytes(
+                    &path,
+                    view.file_bytes(),
+                    local_history::Cause::Auto,
+                    cx,
+                );
+                Some(version)
+            });
+            match next {
+                Ok(Some(version)) => last = Some(version),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    })
+    .detach();
+}
+
 fn open(
     workspace: &WeakEntity<Workspace>,
     state_dir: &std::path::Path,
@@ -218,6 +258,7 @@ fn open(
     view.update(cx, debug::refresh_breakpoints);
     view.update(cx, debug::refresh_inline_values);
     view.update(cx, |view, cx| view.set_options(options_of(cx), cx));
+    watch_unsaved(&view, cx);
     let opened = view.read(cx).path().to_path_buf();
     crate::library_sources::tab_opened(&opened, cx);
     crate::jshell_panel::tab_opened(&opened, cx);
@@ -1052,6 +1093,16 @@ fn open(
             {
                 panel.update(cx, |panel, cx| panel.project_file_saved(&path, cx));
             }
+        }
+        EditorEvent::BeforeOptimizeImports => {
+            let path = view.read(cx).path().to_path_buf();
+            let bytes = view.read(cx).file_bytes();
+            crate::history::snapshot_bytes(
+                &path,
+                bytes,
+                local_history::Cause::BeforeOptimizeImports,
+                cx,
+            );
         }
         EditorEvent::ExternalChange(bytes) => {
             let path = view.read(cx).path().to_path_buf();

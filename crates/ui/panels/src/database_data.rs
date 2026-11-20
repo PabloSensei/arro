@@ -1004,14 +1004,36 @@ impl DatabaseDataView {
             );
         }
         bar = bar.child(
-            small_button("database-data-add", "Add Row", theme)
-                .debug_selector(|| "database-data-add".to_owned())
-                .on_click(cx.listener(|this, _, _, cx| this.add_row(cx))),
+            icon_button(
+                "database-data-add",
+                "general/add",
+                "Add Row",
+                Some(keymap::shortcut_label("alt-insert", keymap::platform()).into()),
+                theme,
+            )
+            .debug_selector(|| "database-data-add".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| this.add_row(cx))),
         );
         bar = bar.child(
-            small_button("database-data-delete", "Delete Row", theme)
-                .debug_selector(|| "database-data-delete".to_owned())
-                .on_click(cx.listener(|this, _, _, cx| this.delete_row(cx))),
+            icon_button(
+                "database-data-delete",
+                "general/minus",
+                "Delete Row",
+                Some(
+                    keymap::shortcut_label(
+                        if cfg!(target_os = "macos") {
+                            "cmd-delete"
+                        } else {
+                            "ctrl-delete"
+                        },
+                        keymap::platform(),
+                    )
+                    .into(),
+                ),
+                theme,
+            )
+            .debug_selector(|| "database-data-delete".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| this.delete_row(cx))),
         );
         bar = bar.child(
             small_button("database-data-submit", "Submit", theme)
@@ -1019,18 +1041,24 @@ impl DatabaseDataView {
                 .on_click(cx.listener(|this, _, _, cx| this.submit(false, cx))),
         );
         bar = bar.child(
-            small_button("database-data-revert", "Revert", theme)
-                .debug_selector(|| "database-data-revert".to_owned())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.busy(cx) {
-                        return;
-                    }
-                    this.model.revert();
-                    this.submit = None;
-                    this.error = None;
-                    this.status = Some("The changes are reverted.".to_owned());
-                    cx.notify();
-                })),
+            icon_button(
+                "database-data-revert",
+                "general/rollback",
+                "Revert",
+                None,
+                theme,
+            )
+            .debug_selector(|| "database-data-revert".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.busy(cx) {
+                    return;
+                }
+                this.model.revert();
+                this.submit = None;
+                this.error = None;
+                this.status = Some("The changes are reverted.".to_owned());
+                cx.notify();
+            })),
         );
         bar.child(
             icon_button(

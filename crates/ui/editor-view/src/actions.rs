@@ -661,6 +661,7 @@ impl EditorView {
         let only = Some(ActionKind::OrganizeImports);
         self.ask_actions(span, only, cx, |this, version, _, entries, cx| {
             if let Some(entry) = entries.into_iter().next() {
+                cx.emit(EditorEvent::BeforeOptimizeImports);
                 this.apply_entry(version, entry, cx);
             }
         });

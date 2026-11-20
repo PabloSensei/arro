@@ -745,26 +745,21 @@ impl Render for CreateTestDialog {
             })
         };
 
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("create-test")
             .debug_selector(|| "create-test".to_owned())
             .key_context("CreateTest")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .max_h(viewport.height * 0.78)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Create Test"),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
@@ -814,11 +809,26 @@ impl Render for CreateTestDialog {
                     ),
             );
 
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("create-test-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "create-test-dialog",
+                title: "Create Test".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (400., 280.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

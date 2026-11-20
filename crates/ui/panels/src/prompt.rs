@@ -299,22 +299,19 @@ impl Render for Prompt {
                     cx.notify();
                 }))
         });
-        let body = surface(&theme)
+        let title = self.title.clone();
+        let shell = surface(&theme)
             .id("prompt")
             .debug_selector(|| "prompt".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(self.title.clone()),
-            )
             .child(if self.confirm {
                 div()
                     .text_color(theme.text_secondary)
@@ -373,12 +370,27 @@ impl Render for Prompt {
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_answer(window, cx))),
                 )
         });
-        let body = body.children(buttons);
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("prompt-enter", body))
+        let contents = contents.children(buttons);
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "prompt",
+                title,
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (320., 120.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

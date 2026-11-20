@@ -1137,25 +1137,20 @@ impl Render for CompareResponses {
             })
             .collect();
         let enabled = self.selected.len() == 2;
-        surface(&theme)
+        let shell = surface(&theme)
             .id("http-compare-dialog")
             .debug_selector(|| "http-compare-dialog".to_owned())
             .key_context("HttpCompare")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text);
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .text_size(px(UI_SIZE))
-            .text_color(theme.text)
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(theme.text)
-                    .child("Compare two responses"),
-            )
             .child(
                 div()
                     .flex()
@@ -1194,7 +1189,29 @@ impl Render for CompareResponses {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.compare(window, cx))),
                     ),
-            )
+            );
+        let left = (viewport.width - width) / 2.;
+        let top = (viewport.height - height) / 2.;
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "http-compare",
+                title: "Compare two responses".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

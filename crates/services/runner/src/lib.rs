@@ -2,6 +2,7 @@
 //! print and a live tree of test results. What a configuration means belongs to its
 //! provider, the core keeps it as opaque data.
 
+mod command;
 mod compound;
 mod config;
 mod console;
@@ -14,6 +15,7 @@ mod services;
 mod tasks;
 mod testing;
 
+pub use command::CommandProvider;
 pub use compound::CompoundProvider;
 pub use config::{
     AttachPlan, BeforeLaunchStep, COMPOUND_PROVIDER, ConfigField, ConfigFieldKind, ConfigTemplate,

@@ -7,6 +7,7 @@ pub use gpui_kit::*;
 
 pub use ::theme::{metrics, motion, snapped_code_size};
 
+mod dialog;
 mod embedded;
 pub mod icon_sets;
 mod motions;
@@ -21,6 +22,7 @@ mod test_bounds;
 mod text_field;
 mod widgets;
 
+pub use dialog::{DialogPlace, DialogPlaces, DialogSpec, dialog_window};
 pub use embedded::{Assets, app, init};
 pub use icon_sets::{ARRO, INTELLIJ, IconCatalog, IconSet, icon_file};
 pub use motions::{Slide, smoothstep};

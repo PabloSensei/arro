@@ -214,15 +214,19 @@ impl AgentHunkPopup {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
+        // A click closes the popup from inside the update of its own window, and a nested
+        // update of that window fails. The close runs once that update has ended.
         let workspace = self.workspace.clone();
         let window = self.window;
-        window
-            .update(cx, |_, window, cx| {
-                workspace
-                    .update(cx, |workspace, cx| workspace.close_menu(window, cx))
-                    .ok();
-            })
-            .ok();
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.close_menu(window, cx))
+                        .ok();
+                })
+                .ok();
+        });
     }
 
     /// Where the window stands: below the changed lines when there is room, above them

@@ -1,7 +1,7 @@
 //! The Commit tool window: the changed files with check boxes, the message, Commit and
 //! Commit and Push. A double click on a file shows its diff.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -10,9 +10,10 @@ use lang_api::Severity;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use vcs::{CommitOptions, CommitRequest, Hunk, PartialFile};
-use workspace::{COMMIT_TOOL, Settings, Workspace};
+use vcs::{CommitOptions, CommitRequest, FileStatus, Hunk, PartialFile};
+use workspace::{COMMIT_TOOL, FileIcons, Settings, Workspace};
 
+use crate::change_tree::{self, FOLDER_ICON, MODULE_ICON, NodeKind, TreeNode};
 use crate::changelists::{Changelists, Grouping};
 use crate::diff_view::DiffView;
 use crate::git::{GitState, Kind, relative_of, short_commit};
@@ -274,6 +275,117 @@ fn shelf_entries(files: &[String]) -> Vec<ShelfEntry> {
     entries
 }
 
+/// How the ticks under a row add up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tick {
+    On,
+    Off,
+    /// Some of the files are on, or a file has some of its hunks left out.
+    Partial,
+}
+
+/// A row of the tree of the Commit window and the state of the changes it belongs to.
+struct Row {
+    node: TreeNode,
+    /// `changes` or `unversioned`; empty for a repository heading.
+    bucket: &'static str,
+}
+
+/// The path and the index of each of the files at `indices`, as the tree builder takes them.
+fn entries_of<'a>(files: &'a [FileStatus], indices: &[usize]) -> Vec<(&'a str, usize)> {
+    indices
+        .iter()
+        .map(|&index| (files[index].path.as_str(), index))
+        .collect()
+}
+
+/// The debug selectors of a row: the row, its tick and the mark of a partial tick. A file keeps
+/// the selectors the tests of the window know.
+fn selectors_of(node: &TreeNode, bucket: &str) -> (String, String, String) {
+    let subject = match node.kind {
+        NodeKind::File => {
+            let index = node.file.unwrap_or_default();
+            return (
+                format!("commit-row-{index}"),
+                format!("commit-check-{index}"),
+                format!("commit-partial-{index}"),
+            );
+        }
+        NodeKind::Root => node.path.clone(),
+        NodeKind::Group => bucket.to_owned(),
+        NodeKind::Module => format!("{bucket}-{}", node.label),
+        NodeKind::Folder => format!("{bucket}-{}", node.path),
+    };
+    let word = match node.kind {
+        NodeKind::Root => "root",
+        NodeKind::Group => "group",
+        NodeKind::Module => "module",
+        NodeKind::Folder | NodeKind::File => "folder",
+    };
+    (
+        format!("commit-{word}-{subject}"),
+        format!("commit-{word}-check-{subject}"),
+        format!("commit-{word}-partial-{subject}"),
+    )
+}
+
+/// A button of the tree toolbar: the icon of the shared set in a frame named by the button. The
+/// icon sits in a box of its own with the selector `{id}-icon`, so a test finds this icon inside
+/// this button, not the same icon that another tool window draws elsewhere.
+fn tree_button(
+    id: &'static str,
+    icon_name: &'static str,
+    label: &'static str,
+    shortcut: Option<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    button_frame(id, label, shortcut, theme)
+        .debug_selector(move || id.to_owned())
+        .child(
+            div()
+                .debug_selector(move || format!("{id}-icon"))
+                .child(icon(icon_name, theme)),
+        )
+}
+
+/// The box of a tick: a mark when it is on, a bar when it is partial. The bar carries the
+/// selector `partial`.
+fn tick_box(tick: Tick, partial: String, theme: &Theme) -> Div {
+    let on = tick != Tick::Off;
+    div()
+        .flex_none()
+        .size(px(14.))
+        .mr(px(SPACE_M))
+        .rounded(px(3.))
+        .border_1()
+        .border_color(if on {
+            theme.accent
+        } else {
+            theme.text_secondary
+        })
+        .when(on, |this| this.bg(theme.accent))
+        .child(
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(tick == Tick::On, |this| {
+                    this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                })
+                .when(tick == Tick::Partial, |this| {
+                    this.child(
+                        div()
+                            .debug_selector(move || partial.clone())
+                            .w(px(8.))
+                            .h(px(2.))
+                            .rounded(px(1.))
+                            .bg(theme.over_accent),
+                    )
+                }),
+        )
+}
+
 /// A commit waiting for the answer about the problems of the analysis.
 struct PendingCommit {
     request: CommitRequest,
@@ -387,6 +499,10 @@ pub struct CommitPanel {
     /// The hunks taken off, by path, so that a file shows a partial tick.
     partial: HashMap<String, Vec<Hunk>>,
     selected: Option<usize>,
+    /// The key of the heading or the folder that is selected, when no file is.
+    selected_node: Option<String>,
+    /// The keys of the headings and folders of the tree whose rows are closed.
+    collapsed: HashSet<String>,
     scroll_files: ScrollHandle,
     scroll_shelves: ScrollHandle,
     scroll_shelf_files: ScrollHandle,
@@ -467,6 +583,8 @@ impl CommitPanel {
                 unchecked,
                 partial,
                 selected: None,
+                selected_node: None,
+                collapsed: HashSet::new(),
                 scroll_files: ScrollHandle::new(),
                 scroll_shelves: ScrollHandle::new(),
                 scroll_shelf_files: ScrollHandle::new(),
@@ -744,17 +862,7 @@ impl CommitPanel {
 
     /// Ctrl+Alt+Z: the selected file, or the ticked ones, go back to the last commit.
     fn revert_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths: Vec<String> = match self.selected {
-            Some(index) => self
-                .git
-                .read(cx)
-                .status()
-                .files
-                .get(index)
-                .map(|file| vec![file.path.clone()])
-                .unwrap_or_default(),
-            None => self.checked_paths(cx),
-        };
+        let paths = self.target_paths(cx);
         if paths.is_empty() {
             return;
         }
@@ -806,6 +914,10 @@ impl CommitPanel {
 
     /// The files the list actions work on: the file under the cursor, or every ticked one.
     fn target_paths(&self, cx: &App) -> Vec<String> {
+        if let Some(key) = &self.selected_node {
+            let indices = self.node_files(key, cx);
+            return self.paths_of(&indices, cx);
+        }
         let visible = self.visible_files(cx);
         if let Some(selected) = self.selected
             && visible.contains(&selected)
@@ -828,6 +940,15 @@ impl CommitPanel {
         {
             self.selected = None;
         }
+        if let Some(key) = self.selected_node.clone() {
+            let shown = self
+                .tree_rows(cx, &self.collapsed)
+                .iter()
+                .any(|row| row.node.key == key);
+            if !shown {
+                self.selected_node = None;
+            }
+        }
     }
 
     pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -837,6 +958,7 @@ impl CommitPanel {
         self.tab = tab;
         self.files_focused = false;
         self.selected = None;
+        self.selected_node = None;
         if tab == Tab::Shelf {
             self.reload_shelves(cx);
             if self.shelf_selected.is_none() && !self.shelves.is_empty() {
@@ -1883,27 +2005,25 @@ impl CommitPanel {
             return;
         }
         if self.files_focused {
-            let visible = self.visible_files(cx);
             match key.key.as_str() {
                 "up" => {
-                    let position = self
-                        .selected
-                        .and_then(|selected| visible.iter().position(|index| *index == selected));
-                    let next = position.map_or(0, |position| position.saturating_sub(1));
-                    self.selected = visible.get(next).copied();
+                    self.move_selection(-1, cx);
                     cx.stop_propagation();
-                    cx.notify();
                     return;
                 }
                 "down" => {
-                    let position = self
-                        .selected
-                        .and_then(|selected| visible.iter().position(|index| *index == selected));
-                    let last = visible.len().saturating_sub(1);
-                    let next = position.map_or(0, |position| (position + 1).min(last));
-                    self.selected = visible.get(next).copied();
+                    self.move_selection(1, cx);
                     cx.stop_propagation();
-                    cx.notify();
+                    return;
+                }
+                "left" => {
+                    self.fold_selected(true, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "right" => {
+                    self.fold_selected(false, cx);
+                    cx.stop_propagation();
                     return;
                 }
                 "space" | " " => {
@@ -1923,6 +2043,11 @@ impl CommitPanel {
 
     /// The space bar of the list: the file under the cursor gets the tick or loses it.
     fn toggle_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.selected_node.clone() {
+            let indices = self.node_files(&key, cx);
+            self.toggle_indices(&indices, cx);
+            return;
+        }
         let Some(path) = self
             .selected
             .and_then(|index| self.git.read(cx).status().files.get(index))
@@ -1945,120 +2070,560 @@ impl CommitPanel {
         window.mouse_position()
     }
 
-    fn file_row(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    /// The rows of the tree the window draws: the repositories when there are several, the two
+    /// states of the changes, the modules when the files are grouped by module, and the folders
+    /// and files below them. A row whose key is in `collapsed` has no rows below it.
+    fn tree_rows(&self, cx: &App, collapsed: &HashSet<String>) -> Vec<Row> {
         let git = self.git.read(cx);
-        let file = &git.status().files[index];
-        let path = file.path.clone();
-        let kind = Kind::of(file);
-        let (folder, name) = match path.rsplit_once('/') {
-            Some((folder, name)) => (folder.to_string(), name.to_string()),
-            None => (String::new(), path.clone()),
-        };
-        let checked = !self.unchecked.contains(&path);
-        let partial = self
-            .partial
-            .get(&path)
-            .is_some_and(|hunks| !hunks.is_empty());
-        let pointer = self.git.read(cx).pointer(&path).cloned();
-        let pointer_text = pointer.map(|(old, new)| {
-            let old = old.map_or_else(|| "0000000".to_owned(), |id| short_commit(&id));
-            let new = new.map_or_else(|| "0000000".to_owned(), |id| short_commit(&id));
-            format!("commit {old} → {new}")
-        });
-        let toggle_path = path.clone();
-        let boxed = div()
-            .id(("commit-check", index))
-            .flex_none()
-            .size(px(14.))
-            .mr(px(SPACE_M))
-            .rounded(px(3.))
-            .border_1()
-            .border_color(if checked {
-                theme.accent
+        let files = &git.status().files;
+        let shown_roots = git.roots().len() > 1;
+        let root_of = |index: usize| {
+            if shown_roots {
+                git.root_of(&files[index].path)
             } else {
-                theme.text_secondary
-            })
-            .when(checked, |this| this.bg(theme.accent))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.files_focused = true;
-                let now = this.unchecked.contains(&toggle_path);
-                this.set_checked(&toggle_path, now, cx);
-            }))
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(checked && !partial, |this| {
-                        this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
-                    })
-                    .when(checked && partial, |this| {
-                        this.child(
-                            div()
-                                .debug_selector(move || format!("commit-partial-{index}"))
-                                .w(px(8.))
-                                .h(px(2.))
-                                .rounded(px(1.))
-                                .bg(theme.over_accent),
+                String::new()
+            }
+        };
+        let visible = self.visible_files(cx);
+        let mut prefixes: Vec<String> = Vec::new();
+        for &index in &visible {
+            let prefix = root_of(index);
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+        let mut rows = Vec::new();
+        for prefix in prefixes {
+            let members: Vec<usize> = visible
+                .iter()
+                .copied()
+                .filter(|&index| root_of(index) == prefix)
+                .collect();
+            let mut depth = 0;
+            if shown_roots {
+                let key = format!("root:{prefix}");
+                let open = !collapsed.contains(&key);
+                let label = git.root_label(&prefix);
+                rows.push(Row {
+                    node: change_tree::heading(
+                        NodeKind::Root,
+                        depth,
+                        key,
+                        label,
+                        prefix.clone(),
+                        members.clone(),
+                        open,
+                    ),
+                    bucket: "",
+                });
+                if !open {
+                    continue;
+                }
+                depth += 1;
+            }
+            for (bucket, label, untracked) in [
+                ("changes", "Changes", false),
+                ("unversioned", "Unversioned Files", true),
+            ] {
+                let group: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|&index| (Kind::of(&files[index]) == Kind::Untracked) == untracked)
+                    .collect();
+                if group.is_empty() {
+                    continue;
+                }
+                let key = format!("group:{prefix}|{bucket}");
+                let open = !collapsed.contains(&key);
+                rows.push(Row {
+                    node: change_tree::heading(
+                        NodeKind::Group,
+                        depth,
+                        key,
+                        label.to_owned(),
+                        String::new(),
+                        group.clone(),
+                        open,
+                    ),
+                    bucket,
+                });
+                if !open {
+                    continue;
+                }
+                let scope = format!("{prefix}|{bucket}");
+                if self.lists.grouping == Grouping::Module {
+                    let mut modules: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+                    for &index in &group {
+                        let module = self.group_of(&files[index].path, cx);
+                        modules.entry(module).or_default().push(index);
+                    }
+                    for (module, indices) in modules {
+                        let key = format!("module:{scope}|{module}");
+                        let open = !collapsed.contains(&key);
+                        rows.push(Row {
+                            node: change_tree::heading(
+                                NodeKind::Module,
+                                depth + 1,
+                                key,
+                                module.clone(),
+                                String::new(),
+                                indices.clone(),
+                                open,
+                            ),
+                            bucket,
+                        });
+                        if open {
+                            let entries = entries_of(files, &indices);
+                            let module_scope = format!("{scope}|{module}");
+                            rows.extend(
+                                change_tree::tree_rows(
+                                    &entries,
+                                    &module_scope,
+                                    depth + 2,
+                                    collapsed,
+                                )
+                                .into_iter()
+                                .map(|node| Row { node, bucket }),
+                            );
+                        }
+                    }
+                } else {
+                    let entries = entries_of(files, &group);
+                    rows.extend(
+                        change_tree::tree_rows(&entries, &scope, depth + 1, collapsed)
+                            .into_iter()
+                            .map(|node| Row { node, bucket }),
+                    );
+                }
+            }
+        }
+        rows
+    }
+
+    /// The elements of the rows of the tree, in the order they are drawn.
+    fn tree_elements(
+        &self,
+        icons: &FileIcons,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let rows = self.tree_rows(cx, &self.collapsed);
+        rows.iter()
+            .enumerate()
+            .map(|(position, row)| self.tree_row(position, row, icons, theme, cx))
+            .collect()
+    }
+
+    /// One row of the tree: the arrow of a heading or a folder, the tick, the icon, the name,
+    /// the count of a heading and the pointer of a file of a submodule.
+    fn tree_row(
+        &self,
+        position: usize,
+        row: &Row,
+        icons: &FileIcons,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let node = &row.node;
+        let (selector, tick_selector, partial_selector) = selectors_of(node, row.bucket);
+        let tick = self.tick_of(&node.files, cx);
+        let (color, icon_name, pointer) = match node.file {
+            Some(_) => {
+                let git = self.git.read(cx);
+                match git.status().files.get(node.file.unwrap_or_default()) {
+                    Some(file) => {
+                        let pointer = git.pointer(&file.path).cloned().map(|(old, new)| {
+                            let old =
+                                old.map_or_else(|| "0000000".to_owned(), |id| short_commit(&id));
+                            let new =
+                                new.map_or_else(|| "0000000".to_owned(), |id| short_commit(&id));
+                            format!("commit {old} → {new}")
+                        });
+                        (
+                            Kind::of(file).color(theme),
+                            Some(icons.icon_for(Path::new(&file.path))),
+                            pointer,
                         )
-                    }),
-            );
-        let selected = self.selected == Some(index);
+                    }
+                    None => (theme.text, None, None),
+                }
+            }
+            None => {
+                let color = match node.kind {
+                    NodeKind::Root => theme.link,
+                    NodeKind::Folder => theme.text,
+                    NodeKind::Group | NodeKind::Module | NodeKind::File => theme.text_secondary,
+                };
+                let icon_name = match node.kind {
+                    NodeKind::Folder => Some(FOLDER_ICON),
+                    NodeKind::Module => Some(MODULE_ICON),
+                    _ => None,
+                };
+                (color, icon_name, None)
+            }
+        };
+        let count =
+            (node.kind == NodeKind::Group).then(|| change_tree::file_count(node.files.len()));
+        let arrow = match node.kind {
+            NodeKind::File => None,
+            _ => Some(if node.open {
+                "general/chevronDown"
+            } else {
+                "general/chevronRight"
+            }),
+        };
+        let selected = self.row_is_selected(node);
         let hover = theme.selection_hover;
-        let row = div()
-            .id(("commit-row", index))
-            .debug_selector(move || format!("commit-row-{index}"))
+        let indent = node.depth as f32 * change_tree::INDENT;
+        let key = node.key.clone();
+        let indices = node.files.clone();
+        let tick_element = tick_box(tick, partial_selector, theme)
+            .id(("commit-tick", position))
+            .debug_selector(move || tick_selector.clone());
+        let tick_element = match node.file {
+            Some(_) => {
+                let path = node.path.clone();
+                tick_element.on_click(cx.listener(move |this, _, _, cx| {
+                    this.files_focused = true;
+                    let now = this.unchecked.contains(&path);
+                    this.set_checked(&path, now, cx);
+                }))
+            }
+            None => tick_element.on_click(cx.listener(move |this, _, _, cx| {
+                // The tick of a folder or a heading leaves the click to the tick alone.
+                cx.stop_propagation();
+                this.files_focused = true;
+                this.toggle_indices(&indices, cx);
+            })),
+        };
+        let row_bounds = self.row_bounds.clone();
+        let row_id: ElementId = match node.file {
+            Some(index) => ("commit-row", index).into(),
+            None => ("commit-node", position).into(),
+        };
+        let base = div()
+            .id(row_id)
+            .debug_selector(move || selector.clone())
             .flex()
             .items_center()
             .flex_none()
             .w_full()
             .h(px(ROW_HEIGHT))
-            .pl(px(ROW_PADDING_X))
+            .pl(px(indent + ROW_PADDING_X))
+            .pr(px(ROW_PADDING_X))
             .rounded(px(ROW_RADIUS))
             .when(selected, |this| this.bg(theme.selection_inactive))
             .when(!selected, |this| this.hover(move |style| style.bg(hover)))
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.files_focused = true;
-                this.selected = Some(index);
-                if event.click_count() >= 2 {
-                    this.open_diff(index, window, cx);
-                }
-                cx.notify();
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, _, window, cx| this.open_file(index, window, cx)),
-            )
-            .child(boxed)
-            .child(div().text_color(kind.color(theme)).flex_none().child(name))
             .child(
                 div()
-                    .ml(px(8.))
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_color(theme.text_secondary)
-                    .child(folder),
+                    .size(px(16.))
+                    .flex_none()
+                    .children(arrow.map(|name| icon(name, theme))),
             )
-            .children(pointer_text.map(|text| {
+            .child(tick_element)
+            .children(icon_name.map(|name| icon(name, theme).ml(px(SPACE_S))))
+            .child(
                 div()
-                    .ml(px(8.))
+                    .flex_none()
+                    .text_color(color)
+                    .when(
+                        matches!(
+                            node.kind,
+                            NodeKind::Root | NodeKind::Group | NodeKind::Module
+                        ),
+                        |this| this.font_weight(FontWeight::MEDIUM),
+                    )
+                    .child(node.label.clone()),
+            )
+            .children(count.map(|text| {
+                div()
+                    .ml(px(SPACE_M))
+                    .flex_none()
+                    .text_color(theme.text_secondary)
+                    .child(text)
+            }))
+            .children(pointer.map(|text| {
+                div()
+                    .ml(px(SPACE_S))
                     .flex_none()
                     .text_color(theme.text_secondary)
                     .debug_selector(|| "commit-pointer".to_owned())
                     .child(text)
             }));
-        let row_bounds = self.row_bounds.clone();
+        let row = match node.file {
+            Some(index) => {
+                let open_diff = cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    this.files_focused = true;
+                    this.selected = Some(index);
+                    this.selected_node = None;
+                    if event.click_count() >= 2 {
+                        this.open_diff(index, window, cx);
+                    }
+                    cx.notify();
+                });
+                let open_menu =
+                    cx.listener(move |this, _, window, cx| this.open_file(index, window, cx));
+                base.on_click(open_diff)
+                    .on_mouse_down(MouseButton::Right, open_menu)
+            }
+            None => base.on_click(cx.listener(move |this, _, _, cx| {
+                this.files_focused = true;
+                this.selected = None;
+                this.selected_node = Some(key.clone());
+                this.toggle_row(&key, cx);
+            })),
+        };
+        let wrapper = div().w_full().px(px(ROW_MARGIN)).child(row);
+        match node.file {
+            Some(index) => wrapper
+                .on_children_prepainted(move |bounds, _, _| {
+                    if let Some(bounds) = bounds.first() {
+                        row_bounds.borrow_mut().insert(index, *bounds);
+                    }
+                })
+                .into_any_element(),
+            None => wrapper.into_any_element(),
+        }
+    }
+
+    /// The icons above the tree: Refresh, Rollback, Show Diff, Expand All and Collapse All.
+    fn tree_toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         div()
-            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .flex_none()
             .px(px(ROW_MARGIN))
-            .on_children_prepainted(move |bounds, _, _| {
-                if let Some(bounds) = bounds.first() {
-                    row_bounds.borrow_mut().insert(index, *bounds);
+            .pt(px(SPACE_S))
+            .child(
+                tree_button(
+                    "commit-tree-refresh",
+                    "general/refresh",
+                    "Refresh",
+                    None,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+            )
+            .child(
+                tree_button(
+                    "commit-tree-rollback",
+                    "general/trash",
+                    "Rollback",
+                    Some("Ctrl+Alt+Z".into()),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.revert_selected(window, cx))),
+            )
+            .child(
+                tree_button(
+                    "commit-tree-diff",
+                    "general/diff",
+                    "Show Diff",
+                    Some("Ctrl+D".into()),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show_diff(window, cx))),
+            )
+            .child(
+                tree_button(
+                    "commit-tree-expand",
+                    "general/expandAll",
+                    "Expand All",
+                    None,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.expand_all(cx))),
+            )
+            .child(
+                tree_button(
+                    "commit-tree-collapse",
+                    "general/collapseAll",
+                    "Collapse All",
+                    None,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
+            )
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.git.update(cx, |git, cx| git.refresh(cx));
+    }
+
+    /// Opens every heading and folder of the tree.
+    fn expand_all(&mut self, cx: &mut Context<Self>) {
+        self.collapsed.clear();
+        cx.notify();
+    }
+
+    /// Closes every heading and folder of the tree, the ones that are hidden too.
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        let keys: Vec<String> = self
+            .tree_rows(cx, &HashSet::new())
+            .into_iter()
+            .filter(|row| row.node.file.is_none())
+            .map(|row| row.node.key)
+            .collect();
+        self.collapsed.extend(keys);
+        cx.notify();
+    }
+
+    /// Opens the heading or the folder with the key when it is closed, and closes it when it is
+    /// open.
+    fn toggle_row(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key.to_owned());
+        }
+        cx.notify();
+    }
+
+    /// Left closes the selected heading or folder, Right opens it.
+    fn fold_selected(&mut self, fold: bool, cx: &mut Context<Self>) {
+        let Some(key) = self.selected_node.clone() else {
+            return;
+        };
+        if fold {
+            self.collapsed.insert(key);
+        } else {
+            self.collapsed.remove(&key);
+        }
+        cx.notify();
+    }
+
+    /// Up and Down move the selection over the rows the window draws, headings included.
+    fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        let rows = self.tree_rows(cx, &self.collapsed);
+        if rows.is_empty() {
+            return;
+        }
+        let next = match rows.iter().position(|row| self.row_is_selected(&row.node)) {
+            None => 0,
+            Some(position) => (position as isize + step).clamp(0, rows.len() as isize - 1) as usize,
+        };
+        self.select_node(&rows[next].node);
+        cx.notify();
+    }
+
+    /// Whether the row of a node is the selected one: a file by its index, a heading or a
+    /// folder by its key.
+    fn row_is_selected(&self, node: &TreeNode) -> bool {
+        match node.file {
+            Some(index) => self.selected == Some(index),
+            None => self.selected_node.as_deref() == Some(node.key.as_str()),
+        }
+    }
+
+    fn select_node(&mut self, node: &TreeNode) {
+        match node.file {
+            Some(index) => {
+                self.selected = Some(index);
+                self.selected_node = None;
+            }
+            None => {
+                self.selected = None;
+                self.selected_node = Some(node.key.clone());
+            }
+        }
+    }
+
+    /// The tick of one file: off when the user left it out, partial when some of its hunks
+    /// are left out, on otherwise.
+    fn file_tick(&self, path: &str) -> Tick {
+        if self.unchecked.contains(path) {
+            Tick::Off
+        } else if self
+            .partial
+            .get(path)
+            .is_some_and(|hunks| !hunks.is_empty())
+        {
+            Tick::Partial
+        } else {
+            Tick::On
+        }
+    }
+
+    /// The tick of a heading or a folder: on when all its files are on, off when all of them
+    /// are off, partial otherwise.
+    fn tick_of(&self, indices: &[usize], cx: &App) -> Tick {
+        let files = &self.git.read(cx).status().files;
+        let mut on = 0;
+        let mut off = 0;
+        let mut total = 0;
+        for file in indices.iter().filter_map(|&index| files.get(index)) {
+            total += 1;
+            match self.file_tick(&file.path) {
+                Tick::On => on += 1,
+                Tick::Off => off += 1,
+                Tick::Partial => {}
+            }
+        }
+        if total == 0 || off == total {
+            Tick::Off
+        } else if on == total {
+            Tick::On
+        } else {
+            Tick::Partial
+        }
+    }
+
+    /// The paths of the files with the indices.
+    fn paths_of(&self, indices: &[usize], cx: &App) -> Vec<String> {
+        let files = &self.git.read(cx).status().files;
+        indices
+            .iter()
+            .filter_map(|&index| files.get(index))
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    /// The files under the heading or the folder with the key, in the rows the window draws.
+    fn node_files(&self, key: &str, cx: &App) -> Vec<usize> {
+        self.tree_rows(cx, &self.collapsed)
+            .into_iter()
+            .find(|row| row.node.key == key)
+            .map(|row| row.node.files)
+            .unwrap_or_default()
+    }
+
+    /// Ticks the files of a heading or a folder, or takes the ticks off all of them: when they
+    /// are not all on, the click ticks every one.
+    fn toggle_indices(&mut self, indices: &[usize], cx: &mut Context<Self>) {
+        let checked = self.tick_of(indices, cx) != Tick::On;
+        let paths = self.paths_of(indices, cx);
+        self.set_checked_paths(&paths, checked, cx);
+    }
+
+    /// Ticks or unticks several files at once, as one change of the draft both views share.
+    fn set_checked_paths(&mut self, paths: &[String], checked: bool, cx: &mut Context<Self>) {
+        let paths = paths.to_vec();
+        self.change(cx, |draft| {
+            for path in paths {
+                if checked {
+                    draft.unchecked.remove(&path);
+                    draft.excluded_hunks.remove(&path);
+                } else {
+                    draft.unchecked.insert(path);
                 }
+            }
+        });
+        cx.notify();
+    }
+
+    /// The text of each row of the tree, for tests: a heading with its count, a folder or a file.
+    #[cfg(test)]
+    pub(crate) fn tree_summary(&self, cx: &App) -> Vec<String> {
+        self.tree_rows(cx, &self.collapsed)
+            .iter()
+            .map(|row| match row.node.kind {
+                NodeKind::Group => format!(
+                    "{} {}",
+                    row.node.label,
+                    change_tree::file_count(row.node.files.len())
+                ),
+                _ => row.node.label.clone(),
             })
-            .child(row)
+            .collect()
     }
 
     fn button(
@@ -2114,73 +2679,6 @@ impl CommitPanel {
                     .unwrap_or_else(|| self.project_name())
             }
         }
-    }
-
-    fn group_row(&self, group: &str, index: usize, theme: &Theme) -> Stateful<Div> {
-        div()
-            .id(("commit-group", index))
-            .debug_selector(move || format!("commit-group-{index}"))
-            .flex()
-            .items_center()
-            .flex_none()
-            .h(px(ROW_HEIGHT))
-            .px(px(ROW_MARGIN + 6.))
-            .text_color(theme.text_secondary)
-            .font_weight(FontWeight::MEDIUM)
-            .child(group.to_string())
-    }
-
-    /// The heading of a root when the project has submodules: the same files below it
-    /// belong to that repository.
-    fn root_row(&self, root: &str, index: usize, theme: &Theme) -> Stateful<Div> {
-        div()
-            .id(("commit-root", index))
-            .debug_selector(move || format!("commit-root-{index}"))
-            .flex()
-            .items_center()
-            .flex_none()
-            .h(px(ROW_HEIGHT))
-            .mx(px(ROW_MARGIN))
-            .px(px(ROW_PADDING_X))
-            .text_color(theme.link)
-            .font_weight(FontWeight::MEDIUM)
-            .child(root.to_string())
-    }
-
-    fn grouped_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut rows = Vec::new();
-        let mut last: Option<String> = None;
-        let mut last_root: Option<String> = None;
-        let show_roots = self.git.read(cx).roots().len() > 1;
-        for index in self.visible_files(cx) {
-            let Some(path) = self
-                .git
-                .read(cx)
-                .status()
-                .files
-                .get(index)
-                .map(|file| file.path.clone())
-            else {
-                continue;
-            };
-            if show_roots {
-                let git = self.git.read(cx);
-                let prefix = git.root_of(&path);
-                let root = git.root_label(&prefix);
-                if last_root.as_deref() != Some(root.as_str()) {
-                    rows.push(self.root_row(&root, rows.len(), theme).into_any_element());
-                    last_root = Some(root);
-                    last = None;
-                }
-            }
-            let group = self.group_of(&path, cx);
-            if last.as_deref() != Some(group.as_str()) {
-                rows.push(self.group_row(&group, rows.len(), theme).into_any_element());
-                last = Some(group);
-            }
-            rows.push(self.file_row(index, theme, cx).into_any_element());
-        }
-        rows
     }
 
     fn tab_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -2598,21 +3096,16 @@ impl Render for AnalysisDialog {
                 })
                 .child(label)
         };
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("analysis-dialog")
             .debug_selector(|| "analysis-dialog".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(DIALOG_PADDING))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
             .gap(px(DIALOG_GAP))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Code analysis found problems"),
-            )
+            .p(px(DIALOG_PADDING))
             .child(div().text_color(theme.text_secondary).child(format!(
                 "{} error(s) in the chosen files. Review them or commit anyway?",
                 self.errors
@@ -2631,11 +3124,26 @@ impl Render for AnalysisDialog {
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("analysis", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "analysis",
+                title: "Code analysis found problems".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (320., 120.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -2655,7 +3163,11 @@ impl Render for CommitPanel {
                 })
                 .ok();
         };
-        let rows = self.grouped_rows(&theme, cx);
+        let icons = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.icons().clone())
+            .unwrap_or_default();
+        let rows = self.tree_elements(&icons, &theme, cx);
         let message_empty = self.message.text.is_empty();
         let message_shown = !self.files_focused;
         let summary = match (busy, branch) {
@@ -2681,6 +3193,7 @@ impl Render for CommitPanel {
                 .flex_1()
                 .min_h_0()
                 .child(self.changelist_row(&theme, cx))
+                .child(self.tree_toolbar(&theme, cx))
                 .child(
                     scrollable(
                         "commit-files",
@@ -2929,30 +3442,22 @@ impl Render for PointerView {
             })
             .collect();
         let empty = rows.is_empty();
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("submodule-pointer")
             .debug_selector(|| "submodule-pointer".to_owned())
             .key_context("SubmodulePointer")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(POPUP_PADDING))
-            .flex()
-            .flex_col()
-            .gap(px(SPACE_S))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     this.close(window, cx);
                     cx.stop_propagation();
                 }
-            }))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(self.title.clone()),
-            )
+            }));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(POPUP_PADDING))
             .child(
                 scrollable(
                     "pointer-commits",
@@ -2974,7 +3479,26 @@ impl Render for PointerView {
                 )
                 .max_h(px(420.)),
             );
-        div().absolute().left(left).top(top).child(body)
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "submodule-pointer",
+                title: self.title.clone().into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 160.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

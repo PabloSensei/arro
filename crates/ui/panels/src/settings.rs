@@ -17,14 +17,34 @@ use workspace::{McpToolChoice, Settings, Workspace};
 use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog, dialog_button};
 use crate::prompt::TextField;
 use crate::settings_catalog::{self, Setting, SettingField, SettingKind, SettingsPage};
+use crate::settings_file_types::{FileTypesPage, IGNORED_FIELD};
 use crate::settings_keymap::KeymapPage;
 use crate::settings_templates::TemplateSection;
 
 const WIDTH: f32 = 800.;
 const MIN_WIDTH: f32 = 640.;
 const MIN_HEIGHT: f32 = 420.;
-/// The grab area of the edge and the corner that change the size.
-const RESIZE_GRIP: f32 = 8.;
+/// The narrowest and the widest the tree of pages can be made by its divider.
+const MIN_PAGES_WIDTH: f32 = 160.;
+const MAX_PAGES_WIDTH: f32 = 360.;
+
+/// The families the editor font row offers beside the one the file names.
+const EDITOR_FONTS: [&str; 5] = [
+    "JetBrains Mono",
+    "Consolas",
+    "Cascadia Mono",
+    "Courier New",
+    "Lucida Console",
+];
+
+/// A dropdown of a page that is open: the setting, its values as the list shows them,
+/// the value in force and the one the pointer or the keys mark.
+struct OpenChoice {
+    id: String,
+    values: Vec<(String, String)>,
+    chosen: usize,
+    marked: usize,
+}
 
 /// The home folder the MCP client rows read, for a test that keeps its own: the profile of
 /// the user of the machine is neither read nor written there.
@@ -34,37 +54,6 @@ pub(crate) struct TestMcpHome(pub PathBuf);
 
 #[cfg(test)]
 impl Global for TestMcpHome {}
-
-/// Where the Settings window sits and how large it is, for this session only.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SettingsWindowPlacement {
-    pub left: f32,
-    pub top: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-impl Global for SettingsWindowPlacement {}
-
-#[derive(Clone, Copy)]
-struct PlacementDrag {
-    from: Point<Pixels>,
-    placement: SettingsWindowPlacement,
-}
-
-#[derive(Clone, Copy)]
-enum ResizeEdge {
-    Right,
-    Bottom,
-    Corner,
-}
-
-#[derive(Clone, Copy)]
-struct PlacementResize {
-    from: Point<Pixels>,
-    placement: SettingsWindowPlacement,
-    edge: ResizeEdge,
-}
 
 /// A plugin as the list shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,6 +212,7 @@ pub struct SettingsView {
     plugin_file: PathBuf,
     pub(crate) keymap_page: KeymapPage,
     pub(crate) templates_page: crate::settings_templates::TemplatesPage,
+    pub(crate) file_types_page: FileTypesPage,
     page: SettingsPage,
     /// The row the window came for, drawn as chosen while the window is open.
     highlight: Option<&'static str>,
@@ -244,6 +234,9 @@ pub struct SettingsView {
     /// The word the user is typing into the dictionary.
     spelling_word: TextField,
     spelling_editing: bool,
+    /// The pattern the user is typing on the TODO page.
+    todo_new: TextField,
+    todo_new_editing: bool,
     /// The search over the pages, drawn above the tree.
     search: TextField,
     /// Whether the caret of the search field is shown. The window opens with it in the
@@ -277,8 +270,13 @@ pub struct SettingsView {
     /// What the Test button of the Git page found.
     git_version: Option<String>,
     testing_git: bool,
-    dragging: Option<PlacementDrag>,
-    resizing: Option<PlacementResize>,
+    /// The dropdown of the page that is open, if any.
+    choice_open: Option<OpenChoice>,
+    /// The width of the tree of pages, with room for the longest title until the divider
+    /// moves.
+    pages_width: f32,
+    /// Where the pointer was when a drag of that divider began.
+    pages_drag: Option<f32>,
     scroll_pages: ScrollHandle,
     scroll_content: ScrollHandle,
 }
@@ -352,6 +350,7 @@ impl SettingsView {
         let project_style = text_core::style_source(&root);
         let project_style_off = root.join(text_core::idea_style::DISABLED_FILE).is_file();
         let mcp_home = mcp_home_folder(cx);
+        let pages_width = pages_width_for(window);
         let view = cx.new(|cx| Self {
             workspace: weak,
             focus: cx.focus_handle(),
@@ -364,6 +363,7 @@ impl SettingsView {
             plugin_file: plugin_file.clone(),
             keymap_page,
             templates_page,
+            file_types_page: FileTypesPage::default(),
             page,
             highlight: target,
             inspections,
@@ -377,6 +377,8 @@ impl SettingsView {
             spelling_source,
             spelling_word: TextField::default(),
             spelling_editing: false,
+            todo_new: TextField::default(),
+            todo_new_editing: false,
             search: TextField::default(),
             search_editing: true,
             sdk: "not set".to_owned(),
@@ -395,8 +397,9 @@ impl SettingsView {
             repository: String::new(),
             git_version: None,
             testing_git: false,
-            dragging: None,
-            resizing: None,
+            choice_open: None,
+            pages_width,
+            pages_drag: None,
             scroll_pages: ScrollHandle::new(),
             scroll_content: ScrollHandle::new(),
         });
@@ -460,6 +463,8 @@ impl SettingsView {
     fn change(&mut self, change: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
         change(&mut self.draft);
         self.search_editing = false;
+        self.todo_new_editing = false;
+        self.choice_open = None;
         cx.notify();
     }
 
@@ -469,6 +474,296 @@ impl SettingsView {
         };
         row.enabled = !row.enabled;
         self.search_editing = false;
+        self.choice_open = None;
+        cx.notify();
+    }
+
+    /// The values of a dropdown as the window offers them: the value the settings keep
+    /// and the text of the row.
+    fn choice_values(&self, id: &str, cx: &App) -> Vec<(String, String)> {
+        match id {
+            "theme" | "theme_light" | "theme_dark" => ThemeCatalog::library_of(cx)
+                .themes()
+                .iter()
+                .map(|definition| (definition.id.clone(), definition.name.clone()))
+                .collect(),
+            "editor_font_family" => {
+                let mut families: Vec<String> = EDITOR_FONTS
+                    .iter()
+                    .map(|family| (*family).to_owned())
+                    .collect();
+                let current = self.draft.editor_font_family.trim().to_owned();
+                if !current.is_empty() && !families.contains(&current) {
+                    families.insert(0, current);
+                }
+                families
+                    .into_iter()
+                    .map(|family| (family.clone(), family))
+                    .collect()
+            }
+            "build_tool_second_runtime_home" => {
+                let mut homes = vec![(String::new(), "Project SDK".to_owned())];
+                homes.extend(
+                    self.runtimes
+                        .iter()
+                        .map(|runtime| (runtime.home.display().to_string(), runtime.name.clone())),
+                );
+                homes
+            }
+            _ => settings_catalog::choices(id)
+                .into_iter()
+                .map(|label| (label.clone(), label))
+                .collect(),
+        }
+    }
+
+    /// The place of the value in force in the list of `values`.
+    fn chosen_value(&self, id: &str, values: &[(String, String)], cx: &App) -> usize {
+        let index_of = |wanted: &str| {
+            values
+                .iter()
+                .position(|(value, _)| value == wanted)
+                .unwrap_or(0)
+        };
+        match id {
+            "theme" => {
+                let theme = *cx.global::<Theme>();
+                index_of(settings_catalog::chosen_theme(
+                    &self.draft,
+                    theme.dark,
+                    theme.id(),
+                ))
+            }
+            "theme_light" => index_of(&self.draft.theme_light),
+            "theme_dark" => index_of(&self.draft.theme_dark),
+            "editor_font_family" => index_of(self.draft.editor_font_family.trim()),
+            "build_tool_second_runtime_home" => {
+                index_of(&self.draft.build_tools.second.runtime_home)
+            }
+            _ => settings_catalog::chosen_choice(&self.draft, id),
+        }
+    }
+
+    /// A click on the field of a dropdown opens its list, or closes it when it is open.
+    fn click_choice(
+        &mut self,
+        id: String,
+        values: Vec<(String, String)>,
+        chosen: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_editing = false;
+        self.editing = None;
+        if self.choice_open.as_ref().is_some_and(|open| open.id == id) {
+            self.choice_open = None;
+        } else {
+            let marked = chosen.min(values.len().saturating_sub(1));
+            self.choice_open = Some(OpenChoice {
+                id,
+                values,
+                chosen,
+                marked,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Takes the value the list marks.
+    fn pick_choice(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(open) = self.choice_open.take() else {
+            return;
+        };
+        let Some((value, _)) = open.values.get(index).cloned() else {
+            return;
+        };
+        self.apply_choice(&open.id, index, value, cx);
+        cx.notify();
+    }
+
+    /// Writes a value the list picked, by the kind of setting it belongs to.
+    fn apply_choice(&mut self, id: &str, index: usize, value: String, cx: &mut Context<Self>) {
+        match id {
+            "theme" => {
+                self.draft.theme.clone_from(&value);
+                self.draft.theme_sync_with_os = false;
+                let chosen = value.clone();
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.update_settings(
+                            |settings| {
+                                settings.theme.clone_from(&chosen);
+                                settings.theme_sync_with_os = false;
+                            },
+                            cx,
+                        );
+                        workspace.choose_theme(&chosen, cx);
+                    })
+                    .ok();
+            }
+            "theme_light" | "theme_dark" => {
+                let dark = id == "theme_dark";
+                if dark {
+                    self.draft.theme_dark.clone_from(&value);
+                } else {
+                    self.draft.theme_light.clone_from(&value);
+                }
+                if !self.draft.theme_sync_with_os {
+                    self.draft.theme.clone_from(&value);
+                }
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.assign_theme(&value, dark, cx);
+                    })
+                    .ok();
+            }
+            "editor_font_family" => self.draft.editor_font_family = value,
+            "build_tool_second_runtime_home" => {
+                settings_catalog::set_text(
+                    &mut self.draft,
+                    "build_tool_second_runtime_home",
+                    &value,
+                );
+            }
+            id => {
+                if let Some(inspection) = id.strip_prefix("inspection:") {
+                    let Some(level) = lang_api::InspectionLevel::ALL.get(index).copied() else {
+                        return;
+                    };
+                    let enabled = level != lang_api::InspectionLevel::Off;
+                    self.inspection_settings
+                        .set(inspection, enabled, enabled.then_some(level));
+                    self.inspection_editing = false;
+                } else {
+                    settings_catalog::set_choice(&mut self.draft, id, index);
+                }
+            }
+        }
+    }
+
+    /// The field of a dropdown of a setting with named choices.
+    fn setting_select(
+        &self,
+        id: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let values = self.choice_values(id, cx);
+        let chosen = self.chosen_value(id, &values, cx);
+        let open = self.choice_open.as_ref().is_some_and(|open| open.id == id);
+        let label = values
+            .get(chosen)
+            .map_or_else(String::new, |(_, label)| label.clone());
+        let selector = format!("settings-{}", id.replace('_', "-"));
+        select_field(
+            SharedString::from(format!("settings-choice-{id}")),
+            label,
+            open,
+            theme,
+        )
+        .debug_selector(move || selector.clone())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.click_choice(id.to_owned(), values.clone(), chosen, cx);
+        }))
+    }
+
+    /// The field of the dropdown of the JVM of the second build tool: the SDKs of the
+    /// project and the one the tool picks itself.
+    fn runtime_select(
+        &self,
+        entry: &'static Setting,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let id = "build_tool_second_runtime_home";
+        let values = self.choice_values(id, cx);
+        let chosen = self.chosen_value(id, &values, cx);
+        let open = self.choice_open.as_ref().is_some_and(|open| open.id == id);
+        let label = values
+            .get(chosen)
+            .map_or_else(String::new, |(_, label)| label.clone());
+        let selector = format!("settings-{}", entry.id.replace('_', "-"));
+        select_field(
+            SharedString::from(format!("settings-choice-{id}")),
+            label,
+            open,
+            theme,
+        )
+        .debug_selector(move || selector.clone())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.click_choice(id.to_owned(), values.clone(), chosen, cx);
+        }))
+    }
+
+    /// The list of the open dropdown, under the row of its setting.
+    fn choice_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let open = self.choice_open.as_ref()?;
+        let values = open.values.clone();
+        let (chosen, marked) = (open.chosen, open.marked);
+        let mut menu = select_menu(theme).debug_selector(|| "settings-choice-menu".to_owned());
+        for (index, (_, label)) in values.iter().enumerate() {
+            let selector = format!("settings-choice-option-{}", slug(label));
+            let option = select_option(
+                ("settings-choice-option", index),
+                label.clone(),
+                index == chosen,
+                index == marked,
+                theme,
+            )
+            .debug_selector(move || selector.clone())
+            .on_click(cx.listener(move |this, _, _, cx| this.pick_choice(index, cx)));
+            menu = menu.child(option);
+        }
+        Some(div().flex().justify_end().px(px(ROW_PADDING_X)).child(menu))
+    }
+
+    /// The keys of an open dropdown: Up and Down walk the values, Enter picks the marked
+    /// one and Escape closes the list without a choice.
+    fn choice_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(open) = self.choice_open.as_ref() else {
+            return;
+        };
+        let (count, marked) = (open.values.len(), open.marked);
+        match event.keystroke.key.as_str() {
+            "escape" => self.choice_open = None,
+            "up" => {
+                if let Some(open) = self.choice_open.as_mut() {
+                    open.marked = marked.saturating_sub(1);
+                }
+            }
+            "down" => {
+                if let Some(open) = self.choice_open.as_mut() {
+                    open.marked = (marked + 1).min(count.saturating_sub(1));
+                }
+            }
+            "enter" => {
+                self.pick_choice(marked.min(count.saturating_sub(1)), cx);
+                return;
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    /// The divider of the tree of pages follows the pointer; a drag right makes the tree
+    /// wider.
+    fn drag_pages(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(from) = self.pages_drag else {
+            return;
+        };
+        // A move that reports no button held ends the drag, so a missed release cannot stick.
+        if !event.dragging() {
+            self.end_pages_drag(cx);
+            return;
+        }
+        let now = f32::from(event.position.x);
+        self.pages_width = (self.pages_width + now - from).clamp(MIN_PAGES_WIDTH, MAX_PAGES_WIDTH);
+        self.pages_drag = Some(now);
+        cx.notify();
+    }
+
+    /// The button came up after a drag of the divider.
+    fn end_pages_drag(&mut self, cx: &mut Context<Self>) {
+        self.pages_drag = None;
         cx.notify();
     }
 
@@ -686,63 +981,6 @@ impl SettingsView {
             .ok();
     }
 
-    /// Moves the window with a drag of its title bar.
-    fn drag_window(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if !event.dragging() {
-            return;
-        }
-        let Some(drag) = self.dragging else {
-            return;
-        };
-        let next = SettingsWindowPlacement {
-            left: drag.placement.left + f32::from(event.position.x) - f32::from(drag.from.x),
-            top: drag.placement.top + f32::from(event.position.y) - f32::from(drag.from.y),
-            ..drag.placement
-        };
-        cx.set_global(next);
-        cx.notify();
-    }
-
-    /// Changes the size from the edge or the corner the drag started on.
-    fn resize_window(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !event.dragging() {
-            return;
-        }
-        let Some(resize) = self.resizing else {
-            return;
-        };
-        let dx = f32::from(event.position.x) - f32::from(resize.from.x);
-        let dy = f32::from(event.position.y) - f32::from(resize.from.y);
-        let mut next = resize.placement;
-        let viewport = window.viewport_size();
-        if matches!(resize.edge, ResizeEdge::Right | ResizeEdge::Corner) {
-            let room = f32::from(viewport.width) - resize.placement.left;
-            next.width = (resize.placement.width + dx)
-                .max(MIN_WIDTH)
-                .min(room.max(MIN_WIDTH));
-        }
-        if matches!(resize.edge, ResizeEdge::Bottom | ResizeEdge::Corner) {
-            let room = f32::from(viewport.height) - resize.placement.top;
-            next.height = (resize.placement.height + dy)
-                .max(MIN_HEIGHT)
-                .min(room.max(MIN_HEIGHT));
-        }
-        cx.set_global(next);
-        cx.notify();
-    }
-
-    /// The button came up after a drag of the title or of an edge.
-    fn finish_drag(&mut self, cx: &mut Context<Self>) {
-        if self.dragging.take().is_some() || self.resizing.take().is_some() {
-            cx.notify();
-        }
-    }
-
     /// The search field over the tree of pages.
     fn search_field(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let empty = self.search.text.is_empty();
@@ -781,6 +1019,8 @@ impl SettingsView {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.search_editing = true;
                 this.editing = None;
+                this.todo_new_editing = false;
+                this.choice_open = None;
                 cx.notify();
             }))
     }
@@ -847,13 +1087,63 @@ impl SettingsView {
         }
     }
 
+    /// Puts the caret in the field that adds an ignored mask.
+    pub(crate) fn start_ignored_pattern(&mut self, cx: &mut Context<Self>) {
+        self.editing = Some(IGNORED_FIELD);
+        self.search_editing = false;
+        self.file_types_page.pattern = TextField::default();
+        cx.notify();
+    }
+
+    /// Adds the mask typed into the field of the File Types page, once.
+    pub(crate) fn add_ignored_pattern(&mut self, cx: &mut Context<Self>) {
+        let pattern = self.file_types_page.pattern.text.trim().to_owned();
+        self.file_types_page.pattern = TextField::default();
+        if pattern.is_empty()
+            || self
+                .draft
+                .ignored_files
+                .iter()
+                .any(|known| known == &pattern)
+        {
+            cx.notify();
+            return;
+        }
+        self.draft.ignored_files.push(pattern);
+        cx.notify();
+    }
+
+    /// Takes one mask of the File Types page away from the draft.
+    pub(crate) fn remove_ignored_pattern(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.draft.ignored_files.len() {
+            self.draft.ignored_files.remove(index);
+        }
+        cx.notify();
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.choice_open.is_some() {
+            self.choice_key(event, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.spelling_editing {
             if event.keystroke.key == "escape" {
                 self.spelling_editing = false;
             } else if event.keystroke.key == "enter" {
                 self.add_spelling_word(cx);
             } else if self.spelling_word.key_with_clipboard(event, false, cx) {
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.todo_new_editing {
+            if event.keystroke.key == "escape" {
+                self.todo_new_editing = false;
+            } else if event.keystroke.key == "enter" {
+                self.add_todo_template(cx);
+            } else if self.todo_new.key_with_clipboard(event, false, cx) {
                 cx.notify();
             }
             cx.stop_propagation();
@@ -875,6 +1165,22 @@ impl SettingsView {
         }
         if self.search_editing {
             self.search_key(event, window, cx);
+            return;
+        }
+        if self.editing == Some(IGNORED_FIELD) {
+            if event.keystroke.key == "escape" {
+                self.editing = None;
+                cx.notify();
+            } else if event.keystroke.key == "enter" {
+                self.add_ignored_pattern(cx);
+            } else if self
+                .file_types_page
+                .pattern
+                .key_with_clipboard(event, false, cx)
+            {
+                cx.notify();
+            }
+            cx.stop_propagation();
             return;
         }
         if let Some(id) = self.editing {
@@ -904,6 +1210,120 @@ impl SettingsView {
             self.close(window, cx);
             cx.stop_propagation();
         }
+    }
+
+    /// The patterns the TODO window looks for and whether it keeps their case.
+    fn render_todo(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
+        let mut content = Vec::new();
+        content.push(note(
+            "The TODO window looks for these words as whole words. Changes apply with OK or Apply.",
+            theme,
+        ));
+        content.push(heading("Patterns", theme));
+        if self.draft.todo_templates.is_empty() {
+            content.push(note_owned(
+                "No patterns: the TODO window finds nothing.".to_owned(),
+                theme,
+            ));
+        }
+        for (index, template) in self.draft.todo_templates.iter().enumerate() {
+            let remove = icon_button(
+                ("settings-todo-remove", index),
+                "general/minus",
+                "Remove Pattern",
+                None,
+                theme,
+            )
+            .debug_selector(move || format!("settings-todo-remove-{index}"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if index < this.draft.todo_templates.len() {
+                    this.draft.todo_templates.remove(index);
+                }
+                this.search_editing = false;
+                cx.notify();
+            }));
+            content.push(
+                div()
+                    .debug_selector(move || format!("settings-todo-pattern-{index}"))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .min_h(px(28.))
+                    .px(px(ROW_PADDING_X))
+                    .child(template.clone())
+                    .child(remove),
+            );
+        }
+        let active = self.todo_new_editing;
+        let enabled = !self.todo_new.text.trim().is_empty();
+        content.push(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .child(
+                    field(
+                        "settings-todo-new-pattern",
+                        &self.todo_new,
+                        "New pattern",
+                        active,
+                        theme,
+                    )
+                    .debug_selector(|| "settings-todo-new".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.todo_new_editing = true;
+                        this.search_editing = false;
+                        this.editing = None;
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    dialog_button(
+                        "settings-todo-add",
+                        "settings-todo-add".to_owned(),
+                        "Add",
+                        true,
+                        enabled,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.add_todo_template(cx))),
+                ),
+        );
+        content.push(
+            div().child(
+                checkbox_row(
+                    "settings-todo-case-sensitive",
+                    "Case sensitive",
+                    self.draft.todo_case_sensitive,
+                    theme,
+                )
+                .debug_selector(|| "settings-todo-case-sensitive".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.change(
+                        |settings| {
+                            settings_catalog::toggle(settings, "todo_case_sensitive");
+                        },
+                        cx,
+                    )
+                })),
+            ),
+        );
+        content
+    }
+
+    /// The pattern field of the TODO page: Enter or Add puts the word in the list.
+    fn add_todo_template(&mut self, cx: &mut Context<Self>) {
+        let name = self.todo_new.text.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        if !self.draft.todo_templates.iter().any(|known| known == &name) {
+            self.draft.todo_templates.push(name);
+        }
+        self.todo_new = TextField::default();
+        self.todo_new_editing = false;
+        self.search_editing = false;
+        cx.notify();
     }
 
     /// The picks of the Inspections page: a search over the checks, the tree by group,
@@ -988,23 +1408,46 @@ impl SettingsView {
             let level = self
                 .inspection_settings
                 .level_of(&id, info.default_severity);
-            let toggle = pill(
-                ("inspection-toggle", index),
-                if enabled { "On" } else { "Off" },
-                enabled,
+            let toggle = div()
+                .id(("inspection-toggle", index))
+                .debug_selector(move || format!("settings-inspection-toggle-{index}"))
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_none()
+                .size(px(ICON))
+                .cursor_pointer()
+                .child(checkbox(enabled, theme))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_inspection(&id, cx);
+                }));
+            let level_id = info.id.clone();
+            let level_field = format!("inspection:{level_id}");
+            let level_open = self
+                .choice_open
+                .as_ref()
+                .is_some_and(|open| open.id == level_field);
+            let level_values: Vec<(String, String)> = lang_api::InspectionLevel::ALL
+                .iter()
+                .map(|value| (value.label().to_owned(), value.label().to_owned()))
+                .collect();
+            let chosen_level = lang_api::InspectionLevel::ALL
+                .iter()
+                .position(|value| *value == level)
+                .unwrap_or(1);
+            let level_selector = format!("settings-inspection-level-{index}");
+            let click_field = level_field.clone();
+            let click_values = level_values.clone();
+            let severity = select_field(
+                SharedString::from(format!("settings-inspection-level-field-{index}")),
+                level.label(),
+                level_open,
                 theme,
             )
-            .debug_selector(move || format!("settings-inspection-toggle-{index}"))
+            .debug_selector(move || level_selector.clone())
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_inspection(&id, cx);
+                this.click_choice(click_field.clone(), click_values.clone(), chosen_level, cx);
             }));
-            let level_id = info.id.clone();
-            let severity =
-                toolbar_dropdown(("inspection-level", index), None, level.label(), theme)
-                    .debug_selector(move || format!("settings-inspection-level-{index}"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.cycle_inspection(&level_id, cx);
-                    }));
             let chosen = self.inspection_highlight.as_deref() == Some(info.id.as_str());
             let row = div()
                 .id(("inspection-row", index))
@@ -1038,6 +1481,9 @@ impl SettingsView {
                     .debug_selector(move || format!("settings-inspection-{index}"))
                     .child(row),
             );
+            if level_open && let Some(menu) = self.choice_menu(theme, cx) {
+                content.push(menu);
+            }
         }
         content
     }
@@ -1157,22 +1603,6 @@ impl SettingsView {
         let enabled = current.is_some_and(|setting| !setting.enabled);
         let level = current.and_then(|setting| setting.level);
         self.inspection_settings.set(id, enabled, level);
-        self.inspection_editing = false;
-        cx.notify();
-    }
-
-    fn cycle_inspection(&mut self, id: &str, cx: &mut Context<Self>) {
-        let default = self
-            .inspections
-            .iter()
-            .find(|info| info.id == id)
-            .map_or(lang_api::InspectionLevel::Warning, |info| {
-                info.default_severity
-            });
-        let next = self.inspection_settings.level_of(id, default).next();
-        let level = (next != lang_api::InspectionLevel::Off).then_some(next);
-        self.inspection_settings
-            .set(id, next != lang_api::InspectionLevel::Off, level);
         self.inspection_editing = false;
         cx.notify();
     }
@@ -1326,49 +1756,6 @@ fn text_hint(field: SettingField) -> &'static str {
     }
 }
 
-/// The JVM of the second build tool as one choice among the SDKs of the project.
-fn runtime_pill(
-    entry: &'static Setting,
-    settings: &Settings,
-    runtimes: &[RuntimeInfo],
-    theme: &Theme,
-    cx: &mut Context<SettingsView>,
-) -> Stateful<Div> {
-    let chosen = &settings.build_tools.second.runtime_home;
-    let label = if chosen.trim().is_empty() {
-        "Project SDK".to_owned()
-    } else {
-        runtimes
-            .iter()
-            .find(|runtime| runtime.home.display().to_string() == *chosen)
-            .map(|runtime| runtime.name.clone())
-            .unwrap_or_else(|| chosen.clone())
-    };
-    let id = entry.id;
-    pill(id, &label, true, theme)
-        .debug_selector(move || format!("settings-{}", id.replace('_', "-")))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            let current = this.draft.build_tools.second.runtime_home.clone();
-            let mut homes = vec![String::new()];
-            homes.extend(
-                this.runtimes
-                    .iter()
-                    .map(|runtime| runtime.home.display().to_string()),
-            );
-            let next = homes
-                .iter()
-                .position(|home| home == &current)
-                .map_or(0, |index| (index + 1) % homes.len());
-            let next = homes[next].clone();
-            this.change(
-                |settings| {
-                    settings_catalog::set_text(settings, id, &next);
-                },
-                cx,
-            );
-        }))
-}
-
 /// The Test button of the Git page and the line it brings back.
 fn git_test_row(
     version: &Option<String>,
@@ -1422,6 +1809,58 @@ fn heading(text: &'static str, theme: &Theme) -> Div {
         .child(text)
 }
 
+/// The width of the tree of pages: the longest title with the indent of its row and the
+/// padding of the tree, so no name is cut until the divider moves.
+fn pages_width_for(window: &Window) -> f32 {
+    let style = window.text_style();
+    let size = style.font_size.to_pixels(window.rem_size());
+    let mut widest: f32 = 0.;
+    for page in SettingsPage::ALL {
+        let run = style.to_run(page.title().len());
+        let line = window.text_system().shape_line(
+            SharedString::from(page.title()),
+            size,
+            std::slice::from_ref(&run),
+            None,
+        );
+        let width = f32::from(line.width()) + page.depth() as f32 * SPACE_L;
+        widest = widest.max(width);
+    }
+    (widest + 2. * ROW_PADDING_X + SPACE_M).clamp(MIN_PAGES_WIDTH, MAX_PAGES_WIDTH)
+}
+
+/// The probe of a page title: a test tells the room of the row from the width of the
+/// name.
+#[cfg(test)]
+fn page_title_probe(page: SettingsPage) -> AnyElement {
+    bounds_probe(
+        format!(
+            "settings-page-title-{}",
+            page.title().to_lowercase().replace(' ', "-")
+        ),
+        Some(page.title().into()),
+    )
+}
+
+#[cfg(not(test))]
+fn page_title_probe(_page: SettingsPage) -> AnyElement {
+    div().into_any_element()
+}
+
+/// The part of a selector of a value: its text in lower case, with every run of other
+/// characters as one dash.
+fn slug(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
 fn setting_row(
     entry: &Setting,
     control: impl IntoElement,
@@ -1439,23 +1878,35 @@ fn setting_row(
         .when(highlighted, |this| this.bg(theme.selection))
 }
 
-fn toggle_button(
-    id: &'static str,
+fn toggle_setting_row(
+    entry: &Setting,
     on: bool,
+    highlighted: bool,
+    chosen: bool,
     theme: &Theme,
     cx: &mut Context<SettingsView>,
-) -> Stateful<Div> {
-    let text = if on { "On" } else { "Off" };
-    pill(id, text, on, theme)
-        .debug_selector(move || format!("settings-{}", id.replace('_', "-")))
+) -> Div {
+    let id = entry.id;
+    let selector = format!("settings-{}", id.replace('_', "-"));
+    let row = checkbox_row(SharedString::from(selector.clone()), entry.title, on, theme)
+        .min_h(px(30.))
+        .px(px(ROW_PADDING_X))
+        .rounded(px(CONTROL_RADIUS))
+        .debug_selector(move || selector.clone())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.change(
                 |settings| {
                     settings_catalog::toggle(settings, id);
                 },
                 cx,
-            )
+            );
         }))
+        .when(highlighted, |this| this.bg(theme.selection));
+    div()
+        .when(chosen, |this| {
+            this.debug_selector(move || format!("settings-chosen-{}", id.replace('_', "-")))
+        })
+        .child(row)
 }
 
 /// The id of a step button: the size keeps its old `settings-font-up`, the others name
@@ -1540,62 +1991,6 @@ fn project_sdk_row(sdk: &str, theme: &Theme, cx: &mut Context<SettingsView>) -> 
                 })
                 .ok();
         }))
-}
-
-/// One edge or the corner that changes the size of the window.
-fn resize_grip(
-    id: &'static str,
-    edge: ResizeEdge,
-    placement: SettingsWindowPlacement,
-    cx: &mut Context<SettingsView>,
-) -> Stateful<Div> {
-    let grip = div()
-        .id(id)
-        .debug_selector(move || id.to_owned())
-        .absolute()
-        .occlude()
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                this.resizing = Some(PlacementResize {
-                    from: event.position,
-                    placement,
-                    edge,
-                });
-                cx.notify();
-            }),
-        )
-        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-            this.resize_window(event, window, cx);
-        }))
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.finish_drag(cx)),
-        )
-        .on_mouse_up_out(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.finish_drag(cx)),
-        );
-    match edge {
-        ResizeEdge::Right => grip
-            .top_0()
-            .bottom_0()
-            .right_0()
-            .w(px(RESIZE_GRIP))
-            .cursor_col_resize(),
-        ResizeEdge::Bottom => grip
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .h(px(RESIZE_GRIP))
-            .cursor_row_resize(),
-        ResizeEdge::Corner => grip
-            .right_0()
-            .bottom_0()
-            .w(px(RESIZE_GRIP))
-            .h(px(RESIZE_GRIP))
-            .cursor_row_resize(),
-    }
 }
 
 impl SettingsView {
@@ -1708,7 +2103,9 @@ impl SettingsView {
                     })
                     .ok();
             }));
-        rows.push(div().pt(px(SPACE_S)).child(import));
+        // The import sits under the note of the theme files. At the end of the list, under the
+        // cards, it lay below the visible part of the page, across the edge of the dialog.
+        rows.insert(2, div().pt(px(SPACE_S)).child(import));
         rows
     }
 
@@ -1780,45 +2177,9 @@ impl SettingsView {
     }
 
     /// The text of the Theme row.
+    #[cfg(test)]
     pub(crate) fn theme_label(&self, theme: &Theme) -> String {
         settings_catalog::theme_label(&self.draft, theme.dark, theme.id())
-    }
-
-    /// A click on the Theme row: with Sync with OS on the row shows the theme of the other
-    /// look, as it always has; a window that does not follow the system goes to the next
-    /// theme of the list.
-    fn next_theme(&mut self, theme: &Theme, cx: &mut Context<Self>) {
-        self.search_editing = false;
-        if self.draft.theme_sync_with_os {
-            self.workspace
-                .update(cx, |workspace, cx| workspace.toggle_theme(cx))
-                .ok();
-            // The window no longer follows the system: the draft takes the theme the
-            // click chose, so the row does not keep the name of the old one.
-            if let Some(current) = cx.try_global::<Settings>() {
-                self.draft.theme_sync_with_os = current.theme_sync_with_os;
-                self.draft.theme.clone_from(&current.theme);
-            }
-            cx.notify();
-            return;
-        }
-        let next = {
-            let themes = ThemeCatalog::library_of(cx).themes();
-            if themes.is_empty() {
-                return;
-            }
-            let chosen = settings_catalog::chosen_theme(&self.draft, theme.dark, theme.id());
-            let at = themes
-                .iter()
-                .position(|definition| definition.id == chosen)
-                .unwrap_or(0);
-            themes[(at + 1) % themes.len()].id.clone()
-        };
-        self.draft.theme.clone_from(&next);
-        self.workspace
-            .update(cx, |workspace, cx| workspace.choose_theme(&next, cx))
-            .ok();
-        cx.notify();
     }
 
     /// A card of a theme takes the slot of its look: Sync with OS keeps choosing between
@@ -1865,10 +2226,26 @@ impl SettingsView {
         content.extend(self.mcp_manual_rows(settings, theme, cx));
         content.push(heading("Command execution", theme));
         content.push(self.mcp_permission_row(settings, theme, cx));
+        if self
+            .choice_open
+            .as_ref()
+            .is_some_and(|open| open.id == "mcp_execute_permission")
+            && let Some(menu) = self.choice_menu(theme, cx)
+        {
+            content.push(menu);
+        }
         content.push(heading("Terminal Sessions", theme));
         content.push(self.mcp_terminal_row(settings, theme, cx));
         content.push(heading("Exposed Tools", theme));
         content.push(self.mcp_router_row(settings, theme, cx));
+        if self
+            .choice_open
+            .as_ref()
+            .is_some_and(|open| open.id == "mcp_router_only_scope")
+            && let Some(menu) = self.choice_menu(theme, cx)
+        {
+            content.push(menu);
+        }
         content.extend(self.mcp_tool_rows(settings, theme, cx));
         if let Some(error) = &self.mcp_error {
             content.push(note_owned(error.clone(), theme));
@@ -1878,23 +2255,21 @@ impl SettingsView {
 
     fn mcp_enable_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let on = self.draft.mcp_enabled;
-        let toggle = pill(
-            "settings-mcp-enabled",
-            if on { "On" } else { "Off" },
-            on,
-            theme,
+        div().child(
+            checkbox_row("settings-mcp-enabled", "Enable MCP Server", on, theme)
+                .min_h(px(30.))
+                .debug_selector(|| "settings-mcp-enabled".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.draft.mcp_enabled {
+                        this.change(|settings| settings.mcp_enabled = false, cx);
+                    } else {
+                        this.mcp_confirm_enable = true;
+                        this.search_editing = false;
+                        this.choice_open = None;
+                        cx.notify();
+                    }
+                })),
         )
-        .debug_selector(|| "settings-mcp-enabled".to_owned())
-        .on_click(cx.listener(|this, _, _, cx| {
-            if this.draft.mcp_enabled {
-                this.change(|settings| settings.mcp_enabled = false, cx);
-            } else {
-                this.mcp_confirm_enable = true;
-                this.search_editing = false;
-                cx.notify();
-            }
-        }));
-        row("Enable MCP Server", toggle, theme)
     }
 
     /// The question of IDEA before the server of the window opens to other programs.
@@ -2244,21 +2619,11 @@ impl SettingsView {
 
     fn mcp_permission_row(
         &self,
-        settings: &Settings,
+        _settings: &Settings,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let label = settings.mcp_execute_permission.label();
-        let choice = pill("settings-mcp-brave-mode", label, true, theme)
-            .debug_selector(|| "settings-mcp-brave-mode".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.change(
-                    |settings| {
-                        settings.mcp_execute_permission = settings.mcp_execute_permission.next();
-                    },
-                    cx,
-                )
-            }));
+        let choice = self.setting_select("mcp_execute_permission", theme, cx);
         row(
             "Run shell commands or run configurations without confirmation (brave mode)",
             choice,
@@ -2268,33 +2633,31 @@ impl SettingsView {
 
     fn mcp_terminal_row(&self, settings: &Settings, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let on = settings.mcp_terminal_suggestions;
-        let toggle = pill(
-            "settings-mcp-terminal",
-            if on { "On" } else { "Off" },
-            on,
-            theme,
-        )
-        .debug_selector(|| "settings-mcp-terminal".to_owned())
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.change(
-                |settings| {
-                    settings.mcp_terminal_suggestions = !settings.mcp_terminal_suggestions;
-                },
-                cx,
+        div().child(
+            checkbox_row(
+                "settings-mcp-terminal",
+                "Show setup suggestions for Codex and Claude terminal sessions",
+                on,
+                theme,
             )
-        }));
-        row(
-            "Show setup suggestions for Codex and Claude terminal sessions",
-            toggle,
-            theme,
+            .min_h(px(30.))
+            .debug_selector(|| "settings-mcp-terminal".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.change(
+                    |settings| {
+                        settings.mcp_terminal_suggestions = !settings.mcp_terminal_suggestions;
+                    },
+                    cx,
+                );
+            })),
         )
     }
 
     fn mcp_router_row(&self, settings: &Settings, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let on = settings.mcp_router_only_mode;
-        let toggle = pill(
+        let toggle = checkbox_row(
             "settings-mcp-router-only",
-            if on { "On" } else { "Off" },
+            "Enable router-only mode",
             on,
             theme,
         )
@@ -2303,30 +2666,17 @@ impl SettingsView {
             this.change(
                 |settings| settings.mcp_router_only_mode = !settings.mcp_router_only_mode,
                 cx,
-            )
+            );
         }));
-        let scope = pill(
-            "settings-mcp-router-scope",
-            settings.mcp_router_only_scope.label(),
-            true,
-            theme,
-        )
-        .debug_selector(|| "settings-mcp-router-scope".to_owned())
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.change(
-                |settings| settings.mcp_router_only_scope = settings.mcp_router_only_scope.next(),
-                cx,
-            )
-        }));
+        let scope = self.setting_select("mcp_router_only_scope", theme, cx);
         div()
             .flex()
             .items_center()
             .gap(px(SPACE_M))
             .min_h(px(30.))
             .px(px(ROW_PADDING_X))
-            .child(div().flex_1().child("Enable router-only mode"))
+            .child(div().flex_1().child(toggle))
             .child(scope)
-            .child(toggle)
     }
 
     fn mcp_tool_rows(
@@ -2356,38 +2706,46 @@ impl SettingsView {
             {
                 let choice = tool_choice(settings, spec.name);
                 let name = spec.name;
-                let enabled = pill(
-                    format!("settings-mcp-tool-{name}-enabled"),
-                    "Enabled",
-                    choice.enabled,
-                    theme,
-                )
-                .debug_selector(move || format!("settings-mcp-tool-{name}-enabled"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.change(
-                        move |settings| {
-                            let entry = tool_choice_entry(settings, name);
-                            entry.enabled = !entry.enabled;
-                        },
-                        cx,
-                    )
-                }));
-                let router = pill(
-                    format!("settings-mcp-tool-{name}-router"),
-                    "Router-only",
-                    choice.router_only,
-                    theme,
-                )
-                .debug_selector(move || format!("settings-mcp-tool-{name}-router"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.change(
-                        move |settings| {
-                            let entry = tool_choice_entry(settings, name);
-                            entry.router_only = !entry.router_only;
-                        },
-                        cx,
-                    )
-                }));
+                let enabled = div()
+                    .id(SharedString::from(format!(
+                        "settings-mcp-tool-{name}-enabled"
+                    )))
+                    .debug_selector(move || format!("settings-mcp-tool-{name}-enabled"))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(24.))
+                    .cursor_pointer()
+                    .child(checkbox(choice.enabled, theme))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.change(
+                            move |settings| {
+                                let entry = tool_choice_entry(settings, name);
+                                entry.enabled = !entry.enabled;
+                            },
+                            cx,
+                        );
+                    }));
+                let router = div()
+                    .id(SharedString::from(format!(
+                        "settings-mcp-tool-{name}-router"
+                    )))
+                    .debug_selector(move || format!("settings-mcp-tool-{name}-router"))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(24.))
+                    .cursor_pointer()
+                    .child(checkbox(choice.router_only, theme))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.change(
+                            move |settings| {
+                                let entry = tool_choice_entry(settings, name);
+                                entry.router_only = !entry.router_only;
+                            },
+                            cx,
+                        );
+                    }));
                 rows.push(
                     div()
                         .flex()
@@ -2652,7 +3010,7 @@ fn colour_strip(color: Hsla) -> Div {
 }
 
 /// A line that says a control of the page does not wait for Apply.
-fn note(text: &'static str, theme: &Theme) -> Div {
+pub(crate) fn note(text: &'static str, theme: &Theme) -> Div {
     div()
         .text_size(px(TEXT_SMALL))
         .text_color(theme.text_secondary)
@@ -2673,20 +3031,14 @@ impl Render for SettingsView {
         let settings = self.draft.clone();
         let query = self.search.text.trim().to_owned();
         let viewport = window.viewport_size();
-        let default = SettingsWindowPlacement {
-            left: (f32::from(viewport.width)
-                - f32::from(px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING))))
-                / 2.,
+        let width = px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING));
+        let place = DialogPlace {
+            left: (f32::from(viewport.width) - f32::from(width)) / 2.,
             top: f32::from(viewport.height) * 0.08,
-            width: f32::from(px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING))),
-            height: f32::from(viewport.height) * 0.8,
+            width: f32::from(width),
+            height: Some(f32::from(viewport.height) * 0.8),
         };
-        let placement = cx
-            .try_global::<SettingsWindowPlacement>()
-            .copied()
-            .unwrap_or(default);
 
-        let on_off = |on: bool| if on { "On" } else { "Off" };
         let navigation = settings_catalog::pages_matching(&query);
         let pages: Vec<_> = navigation
             .iter()
@@ -2705,27 +3057,36 @@ impl Render for SettingsView {
                     .flex()
                     .items_center()
                     .h(px(26.))
+                    // A row keeps its height: in a column shorter than the rows, the rows would
+                    // shrink instead of overflowing, and the list would show no bar.
+                    .flex_none()
                     .pl(px(ROW_PADDING_X + page.depth() as f32 * SPACE_L))
                     .pr(px(ROW_PADDING_X))
                     .rounded(px(CONTROL_RADIUS))
                     .border_1()
+                    .overflow_hidden()
                     .border_color(if chosen {
                         theme.tab_selected_border
                     } else {
                         theme.popup_bg
                     })
                     .when(chosen, |this| this.bg(theme.tab_selected))
+                    .tooltip(move |_, cx| tooltip(page.title(), None, cx))
+                    .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.page = page.target();
                         this.highlight = None;
                         this.editing = None;
                         this.search_editing = false;
+                        this.todo_new_editing = false;
+                        this.choice_open = None;
                         if this.page == SettingsPage::Mcp && this.mcp_clients_loaded == 0 {
                             this.load_mcp_clients(cx);
                         }
                         cx.notify();
                     }))
-                    .child(page.title())
+                    .child(div().min_w_0().truncate().child(page.title()))
+                    .child(page_title_probe(page))
             })
             .collect();
 
@@ -2733,20 +3094,15 @@ impl Render for SettingsView {
         match self.page {
             SettingsPage::Plugins => {
                 content.extend(self.plugins.iter().enumerate().map(|(index, plugin)| {
-                    let switch = pill(
-                        ("plugin", index),
-                        on_off(plugin.enabled),
-                        plugin.enabled,
-                        &theme,
+                    div().child(
+                        checkbox_row(
+                            ("plugin", index),
+                            plugin.title.clone(),
+                            plugin.enabled,
+                            &theme,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_plugin(index, cx))),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_plugin(index, cx)));
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .min_h(px(28.))
-                        .child(plugin.title.clone())
-                        .child(switch)
                 }));
                 if content.is_empty() {
                     content.push(
@@ -2781,6 +3137,22 @@ impl Render for SettingsView {
                     self.templates_page
                         .render(TemplateSection::Files, window, cx),
                 );
+            }
+            SettingsPage::EditorTodo => {
+                content.extend(self.render_todo(&theme, cx));
+            }
+            SettingsPage::EditorFileTypes => {
+                let patterns = settings.ignored_files.clone();
+                content.push(note(
+                    "The project tree and the file index leave these names out.",
+                    &theme,
+                ));
+                content.push(self.file_types_page.render(
+                    &patterns,
+                    self.editing == Some(IGNORED_FIELD),
+                    &theme,
+                    cx,
+                ));
             }
             SettingsPage::EditorInspections => {
                 content.extend(self.render_inspections(&theme, cx));
@@ -2837,34 +3209,24 @@ impl Render for SettingsView {
                         content.push(heading(section, &theme));
                         last_section = Some(section);
                     }
+                    let highlighted = self.highlight == Some(entry.id)
+                        || (!query.is_empty() && entry.matches(&query));
+                    let chosen_row = self.highlight == Some(entry.id);
+                    if entry.kind == SettingKind::Toggle {
+                        let on = settings_catalog::value(&settings, entry.id).unwrap_or(false);
+                        content.push(toggle_setting_row(
+                            entry,
+                            on,
+                            highlighted,
+                            chosen_row,
+                            &theme,
+                            cx,
+                        ));
+                        continue;
+                    }
                     let control = match entry.kind {
                         SettingKind::Choice => {
-                            if entry.field == SettingField::Theme {
-                                let label = self.theme_label(&theme);
-                                pill("theme", &label, true, &theme)
-                                    .debug_selector(|| "settings-theme".to_owned())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.next_theme(&theme, cx)
-                                    }))
-                                    .into_any_element()
-                            } else {
-                                let id = entry.id;
-                                let label = settings_catalog::choice_label(&settings, id)
-                                    .unwrap_or_default();
-                                pill(id, &label, true, &theme)
-                                    .debug_selector(move || {
-                                        format!("settings-{}", id.replace('_', "-"))
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.change(
-                                            |settings| {
-                                                settings_catalog::next_choice(settings, id);
-                                            },
-                                            cx,
-                                        )
-                                    }))
-                                    .into_any_element()
-                            }
+                            self.setting_select(entry.id, &theme, cx).into_any_element()
                         }
                         SettingKind::Number => {
                             let step = match entry.field {
@@ -2888,8 +3250,7 @@ impl Render for SettingsView {
                         }
                         SettingKind::Text => {
                             if entry.field == SettingField::BuildToolSecondRuntimeHome {
-                                runtime_pill(entry, &settings, &self.runtimes, &theme, cx)
-                                    .into_any_element()
+                                self.runtime_select(entry, &theme, cx).into_any_element()
                             } else if entry.field == SettingField::BuildToolFirstRepository {
                                 field(
                                     entry.id,
@@ -2930,6 +3291,8 @@ impl Render for SettingsView {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.editing = Some(id);
                                         this.search_editing = false;
+                                        this.todo_new_editing = false;
+                                        this.choice_open = None;
                                         this.text_field = TextField::from_text(start.clone());
                                         cx.notify();
                                     }));
@@ -2946,20 +3309,17 @@ impl Render for SettingsView {
                                 }
                             }
                         }
-                        SettingKind::Toggle => {
-                            let on = settings_catalog::value(&settings, entry.id).unwrap_or(false);
-                            toggle_button(entry.id, on, &theme, cx).into_any_element()
-                        }
+                        SettingKind::Toggle => div().into_any_element(),
                     };
-                    let highlighted = self.highlight == Some(entry.id)
-                        || (!query.is_empty() && entry.matches(&query));
-                    content.push(setting_row(
-                        entry,
-                        control,
-                        highlighted,
-                        self.highlight == Some(entry.id),
-                        &theme,
-                    ));
+                    content.push(setting_row(entry, control, highlighted, chosen_row, &theme));
+                    if self
+                        .choice_open
+                        .as_ref()
+                        .is_some_and(|open| open.id == entry.id)
+                        && let Some(menu) = self.choice_menu(&theme, cx)
+                    {
+                        content.push(menu);
+                    }
                 }
                 if self.page == SettingsPage::Appearance {
                     content.extend(self.icon_section(&theme, cx));
@@ -2991,11 +3351,42 @@ impl Render for SettingsView {
             .flex()
             .flex_col()
             .gap(px(SPACE_S))
-            .w(px(160.))
+            .w(px(self.pages_width))
             .flex_none()
             .h_full()
             .child(self.search_field(&theme, cx))
             .child(pages);
+        let pages_divider = div()
+            .id("settings-pages-splitter")
+            .debug_selector(|| "settings-pages-splitter".to_owned())
+            .flex_none()
+            .w(px(SPACE_XS))
+            .h_full()
+            .cursor_col_resize()
+            .hover({
+                let hover = theme.hover;
+                move |style| style.bg(hover)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.pages_drag = Some(f32::from(event.position.x));
+                    this.search_editing = false;
+                    this.choice_open = None;
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_pages(event, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_pages_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_pages_drag(cx)),
+            );
         let content = scrollable(
             "settings-content",
             &self.scroll_content,
@@ -3025,8 +3416,9 @@ impl Render for SettingsView {
             .items_start()
             .flex_1()
             .min_h_0()
-            .gap(px(DIALOG_GAP))
+            .gap(px(SPACE_S))
             .child(pages)
+            .child(pages_divider)
             .child(content);
 
         let changed = self.changed();
@@ -3066,82 +3458,11 @@ impl Render for SettingsView {
             .child(cancel)
             .child(apply);
 
-        let close = icon_button("settings-close", "general/close", "Close", None, &theme)
-            .debug_selector(|| "settings-close".to_owned())
-            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
-        let title = div()
-            .id("settings-title")
-            .debug_selector(|| "settings-title".to_owned())
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            // The close button is a control of the header height: a shorter title would
-            // leave it sticking out of the bar that the pointer drags.
-            .h(px(CONTROL_HEIGHT))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.dragging = Some(PlacementDrag {
-                        from: event.position,
-                        placement,
-                    });
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(
-                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag_window(event, cx)),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.finish_drag(cx)),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.finish_drag(cx)),
-            )
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Settings"),
-            )
-            .child(close);
-
-        let catcher = (self.dragging.is_some() || self.resizing.is_some()).then(|| {
-            div()
-                .id("settings-drag-catcher")
-                .debug_selector(|| "settings-drag-catcher".to_owned())
-                .absolute()
-                .left(px(-placement.left))
-                .top(px(-placement.top))
-                .w(viewport.width)
-                .h(viewport.height)
-                .occlude()
-                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                    this.drag_window(event, cx);
-                    this.resize_window(event, window, cx);
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.finish_drag(cx)),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.finish_drag(cx)),
-                )
-        });
-
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("settings")
             .debug_selector(|| "settings".to_owned())
             .key_context("Settings")
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(placement.width))
-            .h(px(placement.height))
-            .p(px(DIALOG_PADDING))
-            .gap(px(SPACE_XS))
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .on_action(cx.listener(|this, _: &workspace::Dismiss, window, cx| {
                 if this.page == SettingsPage::Keymap && this.keymap_page.escape(cx) {
@@ -3160,34 +3481,55 @@ impl Render for SettingsView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
-            )
-            .child(title)
+            );
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .px(px(DIALOG_PADDING))
+            .pb(px(DIALOG_PADDING))
+            .gap(px(SPACE_XS))
             .child(section)
-            .child(buttons)
-            .child(resize_grip(
-                "settings-resize-right",
-                ResizeEdge::Right,
-                placement,
-                cx,
-            ))
-            .child(resize_grip(
-                "settings-resize-bottom",
-                ResizeEdge::Bottom,
-                placement,
-                cx,
-            ))
-            .child(resize_grip(
-                "settings-resize-corner",
-                ResizeEdge::Corner,
-                placement,
-                cx,
-            ));
-        div()
-            .absolute()
-            .left(px(placement.left))
-            .top(px(placement.top))
-            .child(enter("settings-enter", body))
-            .children(catcher)
+            .child(buttons);
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        // While the divider is dragged, a layer over the window takes the moves and the
+        // release: the pointer leaves the few pixels of the divider on the first step.
+        let catcher = self.pages_drag.is_some().then(|| {
+            div()
+                .id("settings-pages-catcher")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.drag_pages(event, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.end_pages_drag(cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.end_pages_drag(cx)),
+                )
+        });
+        dialog_window(
+            DialogSpec {
+                key: "settings",
+                title: "Settings".into(),
+                extra: None,
+                place,
+                min: (MIN_WIDTH, MIN_HEIGHT),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
+        .children(catcher)
     }
 }
 

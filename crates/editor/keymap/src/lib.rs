@@ -761,6 +761,8 @@ pub mod workspace {
     pub const BACK: &str = "workspace.back";
     pub const FORWARD: &str = "workspace.forward";
     pub const RUN_CLASS: &str = "workspace.run_class";
+    /// Runs the selection, or the line of the caret, in the terminal of the window.
+    pub const RUN_IN_TERMINAL: &str = "workspace.run_in_terminal";
     pub const BUILD_PROJECT: &str = "workspace.build_project";
     pub const RECENT_LOCATIONS: &str = "workspace.recent_locations";
     pub const GOTO_TEST: &str = "workspace.goto_test";

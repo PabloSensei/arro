@@ -102,6 +102,13 @@ fn compact_middle_packages(cx: &App) -> bool {
         .is_none_or(|settings| settings.project_compact_middle_packages)
 }
 
+/// The file and folder masks the project tree leaves out.
+fn ignored_patterns(cx: &App) -> Vec<String> {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.ignored_files.clone())
+        .unwrap_or_default()
+}
+
 /// The tree keys and, from the same rows, the table the keymap check reads.
 macro_rules! panel_keys {
     ($(($keys:literal, $action:ident, $idea:expr, $mac:expr)),* $(,)?) => {
@@ -336,6 +343,7 @@ impl ProjectPanel {
             layout.tree_expanded.iter().cloned(),
         );
         tree.set_compact(compact_middle_packages(cx));
+        tree.set_ignored(ignored_patterns(cx));
         // Scratches live outside the project but show up in its tree.
         let scratches = workspace.state_dir().join("scratches");
         tree.add_virtual_child(
@@ -376,9 +384,17 @@ impl ProjectPanel {
                 migrations: MigrationModel::default(),
                 runs_watched: false,
             };
-            // The switch of Compact Middle Packages may also be flipped in the settings.
+            // The switch of Compact Middle Packages and the ignored masks may also be
+            // changed in the settings.
             cx.observe_global::<Settings>(|this: &mut Self, cx| {
-                if this.apply_compact(cx) {
+                let ignored = ignored_patterns(cx);
+                if let Some(index) = cx.try_global::<crate::index::ActiveIndex>() {
+                    index.0.set_ignored(ignored.clone());
+                }
+                let mut changed = this.tree.set_ignored(ignored);
+                changed |= this.apply_compact(cx);
+                if changed {
+                    this.read_pending(cx);
                     cx.notify();
                 }
             })

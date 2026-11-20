@@ -687,6 +687,9 @@ pub enum EditorEvent {
     CreateTest(lang_api::DocumentSpot),
     /// Ctrl+Alt+L: the window formats with the flags of the Reformat File dialog.
     Reformat,
+    /// Ctrl+Alt+O is about to apply the edits of the language: the window records the
+    /// file in Local History before they reach the buffer.
+    BeforeOptimizeImports,
     /// The text changed, by typing or from outside.
     Changed,
     /// The caret or the selection moved without changing the text.

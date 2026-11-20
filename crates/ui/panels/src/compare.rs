@@ -287,27 +287,24 @@ impl Render for CompareView {
                     .min_h_0(),
                 )
         };
-        let body = surface(&theme)
+        let title = heading.clone();
+        let shell = surface(&theme)
             .id("compare")
             .debug_selector(|| "compare".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .p(px(POPUP_PADDING))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close(window, cx);
+                    cx.stop_propagation();
+                }
+            }));
+        let contents = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(POPUP_PADDING))
             .gap(px(SPACE_S))
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(CONTROL_HEIGHT))
-                    .px(px(ROW_PADDING_X))
-                    .flex()
-                    .items_center()
-                    .text_size(px(TEXT_TITLE))
-                    .child(heading),
-            )
             .child(
                 div()
                     .flex()
@@ -364,18 +361,26 @@ impl Render for CompareView {
                 )
                 .flex_1()
                 .min_h_0(),
-            )
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
-                    this.close(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)));
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("compare-enter", body))
+            );
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "compare",
+                title: title.into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

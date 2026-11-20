@@ -20,6 +20,7 @@ use workspace::Workspace;
 use crate::diff_view::{decorations_with_visible, hunk_row_spans, rows_of};
 use crate::editor_tab::{options_of, style_of};
 use crate::history::{self, snapshot_bytes};
+use crate::prompt::TextField;
 
 const WIDTH: f32 = 1100.;
 const STRIP_WIDTH: f32 = 48.;
@@ -109,6 +110,12 @@ pub struct HistoryView {
     syncing: bool,
     message: Option<SharedString>,
     scroll_list: ScrollHandle,
+    /// The search over the captions of the versions and the names of the labels.
+    filter: TextField,
+    /// Whether the caret of the search field is shown.
+    filter_editing: bool,
+    /// The list shows the labels alone.
+    only_labels: bool,
 }
 
 fn editor_of(
@@ -182,6 +189,9 @@ impl HistoryView {
             syncing: false,
             message: None,
             scroll_list: ScrollHandle::new(),
+            filter: TextField::default(),
+            filter_editing: false,
+            only_labels: false,
         });
         view.update(cx, |view, cx| view.reread(cx));
         cx.set_global(ActiveHistory(view.downgrade()));
@@ -206,18 +216,74 @@ impl HistoryView {
             this.update(cx, |this, cx| {
                 this.revisions = revisions;
                 this.deleted = deleted;
-                let first = this
-                    .revisions
+                let visible = this.visible();
+                let first = visible
                     .iter()
-                    .position(|revision| revision.content.is_some());
-                match this.selected.or(first) {
+                    .copied()
+                    .find(|index| this.revisions[*index].content.is_some());
+                let chosen = this
+                    .selected
+                    .filter(|index| visible.contains(index))
+                    .or(first);
+                match chosen {
                     Some(index) => this.select(index, cx),
-                    None => cx.notify(),
+                    None => {
+                        this.selected = None;
+                        cx.notify();
+                    }
                 }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// The versions the search and the switch keep, in the order of the list.
+    fn visible(&self) -> Vec<usize> {
+        let query = self.filter.text.trim().to_lowercase();
+        self.revisions
+            .iter()
+            .enumerate()
+            .filter(|(_, revision)| {
+                if self.only_labels && !revision.is_label() {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                let text = format!(
+                    "{} {}",
+                    self.revision_title(revision),
+                    revision.cause.title()
+                );
+                text.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// A change of the filter keeps or moves the chosen version, so that the right pane
+    /// shows something the list still holds.
+    fn refresh_visible(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible();
+        if let Some(selected) = self.selected
+            && visible.contains(&selected)
+        {
+            cx.notify();
+            return;
+        }
+        self.selected = None;
+        match visible
+            .iter()
+            .copied()
+            .find(|index| self.revisions[*index].content.is_some())
+        {
+            Some(index) => self.select(index, cx),
+            None => {
+                self.shown = None;
+                cx.notify();
+            }
+        }
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -499,8 +565,25 @@ impl HistoryView {
         self.left.is_some() && self.right.is_some()
     }
 
-    fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
+        if self.filter_editing {
+            if key.key == "escape" {
+                if self.filter.text.is_empty() {
+                    self.close(window, cx);
+                } else {
+                    self.filter = TextField::default();
+                    self.refresh_visible(cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+            if self.filter.key_with_clipboard(event, false, cx) {
+                self.refresh_visible(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if key.modifiers.control && !key.modifiers.alt && key.key == "c" {
             if let Some(revision) = self.selected.and_then(|index| self.revisions.get(index)) {
                 let text = self.revision_title(revision);
@@ -509,24 +592,33 @@ impl HistoryView {
             cx.stop_propagation();
             return;
         }
-        let count = self.revisions.len();
-        if count == 0 {
+        // The keyboard walks the versions the filter keeps; a label is a separator, not a
+        // row the diff can show.
+        let visible: Vec<usize> = self
+            .visible()
+            .into_iter()
+            .filter(|index| self.revisions[*index].content.is_some())
+            .collect();
+        if visible.is_empty() {
             return;
         }
-        let last = count as isize - 1;
+        let at = self
+            .selected
+            .and_then(|selected| visible.iter().position(|index| *index == selected));
+        let last = visible.len() as isize - 1;
         let next = match key.key.as_str() {
-            "up" => Some(match self.selected {
-                Some(index) => (index as isize - 1).clamp(0, last),
-                None => last,
+            "up" => Some(match at {
+                Some(index) => (index as isize - 1).clamp(0, last) as usize,
+                None => last as usize,
             }),
-            "down" => Some(match self.selected {
-                Some(index) => (index as isize + 1).clamp(0, last),
+            "down" => Some(match at {
+                Some(index) => (index as isize + 1).clamp(0, last) as usize,
                 None => 0,
             }),
             _ => None,
         };
         if let Some(index) = next {
-            self.select(index as usize, cx);
+            self.select(visible[index], cx);
             cx.stop_propagation();
         }
     }
@@ -556,6 +648,72 @@ impl HistoryView {
         } else {
             what
         }
+    }
+
+    /// The search over the captions and the labels, and the switch that keeps the labels
+    /// alone, as the other search fields of the window work.
+    fn filter_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let empty = self.filter.text.is_empty();
+        let color = if empty {
+            theme.text_secondary
+        } else {
+            theme.text
+        };
+        let labels = self.only_labels;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_M))
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(DIALOG_PADDING))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .id("history-filter")
+                    .debug_selector(|| "history-filter".to_owned())
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_M))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_2()
+                    .border_color(if self.filter_editing {
+                        theme.accent
+                    } else {
+                        theme.border
+                    })
+                    .text_color(color)
+                    .children(text_field_children_named(
+                        "history-filter-field",
+                        &self.filter,
+                        theme.text,
+                        theme.text,
+                        theme.selection,
+                        theme.caret,
+                        16.,
+                        self.filter_editing,
+                    ))
+                    .when(empty, |this| this.child("Search history"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.filter_editing = true;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Self::button("history-only-labels", "Labels", theme)
+                    .debug_selector(|| "history-only-labels".to_owned())
+                    .when(labels, |this| {
+                        this.bg(theme.selection).text_color(theme.accent)
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.only_labels = !this.only_labels;
+                        this.refresh_visible(cx);
+                    })),
+            )
     }
 
     fn list(
@@ -600,7 +758,27 @@ impl HistoryView {
                     .into_any_element(),
             );
         }
-        for (index, revision) in self.revisions.iter().enumerate() {
+        for index in self.visible() {
+            let Some(revision) = self.revisions.get(index) else {
+                continue;
+            };
+            if revision.is_label() {
+                // A label is a separator over the versions that follow it.
+                let name = revision.label.clone().unwrap_or_default();
+                let row = div()
+                    .id(("history-label", index))
+                    .debug_selector(move || format!("history-label-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(ROW_HEIGHT))
+                    .px(px(SPACE_M))
+                    .child(div().flex_1().h(px(1.)).bg(theme.border))
+                    .child(div().text_color(theme.text_secondary).child(name))
+                    .child(div().flex_1().h(px(1.)).bg(theme.border));
+                rows.push(row.into_any_element());
+                continue;
+            }
             let selected = self.selected == Some(index);
             let hover = theme.selection_hover;
             let row = div()
@@ -627,6 +805,14 @@ impl HistoryView {
                     .p(px(SPACE_L))
                     .text_color(theme.text_secondary)
                     .child("No history yet: versions appear on save")
+                    .into_any_element(),
+            );
+        } else if rows.is_empty() {
+            rows.push(
+                div()
+                    .p(px(SPACE_L))
+                    .text_color(theme.text_secondary)
+                    .child("No version matches the search")
                     .into_any_element(),
             );
         }
@@ -801,8 +987,10 @@ impl HistoryView {
                 relative(&self.root, &revision.path)
             ));
         }
-        for revision in &self.revisions {
-            lines.push(format!("history-version {}", self.revision_title(revision)));
+        for index in self.visible() {
+            if let Some(revision) = self.revisions.get(index) {
+                lines.push(format!("history-version {}", self.revision_title(revision)));
+            }
         }
         if let Some(shown) = &self.shown {
             lines.push(format!("history-diff hunks {}", shown.hunks.len()));
@@ -819,7 +1007,7 @@ impl Render for HistoryView {
         let height = viewport.height * 0.75;
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.1;
-        let title = format!("Local History: {}", relative(&self.root, &self.scope));
+        let scope = relative(&self.root, &self.scope);
         let can_revert = self
             .shown
             .as_ref()
@@ -833,7 +1021,7 @@ impl Render for HistoryView {
             .px(px(DIALOG_PADDING))
             .border_b_1()
             .border_color(theme.border)
-            .child(div().font_weight(FontWeight::MEDIUM).child(title))
+            .child(div().font_weight(FontWeight::MEDIUM).child(scope))
             .when(can_revert, |header| {
                 header.child(
                     Self::button("history-revert", "Revert", &theme)
@@ -847,15 +1035,17 @@ impl Render for HistoryView {
                 .text_color(theme.close_hover)
                 .child(message)
         });
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("history")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
-            .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .child(header)
+            .child(self.filter_row(&theme, cx))
             .children(message)
             .child(
                 div()
@@ -865,11 +1055,26 @@ impl Render for HistoryView {
                     .child(self.list(&theme, window, cx))
                     .child(self.diff(&theme, window, cx)),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("history-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "history",
+                title: "Local History".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

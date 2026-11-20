@@ -211,38 +211,50 @@ impl Render for InvalidateDialog {
                 .child(error)
         });
 
-        div().absolute().left(left).top(top).child(
-            surface(&theme)
-                .id("invalidate-caches")
-                .debug_selector(|| "invalidate-caches".to_owned())
-                .key_context("InvalidateCaches")
-                .track_focus(&self.focus)
-                .occlude()
-                .w(width)
-                .p(px(DIALOG_PADDING))
-                .gap(px(DIALOG_GAP))
-                .text_size(px(UI_SIZE))
-                .text_color(theme.text)
-                .on_key_down(
-                    cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        this.key(event, window, cx)
-                    }),
-                )
-                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-                .child(
-                    div()
-                        .text_size(px(TEXT_TITLE))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Invalidate Caches"),
-                )
-                .child(
-                    div()
-                        .text_color(theme.text_secondary)
-                        .child("The project restarts; the chosen caches are deleted before it opens and rebuilt after."),
-                )
-                .children(rows)
-                .children(error)
-                .child(actions),
+        let shell = surface(&theme)
+            .id("invalidate-caches")
+            .debug_selector(|| "invalidate-caches".to_owned())
+            .key_context("InvalidateCaches")
+            .track_focus(&self.focus)
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text)
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, window, cx| this.key(event, window, cx)),
+            );
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
+            .child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .child("The project restarts; the chosen caches are deleted before it opens and rebuilt after."),
+            )
+            .children(rows)
+            .children(error)
+            .child(actions);
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "invalidate",
+                title: "Invalidate Caches".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
         )
     }
 }

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use ::base::Cancel;
 use editor_view::{EditorView, Languages, Spot};
+use futures_util::StreamExt;
 use search::{FileHits, SearchError, TextQuery, find_in_files, find_in_selection, replace_edits};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -112,6 +113,11 @@ pub struct Finder {
     results: Vec<FileHits>,
     truncated: bool,
     message: Option<String>,
+    /// Whether the search in flight has not answered yet.
+    searching: bool,
+    /// What the search found before it answered: files with matches and their lines.
+    found_files: usize,
+    found_lines: usize,
     selected: usize,
     serial: usize,
     cancel: Cancel,
@@ -180,6 +186,9 @@ impl Finder {
             results: Vec::new(),
             truncated: false,
             message: None,
+            searching: false,
+            found_files: 0,
+            found_lines: 0,
             selected: 0,
             serial: 0,
             cancel: Cancel::new(),
@@ -245,6 +254,9 @@ impl Finder {
         self.cancel = Cancel::new();
         self.task = None;
         self.message = None;
+        self.searching = false;
+        self.found_files = 0;
+        self.found_lines = 0;
         // The subscription keeps the hint up to date; a keystroke does not read the
         // whole list of files again.
         if self.mask_hint.is_empty() {
@@ -278,6 +290,7 @@ impl Finder {
         let selection = selection_requested
             .then(|| self.selection_text(cx))
             .flatten();
+        let (sender, mut receiver) = futures_channel::mpsc::unbounded::<FileHits>();
         let search = cx.background_executor().spawn(async move {
             if selection_requested && selection.is_none() {
                 return (Ok(()), Vec::new());
@@ -287,10 +300,14 @@ impl Finder {
                     Ok(hits) => vec![hits],
                     Err(_) => Vec::new(),
                 };
+                for hits in &found {
+                    let _ = sender.unbounded_send(hits.clone());
+                }
                 return (Ok(()), found);
             }
             let found = Mutex::new(Vec::new());
             let on_file = |hits: FileHits| {
+                let _ = sender.unbounded_send(hits.clone());
                 found
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -302,11 +319,28 @@ impl Finder {
                 .unwrap_or_else(|poison| poison.into_inner());
             (result, found)
         });
+        self.searching = true;
         self.task = Some(cx.spawn(async move |this, cx| {
+            // Every file the search finds reaches the window while it runs, so the line
+            // under the fields counts what is already there.
+            while let Some(hits) = receiver.next().await {
+                this.update(cx, |this, cx| this.progress(serial, &hits, cx))
+                    .ok();
+            }
             let found = search.await;
             this.update(cx, |this, cx| this.arrived(serial, found, cx))
                 .ok();
         }));
+        cx.notify();
+    }
+
+    /// A file the running search found: the line of the window counts its matches.
+    fn progress(&mut self, serial: usize, hits: &FileHits, cx: &mut Context<Self>) {
+        if serial != self.serial {
+            return;
+        }
+        self.found_files += 1;
+        self.found_lines += hits.lines.len();
         cx.notify();
     }
 
@@ -328,6 +362,7 @@ impl Finder {
         if serial != self.serial {
             return;
         }
+        self.searching = false;
         if let Err(error) = result {
             self.message = Some(error.to_string());
             self.results.clear();
@@ -377,6 +412,20 @@ impl Finder {
     #[cfg(test)]
     pub(crate) fn replace_field(&self) -> &TextField {
         &self.replacement
+    }
+
+    /// Starts a search from a test without a key press, so the state before the answer
+    /// of the search can be read.
+    #[cfg(test)]
+    pub(crate) fn search(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.find = TextField::from_text(text.to_owned());
+        self.refresh(cx);
+    }
+
+    /// Whether the search in flight has not answered yet, for a test of the status line.
+    #[cfg(test)]
+    pub(crate) fn is_searching(&self) -> bool {
+        self.searching
     }
 
     fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -845,14 +894,28 @@ impl Finder {
                     .strip_prefix(self.root.as_path())
                     .unwrap_or(&hits.path);
                 let title = format!("{}  ({})", relative.display(), hits.lines.len());
+                let file_icon = self
+                    .workspace
+                    .upgrade()
+                    .map_or("fileTypes/text", |workspace| {
+                        workspace.read(cx).icons().icon_for(&hits.path)
+                    });
                 div()
                     .id(("find-row", at))
+                    .debug_selector(move || format!("find-file-{at}"))
                     .flex_none()
                     .h(px(ROW_HEIGHT))
                     .px(px(ROW_PADDING_X))
                     .pt(px(SPACE_S))
                     .text_color(theme.text_secondary)
-                    .child(title)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .child(icon(file_icon, theme))
+                            .child(title),
+                    )
                     .into_any_element()
             }
             Row::Hit(file, line) => {
@@ -970,20 +1033,35 @@ impl Render for Finder {
             .enumerate()
             .map(|(at, row)| self.row(at, *row, &theme, cx))
             .collect();
-        let status = match (
-            &self.message,
-            self.results.is_empty(),
-            self.find.text.is_empty(),
-        ) {
-            (Some(message), _, _) => message.clone(),
-            (None, _, true) => String::new(),
-            (None, true, false) => "Nothing found".to_owned(),
-            (None, false, false) => {
+        let status = match (self.message.as_deref(), self.find.text.is_empty()) {
+            (Some(message), _) => message.to_owned(),
+            (None, true) => String::new(),
+            (None, false) if self.searching => {
+                if self.found_lines == 0 {
+                    "Searching…".to_owned()
+                } else {
+                    format!(
+                        "Searching… {} matches in {} files",
+                        self.found_lines, self.found_files
+                    )
+                }
+            }
+            (None, false) if self.results.is_empty() => "Nothing found".to_owned(),
+            (None, false) => {
                 let lines: usize = self.results.iter().map(|file| file.lines.len()).sum();
                 let more = if self.truncated { "+" } else { "" };
                 format!("{lines}{more} matches in {} files", self.results.len())
             }
         };
+        let status_bar = div()
+            .debug_selector(|| "finder-status".to_owned())
+            .flex_none()
+            .h(px(22.))
+            .px(px(ROW_PADDING_X))
+            .text_color(theme.text_secondary)
+            .child(status.clone());
+        #[cfg(test)]
+        let status_bar = status_bar.child(bounds_probe("finder-status-text", Some(status.into())));
         let heading = if self.replace_mode {
             "Replace in Files"
         } else {
@@ -1182,14 +1260,7 @@ impl Render for Finder {
                         ),
                 )
             })
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(22.))
-                    .px(px(ROW_PADDING_X))
-                    .text_color(theme.text_secondary)
-                    .child(status),
-            )
+            .child(status_bar)
             .child(
                 div()
                     .flex()

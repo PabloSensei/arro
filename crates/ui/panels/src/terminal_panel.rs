@@ -195,6 +195,8 @@ pub struct TerminalPanel {
     terminal_suggestion: Option<mcp_discovery::Client>,
     /// Numbers the reads behind the bar, so a later command wins.
     suggestion_generation: u64,
+    /// The lines Run Selection in Terminal sends once the shell of a new tab is up.
+    pending_run: Option<(usize, Vec<String>)>,
 }
 
 /// The client a command line of the prompt starts, when it is `claude` or `codex`.
@@ -208,6 +210,48 @@ fn client_of_command(line: &str) -> Option<mcp_discovery::Client> {
         "codex" => Some(mcp_discovery::Client::Codex),
         _ => None,
     }
+}
+
+/// The command after the prompt of a shell, when the line shows one.
+fn after_prompt(line: &str) -> &str {
+    line.rsplit(['$', '>', '#', '%'])
+        .next()
+        .unwrap_or(line)
+        .trim_start()
+}
+
+/// The programs whose lines run as a build or a test of the project rather than inside
+/// the shell. The name may come with a relative path and an extension of Windows.
+fn build_program(program: &str) -> bool {
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "mvn"
+            | "mvn.cmd"
+            | "mvnw"
+            | "mvnw.cmd"
+            | "gradle"
+            | "gradle.bat"
+            | "gradlew"
+            | "gradlew.bat"
+    )
+}
+
+/// The build or test line a prompt shows, without the prompt of the shell.
+fn build_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let typed = |text: &str| text.split_whitespace().next().is_some_and(build_program);
+    if typed(line) && one_program(line) {
+        return Some(line.to_owned());
+    }
+    let command = after_prompt(line);
+    (command != line && typed(command) && one_program(command)).then(|| command.to_owned())
+}
+
+/// Whether the line starts one program. The Run window runs no shell, so a line with an
+/// operator or an expansion stays in the shell, which reads it itself.
+fn one_program(line: &str) -> bool {
+    !line.contains(['|', '&', ';', '<', '>', '`', '$'])
 }
 
 /// The shell sees what the user sees in any console, plus the terminal variables and the
@@ -295,6 +339,8 @@ enum TerminalCommand {
     /// Copies a selection and otherwise goes to the shell, where Ctrl+C interrupts.
     CopyIfSelected,
     Paste,
+    /// Runs a build or test line of the prompt in the Run window instead of the shell.
+    RunLine,
 }
 
 /// The keys of the terminal that act on the window rather than reach the shell. macOS
@@ -307,6 +353,8 @@ struct TerminalKeys {
     copy: &'static [&'static str],
     copy_selection: &'static [&'static str],
     paste: &'static [&'static str],
+    /// `Console.Execute.Multiline` of IDEA: a build line goes to the Run window.
+    run_line: &'static [&'static str],
 }
 
 const TERMINAL_KEYS_WINDOWS: TerminalKeys = TerminalKeys {
@@ -316,6 +364,7 @@ const TERMINAL_KEYS_WINDOWS: TerminalKeys = TerminalKeys {
     copy: &["ctrl-shift-c"],
     copy_selection: &["ctrl-c"],
     paste: &["ctrl-shift-v", "ctrl-v", "shift-insert"],
+    run_line: &["ctrl-enter"],
 };
 
 const TERMINAL_KEYS_MACOS: TerminalKeys = TerminalKeys {
@@ -326,6 +375,7 @@ const TERMINAL_KEYS_MACOS: TerminalKeys = TerminalKeys {
     // Control belongs to the shell on macOS: Ctrl+C keeps interrupting the program.
     copy_selection: &[],
     paste: &["cmd-v"],
+    run_line: &["cmd-enter"],
 };
 
 /// The keys of the terminal of one platform, for the bindings and the press handler.
@@ -366,6 +416,8 @@ fn terminal_command(stroke: &Keystroke, platform: Platform) -> Option<TerminalCo
         Some(TerminalCommand::CopyIfSelected)
     } else if any(keys.paste) {
         Some(TerminalCommand::Paste)
+    } else if any(keys.run_line) {
+        Some(TerminalCommand::RunLine)
     } else {
         None
     }
@@ -482,6 +534,7 @@ impl TerminalPanel {
                 ide_connected: false,
                 terminal_suggestion: None,
                 suggestion_generation: 0,
+                pending_run: None,
             };
             for tab in 0..panel.tabs.len() {
                 for pane in 0..panel.tabs[tab].panes.len() {
@@ -566,6 +619,22 @@ impl TerminalPanel {
         cx.spawn(async move |this, cx| {
             let result = spawn.await;
             this.update(cx, |this, cx| {
+                let started = match result {
+                    Ok(session) => {
+                        ::platform::label_process(session.pid(), "Terminal");
+                        Ok(Arc::new(session))
+                    }
+                    Err(error) => Err(format!("The shell did not start: {error}")),
+                };
+                // The lines of Run Selection in Terminal wait for the shell of the tab
+                // the action opened.
+                let pending = this
+                    .pending_run
+                    .clone()
+                    .filter(|(waiting, _)| *waiting == tab);
+                if pending.is_some() {
+                    this.pending_run = None;
+                }
                 let Some(pane) = this
                     .tabs
                     .get_mut(tab)
@@ -573,13 +642,15 @@ impl TerminalPanel {
                 else {
                     return;
                 };
-                pane.state = match result {
-                    Ok(session) => {
-                        ::platform::label_process(session.pid(), "Terminal");
-                        State::Running(Arc::new(session))
-                    }
-                    Err(error) => State::Failed(format!("The shell did not start: {error}").into()),
+                pane.state = match started {
+                    Ok(session) => State::Running(session),
+                    Err(text) => State::Failed(text.into()),
                 };
+                if let Some((_, lines)) = pending {
+                    for line in lines {
+                        let _ = this.run_command(&line);
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -687,6 +758,14 @@ impl TerminalPanel {
                 self.paste(window, cx);
                 return;
             }
+            Some(TerminalCommand::RunLine) => {
+                if let Some(line) = self.typed_build_line() {
+                    cx.stop_propagation();
+                    self.run_build_line(line, window, cx);
+                    return;
+                }
+                // Anything else is a plain Enter for the shell.
+            }
             None => {}
         }
         if modifiers.alt
@@ -767,6 +846,68 @@ impl TerminalPanel {
             .ok();
         })
         .detach();
+    }
+
+    /// The build or test line the prompt holds, when Ctrl+Enter is to run it in the Run
+    /// window. The prompt of the shell is not a part of the line.
+    fn typed_build_line(&self) -> Option<String> {
+        let session = self.session()?;
+        let screen = session.screen();
+        let (row, column) = screen.cursor?;
+        let shown = screen.line(row);
+        let left: String = shown.chars().take(column as usize).collect();
+        build_line(&left)
+    }
+
+    /// Starts a line the user typed in the terminal as a configuration of the Run
+    /// window, as IDEA's Run Anything does. The line stays in the prompt of the shell.
+    fn run_build_line(&mut self, line: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(run) = cx
+            .try_global::<crate::script::ActiveRunPanel>()
+            .map(|panel| panel.0.clone())
+        else {
+            return;
+        };
+        let config = runner::CommandProvider::config_of(&line);
+        run.update(cx, |panel, cx| {
+            panel.choose_configuration(config, cx);
+            panel.run(cx);
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(workspace::RUN_TOOL, window, cx)
+            })
+            .ok();
+    }
+
+    /// Run Selection in Terminal: the lines of the editor reach the shell of the active
+    /// tab, and a closed terminal opens with a new tab in the root of the project.
+    pub(crate) fn run_lines(
+        &mut self,
+        lines: Vec<String>,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if lines.iter().all(|line| line.trim().is_empty()) {
+            return;
+        }
+        if new_tab {
+            // The shell of a new tab starts in the background: the lines wait for it.
+            self.open_tab_in(self.root.clone(), window, cx);
+            self.pending_run = Some((self.active, lines));
+            return;
+        }
+        // A line goes to the shell as if the user typed it and pressed Enter: a
+        // multi-line selection is a set of such lines.
+        if self.session().is_none() {
+            // A shell that still starts takes the lines when it is up.
+            self.pending_run = Some((self.active, lines));
+            return;
+        }
+        for line in lines.iter().filter(|line| !line.trim().is_empty()) {
+            let _ = self.run_command(line);
+        }
     }
 
     /// The presses of the search bar, before the ones of the terminal.
@@ -2266,7 +2407,7 @@ impl TerminalPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalCommand, terminal_command};
+    use super::{TerminalCommand, build_line, terminal_command};
     use keymap::Platform;
     use ui_kit::gpui::Keystroke;
 
@@ -2351,5 +2492,67 @@ mod tests {
             None,
             "the Super key is not ours"
         );
+    }
+
+    /// Ctrl+Enter (Command+Enter on macOS) is the multiline execute of IDEA: a build or
+    /// test line goes to the Run window, anything else stays an Enter for the shell.
+    #[test]
+    fn ctrl_enter_is_the_run_line_key_of_each_platform() {
+        assert_eq!(
+            terminal_command(&stroke("ctrl-enter"), Platform::Windows),
+            Some(TerminalCommand::RunLine)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-enter"), Platform::Linux),
+            Some(TerminalCommand::RunLine)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-enter"), Platform::MacOs),
+            Some(TerminalCommand::RunLine)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-enter"), Platform::MacOs),
+            None,
+            "Control belongs to the shell on macOS"
+        );
+    }
+
+    #[test]
+    fn only_a_build_or_test_line_is_taken_from_the_prompt() {
+        assert_eq!(build_line("mvn test").as_deref(), Some("mvn test"));
+        assert_eq!(
+            build_line("./mvnw verify -DskipTests").as_deref(),
+            Some("./mvnw verify -DskipTests")
+        );
+        assert_eq!(build_line("gradle build").as_deref(), Some("gradle build"));
+        assert_eq!(
+            build_line("./gradlew check").as_deref(),
+            Some("./gradlew check")
+        );
+        assert_eq!(
+            build_line(r"C:\work> .\mvnw.cmd package").as_deref(),
+            Some(r".\mvnw.cmd package")
+        );
+        assert_eq!(
+            build_line("user@host:~/work$ mvn clean").as_deref(),
+            Some("mvn clean")
+        );
+        assert_eq!(
+            build_line("PS C:\\work> gradle test").as_deref(),
+            Some("gradle test")
+        );
+        for line in ["ls", "echo mvn test", "cat build.gradle", "mvnTooMuch test"] {
+            assert_eq!(build_line(line), None, "{line}");
+        }
+        // The Run window starts one program: a line of the shell stays in the shell.
+        for line in [
+            "mvn test && echo done",
+            "mvn test; echo done",
+            "mvn test > log.txt",
+            "user@host:~$ gradle test | tee log",
+            "mvn -Dplace=$HOME/place test",
+        ] {
+            assert_eq!(build_line(line), None, "{line}");
+        }
     }
 }

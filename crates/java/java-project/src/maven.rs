@@ -169,6 +169,10 @@ impl Maven {
 }
 
 impl BuildSystem for Maven {
+    fn task_icon(&self) -> &'static str {
+        "run/maven"
+    }
+
     fn detect(&self, root: &Path) -> bool {
         root.join("pom.xml").is_file()
     }

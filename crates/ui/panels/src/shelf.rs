@@ -357,21 +357,19 @@ impl Render for UnshelveDialog {
             })
             .collect();
         let delete = self.delete_after;
-        let body = surface(&theme)
+        let title: SharedString = format!("Unshelve {}", self.shelf).into();
+        let shell = surface(&theme)
             .id("unshelve-dialog")
             .debug_selector(|| "unshelve-dialog".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("Unshelve {}", self.shelf)),
-            )
             .child(
                 scrollable(
                     "unshelve-files",
@@ -454,11 +452,26 @@ impl Render for UnshelveDialog {
                             .on_click(cx.listener(|this, _, window, cx| this.unpack(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("unshelve", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "unshelve",
+                title,
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

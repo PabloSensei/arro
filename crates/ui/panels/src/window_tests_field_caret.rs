@@ -277,11 +277,11 @@ fn the_settings_field_has_a_caret_and_a_selection(cx: &mut TestAppContext) {
     let (_, window) = open_sample_window(cx, "field-settings");
     press(cx, window, "ctrl-alt-s");
     draw(cx, window);
-    click(cx, window, "settings-page-appearance");
+    click(cx, window, "settings-page-terminal");
     draw(cx, window);
-    click(cx, window, "settings-editor-font-family");
+    click(cx, window, "settings-terminal-shell");
     draw(cx, window);
-    type_text(cx, window, "Mono");
+    type_text(cx, window, "bash");
     caret_and_selection(
         cx,
         window,

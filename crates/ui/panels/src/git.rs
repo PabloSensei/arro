@@ -875,6 +875,33 @@ impl GitState {
         .detach();
     }
 
+    /// Runs a command that rewrites many files. The project tree is recorded in Local
+    /// History in the same background job, before the command: the bytes the snapshot
+    /// reads are the ones the command is about to change.
+    fn run_snapshot<T: Send + 'static>(
+        &mut self,
+        what: &'static str,
+        cause: local_history::Cause,
+        work: impl FnOnce(&Repository) -> std::io::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let history = crate::history::get(cx);
+        let skipped = crate::history::skipped_folders(cx);
+        let root = self.repo.as_ref().map(|repo| repo.root().to_path_buf());
+        self.run(
+            what,
+            move |repo| {
+                if let (Some(history), Some(root)) = (&history, &root) {
+                    crate::history::record_tree_blocking(history, root, cause, &skipped);
+                }
+                work(repo)
+            },
+            done,
+            cx,
+        );
+    }
+
     /// Commits the chosen files of every root, one commit per root with the same message,
     /// as the Commit window does for a project with submodules.
     pub fn commit_roots(
@@ -1299,8 +1326,9 @@ impl GitState {
         let submodules = cx
             .try_global::<Settings>()
             .is_none_or(|settings| settings.git_update_submodules);
-        self.run(
+        self.run_snapshot(
             "Update",
+            local_history::Cause::BeforeGitPull,
             move |repo| repo.update_all(mode, submodules),
             move |this, update, cx| this.finish_update(update, cx),
             cx,
@@ -1411,8 +1439,9 @@ impl GitState {
             self.report("Update", message, cx);
             return;
         }
-        self.run(
+        self.run_snapshot(
             "Abort",
+            local_history::Cause::BeforeGitRevert,
             |repo| repo.abort(),
             |this, stash, cx| {
                 this.operation = Operation::None;
@@ -1462,8 +1491,9 @@ impl GitState {
 
     pub fn switch(&mut self, branch: String, cx: &mut Context<Self>) {
         let name = branch.clone();
-        self.run(
+        self.run_snapshot(
             "Switch branch",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.switch(&name),
             move |this, (), cx| {
                 this.remember_recent(&branch);
@@ -1480,8 +1510,9 @@ impl GitState {
         let local = branch
             .split_once('/')
             .map_or_else(|| branch.clone(), |(_, name)| name.to_owned());
-        self.run(
+        self.run_snapshot(
             "Checkout branch",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.checkout_remote(&name),
             move |this, (), cx| {
                 this.remember_recent(&local);
@@ -1498,8 +1529,9 @@ impl GitState {
 
     pub fn create_branch_from(&mut self, name: String, start: String, cx: &mut Context<Self>) {
         let (made, shown) = (name.clone(), name);
-        self.run(
+        self.run_snapshot(
             "New branch",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| {
                 repo.create_branch(&made, &start)?;
                 repo.switch(&made)
@@ -1516,8 +1548,9 @@ impl GitState {
     /// git cannot keep are the error of the command, as they are for a branch.
     pub fn checkout_revision(&mut self, commit: String, cx: &mut Context<Self>) {
         let short = short_commit(&commit);
-        self.run(
+        self.run_snapshot(
             "Checkout Revision",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.checkout_commit(&commit),
             move |this, (), cx| {
                 this.reload_everything(cx);
@@ -1634,8 +1667,9 @@ impl GitState {
         } else {
             format!("Cherry-picked {count} commits")
         };
-        self.run(
+        self.run_snapshot(
             "Cherry-Pick",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.cherry_pick(&commits),
             move |this, report, cx| {
                 this.finish_branch_update(report, "Cherry-Pick", message.clone(), cx)
@@ -1652,8 +1686,9 @@ impl GitState {
             return;
         }
         let short = short_commit(&commit);
-        self.run(
+        self.run_snapshot(
             "Revert",
+            local_history::Cause::BeforeGitRevert,
             move |repo| repo.revert_commit(&commit),
             move |this, report, cx| {
                 this.finish_branch_update(report, "Revert", format!("Reverted {short}"), cx)
@@ -1671,8 +1706,9 @@ impl GitState {
         }
         let short = short_commit(&commit);
         let label = mode.label();
-        self.run(
+        self.run_snapshot(
             "Reset",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.reset(&commit, mode),
             move |this, (), cx| {
                 this.reload_everything_from_disk(cx);
@@ -1686,8 +1722,9 @@ impl GitState {
     pub fn checkout_and_rebase(&mut self, branch: String, onto: String, cx: &mut Context<Self>) {
         let (name, target) = (branch.clone(), onto.clone());
         let shown = (branch.clone(), onto.clone());
-        self.run(
+        self.run_snapshot(
             "Checkout and Rebase",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| {
                 repo.switch(&name)?;
                 repo.rebase_onto(&target)
@@ -1719,8 +1756,9 @@ impl GitState {
             return;
         }
         let name = branch.clone();
-        self.run(
+        self.run_snapshot(
             "Merge",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.merge_branch(&name),
             move |this, report, cx| {
                 this.finish_branch_update(
@@ -1741,8 +1779,9 @@ impl GitState {
             return;
         }
         let name = branch.clone();
-        self.run(
+        self.run_snapshot(
             "Rebase",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.rebase_onto(&name),
             move |this, report, cx| {
                 this.finish_branch_update(
@@ -1797,8 +1836,9 @@ impl GitState {
             self.report("Rebase", message, cx);
             return;
         }
-        self.run(
+        self.run_snapshot(
             "Rebase",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.rebase(&plan),
             |this, report, cx| this.finish_rebase(report, cx),
             cx,
@@ -2158,8 +2198,9 @@ impl GitState {
             return;
         }
         let count = paths.len();
-        self.run(
+        self.run_snapshot(
             "Rollback",
+            local_history::Cause::BeforeGitRevert,
             move |repo| repo.revert_paths(&paths),
             move |this, (), cx| {
                 this.reload_everything_from_disk(cx);
@@ -2836,8 +2877,9 @@ impl GitState {
     /// The revision Checkout Tag or Revision names, shown as the user typed it.
     fn checkout_named(&mut self, revision: String, cx: &mut Context<Self>) {
         let shown = revision.clone();
-        self.run(
+        self.run_snapshot(
             "Checkout",
+            local_history::Cause::BeforeGitCheckout,
             move |repo| repo.checkout_commit(&revision),
             move |this, (), cx| {
                 this.reload_everything(cx);

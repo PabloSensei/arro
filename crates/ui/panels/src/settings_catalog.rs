@@ -39,6 +39,10 @@ pub enum SettingsPage {
     /// The group above the MCP server page, under Tools.
     ToolsAi,
     Mcp,
+    /// The patterns and the case of the TODO tool window.
+    EditorTodo,
+    /// The ignored file and folder masks of the project tree and the file index.
+    EditorFileTypes,
 }
 
 /// The names the language gives its two build tools. They are no part of this crate:
@@ -66,7 +70,7 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 27] = [
+    pub const ALL: [SettingsPage; 29] = [
         SettingsPage::Appearance,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
@@ -77,6 +81,7 @@ impl SettingsPage {
         SettingsPage::EditorLiveTemplates,
         SettingsPage::EditorPostfix,
         SettingsPage::EditorFileTemplates,
+        SettingsPage::EditorTodo,
         SettingsPage::Debugger,
         SettingsPage::Project,
         SettingsPage::BuildTools,
@@ -94,6 +99,7 @@ impl SettingsPage {
         SettingsPage::Database,
         SettingsPage::ToolsAi,
         SettingsPage::Mcp,
+        SettingsPage::EditorFileTypes,
     ];
 
     pub fn title(self) -> &'static str {
@@ -125,6 +131,8 @@ impl SettingsPage {
             SettingsPage::Database => "Database",
             SettingsPage::ToolsAi => "AI",
             SettingsPage::Mcp => "MCP Server",
+            SettingsPage::EditorTodo => "TODO",
+            SettingsPage::EditorFileTypes => "File Types",
         }
     }
 
@@ -144,10 +152,12 @@ impl SettingsPage {
             | SettingsPage::Kubernetes
             | SettingsPage::Database
             | SettingsPage::EditorLiveTemplates
-            | SettingsPage::EditorFileTemplates => 1,
+            | SettingsPage::EditorFileTemplates
+            | SettingsPage::EditorTodo => 1,
             SettingsPage::EditorPostfix => 2,
             SettingsPage::ToolsAi => 1,
             SettingsPage::Mcp => 2,
+            SettingsPage::EditorFileTypes => 1,
             _ => 0,
         }
     }
@@ -173,7 +183,9 @@ impl SettingsPage {
             | SettingsPage::EditorSpelling
             | SettingsPage::EditorLiveTemplates
             | SettingsPage::EditorPostfix
-            | SettingsPage::EditorFileTemplates => Some(SettingsPage::Editor),
+            | SettingsPage::EditorFileTemplates
+            | SettingsPage::EditorTodo => Some(SettingsPage::Editor),
+            SettingsPage::EditorFileTypes => Some(SettingsPage::Editor),
             SettingsPage::BuildToolsFirst | SettingsPage::BuildToolsSecond => {
                 Some(SettingsPage::BuildTools)
             }
@@ -313,6 +325,12 @@ pub enum SettingField {
     McpRouterOnlyScope,
     /// Whether a terminal suggests the setup of a client that starts in it.
     McpTerminalSuggestions,
+    /// The patterns the TODO window looks for.
+    TodoTemplates,
+    /// Whether the TODO window matches the patterns with their case.
+    TodoCaseSensitive,
+    /// The file and folder masks the project tree and the file index leave out.
+    IgnoredFiles,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -453,7 +471,7 @@ pub const SETTINGS: &[Setting] = &[
         id: "editor_font_family",
         title: "Editor typeface",
         page: SettingsPage::Appearance,
-        kind: SettingKind::Text,
+        kind: SettingKind::Choice,
         field: SettingField::EditorFontFamily,
         keywords: "typeface family monospace text appearance",
     },
@@ -1121,6 +1139,30 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::McpTerminalSuggestions,
         keywords: "mcp terminal codex claude setup suggestion configure auto",
     },
+    Setting {
+        id: "todo_templates",
+        title: "TODO patterns",
+        page: SettingsPage::EditorTodo,
+        kind: SettingKind::Text,
+        field: SettingField::TodoTemplates,
+        keywords: "todo fixme hack patterns keywords markers comments editor",
+    },
+    Setting {
+        id: "todo_case_sensitive",
+        title: "Case sensitive",
+        page: SettingsPage::EditorTodo,
+        kind: SettingKind::Toggle,
+        field: SettingField::TodoCaseSensitive,
+        keywords: "todo patterns case sensitive editor",
+    },
+    Setting {
+        id: "ignored_files",
+        title: "Ignored files and folders",
+        page: SettingsPage::EditorFileTypes,
+        kind: SettingKind::Text,
+        field: SettingField::IgnoredFiles,
+        keywords: "file types masks exclude hide tree project class node_modules",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1235,6 +1277,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::McpEnabled => Some(settings.mcp_enabled),
         SettingField::McpRouterOnlyMode => Some(settings.mcp_router_only_mode),
         SettingField::McpTerminalSuggestions => Some(settings.mcp_terminal_suggestions),
+        SettingField::TodoCaseSensitive => Some(settings.todo_case_sensitive),
         SettingField::AiEnabled => Some(settings.ai_enabled),
         SettingField::ProjectCompactMiddlePackages => {
             Some(settings.project_compact_middle_packages)
@@ -1306,13 +1349,16 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::McpBinary
         | SettingField::McpExecutePermission
         | SettingField::McpRouterOnlyScope
-        | SettingField::SqlKeywordCase => None,
+        | SettingField::SqlKeywordCase
+        | SettingField::TodoTemplates
+        | SettingField::IgnoredFiles => None,
     }
 }
 
 /// Flips a boolean setting. False when the id is not a switch.
 pub fn toggle(settings: &mut Settings, id: &str) -> bool {
     match find(id).map(|setting| setting.field) {
+        Some(SettingField::IgnoredFiles) => return false,
         Some(SettingField::ThemeSyncWithOs) => {
             settings.theme_sync_with_os = !settings.theme_sync_with_os;
         }
@@ -1400,6 +1446,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::McpTerminalSuggestions) => {
             settings.mcp_terminal_suggestions = !settings.mcp_terminal_suggestions;
+        }
+        Some(SettingField::TodoCaseSensitive) => {
+            settings.todo_case_sensitive = !settings.todo_case_sensitive;
         }
         Some(SettingField::SqlScriptStopOnError) => {
             settings.sql_script_stop_on_error = !settings.sql_script_stop_on_error;
@@ -1502,7 +1551,8 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::McpBinary
             | SettingField::McpExecutePermission
             | SettingField::McpRouterOnlyScope
-            | SettingField::SqlKeywordCase,
+            | SettingField::SqlKeywordCase
+            | SettingField::TodoTemplates,
         )
         | None => {
             return false;
@@ -1648,6 +1698,24 @@ pub fn set_text(settings: &mut Settings, id: &str, text: &str) -> bool {
         SettingField::KubectlPath => settings.kubectl_path = text.to_owned(),
         SettingField::KubeconfigPath => settings.kubeconfig_path = text.to_owned(),
         SettingField::McpBinary => settings.mcp_binary = text.to_owned(),
+        SettingField::TodoTemplates => {
+            let mut seen = std::collections::HashSet::new();
+            settings.todo_templates = text
+                .split([',', ';', '\n'])
+                .map(str::trim)
+                .filter(|template| !template.is_empty())
+                .filter(|template| seen.insert(*template))
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+        SettingField::IgnoredFiles => {
+            settings.ignored_files = text
+                .split([';', '\n'])
+                .map(str::trim)
+                .filter(|mask| !mask.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
         _ => return false,
     }
     true
@@ -1681,6 +1749,8 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
         SettingField::KubectlPath => settings.kubectl_path.clone(),
         SettingField::KubeconfigPath => settings.kubeconfig_path.clone(),
         SettingField::McpBinary => settings.mcp_binary.clone(),
+        SettingField::TodoTemplates => settings.todo_templates.join(", "),
+        SettingField::IgnoredFiles => settings.ignored_files.join("; "),
         _ => return None,
     })
 }
@@ -1704,6 +1774,7 @@ pub fn chosen_theme<'a>(settings: &'a Settings, dark: bool, on_screen: &'a str) 
 
 /// The text of the Theme row: the name of the chosen theme, or the look the system picks
 /// while Sync with OS is on, as the row has always written it.
+#[cfg(test)]
 pub fn theme_label(settings: &Settings, system_dark: bool, on_screen: &str) -> String {
     if settings.theme_sync_with_os {
         if system_dark {
@@ -1802,6 +1873,58 @@ pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
             settings.sql_keyword_case = settings.sql_keyword_case.next();
         }
         _ => return false,
+    }
+    true
+}
+
+/// The values of a setting with named choices, in the order the window lists them. The
+/// themes, their two system slots and the editor font are not here: the window knows
+/// the themes and the families it can offer.
+pub fn choices(id: &str) -> Vec<String> {
+    let labels: &[&str] = match find(id).map(|setting| setting.field) {
+        Some(SettingField::TrimTrailingWhitespace) => &["None", "Modified lines", "All"],
+        Some(SettingField::ActionsOnSaveScope) => &["Whole file", "Changed lines"],
+        Some(SettingField::UseTabs) => &["Spaces", "Tabs"],
+        Some(SettingField::CompletionCase) => &["None", "First letter", "All"],
+        Some(SettingField::InlayParameterNames) => &["None", "Literals", "All"],
+        Some(SettingField::GitUpdateMethod) => &["Merge", "Rebase"],
+        Some(SettingField::BuildToolFirstHomeKind) => {
+            &["Automatic", "Bundled", "PATH", "Project wrapper", "Folder"]
+        }
+        Some(SettingField::McpExecutePermission) => &[
+            "Always ask",
+            "Allow for trusted projects",
+            "Run without confirmation",
+        ],
+        Some(SettingField::McpRouterOnlyScope) => &["All agents", "ACP only"],
+        Some(SettingField::SqlKeywordCase) => &["Upper case", "Lower case", "As is"],
+        _ => return Vec::new(),
+    };
+    labels.iter().map(|label| (*label).to_owned()).collect()
+}
+
+/// The place of the value in force among [`choices`], zero for a setting without them.
+pub fn chosen_choice(settings: &Settings, id: &str) -> usize {
+    let Some(label) = choice_label(settings, id) else {
+        return 0;
+    };
+    choices(id)
+        .iter()
+        .position(|value| *value == label)
+        .unwrap_or(0)
+}
+
+/// Picks the value at `index` of [`choices`]; false when the setting has none.
+pub fn set_choice(settings: &mut Settings, id: &str, index: usize) -> bool {
+    let count = choices(id).len();
+    if count == 0 {
+        return false;
+    }
+    let steps = (index + count - chosen_choice(settings, id)) % count;
+    for _ in 0..steps {
+        if !next_choice(settings, id) {
+            return false;
+        }
     }
     true
 }

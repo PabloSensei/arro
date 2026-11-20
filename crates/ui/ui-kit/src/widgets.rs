@@ -44,6 +44,124 @@ pub fn checkbox(on: bool, theme: &Theme) -> Div {
         .children(on.then(|| icon_sized("general/check", 10., theme)))
 }
 
+/// A checkbox with its label: the whole row takes the click, as a setting of IDEA does,
+/// so the caller puts its handler on the row.
+pub fn checkbox_row(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    on: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let (hover, pressed) = (theme.hover, theme.pressed);
+    let label = label.into();
+    let id = id.into();
+    #[cfg(any(test, feature = "test-support"))]
+    let name = id.to_string();
+    #[cfg(any(test, feature = "test-support"))]
+    let box_name = format!("{name}-box");
+    let box_ = checkbox(on, theme);
+    #[cfg(any(test, feature = "test-support"))]
+    let box_ = box_.debug_selector(move || box_name.clone());
+    let row = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(SPACE_S))
+        .min_h(px(ROW_HEIGHT))
+        .px(px(SPACE_S))
+        .rounded(px(ROW_RADIUS))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .child(box_)
+        .child(div().text_color(theme.text).child(label.clone()));
+    #[cfg(any(test, feature = "test-support"))]
+    let row = row.child(crate::bounds_probe(name, Some(label)));
+    row
+}
+
+/// The field of a dropdown: the chosen value and a chevron. The caller keeps the list
+/// open or closed and draws [`select_menu`] under it, so the page owns the keys.
+pub fn select_field(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    open: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let (hover, pressed) = (theme.hover, theme.pressed);
+    let label = label.into();
+    let id = id.into();
+    #[cfg(any(test, feature = "test-support"))]
+    let name = id.to_string();
+    let field = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(SPACE_S))
+        .min_w(px(180.))
+        .h(px(CONTROL_HEIGHT))
+        .px(px(SPACE_M))
+        .rounded(px(CONTROL_RADIUS))
+        .border_1()
+        .border_color(if open {
+            theme.accent
+        } else {
+            theme.control_border
+        })
+        .bg(theme.popup_bg)
+        .cursor_pointer()
+        .occlude()
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .child(div().min_w_0().truncate().child(label.clone()))
+        .child(icon_sized("general/chevronDown", TEXT_SMALL, theme));
+    #[cfg(any(test, feature = "test-support"))]
+    let field = field.child(crate::bounds_probe(name, Some(label)));
+    field
+}
+
+/// The popup of a dropdown, under its field.
+pub fn select_menu(theme: &Theme) -> Div {
+    popup_frame(theme)
+        .flex()
+        .flex_col()
+        .p(px(SPACE_XS))
+        .min_w(px(180.))
+}
+
+/// One value of the list of a dropdown. `chosen` marks the value in force, `marked` the
+/// one the pointer or the keys are on.
+pub fn select_option(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    chosen: bool,
+    marked: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let hover = theme.selection_hover;
+    let label = label.into();
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(SPACE_S))
+        .h(px(ROW_HEIGHT))
+        .px(px(SPACE_S))
+        .rounded(px(ROW_RADIUS))
+        .text_color(theme.text)
+        .cursor_pointer()
+        .when(marked, |this| this.bg(theme.selection))
+        .when(!marked, |this| this.hover(move |style| style.bg(hover)))
+        .child(
+            div()
+                .size(px(TEXT_SMALL))
+                .flex_none()
+                .children(chosen.then(|| icon_sized("general/check", TEXT_SMALL, theme))),
+        )
+        .child(div().min_w_0().truncate().child(label))
+}
+
 /// Toolbar-style square button with hover and pressed states, its name and its key.
 pub fn icon_button(
     id: impl Into<ElementId>,

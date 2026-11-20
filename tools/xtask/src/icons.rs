@@ -268,6 +268,15 @@ const ICONS: &[Icon] = &[
         paint: Paint::OverAccent,
     },
     Icon {
+        name: "general/cherryPick",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "cherry",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
         name: "general/chevronDown",
         size: 16,
         shape: Shape::Lucide {
@@ -331,6 +340,15 @@ const ICONS: &[Icon] = &[
         paint: Paint::Main,
     },
     Icon {
+        name: "general/cut",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "scissors",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
         name: "general/editorAndPreview",
         size: 16,
         shape: Shape::Lucide {
@@ -371,6 +389,15 @@ const ICONS: &[Icon] = &[
         size: 16,
         shape: Shape::Lucide {
             name: "eye-off",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
+        name: "general/history",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "clock",
             tint: false,
         },
         paint: Paint::Main,
@@ -421,6 +448,24 @@ const ICONS: &[Icon] = &[
         paint: Paint::Main,
     },
     Icon {
+        name: "general/newFile",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "file-plus",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
+        name: "general/newFolder",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "folder-plus",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
         name: "general/openInToolWindow",
         size: 16,
         shape: Shape::Lucide {
@@ -452,6 +497,24 @@ const ICONS: &[Icon] = &[
         size: 16,
         shape: Shape::Lucide {
             name: "regex",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
+        name: "general/replace",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "replace",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
+        name: "general/rollback",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "undo-2",
             tint: false,
         },
         paint: Paint::Main,
@@ -553,7 +616,7 @@ const ICONS: &[Icon] = &[
         name: "nodes/library",
         size: 16,
         shape: Shape::Lucide {
-            name: "library",
+            name: "library-big",
             tint: false,
         },
         paint: Paint::Kind(Kind::Library),
@@ -583,6 +646,15 @@ const ICONS: &[Icon] = &[
         paint: Paint::Kind(Kind::Package),
     },
     Icon {
+        name: "nodes/plugin",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "puzzle",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
         name: "nodes/record",
         size: 16,
         shape: Shape::Badge('R'),
@@ -607,6 +679,15 @@ const ICONS: &[Icon] = &[
         paint: Paint::Accent,
     },
     Icon {
+        name: "run/application",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "square-play",
+            tint: false,
+        },
+        paint: Paint::Main,
+    },
+    Icon {
         name: "run/debug",
         size: 16,
         shape: Shape::Lucide {
@@ -614,6 +695,18 @@ const ICONS: &[Icon] = &[
             tint: false,
         },
         paint: Paint::Main,
+    },
+    Icon {
+        name: "run/gradle",
+        size: 16,
+        shape: Shape::Badge('G'),
+        paint: Paint::Kind(Kind::Interface),
+    },
+    Icon {
+        name: "run/maven",
+        size: 16,
+        shape: Shape::Badge('M'),
+        paint: Paint::Kind(Kind::Constant),
     },
     Icon {
         name: "run/restart",
@@ -632,6 +725,15 @@ const ICONS: &[Icon] = &[
             tint: false,
         },
         paint: Paint::Main,
+    },
+    Icon {
+        name: "run/springBoot",
+        size: 16,
+        shape: Shape::Lucide {
+            name: "leaf",
+            tint: false,
+        },
+        paint: Paint::Kind(Kind::Method),
     },
     Icon {
         name: "run/stop",
@@ -1107,7 +1209,7 @@ mod tests {
     fn every_icon_file_exists_and_has_the_expected_shape() {
         let directory = root().join(ICON_DIR);
         let files = expected_files();
-        assert_eq!(files.len(), 163);
+        assert_eq!(files.len(), 187);
         for (name, size) in files {
             let path = directory.join(&name);
             let text = fs::read_to_string(&path)

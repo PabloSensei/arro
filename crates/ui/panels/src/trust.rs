@@ -108,23 +108,20 @@ impl Render for TrustDialog {
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.25;
         let folder = self.project.display().to_string();
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("trust-project")
             .key_context("TrustDialog")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(
-                div()
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Trust this project?"),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .child(div().text_color(theme.text_muted).child(folder))
             .child(div().text_color(theme.text_secondary).child(
                 "An AI agent runs commands and edits files in this folder. \
@@ -144,10 +141,25 @@ impl Render for TrustDialog {
                             .on_click(cx.listener(|this, _, window, cx| this.trust(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("trust-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "trust",
+                title: "Trust this project?".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

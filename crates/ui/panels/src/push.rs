@@ -2,12 +2,16 @@
 //! the files of one of them on the right, the remote and the branch they go to, Push tags
 //! and Force Push with a lease. Nothing is sent until Push is pressed.
 
+use std::collections::HashSet;
+use std::path::Path;
+
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::{Commit, PushRequest};
-use workspace::Workspace;
+use workspace::{FileIcons, Workspace};
 
+use crate::change_tree::{self, FOLDER_ICON, TreeNode};
 use crate::git::{GitState, short_commit};
 
 const WIDTH: f32 = 780.;
@@ -46,6 +50,8 @@ pub(crate) struct PushWindow {
     selected_commit: usize,
     files: Vec<String>,
     files_loading: bool,
+    /// The keys of the folders of the files that are folded.
+    collapsed: HashSet<String>,
     tags: bool,
     force_confirm: bool,
     force_menu: bool,
@@ -81,6 +87,7 @@ impl PushWindow {
             selected_commit: 0,
             files: Vec::new(),
             files_loading: false,
+            collapsed: HashSet::new(),
             tags: false,
             force_confirm: false,
             force_menu: false,
@@ -197,7 +204,18 @@ impl PushWindow {
         cx.notify();
     }
 
-    fn dismiss(&mut self, cx: &mut Context<Self>) {
+    /// Closes the window from a click or a key press. GPUI takes a window out of its slot
+    /// while it dispatches an event of that window, so an update of the window from its own
+    /// listener fails with "window not found": the listener passes its window instead.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+
+    /// Closes the window when no event of it runs, as when the remote has the commits.
+    fn close_later(&mut self, cx: &mut Context<Self>) {
         let workspace = self.workspace.clone();
         self.window
             .update(cx, |_, window, cx| {
@@ -206,10 +224,6 @@ impl PushWindow {
                     .ok();
             })
             .ok();
-    }
-
-    fn close(&mut self, cx: &mut Context<Self>) {
-        self.dismiss(cx);
     }
 
     /// Sends the current branch as the window shows it. The git call runs off the UI
@@ -250,7 +264,7 @@ impl PushWindow {
             git.push_to(
                 request,
                 move |_, cx| {
-                    me.update(cx, |this, cx| this.close(cx)).ok();
+                    me.update(cx, |this, cx| this.close_later(cx)).ok();
                 },
                 cx,
             )
@@ -258,14 +272,14 @@ impl PushWindow {
         cx.notify();
     }
 
-    fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if key == "escape" {
             if self.force_confirm {
                 self.force_confirm = false;
                 cx.notify();
             } else {
-                self.close(cx);
+                self.close(window, cx);
             }
             cx.stop_propagation();
             return;
@@ -435,22 +449,21 @@ impl PushWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows: Vec<AnyElement> = self
+        let icons = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.icons().clone())
+            .unwrap_or_default();
+        let entries: Vec<(&str, usize)> = self
             .files
             .iter()
             .enumerate()
-            .map(|(index, file)| {
-                div()
-                    .debug_selector(move || format!("push-file-{index}"))
-                    .flex()
-                    .items_center()
-                    .flex_none()
-                    .h(px(ROW_HEIGHT))
-                    .px(px(ROW_PADDING_X))
-                    .truncate()
-                    .child(file.clone())
-                    .into_any_element()
-            })
+            .map(|(index, file)| (file.as_str(), index))
+            .collect();
+        let nodes = change_tree::tree_rows(&entries, "push", 0, &self.collapsed);
+        let rows: Vec<AnyElement> = nodes
+            .iter()
+            .enumerate()
+            .map(|(position, node)| self.file_row(position, node, &icons, theme, cx))
             .collect();
         let empty = rows.is_empty();
         div()
@@ -497,6 +510,55 @@ impl PushWindow {
                 .min_h_0(),
             )
             .into_any_element()
+    }
+
+    /// One row of the tree of the files. A folder opens and closes on a click; a file shows
+    /// the icon of its type, as the project tree does.
+    fn file_row(
+        &self,
+        position: usize,
+        node: &TreeNode,
+        icons: &FileIcons,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let icon = match node.file {
+            Some(_) => icons.icon_for(Path::new(&node.path)),
+            None => FOLDER_ICON,
+        };
+        let row = tree_row(
+            TreeRow {
+                id: ("push-tree-row", position).into(),
+                depth: node.depth,
+                label: node.label.clone().into(),
+                hint: None,
+                icon,
+                expandable: node.file.is_none(),
+                open: node.open,
+                selected: false,
+            },
+            theme,
+        );
+        match node.file {
+            Some(index) => row
+                .debug_selector(move || format!("push-file-{index}"))
+                .into_any_element(),
+            None => {
+                let path = node.path.clone();
+                let key = node.key.clone();
+                row.debug_selector(move || format!("push-folder-{path}"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_folder(&key, cx)))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// Opens the folder of the tree that is closed, and closes the one that is open.
+    fn toggle_folder(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key.to_owned());
+        }
+        cx.notify();
     }
 
     fn controls(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -705,7 +767,7 @@ impl PushWindow {
                 move |style| style.bg(hover)
             })
             .child("Cancel")
-            .on_click(cx.listener(|this, _, _, cx| this.close(cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
         let warning = self.force_confirm.then(|| {
             div()
                 .debug_selector(|| "push-force-warning".to_string())
@@ -788,38 +850,24 @@ impl Render for PushWindow {
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.14;
         let error = self.error.clone();
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("push-dialog")
             .debug_selector(|| "push-dialog".to_string())
             .key_context(CONTEXT)
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .h(height)
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let upstream = div()
+            .text_color(theme.text_secondary)
+            .text_size(px(TEXT_SMALL))
+            .child(match &self.upstream {
+                Some(upstream) => format!("Upstream: {upstream}"),
+                None => "No upstream yet".to_string(),
+            });
+        let contents = div()
             .flex()
             .flex_col()
-            .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .h(px(40.))
-                    .px(px(DIALOG_PADDING))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Push")
-                    .child(
-                        div()
-                            .text_color(theme.text_secondary)
-                            .text_size(px(TEXT_SMALL))
-                            .child(match &self.upstream {
-                                Some(upstream) => format!("Upstream: {upstream}"),
-                                None => "No upstream yet".to_string(),
-                            }),
-                    ),
-            )
+            .flex_1()
+            .min_h_0()
             .child(self.controls(&theme, cx))
             .child(
                 div()
@@ -839,11 +887,33 @@ impl Render for PushWindow {
                     .child(error)
             }))
             .child(self.buttons(&theme, cx));
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("push", body))
+        // The cross dismisses through the window of the click: a nested update of the
+        // window that is handling the click would fail, and the dialog would stay open.
+        let workspace = self.workspace.clone();
+        let close = cx.listener(move |_, _: &ClickEvent, window, cx| {
+            workspace
+                .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+                .ok();
+        });
+        dialog_window(
+            DialogSpec {
+                key: "push",
+                title: "Push".into(),
+                extra: Some(upstream.into_any_element()),
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(f32::from(height)),
+                },
+                min: (480., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

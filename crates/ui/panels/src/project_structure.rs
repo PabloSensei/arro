@@ -24,6 +24,9 @@ use crate::navigation;
 
 const WIDTH: f32 = 760.;
 const BODY_HEIGHT: f32 = 380.;
+/// The height on the first opening: the body and the room of the title bar, the buttons and
+/// the paddings around them.
+const DIALOG_HEIGHT: f32 = BODY_HEIGHT + 120.;
 const SECTIONS_WIDTH: f32 = 160.;
 const MODULES_WIDTH: f32 = 210.;
 const LABEL_WIDTH: f32 = 130.;
@@ -1796,31 +1799,27 @@ impl Render for ProjectStructureDialog {
                 .child(notice)
         });
 
-        let panel = surface(&theme)
+        let shell = surface(&theme)
             .id("project-structure")
             .debug_selector(|| "project-structure".to_owned())
             .key_context("ProjectStructure")
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(DIALOG_PADDING))
-            .gap(px(DIALOG_GAP))
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .debug_selector(|| "project-structure-title".to_owned())
-                    .text_size(px(TEXT_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Project Structure"),
-            )
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
             .child(
                 div()
                     .flex()
+                    .flex_1()
+                    .min_h_0()
                     .gap(px(DIALOG_GAP))
-                    .h(px(BODY_HEIGHT))
                     .child(sections)
                     .child(
                         scrollable(
@@ -1853,11 +1852,25 @@ impl Render for ProjectStructureDialog {
                     .child(apply)
                     .child(ok),
             );
-
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("project-structure-enter", panel))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "project-structure",
+                title: "Project Structure".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: Some(DIALOG_HEIGHT),
+                },
+                min: (560., 360.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }

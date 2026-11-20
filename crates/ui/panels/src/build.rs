@@ -70,6 +70,8 @@ enum RowKind {
     Profile,
     Module,
     Group,
+    /// A group whose tasks start programs: the plugin of the build tool that starts them.
+    Plugin,
     Task,
     /// The node of a module that holds its dependencies.
     Dependencies,
@@ -503,7 +505,11 @@ impl BuildPanel {
                 toggle(&mut self.closed_modules, &row.module);
                 cx.notify();
             }
-            RowKind::Profiles | RowKind::Group | RowKind::Dependencies | RowKind::Scope => {
+            RowKind::Profiles
+            | RowKind::Group
+            | RowKind::Plugin
+            | RowKind::Dependencies
+            | RowKind::Scope => {
                 if let Some(key) = &row.key {
                     toggle(&mut self.closed_groups, key);
                 }
@@ -1779,7 +1785,11 @@ fn module_row(module: &BuildModule, has_dependencies: bool, closed: &HashSet<Str
 
 fn group_row(module: &BuildModule, group: &BuildGroup, open: bool) -> Row {
     Row {
-        kind: RowKind::Group,
+        kind: if group.tasks.iter().any(|task| task.program) {
+            RowKind::Plugin
+        } else {
+            RowKind::Group
+        },
         depth: 1,
         label: group.name.clone(),
         expandable: !group.tasks.is_empty(),
@@ -2043,7 +2053,9 @@ impl Render for BuildPanel {
                         RowKind::Profile => "general/check",
                         RowKind::Module => "nodes/module",
                         RowKind::Group => "nodes/folder",
-                        RowKind::Task => "run/run",
+                        RowKind::Plugin => "nodes/plugin",
+                        RowKind::Task if row.program => "run/run",
+                        RowKind::Task => "general/settings",
                         RowKind::Dependencies => "nodes/library",
                         RowKind::Scope => "nodes/folder",
                         RowKind::Dependency => "nodes/library",

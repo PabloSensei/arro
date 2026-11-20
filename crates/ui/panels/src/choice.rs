@@ -133,42 +133,54 @@ impl Render for ChoiceDialog {
             })
             .collect::<Vec<_>>();
 
-        div().absolute().left(left).top(top).child(
-            surface(&theme)
-                .id("choice-dialog")
-                .debug_selector(|| "choice-dialog".to_owned())
-                .key_context("ChoiceDialog")
-                .track_focus(&self.focus)
-                .occlude()
-                .w(width)
-                .p(px(DIALOG_PADDING))
-                .gap(px(DIALOG_GAP))
-                .text_size(px(UI_SIZE))
-                .text_color(theme.text)
-                .on_key_down(
-                    cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        this.key(event, window, cx)
-                    }),
-                )
-                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-                .child(
-                    div()
-                        .text_size(px(TEXT_TITLE))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(self.title.clone()),
-                )
-                .child(
-                    div()
-                        .text_color(theme.text_secondary)
-                        .child(self.text.clone()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap(px(SPACE_M))
-                        .children(buttons),
-                ),
+        let shell = surface(&theme)
+            .id("choice-dialog")
+            .debug_selector(|| "choice-dialog".to_owned())
+            .key_context("ChoiceDialog")
+            .track_focus(&self.focus)
+            .text_size(px(UI_SIZE))
+            .text_color(theme.text)
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, window, cx| this.key(event, window, cx)),
+            );
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
+            .child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .child(self.text.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(SPACE_M))
+                    .children(buttons),
+            );
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "choice",
+                title: self.title.clone(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(width),
+                    height: None,
+                },
+                min: (320., 140.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
         )
     }
 }

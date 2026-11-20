@@ -17,7 +17,7 @@ use crate::window_tests::{press, sample_project};
 use crate::window_tests_run::{LongRun, long_image, open_with, run_panel, setup, wait_for};
 
 /// Hovers the middle of an element and returns the tooltip it shows.
-fn hover(
+pub(crate) fn hover(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     selector: &'static str,
@@ -37,7 +37,7 @@ fn hover(
         .unwrap_or_else(|| panic!("{selector} shows no tooltip"))
 }
 
-fn assert_tooltip(
+pub(crate) fn assert_tooltip(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     selector: &'static str,

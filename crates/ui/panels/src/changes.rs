@@ -306,6 +306,8 @@ struct LiveBuffers<'a, 'c> {
     workspace: &'a mut Workspace,
     window: &'a mut Window,
     cx: &'a mut Context<'c, Workspace>,
+    /// The reason the snapshots name: a refactoring, a reformat or another change.
+    cause: local_history::Cause,
     /// The open files the change applied to, in the order it named them.
     open: Vec<PathBuf>,
     /// The closed files that reached the disk.
@@ -316,7 +318,13 @@ struct LiveBuffers<'a, 'c> {
 
 impl Buffers for LiveBuffers<'_, '_> {
     fn snapshot(&mut self, path: &Path) {
-        crate::history::snapshot_file(path, local_history::Cause::BeforeReplace, self.cx);
+        match open_view(self.workspace, path) {
+            Some(view) => {
+                let bytes = view.read(self.cx).file_bytes();
+                crate::history::snapshot_bytes(path, bytes, self.cause, self.cx);
+            }
+            None => crate::history::snapshot_now(path, self.cause, self.cx),
+        }
     }
 
     fn save(&mut self, path: &Path) -> Result<(), String> {
@@ -335,7 +343,7 @@ impl Buffers for LiveBuffers<'_, '_> {
             return;
         };
         let bytes = view.read(self.cx).file_bytes();
-        crate::history::snapshot_bytes(path, bytes, local_history::Cause::BeforeReplace, self.cx);
+        crate::history::snapshot_bytes(path, bytes, self.cause, self.cx);
         view.update(self.cx, |view, cx| {
             view.apply_document_batches(batches, cx);
         });
@@ -357,7 +365,33 @@ pub(crate) fn apply(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    apply_from(workspace, change, None, None, window, cx);
+    apply_cause(
+        workspace,
+        change,
+        None,
+        None,
+        local_history::Cause::BeforeRefactoring,
+        window,
+        cx,
+    );
+}
+
+/// Reformat Code changes a file the way a refactoring does; its snapshots say Reformat.
+pub(crate) fn apply_reformat(
+    workspace: &mut Workspace,
+    change: WorkspaceChange,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    apply_cause(
+        workspace,
+        change,
+        None,
+        None,
+        local_history::Cause::BeforeReformat,
+        window,
+        cx,
+    );
 }
 
 /// Applies a change that a refactoring started in `origin`, whose name `label` gives to
@@ -368,6 +402,26 @@ pub(crate) fn apply_from(
     change: WorkspaceChange,
     origin: Option<Entity<EditorView>>,
     label: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    apply_cause(
+        workspace,
+        change,
+        origin,
+        label,
+        local_history::Cause::BeforeRefactoring,
+        window,
+        cx,
+    );
+}
+
+fn apply_cause(
+    workspace: &mut Workspace,
+    change: WorkspaceChange,
+    origin: Option<Entity<EditorView>>,
+    label: Option<String>,
+    cause: local_history::Cause,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -386,6 +440,7 @@ pub(crate) fn apply_from(
             workspace,
             window,
             cx,
+            cause,
             open: Vec::new(),
             written: Vec::new(),
             renames: Vec::new(),

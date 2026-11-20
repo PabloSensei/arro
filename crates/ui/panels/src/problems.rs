@@ -11,7 +11,7 @@ use editor_view::{EditorView, Semantic};
 use keymap::editor as actions;
 use lang_api::{DiagnosticEntry, ProjectProblem, Severity};
 use ui_kit::*;
-use workspace::{PROBLEMS_TOOL, Workspace};
+use workspace::{FileIcons, PROBLEMS_TOOL, Workspace};
 
 use crate::items::{Item, ItemsPanel, PanelRow, PanelTab, open_at};
 
@@ -136,7 +136,7 @@ impl ProblemsState {
     }
 
     /// The list of the whole project, with a row per file and its problems under it.
-    pub fn project_view(&self, root: &Path) -> (Vec<Item>, Vec<PanelRow>) {
+    pub fn project_view(&self, root: &Path, icons: &FileIcons) -> (Vec<Item>, Vec<PanelRow>) {
         let mut items = Vec::new();
         let mut rows = Vec::new();
         for (path, problems) in &self.files {
@@ -144,7 +144,7 @@ impl ProblemsState {
             rows.push(PanelRow::Group {
                 label: relative.display().to_string().replace('\\', "/"),
                 depth: 0,
-                icon: "fileTypes/text",
+                icon: icons.icon_for(path),
             });
             for problem in problems {
                 let index = items.len();
@@ -333,6 +333,8 @@ fn problem_ai_menu(item: &Item, workspace: &WeakEntity<Workspace>, cx: &App) -> 
 pub struct ProblemsHub {
     state: ProblemsState,
     root: PathBuf,
+    /// The window, for the icons of the file types.
+    workspace: WeakEntity<Workspace>,
     panel: Entity<ItemsPanel>,
     /// Files that carry problems of the project itself, replaced as a group.
     project_files: Vec<PathBuf>,
@@ -367,6 +369,7 @@ impl ProblemsHub {
         cx.new(|_| Self {
             state: ProblemsState::default(),
             root,
+            workspace,
             panel,
             project_files: Vec::new(),
             scope: Scope::CurrentFile,
@@ -457,9 +460,14 @@ impl ProblemsHub {
         crate::claude_ide::publish_problems(cx, files);
         let (errors, warnings) = self.state.totals();
         let title = format!("Problems ({errors} errors, {warnings} warnings)");
+        let icons = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).icons().clone())
+            .unwrap_or_default();
         let (items, rows, empty) = match self.scope {
             Scope::Project => {
-                let (items, rows) = self.state.project_view(&self.root);
+                let (items, rows) = self.state.project_view(&self.root, &icons);
                 (items, rows, "No problems found.")
             }
             // With no file open there is nothing to scope the tab to, so it lists the
@@ -477,7 +485,7 @@ impl ProblemsHub {
                     (items, rows, "No problems in the current file.")
                 }
                 _ => {
-                    let (items, rows) = self.state.project_view(&self.root);
+                    let (items, rows) = self.state.project_view(&self.root, &icons);
                     (items, rows, "No problems found.")
                 }
             },

@@ -1301,24 +1301,18 @@ impl Render for ScopePopup {
                     .on_click(cx.listener(move |this, _, window, cx| this.pick(index, window, cx)))
             })
             .collect();
-        let body = surface(&theme)
+        let title = SharedString::from(self.title.clone());
+        let shell = surface(&theme)
             .id("inspect-scope-popup")
             .debug_selector(|| "inspect-scope-popup".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(WIDTH))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(POPUP_PADDING))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .px(px(8.))
-                    .h(px(28.))
-                    .flex()
-                    .items_center()
-                    .text_color(theme.text_secondary)
-                    .child(SharedString::from(self.title.clone())),
-            )
             .child(
                 div()
                     .flex()
@@ -1368,11 +1362,26 @@ impl Render for ScopePopup {
                             })),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("inspect-scope-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "inspect-scope",
+                title,
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(px(WIDTH)),
+                    height: None,
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
@@ -1487,15 +1496,17 @@ impl Render for RunInspectionPopup {
         } else {
             "Inspection name"
         };
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("run-inspection")
             .debug_selector(|| "run-inspection".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(WIDTH))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .p(px(POPUP_PADDING))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(
                 div()
                     .mx(px(SPACE_S))
@@ -1532,11 +1543,26 @@ impl Render for RunInspectionPopup {
                     .overflow_hidden()
                     .children(rows),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("run-inspection-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "run-inspection",
+                title: "Run Inspection".into(),
+                extra: None,
+                place: DialogPlace {
+                    left: f32::from(left),
+                    top: f32::from(top),
+                    width: f32::from(px(WIDTH)),
+                    height: None,
+                },
+                min: (360., 200.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 
