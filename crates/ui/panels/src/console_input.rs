@@ -20,7 +20,7 @@ pub(crate) enum ConsoleKey {
 
 /// The line the user types into a console, with the history of the lines sent to it.
 pub(crate) struct ConsoleInput {
-    field: TextField,
+    pub(crate) field: TextField,
     history: Vec<String>,
     /// Where the walk through the history stands; `None` while the line is the live one.
     history_at: Option<usize>,
@@ -143,7 +143,7 @@ impl ConsoleInput {
     }
 
     /// The line with the caret after it, at the end of the console output.
-    pub fn element(&self, selector: &'static str, theme: &Theme) -> AnyElement {
+    pub fn element(&self, mouse: FieldMouse, selector: &'static str, theme: &Theme) -> AnyElement {
         div()
             .debug_selector(move || selector.to_owned())
             .flex()
@@ -153,6 +153,7 @@ impl ConsoleInput {
             .whitespace_nowrap()
             .text_color(theme.console_input)
             .children(text_field_children_named(
+                mouse,
                 "console-input-field",
                 &self.field,
                 theme.console_input,

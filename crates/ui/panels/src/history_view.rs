@@ -688,6 +688,11 @@ impl HistoryView {
                     })
                     .text_color(color)
                     .children(text_field_children_named(
+                        FieldMouse::with_edit(
+                            cx,
+                            |this| Some(&mut this.filter),
+                            |this, cx| this.refresh_visible(cx),
+                        ),
                         "history-filter-field",
                         &self.filter,
                         theme.text,

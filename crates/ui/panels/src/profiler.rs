@@ -1153,6 +1153,7 @@ impl ProfilerPanel {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .children(text_field_children(
+                        FieldMouse::new(cx, |this| Some(&mut this.search)),
                         &self.search,
                         theme.text,
                         theme.text,

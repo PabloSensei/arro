@@ -707,7 +707,25 @@ impl EditorView {
                     .whitespace_nowrap()
                     .when(placeholder, |this| this.child(hint))
                     .when(!placeholder, |this| {
-                        this.children(text_field_children(
+                        this.children(text_field_children_named(
+                            FieldMouse::with_edit(
+                                cx,
+                                move |editor: &mut Self| {
+                                    let bar = editor.bar.as_mut()?;
+                                    Some(if which == Field::Query {
+                                        &mut bar.query
+                                    } else {
+                                        &mut bar.replacement
+                                    })
+                                },
+                                move |editor: &mut Self, cx| {
+                                    if let Some(bar) = &mut editor.bar {
+                                        bar.error = None;
+                                    }
+                                    editor.refresh_matches(which == Field::Query, cx);
+                                },
+                            ),
+                            id,
                             value,
                             style.code,
                             style.code,

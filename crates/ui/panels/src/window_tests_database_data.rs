@@ -23,7 +23,7 @@ use crate::window_tests::{draw, open_window, press, sample_project, type_text, w
 
 const SOURCE: &str = "owners";
 
-fn source() -> Source {
+pub(crate) fn source() -> Source {
     Source {
         id: SourceId::new(SOURCE),
         name: "PetClinic".into(),
@@ -61,7 +61,7 @@ fn columns() -> Vec<Column> {
     ]
 }
 
-fn table() -> Table {
+pub(crate) fn table() -> Table {
     Table {
         schema: "PUBLIC".into(),
         name: "OWNERS".into(),
@@ -80,7 +80,7 @@ fn view() -> Table {
     }
 }
 
-fn page(rows: Vec<Vec<Value>>) -> ScriptedReply {
+pub(crate) fn page(rows: Vec<Vec<Value>>) -> ScriptedReply {
     ScriptedReply {
         result: ResultSet {
             columns: columns(),
@@ -92,7 +92,7 @@ fn page(rows: Vec<Vec<Value>>) -> ScriptedReply {
     }
 }
 
-fn owners() -> Vec<Vec<Value>> {
+pub(crate) fn owners() -> Vec<Vec<Value>> {
     vec![
         vec![
             Value::Integer(1),
@@ -107,7 +107,7 @@ fn owners() -> Vec<Vec<Value>> {
     ]
 }
 
-fn count(rows: i64) -> ScriptedReply {
+pub(crate) fn count(rows: i64) -> ScriptedReply {
     ScriptedReply {
         result: ResultSet {
             columns: vec![Column {
@@ -141,7 +141,7 @@ fn panel(cx: &TestAppContext) -> gpui::Entity<DatabasePanel> {
 
 /// Opens the window, shows Database, gives the panel a scripted connection and opens the
 /// rows of `table` through the menu action of the tree.
-fn data_tab(
+pub(crate) fn data_tab(
     cx: &mut TestAppContext,
     name: &str,
     table: Table,
@@ -192,7 +192,7 @@ fn data_view(
     })
 }
 
-fn wait_for_rows(
+pub(crate) fn wait_for_rows(
     cx: &mut TestAppContext,
     panel: &gpui::Entity<DatabasePanel>,
     table: &Table,

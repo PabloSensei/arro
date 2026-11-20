@@ -1777,6 +1777,9 @@ impl TerminalPanel {
                                     .items_center()
                                     .min_w(px(90.))
                                     .children(text_field_children_named(
+                                        FieldMouse::new(cx, |this| {
+                                            this.renaming.as_mut().map(|(_, field)| field)
+                                        }),
                                         "terminal-rename-field",
                                         self.renaming.as_ref().map(|(_, field)| field).unwrap(),
                                         theme.text,
@@ -1941,6 +1944,10 @@ impl TerminalPanel {
                 .text_color(theme.text)
                 .overflow_hidden()
                 .children(text_field_children_named(
+                    FieldMouse::new(cx, |this| {
+                        let tab = this.tabs.get_mut(this.active)?;
+                        Some(&mut tab.pane_mut().search.field)
+                    }),
                     "terminal-search-field",
                     &search.field,
                     theme.text,

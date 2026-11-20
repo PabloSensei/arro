@@ -458,6 +458,7 @@ impl Render for MoveMembersDialog {
             })
             .text_color(theme.text)
             .children(text_field_children_named(
+                FieldMouse::new(cx, |this| Some(&mut this.target)),
                 "move-members-text",
                 &self.target,
                 theme.text,

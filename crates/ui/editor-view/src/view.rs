@@ -5820,6 +5820,9 @@ impl EditorView {
                         this.text_color(theme.text_secondary).child("Filter")
                     })
                     .children(text_field_children(
+                        FieldMouse::new(cx, |editor: &mut Self| {
+                            editor.crumb_menu.as_mut().map(|menu| &mut menu.filter)
+                        }),
                         &menu.filter,
                         theme.text,
                         theme.text,
@@ -6022,7 +6025,7 @@ impl EditorView {
             );
         }
         if let Some(popup) = &self.region_popup {
-            popups.extend(self.render_region_popup(popup, &theme));
+            popups.extend(self.render_region_popup(popup, &theme, cx));
         }
         if let Some((text, position)) = &self.stripe_hint {
             let body = surface(&theme)

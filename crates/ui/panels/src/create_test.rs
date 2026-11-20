@@ -854,6 +854,16 @@ impl CreateTestDialog {
         ))
     }
 
+    /// The stored text of a row of the form, for the mouse.
+    fn row_field_mut(&mut self, row: Row) -> Option<&mut TextField> {
+        match row {
+            Row::ClassName => Some(&mut self.class_name),
+            Row::Superclass => Some(&mut self.superclass),
+            Row::Package => Some(&mut self.package),
+            _ => None,
+        }
+    }
+
     fn text_row(&self, row: Row, label: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let field = match row {
             Row::ClassName => &self.class_name,
@@ -882,6 +892,7 @@ impl CreateTestDialog {
             })
             .text_color(theme.text)
             .children(text_field_children_named(
+                FieldMouse::new(cx, move |this| this.row_field_mut(row)),
                 "create-test-text",
                 field,
                 theme.text,

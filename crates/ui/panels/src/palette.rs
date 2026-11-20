@@ -1615,6 +1615,7 @@ impl Render for Palette {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .children(text_field_children(
+                                    FieldMouse::new(cx, |this| Some(&mut this.query)),
                                     &self.query,
                                     theme.text,
                                     theme.text,

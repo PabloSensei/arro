@@ -174,6 +174,12 @@ impl DatabaseDataView {
         self.load(cx);
     }
 
+    /// The text of the filter field, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn filter_for_test(&self) -> String {
+        self.filter.text.clone()
+    }
+
     /// The page the tab shows, for the window tests.
     #[cfg(test)]
     pub(crate) fn page_for_test(&self) -> usize {
@@ -600,6 +606,14 @@ impl DatabaseDataView {
     }
 
     fn begin_edit(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        // A double click inside the cell being edited selects a word of it: the editor stays.
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|editing| editing.row == row && editing.column == column)
+        {
+            return;
+        }
         if self.busy(cx) {
             return;
         }
@@ -953,8 +967,10 @@ impl DatabaseDataView {
                 } else {
                     theme.control_border
                 })
+                .debug_selector(|| "database-data-filter".to_owned())
                 .cursor_text()
                 .children(text_field_children_named(
+                    FieldMouse::new(cx, |this| Some(&mut this.filter)),
                     "database-data-filter-field",
                     &self.filter,
                     theme.text,
@@ -1339,6 +1355,9 @@ impl DatabaseDataView {
                             .items_center()
                             .size_full()
                             .children(text_field_children_named(
+                                FieldMouse::new(cx, |this| {
+                                    this.editing.as_mut().map(|editing| &mut editing.field)
+                                }),
                                 "database-data-cell-field",
                                 &field,
                                 theme.text,

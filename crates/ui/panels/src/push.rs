@@ -619,6 +619,7 @@ impl PushWindow {
                 cx.notify();
             }))
             .children(text_field_children(
+                FieldMouse::new(cx, |this| Some(&mut this.destination)),
                 &self.destination,
                 theme.text,
                 theme.text,

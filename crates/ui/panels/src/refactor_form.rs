@@ -455,6 +455,14 @@ impl Render for RefactorFormDialog {
                 })
                 .text_color(theme.text)
                 .children(text_field_children_named(
+                    FieldMouse::with_edit(
+                        cx,
+                        move |this: &mut Self| this.fields.get_mut(index).map(|(_, text)| text),
+                        |this: &mut Self, _| {
+                            this.status = None;
+                            this.error = None;
+                        },
+                    ),
                     "refactor-form-text",
                     text,
                     theme.text,

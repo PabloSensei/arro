@@ -29,7 +29,7 @@ fn status_text() -> String {
         .map_or_else(String::new, |label| label.to_string())
 }
 
-fn open_finder(
+pub(crate) fn open_finder(
     cx: &mut TestAppContext,
     name: &str,
     files: &[(&str, &str)],

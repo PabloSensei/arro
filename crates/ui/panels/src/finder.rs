@@ -824,7 +824,14 @@ impl Finder {
         &self.files
     }
 
-    fn input(&self, field: Field, value: &TextField, label: &str, theme: &Theme) -> Div {
+    fn input(
+        &self,
+        field: Field,
+        value: &TextField,
+        label: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let active = field == self.field;
         let selector = match field {
             Field::Find => "finder-input-find",
@@ -857,7 +864,22 @@ impl Finder {
                         .items_center()
                         .overflow_hidden()
                         .whitespace_nowrap()
-                        .children(text_field_children(
+                        .children(text_field_children_named(
+                            FieldMouse::with_edit(
+                                cx,
+                                move |this: &mut Self| {
+                                    Some(match field {
+                                        Field::Find => &mut this.find,
+                                        Field::Replace => &mut this.replacement,
+                                    })
+                                },
+                                move |this: &mut Self, cx| {
+                                    if matches!(field, Field::Find) {
+                                        this.refresh(cx);
+                                    }
+                                },
+                            ),
+                            selector,
                             value,
                             theme.text,
                             theme.text,
@@ -1138,6 +1160,11 @@ impl Render for Finder {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .children(text_field_children(
+                        FieldMouse::with_edit(
+                            cx,
+                            |this| Some(&mut this.mask),
+                            |this, cx| this.refresh(cx),
+                        ),
                         &self.mask,
                         theme.text,
                         theme.text,
@@ -1227,7 +1254,7 @@ impl Render for Finder {
                     .flex_none()
                     .gap(px(SPACE_S))
                     .mb(px(POPUP_PADDING))
-                    .child(self.input(Field::Find, &self.find, find_label, &theme))
+                    .child(self.input(Field::Find, &self.find, find_label, &theme, cx))
                     .child(self.toggle(
                         ("case", "general/caseSensitive", "Match Case", "Alt+C"),
                         self.match_case,
@@ -1265,6 +1292,7 @@ impl Render for Finder {
                             &self.replacement,
                             "Replace with",
                             &theme,
+                            cx,
                         ))
                         .child(
                             div()

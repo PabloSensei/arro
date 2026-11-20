@@ -34,14 +34,14 @@ const SERVER: &str = "the stand-in helper stops here";
 
 /// The language side of the window in the tests: the address templates of two products, a
 /// PostgreSQL driver whose jar the project has, and a helper that stops before it starts.
-struct StandIn {
+pub(crate) struct StandIn {
     /// Keeps the folder of the jar until the support goes.
     _folder: test_support::TempDir,
     jar: PathBuf,
 }
 
 impl StandIn {
-    fn support(name: &str) -> Arc<dyn Support> {
+    pub(crate) fn support(name: &str) -> Arc<dyn Support> {
         let folder = test_support::TempDir::new(name);
         let jar = folder.path().join("postgresql-42.7.4.jar");
         fs::write(&jar, b"the stand-in jar").expect("the stand-in jar is written");
@@ -103,7 +103,7 @@ fn source() -> Source {
 }
 
 /// Opens the window, shows the Database tool, and gives it the language side and the sources.
-fn open(
+pub(crate) fn open(
     cx: &mut TestAppContext,
     name: &str,
     support: Arc<dyn Support>,
@@ -137,7 +137,7 @@ fn open(
 }
 
 /// Whether the element with a debug selector is on screen.
-fn on_screen(
+pub(crate) fn on_screen(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     selector: &'static str,
@@ -159,7 +159,7 @@ pub(crate) fn data_sources_of(
 }
 
 /// The text of a field of the selected connection in the window.
-fn field_text(
+pub(crate) fn field_text(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     field: Field,
@@ -186,7 +186,7 @@ fn choose_kind(cx: &mut TestAppContext, window: WindowHandle<Workspace>, row: &'
 }
 
 /// Types into a field of the form: the field takes the focus on click, and the old text goes.
-fn retype(
+pub(crate) fn retype(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     selector: &'static str,

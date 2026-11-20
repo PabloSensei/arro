@@ -1517,6 +1517,7 @@ impl Render for RunInspectionPopup {
                         theme.text
                     })
                     .children(text_field_children_named(
+                        FieldMouse::new(cx, |this| Some(&mut this.field)),
                         "run-inspection-field",
                         &self.field,
                         theme.text,

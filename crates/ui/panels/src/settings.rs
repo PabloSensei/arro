@@ -238,7 +238,7 @@ pub struct SettingsView {
     todo_new: TextField,
     todo_new_editing: bool,
     /// The search over the pages, drawn above the tree.
-    search: TextField,
+    pub(crate) search: TextField,
     /// Whether the caret of the search field is shown. The window opens with it in the
     /// field, and a click on a page or a setting takes it out.
     search_editing: bool,
@@ -1006,6 +1006,7 @@ impl SettingsView {
             })
             .text_color(color)
             .children(text_field_children_named(
+                FieldMouse::new(cx, |this| Some(&mut this.search)),
                 "settings-search-field",
                 &self.search,
                 theme.text,
@@ -1119,6 +1120,20 @@ impl SettingsView {
             self.draft.ignored_files.remove(index);
         }
         cx.notify();
+    }
+
+    /// Starts editing the value `id` with `text`. A value that is edited already keeps its
+    /// text. Returns whether the editing started now.
+    fn begin_value_edit(&mut self, id: &'static str, text: &str) -> bool {
+        if self.editing == Some(id) {
+            return false;
+        }
+        self.editing = Some(id);
+        self.search_editing = false;
+        self.todo_new_editing = false;
+        self.choice_open = None;
+        self.text_field = TextField::from_text(text);
+        true
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1269,6 +1284,7 @@ impl SettingsView {
                 .gap(px(SPACE_S))
                 .child(
                     field(
+                        FieldMouse::new(cx, |this| Some(&mut this.todo_new)),
                         "settings-todo-new-pattern",
                         &self.todo_new,
                         "New pattern",
@@ -1343,6 +1359,7 @@ impl SettingsView {
         content.push(
             div().child(
                 field(
+                    FieldMouse::new(cx, |this| Some(&mut this.inspection_search)),
                     "settings-inspection-search",
                     &self.inspection_search,
                     "Search inspections",
@@ -1528,6 +1545,7 @@ impl SettingsView {
                 .child(
                     div().flex_1().child(
                         field(
+                            FieldMouse::new(cx, |this| Some(&mut this.spelling_word)),
                             "settings-spelling-word",
                             &self.spelling_word,
                             "Add a word",
@@ -1695,6 +1713,7 @@ fn pill(id: impl Into<ElementId>, text: &str, on: bool, theme: &Theme) -> Statef
 }
 
 fn field(
+    mouse: FieldMouse,
     id: &'static str,
     value: &TextField,
     hint: &'static str,
@@ -1719,6 +1738,7 @@ fn field(
         .border_color(if active { theme.accent } else { theme.border })
         .text_color(color)
         .children(text_field_children_named(
+            mouse,
             "settings-field",
             value,
             theme.text,
@@ -2612,13 +2632,21 @@ impl SettingsView {
             typed = TextField::from_text(current);
             &typed
         };
-        let input = field(id, value, "Next to Arro", active, theme)
+        let press_start = start.clone();
+        let mouse = FieldMouse::new(cx, move |this| {
+            if this.editing == Some(id) {
+                Some(&mut this.text_field)
+            } else {
+                None
+            }
+        })
+        .starting(cx, move |this, _| this.begin_value_edit(id, &press_start));
+        let input = field(mouse, id, value, "Next to Arro", active, theme)
             .debug_selector(|| "settings-mcp-binary".to_owned())
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.editing = Some(id);
-                this.search_editing = false;
-                this.text_field = TextField::from_text(start.clone());
-                cx.notify();
+                if this.begin_value_edit(id, &start) {
+                    cx.notify();
+                }
             }));
         row("Path to arro-mcp", input, theme)
     }
@@ -3259,6 +3287,7 @@ impl Render for SettingsView {
                                 self.runtime_select(entry, &theme, cx).into_any_element()
                             } else if entry.field == SettingField::BuildToolFirstRepository {
                                 field(
+                                    FieldMouse::off(),
                                     entry.id,
                                     &TextField::from_text(self.repository.clone()),
                                     "Read from the settings file",
@@ -3290,17 +3319,25 @@ impl Render for SettingsView {
                                 } else {
                                     None
                                 };
-                                let input = field(id, value, hint, active, &theme)
+                                let press_start = start.clone();
+                                let mouse = FieldMouse::new(cx, move |this| {
+                                    if this.editing == Some(id) {
+                                        Some(&mut this.text_field)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .starting(cx, move |this, _| {
+                                    this.begin_value_edit(id, &press_start)
+                                });
+                                let input = field(mouse, id, value, hint, active, &theme)
                                     .debug_selector(move || {
                                         format!("settings-{}", id.replace('_', "-"))
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.editing = Some(id);
-                                        this.search_editing = false;
-                                        this.todo_new_editing = false;
-                                        this.choice_open = None;
-                                        this.text_field = TextField::from_text(start.clone());
-                                        cx.notify();
+                                        if this.begin_value_edit(id, &start) {
+                                            cx.notify();
+                                        }
                                     }));
                                 match test {
                                     Some(test) => div()

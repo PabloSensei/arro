@@ -1141,6 +1141,7 @@ impl Render for RunConfigDialog {
                 .p(px(SPACE_XS))
                 .gap(px(2.))
                 .child(field_box(
+                    FieldMouse::new(cx, |this| Some(&mut this.template_search)),
                     "run-config-template-search",
                     "run-config-template-search".to_owned(),
                     &self.template_search,
@@ -1154,6 +1155,7 @@ impl Render for RunConfigDialog {
 
         let name_active = self.active == 0;
         let name = field_box(
+            FieldMouse::new(cx, |this| Some(&mut this.name)),
             "run-config-name",
             "run-config-name".to_owned(),
             &self.name,
@@ -1189,6 +1191,9 @@ impl Render for RunConfigDialog {
                 let edit = match &row.step {
                     BeforeLaunchStep::Task { .. } => Some(
                         field_box(
+                            FieldMouse::new(cx, move |this| {
+                                this.steps.get_mut(index).map(|row| &mut row.target)
+                            }),
                             ("run-config-step-target", index),
                             format!("run-config-step-target-{index}"),
                             &row.target,
@@ -1418,6 +1423,7 @@ impl Render for RunConfigDialog {
 
         let environment_active = self.active == self.rows.len() + 1;
         let environment = field_box(
+            FieldMouse::new(cx, |this| Some(&mut this.environment_file)),
             "run-config-environment",
             "run-config-environment".to_owned(),
             &self.environment_file,
@@ -1546,6 +1552,9 @@ impl Render for RunConfigDialog {
                         let key = row.field.key;
                         let text = row.text.text.clone();
                         let field = field_box(
+                            FieldMouse::new(cx, move |this| {
+                                this.rows.get_mut(index).map(|row| &mut row.text)
+                            }),
                             ("run-config-read-only", index),
                             format!("run-config-field-{key}"),
                             &row.text,
@@ -1580,6 +1589,9 @@ impl Render for RunConfigDialog {
                             _ => Vec::new(),
                         };
                         let field = field_box(
+                            FieldMouse::new(cx, move |this| {
+                                this.rows.get_mut(index).map(|row| &mut row.text)
+                            }),
                             ("run-config-field", index),
                             format!("run-config-field-{key}"),
                             &row.text,
@@ -1952,6 +1964,7 @@ fn section_header(label: &str, theme: &Theme) -> Div {
 
 /// A text input of the dialog.
 fn field_box(
+    mouse: FieldMouse,
     id: impl Into<ElementId>,
     selector: String,
     field: &TextField,
@@ -1983,6 +1996,7 @@ fn field_box(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .children(text_field_children(
+                    mouse,
                     field,
                     theme.text,
                     theme.text,

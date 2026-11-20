@@ -4640,7 +4640,7 @@ impl DatabasePanel {
                     ask.focused = (ask.focused + 1) % ask.fields.len();
                     changed = true;
                 } else if let Some(field) = ask.fields.get_mut(ask.focused) {
-                    changed = field.value.key(event, false);
+                    changed = field.value.key_with_clipboard(event, false, cx);
                 }
             }
             if changed {
@@ -4660,7 +4660,7 @@ impl DatabasePanel {
             // The name of the table is the only field of the form; the buttons take the
             // pointer.
             if !dialog.known_table && dialog.format == ExportFormat::SqlInsert {
-                if dialog.table.key(event, false) {
+                if dialog.table.key_with_clipboard(event, false, cx) {
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -4668,7 +4668,7 @@ impl DatabasePanel {
             }
         }
         if self.password_field {
-            if self.password.key(event, false) {
+            if self.password.key_secret(event, cx) {
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -5808,8 +5808,6 @@ impl DatabasePanel {
         let focused = ask.focused;
         let mut fields = Vec::new();
         for (index, field) in ask.fields.iter().enumerate() {
-            let mut shown = TextField::from_text(field.value.text.clone());
-            shown.set_caret(shown.text.len());
             let active = index == focused;
             fields.push(
                 div()
@@ -5845,7 +5843,13 @@ impl DatabasePanel {
                             .overflow_hidden()
                             .cursor_text()
                             .children(text_field_children(
-                                &shown,
+                                FieldMouse::new(cx, move |this| {
+                                    this.params_ask
+                                        .as_mut()
+                                        .and_then(|ask| ask.fields.get_mut(index))
+                                        .map(|field| &mut field.value)
+                                }),
+                                &field.value,
                                 theme.text,
                                 theme.text,
                                 theme.selection,
@@ -5953,8 +5957,6 @@ impl DatabasePanel {
         }
         body = body.child(formats);
         if format == ExportFormat::SqlInsert && !known_table {
-            let mut shown = TextField::from_text(table);
-            shown.set_caret(shown.text.len());
             body = body.child(
                 div()
                     .flex()
@@ -5982,7 +5984,10 @@ impl DatabasePanel {
                             .overflow_hidden()
                             .cursor_text()
                             .children(text_field_children(
-                                &shown,
+                                FieldMouse::new(cx, |this| {
+                                    this.export_dialog.as_mut().map(|dialog| &mut dialog.table)
+                                }),
+                                &dialog.table,
                                 theme.text,
                                 theme.text,
                                 theme.selection,
@@ -6186,6 +6191,9 @@ impl DatabasePanel {
             );
         } else if let Some(source) = &source {
             let id = source.id.clone();
+            // The password is drawn as dots, as the password of Data Sources is. The field takes
+            // no mouse, so the typed text is never drawn.
+            let shown = TextField::from_text("•".repeat(self.password.text.chars().count()));
             bar = bar.child(
                 div()
                     .id("database-password")
@@ -6204,7 +6212,8 @@ impl DatabasePanel {
                     })
                     .cursor_text()
                     .children(text_field_children(
-                        &self.password,
+                        FieldMouse::off(),
+                        &shown,
                         theme.text,
                         theme.text,
                         theme.selection,
@@ -6212,6 +6221,7 @@ impl DatabasePanel {
                         TEXT_SMALL,
                         self.password_field,
                     ))
+                    .children(password_probe(&shown))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
@@ -6832,6 +6842,20 @@ fn slug(name: &str) -> String {
     } else {
         id
     }
+}
+
+/// The probe of the drawn password: a test reads that only dots are drawn.
+#[cfg(test)]
+fn password_probe(shown: &TextField) -> Option<AnyElement> {
+    Some(bounds_probe(
+        "database-password-text",
+        Some(shown.text.clone().into()),
+    ))
+}
+
+#[cfg(not(test))]
+fn password_probe(_shown: &TextField) -> Option<AnyElement> {
+    None
 }
 
 #[cfg(test)]

@@ -506,6 +506,11 @@ impl Render for StackTracePanel {
                     cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
                 )
                 .children(text_field_children(
+                    FieldMouse::with_edit(
+                        cx,
+                        |this| Some(&mut this.filter),
+                        |this, cx| this.refresh(cx),
+                    ),
                     &self.filter,
                     theme.text,
                     theme.text,

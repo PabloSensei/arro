@@ -256,6 +256,7 @@ impl Render for ConflictView {
                         .flex_col()
                         .text_color(message_color)
                         .children(text_field_lines_named(
+                            FieldMouse::new(cx, |this| Some(&mut this.message)),
                             "conflict-message-field",
                             &self.message,
                             theme.text,

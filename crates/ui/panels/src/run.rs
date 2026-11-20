@@ -5577,6 +5577,7 @@ impl RunPanel {
             .text_color(theme.text)
             .overflow_hidden()
             .children(crate::console_search::field_parts(
+                FieldMouse::new(cx, |this| Some(&mut this.console_search.field)),
                 "run-search-field",
                 &search.field,
                 theme,
@@ -5660,6 +5661,7 @@ impl RunPanel {
             .track_focus(&self.filter_focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.filter_key(event, window, cx)))
             .children(crate::console_search::field_parts(
+                FieldMouse::new(cx, |this| Some(&mut this.console_search.filter)),
                 "run-filter-field",
                 &self.console_search.filter,
                 theme,
@@ -5690,7 +5692,12 @@ impl RunPanel {
         range
             .map(|row| {
                 if typed == Some(row) {
-                    return self.console_input.element("run-console-input", theme);
+                    return self.console_input.element(
+                        FieldMouse::new(cx, |this| Some(&mut this.console_input.field))
+                            .without_menu(),
+                        "run-console-input",
+                        theme,
+                    );
                 }
                 if row >= kept {
                     // The line the program has not ended yet.

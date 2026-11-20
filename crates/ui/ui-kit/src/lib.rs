@@ -22,6 +22,7 @@ mod scrollbars;
 #[cfg(any(test, feature = "test-support"))]
 mod test_bounds;
 mod text_field;
+mod text_field_mouse;
 mod widgets;
 
 pub use dialog::{DialogSpec, dialog_window};
@@ -46,9 +47,10 @@ pub use scrollbars::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_bounds::*;
 pub use text_field::{
-    TextField, text_field_children, text_field_children_named, text_field_lines,
+    FieldMenu, TextField, text_field_children, text_field_children_named, text_field_lines,
     text_field_lines_named,
 };
+pub use text_field_mouse::FieldMouse;
 pub use widgets::*;
 
 #[cfg(any(test, feature = "test-support"))]

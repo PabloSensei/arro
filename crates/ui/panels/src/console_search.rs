@@ -226,12 +226,14 @@ impl ConsoleSearch {
 /// The drawn parts of the query field of a console or of its filter: `name` marks the
 /// caret and the selection for the tests of the window.
 pub(crate) fn field_parts(
+    mouse: ui_kit::FieldMouse,
     name: &'static str,
     field: &TextField,
     theme: &Theme,
     show_caret: bool,
 ) -> Vec<AnyElement> {
     ui_kit::text_field_children_named(
+        mouse,
         name,
         field,
         theme.text,

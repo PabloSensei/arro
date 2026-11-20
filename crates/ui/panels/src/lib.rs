@@ -2131,3 +2131,6 @@ mod window_tests_run_configs_tree;
 mod tool_menu;
 #[cfg(test)]
 mod window_tests_tool_headers;
+
+#[cfg(test)]
+mod window_tests_field_mouse;

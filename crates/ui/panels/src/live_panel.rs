@@ -616,6 +616,11 @@ impl Render for LivePanel {
                         .whitespace_nowrap()
                         .on_click(cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
                         .children(text_field_children_named(
+                            FieldMouse::with_edit(
+                                cx,
+                                move |this: &mut Self| this.filters.get_mut(section.index()),
+                                move |this: &mut Self, _| this.selected[section.index()] = None,
+                            ),
                             "actuator-filter",
                             query,
                             theme.text,
