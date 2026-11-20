@@ -793,6 +793,11 @@ impl Render for TypeHierarchyPanel {
         let theme = *cx.global::<Theme>();
         self.refresh_scope_roots(cx);
         let workspace = self.workspace.clone();
+        let options = crate::tool_menu::options_menu(
+            workspace.clone(),
+            workspace::TYPE_HIERARCHY_TOOL,
+            |_| Vec::new(),
+        );
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -934,7 +939,14 @@ impl Render for TypeHierarchyPanel {
             .group(GROUP)
             .h_full()
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(panel_header(TITLE, GROUP, hide, &theme))
+            .child(panel_header(
+                TITLE,
+                GROUP,
+                "type-hierarchy",
+                options,
+                hide,
+                &theme,
+            ))
             .child(switch)
             .child(
                 scrollable(

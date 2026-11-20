@@ -152,6 +152,12 @@ const MAX_OLD_RUNS: usize = 4;
 const MAX_TEMPORARY: usize = 5;
 /// Events handled in one poll, so that a flood of output does not freeze the window.
 const EVENTS_PER_POLL: usize = 2_000;
+/// How long a test holds the first look at a run, for a run that lasts that long.
+#[cfg(test)]
+const HOLD_LIMIT: Duration = Duration::from_secs(60);
+/// The text a held console waits for. No program prints it, so the wait ends with the run.
+#[cfg(test)]
+const HOLD_MARKER: &str = "\u{0}the hold ends with the run";
 const GROUP: &str = "bottom-panel";
 const LINE_PAD: f32 = SPACE_L;
 
@@ -298,6 +304,9 @@ pub struct RunPanel {
     /// process instead of a clock.
     #[cfg(test)]
     finished: u64,
+    /// A test holds the first look of the poll at a run until the run is over; see `poll`.
+    #[cfg(test)]
+    observation_held: bool,
     /// Bumped on every build file that changed: only the import after the last of a
     /// batch runs.
     model_reload: u64,
@@ -384,8 +393,11 @@ struct ToolJob {
     output: String,
     kind: ToolJobKind,
     started: Instant,
-    /// Whether the console of the job ever appeared; a plan that failed leaves none.
-    saw_console: bool,
+    /// Whether the process of the job started. A plan that failed, and a program that could
+    /// not start, leave none: the answer then says that the run did not start.
+    process_started: bool,
+    /// Why the process could not start, as the console reported it.
+    start_error: Option<String>,
     /// The tool that waits for the end of this run.
     reply: std::sync::mpsc::Sender<Result<Answer, String>>,
 }
@@ -655,6 +667,8 @@ impl RunPanel {
                 reload: None,
                 #[cfg(test)]
                 finished: 0,
+                #[cfg(test)]
+                observation_held: false,
                 model_reload: 0,
                 console_input: ConsoleInput::new(),
                 program_started: false,
@@ -702,6 +716,19 @@ impl RunPanel {
     #[cfg(test)]
     pub(crate) fn set_program_pid(&mut self, pid: Option<u32>) {
         self.program_pid = pid;
+    }
+
+    /// Holds the first look of the poll at a run until the run is over, for the window tests
+    /// of the tools: a run that ends between two polls is then read by one poll.
+    #[cfg(all(test, windows))]
+    pub(crate) fn hold_observation(&mut self) {
+        self.observation_held = true;
+    }
+
+    /// Whether the plan of the run has started its console, for the window tests.
+    #[cfg(all(test, windows))]
+    pub(crate) fn console_started(&self) -> bool {
+        self.console.is_some()
     }
 
     /// The root of the build model cache of the project, for Invalidate Caches.
@@ -3187,7 +3214,8 @@ impl RunPanel {
             output: output.clone(),
             kind: ToolJobKind::Build,
             started: Instant::now(),
-            saw_console: false,
+            process_started: false,
+            start_error: None,
             reply: job.reply.clone(),
         });
         self.tool_output = Some((output, false));
@@ -3239,7 +3267,8 @@ impl RunPanel {
             output: output.clone(),
             kind: ToolJobKind::Tests,
             started: Instant::now(),
-            saw_console: false,
+            process_started: false,
+            start_error: None,
             reply: job.reply.clone(),
         });
         self.tool_output = Some((output, false));
@@ -3427,14 +3456,6 @@ impl RunPanel {
     /// Answers the build or test run of a job once the console is closed and every event
     /// is in.
     fn complete_tool_job(&mut self) -> bool {
-        if let Some(job) = &mut self.tool_job
-            && (self.starting
-                || self.console.is_some()
-                || self.tests.run.is_some()
-                || self.waiting_tests.is_some())
-        {
-            job.saw_console = true;
-        }
         let done = self.tool_job.as_ref().is_some_and(|job| match job.kind {
             ToolJobKind::Build => !self.starting && self.console.is_none() && !self.console_running,
             ToolJobKind::Tests => {
@@ -3451,15 +3472,16 @@ impl RunPanel {
             return false;
         };
         let duration_ms = job.started.elapsed().as_millis() as u64;
-        if !job.saw_console {
-            let last = self
-                .lines
-                .back()
-                .map(|line| line.text.clone())
+        if !job.process_started {
+            // The process never started. Its console gave the reason when it could not
+            // start it; a plan that failed before a console came says it in the last line.
+            let reason = job
+                .start_error
+                .or_else(|| self.lines.back().map(|line| line.text.clone()))
                 .unwrap_or_default();
-            let message = match last.is_empty() {
+            let message = match reason.is_empty() {
                 true => "the run did not start".to_string(),
-                false => format!("the run did not start: {last}"),
+                false => format!("the run did not start: {reason}"),
             };
             let _ = job.reply.send(Err(message));
             self.tool_output = None;
@@ -4650,6 +4672,14 @@ impl RunPanel {
         let mut program_ended = false;
         let mut closed = false;
         let mut built = false;
+        // A test holds the first look at a run until the run is over, so this poll reads all
+        // of its events at once, as a loaded machine makes it read them.
+        #[cfg(test)]
+        if self.observation_held
+            && let Some(console) = &self.console
+        {
+            console.wait_for_output(HOLD_MARKER, HOLD_LIMIT, &Cancel::new());
+        }
         let main_console = self.console.is_some();
         let tests = self.tests.run.as_ref().map(TestRun::console);
         if let Some(console) = self.console.as_ref().or(tests) {
@@ -4668,6 +4698,9 @@ impl RunPanel {
                             .push(process, stream == Stream::Stderr, &text, &mut done);
                     }
                     ConsoleEvent::Started { pid, step } => {
+                        if let Some(job) = &mut self.tool_job {
+                            job.process_started = true;
+                        }
                         self.console_process = Some(pid);
                         if step == Step::Program {
                             self.program_pid = Some(pid);
@@ -4681,6 +4714,9 @@ impl RunPanel {
                         }
                     }
                     ConsoleEvent::Failed { message } => {
+                        if let Some(job) = &mut self.tool_job {
+                            job.start_error = Some(message.clone());
+                        }
                         done.push(Line::plain(message, error_style()));
                     }
                     ConsoleEvent::Exited { code, step } => {
@@ -6082,6 +6118,7 @@ impl Render for RunPanel {
         let kept = self.console_search.kept_count(self.console_line_count());
         let count = kept + 1 + usize::from(view.is_none() && self.takes_input());
         let workspace = self.workspace.clone();
+        let options = crate::tool_menu::options_menu(workspace.clone(), RUN_TOOL, |_| Vec::new());
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -6298,33 +6335,29 @@ impl Render for RunPanel {
             .live
             .as_ref()
             .is_some_and(|live| live.read(cx).started());
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .text_size(px(UI_SIZE))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .font_weight(FontWeight::MEDIUM)
-                    .children(ready.then(|| {
-                        div()
-                            .debug_selector(|| "run-ready-dot".to_owned())
-                            .flex_none()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(theme.semantic_type)
-                    }))
-                    .child(self.title.clone()),
-            )
-            .child(panel_tools(GROUP, hide, &theme))
-            .debug_selector(|| "run-header".to_owned());
+        let header = tool_header(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .font_weight(FontWeight::MEDIUM)
+                .children(ready.then(|| {
+                    div()
+                        .debug_selector(|| "run-ready-dot".to_owned())
+                        .flex_none()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(theme.semantic_type)
+                }))
+                .child(self.title.clone()),
+            div(),
+            GROUP,
+            "run",
+            options,
+            hide,
+            &theme,
+        )
+        .debug_selector(|| "run-header".to_owned());
         let panel = island(&theme)
             .id("run-panel")
             .key_context("RunPanel ToolWindow")

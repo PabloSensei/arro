@@ -74,32 +74,6 @@ impl TrustDialog {
     }
 }
 
-fn dialog_button(
-    id: &'static str,
-    label: &'static str,
-    primary: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .h(px(CONTROL_HEIGHT))
-        .px(px(SPACE_L))
-        .rounded(px(CONTROL_RADIUS))
-        .when(primary, |this| {
-            this.bg(theme.accent).text_color(theme.over_accent)
-        })
-        .when(!primary, |this| {
-            this.border_1()
-                .border_color(theme.control_border)
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-        })
-        .child(label)
-}
-
 impl Render for TrustDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -128,18 +102,30 @@ impl Render for TrustDialog {
                  Start agents only in projects you trust.",
             ))
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
-                        dialog_button("trust-cancel", "Don't Trust", false, &theme)
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "trust-accept",
+                            "trust-accept".to_owned(),
+                            "Trust Project",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.trust(window, cx))),
                     )
-                    .child(
-                        dialog_button("trust-accept", "Trust Project", true, &theme)
-                            .on_click(cx.listener(|this, _, window, cx| this.trust(window, cx))),
-                    ),
+                    .other(
+                        dialog_button(
+                            "trust-cancel",
+                            "trust-cancel".to_owned(),
+                            "Don't Trust",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(

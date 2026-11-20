@@ -354,7 +354,7 @@ impl ProblemsHub {
         let panel = ItemsPanel::create(
             "Problems",
             PROBLEMS_TOOL,
-            "No problems found.",
+            "No problems found",
             workspace.clone(),
             cx,
         );
@@ -468,7 +468,7 @@ impl ProblemsHub {
         let (items, rows, empty) = match self.scope {
             Scope::Project => {
                 let (items, rows) = self.state.project_view(&self.root, &icons);
-                (items, rows, "No problems found.")
+                (items, rows, "No problems found")
             }
             // With no file open there is nothing to scope the tab to, so it lists the
             // project rather than an empty window.
@@ -482,11 +482,11 @@ impl ProblemsHub {
                             excluded: false,
                         })
                         .collect();
-                    (items, rows, "No problems in the current file.")
+                    (items, rows, "No problems in the current file")
                 }
                 _ => {
                     let (items, rows) = self.state.project_view(&self.root, &icons);
-                    (items, rows, "No problems found.")
+                    (items, rows, "No problems found")
                 }
             },
         };

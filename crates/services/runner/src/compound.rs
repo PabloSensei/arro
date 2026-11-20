@@ -16,6 +16,10 @@ impl RunConfigProvider for CompoundProvider {
         COMPOUND_PROVIDER
     }
 
+    fn group_name(&self, _config: &RunConfig) -> &'static str {
+        "Compound"
+    }
+
     fn discover(&self, _model: &ProjectModel) -> Result<Vec<RunConfig>> {
         Ok(Vec::new())
     }

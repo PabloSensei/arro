@@ -8,7 +8,6 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::Workspace;
 
-use crate::project_structure::dialog_button;
 use crate::script::ActiveRunPanel;
 
 const WIDTH: f32 = 520.;
@@ -166,22 +165,21 @@ impl Render for InvalidateDialog {
             })
             .collect::<Vec<_>>();
 
-        let actions = div()
-            .flex()
-            .justify_end()
-            .gap(px(SPACE_M))
-            .child(
+        // Invalidate and Restart is the primary button; Just Restart is the alternative that
+        // keeps the caches, and it stands before Cancel.
+        let actions = DialogButtons::new()
+            .primary(
                 dialog_button(
-                    "invalidate-cancel",
-                    "invalidate-cancel".to_owned(),
-                    "Cancel",
-                    false,
+                    "invalidate-restart",
+                    "invalidate-restart".to_owned(),
+                    "Invalidate and Restart",
+                    true,
                     true,
                     &theme,
                 )
-                .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                .on_click(cx.listener(|this, _, window, cx| this.restart(true, window, cx))),
             )
-            .child(
+            .other(
                 dialog_button(
                     "invalidate-just-restart",
                     "invalidate-just-restart".to_owned(),
@@ -192,17 +190,18 @@ impl Render for InvalidateDialog {
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.restart(false, window, cx))),
             )
-            .child(
+            .other(
                 dialog_button(
-                    "invalidate-restart",
-                    "invalidate-restart".to_owned(),
-                    "Invalidate and Restart",
-                    true,
+                    "invalidate-cancel",
+                    "invalidate-cancel".to_owned(),
+                    "Cancel",
+                    false,
                     true,
                     &theme,
                 )
-                .on_click(cx.listener(|this, _, window, cx| this.restart(true, window, cx))),
-            );
+                .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+            )
+            .into_row();
 
         let error = self.error.clone().map(|error| {
             div()

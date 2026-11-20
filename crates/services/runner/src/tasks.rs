@@ -59,6 +59,10 @@ impl RunConfigProvider for BuildTaskProvider {
         self.tool.task_icon()
     }
 
+    fn group_name(&self, _config: &RunConfig) -> &'static str {
+        self.tool.tool_name()
+    }
+
     fn discover(&self, _model: &ProjectModel) -> Result<Vec<RunConfig>> {
         Ok(Vec::new())
     }

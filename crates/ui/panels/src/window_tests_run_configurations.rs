@@ -309,6 +309,8 @@ fn the_dialog_stores_the_before_launch_list_the_flag_and_the_environment_file(
         has(cx, window, "run-config-step-0"),
         "the build is a step of the list"
     );
+    click_selector(cx, window, "run-config-step-add");
+    draw(cx, window);
     click_selector(cx, window, "run-config-step-add-task");
     draw(cx, window);
     click_selector(cx, window, "run-config-step-target-1");

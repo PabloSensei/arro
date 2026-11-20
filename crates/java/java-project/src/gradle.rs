@@ -310,6 +310,10 @@ impl BuildSystem for Gradle {
         "run/gradle"
     }
 
+    fn tool_name(&self) -> &'static str {
+        "Gradle"
+    }
+
     fn detect(&self, root: &Path) -> bool {
         BUILD_FILES.iter().any(|name| root.join(name).is_file())
     }

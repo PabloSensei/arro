@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 base.workspace = true
 dap-client.workspace = true
+database.workspace = true
 java-exec.workspace = true
 java-lang = { path = "../../crates/java/java-lang" }
 java-project.workspace = true

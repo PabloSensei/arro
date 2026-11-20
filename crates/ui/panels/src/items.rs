@@ -480,6 +480,7 @@ impl Render for ItemsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let (workspace, tool) = (self.workspace.clone(), self.tool);
+        let options = crate::tool_menu::options_menu(workspace.clone(), tool, |_| Vec::new());
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| workspace.toggle_tool(tool, window, cx))
@@ -578,7 +579,11 @@ impl Render for ItemsPanel {
         });
         let body = if self.items.is_empty() {
             div()
-                .p(px(12.))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(SPACE_M))
                 .text_color(theme.text_secondary)
                 .child(self.empty.clone())
                 .into_any_element()
@@ -676,32 +681,30 @@ impl Render for ItemsPanel {
                     .child(tab.label.clone())
             })
             .collect();
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(HEADER_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(self.title.clone()),
-                    )
-                    .child(div().flex().items_center().gap(px(2.)).children(tabs))
-                    .child(div().flex().items_center().gap(px(2.)).children(buttons)),
-            )
-            .child(panel_tools(GROUP, hide, &theme));
+        let header = tool_header(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .min_w_0()
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(self.title.clone()),
+                )
+                .child(div().flex().items_center().gap(px(SPACE_XS)).children(tabs)),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .children(buttons),
+            GROUP,
+            tool,
+            options,
+            hide,
+            &theme,
+        )
+        .debug_selector(move || format!("{tool}-header"));
         island(&theme)
             .id(self.tool)
             .debug_selector(move || format!("items-{tool}"))

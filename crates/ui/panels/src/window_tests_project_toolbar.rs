@@ -223,7 +223,7 @@ fn always_select_opened_file_is_a_switch_saved_in_the_settings_file(cx: &mut Tes
     let window = project_window(cx, root);
     let file = settings_file(cx, window);
 
-    click(cx, window, "project-view-options");
+    click(cx, window, "project-options");
     click_menu_row(cx, window, "Always Select Opened File");
     wait_for_signal(cx, "the switch written to the settings file", |_| {
         Settings::load(&file).project_always_select_opened_file
@@ -234,7 +234,7 @@ fn always_select_opened_file_is_a_switch_saved_in_the_settings_file(cx: &mut Tes
         "the settings file names the switch"
     );
 
-    click(cx, window, "project-view-options");
+    click(cx, window, "project-options");
     click_menu_row(cx, window, "✓ Always Select Opened File");
     wait_for_signal(cx, "the switch off in the settings file", |_| {
         !Settings::load(&file).project_always_select_opened_file
@@ -257,7 +257,7 @@ fn always_select_opened_file_follows_the_tabs_once_it_is_on(cx: &mut TestAppCont
     );
 
     // Switching it on selects the file of the active tab at once.
-    click(cx, window, "project-view-options");
+    click(cx, window, "project-options");
     click_menu_row(cx, window, "Always Select Opened File");
     wait_for_signal(cx, "the file of the active tab selected", |cx| {
         panel.read_with(cx, |panel, _| panel.selected_path() == Some(deep.as_path()))

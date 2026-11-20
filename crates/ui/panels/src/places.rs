@@ -14,6 +14,9 @@ use crate::outline::OpenEditors;
 
 const WIDTH: f32 = 640.;
 const HEIGHT: f32 = 420.;
+/// The smallest size the window resizes to.
+const MIN_WIDTH: f32 = 360.;
+const MIN_HEIGHT: f32 = 200.;
 /// Places the log keeps.
 const LOG_MAX: usize = 50;
 /// Characters of the line shown for a place.
@@ -226,8 +229,16 @@ impl Render for PlacesPopup {
         let theme = *cx.global::<Theme>();
         let scripted = cx.has_global::<ScriptSpots>();
         let viewport = window.viewport_size();
-        let left = (viewport.width - px(WIDTH)) / 2.;
-        let top = viewport.height * 0.205;
+        let first = DialogPlace {
+            left: (f32::from(viewport.width) - WIDTH) / 2.,
+            top: f32::from(viewport.height) * 0.205,
+            width: WIDTH,
+            height: None,
+        };
+        let key = match self.kind {
+            Kind::Recent => "recent-places",
+            Kind::Bookmarks => "bookmarks-popup",
+        };
         let rows: Vec<_> = self
             .rows
             .iter()
@@ -273,6 +284,20 @@ impl Render for PlacesPopup {
             Kind::Recent => "Recent Locations",
             Kind::Bookmarks => "Bookmarks",
         };
+        let header = popup_drag_header(
+            cx,
+            key,
+            (MIN_WIDTH, MIN_HEIGHT),
+            div()
+                .px(px(ROW_PADDING_X))
+                .h(px(CONTROL_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .text_color(theme.text_secondary)
+                .debug_selector(|| "places-title".to_owned())
+                .child(title),
+        );
         let body = surface(&theme)
             .id("places-popup")
             .debug_selector(|| "places-popup".to_owned())
@@ -280,22 +305,12 @@ impl Render for PlacesPopup {
             .child(script_spot(scripted, "places-popup"))
             .track_focus(&self.focus)
             .occlude()
-            .w(px(WIDTH))
-            .max_h(px(HEIGHT))
             .p(px(POPUP_PADDING))
             .flex()
             .flex_col()
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
-            .child(
-                div()
-                    .px(px(ROW_PADDING_X))
-                    .h(px(CONTROL_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .text_color(theme.text_secondary)
-                    .child(title),
-            )
+            .child(header)
             .child(if rows.is_empty() {
                 // The bookmarks have a popup of their own even with nothing in it: the
                 // list says so in place of its rows, without a notification.
@@ -331,11 +346,18 @@ impl Render for PlacesPopup {
                 .min_h_0()
                 .into_any_element()
             });
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("places-enter", body))
+        popup_window(
+            PopupSpec {
+                key,
+                place: first,
+                min: (MIN_WIDTH, MIN_HEIGHT),
+                content_height: true,
+                max_height: Some(HEIGHT),
+            },
+            body,
+            window,
+            cx,
+        )
     }
 }
 

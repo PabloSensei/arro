@@ -2687,6 +2687,10 @@ pub(crate) fn install(cx: &mut App) {
 impl Render for AgentsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let options =
+            crate::tool_menu::options_menu(self.workspace.clone(), workspace::AI_TOOL, |_| {
+                Vec::new()
+            });
         let hide = |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             window.dispatch_action(Box::new(ToggleAi), cx);
         };
@@ -2740,7 +2744,14 @@ impl Render for AgentsPanel {
             .group(GROUP)
             .h_full()
             .text_size(px(UI_SIZE))
-            .child(panel_header("AI Sessions", GROUP, hide, &theme))
+            .child(panel_header(
+                "AI Sessions",
+                GROUP,
+                "ai",
+                options,
+                hide,
+                &theme,
+            ))
             .child(self.start_row(&theme, cx))
             .children(error)
             .child(self.session_rows(&theme, cx))

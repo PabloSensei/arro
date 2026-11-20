@@ -2112,3 +2112,22 @@ mod window_tests_finder_polish;
 mod window_tests_icons;
 #[cfg(test)]
 mod window_tests_settings_polish;
+
+mod database_sources;
+
+#[cfg(test)]
+mod window_tests_database_sources;
+#[cfg(test)]
+mod window_tests_dialog_buttons;
+#[cfg(test)]
+mod window_tests_mcp_runs_unseen;
+#[cfg(test)]
+mod window_tests_new_file;
+#[cfg(test)]
+mod window_tests_popup_frame;
+#[cfg(test)]
+mod window_tests_run_configs_tree;
+
+mod tool_menu;
+#[cfg(test)]
+mod window_tests_tool_headers;

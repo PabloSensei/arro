@@ -387,13 +387,22 @@ pub fn panel_tools(
                 false,
                 theme,
             )
+            .debug_selector(move || format!("{group}-hide"))
             .on_click(on_hide),
         )
 }
 
-pub fn panel_header(
-    title: impl Into<SharedString>,
+/// The header of every tool window, one height and one row: the title and the tabs of the
+/// window on the left, its actions on the right, then the Options button, which opens the
+/// menu of the window, and the Hide button, which shows only under the pointer. `name` is
+/// the window alone: the ids and the debug selectors of its buttons are its own, while the
+/// tools of a group share the names of the group.
+pub fn tool_header(
+    head: impl IntoElement,
+    actions: impl IntoElement,
     group: &'static str,
+    name: &'static str,
+    on_options: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_hide: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     theme: &Theme,
 ) -> Div {
@@ -411,10 +420,57 @@ pub fn panel_header(
                 .flex()
                 .items_center()
                 .gap(px(SPACE_XS))
-                .font_weight(FontWeight::MEDIUM)
-                .child(title.into()),
+                .min_w_0()
+                .child(head),
         )
-        .child(panel_tools(group, on_hide, theme))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .flex_none()
+                .child(actions)
+                .child(
+                    div()
+                        .debug_selector(move || format!("{name}-options"))
+                        .child(
+                            icon_button_with_occlusion(
+                                SharedString::from(format!("{name}-options")),
+                                "general/moreVertical",
+                                "Options",
+                                None,
+                                false,
+                                theme,
+                            )
+                            .on_click(on_options),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || format!("{name}-hide"))
+                        .child(panel_tools(group, on_hide, theme)),
+                ),
+        )
+}
+
+/// The header of a tool window whose title is its only text.
+pub fn panel_header(
+    title: impl Into<SharedString>,
+    group: &'static str,
+    name: &'static str,
+    on_options: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_hide: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    theme: &Theme,
+) -> Div {
+    tool_header(
+        div().font_weight(FontWeight::MEDIUM).child(title.into()),
+        div(),
+        group,
+        name,
+        on_options,
+        on_hide,
+        theme,
+    )
 }
 
 pub fn popup_shadow(theme: &Theme) -> Vec<BoxShadow> {

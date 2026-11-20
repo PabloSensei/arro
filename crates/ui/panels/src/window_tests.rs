@@ -870,7 +870,7 @@ fn the_project_tree_creates_renames_and_deletes_in_a_scratch_folder(cx: &mut Tes
     let found = panel.read_with(cx, |panel, _| panel.tree().index_of(&made));
     assert!(found.is_some(), "the new file is in the tree");
 
-    // The second entry: a folder.
+    // The third entry: a folder, after the scratch file.
     with_window(cx, window, |_, cx| {
         panel.update(cx, |panel, cx| panel.select_path(&src, cx))
     });
@@ -882,7 +882,7 @@ fn the_project_tree_creates_renames_and_deletes_in_a_scratch_folder(cx: &mut Tes
     draw(cx, window);
     press(cx, window, "alt-insert");
     draw(cx, window);
-    click(cx, window, "menu-1");
+    click(cx, window, "menu-2");
     draw(cx, window);
     type_text(cx, window, "made_dir");
     press(cx, window, "enter");

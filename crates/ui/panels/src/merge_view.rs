@@ -1286,14 +1286,26 @@ impl Render for MergeView {
                         })),
                     )
                     .child(
-                        Self::button(("merge-apply", 0), "Apply", true, &theme)
-                            .debug_selector(|| "merge-apply".to_owned())
-                            .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx))),
+                        dialog_button(
+                            "merge-apply",
+                            "merge-apply".to_owned(),
+                            "Apply",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx))),
                     )
                     .child(
-                        Self::button(("merge-cancel", 0), "Cancel", false, &theme)
-                            .debug_selector(|| "merge-cancel".to_owned())
-                            .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
+                        dialog_button(
+                            "merge-cancel",
+                            "merge-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
                     ),
             );
         let titles = div()

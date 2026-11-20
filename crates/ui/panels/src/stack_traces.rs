@@ -384,6 +384,10 @@ impl Render for StackTracePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::STACK_TRACE_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -573,7 +577,14 @@ impl Render for StackTracePanel {
             .group(GROUP)
             .h_full()
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(panel_header("Stack Trace", GROUP, hide, &theme))
+            .child(panel_header(
+                "Stack Trace",
+                GROUP,
+                "stack-trace",
+                options,
+                hide,
+                &theme,
+            ))
             .when(deadlock, |this| {
                 this.child(
                     div()

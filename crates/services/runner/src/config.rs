@@ -404,6 +404,21 @@ pub trait RunConfigProvider: Send + Sync {
         "run/run"
     }
 
+    /// The kind of configuration of `config`, shown as a group of the tree of the dialog.
+    fn group_name(&self, _config: &RunConfig) -> &'static str {
+        "Application"
+    }
+
+    /// The icon of that group.
+    fn group_icon(&self, config: &RunConfig) -> &'static str {
+        self.icon(config)
+    }
+
+    /// The icon of one kind of configuration in the Add menu of the dialog.
+    fn template_icon(&self, _template: &ConfigTemplate) -> &'static str {
+        "run/run"
+    }
+
     /// Whether [`RunConfigProvider::coverage_plan`] makes a plan. The menus offer Run
     /// with Coverage only for a provider that has it.
     fn supports_coverage(&self) -> bool {

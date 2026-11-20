@@ -2,6 +2,7 @@
 //! ones found in it, and the fields their providers describe. The dialog knows no
 //! language: a provider reads and writes every field in the settings of a configuration.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use project_model::ProjectModel;
@@ -25,6 +26,7 @@ const FIELD_HEIGHT: f32 = 26.;
 const CHECKBOX: f32 = 14.;
 
 /// One configuration of the dialog and what the last read of it was.
+#[derive(Clone)]
 struct Item {
     config: RunConfig,
     original: RunConfig,
@@ -33,6 +35,9 @@ struct Item {
     /// The configuration is temporary: it is not in the file and is not lost until the
     /// dialog changes it.
     temporary: bool,
+    /// What the user chose with Store as project file, when the choice is theirs rather
+    /// than the kind of the configuration.
+    store_choice: Option<bool>,
 }
 
 /// The field of a provider as the dialog shows it.
@@ -81,6 +86,28 @@ struct TemplateRow {
     template: ConfigTemplate,
 }
 
+/// The configurations of one kind, as the tree of the dialog groups them.
+struct ConfigGroup {
+    provider: String,
+    name: &'static str,
+    icon: &'static str,
+    /// The name of the group in the selectors of a test.
+    slug: String,
+    items: Vec<usize>,
+}
+
+fn slug_of(name: &str) -> String {
+    let mut slug = String::new();
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
 /// The Run/Debug Configurations dialog over the workspace.
 pub struct RunConfigDialog {
     items: Vec<Item>,
@@ -88,8 +115,12 @@ pub struct RunConfigDialog {
     name: TextField,
     /// The steps before the program, in order.
     steps: Vec<StepRow>,
+    /// The step the buttons of the list act on.
+    step_selected: Option<usize>,
     /// The step whose goal is being typed.
     step_active: Option<usize>,
+    /// The list of the kinds of a new step is open.
+    steps_add_open: bool,
     /// The configurations a compound configuration starts.
     compound: Vec<String>,
     allow_multiple_instances: bool,
@@ -99,6 +130,12 @@ pub struct RunConfigDialog {
     active: usize,
     templates: Vec<TemplateRow>,
     templates_open: bool,
+    /// The text that filters the kinds of the Add menu.
+    template_search: TextField,
+    /// The row of the filtered Add menu the keys are on.
+    template_mark: usize,
+    /// The groups of the tree the user closed.
+    collapsed: HashSet<String>,
     /// The list or the fields changed since the last write.
     changed: bool,
     error: Option<String>,
@@ -150,6 +187,7 @@ impl RunConfigDialog {
                     config,
                     saved,
                     temporary,
+                    store_choice: None,
                 })
                 .collect();
             (
@@ -180,14 +218,19 @@ impl RunConfigDialog {
                 selected,
                 name: TextField::default(),
                 steps: Vec::new(),
+                step_selected: None,
                 step_active: None,
+                steps_add_open: false,
                 compound: Vec::new(),
                 allow_multiple_instances: false,
                 environment_file: TextField::default(),
                 rows: Vec::new(),
-                active: 0,
+                active: usize::MAX,
                 templates,
                 templates_open: false,
+                template_search: TextField::default(),
+                template_mark: 0,
+                collapsed: HashSet::new(),
                 changed: false,
                 error: store_error,
                 providers,
@@ -222,12 +265,14 @@ impl RunConfigDialog {
     fn load_fields(&mut self) {
         self.name = TextField::default();
         self.steps.clear();
+        self.step_selected = None;
         self.step_active = None;
+        self.steps_add_open = false;
         self.compound.clear();
         self.allow_multiple_instances = false;
         self.environment_file = TextField::default();
         self.rows.clear();
-        self.active = 0;
+        self.active = usize::MAX;
         let Some(index) = self.selected else {
             return;
         };
@@ -278,15 +323,9 @@ impl RunConfigDialog {
             .collect();
     }
 
-    /// Writes the fields into the selected configuration. A discovered configuration
-    /// that changed becomes a stored one.
-    fn commit(&mut self) {
-        let Some(item) = self.items.get_mut(self.selected.unwrap_or(usize::MAX)) else {
-            return;
-        };
-        item.config.name = self.name.text.trim().to_owned();
-        let steps: Vec<BeforeLaunchStep> = self
-            .steps
+    /// The list of steps as the dialog shows it.
+    fn steps_from_fields(&self) -> Vec<BeforeLaunchStep> {
+        self.steps
             .iter()
             .map(|row| match &row.step {
                 BeforeLaunchStep::Task { .. } => BeforeLaunchStep::Task {
@@ -297,31 +336,33 @@ impl RunConfigDialog {
                 },
                 BeforeLaunchStep::Build => BeforeLaunchStep::Build,
             })
-            .collect();
+            .collect()
+    }
+
+    /// The configuration the fields of the dialog describe, on top of `base`.
+    fn draft_config(&self, base: &RunConfig) -> RunConfig {
+        let mut config = base.clone();
+        config.name = self.name.text.trim().to_owned();
+        let steps = self.steps_from_fields();
         // An untouched configuration keeps the old flag instead of gaining a list: an old
         // file reads the same after a visit to the dialog.
-        if steps == [BeforeLaunchStep::Build]
-            && item.original.before_launch.is_none()
-            && item.original.assemble_first
+        if base.before_launch.is_none()
+            && ((steps == [BeforeLaunchStep::Build] && base.assemble_first)
+                || (steps.is_empty() && !base.assemble_first))
         {
-            item.config.before_launch = None;
-            item.config.assemble_first = true;
+            config.before_launch = None;
+            config.assemble_first = base.assemble_first;
         } else {
-            item.config.before_launch = Some(steps);
-            item.config.assemble_first = false;
+            config.before_launch = Some(steps);
+            config.assemble_first = false;
         }
-        item.config.allow_multiple_instances = self.allow_multiple_instances;
+        config.allow_multiple_instances = self.allow_multiple_instances;
         let file = self.environment_file.text.trim();
-        item.config.environment_file = (!file.is_empty()).then(|| file.into());
-        if item.config.is_compound() {
-            item.config.compound = self.compound.clone();
+        config.environment_file = (!file.is_empty()).then(|| file.into());
+        if config.is_compound() {
+            config.compound = self.compound.clone();
         }
-        let provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.id() == item.config.provider)
-            .cloned();
-        if let Some(provider) = provider {
+        if let Some(provider) = self.provider_of(&config) {
             for row in &self.rows {
                 let value = match row.field.kind {
                     ConfigFieldKind::Bool => {
@@ -333,14 +374,78 @@ impl RunConfigDialog {
                     }
                     _ => &row.text.text,
                 };
-                provider.write_field(&mut item.config, row.field.key, value);
+                provider.write_field(&mut config, row.field.key, value);
             }
         }
+        config
+    }
+
+    /// Writes the fields into the selected configuration. A discovered configuration
+    /// that changed becomes a stored one.
+    fn commit(&mut self) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(item) = self.items.get(index) else {
+            return;
+        };
+        let config = self.draft_config(&item.config);
+        let item = &mut self.items[index];
+        item.config = config;
         if item.config != item.original {
-            item.saved = true;
-            item.temporary = false;
+            let stored = item.store_choice.unwrap_or(true);
+            item.saved = stored;
+            item.temporary = !stored;
             self.changed = true;
         }
+    }
+
+    /// Whether the fields of the dialog differ from the selected configuration.
+    fn fields_changed(&self, item: &Item) -> bool {
+        if self.name.text.trim() != item.config.name {
+            return true;
+        }
+        if self.steps_from_fields() != item.config.before_launch_steps() {
+            return true;
+        }
+        if self.allow_multiple_instances != item.config.allow_multiple_instances {
+            return true;
+        }
+        let stored_file = item
+            .config
+            .environment_file
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if self.environment_file.text.trim() != stored_file {
+            return true;
+        }
+        if item.config.is_compound() && self.compound != item.config.compound {
+            return true;
+        }
+        let Some(provider) = self.provider_of(&item.config) else {
+            return false;
+        };
+        for row in &self.rows {
+            let shown = provider.read_field(&item.config, row.field.key);
+            let same = if row.field.kind == ConfigFieldKind::Bool {
+                (shown == "true") == row.flag
+            } else {
+                shown == row.text.text
+            };
+            if !same {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the dialog holds a change that OK or Apply would write.
+    fn dirty(&self) -> bool {
+        if self.changed {
+            return true;
+        }
+        self.item().is_some_and(|item| self.fields_changed(item))
     }
 
     /// What keeps OK and Apply from saving the list.
@@ -375,6 +480,175 @@ impl RunConfigDialog {
         }
     }
 
+    /// The groups of the tree, in the order their first configuration appears.
+    fn groups(&self) -> Vec<ConfigGroup> {
+        let mut groups: Vec<ConfigGroup> = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            let provider = self.provider_of(&item.config);
+            let (id, name, icon) = provider.map_or(("", "Application", "run/run"), |provider| {
+                (
+                    provider.id(),
+                    provider.group_name(&item.config),
+                    provider.group_icon(&item.config),
+                )
+            });
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.provider == id && group.name == name)
+            {
+                group.items.push(index);
+            } else {
+                groups.push(ConfigGroup {
+                    provider: id.to_owned(),
+                    name,
+                    icon,
+                    slug: slug_of(name),
+                    items: vec![index],
+                });
+            }
+        }
+        groups
+    }
+
+    /// The kinds of the Add menu, filtered by the text typed into it.
+    fn filtered_templates(&self) -> Vec<usize> {
+        let needle = self.template_search.text.trim().to_ascii_lowercase();
+        self.templates
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                needle.is_empty() || row.template.name.to_ascii_lowercase().contains(&needle)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Opens the list of kinds of the Add menu.
+    fn open_templates(&mut self, cx: &mut Context<Self>) {
+        self.templates_open = true;
+        self.active = usize::MAX;
+        self.step_active = None;
+        self.steps_add_open = false;
+        self.templates_add_reset();
+        cx.notify();
+    }
+
+    fn templates_add_reset(&mut self) {
+        self.template_search = TextField::default();
+        self.template_mark = 0;
+    }
+
+    fn move_template_mark(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.filtered_templates().len();
+        if count == 0 {
+            return;
+        }
+        let current = self.template_mark.min(count - 1) as isize;
+        self.template_mark = (current + delta).clamp(0, count as isize - 1) as usize;
+        cx.notify();
+    }
+
+    fn add_marked(&mut self, cx: &mut Context<Self>) {
+        let filtered = self.filtered_templates();
+        let Some(index) = filtered.get(self.template_mark).copied() else {
+            return;
+        };
+        self.add_from(index, cx);
+    }
+
+    /// Whether the selected configuration lives in the project file.
+    fn stores_file(&self) -> bool {
+        self.item().is_some_and(|item| item.saved)
+    }
+
+    /// Writes the selected configuration into the project file or keeps it out of it.
+    fn set_stored(&mut self, stored: bool, cx: &mut Context<Self>) {
+        if self.selected.is_none() {
+            return;
+        }
+        if self.problem().is_some() {
+            self.error = self.problem();
+            cx.notify();
+            return;
+        }
+        self.commit();
+        if let Some(item) = self.items.get_mut(self.selected.unwrap_or(usize::MAX)) {
+            item.store_choice = Some(stored);
+            if item.saved != stored || item.temporary == stored {
+                item.saved = stored;
+                item.temporary = !stored;
+                self.changed = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Moves the selected configuration one place up (`-1`) or down (`1`) inside its
+    /// group. The list of the file keeps the same order.
+    fn move_item(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        if self.problem().is_some() {
+            self.error = self.problem();
+            cx.notify();
+            return;
+        }
+        self.commit();
+        let Some(group) = self
+            .groups()
+            .into_iter()
+            .find(|group| group.items.contains(&index))
+        else {
+            return;
+        };
+        let Some(position) = group.items.iter().position(|item| *item == index) else {
+            return;
+        };
+        let Some(target) = position
+            .checked_add_signed(delta)
+            .and_then(|target| group.items.get(target))
+            .copied()
+        else {
+            return;
+        };
+        self.items.swap(index, target);
+        self.selected = Some(target);
+        self.changed = true;
+        cx.notify();
+    }
+
+    /// Sorts every group by name, keeping the selected configuration selected.
+    fn sort_items(&mut self, cx: &mut Context<Self>) {
+        if self.problem().is_some() {
+            self.error = self.problem();
+            cx.notify();
+            return;
+        }
+        self.commit();
+        let selected_name = self.item().map(|item| item.config.name.clone());
+        let mut next: Vec<Item> = Vec::with_capacity(self.items.len());
+        for group in self.groups() {
+            let mut indexes = group.items;
+            indexes.sort_by(|left, right| {
+                self.items[*left]
+                    .config
+                    .name
+                    .cmp(&self.items[*right].config.name)
+            });
+            for index in indexes {
+                next.push(self.items[index].clone());
+            }
+        }
+        self.items = next;
+        self.selected = selected_name
+            .and_then(|name| self.items.iter().position(|item| item.config.name == name))
+            .or_else(|| (!self.items.is_empty()).then_some(0));
+        self.load_fields();
+        self.changed = true;
+        cx.notify();
+    }
+
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.selected == Some(index) || index >= self.items.len() {
             return;
@@ -395,8 +669,12 @@ impl RunConfigDialog {
         if self.templates.is_empty() {
             return;
         }
-        self.templates_open = !self.templates_open;
-        cx.notify();
+        if self.templates_open {
+            self.templates_open = false;
+            cx.notify();
+        } else {
+            self.open_templates(cx);
+        }
     }
 
     fn add_from(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -421,6 +699,7 @@ impl RunConfigDialog {
                     config,
                     saved: true,
                     temporary: false,
+                    store_choice: None,
                 });
                 self.select_silently(self.items.len() - 1);
                 self.changed = true;
@@ -452,6 +731,7 @@ impl RunConfigDialog {
             config,
             saved: true,
             temporary: false,
+            store_choice: None,
         });
         self.select_silently(self.items.len() - 1);
         self.changed = true;
@@ -467,7 +747,9 @@ impl RunConfigDialog {
             .map(|item| item.config.name.clone())
             .collect::<Vec<_>>();
         self.steps.push(StepRow::new(step, &names));
+        self.step_selected = Some(self.steps.len() - 1);
         self.step_active = Some(self.steps.len() - 1);
+        self.steps_add_open = false;
         self.active = usize::MAX;
         cx.notify();
     }
@@ -478,6 +760,7 @@ impl RunConfigDialog {
         }
         self.steps.remove(index);
         self.step_active = None;
+        self.step_selected = (!self.steps.is_empty()).then(|| index.min(self.steps.len() - 1));
         cx.notify();
     }
 
@@ -490,6 +773,12 @@ impl RunConfigDialog {
             return;
         };
         self.steps.swap(index, target);
+        if self.step_selected == Some(index) {
+            self.step_selected = Some(target);
+        } else if self.step_selected == Some(target) {
+            self.step_selected = Some(index);
+        }
+        self.step_active = None;
         cx.notify();
     }
 
@@ -524,7 +813,7 @@ impl RunConfigDialog {
             return;
         }
         self.commit();
-        let items = self
+        let items: Vec<(RunConfig, bool, bool)> = self
             .items
             .iter()
             .map(|item| (item.config.clone(), item.saved, item.temporary))
@@ -544,6 +833,7 @@ impl RunConfigDialog {
                 if close {
                     self.close(window, cx);
                 } else {
+                    self.load_fields();
                     cx.notify();
                 }
             }
@@ -561,6 +851,67 @@ impl RunConfigDialog {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        let primary = stroke.modifiers.control || stroke.modifiers.platform;
+        if self.templates_open {
+            match stroke.key.as_str() {
+                "escape" => {
+                    self.templates_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                "up" => {
+                    self.move_template_mark(-1, cx);
+                    cx.stop_propagation();
+                }
+                "down" => {
+                    self.move_template_mark(1, cx);
+                    cx.stop_propagation();
+                }
+                "enter" => {
+                    self.add_marked(cx);
+                    cx.stop_propagation();
+                }
+                _ => {
+                    if self.template_search.key_with_clipboard(event, false, cx) {
+                        self.template_mark = 0;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }
+            return;
+        }
+        if (primary && stroke.key.as_str() == "n")
+            || (stroke.modifiers.alt && stroke.key.as_str() == "insert")
+        {
+            self.add(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if primary && stroke.key.as_str() == "d" {
+            self.copy(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if stroke.key.as_str() == "delete"
+            && self.active == usize::MAX
+            && self.step_active.is_none()
+        {
+            if let Some(index) = self.step_selected {
+                self.remove_step(index, cx);
+            } else {
+                self.remove(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.steps_add_open && stroke.key.as_str() == "escape" {
+            self.steps_add_open = false;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if !matches!(event.keystroke.key.as_str(), "escape" | "enter")
             && let Some(index) = self.step_active
             && let Some(row) = self.steps.get_mut(index)
@@ -574,7 +925,8 @@ impl RunConfigDialog {
         let env_active = self.rows.len() + 1;
         match event.keystroke.key.as_str() {
             "escape" => self.close(window, cx),
-            "enter" => self.apply(true, window, cx),
+            // Enter presses OK, which takes no press while the configuration has a problem.
+            "enter" if self.problem().is_none() => self.apply(true, window, cx),
             "space" if self.active > 0 && self.active <= self.rows.len() => {
                 if let Some(row) = self.rows.get_mut(self.active - 1)
                     && row.field.kind == ConfigFieldKind::Bool
@@ -624,62 +976,180 @@ impl Render for RunConfigDialog {
         let left = (viewport.width - width) / 2.;
         let top = ((viewport.height - height) / 2.).max(px(DIALOG_PADDING));
 
-        let items = self.items.iter().enumerate().map(|(index, item)| {
-            let selected = self.selected == Some(index);
-            let temporary = item.temporary;
-            let kind = self
-                .provider_of(&item.config)
-                .map_or("run/run", |provider| provider.icon(&item.config));
-            let label: SharedString = item.config.name.clone().into();
-            div()
-                .id(("run-config-item", index))
-                .debug_selector(move || format!("run-config-item-{index}"))
-                .flex()
-                .items_center()
-                .gap(px(SPACE_S))
-                .h(px(CONTROL_HEIGHT))
-                .px(px(SPACE_M))
-                .rounded(px(CONTROL_RADIUS))
-                .text_color(if selected {
-                    theme.text
-                } else {
-                    theme.text_secondary
-                })
-                .when(selected, |this| this.bg(theme.selection))
-                .when(!selected, |this| {
-                    let hover = theme.hover;
-                    this.hover(move |style| style.bg(hover))
-                })
-                .child(
-                    div()
-                        .flex_none()
-                        .when(temporary, |this| this.opacity(0.45))
-                        .child(icon(kind, &theme)),
-                )
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
-        });
-
-        let templates = self.templates_open.then(|| {
-            let rows = self.templates.iter().enumerate().map(|(index, template)| {
-                let id = template.template.id;
-                let label: SharedString = template.template.name.into();
+        let mut tree_rows: Vec<AnyElement> = Vec::new();
+        for (group_index, group) in self.groups().into_iter().enumerate() {
+            let collapsed = self.collapsed.contains(&group.slug);
+            let slug = group.slug.clone();
+            let group_selector = format!("run-config-group-{slug}");
+            let count_selector = format!("run-config-group-count-{slug}-{}", group.items.len());
+            let group_name = group.name;
+            let group_icon = group.icon;
+            let count = group.items.len();
+            let toggle_slug = slug.clone();
+            tree_rows.push(
                 div()
-                    .id(("run-config-template", index))
-                    .debug_selector(move || format!("run-config-template-{id}"))
+                    .id(("run-config-group", group_index))
+                    .debug_selector(move || group_selector)
                     .flex()
                     .items_center()
+                    .gap(px(SPACE_XS))
                     .h(px(CONTROL_HEIGHT))
-                    .px(px(SPACE_M))
+                    .px(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
                     .text_color(theme.text)
                     .hover({
                         let hover = theme.hover;
                         move |style| style.bg(hover)
                     })
+                    .child(icon_sized(
+                        if collapsed {
+                            "general/chevronRight"
+                        } else {
+                            "general/chevronDown"
+                        },
+                        TEXT_SMALL,
+                        &theme,
+                    ))
+                    .child(icon(group_icon, &theme))
+                    .child(group_name)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .debug_selector(move || count_selector)
+                            .text_color(theme.text_muted)
+                            .child(count.to_string()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed.remove(&toggle_slug) {
+                            this.collapsed.insert(toggle_slug.clone());
+                        }
+                        this.active = usize::MAX;
+                        this.step_active = None;
+                        this.step_selected = None;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if collapsed {
+                continue;
+            }
+            for index in group.items {
+                let item = &self.items[index];
+                let selected = self.selected == Some(index);
+                let temporary = item.temporary;
+                let changed =
+                    item.config != item.original || (selected && self.fields_changed(item));
+                let kind = self
+                    .provider_of(&item.config)
+                    .map_or("run/run", |provider| provider.icon(&item.config));
+                let label: SharedString = if changed {
+                    format!("{} *", item.config.name).into()
+                } else {
+                    item.config.name.clone().into()
+                };
+                tree_rows.push(
+                    div()
+                        .id(("run-config-item", index))
+                        .debug_selector(move || format!("run-config-item-{index}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .h(px(CONTROL_HEIGHT))
+                        .pl(px(SPACE_L))
+                        .pr(px(SPACE_M))
+                        .rounded(px(CONTROL_RADIUS))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_secondary
+                        })
+                        .when(selected, |this| this.bg(theme.selection))
+                        .when(!selected, |this| {
+                            let hover = theme.hover;
+                            this.hover(move |style| style.bg(hover))
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .when(temporary, |this| this.opacity(0.45))
+                                .child(icon(kind, &theme)),
+                        )
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
+                        .into_any_element(),
+                );
+            }
+        }
+        if !self.templates.is_empty() {
+            let hover = theme.hover;
+            tree_rows.push(
+                div()
+                    .id("run-config-edit-templates")
+                    .debug_selector(|| "run-config-edit-templates".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
+                    .text_color(theme.text_secondary)
+                    .hover(move |style| style.bg(hover))
+                    .child(icon_sized("general/settings", TEXT_SMALL, &theme))
+                    .child("Edit configuration templates…")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_templates(cx)))
+                    .into_any_element(),
+            );
+        }
+
+        let templates = self.templates_open.then(|| {
+            let filtered = self.filtered_templates();
+            let rows = filtered.iter().enumerate().map(|(position, index)| {
+                let index = *index;
+                let template = &self.templates[index];
+                let id = template.template.id;
+                let row_icon = template.provider.template_icon(&template.template);
+                let label: SharedString = template.template.name.into();
+                let marked = position == self.template_mark;
+                div()
+                    .id(("run-config-template", index))
+                    .debug_selector(move || format!("run-config-template-{id}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_M))
+                    .rounded(px(CONTROL_RADIUS))
+                    .text_color(theme.text)
+                    .when(marked, |this| this.bg(theme.selection))
+                    .when(!marked, |this| {
+                        this.hover(move |style| style.bg(theme.hover))
+                    })
+                    .child(icon(row_icon, &theme))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| this.add_from(index, cx)))
             });
-            div().flex().flex_col().children(rows).into_any_element()
+            let empty = filtered.is_empty().then(|| {
+                div()
+                    .px(px(SPACE_M))
+                    .py(px(SPACE_S))
+                    .text_color(theme.text_muted)
+                    .child("No matching configuration type")
+            });
+            let search_active = self.templates_open;
+            surface(&theme)
+                .mt(px(SPACE_XS))
+                .p(px(SPACE_XS))
+                .gap(px(2.))
+                .child(field_box(
+                    "run-config-template-search",
+                    "run-config-template-search".to_owned(),
+                    &self.template_search,
+                    search_active,
+                    &theme,
+                ))
+                .children(rows)
+                .children(empty)
+                .into_any_element()
         });
 
         let name_active = self.active == 0;
@@ -710,27 +1180,12 @@ impl Render for RunConfigDialog {
             .enumerate()
             .map(|(index, row)| {
                 let label: SharedString = row.step.label().into();
-                let up = small_button(
-                    ("run-config-step-up", index),
-                    format!("run-config-step-up-{index}"),
-                    "↑",
-                    &theme,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.move_step(index, -1, cx)));
-                let down = small_button(
-                    ("run-config-step-down", index),
-                    format!("run-config-step-down-{index}"),
-                    "↓",
-                    &theme,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.move_step(index, 1, cx)));
-                let remove = small_button(
-                    ("run-config-step-remove", index),
-                    format!("run-config-step-remove-{index}"),
-                    "×",
-                    &theme,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.remove_step(index, cx)));
+                let selected = self.step_selected == Some(index);
+                let step_icon = match &row.step {
+                    BeforeLaunchStep::Build => "run/run",
+                    BeforeLaunchStep::Task { .. } => "run/run",
+                    BeforeLaunchStep::Configuration { .. } => "nodes/class",
+                };
                 let edit = match &row.step {
                     BeforeLaunchStep::Task { .. } => Some(
                         field_box(
@@ -744,6 +1199,7 @@ impl Render for RunConfigDialog {
                             this.step_active = Some(index);
                             this.active = usize::MAX;
                             window.focus(&this.focus, cx);
+                            cx.stop_propagation();
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -801,50 +1257,122 @@ impl Render for RunConfigDialog {
                     .items_center()
                     .gap(px(SPACE_S))
                     .h(px(FIELD_HEIGHT))
+                    .px(px(SPACE_XS))
+                    .rounded(px(CONTROL_RADIUS))
+                    .when(selected, |this| this.bg(theme.selection))
+                    .child(icon_sized(step_icon, TEXT_SMALL, &theme))
                     .child(div().w(px(60.)).flex_none().child(label))
                     .children(edit)
                     .child(div().flex_1())
-                    .child(up)
-                    .child(down)
-                    .child(remove)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.step_selected = Some(index);
+                        this.step_active = None;
+                        cx.notify();
+                    }))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let add_build = small_button(
-            "run-config-step-add-build",
-            "run-config-step-add-build".to_owned(),
-            "+ Build",
+        let step_selected = self.step_selected;
+        let add_step = icon_button(
+            "run-config-step-add",
+            "general/add",
+            "Add Before Launch Step",
+            None,
             &theme,
         )
-        .on_click(cx.listener(|this, _, _, cx| this.add_step(BeforeLaunchStep::Build, cx)));
-        let add_task = small_button(
-            "run-config-step-add-task",
-            "run-config-step-add-task".to_owned(),
-            "+ Task",
-            &theme,
-        )
+        .debug_selector(|| "run-config-step-add".to_owned())
         .on_click(cx.listener(|this, _, _, cx| {
-            this.add_step(
-                BeforeLaunchStep::Task {
-                    target: String::new(),
-                },
-                cx,
-            )
+            this.steps_add_open = !this.steps_add_open;
+            cx.notify();
         }));
-        let add_config = small_button(
-            "run-config-step-add-config",
-            "run-config-step-add-config".to_owned(),
-            "+ Configuration",
+        let remove_step = icon_button(
+            "run-config-step-remove",
+            "general/minus",
+            "Remove Before Launch Step",
+            None,
             &theme,
         )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.add_step(
-                BeforeLaunchStep::Configuration {
-                    name: String::new(),
-                },
-                cx,
-            )
+        .debug_selector(|| "run-config-step-remove".to_owned())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(index) = this.step_selected {
+                this.remove_step(index, cx);
+            }
         }));
+        let step_up = icon_button(
+            "run-config-step-up",
+            "general/arrowUp",
+            "Move Step Up",
+            None,
+            &theme,
+        )
+        .debug_selector(|| "run-config-step-up".to_owned())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(index) = this.step_selected {
+                this.move_step(index, -1, cx);
+            }
+        }));
+        let step_down = icon_button(
+            "run-config-step-down",
+            "general/arrowDown",
+            "Move Step Down",
+            None,
+            &theme,
+        )
+        .debug_selector(|| "run-config-step-down".to_owned())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(index) = this.step_selected {
+                this.move_step(index, 1, cx);
+            }
+        }));
+        let add_rows = [
+            ("Build", "run/run", 0usize),
+            ("Task", "run/run", 1),
+            ("Configuration", "nodes/class", 2),
+        ]
+        .into_iter()
+        .map(|(label, row_icon, kind)| {
+            let id = match kind {
+                0 => "run-config-step-add-build",
+                1 => "run-config-step-add-task",
+                _ => "run-config-step-add-config",
+            };
+            div()
+                .id((id, kind))
+                .debug_selector(move || id.to_owned())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_M))
+                .rounded(px(CONTROL_RADIUS))
+                .text_color(theme.text)
+                .hover({
+                    let hover = theme.hover;
+                    move |style| style.bg(hover)
+                })
+                .child(icon(row_icon, &theme))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let step = match kind {
+                        0 => BeforeLaunchStep::Build,
+                        1 => BeforeLaunchStep::Task {
+                            target: String::new(),
+                        },
+                        _ => BeforeLaunchStep::Configuration {
+                            name: String::new(),
+                        },
+                    };
+                    this.add_step(step, cx);
+                }))
+        });
+        let add_menu = self.steps_add_open.then(|| {
+            surface(&theme)
+                .mt(px(SPACE_XS))
+                .p(px(SPACE_XS))
+                .gap(px(2.))
+                .children(add_rows)
+                .into_any_element()
+        });
         let steps = div()
             .flex()
             .flex_col()
@@ -853,57 +1381,40 @@ impl Render for RunConfigDialog {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(SPACE_S))
+                    .gap(px(SPACE_XS))
                     .child(
                         div()
-                            .w(px(LABEL_WIDTH))
-                            .flex_none()
+                            .flex_1()
                             .text_color(theme.text_muted)
                             .child("Before launch"),
                     )
-                    .child(add_build)
-                    .child(add_task)
-                    .child(add_config),
+                    .child(add_step)
+                    .child(remove_step)
+                    .child(step_up)
+                    .child(step_down),
             )
-            .children(step_rows);
+            .children(add_menu)
+            .children(step_rows)
+            .when(step_selected.is_none() && !self.steps.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_muted)
+                        .child("Select a step to move or remove it"),
+                )
+            });
 
-        let multiple = {
-            let on = self.allow_multiple_instances;
-            let (hover, pressed) = (theme.hover, theme.pressed);
-            div()
-                .id("run-config-multiple")
-                .debug_selector(|| "run-config-multiple".to_owned())
-                .flex()
-                .items_center()
-                .gap(px(SPACE_S))
-                .h(px(FIELD_HEIGHT))
-                .cursor_pointer()
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(CHECKBOX))
-                        .h(px(CHECKBOX))
-                        .rounded(px(CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(if on {
-                            theme.accent
-                        } else {
-                            theme.control_border
-                        })
-                        .when(on, |this| this.bg(theme.accent)),
-                )
-                .child(
-                    div()
-                        .text_color(theme.text)
-                        .child("Allow multiple instances"),
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.allow_multiple_instances = !this.allow_multiple_instances;
-                    cx.notify();
-                }))
-        };
+        let multiple = checkbox_row(
+            "run-config-multiple",
+            "Allow multiple instances",
+            self.allow_multiple_instances,
+            &theme,
+        )
+        .debug_selector(|| "run-config-multiple".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.allow_multiple_instances = !this.allow_multiple_instances;
+            cx.notify();
+        }));
 
         let environment_active = self.active == self.rows.len() + 1;
         let environment = field_box(
@@ -1151,42 +1662,126 @@ impl Render for RunConfigDialog {
             })
             .collect::<Vec<_>>();
 
-        let add = small_button("run-config-add", "run-config-add".to_owned(), "+", &theme)
-            .on_click(cx.listener(|this, _, _, cx| this.add(cx)));
-        let copy = small_button(
+        let add = icon_button(
+            "run-config-add",
+            "general/add",
+            "Add New Configuration",
+            Some("Alt+Insert".into()),
+            &theme,
+        )
+        .debug_selector(|| "run-config-add".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| this.add(cx)));
+        let copy = icon_button(
             "run-config-copy",
-            "run-config-copy".to_owned(),
-            "Copy",
+            "general/copy",
+            "Copy Configuration",
+            Some("Ctrl+D".into()),
             &theme,
         )
+        .debug_selector(|| "run-config-copy".to_owned())
         .on_click(cx.listener(|this, _, _, cx| this.copy(cx)));
-        let remove = small_button(
+        let remove = icon_button(
             "run-config-remove",
-            "run-config-remove".to_owned(),
-            "Remove",
+            "general/minus",
+            "Remove Configuration",
+            Some("Delete".into()),
             &theme,
         )
+        .debug_selector(|| "run-config-remove".to_owned())
         .on_click(cx.listener(|this, _, _, cx| this.remove(cx)));
+        let save = icon_button(
+            "run-config-save",
+            "general/download",
+            "Save as Project File",
+            None,
+            &theme,
+        )
+        .debug_selector(|| "run-config-save".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| this.set_stored(true, cx)));
+        let move_up = icon_button(
+            "run-config-move-up",
+            "general/arrowUp",
+            "Move Up",
+            None,
+            &theme,
+        )
+        .debug_selector(|| "run-config-move-up".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| this.move_item(-1, cx)));
+        let move_down = icon_button(
+            "run-config-move-down",
+            "general/arrowDown",
+            "Move Down",
+            None,
+            &theme,
+        )
+        .debug_selector(|| "run-config-move-down".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| this.move_item(1, cx)));
+        let sort = icon_button(
+            "run-config-sort",
+            "general/filter",
+            "Sort Configurations",
+            None,
+            &theme,
+        )
+        .debug_selector(|| "run-config-sort".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| this.sort_items(cx)));
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .child(add)
+            .child(remove)
+            .child(copy)
+            .child(save)
+            .child(div().w(px(SPACE_S)))
+            .child(move_up)
+            .child(move_down)
+            .child(sort);
+        let store = checkbox_row(
+            "run-config-store",
+            "Store as project file",
+            self.item().is_some_and(|item| item.saved),
+            &theme,
+        )
+        .flex_none()
+        .debug_selector(|| "run-config-store".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            let stored = this.stores_file();
+            this.set_stored(!stored, cx);
+        }));
 
         let can_apply = self.problem().is_none();
-        let ok = dialog_button(
+        let apply_enabled = can_apply && self.dirty();
+        // A disabled OK takes no click: the problem of the configuration is shown above.
+        let mut ok = dialog_button(
             "run-config-ok",
             "run-config-ok".to_owned(),
             "OK",
             true,
             can_apply,
             &theme,
-        )
-        .on_click(cx.listener(|this, _, window, cx| this.apply(true, window, cx)));
-        let apply = dialog_button(
+        );
+        if can_apply {
+            ok = ok.on_click(cx.listener(|this, _, window, cx| this.apply(true, window, cx)));
+        }
+        let mut apply = dialog_button(
             "run-config-apply",
             "run-config-apply".to_owned(),
             "Apply",
             false,
-            can_apply,
+            apply_enabled,
             &theme,
-        )
-        .on_click(cx.listener(|this, _, window, cx| this.apply(false, window, cx)));
+        );
+        if apply_enabled {
+            apply =
+                apply.on_click(cx.listener(|this, _, window, cx| this.apply(false, window, cx)));
+        } else {
+            apply = apply.child(
+                div()
+                    .debug_selector(|| "run-config-apply-disabled".to_owned())
+                    .size(px(1.)),
+            );
+        }
 
         let shell = surface(&theme)
             .id("run-configs")
@@ -1216,6 +1811,8 @@ impl Render for RunConfigDialog {
                             .gap(px(SPACE_S))
                             .w(px(LIST_WIDTH))
                             .flex_none()
+                            .child(toolbar)
+                            .children(templates)
                             .child(
                                 scrollable(
                                     "run-config-list",
@@ -1228,22 +1825,12 @@ impl Render for RunConfigDialog {
                                         .gap(px(2.))
                                         .overflow_y_scroll()
                                         .track_scroll(&self.scroll_list)
-                                        .children(items),
+                                        .children(tree_rows),
                                     &theme,
                                     window,
                                     cx,
                                 )
                                 .flex_1(),
-                            )
-                            .children(templates)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(SPACE_S))
-                                    .child(add)
-                                    .child(copy)
-                                    .child(remove),
                             ),
                     )
                     .child(
@@ -1271,11 +1858,14 @@ impl Render for RunConfigDialog {
                                                 .text_color(theme.text_muted)
                                                 .child("Name"),
                                         )
-                                        .child(name),
+                                        .child(name)
+                                        .child(store),
                                 )
                                 .children(error)
-                                .child(steps)
+                                .child(section_header("Build and run", &theme))
+                                .children(rows)
                                 .children(compound)
+                                .child(section_header("Modify options", &theme))
                                 .child(
                                     div()
                                         .flex()
@@ -1291,7 +1881,15 @@ impl Render for RunConfigDialog {
                                         .child(environment),
                                 )
                                 .child(multiple)
-                                .children(rows),
+                                .child(section_header("Before launch", &theme))
+                                .child(steps)
+                                .child(section_header("Logs", &theme))
+                                .child(
+                                    div()
+                                        .text_size(px(TEXT_SMALL))
+                                        .text_color(theme.text_muted)
+                                        .child("The console output is shown in the Run window."),
+                                ),
                             &theme,
                             window,
                             cx,
@@ -1301,12 +1899,9 @@ impl Render for RunConfigDialog {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .flex_none()
-                    .gap(px(SPACE_M))
-                    .child(
+                DialogButtons::new()
+                    .primary(ok)
+                    .other(
                         dialog_button(
                             "run-config-cancel",
                             "run-config-cancel".to_owned(),
@@ -1317,8 +1912,8 @@ impl Render for RunConfigDialog {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     )
-                    .child(apply)
-                    .child(ok),
+                    .apply(apply)
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(
@@ -1341,6 +1936,18 @@ impl Render for RunConfigDialog {
             contents,
         )
     }
+}
+
+/// The title of one part of the form.
+fn section_header(label: &str, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .h(px(CONTROL_HEIGHT))
+        .mt(px(SPACE_S))
+        .text_color(theme.text)
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.to_owned())
 }
 
 /// A text input of the dialog.
@@ -1411,44 +2018,16 @@ fn small_button(
         .child(label.to_owned())
 }
 
-/// A button of the dialog: the primary one is filled with the accent, and a button that
-/// cannot be used now is grey and has no handler.
-fn dialog_button(
-    id: impl Into<ElementId>,
-    selector: String,
-    label: &str,
-    primary: bool,
-    enabled: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
-        .id(id)
-        .debug_selector(move || selector)
-        .flex()
-        .items_center()
-        .h(px(CONTROL_HEIGHT))
-        .px(px(SPACE_L))
-        .rounded(px(CONTROL_RADIUS))
-        .when(primary && enabled, |this| {
-            this.bg(theme.accent).text_color(theme.over_accent)
-        })
-        .when(primary && !enabled, |this| {
-            this.text_color(theme.text_disabled)
-                .border_1()
-                .border_color(theme.control_border)
-        })
-        .when(!primary && enabled, |this| {
-            this.border_1()
-                .border_color(theme.control_border)
-                .text_color(theme.text)
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-        })
-        .when(!primary && !enabled, |this| {
-            this.text_color(theme.text_disabled)
-                .border_1()
-                .border_color(theme.control_border)
-        })
-        .child(label.to_owned())
+#[cfg(test)]
+mod tests {
+    use super::slug_of;
+
+    #[test]
+    fn a_group_name_becomes_the_name_of_its_selector() {
+        assert_eq!(slug_of("Application"), "application");
+        assert_eq!(slug_of("Spring Boot"), "spring-boot");
+        assert_eq!(slug_of("Remote JVM Debug"), "remote-jvm-debug");
+        assert_eq!(slug_of("Shell/Command"), "shell-command");
+        assert_eq!(slug_of(""), "");
+    }
 }

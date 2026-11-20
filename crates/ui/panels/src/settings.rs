@@ -14,7 +14,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{McpToolChoice, Settings, Workspace};
 
-use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog, dialog_button};
+use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog};
 use crate::prompt::TextField;
 use crate::settings_catalog::{self, Setting, SettingField, SettingKind, SettingsPage};
 use crate::settings_file_types::{FileTypesPage, IGNORED_FIELD};
@@ -1203,6 +1203,12 @@ impl SettingsView {
         let templates =
             TemplateSection::section(self.page).is_some() && self.templates_page.key(event, cx);
         if keymap || templates {
+            cx.stop_propagation();
+            return;
+        }
+        // Enter presses OK, the primary button, unless a field of the window has the focus.
+        if event.keystroke.key == "enter" {
+            self.apply_draft(true, window, cx);
             cx.stop_propagation();
             return;
         }
@@ -3449,14 +3455,11 @@ impl Render for SettingsView {
             &theme,
         )
         .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
-        let buttons = div()
-            .flex()
-            .justify_end()
-            .flex_none()
-            .gap(px(SPACE_M))
-            .child(ok)
-            .child(cancel)
-            .child(apply);
+        let buttons = DialogButtons::new()
+            .primary(ok)
+            .other(cancel)
+            .apply(apply)
+            .into_row();
 
         let shell = surface(&theme)
             .id("settings")

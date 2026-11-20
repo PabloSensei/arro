@@ -407,34 +407,6 @@ fn check_box(checked: bool, theme: &Theme) -> Div {
         )
 }
 
-fn dialog_button(
-    id: impl Into<ElementId>,
-    selector: String,
-    label: &str,
-    primary: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
-        .id(id)
-        .debug_selector(move || selector)
-        .flex()
-        .items_center()
-        .h(px(CONTROL_HEIGHT))
-        .px(px(SPACE_L))
-        .rounded(px(CONTROL_RADIUS))
-        .when(primary, |this| {
-            this.bg(theme.accent).text_color(theme.over_accent)
-        })
-        .when(!primary, |this| {
-            this.border_1()
-                .border_color(theme.control_border)
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-        })
-        .child(label.to_owned())
-}
-
 impl Render for MoveMembersDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -615,32 +587,32 @@ impl Render for MoveMembersDialog {
             .children(target_rows)
             .children(note)
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
-                        dialog_button(
-                            "move-members-cancel",
-                            "move-members-cancel".to_owned(),
-                            "Cancel",
-                            false,
-                            &theme,
-                        )
-                        .tooltip(|_, cx| tooltip("Close without moving anything", None, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                    )
-                    .child(
+                DialogButtons::new()
+                    .primary(
                         dialog_button(
                             "move-members-refactor",
                             "move-members-refactor".to_owned(),
                             "Refactor",
                             true,
+                            !self.busy && !self.loading,
                             &theme,
                         )
                         .tooltip(|_, cx| tooltip("Move the chosen member into this type", None, cx))
                         .on_click(cx.listener(|this, _, window, cx| this.refactor(window, cx))),
-                    ),
+                    )
+                    .other(
+                        dialog_button(
+                            "move-members-cancel",
+                            "move-members-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .tooltip(|_, cx| tooltip("Close without moving anything", None, cx))
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
 
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));

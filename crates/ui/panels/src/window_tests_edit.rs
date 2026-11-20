@@ -612,6 +612,9 @@ fn the_project_tree_menu_creates_renames_deletes_and_copies(cx: &mut TestAppCont
     right_click(cx, window, "tree-row-src");
     click(cx, window, "menu-0");
     draw(cx, window);
+    // The New submenu of a project without source templates starts with File.
+    click(cx, window, "menu-0-0");
+    draw(cx, window);
     type_text(cx, window, "menu-made.txt");
     press(cx, window, "enter");
     cx.run_until_parked();
@@ -631,7 +634,7 @@ fn the_project_tree_menu_creates_renames_deletes_and_copies(cx: &mut TestAppCont
         "the new file is in the tree"
     );
     right_click(cx, window, "tree-row-menu-made.txt");
-    click(cx, window, "menu-4");
+    click(cx, window, "menu-3");
     draw(cx, window);
     press(
         cx,
@@ -653,7 +656,7 @@ fn the_project_tree_menu_creates_renames_deletes_and_copies(cx: &mut TestAppCont
     });
     show_project(cx, window);
     right_click(cx, window, "tree-row-menu-renamed.txt");
-    click(cx, window, "menu-9");
+    click(cx, window, "menu-8");
     assert_eq!(
         clipboard(cx).map(PathBuf::from),
         Some(renamed.clone()),
@@ -663,13 +666,13 @@ fn the_project_tree_menu_creates_renames_deletes_and_copies(cx: &mut TestAppCont
     // Reveal in Explorer goes through the platform of the toolkit; the test platform
     // records the call and starts nothing.
     ui_kit::clear_revealed_paths();
-    click(cx, window, "menu-10");
+    click(cx, window, "menu-9");
     draw(cx, window);
     assert_eq!(ui_kit::revealed_paths(), vec![renamed.clone()]);
 
     // Delete asks once and then takes the file away without the Recycle Bin.
     right_click(cx, window, "tree-row-menu-renamed.txt");
-    click(cx, window, "menu-5");
+    click(cx, window, "menu-4");
     draw(cx, window);
     press(cx, window, "enter");
     cx.run_until_parked();
@@ -916,7 +919,7 @@ fn the_tree_menu_opens_the_local_history_of_a_file(cx: &mut TestAppContext) {
     show_project(cx, window);
 
     right_click(cx, window, "tree-row-README.txt");
-    click(cx, window, "menu-7");
+    crate::window_tests_menus::click_menu_row(cx, window, "Local History...");
     cx.run_until_parked();
     draw(cx, window);
     let report = cx.update(|cx| crate::history_view::report(cx));

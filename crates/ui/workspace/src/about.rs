@@ -106,36 +106,8 @@ fn notice_files() -> Vec<PathBuf> {
         .collect()
 }
 
-fn dialog_button(
-    id: &'static str,
-    label: &'static str,
-    primary: bool,
-    enabled: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .h(px(CONTROL_HEIGHT))
-        .px(px(SPACE_L))
-        .rounded(px(CONTROL_RADIUS))
-        .when(primary && enabled, |this| {
-            this.bg(theme.accent).text_color(theme.over_accent)
-        })
-        .when(!primary && enabled, |this| {
-            this.border_1()
-                .border_color(theme.control_border)
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-        })
-        .when(!enabled, |this| this.text_color(theme.text_muted))
-        .child(label)
-}
-
 fn action(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
-    dialog_button(id, label, false, true, theme).debug_selector(move || format!("about-{id}"))
+    dialog_button(id, format!("about-{id}"), label, false, true, theme)
 }
 
 impl Render for AboutView {
@@ -148,12 +120,12 @@ impl Render for AboutView {
         let lines = self.lines();
         let notices = dialog_button(
             "about-notices",
+            "about-notices".to_owned(),
             "Third-Party Notices",
             false,
             self.has_notices(),
             &theme,
         )
-        .debug_selector(|| "about-notices".to_owned())
         .when(self.has_notices(), |this| {
             this.on_click(cx.listener(|this, _, _, _| this.open_notices()))
         });
@@ -188,30 +160,35 @@ impl Render for AboutView {
                     .child(SharedString::from(line))
             }))
             .child(
-                div()
-                    .mt(px(DIALOG_GAP))
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(SPACE_M))
-                    .child(action("copy", "Copy", &theme).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.copy(cx);
-                            cx.notify();
-                        },
-                    )))
-                    .child(notices)
-                    .child(
-                        action("support", "Support Arro", &theme).on_click(cx.listener(
-                            |_, _, _, _| {
-                                open_url(SUPPORT_URL);
+                div().mt(px(DIALOG_GAP)).child(
+                    DialogButtons::new()
+                        .extra(action("copy", "Copy", &theme).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.copy(cx);
+                                cx.notify();
                             },
-                        )),
-                    )
-                    .child(
-                        dialog_button("about-close", "Close", true, true, &theme)
-                            .debug_selector(|| "about-close".to_owned())
+                        )))
+                        .extra(notices)
+                        .extra(
+                            action("support", "Support Arro", &theme).on_click(cx.listener(
+                                |_, _, _, _| {
+                                    open_url(SUPPORT_URL);
+                                },
+                            )),
+                        )
+                        .primary(
+                            dialog_button(
+                                "about-close",
+                                "about-close".to_owned(),
+                                "Close",
+                                true,
+                                true,
+                                &theme,
+                            )
                             .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                    ),
+                        )
+                        .into_row(),
+                ),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(

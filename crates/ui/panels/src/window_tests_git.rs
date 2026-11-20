@@ -558,7 +558,7 @@ fn the_log_lists_commits_and_double_click_on_a_file_opens_its_diff(cx: &mut Test
     cx.run_until_parked();
     draw(cx, window);
     right_click(cx, window, "tree-row-README.txt");
-    click(cx, window, "menu-11");
+    crate::window_tests_menus::click_menu_row(cx, window, "Show History");
     wait_for(cx, "the log of the file", |cx| {
         cx.read(|cx| {
             let log = cx.global::<ActiveGitLog>().0.clone();

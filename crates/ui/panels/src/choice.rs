@@ -8,8 +8,6 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::Workspace;
 
-use crate::project_structure::dialog_button;
-
 const WIDTH: f32 = 460.;
 
 /// What a button of the dialog does after the dialog closes.
@@ -115,23 +113,23 @@ impl Render for ChoiceDialog {
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.3;
 
-        let buttons = self
-            .choices
-            .iter()
-            .enumerate()
-            .map(|(index, choice)| {
-                let selector = format!("choice-{index}");
-                dialog_button(
-                    ("choice-button", index),
-                    selector.clone(),
-                    choice.label,
-                    choice.primary,
-                    true,
-                    &theme,
-                )
-                .on_click(cx.listener(move |this, _, window, cx| this.choose(index, window, cx)))
-            })
-            .collect::<Vec<_>>();
+        let mut buttons = DialogButtons::new();
+        for (index, choice) in self.choices.iter().enumerate() {
+            let button = dialog_button(
+                ("choice-button", index),
+                format!("choice-{index}"),
+                choice.label,
+                choice.primary,
+                true,
+                &theme,
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.choose(index, window, cx)));
+            buttons = if choice.primary {
+                buttons.primary(button)
+            } else {
+                buttons.other(button)
+            };
+        }
 
         let shell = surface(&theme)
             .id("choice-dialog")
@@ -155,13 +153,7 @@ impl Render for ChoiceDialog {
                     .text_color(theme.text_secondary)
                     .child(self.text.clone()),
             )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .children(buttons),
-            );
+            .child(buttons.into_row());
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(
             DialogSpec {

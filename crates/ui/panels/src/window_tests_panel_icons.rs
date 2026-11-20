@@ -10,7 +10,7 @@ use ui_kit::metrics::ICON;
 use ui_kit::{ARRO, INTELLIJ, Theme, icon_file};
 use workspace::{PROJECT_TOOL, SystemAppearance, TERMINAL_TOOL, USAGES_TOOL, Workspace};
 
-use crate::window_tests::{bounds_of, draw, open_sample_window, press};
+use crate::window_tests::{bounds_of, click, draw, open_sample_window, press};
 use crate::window_tests_lang::project;
 use crate::window_tests_ui::wait_for;
 use crate::window_tests_usages_tabs::{UsageLanguage, open_language_window, tabs};
@@ -273,12 +273,12 @@ fn the_hide_button_shows_its_icon_under_the_pointer_and_hides_the_window(cx: &mu
         "the tools of a panel show only under the pointer"
     );
 
-    hover(cx, window, "left-panel-tools");
+    hover(cx, window, "project-hide");
     assert!(
         has(cx, window, hide),
         "the Hide icon of Project stays visible under the pointer"
     );
-    click_control(cx, window, "left-panel-hide");
+    click(cx, window, "project-hide");
     draw(cx, window);
     assert!(
         !tool_open(cx, window, PROJECT_TOOL),

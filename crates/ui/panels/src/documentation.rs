@@ -270,6 +270,8 @@ impl Render for DocumentationPanel {
         let theme = *cx.global::<Theme>();
         let style = EditorStyle::from_theme(&theme);
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), DOCUMENTATION_TOOL, |_| Vec::new());
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -301,26 +303,22 @@ impl Render for DocumentationPanel {
         } else {
             forward
         };
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .text_size(px(UI_SIZE))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(back)
-                    .child(forward)
-                    .child("Documentation"),
-            )
-            .child(panel_tools(GROUP, hide, &theme));
+        let header = tool_header(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .font_weight(FontWeight::MEDIUM)
+                .child(back)
+                .child(forward)
+                .child("Documentation"),
+            div(),
+            GROUP,
+            "documentation",
+            options,
+            hide,
+            &theme,
+        );
         let body = match &self.doc {
             Some(entry) => {
                 let weak = cx.entity().downgrade();

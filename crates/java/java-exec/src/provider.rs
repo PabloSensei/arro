@@ -230,6 +230,36 @@ impl RunConfigProvider for JavaProvider {
         }
     }
 
+    fn group_name(&self, config: &RunConfig) -> &'static str {
+        let target = Self::target(config);
+        if target.remote {
+            "Remote JVM Debug"
+        } else if target.spring_boot {
+            "Spring Boot"
+        } else {
+            "Application"
+        }
+    }
+
+    fn group_icon(&self, config: &RunConfig) -> &'static str {
+        let target = Self::target(config);
+        if target.remote {
+            "run/debug"
+        } else if target.spring_boot {
+            "run/springBoot"
+        } else {
+            "run/application"
+        }
+    }
+
+    fn template_icon(&self, template: &ConfigTemplate) -> &'static str {
+        if template.id == TEMPLATE_REMOTE {
+            "run/debug"
+        } else {
+            "run/application"
+        }
+    }
+
     fn discover(&self, model: &ProjectModel) -> Result<Vec<RunConfig>> {
         let jdk = self.jdk(model)?;
         let mut configs = Vec::new();

@@ -7,8 +7,6 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::Workspace;
 
-use crate::project_structure::dialog_button;
-
 pub use ui_kit::TextField;
 
 /// What Enter of a prompt without an option sends back.
@@ -17,11 +15,22 @@ type Submit = Rc<dyn Fn(String, &mut App)>;
 /// What Enter of a prompt with an option sends back.
 type SubmitOption = Rc<dyn Fn(String, bool, &mut App)>;
 
-/// What Enter of the prompt sends back: the text, and the tick of the option row when the
-/// prompt has one.
+/// What Enter of a prompt with a list of kinds sends back.
+type SubmitKind = Rc<dyn Fn(String, usize, &mut App)>;
+
+/// What Enter of the prompt sends back: the text, the tick of the option row when the
+/// prompt has one, and the kind of the list when it has one.
 enum Answer {
     Text(Submit),
     TextAndOption(SubmitOption),
+    TextAndKind(SubmitKind),
+}
+
+/// One row of the list under the field of a prompt, such as the kinds of a new source file.
+#[derive(Clone)]
+pub struct PromptKind {
+    pub label: SharedString,
+    pub icon: &'static str,
 }
 
 /// Where a prompt stands: in the middle of the window, or over the part of the window
@@ -40,6 +49,9 @@ pub struct Prompt {
     field: TextField,
     /// The tick under the field and whether it is on. New Branch asks for Checkout.
     option: Option<(SharedString, bool)>,
+    /// The kinds the field can create, and the one the keys are on.
+    kinds: Vec<PromptKind>,
+    kind: usize,
     /// Where the prompt stands on screen.
     place: Place,
     focus: FocusHandle,
@@ -62,6 +74,7 @@ impl Prompt {
             "",
             false,
             None,
+            Vec::new(),
             Answer::Text(Rc::new(submit)),
             workspace,
             window,
@@ -84,6 +97,7 @@ impl Prompt {
             text,
             false,
             None,
+            Vec::new(),
             Answer::Text(Rc::new(submit)),
             workspace,
             window,
@@ -110,7 +124,61 @@ impl Prompt {
             "",
             false,
             Some((option.to_string().into(), checked)),
+            Vec::new(),
             Answer::TextAndOption(Rc::new(submit)),
+            workspace,
+            window,
+            cx,
+        );
+    }
+
+    /// Like [`Prompt::show`] with the list of kinds under the field: the arrows move the
+    /// chosen kind, and Enter sends it with the text. The dialog of a new class asks this
+    /// way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_with_kinds(
+        title: &str,
+        hint: &str,
+        kinds: Vec<PromptKind>,
+        chosen: usize,
+        submit: impl Fn(String, usize, &mut App) + 'static,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::open_kinds(
+            title,
+            hint,
+            kinds,
+            chosen,
+            Answer::TextAndKind(Rc::new(submit)),
+            workspace,
+            window,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_kinds(
+        title: &str,
+        hint: &str,
+        kinds: Vec<PromptKind>,
+        chosen: usize,
+        submit: Answer,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::open_at(
+            title,
+            hint,
+            "",
+            false,
+            None,
+            kinds,
+            chosen,
+            submit,
+            Place::Center,
             workspace,
             window,
             cx,
@@ -155,6 +223,8 @@ impl Prompt {
             "",
             true,
             None,
+            Vec::new(),
+            0,
             Answer::Text(Rc::new(submit)),
             place,
             workspace,
@@ -170,6 +240,7 @@ impl Prompt {
         text: &str,
         confirm: bool,
         option: Option<(SharedString, bool)>,
+        kinds: Vec<PromptKind>,
         submit: Answer,
         workspace: &mut Workspace,
         window: &mut Window,
@@ -181,6 +252,8 @@ impl Prompt {
             text,
             confirm,
             option,
+            kinds,
+            0,
             submit,
             Place::Center,
             workspace,
@@ -196,6 +269,8 @@ impl Prompt {
         text: &str,
         confirm: bool,
         option: Option<(SharedString, bool)>,
+        kinds: Vec<PromptKind>,
+        chosen: usize,
         submit: Answer,
         place: Place,
         workspace: &mut Workspace,
@@ -205,12 +280,15 @@ impl Prompt {
         let weak = cx.weak_entity();
         let (title, hint) = (title.to_string(), hint.to_string());
         let text = text.to_string();
-        let view = cx.new(|cx| Self {
+        let chosen = chosen.min(kinds.len().saturating_sub(1));
+        let view = cx.new(move |cx| Self {
             title: title.into(),
             hint: hint.into(),
             confirm,
             field: TextField::from_text(text),
             option,
+            kinds,
+            kind: chosen,
             place,
             focus: cx.focus_handle(),
             workspace: weak,
@@ -233,6 +311,7 @@ impl Prompt {
                 let checked = self.option.as_ref().is_some_and(|(_, on)| *on);
                 submit(text, checked, cx);
             }
+            Answer::TextAndKind(submit) => submit(text, self.kind, cx),
         }
         self.close(window, cx);
     }
@@ -242,6 +321,14 @@ impl Prompt {
             self.confirm_answer(window, cx);
         } else if event.keystroke.key == "escape" {
             self.close(window, cx);
+        } else if !self.kinds.is_empty() && event.keystroke.key == "down" {
+            self.kind = (self.kind + 1).min(self.kinds.len() - 1);
+            cx.stop_propagation();
+            cx.notify();
+        } else if !self.kinds.is_empty() && event.keystroke.key == "up" {
+            self.kind = self.kind.saturating_sub(1);
+            cx.stop_propagation();
+            cx.notify();
         } else if !self.confirm && self.field.key_with_clipboard(event, false, cx) {
             cx.stop_propagation();
             cx.notify();
@@ -299,6 +386,47 @@ impl Render for Prompt {
                     cx.notify();
                 }))
         });
+        let kinds = (!self.kinds.is_empty()).then(|| {
+            let rows = self.kinds.iter().enumerate().map(|(index, kind)| {
+                let chosen = index == self.kind;
+                let label = kind.label.clone();
+                let row_icon = kind.icon;
+                div()
+                    .id(("prompt-kind", index))
+                    .debug_selector(move || format!("prompt-kind-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_M))
+                    .rounded(px(ROW_RADIUS))
+                    .cursor_pointer()
+                    .text_color(theme.text)
+                    .when(chosen, |this| this.bg(theme.selection))
+                    .when(!chosen, |this| {
+                        let hover = theme.hover;
+                        this.hover(move |style| style.bg(hover))
+                    })
+                    .child(icon(row_icon, &theme))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kind = index;
+                        cx.notify();
+                    }))
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(theme.text_muted)
+                        .child("Kind"),
+                )
+                .children(rows)
+                .into_any_element()
+        });
         let title = self.title.clone();
         let shell = surface(&theme)
             .id("prompt")
@@ -340,25 +468,12 @@ impl Render for Prompt {
                     .when(empty, |this| this.child(self.hint.clone()))
                     .into_any_element()
             })
-            .children(option);
+            .children(option)
+            .children(kinds);
         let buttons = self.confirm.then(|| {
             let label = self.title.to_string();
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(SPACE_M))
-                .child(
-                    dialog_button(
-                        ("prompt-cancel", 0usize),
-                        "prompt-cancel".to_owned(),
-                        "Cancel",
-                        false,
-                        true,
-                        &theme,
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                )
-                .child(
+            DialogButtons::new()
+                .primary(
                     dialog_button(
                         ("prompt-confirm", 0usize),
                         "prompt-confirm".to_owned(),
@@ -369,6 +484,18 @@ impl Render for Prompt {
                     )
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_answer(window, cx))),
                 )
+                .other(
+                    dialog_button(
+                        ("prompt-cancel", 0usize),
+                        "prompt-cancel".to_owned(),
+                        "Cancel",
+                        false,
+                        true,
+                        &theme,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                )
+                .into_row()
         });
         let contents = contents.children(buttons);
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));

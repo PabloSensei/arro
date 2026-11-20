@@ -8,7 +8,9 @@ pub use gpui_kit::*;
 pub use ::theme::{metrics, motion, snapped_code_size};
 
 mod dialog;
+mod dialog_buttons;
 mod embedded;
+mod floating;
 pub mod icon_sets;
 mod motions;
 mod palette;
@@ -22,8 +24,10 @@ mod test_bounds;
 mod text_field;
 mod widgets;
 
-pub use dialog::{DialogPlace, DialogPlaces, DialogSpec, dialog_window};
+pub use dialog::{DialogSpec, dialog_window};
+pub use dialog_buttons::{DialogButtons, dialog_button};
 pub use embedded::{Assets, app, init};
+pub use floating::{DialogPlace, DialogPlaces, PopupSpec, popup_drag_header, popup_window};
 pub use icon_sets::{ARRO, INTELLIJ, IconCatalog, IconSet, icon_file};
 pub use motions::{Slide, smoothstep};
 pub use palette::{

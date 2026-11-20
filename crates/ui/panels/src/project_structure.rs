@@ -1667,47 +1667,6 @@ fn small_button(
         .child(label.to_owned())
 }
 
-/// A button of the dialog: the primary one is filled with the accent.
-pub(crate) fn dialog_button(
-    id: impl Into<ElementId>,
-    selector: String,
-    label: &str,
-    primary: bool,
-    enabled: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
-        .id(id)
-        .debug_selector(move || selector)
-        .flex()
-        .items_center()
-        .h(px(CONTROL_HEIGHT))
-        .px(px(SPACE_L))
-        .rounded(px(CONTROL_RADIUS))
-        .when(primary && enabled, |this| {
-            this.bg(theme.accent).text_color(theme.over_accent)
-        })
-        .when(primary && !enabled, |this| {
-            this.text_color(theme.text_disabled)
-                .border_1()
-                .border_color(theme.control_border)
-        })
-        .when(!primary && enabled, |this| {
-            this.border_1()
-                .border_color(theme.control_border)
-                .text_color(theme.text)
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-        })
-        .when(!primary && !enabled, |this| {
-            this.text_color(theme.text_disabled)
-                .border_1()
-                .border_color(theme.control_border)
-        })
-        .child(label.to_owned())
-}
-
 impl Render for ProjectStructureDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -1844,13 +1803,11 @@ impl Render for ProjectStructureDialog {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(cancel)
-                    .child(apply)
-                    .child(ok),
+                DialogButtons::new()
+                    .primary(ok)
+                    .other(cancel)
+                    .apply(apply)
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(

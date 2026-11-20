@@ -6,7 +6,6 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{STACK_TRACE_TOOL, Workspace};
 
-use crate::project_structure::dialog_button;
 use crate::prompt::TextField;
 use crate::stack_traces::ActiveStackTrace;
 
@@ -166,11 +165,19 @@ impl Render for StackTraceDialog {
             )
             .child(field)
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "stack-trace-ok",
+                            "stack-trace-ok".to_owned(),
+                            "OK",
+                            true,
+                            !empty,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    )
+                    .other(
                         dialog_button(
                             "stack-trace-cancel",
                             "stack-trace-cancel".to_owned(),
@@ -181,17 +188,7 @@ impl Render for StackTraceDialog {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     )
-                    .child(
-                        dialog_button(
-                            "stack-trace-ok",
-                            "stack-trace-ok".to_owned(),
-                            "OK",
-                            true,
-                            !empty,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                    ),
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(

@@ -274,7 +274,8 @@ fn the_class_template_of_the_page_makes_a_new_file(cx: &mut TestAppContext) {
     draw(cx, window);
     press(cx, window, "alt-insert");
     draw(cx, window);
-    click(cx, window, "menu-2");
+    // The source template comes first in the New list of this project.
+    click(cx, window, "menu-0");
     draw(cx, window);
     type_text(cx, window, "Thing");
     press(cx, window, "enter");

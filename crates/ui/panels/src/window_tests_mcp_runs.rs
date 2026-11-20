@@ -63,7 +63,7 @@ impl BuildSystem for FailingTool {
     }
 }
 
-fn failing_tool(root: &Path) -> Arc<dyn BuildSystem> {
+pub(crate) fn failing_tool(root: &Path) -> Arc<dyn BuildSystem> {
     Arc::new(FailingTool(ProjectModel {
         root: root.to_path_buf(),
         tool: "fixture".into(),
@@ -112,7 +112,7 @@ impl TestProvider for FixtureTests {
     }
 }
 
-fn scope(root: &Path) -> SessionScope {
+pub(crate) fn scope(root: &Path) -> SessionScope {
     SessionScope {
         session: "mcp-runs".to_string(),
         project: root.to_path_buf(),
@@ -121,7 +121,9 @@ fn scope(root: &Path) -> SessionScope {
 }
 
 /// The gateway of the window, over the language tools the window filled in.
-fn gateway(cx: &mut TestAppContext) -> (Arc<ToolGateway>, Arc<crate::mcp_approval::McpApprovals>) {
+pub(crate) fn gateway(
+    cx: &mut TestAppContext,
+) -> (Arc<ToolGateway>, Arc<crate::mcp_approval::McpApprovals>) {
     let agents = cx.read(|cx| cx.global::<ActiveAgents>().0.clone());
     let approvals = agents.read_with(cx, |panel, _| panel.approvals.clone());
     let tools = cx.read(|cx| cx.global::<AgentLanguages>().0.clone());
@@ -133,18 +135,21 @@ fn gateway(cx: &mut TestAppContext) -> (Arc<ToolGateway>, Arc<crate::mcp_approva
     (gateway, approvals)
 }
 
-fn wait_for_question(cx: &mut TestAppContext, approvals: &crate::mcp_approval::McpApprovals) {
+pub(crate) fn wait_for_question(
+    cx: &mut TestAppContext,
+    approvals: &crate::mcp_approval::McpApprovals,
+) {
     wait_for(cx, "the question of the tool", |_| {
         approvals.pending().is_some()
     });
 }
 
-fn answer(cx: &mut TestAppContext, reply: Reply) {
+pub(crate) fn answer(cx: &mut TestAppContext, reply: Reply) {
     let agents = cx.read(|cx| cx.global::<ActiveAgents>().0.clone());
     agents.update(cx, |panel, cx| panel.answer_mcp_question(reply, cx));
 }
 
-fn wait_for_call<T: Send + 'static>(
+pub(crate) fn wait_for_call<T: Send + 'static>(
     cx: &mut TestAppContext,
     what: &str,
     join: thread::JoinHandle<T>,

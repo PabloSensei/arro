@@ -1329,6 +1329,10 @@ pub(crate) struct SignaturePopup {
     pub at: usize,
     pub help: SignatureHelp,
     pub selected: usize,
+    /// The parameter the caret is in, as the last answer said. It belongs to the call
+    /// rather than to the overload, so picking another overload by hand keeps the bold
+    /// parameter in step with the caret.
+    caret_parameter: usize,
     pub parameter: usize,
 }
 
@@ -1338,14 +1342,15 @@ impl SignaturePopup {
             return None;
         }
         let selected = help.active_signature.min(help.signatures.len() - 1);
+        let caret_parameter = help.active_parameter;
         let parameter = help.signatures.get(selected).map_or(0, |signature| {
-            help.active_parameter
-                .min(signature.parameters.len().saturating_sub(1))
+            caret_parameter.min(signature.parameters.len().saturating_sub(1))
         });
         Some(Self {
             at,
             help,
             selected,
+            caret_parameter,
             parameter,
         })
     }
@@ -2097,10 +2102,11 @@ pub(crate) async fn first<T>(mut replies: Replies<T>) -> Option<(T, Confidence)>
     Some((answer.value, answer.confidence))
 }
 
-/// Keeps the active parameter inside the overload the user picked.
+/// Keeps the active parameter inside the overload the user picked: the caret says which
+/// argument it is in, the overload says how many arguments it has.
 fn maybe_clamp_parameter(popup: &mut SignaturePopup) {
     let count = popup.signature().parameters.len();
-    popup.parameter = popup.parameter.min(count.saturating_sub(1));
+    popup.parameter = popup.caret_parameter.min(count.saturating_sub(1));
 }
 
 impl EditorView {
@@ -3872,10 +3878,6 @@ impl EditorView {
             return;
         };
         let support = lsp.support.clone();
-        let selected_before = lsp
-            .signatures
-            .as_ref()
-            .map(|popup| popup.signature().label.clone());
         lsp.signature_asked += 1;
         let asked = lsp.signature_asked;
         if support.signature_info().is_none() {
@@ -3899,11 +3901,13 @@ impl EditorView {
                 let Some((help, _)) = answer else {
                     return;
                 };
-                let keep = selected_before.or_else(|| {
-                    lsp.signatures
-                        .as_ref()
-                        .map(|popup| popup.signature().label.clone())
-                });
+                // The popup may have changed while the answer was on its way: an
+                // answer to an older question must not take the overload the user
+                // picked by hand.
+                let keep = lsp
+                    .signatures
+                    .as_ref()
+                    .map(|popup| popup.signature().label.clone());
                 let mut popup = SignaturePopup::new(caret, help);
                 if let Some(popup) = &mut popup
                     && let Some(keep) = keep

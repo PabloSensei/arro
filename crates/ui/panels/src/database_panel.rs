@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use ::base::Cancel;
 use database::{
     Column, Command, Dialect, DownloadProgress, Driver, DriverKind, Event, ExplainNode,
-    ExplainPlan, ExportFormat, Exporter, MAX_RESULT_BYTES, MAX_RESULT_ROWS, Param, PasswordStore,
-    ResultSet, Secret, Session, Source, SourceId, SourceStore, Suggestion, Support,
-    SystemPasswords, Table, TableRef, Value, VendorTemplate, asked_parameters, bind_parameters,
+    ExplainPlan, ExportFormat, Exporter, Launch, MAX_RESULT_BYTES, MAX_RESULT_ROWS, Param,
+    PasswordStore, ResultSet, Secret, Session, Source, SourceId, SourceStore, Suggestion, Support,
+    SystemPasswords, Table, TableRef, Value, asked_parameters, bind_parameters,
 };
 use editor_view::{EditorView, ExtraTemplates, FileBar, RunFiles};
 use lang_api::{
@@ -36,6 +36,9 @@ use ui_kit::*;
 use workspace::{DATABASE_TOOL, Settings, Stop, Workspace};
 
 use crate::database_data::DatabaseDataView;
+use crate::database_sources::{
+    DataSourcesDialog, Opening, Snapshot, SourceChange, SourceEdit, probe_outcome,
+};
 use crate::mcp_database::{DatabaseBridge, Job as DatabaseJob};
 
 /// The panel of the window, for scripts and for tests.
@@ -157,108 +160,6 @@ const CELL_WIDTH: f32 = 160.;
 const TREE_WIDTH: f32 = 240.;
 /// The height of a field of the form.
 const FIELD_HEIGHT: f32 = 26.;
-
-/// One field of the new source form.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Field {
-    Name,
-    Url,
-    User,
-    Password,
-    Driver,
-    Version,
-}
-
-impl Field {
-    fn next(self) -> Self {
-        match self {
-            Self::Name => Self::Url,
-            Self::Url => Self::User,
-            Self::User => Self::Password,
-            Self::Password => Self::Driver,
-            Self::Driver => Self::Version,
-            Self::Version => Self::Name,
-        }
-    }
-}
-
-/// The form behind `+`, kept in the memory of the window: the password reaches the store
-/// of the system only when `save_password` is on.
-struct Dialog {
-    kind: DriverKind,
-    module: Option<String>,
-    name: TextField,
-    url: TextField,
-    user: TextField,
-    password: TextField,
-    driver: TextField,
-    /// The version of the driver to download; the newest stable one fills it when the
-    /// list of the repository arrives.
-    version: TextField,
-    /// The stable versions the repository offers, newest first.
-    versions: Vec<String>,
-    /// The kind whose versions the list holds, so an answer for another kind is dropped.
-    versions_for: Option<DriverKind>,
-    /// A request for the versions of the kind is in flight.
-    versions_loading: bool,
-    /// Why the versions could not be read, when they were not.
-    versions_error: Option<String>,
-    /// Why the last download of the form failed.
-    driver_error: Option<String>,
-    field: Field,
-    save_password: bool,
-}
-
-impl Dialog {
-    fn new(kind: DriverKind, vendors: &[VendorTemplate], save_password: bool) -> Self {
-        let mut dialog = Self {
-            kind,
-            module: None,
-            name: TextField::default(),
-            url: TextField::default(),
-            user: TextField::default(),
-            password: TextField::default(),
-            driver: TextField::default(),
-            version: TextField::default(),
-            versions: Vec::new(),
-            versions_for: None,
-            versions_loading: false,
-            versions_error: None,
-            driver_error: None,
-            field: Field::Url,
-            save_password,
-        };
-        dialog.template(vendors);
-        dialog
-    }
-
-    fn template(&mut self, vendors: &[VendorTemplate]) {
-        let Some(vendor) = vendors.iter().find(|vendor| vendor.kind == self.kind) else {
-            return;
-        };
-        let url = vendor
-            .url_template
-            .replace("{host}", &vendor.host)
-            .replace(
-                "{port}",
-                &vendor.port.map(|port| port.to_string()).unwrap_or_default(),
-            )
-            .replace("{database}", "database")
-            .replace("{file}", "~/test");
-        self.url = TextField::from_text(url);
-    }
-
-    fn field(&mut self, field: Field) -> &mut TextField {
-        match field {
-            Field::Name => &mut self.name,
-            Field::Url => &mut self.url,
-            Field::User => &mut self.user,
-            Field::Password => &mut self.password,
-            Field::Driver => &mut self.driver,
-            Field::Version => &mut self.version,
-        }
-    }
-}
 
 /// A statement the window sends, with the row limit that goes with it.
 type SentQuery = (String, Option<usize>);
@@ -652,13 +553,19 @@ fn group_digits(value: u64) -> String {
 /// The answer of a download: the version and the jar, or the reason it failed.
 type DownloadAnswer = Result<(String, PathBuf), String>;
 
-/// A driver download in flight. The window shows its bytes each tick and stops it on
-/// request; the work itself is on a background thread and never waits for a frame.
+/// Where the file of a driver download goes: the source that waits for it, or the form of the
+/// Data Sources window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DownloadTarget {
+    Source(SourceId),
+    Form(DriverKind),
+}
+
+/// A driver download in flight. The window shows its bytes each tick and stops it on request;
+/// the work itself is on a background thread and never waits for a frame.
 struct DriverDownload {
-    /// The source that waits for the driver; `None` for the form.
-    source: Option<SourceId>,
-    /// The form gets the file in its driver field.
-    form: bool,
+    /// Where the file goes when the download ends.
+    target: DownloadTarget,
     kind: DriverKind,
     /// What the button asked for; `None` is the newest stable version.
     version: Option<String>,
@@ -666,6 +573,49 @@ struct DriverDownload {
     cancel: Cancel,
     /// The version and the jar of a finished download, or the reason it failed.
     result: Arc<Mutex<Option<DownloadAnswer>>>,
+}
+
+/// The driver download of the Data Sources window, as the window reads it.
+#[derive(Clone)]
+pub(crate) struct FormDownload {
+    /// A download of the window is in flight.
+    pub running: bool,
+    /// How far the download has come.
+    pub text: Option<String>,
+    /// The last answer of a download of the window: its serial, the product, and the file or
+    /// the reason it failed.
+    pub answer: Option<(u64, DriverKind, DownloadAnswer)>,
+}
+
+/// How long a Test Connection waits for the helper to answer.
+const PROBE_LIMIT: Duration = Duration::from_secs(30);
+/// The id of the one request a Test Connection sends.
+const PROBE_ID: u64 = 1;
+
+/// Starts the helper that `launch` names, asks it to connect, and reads its answer. The session
+/// is dropped with the answer, which closes the helper.
+fn probe_with_helper(
+    launch: Result<Launch, String>,
+    url: String,
+    user: String,
+    password: Secret,
+) -> Result<String, String> {
+    let session = Session::start(launch?).map_err(|error| error.to_string())?;
+    session
+        .send(Command::Connect {
+            id: PROBE_ID,
+            url,
+            user,
+            password,
+            properties: Vec::new(),
+        })
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + PROBE_LIMIT;
+    let events = std::iter::from_fn(|| {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        session.events().recv_timeout(left).ok()
+    });
+    probe_outcome(events)
 }
 
 pub struct DatabasePanel {
@@ -743,7 +693,12 @@ pub struct DatabasePanel {
     /// What the window learned about the store when it was built.
     secrets: Secrets,
     status: Option<String>,
-    dialog: Option<Dialog>,
+    /// How many answers the downloads of the Data Sources window gave, and the last one with
+    /// the product it was for.
+    form_serial: u64,
+    form_answer: Option<(u64, DriverKind, DownloadAnswer)>,
+    /// The answers a probe gives instead of a helper, for the window tests.
+    probe_script: Option<Vec<Event>>,
     /// The download of a driver that is in flight, if any.
     driver_download: Option<DriverDownload>,
     /// The migration files of the project, the checks over them and the actions of their
@@ -845,7 +800,9 @@ impl DatabasePanel {
                 password_jobs: Arc::new(PasswordJobs::default()),
                 secrets: Secrets::Checking,
                 status: None,
-                dialog: None,
+                form_serial: 0,
+                form_answer: None,
+                probe_script: None,
                 driver_download: None,
                 migrations: MigrationModel::default(),
                 migrations_open: true,
@@ -1893,15 +1850,6 @@ impl DatabasePanel {
             .then(|| driver_message(source))
     }
 
-    /// The version of the driver in the open form, for the window tests.
-    #[cfg(test)]
-    pub(crate) fn dialog_version_for_test(&self) -> Option<String> {
-        self.dialog
-            .as_ref()
-            .map(|dialog| dialog.version.text.trim().to_owned())
-            .filter(|version| !version.is_empty())
-    }
-
     /// Whether the store of passwords of the test is ready, for the window tests.
     #[cfg(test)]
     pub(crate) fn password_storage_ready_for_test(&self) -> bool {
@@ -1927,12 +1875,6 @@ impl DatabasePanel {
         self.passwords
             .get(source)
             .map(|password| password.expose().to_owned())
-    }
-
-    /// The Save password flag of the open form, for the window tests.
-    #[cfg(test)]
-    pub(crate) fn dialog_save_password_for_test(&self) -> Option<bool> {
-        self.dialog.as_ref().map(|dialog| dialog.save_password)
     }
 
     /// The sources and the selected one, without a connection, for the window tests.
@@ -2756,85 +2698,25 @@ impl DatabasePanel {
         .detach();
     }
 
-    /// Reads the stable versions of the driver of the form in the background, so the
-    /// field shows one and the user may pick another.
-    fn load_versions(&mut self, cx: &mut Context<Self>) {
-        let Some(support) = self.support.clone() else {
-            return;
-        };
-        let Some(kind) = self.dialog.as_ref().map(|dialog| dialog.kind) else {
-            return;
-        };
-        if self.package_of(kind).is_none() {
-            if let Some(dialog) = &mut self.dialog
-                && dialog.kind == kind
-            {
-                dialog.versions.clear();
-                dialog.versions_for = None;
-                dialog.versions_error = None;
-            }
-            return;
-        }
-        let Some(dialog) = &mut self.dialog else {
-            return;
-        };
-        if dialog.versions_loading || dialog.versions_for == Some(kind) {
-            return;
-        }
-        dialog.versions_loading = true;
-        dialog.versions_for = Some(kind);
-        dialog.versions.clear();
-        dialog.versions_error = None;
-        let job = cx
-            .background_executor()
-            .spawn(async move { support.versions(kind) });
-        cx.spawn(async move |this, cx| {
-            let answer = job.await;
-            this.update(cx, |this, cx| {
-                let Some(dialog) = &mut this.dialog else {
-                    return;
-                };
-                if dialog.kind != kind {
-                    return;
-                }
-                dialog.versions_loading = false;
-                match answer {
-                    Ok(versions) => {
-                        if dialog.version.text.trim().is_empty()
-                            && let Some(newest) = versions.first()
-                        {
-                            dialog.version = TextField::from_text(newest.clone());
-                        }
-                        dialog.versions = versions;
-                    }
-                    Err(reason) => dialog.versions_error = Some(reason),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Downloads the driver of the source, or of the form when `form` is set. The work
-    /// is on a background thread; the window shows its bytes and stops it on request.
+    /// Downloads the driver of the source, or of the form, in the background. The window shows
+    /// its bytes each tick and stops it on request; the work itself is on a background thread
+    /// and never waits for a frame.
     fn start_download(
         &mut self,
-        source: Option<SourceId>,
-        form: bool,
+        target: DownloadTarget,
         version: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if self.driver_download.is_some() {
             return;
         }
-        let kind = if form {
-            self.dialog.as_ref().map(|dialog| dialog.kind)
-        } else {
-            source
-                .as_ref()
-                .and_then(|source| self.sources.iter().find(|known| &known.id == source))
-                .map(|source| source.kind)
+        let kind = match &target {
+            DownloadTarget::Source(source) => self
+                .sources
+                .iter()
+                .find(|known| &known.id == source)
+                .map(|source| source.kind),
+            DownloadTarget::Form(kind) => Some(*kind),
         };
         let Some(kind) = kind else {
             return;
@@ -2849,9 +2731,6 @@ impl DatabasePanel {
             cx.notify();
             return;
         }
-        if form && let Some(dialog) = &mut self.dialog {
-            dialog.driver_error = None;
-        }
         let progress = Arc::new(DownloadProgress::new());
         let cancel = Cancel::new();
         let done = Arc::new(AtomicBool::new(false));
@@ -2863,8 +2742,7 @@ impl DatabasePanel {
         let job_result = result.clone();
         let watch_done = done.clone();
         self.driver_download = Some(DriverDownload {
-            source,
-            form,
+            target,
             kind,
             version,
             progress,
@@ -2914,71 +2792,88 @@ impl DatabasePanel {
         .detach();
     }
 
-    /// Puts the answer of a finished download in its source or its form.
+    /// Puts the answer of a finished download in its source, or keeps it for the Data Sources
+    /// window that asked for the driver of its form.
     fn finish_download(&mut self, cx: &mut Context<Self>) {
         let Some(run) = self.driver_download.take() else {
             return;
         };
-        let answer = run.result.lock().ok().and_then(|mut slot| slot.take());
-        match answer {
-            Some(Ok((version, jar))) => {
-                if let Some(id) = &run.source {
-                    if let Some(source) = self.sources.iter_mut().find(|source| &source.id == id) {
-                        source.driver_jar = Some(jar.clone());
+        let answer = run
+            .result
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_else(|| Err("The download ended without a file.".to_owned()));
+        match run.target {
+            DownloadTarget::Source(id) => match answer {
+                Ok((_, jar)) => {
+                    if let Some(source) = self.sources.iter_mut().find(|source| source.id == id) {
+                        source.driver_jar = Some(jar);
                     }
-                    self.errors.remove(id);
-                    self.driver_failed.remove(id);
+                    self.errors.remove(&id);
+                    self.driver_failed.remove(&id);
                     self.save_sources(cx);
-                    // A source that waited for its driver goes on to the helper as soon
-                    // as the file is in place.
+                    // A source that waited for its driver goes on to the helper as soon as the
+                    // file is in place.
                     let password = self
                         .passwords
-                        .get(id)
+                        .get(&id)
                         .cloned()
                         .unwrap_or_else(|| Secret::new(""));
                     if let Some(source) =
-                        self.sources.iter().find(|source| &source.id == id).cloned()
+                        self.sources.iter().find(|source| source.id == id).cloned()
                     {
                         self.connect_source(source, password, cx);
                     }
+                    self.status = Some("The driver is downloaded.".to_owned());
                 }
-                if run.form
-                    && let Some(dialog) = &mut self.dialog
-                {
-                    dialog.version = TextField::from_text(version);
-                    dialog.driver = TextField::from_text(jar.display().to_string());
-                    dialog.driver_error = None;
+                Err(error) => {
+                    self.errors.insert(id, error.clone());
+                    self.status = Some(error);
                 }
-                self.status = Some("The driver is downloaded.".to_owned());
-            }
-            Some(Err(error)) => {
-                if let Some(id) = &run.source {
-                    self.errors.insert(id.clone(), error.clone());
-                }
-                if run.form
-                    && let Some(dialog) = &mut self.dialog
-                {
-                    dialog.driver_error = Some(error.clone());
-                }
-                self.status = Some(error);
-            }
-            None => {
-                let message = "The download ended without a file.".to_owned();
-                if let Some(id) = run.source {
-                    self.errors.insert(id, message.clone());
-                }
-                self.status = Some(message);
+            },
+            DownloadTarget::Form(kind) => {
+                self.status = Some(match &answer {
+                    Ok(_) => "The driver is downloaded.".to_owned(),
+                    Err(error) => error.clone(),
+                });
+                self.form_serial += 1;
+                self.form_answer = Some((self.form_serial, kind, answer));
             }
         }
         cx.notify();
     }
 
-    fn cancel_download(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn cancel_download(&mut self, cx: &mut Context<Self>) {
         if let Some(run) = &self.driver_download {
             run.cancel.cancel();
             self.status = Some("Stopping the download…".into());
             cx.notify();
         }
+    }
+
+    /// The driver download of the Data Sources window and the last answer it had, as the
+    /// window reads them.
+    pub(crate) fn form_download(&self) -> FormDownload {
+        let run = self
+            .driver_download
+            .as_ref()
+            .filter(|run| matches!(run.target, DownloadTarget::Form(_)));
+        FormDownload {
+            running: run.is_some(),
+            text: run.map(download_text),
+            answer: self.form_answer.clone(),
+        }
+    }
+
+    /// Starts the download of the driver of `kind` for the Data Sources window.
+    pub(crate) fn start_form_download(
+        &mut self,
+        kind: DriverKind,
+        version: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_download(DownloadTarget::Form(kind), version, cx);
     }
 
     /// Disconnects a source as its toolbar button does: an open transaction asks first.
@@ -3889,12 +3784,19 @@ impl DatabasePanel {
         let panel = cx.entity();
         let console = panel.clone();
         let console_source = source.id.clone();
+        let properties = panel.clone();
+        let properties_source = source.id.clone();
         let remove = panel;
         let remove_source = source.id.clone();
         let entries = vec![
             MenuEntry::new("Open Console", move |window, cx| {
                 console.update(cx, |panel, cx| {
                     panel.open_console(console_source.clone(), window, cx)
+                });
+            }),
+            MenuEntry::new("Properties", move |_, cx| {
+                properties.update(cx, |panel, cx| {
+                    panel.open_data_sources(Opening::Edit(properties_source.clone()), cx)
                 });
             }),
             MenuEntry::new("Remove", move |_, cx| {
@@ -4428,54 +4330,181 @@ impl DatabasePanel {
         });
     }
 
-    fn add_source(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.dialog.take() else {
+    /// The state the Data Sources window starts from, read now.
+    pub(crate) fn data_sources_snapshot(&mut self) -> Snapshot {
+        self.refresh_catalog();
+        Snapshot {
+            sources: self.sources.clone(),
+            support: self.support.clone().or_else(support),
+            drivers: self.drivers.clone(),
+            suggestions: self.suggestions.clone(),
+            secrets_ready: self.secrets.ready(),
+            secrets_reason: self.secrets.reason().map(str::to_owned),
+            stored: self.passwords.keys().cloned().collect(),
+        }
+    }
+
+    /// Opens the Data Sources window on a new connection, or on the connection `opening` names.
+    /// The window is built after the update of the panel is over, so it may read the panel.
+    pub(crate) fn open_data_sources(&mut self, opening: Opening, cx: &mut Context<Self>) {
+        let Some(handle) = self.window else {
             return;
         };
-        let url = dialog.url.text.trim().to_owned();
-        if url.is_empty() {
-            self.status = Some("The address of a source is required.".into());
-            cx.notify();
-            return;
-        }
-        let mut name = dialog.name.text.trim().to_owned();
-        if name.is_empty() {
-            name = source_name(&url);
-        }
-        let id = self.unique_id(&name);
-        let driver = dialog.driver.text.trim();
-        let source = Source {
-            id: id.clone(),
-            name,
-            kind: dialog.kind,
-            url,
-            user: dialog.user.text.trim().to_owned(),
-            module: dialog.module,
-            driver_jar: (!driver.is_empty()).then(|| PathBuf::from(driver)),
-        };
-        let entered = Secret::new(dialog.password.text.clone());
-        if !entered.expose().is_empty() {
-            self.passwords.insert(id.clone(), entered.clone());
-        }
-        let save = dialog.save_password && self.secrets.ready();
-        self.sources.push(source.clone());
-        self.selected = Some(id.clone());
-        self.save_sources(cx);
-        if self.secrets.ready() {
-            if save && !entered.expose().is_empty() {
-                self.remember_password(&source, entered, cx);
-            } else {
-                // The flag is off, or the password was cleared: the old entry of the
-                // store must not come back on the next connection.
-                self.forget_password(&source, cx);
+        let snapshot = self.data_sources_snapshot();
+        let panel = cx.entity();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |workspace, window, cx| {
+                    DataSourcesDialog::show(panel, snapshot, opening, workspace, window, cx)
+                })
+                .ok();
+        });
+    }
+
+    /// Applies the changes of the Data Sources window: the removed connections go first, then
+    /// each saved one is added or updated under its id. Returns the id of each saved connection
+    /// in order, or `None` for a connection the list no longer has.
+    pub(crate) fn apply_data_sources(
+        &mut self,
+        changes: Vec<SourceChange>,
+        connect: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<Option<SourceId>> {
+        let mut saved = Vec::new();
+        for change in changes {
+            match change {
+                // A connection with an open transaction asks first, as Remove in the tree does.
+                SourceChange::Remove(id) => self.remove_source_asked(id, cx),
+                SourceChange::Save(edit) => saved.push(self.save_source(*edit, connect, cx)),
             }
         }
-        let password = self
-            .passwords
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| Secret::new(""));
-        self.connect_source(source, password, cx);
+        self.save_sources(cx);
+        saved
+    }
+
+    /// Adds or updates one connection of the list. A connection keeps its id, which names its
+    /// console folder and its password. The store of passwords is written only when the
+    /// password, the Save password flag or the user changed, so that a rename never removes a
+    /// password. A connection the window adds is connected when `connect` is set, as Add was.
+    fn save_source(
+        &mut self,
+        edit: SourceEdit,
+        connect: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<SourceId> {
+        let SourceEdit {
+            id,
+            mut source,
+            password,
+            save_password,
+            save_changed,
+            account,
+        } = edit;
+        source.name = source.name.trim().to_owned();
+        if source.name.is_empty() {
+            source.name = source_name(&source.url);
+        }
+        let typed = password.is_some();
+        let (id, added) = match id {
+            Some(id) => {
+                let index = self.sources.iter().position(|known| known.id == id)?;
+                let known = self.sources[index].clone();
+                if known.url != source.url || known.kind != source.kind || known.user != source.user
+                {
+                    // The address of a live connection is gone: the helper reads a new one on
+                    // the next open, and the schema of the old address must not be shown.
+                    self.sessions.remove(&id);
+                    self.tables.remove(&id);
+                    self.errors.remove(&id);
+                }
+                if known.kind != source.kind || known.driver_jar != source.driver_jar {
+                    self.driver_failed.remove(&id);
+                }
+                source.id = id.clone();
+                self.sources[index] = source.clone();
+                (id, false)
+            }
+            None => {
+                let id = self.unique_id(&source.name);
+                source.id = id.clone();
+                self.sources.push(source.clone());
+                (id, true)
+            }
+        };
+        if let Some(password) = &password {
+            if password.expose().is_empty() {
+                self.passwords.remove(&id);
+            } else {
+                self.passwords.insert(id.clone(), password.clone());
+            }
+        }
+        if self.secrets.ready() {
+            let moved = !added && account != source.user;
+            if moved {
+                // The password of the old account is not the password of the new one.
+                let mut old = source.clone();
+                old.user = account;
+                self.forget_password(&old, cx);
+            }
+            if typed || save_changed || moved {
+                match self.passwords.get(&id).cloned() {
+                    Some(password) if save_password => {
+                        self.remember_password(&source, password, cx)
+                    }
+                    _ => self.forget_password(&source, cx),
+                }
+            }
+        }
+        if added {
+            self.selected = Some(id.clone());
+            if connect {
+                let password = self
+                    .passwords
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| Secret::new(""));
+                self.connect_source(source, password, cx);
+            }
+        }
+        Some(id)
+    }
+
+    /// Tests a connection as the Data Sources window asks: the helper of its driver starts, is
+    /// asked to connect, and its answer is the product of the server or the reason. The helper
+    /// is closed with the answer. The password is the typed one, or the one the panel holds.
+    pub(crate) fn probe_source(
+        &self,
+        source: Source,
+        password: Option<Secret>,
+        cx: &App,
+    ) -> Task<Result<String, String>> {
+        if let Some(events) = self.probe_script.clone() {
+            return Task::ready(probe_outcome(events));
+        }
+        if self.driver_missing(&source) {
+            return Task::ready(Err(driver_message(&source)));
+        }
+        let Some(support) = self.support.clone().or_else(support) else {
+            return Task::ready(Err(
+                "The language support of the Database window is not ready.".to_owned(),
+            ));
+        };
+        let jars = self.jars_of(&source);
+        let password = password.unwrap_or_else(|| {
+            self.passwords
+                .get(&source.id)
+                .cloned()
+                .unwrap_or_else(|| Secret::new(""))
+        });
+        cx.background_executor().spawn(async move {
+            probe_with_helper(support.helper(&jars), source.url, source.user, password)
+        })
+    }
+
+    /// The answers a probe gives instead of a helper, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn set_probe_script_for_test(&mut self, events: Vec<Event>) {
+        self.probe_script = Some(events);
     }
 
     fn unique_id(&self, name: &str) -> SourceId {
@@ -4638,32 +4667,6 @@ impl DatabasePanel {
                 return;
             }
         }
-        if let Some(dialog) = &mut self.dialog {
-            let stroke = &event.keystroke;
-            if stroke.key == "escape" {
-                self.dialog = None;
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-            if stroke.key == "enter" {
-                self.add_source(cx);
-                cx.stop_propagation();
-                return;
-            }
-            if stroke.key == "tab" {
-                dialog.field = dialog.field.next();
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-            let field = dialog.field;
-            if dialog.field(field).key(event, false) {
-                cx.stop_propagation();
-                cx.notify();
-            }
-            return;
-        }
         if self.password_field {
             if self.password.key(event, false) {
                 cx.stop_propagation();
@@ -4672,6 +4675,19 @@ impl DatabasePanel {
             return;
         }
         let stroke = &event.keystroke;
+        // F4 is Edit Source: the connection the tree shows selected opens in the Data Sources window.
+        if stroke.key == "f4"
+            && !stroke.modifiers.control
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.shift
+            && !stroke.modifiers.platform
+        {
+            if let Some(source) = self.selected.clone() {
+                self.open_data_sources(Opening::Edit(source), cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
         if (stroke.modifiers.control || stroke.modifiers.platform) && stroke.key == "f2" {
             self.stop(cx);
             cx.stop_propagation();
@@ -4687,12 +4703,27 @@ impl DatabasePanel {
         let mut rows = Vec::new();
         rows.extend(self.migration_rows(theme, cx));
         if self.sources.is_empty() {
+            // The empty state of the list: the text and the action that opens a new source.
             rows.push(
                 div()
-                    .px(px(SPACE_M))
-                    .py(px(SPACE_S))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .py(px(SPACE_M))
                     .text_color(theme.text_muted)
-                    .child("No data sources. Press + to add one.")
+                    .child("No data sources")
+                    .child(
+                        div()
+                            .id("database-empty-create")
+                            .debug_selector(|| "database-empty-create".to_owned())
+                            .cursor_pointer()
+                            .text_color(theme.accent)
+                            .child("Create data source (Alt+Insert)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_data_sources(Opening::New, cx)
+                            })),
+                    )
                     .into_any_element(),
             );
         }
@@ -4727,7 +4758,12 @@ impl DatabasePanel {
                             })
                             .child(if connected { "●" } else { "○" }),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        this.select(id.clone(), cx);
+                        if event.click_count() >= 2 {
+                            this.open_data_sources(Opening::Edit(id.clone()), cx);
+                        }
+                    }))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -5645,7 +5681,7 @@ impl DatabasePanel {
             let running = self
                 .driver_download
                 .as_ref()
-                .is_some_and(|run| run.source.as_ref() == Some(&selected));
+                .is_some_and(|run| run.target == DownloadTarget::Source(selected.clone()));
             let mut line = div().flex().items_center().gap(px(SPACE_S));
             if running {
                 if let Some(run) = &self.driver_download {
@@ -5667,7 +5703,7 @@ impl DatabasePanel {
                     small_button("database-download-driver", "Download driver", theme)
                         .debug_selector(|| "database-download-driver".to_owned())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.start_download(Some(id.clone()), false, None, cx)
+                            this.start_download(DownloadTarget::Source(id.clone()), None, cx)
                         })),
                 );
                 line = line.child(
@@ -6016,370 +6052,6 @@ impl DatabasePanel {
         .detach();
     }
 
-    fn dialog(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let Some(dialog) = &self.dialog else {
-            return div().into_any_element();
-        };
-        let vendors = support()
-            .map(|support| support.vendors())
-            .unwrap_or_default();
-        let suggestions = self.suggestions.clone();
-        let kind = dialog.kind;
-        let package = self.package_of(kind);
-        let mut fields = vec![
-            (Field::Name, "Name", dialog.name.text.clone(), false),
-            (Field::Url, "Address", dialog.url.text.clone(), false),
-            (Field::User, "User", dialog.user.text.clone(), false),
-            (
-                Field::Password,
-                "Password",
-                "•".repeat(dialog.password.text.chars().count()),
-                true,
-            ),
-            (
-                Field::Driver,
-                "Driver jar",
-                dialog.driver.text.clone(),
-                false,
-            ),
-        ];
-        if package.is_some() {
-            fields.push((
-                Field::Version,
-                "Driver version",
-                dialog.version.text.clone(),
-                false,
-            ));
-        }
-        let focused = dialog.field;
-        let version_text = dialog.version.text.trim().to_owned();
-        let versions = dialog.versions.clone();
-        let versions_loading = dialog.versions_loading;
-        let versions_error = dialog.versions_error.clone();
-        let driver_error = dialog.driver_error.clone();
-        let storage_ready = self.secrets.ready();
-        let storage_reason = self.secrets.reason().map(str::to_owned);
-        let save_password = dialog.save_password && storage_ready;
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap(px(SPACE_S))
-            .p(px(SPACE_L))
-            .w(px(520.))
-            .rounded(px(CONTROL_RADIUS))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popup_bg);
-        body = body.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child("Data Source")
-                .child(
-                    small_button("database-dialog-close", "Close", theme).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.dialog = None;
-                            cx.notify();
-                        },
-                    )),
-                ),
-        );
-        let mut kinds = div().flex().items_center().gap(px(SPACE_XS));
-        for vendor in &vendors {
-            let chosen = vendor.kind == kind;
-            let vendor_kind = vendor.kind;
-            let vendor_template = vendor.url_template.clone();
-            let host = vendor.host.clone();
-            let port = vendor.port;
-            kinds = kinds.child(
-                small_button(
-                    ("database-kind", vendor_kind as usize),
-                    &vendor.title,
-                    theme,
-                )
-                .when(chosen, |this| this.bg(theme.tab_selected))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(dialog) = &mut this.dialog {
-                        dialog.kind = vendor_kind;
-                        dialog.versions.clear();
-                        dialog.versions_for = None;
-                        dialog.versions_error = None;
-                        let url = vendor_template
-                            .replace("{host}", &host)
-                            .replace(
-                                "{port}",
-                                &port.map(|port| port.to_string()).unwrap_or_default(),
-                            )
-                            .replace("{database}", "database")
-                            .replace("{file}", "~/test");
-                        dialog.url = TextField::from_text(url);
-                    }
-                    this.load_versions(cx);
-                    cx.notify();
-                })),
-            );
-        }
-        body = body.child(kinds);
-        for (field, label, text, _masked) in fields {
-            let mut shown = TextField::from_text(text.clone());
-            shown.set_caret(shown.text.len());
-            let active = field == focused;
-            let mut value = div()
-                .id(("database-field", field as usize))
-                .debug_selector({
-                    let name = format!("database-field-{}", field as usize);
-                    move || name.clone()
-                })
-                .flex()
-                .items_center()
-                .flex_1()
-                .h(px(FIELD_HEIGHT))
-                .px(px(SPACE_M))
-                .rounded(px(CONTROL_RADIUS))
-                .border_1()
-                .border_color(if active {
-                    theme.accent
-                } else {
-                    theme.control_border
-                })
-                .overflow_hidden()
-                .cursor_text()
-                .children(text_field_children(
-                    &shown,
-                    theme.text,
-                    theme.text,
-                    theme.selection,
-                    theme.caret,
-                    TEXT_SMALL,
-                    active,
-                ))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        if let Some(dialog) = &mut this.dialog {
-                            dialog.field = field;
-                        }
-                        window.focus(&this.focus, cx);
-                        cx.notify();
-                    }),
-                );
-            if text.is_empty() && !active {
-                value = value.child(div().text_color(theme.text_muted).child(label.to_owned()));
-            }
-            body = body.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .w(px(96.))
-                            .flex_none()
-                            .text_color(theme.text_muted)
-                            .child(label.to_owned()),
-                    )
-                    .child(value),
-            );
-        }
-        let mut save = div()
-            .id("database-save-password")
-            .debug_selector(|| "database-save-password".to_owned())
-            .flex()
-            .items_center()
-            .gap(px(SPACE_XS))
-            .pl(px(96. + SPACE_M))
-            .text_size(px(TEXT_SMALL))
-            .child(checkbox(save_password, theme))
-            .child("Save password");
-        if storage_ready {
-            save = save
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(dialog) = &mut this.dialog {
-                        dialog.save_password = !dialog.save_password;
-                    }
-                    cx.notify();
-                }));
-        } else {
-            save = save.text_color(theme.text_muted).cursor_default();
-            if let Some(reason) = storage_reason {
-                let hint = SharedString::from(reason);
-                save = save.tooltip(move |_, cx| tooltip(hint.clone(), None, cx));
-            }
-        }
-        body = body.child(save);
-        if !suggestions.is_empty() {
-            let mut list = div().flex().flex_col().gap(px(SPACE_XS));
-            list = list.child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child("From the project files"),
-            );
-            for suggestion in suggestions {
-                let url = suggestion.url.clone();
-                let user = suggestion.user.clone();
-                let kind = suggestion.kind;
-                let module = suggestion.module.clone();
-                let origin = match (module.is_empty(), suggestion.profile.clone()) {
-                    (false, Some(profile)) => format!("{module}, {profile}"),
-                    (false, None) => module.clone(),
-                    (true, Some(profile)) => profile,
-                    (true, None) => String::new(),
-                };
-                let label = if origin.is_empty() {
-                    url.clone()
-                } else {
-                    format!("{url} ({origin})")
-                };
-                list = list.child(
-                    small_button(format!("database-suggestion-{url}"), &label, theme).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            if let Some(dialog) = &mut this.dialog {
-                                dialog.url = TextField::from_text(url.clone());
-                                dialog.user = TextField::from_text(user.clone());
-                                dialog.module = (!module.is_empty()).then(|| module.clone());
-                                if let Some(kind) = kind {
-                                    dialog.kind = kind;
-                                }
-                            }
-                            this.load_versions(cx);
-                            cx.notify();
-                        }),
-                    ),
-                );
-            }
-            body = body.child(list);
-        }
-        let driver = self
-            .drivers
-            .iter()
-            .find(|driver| driver.kind == kind)
-            .map(|driver| {
-                format!(
-                    "{} ({})",
-                    driver.label,
-                    driver.module.clone().unwrap_or_default()
-                )
-            })
-            .unwrap_or_else(|| {
-                if package.is_some() {
-                    "No driver in the dependencies; download one or give the jar path.".to_owned()
-                } else {
-                    "No driver in the dependencies; add one or give the jar path.".to_owned()
-                }
-            });
-        body = body.child(
-            div()
-                .text_size(px(TEXT_SMALL))
-                .text_color(theme.text_muted)
-                .child(driver),
-        );
-        if let Some(package) = package {
-            if !versions.is_empty() {
-                let mut choices = div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .pl(px(96. + SPACE_M));
-                for (index, version) in versions.iter().take(6).enumerate() {
-                    let chosen = version_text == *version;
-                    let picked = version.clone();
-                    choices = choices.child(
-                        small_button(("database-version", index), version, theme)
-                            .when(chosen, |this| this.bg(theme.tab_selected))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(dialog) = &mut this.dialog {
-                                    dialog.version = TextField::from_text(picked.clone());
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
-                body = body.child(choices);
-            }
-            if versions_loading {
-                body = body.child(
-                    div()
-                        .pl(px(96. + SPACE_M))
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.text_muted)
-                        .child("Reading the versions of the repository…"),
-                );
-            } else if let Some(reason) = versions_error {
-                body = body.child(
-                    div()
-                        .pl(px(96. + SPACE_M))
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.text_muted)
-                        .child(reason),
-                );
-            }
-            let running = self.driver_download.as_ref().is_some_and(|run| run.form);
-            let mut download = div()
-                .flex()
-                .items_center()
-                .gap(px(SPACE_S))
-                .pl(px(96. + SPACE_M));
-            if running {
-                if let Some(run) = &self.driver_download {
-                    download = download.child(
-                        div()
-                            .debug_selector(|| "database-download-progress".to_owned())
-                            .text_size(px(TEXT_SMALL))
-                            .text_color(theme.text_muted)
-                            .child(download_text(run)),
-                    );
-                }
-                download = download.child(
-                    small_button("database-download-cancel", "Cancel", theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_download(cx))),
-                );
-            } else {
-                let asked = (!version_text.is_empty()).then(|| version_text.clone());
-                download = download.child(
-                    small_button("database-dialog-download", "Download driver", theme)
-                        .debug_selector(|| "database-dialog-download".to_owned())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.start_download(None, true, asked.clone(), cx)
-                        })),
-                );
-            }
-            download = download.child(
-                div()
-                    .text_size(px(TEXT_SMALL))
-                    .text_color(theme.text_muted)
-                    .child(format!(
-                        "{} · {} · {}",
-                        package.coordinate, package.license, package.repository
-                    )),
-            );
-            body = body.child(download);
-            if let Some(error) = driver_error {
-                body = body.child(
-                    div()
-                        .pl(px(96. + SPACE_M))
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.stripe_error)
-                        .child(error),
-                );
-            }
-        }
-        body = body.child(
-            div().flex().justify_end().gap(px(SPACE_S)).child(
-                small_button("database-dialog-add", "Add", theme)
-                    .debug_selector(|| "database-dialog-add".to_owned())
-                    .on_click(cx.listener(|this, _, _, cx| this.add_source(cx))),
-            ),
-        );
-        div()
-            .flex_none()
-            .p(px(SPACE_M))
-            .child(body)
-            .into_any_element()
-    }
-
     /// The question behind Clean: the tool drops every object of the schema, which no
     /// undo brings back.
     fn clean_dialog(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -6460,23 +6132,14 @@ impl DatabasePanel {
             .items_center()
             .gap(px(SPACE_XS))
             .h(px(CONTROL_HEIGHT))
-            .px(px(SPACE_S))
+            .pl(px(SPACE_M))
+            .pr(px(SPACE_S))
             .border_b_1()
             .border_color(theme.border);
         bar = bar.child(
             icon_button("database-add", "general/add", "Data Source", None, theme)
                 .debug_selector(|| "database-add".to_owned())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let vendors = this
-                        .support
-                        .as_ref()
-                        .map(|support| support.vendors())
-                        .unwrap_or_default();
-                    this.refresh_catalog();
-                    this.dialog = Some(Dialog::new(DriverKind::H2, &vendors, this.secrets.ready()));
-                    this.load_versions(cx);
-                    cx.notify();
-                })),
+                .on_click(cx.listener(|this, _, _, cx| this.open_data_sources(Opening::New, cx))),
         );
         bar = bar.child(
             icon_button(
@@ -6644,6 +6307,10 @@ impl Render for DatabasePanel {
         let theme = *cx.global::<Theme>();
         self.window = window.window_handle().downcast::<Workspace>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::DATABASE_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -6660,7 +6327,6 @@ impl Render for DatabasePanel {
         let tabs = self.result_tabs(&theme, cx);
         let result = self.result_table(&theme, window, cx);
         let notice = self.notice(&theme, cx);
-        let dialog = self.dialog(&theme, cx);
         let clean = self.clean_dialog(&theme, cx);
         let tree = div()
             .id("database-tree-pane")
@@ -6695,9 +6361,18 @@ impl Render for DatabasePanel {
             .flex()
             .flex_col()
             .h_full()
-            .child(panel_header("Database", "bottom-panel", hide, &theme))
+            .child(
+                panel_header(
+                    "Database",
+                    "bottom-panel",
+                    "database",
+                    options,
+                    hide,
+                    &theme,
+                )
+                .debug_selector(|| "database-header".to_owned()),
+            )
             .child(toolbar)
-            .child(dialog)
             .child(clean)
             .child(div().flex().flex_1().min_h_0().child(tree).child(right))
     }
