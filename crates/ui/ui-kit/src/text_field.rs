@@ -1,10 +1,21 @@
 //! A one-line edit: text, a caret and a selection. Tool windows and the find bar use it,
-//! so Ctrl+A, the shift keys, Backspace and the clipboard behave the same everywhere.
+//! so Ctrl+A, the shift keys, Backspace, the clipboard and the mouse behave the same
+//! everywhere. The mouse and the menu are in `text_field_mouse`.
 
 use std::ops::Range;
 
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+
+use crate::text_field_mouse::{self, FieldMouse};
+
+/// The menu that a right click opened on a field: where it stands, and whether Paste
+/// applies to the clipboard as it was at the click.
+#[derive(Clone, Debug)]
+pub struct FieldMenu {
+    pub at: Point<Pixels>,
+    pub can_paste: bool,
+}
 
 /// Typed text with a caret and an anchor. Offsets are bytes on character boundaries.
 #[derive(Clone, Debug, Default)]
@@ -13,6 +24,10 @@ pub struct TextField {
     caret: usize,
     /// The other end of the selection; equal to `caret` when nothing is selected.
     anchor: usize,
+    /// Whether a press of the left button started a selection that a drag still extends.
+    dragging: bool,
+    /// The menu of a right click, while it is open.
+    pub menu: Option<FieldMenu>,
 }
 
 impl TextField {
@@ -23,6 +38,8 @@ impl TextField {
             text,
             caret,
             anchor: caret,
+            dragging: false,
+            menu: None,
         }
     }
 
@@ -61,6 +78,17 @@ impl TextField {
         self.anchor = self.caret;
     }
 
+    /// Inserts pasted `text`. A multiline field takes every line, a single-line one the
+    /// first line only.
+    pub fn paste(&mut self, text: &str, multiline: bool) {
+        if multiline {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.insert_text(&text);
+        } else {
+            self.insert_text(text.lines().next().unwrap_or(""));
+        }
+    }
+
     /// Removes the selection, or one character before the caret.
     pub fn backspace(&mut self, word: bool) {
         if self.delete_selection() {
@@ -90,6 +118,89 @@ impl TextField {
         self.anchor = self.caret;
     }
 
+    /// A press of the left button at byte `at`. One click puts the caret there, and Shift
+    /// keeps the other end of the selection, so the selection grows from it. Two clicks
+    /// select the word under `at`, and three select the whole text. A press with one click
+    /// starts a drag, which [`TextField::drag_to`] extends until [`TextField::release`].
+    pub fn press(&mut self, at: usize, shift: bool, clicks: usize) {
+        let at = self.boundary(at);
+        self.dragging = false;
+        match clicks {
+            0 | 1 => {
+                if !shift {
+                    self.anchor = at;
+                }
+                self.caret = at;
+                self.dragging = true;
+            }
+            2 => {
+                let word = self.word_at(at);
+                self.anchor = word.start;
+                self.caret = word.end;
+            }
+            _ => self.select_all(),
+        }
+    }
+
+    /// Moves the caret of a drag to byte `at`. Returns whether the caret moved; it does
+    /// nothing when no drag is going on.
+    pub fn drag_to(&mut self, at: usize) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        let at = self.boundary(at);
+        let moved = at != self.caret;
+        self.caret = at;
+        moved
+    }
+
+    /// Ends a drag. Returns whether one was going on.
+    pub fn release(&mut self) -> bool {
+        std::mem::take(&mut self.dragging)
+    }
+
+    /// The run of word characters, or the run of other characters, that holds byte `at`.
+    /// At the end of the text the run before the end is taken.
+    pub fn word_at(&self, at: usize) -> Range<usize> {
+        let at = self.boundary(at);
+        let class = if let Some(next) = self.text[at..].chars().next() {
+            Self::word_class(next)
+        } else if let Some(last) = self.text[..at].chars().next_back() {
+            Self::word_class(last)
+        } else {
+            return at..at;
+        };
+        let mut start = at;
+        while start > 0 {
+            let previous = self.previous_boundary(start);
+            let character = self.text[previous..start].chars().next().unwrap_or(' ');
+            if Self::word_class(character) != class {
+                break;
+            }
+            start = previous;
+        }
+        let mut end = at;
+        while end < self.text.len() {
+            let character = self.text[end..].chars().next().unwrap_or(' ');
+            if Self::word_class(character) != class {
+                break;
+            }
+            end = self.next_boundary(end);
+        }
+        start..end
+    }
+
+    fn word_class(character: char) -> u8 {
+        if Self::word_char(character) {
+            0
+        } else if character.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Removes the selection, if there is one. Returns whether it did.
     fn delete_selection(&mut self) -> bool {
         if !self.has_selection() {
             return false;
@@ -287,13 +398,7 @@ impl TextField {
                 }
                 "v" => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                        if !multiline {
-                            let line = text.lines().next().unwrap_or("");
-                            self.insert_text(line);
-                        } else {
-                            let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                            self.insert_text(&text);
-                        }
+                        self.paste(&text, multiline);
                     }
                     return true;
                 }
@@ -301,6 +406,20 @@ impl TextField {
             }
         }
         self.key(event, multiline)
+    }
+
+    /// [`key_with_clipboard`](Self::key_with_clipboard) for a password: Copy and Cut do
+    /// nothing, so the secret never reaches the clipboard; Paste and the other keys work.
+    pub fn key_secret(&mut self, event: &KeyDownEvent, cx: &mut App) -> bool {
+        let stroke = &event.keystroke;
+        let modifiers = stroke.modifiers;
+        if (modifiers.control || modifiers.platform)
+            && !modifiers.alt
+            && matches!(stroke.key.as_str(), "c" | "x")
+        {
+            return true;
+        }
+        self.key_with_clipboard(event, false, cx)
     }
 
     fn vertical(&mut self, step: isize, shift: bool) {
@@ -329,10 +448,24 @@ impl TextField {
     }
 }
 
+/// The colours and the size of the parts of a field.
+#[derive(Clone, Copy)]
+struct Look {
+    text: Hsla,
+    selected: Hsla,
+    selection: Hsla,
+    caret: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+}
+
 /// The parts of a field for drawing: its text split at the selection, with the caret bar
-/// between them. `text_color` is the colour of the unselected text.
+/// between them. `text_color` is the colour of the unselected text. `mouse` connects the
+/// field to the pointer and to its menu; a field whose owner is not connected passes
+/// [`FieldMouse::off`].
 #[allow(clippy::too_many_arguments)]
 pub fn text_field_children(
+    mouse: FieldMouse,
     field: &TextField,
     text_color: Hsla,
     selected_color: Hsla,
@@ -341,16 +474,19 @@ pub fn text_field_children(
     caret_height: f32,
     show_caret: bool,
 ) -> Vec<AnyElement> {
-    range_children(
+    field_children(
+        mouse,
         None,
         field,
-        0..field.text.len(),
-        text_color,
-        selected_color,
-        selection_color,
-        caret_color,
-        caret_height,
-        show_caret,
+        false,
+        Look {
+            text: text_color,
+            selected: selected_color,
+            selection: selection_color,
+            caret: caret_color,
+            caret_height,
+            show_caret,
+        },
     )
 }
 
@@ -359,6 +495,7 @@ pub fn text_field_children(
 /// field it focused.
 #[allow(clippy::too_many_arguments)]
 pub fn text_field_children_named(
+    mouse: FieldMouse,
     name: &'static str,
     field: &TextField,
     text_color: Hsla,
@@ -368,16 +505,19 @@ pub fn text_field_children_named(
     caret_height: f32,
     show_caret: bool,
 ) -> Vec<AnyElement> {
-    range_children(
+    field_children(
+        mouse,
         Some(name),
         field,
-        0..field.text.len(),
-        text_color,
-        selected_color,
-        selection_color,
-        caret_color,
-        caret_height,
-        show_caret,
+        false,
+        Look {
+            text: text_color,
+            selected: selected_color,
+            selection: selection_color,
+            caret: caret_color,
+            caret_height,
+            show_caret,
+        },
     )
 }
 
@@ -385,6 +525,7 @@ pub fn text_field_children_named(
 /// line is `caret_height` tall, so a caret and the text next to it share the row.
 #[allow(clippy::too_many_arguments)]
 pub fn text_field_lines(
+    mouse: FieldMouse,
     field: &TextField,
     text_color: Hsla,
     selected_color: Hsla,
@@ -393,21 +534,26 @@ pub fn text_field_lines(
     caret_height: f32,
     show_caret: bool,
 ) -> Vec<AnyElement> {
-    lines_children(
+    field_children(
+        mouse,
         None,
         field,
-        text_color,
-        selected_color,
-        selection_color,
-        caret_color,
-        caret_height,
-        show_caret,
+        true,
+        Look {
+            text: text_color,
+            selected: selected_color,
+            selection: selection_color,
+            caret: caret_color,
+            caret_height,
+            show_caret,
+        },
     )
 }
 
 /// [`text_field_lines`] with the named parts of [`text_field_children_named`].
 #[allow(clippy::too_many_arguments)]
 pub fn text_field_lines_named(
+    mouse: FieldMouse,
     name: &'static str,
     field: &TextField,
     text_color: Hsla,
@@ -417,57 +563,74 @@ pub fn text_field_lines_named(
     caret_height: f32,
     show_caret: bool,
 ) -> Vec<AnyElement> {
-    lines_children(
+    field_children(
+        mouse,
         Some(name),
         field,
-        text_color,
-        selected_color,
-        selection_color,
-        caret_color,
-        caret_height,
-        show_caret,
+        true,
+        Look {
+            text: text_color,
+            selected: selected_color,
+            selection: selection_color,
+            caret: caret_color,
+            caret_height,
+            show_caret,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn lines_children(
+/// The rows of a field, one per line, then the element that covers the field for the
+/// pointer, and the menu when a right click opened one. A row of a multiline field is
+/// `caret_height` tall. Each row also measures its text when the field has a mouse.
+fn field_children(
+    mouse: FieldMouse,
     name: Option<&'static str>,
     field: &TextField,
-    text_color: Hsla,
-    selected_color: Hsla,
-    selection_color: Hsla,
-    caret_color: Hsla,
-    caret_height: f32,
-    show_caret: bool,
+    multiline: bool,
+    look: Look,
 ) -> Vec<AnyElement> {
+    let ranges = line_ranges(field, multiline);
+    let lines = mouse.is_on().then(|| text_field_mouse::lines(ranges.len()));
     let mut children = Vec::new();
+    for (index, range) in ranges.iter().enumerate() {
+        let mut row = div().flex().items_center().flex_none().whitespace_nowrap();
+        if multiline {
+            row = row.h(px(look.caret_height));
+        }
+        row = row.children(range_children(name, field, range.clone(), look));
+        if let Some(lines) = &lines {
+            let text = &field.text[range.clone()];
+            row = row.child(text_field_mouse::measure_line(
+                lines,
+                index,
+                range.clone(),
+                text,
+            ));
+        }
+        children.push(row.into_any_element());
+    }
+    if let Some(lines) = lines {
+        children.push(text_field_mouse::hit_area(&mouse, lines));
+    }
+    children.extend(text_field_mouse::menu(&mouse, field, multiline));
+    children
+}
+
+/// The byte ranges of the lines of a field: one range for a single-line field, and one per
+/// line for a multiline one.
+fn line_ranges(field: &TextField, multiline: bool) -> Vec<Range<usize>> {
+    if !multiline {
+        return std::iter::once(0..field.text.len()).collect();
+    }
+    let mut ranges = Vec::new();
     let mut start = 0;
     loop {
         let end = field.text[start..]
             .find('\n')
             .map_or(field.text.len(), |index| start + index);
-        children.push(
-            div()
-                .flex()
-                .items_center()
-                .flex_none()
-                .h(px(caret_height))
-                .whitespace_nowrap()
-                .children(range_children(
-                    name,
-                    field,
-                    start..end,
-                    text_color,
-                    selected_color,
-                    selection_color,
-                    caret_color,
-                    caret_height,
-                    show_caret,
-                ))
-                .into_any_element(),
-        );
+        ranges.push(start..end);
         if end == field.text.len() {
-            return children;
+            return ranges;
         }
         start = end + 1;
     }
@@ -475,17 +638,11 @@ fn lines_children(
 
 /// The parts of the field that lie on one line. The caret is placed only when it belongs
 /// to this line, and the fallback at the end keeps it on an empty line.
-#[allow(clippy::too_many_arguments)]
 fn range_children(
     name: Option<&'static str>,
     field: &TextField,
     line: Range<usize>,
-    text_color: Hsla,
-    selected_color: Hsla,
-    selection_color: Hsla,
-    caret_color: Hsla,
-    caret_height: f32,
-    show_caret: bool,
+    look: Look,
 ) -> Vec<AnyElement> {
     let selection = field.selection();
     let selected_start = selection.start.clamp(line.start, line.end);
@@ -500,7 +657,7 @@ fn range_children(
     if selected_end < line.end {
         parts.push((selected_end..line.end, false));
     }
-    let caret_in_line = show_caret && field.caret >= line.start && field.caret <= line.end;
+    let caret_in_line = look.show_caret && field.caret >= line.start && field.caret <= line.end;
     let mut children = Vec::new();
     let mut caret_placed = false;
     for (range, selected) in parts {
@@ -514,44 +671,28 @@ fn range_children(
                 name,
                 &field.text[range.start..split],
                 selected,
-                text_color,
-                selected_color,
-                selection_color,
+                look,
             ));
         }
         if caret_here {
-            children.push(caret(caret_color, caret_height, name));
+            children.push(caret(look.caret, look.caret_height, name));
             caret_placed = true;
             if range.end > split {
-                children.push(segment(
-                    name,
-                    &field.text[split..range.end],
-                    selected,
-                    text_color,
-                    selected_color,
-                    selection_color,
-                ));
+                children.push(segment(name, &field.text[split..range.end], selected, look));
             }
         }
     }
     if caret_in_line && !caret_placed {
-        children.push(caret(caret_color, caret_height, name));
+        children.push(caret(look.caret, look.caret_height, name));
     }
     children
 }
 
-fn segment(
-    name: Option<&'static str>,
-    text: &str,
-    selected: bool,
-    text_color: Hsla,
-    selected_color: Hsla,
-    selection_color: Hsla,
-) -> AnyElement {
+fn segment(name: Option<&'static str>, text: &str, selected: bool, look: Look) -> AnyElement {
     div()
         .whitespace_nowrap()
-        .text_color(if selected { selected_color } else { text_color })
-        .when(selected, |this| this.bg(selection_color))
+        .text_color(if selected { look.selected } else { look.text })
+        .when(selected, |this| this.bg(look.selection))
         .when_some(name.filter(|_| selected), |this, name| {
             this.debug_selector(move || format!("{name}-selection"))
         })
@@ -655,5 +796,65 @@ mod tests {
         assert!(field.key(&press("left", None, shift()), false));
         assert!(field.key(&press("delete", None, Modifiers::default()), false));
         assert_eq!(field.text, "ab");
+    }
+
+    #[test]
+    fn a_press_places_the_caret_and_a_drag_selects_up_to_the_pointer() {
+        let mut field = TextField::from_text("one two");
+        field.press(4, false, 1);
+        assert_eq!(field.caret(), 4);
+        assert!(!field.has_selection());
+        assert!(field.drag_to(7));
+        assert_eq!(field.selected_text(), "two");
+        assert!(field.release());
+        assert!(!field.drag_to(0), "a drag ends at the release");
+        assert_eq!(field.selected_text(), "two");
+    }
+
+    #[test]
+    fn shift_click_grows_the_selection_from_the_caret() {
+        let mut field = TextField::from_text("one two");
+        field.press(0, false, 1);
+        field.release();
+        field.press(3, true, 1);
+        field.release();
+        assert_eq!(field.selected_text(), "one");
+        field.press(7, true, 1);
+        field.release();
+        assert_eq!(
+            field.selected_text(),
+            "one two",
+            "the start of the selection stays"
+        );
+    }
+
+    #[test]
+    fn two_clicks_select_a_word_and_three_select_all() {
+        let mut field = TextField::from_text("one two");
+        field.press(5, false, 2);
+        assert_eq!(field.selected_text(), "two");
+        assert!(!field.release(), "a double click starts no drag");
+        field.press(1, false, 3);
+        assert_eq!(field.selected_text(), "one two");
+    }
+
+    #[test]
+    fn a_word_is_a_run_of_word_characters_or_of_other_characters() {
+        let field = TextField::from_text("one  two.");
+        assert_eq!(field.word_at(1), 0..3);
+        assert_eq!(field.word_at(3), 3..5, "the spaces");
+        assert_eq!(field.word_at(5), 5..8, "two");
+        assert_eq!(field.word_at(8), 8..9, "the full stop");
+        assert_eq!(field.word_at(9), 8..9, "the end takes the run before it");
+    }
+
+    #[test]
+    fn paste_takes_the_first_line_of_a_single_line_field() {
+        let mut field = TextField::from_text("ab");
+        field.paste("x\ny", false);
+        assert_eq!(field.text, "abx");
+        let mut lines = TextField::default();
+        lines.paste("p\r\nq", true);
+        assert_eq!(lines.text, "p\nq");
     }
 }

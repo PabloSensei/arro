@@ -3234,6 +3234,11 @@ impl Render for CommitPanel {
                                     theme.text
                                 })
                                 .children(text_field_lines_named(
+                                    FieldMouse::with_edit(
+                                        cx,
+                                        |this| Some(&mut this.message),
+                                        |this, cx| this.flush_message(cx),
+                                    ),
                                     "commit-message",
                                     &self.message,
                                     theme.text,

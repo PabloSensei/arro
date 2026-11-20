@@ -118,6 +118,7 @@ impl Render for StackTraceDialog {
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
                         .children(text_field_lines_named(
+                            FieldMouse::new(cx, |this| Some(&mut this.field)),
                             "stack-trace-field",
                             &self.field,
                             theme.text,

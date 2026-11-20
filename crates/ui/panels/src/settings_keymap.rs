@@ -343,7 +343,7 @@ impl KeymapPage {
             .flex_none()
             .gap(px(SPACE_S))
             .py(px(SPACE_S))
-            .child(self.search_field(&theme))
+            .child(self.search_field(&theme, cx))
             .child(
                 icon_button(
                     "keymap-find-by-shortcut",
@@ -454,7 +454,11 @@ impl KeymapPage {
         page
     }
 
-    fn search_field(&self, theme: &Theme) -> impl IntoElement + use<> {
+    fn search_field(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<SettingsView>,
+    ) -> impl IntoElement + use<> {
         let empty = self.search.text.is_empty();
         let active = self.capture.is_none() && self.conflict.is_none() && !self.reset_all;
         div()
@@ -474,6 +478,7 @@ impl KeymapPage {
                 theme.text
             })
             .children(text_field_children_named(
+                FieldMouse::new(cx, |this| Some(&mut this.search)),
                 "keymap-search-field",
                 &self.search,
                 theme.text,

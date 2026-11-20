@@ -1937,6 +1937,11 @@ impl Render for BranchPopup {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .children(text_field_children(
+                                FieldMouse::with_edit(
+                                    cx,
+                                    |this| Some(&mut this.query),
+                                    |this, _| this.rebuild(),
+                                ),
                                 &self.query,
                                 theme.text,
                                 theme.text,

@@ -612,6 +612,12 @@ impl DataSourcesDialog {
         self.selected.and_then(|index| self.drafts.get_mut(index))
     }
 
+    /// The text field of the selected draft that `field` names, for the mouse.
+    fn draft_field_mut(&mut self, field: Field) -> Option<&mut TextField> {
+        self.selected_draft_mut()
+            .map(|draft| draft.field_mut(field))
+    }
+
     fn package_of(&self, kind: DriverKind) -> Option<&DriverPackage> {
         self.packages.iter().find(|package| package.kind == kind)
     }
@@ -832,7 +838,12 @@ impl DataSourcesDialog {
             return;
         };
         let before = draft.field(field).text.clone();
-        if !draft.field_mut(field).key_with_clipboard(event, false, cx) {
+        let handled = if field == Field::Password {
+            draft.field_mut(field).key_secret(event, cx)
+        } else {
+            draft.field_mut(field).key_with_clipboard(event, false, cx)
+        };
+        if !handled {
             return;
         }
         if draft.field(field).text != before {
@@ -1046,7 +1057,13 @@ impl DataSourcesDialog {
                 .overflow_hidden()
                 .cursor_text()
                 .text_color(theme.text)
-                .children(text_field_children(
+                .children(text_field_children_named(
+                    if field == Field::Password {
+                        FieldMouse::off()
+                    } else {
+                        FieldMouse::new(cx, move |this| this.draft_field_mut(field))
+                    },
+                    "data-sources-field",
                     &shown,
                     theme.text,
                     theme.text,

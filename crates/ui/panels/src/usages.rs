@@ -2389,6 +2389,7 @@ impl Render for ShowUsagesPopup {
                 .child("Filter:")
                 .child(div().flex().items_center().whitespace_nowrap().children(
                     text_field_children(
+                        FieldMouse::new(cx, |this| Some(&mut this.query)),
                         &self.query,
                         theme.text,
                         theme.text,

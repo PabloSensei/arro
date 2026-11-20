@@ -1276,6 +1276,7 @@ impl Render for HeapDumpView {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .children(text_field_children(
+                        FieldMouse::new(cx, |this| Some(&mut this.filter)),
                         &self.filter,
                         theme.text,
                         theme.text,

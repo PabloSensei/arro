@@ -440,6 +440,11 @@ impl Render for BeansPanel {
                     .whitespace_nowrap()
                     .on_click(cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
                     .children(text_field_children_named(
+                        FieldMouse::with_edit(
+                            cx,
+                            |this| Some(&mut this.query),
+                            |this, cx| this.rebuild(cx),
+                        ),
                         "beans-filter",
                         &self.query,
                         theme.text,

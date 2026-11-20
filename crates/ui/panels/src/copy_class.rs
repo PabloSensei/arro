@@ -318,6 +318,7 @@ impl Render for CopyClassDialog {
         let top = window.viewport_size().height * 0.22;
         let active = self.active;
         let name = field_box(
+            FieldMouse::new(cx, |this| Some(&mut this.name)),
             "copy-class-name-field",
             "copy-class-name".to_owned(),
             &self.name,
@@ -330,6 +331,7 @@ impl Render for CopyClassDialog {
             cx.notify();
         }));
         let destination = field_box(
+            FieldMouse::new(cx, |this| Some(&mut this.destination)),
             "copy-class-destination-field",
             "copy-class-destination".to_owned(),
             &self.destination,
@@ -409,6 +411,7 @@ fn labelled(label: &str, field: Stateful<Div>, theme: &Theme) -> Div {
 }
 
 fn field_box(
+    mouse: FieldMouse,
     id: impl Into<ElementId>,
     selector: String,
     field: &TextField,
@@ -432,6 +435,7 @@ fn field_box(
         })
         .text_color(color)
         .children(text_field_children_named(
+            mouse,
             "copy-class-field",
             field,
             theme.text,

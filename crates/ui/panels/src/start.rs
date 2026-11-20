@@ -88,8 +88,8 @@ pub struct StartScreen {
     mode: Mode,
     template: usize,
     active: Active,
-    name: TextField,
-    location: TextField,
+    pub(crate) name: TextField,
+    pub(crate) location: TextField,
     url: TextField,
     message: Option<SharedString>,
     busy: bool,
@@ -605,7 +605,13 @@ fn button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div>
         .child(label)
 }
 
-fn text_field(label: &'static str, field: &TextField, active: bool, theme: &Theme) -> Div {
+fn text_field(
+    mouse: FieldMouse,
+    label: &'static str,
+    field: &TextField,
+    active: bool,
+    theme: &Theme,
+) -> Div {
     div()
         .flex()
         .flex_col()
@@ -621,6 +627,7 @@ fn text_field(label: &'static str, field: &TextField, active: bool, theme: &Them
                 .border_2()
                 .border_color(if active { theme.accent } else { theme.border })
                 .children(text_field_children_named(
+                    mouse,
                     "start-field",
                     field,
                     theme.text,
@@ -727,12 +734,14 @@ impl Render for StartScreen {
                     .child(div().font_weight(FontWeight::MEDIUM).child("New Project"))
                     .child(div().flex().gap(px(SPACE_M)).children(templates))
                     .child(text_field(
+                        FieldMouse::new(cx, |this| Some(&mut this.name)),
                         "Name",
                         &self.name,
                         self.active == Active::Name,
                         &theme,
                     ))
                     .child(text_field(
+                        FieldMouse::new(cx, |this| Some(&mut this.location)),
                         "Location",
                         &self.location,
                         self.active == Active::Location,
@@ -752,12 +761,14 @@ impl Render for StartScreen {
                     .gap(px(DIALOG_GAP))
                     .child(div().font_weight(FontWeight::MEDIUM).child("Get from VCS"))
                     .child(text_field(
+                        FieldMouse::new(cx, |this| Some(&mut this.url)),
                         "URL",
                         &self.url,
                         self.active == Active::Url,
                         &theme,
                     ))
                     .child(text_field(
+                        FieldMouse::new(cx, |this| Some(&mut this.location)),
                         "Directory",
                         &self.location,
                         self.active == Active::Location,

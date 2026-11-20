@@ -478,6 +478,7 @@ fn summary(change: &WorkspaceChange) -> String {
 }
 
 fn field_box(
+    mouse: FieldMouse,
     id: impl Into<ElementId>,
     selector: String,
     field: &TextField,
@@ -502,6 +503,7 @@ fn field_box(
         })
         .text_color(theme.text)
         .children(text_field_children_named(
+            mouse,
             "change-signature-field",
             field,
             theme.text,
@@ -563,6 +565,7 @@ impl Render for ChangeSignatureDialog {
         let active = self.active;
 
         let name = field_box(
+            FieldMouse::new(cx, |this| Some(&mut this.name)),
             "change-signature-name-field",
             "change-signature-name".to_owned(),
             &self.name,
@@ -575,6 +578,7 @@ impl Render for ChangeSignatureDialog {
             cx.notify();
         }));
         let visibility = field_box(
+            FieldMouse::new(cx, |this| Some(&mut this.visibility)),
             "change-signature-visibility-field",
             "change-signature-visibility".to_owned(),
             &self.visibility,
@@ -587,6 +591,7 @@ impl Render for ChangeSignatureDialog {
             cx.notify();
         }));
         let return_type = field_box(
+            FieldMouse::new(cx, |this| Some(&mut this.return_type)),
             "change-signature-return-field",
             "change-signature-return".to_owned(),
             &self.return_type,
@@ -602,6 +607,11 @@ impl Render for ChangeSignatureDialog {
         let mut rows = Vec::with_capacity(self.parameters.len());
         for index in 0..self.parameters.len() {
             let type_field = field_box(
+                FieldMouse::new(cx, move |this| {
+                    this.parameters
+                        .get_mut(index)
+                        .map(|parameter| &mut parameter.type_name)
+                }),
                 ("change-signature-type", index),
                 format!("change-signature-type-{index}"),
                 &self.parameters[index].type_name,
@@ -614,6 +624,11 @@ impl Render for ChangeSignatureDialog {
                 cx.notify();
             }));
             let name_field = field_box(
+                FieldMouse::new(cx, move |this| {
+                    this.parameters
+                        .get_mut(index)
+                        .map(|parameter| &mut parameter.name)
+                }),
                 ("change-signature-param-name", index),
                 format!("change-signature-name-{index}"),
                 &self.parameters[index].name,
@@ -626,6 +641,11 @@ impl Render for ChangeSignatureDialog {
                 cx.notify();
             }));
             let default_field = field_box(
+                FieldMouse::new(cx, move |this| {
+                    this.parameters
+                        .get_mut(index)
+                        .map(|parameter| &mut parameter.default_value)
+                }),
                 ("change-signature-default", index),
                 format!("change-signature-default-{index}"),
                 &self.parameters[index].default_value,

@@ -28,11 +28,17 @@ impl FileTypesPage {
         theme: &Theme,
         cx: &mut Context<SettingsView>,
     ) -> Div {
-        let input = pattern_field(&self.pattern, IGNORED_HINT, active, theme)
-            .debug_selector(|| "settings-ignore-pattern".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.start_ignored_pattern(cx);
-            }));
+        let input = pattern_field(
+            FieldMouse::new(cx, |this| Some(&mut this.file_types_page.pattern)),
+            &self.pattern,
+            IGNORED_HINT,
+            active,
+            theme,
+        )
+        .debug_selector(|| "settings-ignore-pattern".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.start_ignored_pattern(cx);
+        }));
         let add = div()
             .id("settings-ignore-add")
             .debug_selector(|| "settings-ignore-add".to_owned())
@@ -101,6 +107,7 @@ impl FileTypesPage {
 /// The field that takes one more mask. Its caret and its selection are named for the
 /// tests of the window, as every text field of the settings is.
 fn pattern_field(
+    mouse: FieldMouse,
     value: &TextField,
     hint: &'static str,
     active: bool,
@@ -124,6 +131,7 @@ fn pattern_field(
         .border_color(if active { theme.accent } else { theme.border })
         .text_color(color)
         .children(text_field_children_named(
+            mouse,
             "settings-field",
             value,
             theme.text,

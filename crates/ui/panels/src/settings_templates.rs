@@ -500,6 +500,24 @@ impl TemplatesPage {
         false
     }
 
+    /// The stored text of a template field, for the mouse. A variable row that was removed has none.
+    fn text_mut(&mut self, field: Field) -> Option<&mut TextField> {
+        match field {
+            Field::Abbreviation => Some(&mut self.abbreviation),
+            Field::Description => Some(&mut self.description),
+            Field::Body => Some(&mut self.body),
+            Field::FileText => Some(&mut self.file_text),
+            Field::Variable(index, part) => {
+                let row = self.variables.get_mut(index)?;
+                Some(match part {
+                    VariablePart::Name => &mut row.name,
+                    VariablePart::Expression => &mut row.expression,
+                    VariablePart::Default => &mut row.default,
+                })
+            }
+        }
+    }
+
     pub(crate) fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<SettingsView>) -> bool {
         let Some(field) = self.field else {
             return false;
@@ -923,6 +941,7 @@ impl TemplatesPage {
         if active {
             let parts = if multiline {
                 text_field_lines_named(
+                    FieldMouse::new(cx, move |this| this.templates_page.text_mut(field)),
                     "template-field",
                     text,
                     theme.text,
@@ -934,6 +953,7 @@ impl TemplatesPage {
                 )
             } else {
                 text_field_children_named(
+                    FieldMouse::new(cx, move |this| this.templates_page.text_mut(field)),
                     "template-field",
                     text,
                     theme.text,
@@ -1134,6 +1154,7 @@ impl TemplatesPage {
                 cx.notify();
             }))
             .children(text_field_children_named(
+                FieldMouse::new(cx, move |this| this.templates_page.text_mut(field)),
                 "template-field",
                 text,
                 theme.text,
@@ -1367,6 +1388,7 @@ impl TemplatesPage {
             }));
         boxed = if active {
             boxed.children(text_field_lines_named(
+                FieldMouse::new(cx, |this| Some(&mut this.templates_page.file_text)),
                 "template-field",
                 &self.file_text,
                 theme.text,

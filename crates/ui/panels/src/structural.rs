@@ -906,7 +906,7 @@ impl StructuralSearch {
     }
 
     fn input<'a>(
-        &self,
+        mouse: FieldMouse,
         value: &'a TextField,
         label: &'a str,
         active: bool,
@@ -941,6 +941,7 @@ impl StructuralSearch {
             })
             .when(!empty || active, |this| {
                 this.children(text_field_children(
+                    mouse,
                     value,
                     theme.text,
                     theme.text,
@@ -1422,7 +1423,10 @@ impl Render for StructuralSearch {
                 let text_active = self.focus_at == FocusAt::Variable(index, FieldKind::Text);
                 let count_active = self.focus_at == FocusAt::Variable(index, FieldKind::Count);
                 let type_active = self.focus_at == FocusAt::Variable(index, FieldKind::Type);
-                let text = self.input(
+                let text = Self::input(
+                    FieldMouse::new(cx, move |this| {
+                        this.variables.get_mut(index).map(|row| &mut row.text)
+                    }),
                     &row.text,
                     "text",
                     text_active,
@@ -1430,7 +1434,10 @@ impl Render for StructuralSearch {
                     None,
                     &theme,
                 );
-                let count = self.input(
+                let count = Self::input(
+                    FieldMouse::new(cx, move |this| {
+                        this.variables.get_mut(index).map(|row| &mut row.count)
+                    }),
                     &row.count,
                     "[0,∞]",
                     count_active,
@@ -1438,7 +1445,12 @@ impl Render for StructuralSearch {
                     Some(92.),
                     &theme,
                 );
-                let type_filter = self.input(
+                let type_filter = Self::input(
+                    FieldMouse::new(cx, move |this| {
+                        this.variables
+                            .get_mut(index)
+                            .map(|row| &mut row.type_filter)
+                    }),
                     &row.type_filter,
                     "type",
                     type_active,

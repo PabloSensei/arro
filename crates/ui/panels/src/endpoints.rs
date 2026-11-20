@@ -662,6 +662,11 @@ impl Render for EndpointsPanel {
                     .whitespace_nowrap()
                     .on_click(cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
                     .children(text_field_children_named(
+                        FieldMouse::with_edit(
+                            cx,
+                            |this| Some(&mut this.query),
+                            |this, _| this.rebuild(),
+                        ),
                         "endpoints-filter",
                         &self.query,
                         theme.text,

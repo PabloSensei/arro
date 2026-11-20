@@ -1447,6 +1447,7 @@ impl BuildPanel {
                     .border_color(if active { theme.accent } else { theme.border })
                     .text_color(color)
                     .children(text_field_children_named(
+                        FieldMouse::new(cx, |this| Some(&mut this.properties)),
                         "build-properties-text",
                         &self.properties,
                         theme.text,
@@ -1483,6 +1484,7 @@ impl BuildPanel {
             .border_color(theme.accent)
             .text_color(color)
             .children(text_field_children_named(
+                FieldMouse::new(cx, |this| Some(&mut this.execute)),
                 "build-execute-field",
                 &self.execute,
                 theme.text,
@@ -1605,6 +1607,7 @@ impl BuildPanel {
             })
             .text_color(search_color)
             .children(text_field_children_named(
+                FieldMouse::new(cx, |this| Some(&mut this.search)),
                 "dependencies-search",
                 &self.search,
                 theme.text,

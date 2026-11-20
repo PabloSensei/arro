@@ -5485,6 +5485,7 @@ impl DebugPanel {
                     .text_size(px(CODE_SIZE))
                     .child("New watch: ")
                     .children(text_field_children(
+                        FieldMouse::new(cx, |this| this.watch_input.as_mut()),
                         field,
                         theme.text,
                         theme.text,
@@ -5855,7 +5856,11 @@ impl DebugPanel {
                             this.console_menu(event.position, cx)
                         }),
                     )
-                    .child(self.console_input.element("debug-console-input", theme)),
+                    .child(self.console_input.element(
+                        FieldMouse::new(cx, |this| Some(&mut this.console_input.field)),
+                        "debug-console-input",
+                        theme,
+                    )),
             );
         }
         body.into_any_element()
@@ -5990,6 +5995,9 @@ impl DebugPanel {
                 return;
             };
             let children = text_field_children(
+                FieldMouse::new(cx, move |this| {
+                    this.variable_edit.as_mut().map(|edit| &mut edit.field)
+                }),
                 field,
                 theme.text,
                 theme.text,
@@ -6831,6 +6839,7 @@ impl Render for EvaluateView {
             .border_color(theme.control_border)
             .text_color(theme.text)
             .children(text_field_lines_named(
+                FieldMouse::new(cx, |this| Some(&mut this.field)),
                 "evaluate-field",
                 &self.field,
                 theme.text,
@@ -7356,6 +7365,7 @@ fn debug_search_row(panel: &DebugPanel, theme: &Theme, cx: &mut Context<DebugPan
         .text_color(theme.text)
         .overflow_hidden()
         .children(crate::console_search::field_parts(
+            FieldMouse::new(cx, |this| Some(&mut this.console_search.field)),
             "debug-search-field",
             &search.field,
             theme,
@@ -7439,6 +7449,7 @@ fn debug_filter_row(panel: &DebugPanel, theme: &Theme, cx: &mut Context<DebugPan
         .track_focus(&panel.filter_focus)
         .on_key_down(cx.listener(|this, event, window, cx| this.filter_key(event, window, cx)))
         .children(crate::console_search::field_parts(
+            FieldMouse::new(cx, |this| Some(&mut this.console_search.filter)),
             "debug-filter-field",
             &panel.console_search.filter,
             theme,

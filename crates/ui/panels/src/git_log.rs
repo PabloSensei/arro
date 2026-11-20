@@ -1823,7 +1823,7 @@ impl GitLogPanel {
                 cx.notify();
                 return;
             }
-            if self.path_query.key(event, false) {
+            if self.path_query.key_with_clipboard(event, false, cx) {
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -1836,7 +1836,7 @@ impl GitLogPanel {
                 cx.notify();
                 return;
             }
-            if self.branch_query.key(event, false) {
+            if self.branch_query.key_with_clipboard(event, false, cx) {
                 self.rebuild_branches();
                 cx.stop_propagation();
                 cx.notify();
@@ -1875,7 +1875,7 @@ impl GitLogPanel {
             }
             _ => {}
         }
-        if self.filter.key(event, false) {
+        if self.filter.key_with_clipboard(event, false, cx) {
             cx.stop_propagation();
             self.refilter(cx);
         }
@@ -3079,6 +3079,7 @@ impl GitLogPanel {
                             .border_1()
                             .border_color(theme.popup_border)
                             .children(text_field_children_named(
+                                FieldMouse::new(cx, |this| Some(&mut this.branch_query)),
                                 "git-log-branch-search",
                                 &self.branch_query,
                                 theme.text,
@@ -3547,6 +3548,11 @@ impl GitLogPanel {
                                 theme.text
                             })
                             .children(text_field_children_named(
+                                FieldMouse::with_edit(
+                                    cx,
+                                    |this| Some(&mut this.filter),
+                                    |this, cx| this.refilter(cx),
+                                ),
                                 "git-log-filter",
                                 &self.filter,
                                 theme.text,
@@ -3670,6 +3676,7 @@ impl GitLogPanel {
                                 theme.text
                             })
                             .children(text_field_children_named(
+                                FieldMouse::new(cx, |this| Some(&mut this.path_query)),
                                 "git-log-path-filter",
                                 &self.path_query,
                                 theme.text,
@@ -4590,6 +4597,7 @@ impl RebaseView {
                     .flex_col()
                     .text_color(theme.text)
                     .children(text_field_lines_named(
+                        FieldMouse::new(cx, |this| Some(&mut this.message)),
                         "rebase-message-field",
                         &self.message,
                         theme.text,

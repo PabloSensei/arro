@@ -319,3 +319,65 @@ fn without_a_store_the_save_password_flag_stays_off(cx: &mut TestAppContext) {
     });
     assert_eq!(store.entries(), 0, "nothing was written to the store");
 }
+
+/// The password of a source is drawn as dots: the typed text is never in the frame.
+#[ui_kit::gpui::test]
+fn the_password_field_draws_dots_and_no_clear_text(cx: &mut TestAppContext) {
+    let store = FakePasswords::ready();
+    let (window, panel) = open(cx, "database-password-dots", store);
+    wait_for_signal(cx, "the store of passwords", |cx| {
+        panel.read_with(cx, |panel, _| panel.password_storage_ready_for_test())
+    });
+    panel.update(cx, |panel, cx| {
+        panel.sources_for_test(vec![source()], cx);
+    });
+    draw(cx, window);
+
+    click(cx, window, "database-password");
+    type_text(cx, window, "secret");
+    draw(cx, window);
+
+    let drawn = ui_kit::test_bounds()
+        .into_iter()
+        .find(|(name, _)| name == "database-password-text")
+        .and_then(|(_, control)| control.label)
+        .map(|label| label.to_string())
+        .expect("the password field is drawn");
+    assert_eq!(drawn, "••••••", "one dot for each typed character");
+}
+
+/// Copy and Cut in the password field put nothing on the clipboard and leave the password.
+#[ui_kit::gpui::test]
+fn the_password_cannot_be_copied_or_cut(cx: &mut TestAppContext) {
+    let store = FakePasswords::ready();
+    let (window, panel) = open(cx, "database-password-copy", store);
+    wait_for_signal(cx, "the store of passwords", |cx| {
+        panel.read_with(cx, |panel, _| panel.password_storage_ready_for_test())
+    });
+    panel.update(cx, |panel, cx| {
+        panel.sources_for_test(vec![source()], cx);
+    });
+    draw(cx, window);
+    cx.write_to_clipboard(ui_kit::gpui::ClipboardItem::new_string("before".to_owned()));
+
+    click(cx, window, "database-password");
+    type_text(cx, window, "secret");
+    crate::window_tests::press(cx, window, "ctrl-a");
+    crate::window_tests::press(cx, window, "ctrl-c");
+    crate::window_tests::press(cx, window, "ctrl-x");
+    draw(cx, window);
+
+    let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(
+        clipboard.as_deref(),
+        Some("before"),
+        "the password never reaches the clipboard"
+    );
+    let drawn = ui_kit::test_bounds()
+        .into_iter()
+        .find(|(name, _)| name == "database-password-text")
+        .and_then(|(_, control)| control.label)
+        .map(|label| label.to_string())
+        .expect("the password field is drawn");
+    assert_eq!(drawn, "••••••", "Cut leaves the password in the field");
+}

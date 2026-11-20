@@ -879,6 +879,7 @@ impl BundleEditorView {
                     .whitespace_nowrap()
                     .on_click(cx.listener(move |this, _, window, cx| focus(this, window, cx)))
                     .children(text_field_children_named(
+                        FieldMouse::new(cx, |this| Some(&mut this.filter)),
                         "bundle-filter",
                         &self.filter,
                         theme.text,
@@ -965,6 +966,7 @@ impl BundleEditorView {
             let value = key.values.get(index).cloned().flatten();
             let lines = field.map(|field| {
                 text_field_lines(
+                    FieldMouse::new(cx, move |this| this.fields.get_mut(index)),
                     field,
                     theme.text,
                     theme.text,

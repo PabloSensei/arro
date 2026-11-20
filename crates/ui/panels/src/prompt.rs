@@ -456,6 +456,7 @@ impl Render for Prompt {
                     .border_color(theme.accent)
                     .text_color(color)
                     .children(text_field_children_named(
+                        FieldMouse::new(cx, |this| Some(&mut this.field)),
                         "prompt-field",
                         &self.field,
                         theme.text,

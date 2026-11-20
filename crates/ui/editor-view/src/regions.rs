@@ -106,6 +106,7 @@ impl EditorView {
         &self,
         popup: &RegionPopup,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let found = self.regions_matching(&popup.query.text);
         let height =
@@ -158,6 +159,17 @@ impl EditorView {
                     .text_color(theme.text_muted)
                     .child("Region ")
                     .children(text_field_children_named(
+                        FieldMouse::with_edit(
+                            cx,
+                            |editor: &mut Self| {
+                                editor.region_popup.as_mut().map(|popup| &mut popup.query)
+                            },
+                            |editor: &mut Self, _| {
+                                if let Some(popup) = editor.region_popup.as_mut() {
+                                    popup.selected = 0;
+                                }
+                            },
+                        ),
                         "region-query-field",
                         &popup.query,
                         theme.text,

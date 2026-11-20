@@ -622,6 +622,7 @@ impl NewProject {
             ))
             .child(
                 text_box(
+                    FieldMouse::new(cx, |this| Some(&mut this.name)),
                     "new-project-name",
                     &self.name,
                     active == Active::Name,
@@ -649,6 +650,7 @@ impl NewProject {
             )
             .child(
                 text_box(
+                    FieldMouse::new(cx, |this| Some(&mut this.location)),
                     "new-project-location",
                     &self.location,
                     active == Active::Location,
@@ -690,11 +692,21 @@ impl NewProject {
             match kind {
                 Kind::Text => {
                     content = content.child(
-                        text_box(&format!("new-project-field-{key}"), &text, active, &theme)
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        text_box(
+                            FieldMouse::new(cx, move |this| {
+                                this.wizard.rows.get_mut(index).map(|row| &mut row.text)
+                            }),
+                            &format!("new-project-field-{key}"),
+                            &text,
+                            active,
+                            &theme,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 this.wizard.active = Active::Row(index);
                                 this.run_wizard_step(Step::Changed, window, cx);
-                            })),
+                            },
+                        )),
                     );
                 }
                 Kind::Choice => content = content.child(self.choice_row(index, &theme, cx)),
@@ -725,6 +737,9 @@ impl NewProject {
                                 })
                                 .when(!empty_query || active, |this| {
                                     this.child(text_box(
+                                        FieldMouse::new(cx, move |this| {
+                                            this.wizard.rows.get_mut(index).map(|row| &mut row.text)
+                                        }),
                                         &format!("new-project-search-{key}-field"),
                                         &text,
                                         active,
@@ -1113,7 +1128,13 @@ fn label_text(
 }
 
 /// The frame of one line of text, drawn by the one renderer of `ui-kit`.
-fn text_box(selector: &str, field: &TextField, active: bool, theme: &Theme) -> Stateful<Div> {
+fn text_box(
+    mouse: FieldMouse,
+    selector: &str,
+    field: &TextField,
+    active: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
     let debug = selector.to_owned();
     div()
         .id(selector.to_owned())
@@ -1126,6 +1147,7 @@ fn text_box(selector: &str, field: &TextField, active: bool, theme: &Theme) -> S
         .border_2()
         .border_color(if active { theme.accent } else { theme.border })
         .children(text_field_children_named(
+            mouse,
             "new-project-input",
             field,
             theme.text,
