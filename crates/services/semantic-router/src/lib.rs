@@ -20,9 +20,10 @@ use lsp_client::lsp_types::request::{
     CodeActionRequest, CodeActionResolveRequest, CodeLensRefresh, CodeLensRequest, CodeLensResolve,
     Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
     GotoImplementation, GotoImplementationParams, GotoTypeDefinition, GotoTypeDefinitionParams,
-    HoverRequest, InlayHintRefreshRequest, InlayHintRequest, RangeFormatting, References, Rename,
-    Request, SemanticTokensFullRequest, SemanticTokensRangeRequest, SignatureHelpRequest,
-    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkspaceSymbolRequest,
+    HoverRequest, InlayHintRefreshRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
+    References, Rename, Request, SemanticTokensFullRequest, SemanticTokensRangeRequest,
+    SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes,
+    WorkspaceSymbolRequest,
 };
 use lsp_client::lsp_types::{
     CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyOutgoingCallsParams,
@@ -31,13 +32,13 @@ use lsp_client::lsp_types::{
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams,
     DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InlayHint, InlayHintParams,
-    Location, PartialResultParams, Position, PublishDiagnosticsParams, Range, ReferenceContext,
-    ReferenceParams, RenameParams, SemanticTokens, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkDoneProgressParams, WorkspaceEdit,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    Location, PartialResultParams, Position, PrepareRenameResponse, PublishDiagnosticsParams,
+    Range, ReferenceContext, ReferenceParams, RenameParams, SemanticTokens, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentPositionParams, TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressParams,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use lsp_client::{Client, Error as LspError, ServerEvents};
 use serde_json::Value;
@@ -849,6 +850,30 @@ impl Router {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         self.ask::<Rename>(&place, params).await
+    }
+
+    /// Whether the server renames the name at `place`, and the range of that name when it
+    /// names it.
+    pub async fn prepare_rename(&self, place: Place) -> Result<Option<Option<Range>>, RouteError> {
+        let params = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: place.uri.clone(),
+            },
+            position: place.position,
+        };
+        self.ask::<PrepareRenameRequest>(&place, params)
+            .await
+            .map(|answer| {
+                answer.and_then(|response| match response {
+                    PrepareRenameResponse::Range(range) => Some(Some(range)),
+                    PrepareRenameResponse::RangeWithPlaceholder { range, .. } => Some(Some(range)),
+                    // The default behavior renames the word under the caret, which the
+                    // editor knows without the server.
+                    PrepareRenameResponse::DefaultBehavior { default_behavior } => {
+                        default_behavior.then_some(None)
+                    }
+                })
+            })
     }
 
     /// The types next to the one at `place`, above it or below it.

@@ -338,6 +338,8 @@ const LAST_CHECK_KEY: &str = "updates.last_check";
 const SKIPPED_KEY: &str = "updates.skipped_version";
 /// A submenu opens only after the pointer rests on its row, as IDEA does.
 const MENU_OPEN_DELAY: Duration = Duration::from_millis(220);
+/// How long a message of the status bar stays before it goes away.
+const STATUS_MESSAGE_TIME: Duration = Duration::from_secs(5);
 
 /// The build the distribution README names: the commit and its date.
 pub fn build_version() -> &'static str {
@@ -721,6 +723,11 @@ pub struct Workspace {
     zoom_notice: Option<SharedString>,
     /// A number that drops a late end of a notice.
     zoom_notice_serial: usize,
+    /// The message of an action that found nothing to do, shown in the status bar for a
+    /// while.
+    status_message: Option<SharedString>,
+    /// A number that drops a late end of the message.
+    status_message_serial: usize,
     /// The long task the status bar shows while it runs, with its Cancel button.
     status_progress: Option<StatusProgress>,
     pub(crate) balloon_visible: bool,
@@ -1121,6 +1128,8 @@ impl Workspace {
             zen_full_screen: false,
             zoom_notice: None,
             zoom_notice_serial: 0,
+            status_message: None,
+            status_message_serial: 0,
             status_progress: None,
             balloon_visible: false,
             balloon_serial: 0,
@@ -2574,6 +2583,33 @@ impl Workspace {
     /// The zoom notice of the status bar, while it is shown.
     pub fn zoom_notice(&self) -> Option<&SharedString> {
         self.zoom_notice.as_ref()
+    }
+
+    /// Shows `text` in the status bar for a few seconds: what an action says when it found
+    /// nothing to do. A message that comes later replaces it.
+    pub fn show_status_message(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.status_message = Some(text.into());
+        self.status_message_serial += 1;
+        let serial = self.status_message_serial;
+        self.status_view.update(cx, |_, cx| cx.notify());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATUS_MESSAGE_TIME).await;
+            this.update(cx, |this, cx| {
+                if this.status_message_serial == serial {
+                    this.status_message = None;
+                    this.status_view.update(cx, |_, cx| cx.notify());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The message of the status bar, while it is shown.
+    pub fn status_message(&self) -> Option<&SharedString> {
+        self.status_message.as_ref()
     }
 
     /// The mode of View | Appearance, for the menu, the chrome and the tests.

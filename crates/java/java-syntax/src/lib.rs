@@ -1,6 +1,7 @@
 //! Grammar and queries of the language.
 
 mod config_keys;
+mod declarations;
 mod diagram;
 mod edit;
 mod endpoints;
@@ -131,6 +132,19 @@ impl lang_api::SymbolProvider for JavaSymbols {
         let mut symbols = self.0.symbols(text);
         qualify_owners(&mut symbols);
         symbols
+    }
+
+    /// One parse for the names and the signatures, so the outline costs what the names cost.
+    fn file_declarations(&self, _path: &std::path::Path, text: &str) -> Vec<lang_api::Declared> {
+        let Some(tree) = self.0.parse(text) else {
+            return Vec::new();
+        };
+        let mut symbols = self.0.symbols_in(&tree, text);
+        qualify_owners(&mut symbols);
+        symbols
+            .into_iter()
+            .map(|symbol| declarations::declared(&tree, text, symbol))
+            .collect()
     }
 }
 

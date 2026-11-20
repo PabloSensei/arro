@@ -310,7 +310,7 @@ impl PushWindow {
             .border_color(if checked {
                 theme.accent
             } else {
-                theme.text_secondary
+                ui_kit::checkbox_border(theme)
             })
             .when(checked, |this| this.bg(theme.accent))
             .child(

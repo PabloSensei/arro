@@ -1303,6 +1303,7 @@ fn capabilities_of(capabilities: &Value) -> Capabilities {
         function_breakpoints: flag("supportsFunctionBreakpoints"),
         data_breakpoints: flag("supportsDataBreakpoints"),
         restart_frame: flag("supportsRestartFrame"),
+        hit_condition: flag("supportsHitConditionalBreakpoints"),
     }
 }
 
@@ -1419,6 +1420,7 @@ mod tests {
                 function_breakpoints: true,
                 data_breakpoints: true,
                 restart_frame: true,
+                hit_condition: false,
             }
         );
         assert_eq!(capabilities_of(&json!({})), Capabilities::default());

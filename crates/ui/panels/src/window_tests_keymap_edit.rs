@@ -124,6 +124,8 @@ fn the_page_adds_a_shortcut_and_a_conflict_names_the_other_action(cx: &mut TestA
     type_text(cx, window, "copy");
     draw(cx, window);
 
+    click(cx, window, "keymap-row-editor-copy");
+    draw(cx, window);
     click(cx, window, "keymap-add-editor-copy");
     draw(cx, window);
     // Ctrl+D is Duplicate already: the page asks what to do with it.
@@ -234,6 +236,8 @@ fn a_shortcut_added_on_the_page_runs_in_the_window(cx: &mut TestAppContext) {
     let (root, window) = open_sample_window(cx, "keymap-page-runs");
     open_keymap_page(cx, window);
     type_text(cx, window, "duplicate");
+    draw(cx, window);
+    click(cx, window, "keymap-row-editor-duplicate");
     draw(cx, window);
     click(cx, window, "keymap-add-editor-duplicate");
     draw(cx, window);

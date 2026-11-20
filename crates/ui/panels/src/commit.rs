@@ -361,7 +361,7 @@ fn tick_box(tick: Tick, partial: String, theme: &Theme) -> Div {
         .border_color(if on {
             theme.accent
         } else {
-            theme.text_secondary
+            ui_kit::checkbox_border(theme)
         })
         .when(on, |this| this.bg(theme.accent))
         .child(

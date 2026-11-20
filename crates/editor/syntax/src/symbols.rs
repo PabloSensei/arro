@@ -6,7 +6,7 @@ use std::path::Path;
 
 use lang_api::{Symbol, SymbolKind, SymbolProvider};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Query, QueryCursor};
+use tree_sitter::{Language, Parser, Query, QueryCursor, Tree};
 
 const NAME: &str = "name";
 const DEFINITION: &str = "definition.";
@@ -40,14 +40,22 @@ impl TagSymbols {
         Ok(Self { language, query })
     }
 
-    pub fn symbols(&self, text: &str) -> Vec<Symbol> {
+    /// The tree of `text` in this grammar, `None` when the grammar cannot be set.
+    pub fn parse(&self, text: &str) -> Option<Tree> {
         let mut parser = Parser::new();
-        if parser.set_language(&self.language).is_err() {
-            return Vec::new();
+        parser.set_language(&self.language).ok()?;
+        parser.parse(text, None)
+    }
+
+    pub fn symbols(&self, text: &str) -> Vec<Symbol> {
+        match self.parse(text) {
+            Some(tree) => self.symbols_in(&tree, text),
+            None => Vec::new(),
         }
-        let Some(tree) = parser.parse(text, None) else {
-            return Vec::new();
-        };
+    }
+
+    /// The declarations of `tree`, the tree that `parse` made from `text`.
+    pub fn symbols_in(&self, tree: &Tree, text: &str) -> Vec<Symbol> {
         let names = self.query.capture_names();
         let mut found = Vec::new();
         let mut cursor = QueryCursor::new();

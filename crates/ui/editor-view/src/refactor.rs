@@ -12,10 +12,11 @@ use lang_api::{
     MoveKind, MovePlace, MoveQuery, MoveRequest, RenamePosition, RenameQuery, SelectionQuery,
     SourceSpan, TextSpan, WorkspaceChange, apply_to_text, ask,
 };
-use text_core::TextStore;
+use text_core::{EditKind, TextStore};
 use ui_kit::*;
 
 use crate::actions::{Own, Pick};
+use crate::rename::RenameInPlace;
 use crate::semantic::{MAX_SHOWN, NO_ANSWER, first, is_word, offset_at, point_at, uri_path};
 use crate::view::{DetailedUsage, EditorEvent, EditorView, Usage, UsagesUpdate};
 use keymap::editor as editor_actions;
@@ -807,8 +808,17 @@ impl EditorView {
             .unwrap_or_default()
     }
 
-    /// Shift+F6 opens the field with the word under the caret.
+    /// Shift+F6 opens the field with the word under the caret, or starts changing the
+    /// name in the text itself. A second Shift+F6 in that mode opens the field.
     pub(crate) fn start_rename(&mut self, cx: &mut Context<Self>) {
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.rename_in_place.is_some())
+        {
+            self.open_rename_options(cx);
+            return;
+        }
         let Some((spot, caret)) = self.spot() else {
             return;
         };
@@ -833,14 +843,75 @@ impl EditorView {
             return;
         }
         let text = store.slice(start..end);
+        // A type whose name is the name of the file is renamed with the file.
+        if self
+            .path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem == text)
+        {
+            self.open_rename_field(start, text, spot, cx);
+            return;
+        }
+        let Some(lsp) = &self.lsp else {
+            return;
+        };
+        if let Some(provider) = lsp.support.prepare_rename() {
+            let replies = ask(provider, spot.clone());
+            cx.spawn(async move |this, cx| {
+                let answer = first(replies).await;
+                this.update(cx, |this, cx| {
+                    let Some((prepared, Confidence::Certain)) = answer else {
+                        this.rename_not_available(start, cx);
+                        return;
+                    };
+                    match prepared {
+                        Some(prepared) => {
+                            let current = this
+                                .state
+                                .as_ref()
+                                .is_some_and(|state| state.version() as i32 == spot.version);
+                            if current {
+                                this.begin_rename_in_place(spot, prepared.span, start..end, cx);
+                            }
+                        }
+                        None => this.rename_not_available(start, cx),
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        if lsp.support.rename().is_some() || lsp.support.server().is_none() {
+            if lsp.support.rename().is_none() {
+                // No server: the text of this file is all the editor can change.
+                self.begin_rename_in_place(spot, None, start..end, cx);
+            } else {
+                self.open_rename_field(start, text, spot, cx);
+            }
+            return;
+        }
+        self.rename_not_available(start, cx);
+    }
+
+    /// The window with the name field, which previews the change of every file.
+    fn open_rename_field(
+        &mut self,
+        at: usize,
+        text: String,
+        spot: DocumentSpot,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(lsp) = &mut self.lsp {
             lsp.completion = None;
             lsp.actions = None;
             lsp.note = None;
             lsp.move_to = None;
             lsp.name = None;
+            lsp.rename_in_place = None;
             lsp.rename = Some(RenameField {
-                at: start,
+                at,
                 spot,
                 text,
                 preview: None,
@@ -850,8 +921,160 @@ impl EditorView {
         }
     }
 
-    /// Typed text goes to an open rename field. Returns whether it took the text.
+    /// Starts the linked editing of the name at the caret. `span` is the range the
+    /// language prepared, and `word` is what the editor found without it.
+    fn begin_rename_in_place(
+        &mut self,
+        spot: DocumentSpot,
+        prepared: Option<TextSpan>,
+        word: Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let range = prepared
+            .map(|span| {
+                let start = offset_at(&state.store(), span.start);
+                let end = offset_at(&state.store(), span.end).max(start);
+                start..end
+            })
+            .filter(|range| !range.is_empty())
+            .unwrap_or(word);
+        let Some(rename) = RenameInPlace::new(state, range) else {
+            return;
+        };
+        let main = rename.main_range();
+        if let Some(lsp) = &mut self.lsp {
+            lsp.completion = None;
+            lsp.actions = None;
+            lsp.note = None;
+            lsp.move_to = None;
+            lsp.name = None;
+            lsp.rename = None;
+            lsp.highlights.clear();
+            lsp.rename_in_place = Some(rename);
+        }
+        state.select_range(main);
+        self.rename_occurrences(spot, cx);
+        cx.notify();
+    }
+
+    /// Asks the language for the places of the name, so that the occurrences are the
+    /// symbol's and not the same word in a comment.
+    fn rename_occurrences(&mut self, spot: DocumentSpot, cx: &mut Context<Self>) {
+        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.highlights()) else {
+            return;
+        };
+        let replies = ask(provider, spot.clone());
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                let Some((spans, Confidence::Certain)) = answer else {
+                    return;
+                };
+                let (Some(state), Some(lsp)) = (&mut this.state, &mut this.lsp) else {
+                    return;
+                };
+                if state.version() as i32 != spot.version {
+                    return;
+                }
+                let Some(rename) = &mut lsp.rename_in_place else {
+                    return;
+                };
+                if rename.text != rename.original {
+                    return;
+                }
+                let store = state.store();
+                let mut ranges: Vec<Range<usize>> = spans
+                    .into_iter()
+                    .map(|span| {
+                        let start = offset_at(&store, span.start);
+                        start..offset_at(&store, span.end).max(start)
+                    })
+                    .filter(|range| range.start < range.end)
+                    .collect();
+                ranges.sort_by_key(|range| range.start);
+                ranges.dedup();
+                if ranges.is_empty() {
+                    return;
+                }
+                let main_at = rename.main_start();
+                let main = match ranges
+                    .iter()
+                    .position(|range| range.start <= main_at && main_at <= range.end)
+                    .or_else(|| ranges.iter().position(|range| range.start >= main_at))
+                {
+                    Some(main) => main,
+                    None => return,
+                };
+                let focused = ranges[main].clone();
+                rename.spans = ranges;
+                rename.main = main;
+                state.select_range(focused);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A name the language refuses: the status bar says so and no mode starts.
+    fn rename_not_available(&mut self, at: usize, cx: &mut Context<Self>) {
+        let message: SharedString = "This name cannot be renamed".into();
+        self.show_note(at, message.clone(), cx);
+        cx.emit(EditorEvent::Status(message));
+    }
+
+    /// The second Shift+F6: the field of the name with the options, as it was before the
+    /// linked editing. The text of the file goes back to the original name.
+    fn open_rename_options(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.lsp.as_mut().and_then(|lsp| lsp.rename_in_place.take()) else {
+            return;
+        };
+        let text = rename.text.clone();
+        let at = if text != rename.original {
+            rename.main_start_after_revert()
+        } else {
+            rename.main_start()
+        };
+        if text != rename.original {
+            let edits = rename.revert_edits();
+            let after = rename.selection_after_revert();
+            let change = self
+                .state
+                .as_mut()
+                .and_then(|state| state.apply_template_edits(edits, after, EditKind::Command));
+            self.changed(change, cx);
+        }
+        let spot = self.spot_at(at);
+        if let (Some(lsp), Some(spot)) = (&mut self.lsp, spot) {
+            lsp.rename = Some(RenameField {
+                at,
+                spot,
+                text,
+                preview: None,
+                summary: None,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Typed text goes to an open rename field or to the name changed in place. Returns
+    /// whether it took the text.
     pub(crate) fn rename_typed(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.rename_in_place.is_some())
+        {
+            let typed = text.trim_end_matches(['\r', '\n']);
+            if typed.is_empty() {
+                return true;
+            }
+            self.type_in_rename_place(typed, cx);
+            return true;
+        }
         let Some(field) = self.lsp.as_mut().and_then(|lsp| lsp.rename.as_mut()) else {
             return false;
         };
@@ -862,8 +1085,30 @@ impl EditorView {
         true
     }
 
-    /// Keys of an open rename field. Returns whether the key was taken.
+    /// Keys of an open rename field, or of a name changed in place. Returns whether the
+    /// key was taken.
     pub(crate) fn rename_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.rename_in_place.is_some())
+        {
+            return match key {
+                "escape" => {
+                    self.cancel_rename_in_place(cx);
+                    true
+                }
+                "enter" => {
+                    self.finish_rename_in_place(cx);
+                    true
+                }
+                "backspace" => {
+                    self.backspace_rename_place(cx);
+                    true
+                }
+                _ => !is_typed_key(key),
+            };
+        }
         let Some(lsp) = &mut self.lsp else {
             return false;
         };
@@ -890,6 +1135,129 @@ impl EditorView {
         }
         cx.notify();
         true
+    }
+
+    fn type_in_rename_place(&mut self, text: &str, cx: &mut Context<Self>) {
+        let change = match (&mut self.state, &mut self.lsp) {
+            (Some(state), Some(lsp)) => lsp
+                .rename_in_place
+                .as_mut()
+                .and_then(|rename| rename.type_text(state, text, false)),
+            _ => None,
+        };
+        self.refresh_rename_problem();
+        self.changed(change, cx);
+    }
+
+    fn backspace_rename_place(&mut self, cx: &mut Context<Self>) {
+        let change = match (&mut self.state, &mut self.lsp) {
+            (Some(state), Some(lsp)) => lsp
+                .rename_in_place
+                .as_mut()
+                .and_then(|rename| rename.backspace(state, false)),
+            _ => None,
+        };
+        self.refresh_rename_problem();
+        self.changed(change, cx);
+    }
+
+    fn refresh_rename_problem(&mut self) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let support = lsp.support.clone();
+        if let Some(rename) = &mut lsp.rename_in_place {
+            let reserved = support.reserved_word(&rename.text);
+            rename.refresh_problem(reserved);
+        }
+    }
+
+    /// Escape: the original name comes back into every occurrence and the mode ends.
+    fn cancel_rename_in_place(&mut self, cx: &mut Context<Self>) {
+        let Some(mut rename) = self.lsp.as_mut().and_then(|lsp| lsp.rename_in_place.take()) else {
+            return;
+        };
+        let collapsed = if rename.text == rename.original {
+            Some(rename.main_start() + rename.original.len())
+        } else {
+            None
+        };
+        let change = self.state.as_mut().and_then(|state| {
+            let change = rename.cancel(state);
+            if let Some(at) = collapsed {
+                state.select_range(at..at);
+            }
+            change
+        });
+        self.changed(change, cx);
+    }
+
+    /// Enter: the name stays in this file and the language renames every other place.
+    pub(crate) fn finish_rename_in_place(&mut self, cx: &mut Context<Self>) {
+        if self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.rename_in_place.as_ref())
+            .is_some_and(|rename| rename.problem.is_some())
+        {
+            cx.notify();
+            return;
+        }
+        let Some(rename) = self.lsp.as_mut().and_then(|lsp| lsp.rename_in_place.take()) else {
+            return;
+        };
+        if rename.text == rename.original {
+            if let Some(state) = &mut self.state {
+                let at = rename.main_start() + rename.original.len();
+                state.select_range(at..at);
+            }
+            cx.notify();
+            return;
+        }
+        // No server: the text of this file is the whole rename, and it is already there.
+        if self
+            .lsp
+            .as_ref()
+            .is_none_or(|lsp| lsp.support.rename().is_none())
+        {
+            if let Some(state) = &mut self.state {
+                let at = rename.main_start() + rename.text.len();
+                state.select_range(at..at);
+            }
+            cx.notify();
+            return;
+        }
+        let at = rename.main_start_after_revert();
+        let new_name = rename.text.clone();
+        let edits = rename.revert_edits();
+        let after = rename.selection_after_revert();
+        let revert = self
+            .state
+            .as_mut()
+            .and_then(|state| state.apply_template_edits(edits, after, EditKind::Command));
+        self.changed(revert, cx);
+        let Some(spot) = self.spot_at(at) else {
+            return;
+        };
+        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.rename()) else {
+            self.show_note(at, "Cannot rename this", cx);
+            return;
+        };
+        let version = spot.version;
+        let replies = ask(provider, RenameQuery { spot, new_name });
+        cx.spawn(async move |this, cx| {
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| match answer {
+                Some((change, Confidence::Certain)) if !change.is_empty() => {
+                    this.apply_change_labeled(version, change, Some("Rename"), cx);
+                }
+                Some((_, Confidence::Unknown)) => this.show_note(at, NO_ANSWER, cx),
+                Some(_) => this.show_note(at, "Cannot rename this", cx),
+                None => {}
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn ask_rename(&mut self, cx: &mut Context<Self>) {

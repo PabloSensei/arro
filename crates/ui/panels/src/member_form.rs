@@ -423,7 +423,11 @@ fn check_box(checked: bool, theme: &Theme) -> Div {
         .h(px(14.))
         .rounded(px(3.))
         .border_1()
-        .border_color(theme.control_border)
+        .border_color(if checked {
+            theme.control_border
+        } else {
+            ui_kit::checkbox_border(theme)
+        })
         .when(checked, |box_| box_.bg(theme.accent))
         .child(
             div()

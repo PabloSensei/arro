@@ -112,7 +112,7 @@ impl Provider<OverridableMethodsQuery, OverridableMethods> for GenerateLanguage 
         _: base::Cancel,
         mut reply: lang_api::Reply<OverridableMethods>,
     ) {
-        // No method to implement: the Implement Methods row leaves the list.
+        // No method to implement: the Implement Methods row stays and says so when chosen.
         let methods = OverridableMethods {
             owner_type: "A".to_owned(),
             methods: Vec::new(),
@@ -311,7 +311,7 @@ pub(crate) fn alt_insert(
 }
 
 #[ui_kit::gpui::test]
-fn a_class_without_fields_has_no_getter_or_setter(cx: &mut TestAppContext) {
+fn a_class_without_fields_keeps_its_accessor_rows(cx: &mut TestAppContext) {
     let text = "class A {\n}\n";
     let (root, path) = project("generate-list-no-fields", text);
     let language = GenerateLanguage::new();
@@ -322,8 +322,16 @@ fn a_class_without_fields_has_no_getter_or_setter(cx: &mut TestAppContext) {
     let rows = alt_insert(cx, window, &path, 0, 9).expect("the list opens");
     assert_eq!(
         rows,
-        ["Constructor", "Override Methods"],
-        "a class without fields offers its constructor and its overrides only"
+        [
+            "Constructor",
+            "Getter",
+            "Setter",
+            "Getter and Setter",
+            "Override Methods",
+            "Implement Methods",
+        ],
+        "a class without fields offers its constructor, its accessors that have nothing to \
+         write, and its overrides"
     );
     draw(cx, window);
     assert!(
@@ -375,7 +383,7 @@ fn a_class_without_fields_gets_its_constructor_without_a_notice(cx: &mut TestApp
 }
 
 #[ui_kit::gpui::test]
-fn a_final_field_has_a_getter_and_no_setter(cx: &mut TestAppContext) {
+fn a_final_field_has_a_getter_and_a_setter_row_with_nothing_to_write(cx: &mut TestAppContext) {
     let text = "class A {\n    private final String name;\n}\n";
     let (root, path) = project("generate-list-final-field", text);
     let language = GenerateLanguage::new();
@@ -393,13 +401,13 @@ fn a_final_field_has_a_getter_and_no_setter(cx: &mut TestAppContext) {
         "the final field has a getter: {rows:?}"
     );
     assert!(
-        !rows.contains(&"Setter".to_owned()),
-        "the final field has no setter: {rows:?}"
+        rows.contains(&"Setter".to_owned()),
+        "the setter row stays in a class, and says so when chosen: {rows:?}"
     );
 }
 
 #[ui_kit::gpui::test]
-fn a_field_with_a_getter_has_no_getter_row(cx: &mut TestAppContext) {
+fn a_field_with_a_getter_keeps_the_getter_row(cx: &mut TestAppContext) {
     let text = "class A {\n    private String name;\n    public String getName() {\n        return name;\n    }\n}\n";
     let (root, path) = project("generate-list-with-getter", text);
     let language = GenerateLanguage::new();
@@ -413,8 +421,8 @@ fn a_field_with_a_getter_has_no_getter_row(cx: &mut TestAppContext) {
 
     let rows = alt_insert(cx, window, &path, 0, 9).expect("the list opens");
     assert!(
-        !rows.contains(&"Getter".to_owned()),
-        "the field has its getter: {rows:?}"
+        rows.contains(&"Getter".to_owned()),
+        "the getter row stays in a class, and says so when chosen: {rows:?}"
     );
     assert!(
         rows.contains(&"Setter".to_owned()),
@@ -435,13 +443,13 @@ fn without_a_server_answer_the_class_symbols_decide(cx: &mut TestAppContext) {
 
     let rows = alt_insert(cx, window, &path, 0, 9).expect("the list opens");
     assert!(rows.contains(&"Constructor".to_owned()), "{rows:?}");
-    for hidden in [
-        "Getter",
-        "Setter",
-        "Getter and Setter",
-        "equals() and hashCode()",
-        "toString()",
-    ] {
+    for accessor in ["Getter", "Setter", "Getter and Setter"] {
+        assert!(
+            rows.contains(&accessor.to_owned()),
+            "the accessor rows stay in a class, whatever the symbols say: {rows:?}"
+        );
+    }
+    for hidden in ["equals() and hashCode()", "toString()"] {
         assert!(
             !rows.contains(&hidden.to_owned()),
             "the symbols say the class has no fields, so no {hidden}: {rows:?}"

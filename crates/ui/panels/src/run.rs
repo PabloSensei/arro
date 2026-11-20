@@ -5673,6 +5673,69 @@ impl RunPanel {
             .into_any_element()
     }
 
+    /// The console of a window that has run nothing yet: the selected configuration, which
+    /// Run starts, with the shortcut of Run, and the link to the configurations.
+    fn idle_body(&self, name: String, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let platform = keymap::platform();
+        let shortcut = workspace::window_key("workspace::Run", platform)
+            .map(|keys| keymap::shortcut_label(keys, platform));
+        // The link runs what Shift+F10 runs, so both starts take the same path.
+        let run = cx.listener(|this, _, window, cx| {
+            let workspace = this.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| workspace.run_selected(window, cx))
+                    .ok();
+            });
+        });
+        let edit = cx.listener(|this, _, window, cx| {
+            let workspace = this.workspace.clone();
+            let panel = cx.entity();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        crate::run_configs::RunConfigDialog::show(panel, workspace, window, cx)
+                    })
+                    .ok();
+            });
+        });
+        div()
+            .debug_selector(|| "run-idle".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(px(SPACE_S))
+            .text_color(theme.text_secondary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .child(
+                        div()
+                            .id("run-idle-run")
+                            .debug_selector(|| "run-idle-run".to_owned())
+                            .cursor_pointer()
+                            .text_color(theme.accent)
+                            .child(format!("Run '{name}'"))
+                            .on_click(run),
+                    )
+                    .children(shortcut.map(|keys| div().child(keys))),
+            )
+            .child(
+                div()
+                    .id("run-idle-edit")
+                    .debug_selector(|| "run-idle-edit".to_owned())
+                    .cursor_pointer()
+                    .text_color(theme.accent)
+                    .child("Edit Configurations…")
+                    .on_click(edit),
+            )
+            .into_any_element()
+    }
+
     fn rows(
         &mut self,
         range: std::ops::Range<usize>,
@@ -6258,6 +6321,19 @@ impl Render for RunPanel {
             && !self.tests.active()
             && self.live.is_none()
             && !self.busy();
+        // Nothing ran in this window yet and a configuration is selected: the window names it,
+        // so Run starts it from here. A start in progress does not count as idle.
+        let idle = (!running
+            && self.lines.is_empty()
+            && self.draining.is_empty()
+            && !self.tests.active()
+            && self.live.is_none())
+        .then(|| {
+            self.selected
+                .and_then(|index| self.configs.get(index))
+                .map(|config| config.name.clone())
+        })
+        .flatten();
         let console_body: AnyElement = if nothing_to_run {
             let add_config = cx.listener(|this, _, window, cx| {
                 let workspace = this.workspace.clone();
@@ -6290,6 +6366,8 @@ impl Render for RunPanel {
                         .on_click(add_config),
                 )
                 .into_any_element()
+        } else if let Some(name) = idle {
+            self.idle_body(name, &theme, cx)
         } else {
             scrollable(
                 "run-console",

@@ -24,6 +24,7 @@ mod popups;
 mod quick_doc;
 mod refactor;
 mod regions;
+mod rename;
 mod rendered_doc;
 mod scrollbar;
 mod semantic;

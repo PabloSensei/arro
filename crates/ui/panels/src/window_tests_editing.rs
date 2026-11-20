@@ -79,6 +79,7 @@ fn outline_item(
     OutlineItem {
         name: name.to_owned(),
         signature: None,
+        visibility: None,
         kind,
         depth,
         range,

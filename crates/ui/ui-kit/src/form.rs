@@ -60,9 +60,9 @@ fn label_text_width(window: &Window, text: &str) -> f32 {
     f32::from(line.width())
 }
 
-/// A label in a label column of `width`: muted, on the height of a field, cut at the edge of the
-/// column.
-pub fn form_label(width: f32, text: &str, theme: &Theme) -> Div {
+/// A label in a label column of `width` in `color`: on the height of a field, cut at the edge of
+/// the column.
+fn label_in(width: f32, text: &str, color: Hsla) -> Div {
     div()
         .w(px(width))
         .flex_none()
@@ -73,18 +73,29 @@ pub fn form_label(width: f32, text: &str, theme: &Theme) -> Div {
         .whitespace_nowrap()
         .font_family(UI_FONT)
         .text_size(px(UI_SIZE))
-        .text_color(theme.text_muted)
+        .text_color(color)
         .child(text.to_owned())
+}
+
+/// A label in a label column of `width`: muted, on the height of a field, cut at the edge of the
+/// column.
+pub fn form_label(width: f32, text: &str, theme: &Theme) -> Div {
+    label_in(width, text, theme.text_muted)
 }
 
 /// A label and a field on one row. The label stands in the column of `width`, and the field
 /// starts after it and fills the rest of the row.
 pub fn form_row(width: f32, label: &str, field: impl IntoElement, theme: &Theme) -> Div {
+    form_row_colored(width, label, theme.text_muted, field)
+}
+
+/// [`form_row`] with the label in `color`, for the pages whose labels read as their text.
+pub fn form_row_colored(width: f32, label: &str, color: Hsla, field: impl IntoElement) -> Div {
     div()
         .flex()
         .items_center()
         .gap(px(FORM_GAP))
-        .child(form_label(width, label, theme))
+        .child(label_in(width, label, color))
         .child(div().flex_1().min_w(px(0.)).child(field))
 }
 

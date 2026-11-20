@@ -333,7 +333,7 @@ impl Render for UnshelveDialog {
                             .border_color(if checked {
                                 theme.accent
                             } else {
-                                theme.text_secondary
+                                ui_kit::checkbox_border(&theme)
                             })
                             .when(checked, |this| this.bg(theme.accent))
                             .child(
@@ -408,7 +408,7 @@ impl Render for UnshelveDialog {
                             .border_color(if delete {
                                 theme.accent
                             } else {
-                                theme.text_secondary
+                                ui_kit::checkbox_border(&theme)
                             })
                             .when(delete, |this| this.bg(theme.accent)),
                     )

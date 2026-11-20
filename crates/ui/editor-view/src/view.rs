@@ -15,8 +15,8 @@ use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use keymap::{Keymap, Keystroke, Lookup, default_keymap, editor as actions};
 use lang_api::{
-    ActionKind, ActionQuery, DiagnosticEntry, DocumentEdit, FormatQuery, NavigationKind,
-    RangeFormatQuery, Replies, Severity, SourceSpan, TextSpan, ask,
+    ActionKind, ActionQuery, DiagnosticEntry, DocumentEdit, FormatQuery, GraphVisibility,
+    NavigationKind, RangeFormatQuery, Replies, Severity, SourceSpan, TextSpan, ask,
 };
 use syntax::{DocumentId, HighlightSpan, LanguageConfig, SyntaxService};
 use templates::{ExpandWith, FileTemplateDefinition, TemplateLanguage, TemplateOverrides};
@@ -350,6 +350,8 @@ pub struct OutlineItem {
     /// The declaration with its type and parameters, when the language gives them:
     /// `process(int, Owner): String`.
     pub signature: Option<String>,
+    /// How visible the declaration is, when the language says so.
+    pub visibility: Option<GraphVisibility>,
     pub kind: OutlineKind,
     pub depth: u32,
     /// The whole declaration.
@@ -626,6 +628,9 @@ pub enum EditorEvent {
     Dirty(bool),
     Saved,
     Failed(SharedString),
+    /// A message about a language answer that the status bar shows, such as a name the
+    /// language refuses to rename.
+    Status(SharedString),
     /// A save met a language server that could not run its actions; the text went to
     /// the disk without them.
     SaveNote(SharedString),
@@ -787,6 +792,8 @@ pub enum EditorEvent {
     },
     /// The text scrolled: the first visible row in pixels, for a view that follows it.
     Scrolled(f32),
+    /// An action found nothing to do and says so in the status bar of the window.
+    StatusMessage(SharedString),
 }
 
 /// What the Documentation tool window asks about the symbol at the caret: the place, the
@@ -1386,6 +1393,19 @@ impl EditorView {
         }
         cx.observe_global::<Reveals>(|this, cx| this.reveal(cx))
             .detach();
+        // The editor lost the focus: a name changed in place is applied, as IDEA applies
+        // it when the user clicks away.
+        let focus = view.focus_handle.clone();
+        cx.on_blur(&focus, window, |view, _window, cx| {
+            if view
+                .lsp
+                .as_ref()
+                .is_some_and(|lsp| lsp.rename_in_place.is_some())
+            {
+                view.finish_rename_in_place(cx);
+            }
+        })
+        .detach();
         // The window lost the focus of the system: its popups go with it, as IDEA
         // closes them.
         cx.observe_window_activation(window, |view, window, cx| {
@@ -3471,6 +3491,18 @@ impl EditorView {
                 lsp.highlights.retain(|range| range.start < range.end);
                 lsp.highlights.sort_by_key(|range| (range.start, range.end));
                 lsp.highlights.dedup();
+                if lsp.rename_in_place.is_some()
+                    && let Some(state) = &self.state
+                {
+                    let support = lsp.support.clone();
+                    let text = state.text();
+                    let version = state.version();
+                    if let Some(rename) = &mut lsp.rename_in_place {
+                        rename.follow(&change.steps, &text, version, false);
+                        let reserved = support.reserved_word(&rename.text);
+                        rename.refresh_problem(reserved);
+                    }
+                }
                 lsp.retain_transformed_marks(&change.steps, len);
                 lsp.retain_transformed_tokens(&change.steps, len);
             }
@@ -5009,6 +5041,14 @@ impl EditorView {
     }
 
     pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        // A click outside the name applies the rename in place, as Enter does.
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.rename_in_place.is_some())
+        {
+            self.finish_rename_in_place(cx);
+        }
         self.cancel_hover();
         self.close_quick_doc(cx);
         // A click in the editor closes the list of entries in the way.
@@ -6642,6 +6682,36 @@ impl EditorView {
                 .into_any_element(),
             );
         }
+        if let Some(rename) = &lsp.rename_in_place
+            && let Some((position, anchor)) =
+                self.popup_position(rename.main_start(), self.style.line_height + 2. * SPACE_S)
+        {
+            let hint = rename
+                .problem
+                .unwrap_or("Enter to rename, Escape to cancel · Shift+F6 for more options");
+            let body = surface(&theme)
+                .debug_selector(|| "rename-in-place-hint".to_owned())
+                .max_w(px(720.))
+                .p_2()
+                .text_size(px(self.style.font_size))
+                .text_color(if rename.problem.is_some() {
+                    theme.error
+                } else {
+                    theme.text_muted
+                })
+                .child(hint);
+            popups.push(
+                deferred(
+                    anchored()
+                        .anchor(anchor)
+                        .position(position)
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
         if let Some(field) = &lsp.name
             && let Some(position) = self.below(field.at)
         {
@@ -7189,6 +7259,7 @@ mod checks {
         OutlineItem {
             name: name.into(),
             signature: None,
+            visibility: None,
             kind,
             depth: 0,
             range: start..end,

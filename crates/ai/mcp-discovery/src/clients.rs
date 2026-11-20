@@ -93,6 +93,8 @@ pub struct ClientState {
     pub client: Client,
     pub status: Status,
     pub configured: bool,
+    /// The settings file itself is there, rather than only the folder of the client.
+    pub file: bool,
     pub path: PathBuf,
 }
 
@@ -237,11 +239,13 @@ pub fn home_folder() -> PathBuf {
 /// already names Arro.
 pub fn state(client: Client, scope: Scope, home: &Path, project: &Path) -> ClientState {
     let path = client.config(scope, home, project);
+    let file = path.is_file();
     if !client.is_installed(scope, home, project) {
         return ClientState {
             client,
             status: Status::Missing,
             configured: false,
+            file,
             path,
         };
     }
@@ -250,12 +254,14 @@ pub fn state(client: Client, scope: Scope, home: &Path, project: &Path) -> Clien
             client,
             status: Status::Found,
             configured,
+            file,
             path,
         },
         Err(_) => ClientState {
             client,
             status: Status::Damaged,
             configured: false,
+            file,
             path,
         },
     }

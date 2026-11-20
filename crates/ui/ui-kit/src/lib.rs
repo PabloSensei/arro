@@ -7,6 +7,8 @@ pub use gpui_kit::*;
 
 pub use ::theme::{metrics, motion, snapped_code_size};
 
+#[cfg(test)]
+mod checkbox_tests;
 mod dialog;
 mod dialog_buttons;
 mod embedded;
@@ -32,7 +34,7 @@ pub use embedded::{Assets, app, init};
 pub use floating::{DialogPlace, DialogPlaces, PopupSpec, popup_drag_header, popup_window};
 pub use form::{
     FORM_LABEL_MAX, FORM_LABEL_MIN, form_aligned, form_hint, form_label, form_label_width,
-    form_row, label_column_width,
+    form_row, form_row_colored, label_column_width,
 };
 pub use icon_sets::{ARRO, INTELLIJ, IconCatalog, IconSet, icon_file};
 pub use motions::{Slide, smoothstep};

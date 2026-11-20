@@ -2156,12 +2156,34 @@ mod window_tests_project_structure_select;
 mod window_tests_database_blank;
 
 #[cfg(test)]
+mod window_tests_breakpoints_dialog;
+#[cfg(test)]
 mod window_tests_caret_reveal;
 #[cfg(test)]
 mod window_tests_change_tree_gap;
 #[cfg(test)]
 mod window_tests_dialog_windows;
 #[cfg(test)]
+mod window_tests_file_structure_signatures;
+#[cfg(test)]
 mod window_tests_find_window;
 #[cfg(test)]
 mod window_tests_new_project_form;
+
+#[cfg(test)]
+mod window_tests_keymap_tree;
+#[cfg(test)]
+mod window_tests_mcp_reading;
+#[cfg(test)]
+mod window_tests_rename_in_place;
+#[cfg(test)]
+mod window_tests_settings_checks;
+
+#[cfg(test)]
+mod window_tests_debug_idle;
+#[cfg(test)]
+mod window_tests_find_action_tools;
+#[cfg(test)]
+mod window_tests_generate_status;
+#[cfg(test)]
+mod window_tests_run_idle;

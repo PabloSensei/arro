@@ -1,6 +1,8 @@
 use std::ops::Range;
 use std::path::Path;
 
+use crate::GraphVisibility;
+
 /// Neutral kinds, close to the LSP ones. A language maps its own declarations onto them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SymbolKind {
@@ -45,8 +47,33 @@ impl Symbol {
     }
 }
 
+/// A declaration with what the language says about it beyond the name and the place: the
+/// signature the outline shows and the visibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declared {
+    pub symbol: Symbol,
+    /// The name with the parameters and the type, as the outline shows it: `getPet(String):
+    /// Pet`, `count: int`, `Owner(String)`. `None` when the language gives none.
+    pub signature: Option<String>,
+    /// `None` when the kind of declaration has no visibility, such as a package.
+    pub visibility: Option<GraphVisibility>,
+}
+
 /// Declarations of one file, in the order they appear. Blocks, so callers run it off the
 /// UI thread. Answers for a whole project come from the core's index over this.
 pub trait SymbolProvider: Send + Sync {
     fn file_symbols(&self, path: &Path, text: &str) -> Vec<Symbol>;
+
+    /// The declarations of one file with their signatures and visibility, in the order of
+    /// `file_symbols`. A language that reads neither keeps this default.
+    fn file_declarations(&self, path: &Path, text: &str) -> Vec<Declared> {
+        self.file_symbols(path, text)
+            .into_iter()
+            .map(|symbol| Declared {
+                symbol,
+                signature: None,
+                visibility: None,
+            })
+            .collect()
+    }
 }

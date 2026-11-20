@@ -1062,11 +1062,27 @@ fn open(
                 })
                 .ok();
         }
+        EditorEvent::Status(message) => {
+            let message = message.clone();
+            reports
+                .update(cx, |workspace, cx| {
+                    workspace.set_language_status(Some(message), cx)
+                })
+                .ok();
+        }
         EditorEvent::SaveNote(message) => {
             let message = message.clone();
             reports
                 .update(cx, |workspace, cx| {
                     workspace.notify_user("Actions on Save", message, cx)
+                })
+                .ok();
+        }
+        EditorEvent::StatusMessage(message) => {
+            let message = message.clone();
+            reports
+                .update(cx, |workspace, cx| {
+                    workspace.show_status_message(message, cx)
                 })
                 .ok();
         }

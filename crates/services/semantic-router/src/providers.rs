@@ -22,12 +22,12 @@ use lang_api::{
     GenerateKind, GenerateQuery, Generation, HierarchyDirection, HierarchyQuery, HoverText,
     InlayHintEntry, InlayHintKind, InlayHintQuery, MethodSignature, MoveDestination, MoveKind,
     MoveOutcome, MoveQuery, MoveRequest, NavigationKind, NavigationQuery, OverridableMethod,
-    OverridableMethods, OverridableMethodsQuery, Provider, RangeFormatQuery, RenameQuery, Reply,
-    SemanticServer, SemanticToken, SemanticTokenKind, SemanticTokenModifiers, SemanticTokensQuery,
-    Severity, SignatureException, SignatureHelp, SignatureParameter, SignatureQuery, SignatureText,
-    SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery, TextPoint, TextSpan,
-    TypeHierarchyItem, TypeHierarchyQuery, TypeKind, UsageEntry, UsageKind, WorkspaceChange,
-    WorkspaceDiagnosticsQuery, offset_in,
+    OverridableMethods, OverridableMethodsQuery, PrepareRename, Provider, RangeFormatQuery,
+    RenameQuery, Reply, SemanticServer, SemanticToken, SemanticTokenKind, SemanticTokenModifiers,
+    SemanticTokensQuery, Severity, SignatureException, SignatureHelp, SignatureParameter,
+    SignatureQuery, SignatureText, SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery,
+    TextPoint, TextSpan, TypeHierarchyItem, TypeHierarchyQuery, TypeKind, UsageEntry, UsageKind,
+    WorkspaceChange, WorkspaceDiagnosticsQuery, offset_in,
 };
 use lsp_client::SemanticTokensCapability;
 use lsp_client::lsp_types::{
@@ -2267,6 +2267,20 @@ impl Provider<RenameQuery, WorkspaceChange> for LspProviders {
         self.answer(cancel, reply, async move {
             let edit = router.rename(place(&query.spot)?, query.new_name).await;
             Some(edit.map(|edit| edit.map(workspace_change).unwrap_or_default()))
+        });
+    }
+}
+
+impl Provider<DocumentSpot, Option<PrepareRename>> for LspProviders {
+    fn start(&self, spot: DocumentSpot, cancel: Cancel, reply: Reply<Option<PrepareRename>>) {
+        let router = self.router.clone();
+        self.answer(cancel, reply, async move {
+            let answer = router.prepare_rename(place(&spot)?).await;
+            Some(answer.map(|accepted| {
+                accepted.map(|range| PrepareRename {
+                    span: range.map(span),
+                })
+            }))
         });
     }
 }

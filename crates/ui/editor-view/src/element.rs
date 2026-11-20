@@ -435,6 +435,8 @@ pub(crate) struct EditorPrepaint {
     underlines: Vec<(Bounds<Pixels>, Hsla)>,
     gutter_marks: Vec<(Bounds<Pixels>, Hsla)>,
     occurrences: Vec<Bounds<Pixels>>,
+    /// The box around every place of the name being renamed in place.
+    rename_frames: Vec<(Bounds<Pixels>, Hsla)>,
     /// Backgrounds of whole lines and of byte ranges, under the text and the selection.
     line_tints: Vec<(Bounds<Pixels>, Hsla)>,
     range_tints: Vec<(Bounds<Pixels>, Hsla)>,
@@ -1085,6 +1087,7 @@ impl Element for EditorElement {
         let mut underlines = Vec::new();
         let mut gutter_marks = Vec::new();
         let mut occurrences = Vec::new();
+        let mut rename_frames = Vec::new();
         let mut stripes = Vec::new();
         let mut vertical = None;
         let mut horizontal = None;
@@ -1732,6 +1735,34 @@ impl Element for EditorElement {
                     }
                 }
             }
+            if let Some(rename) = &lsp.rename_in_place {
+                let color = if rename.problem.is_some() {
+                    style.error
+                } else {
+                    style.accent
+                };
+                for range in &rename.spans {
+                    for shown in &rows {
+                        if shown.is_block {
+                            continue;
+                        }
+                        let (start, end) = (shown.line.start_offset, shown.line.end_offset);
+                        if range.end < start || range.start > end {
+                            continue;
+                        }
+                        let from = range.start.max(start);
+                        let to = range.end.min(end).max(from);
+                        let left = shown.text.x_for_index(shown.line.column_of(from));
+                        let right = shown.text.x_for_index(shown.line.column_of(to));
+                        let area = Bounds::new(
+                            point(origin_x + left, shown.y),
+                            size(right - left, height),
+                        );
+                        occurrences.push(area);
+                        rename_frames.push((area, color));
+                    }
+                }
+            }
             for mark in &lsp.marks {
                 // An unnecessary range is grey in the text; a line under it would only
                 // draw the eye to a name that is already muted.
@@ -2007,6 +2038,7 @@ impl Element for EditorElement {
             underlines,
             gutter_marks,
             occurrences,
+            rename_frames,
             line_tints,
             range_tints,
             hitbox,
@@ -2517,6 +2549,9 @@ impl Element for EditorElement {
                 for selection in &prepaint.selections {
                     window.paint_quad(fill(*selection, style.selection));
                 }
+                for (area, color) in &prepaint.rename_frames {
+                    window.paint_quad(outline(*area, *color, BorderStyle::Solid));
+                }
 
                 for shown in &prepaint.layout.rows {
                     if shown.is_doc {
@@ -2896,6 +2931,7 @@ mod checks {
         OutlineItem {
             name: name.into(),
             signature: None,
+            visibility: None,
             kind,
             depth,
             range: start..end,

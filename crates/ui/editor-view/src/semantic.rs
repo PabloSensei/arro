@@ -1812,6 +1812,8 @@ pub(crate) struct Lsp {
     pub quick: Option<crate::quick_doc::QuickDoc>,
     pub actions: Option<ActionMenu>,
     pub rename: Option<RenameField>,
+    /// Shift+F6 changes the name in the text of this file itself.
+    pub rename_in_place: Option<crate::rename::RenameInPlace>,
     /// The name an extract introduced, ready to be typed over.
     pub name: Option<crate::refactor::ExtractNameField>,
     pub move_to: Option<MoveField>,
@@ -2216,6 +2218,7 @@ impl EditorView {
             quick: None,
             actions: None,
             rename: None,
+            rename_in_place: None,
             name: None,
             move_to: None,
             workspace_undo: None,
@@ -2778,6 +2781,12 @@ impl EditorView {
             })
             .ok();
         }));
+    }
+
+    /// A command that found nothing to do says so in the status bar of the window, not at
+    /// the caret.
+    pub(crate) fn report_status(&self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::StatusMessage(text.into()));
     }
 
     pub(crate) fn show_note(
