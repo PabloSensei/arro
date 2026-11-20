@@ -1468,6 +1468,17 @@ impl Workspace {
         entry
     }
 
+    /// The row of a command that is grey while the command does not apply.
+    fn command_row_if(
+        &self,
+        weak: &WeakEntity<Workspace>,
+        id: &'static str,
+        label: &'static str,
+        enabled: bool,
+    ) -> MenuEntry {
+        self.command_row(weak, id, label).enabled(enabled)
+    }
+
     /// A window action row with its key from the window bindings.
     fn action_row<A: Action + Clone + 'static>(&self, label: &'static str, action: A) -> MenuEntry {
         let entry = action_entry(label, action);
@@ -2077,9 +2088,62 @@ impl Workspace {
                 command("git.abort", "Abort Merge or Rebase"),
                 MenuEntry::separator(),
                 command("git.show_file_history", "Show History"),
-                command("git.show_selection_history", "Show History for Selection"),
+                command("git.show_selection_history", "Show History for Selection")
+                    .tip("Show the commits that changed the selected lines"),
                 command("git.show_method_history", "Show History for Method"),
                 command("git.show_log", "Git Log"),
+                MenuEntry::separator(),
+                self.command_row_if(
+                    &weak,
+                    "git.annotate",
+                    "Annotate with Git Blame",
+                    self.command_applies("git.annotate", cx),
+                )
+                .tip("Show the commit of every line of the active file"),
+                self.command_row_if(
+                    &weak,
+                    "git.rebase",
+                    "Rebase...",
+                    self.command_applies("git.rebase", cx),
+                )
+                .tip("Rebase the commits of the selected commit onto HEAD interactively"),
+                self.command_row_if(
+                    &weak,
+                    "git.cherry_pick",
+                    "Cherry-pick",
+                    self.command_applies("git.cherry_pick", cx),
+                )
+                .tip("Copy the selected commits of the log onto the current branch"),
+                self.command_row_if(
+                    &weak,
+                    "git.revert_commit",
+                    "Revert Commit",
+                    self.command_applies("git.revert_commit", cx),
+                )
+                .tip("Add a commit that undoes the selected commit of the log"),
+                self.command_row_if(
+                    &weak,
+                    "git.reset_head",
+                    "Reset HEAD...",
+                    self.command_applies("git.reset_head", cx),
+                )
+                .tip("Move the current branch to the selected commit of the log"),
+                MenuEntry::separator(),
+                self.command_row_if(
+                    &weak,
+                    "git.shelve",
+                    "Shelve Changes...",
+                    self.command_applies("git.shelve", cx),
+                )
+                .tip("Put the ticked changes aside as a patch"),
+                self.command_row_if(
+                    &weak,
+                    "git.unshelve",
+                    "Unshelve...",
+                    self.command_applies("git.unshelve", cx),
+                )
+                .tip("Put a shelved patch back into the working tree"),
+                MenuEntry::separator(),
                 command(workspace_keys::ROLLBACK_CHANGED_LINES, "Rollback Lines"),
                 command(workspace_keys::NEXT_CHANGE, "Show Next Change"),
                 command(workspace_keys::PREVIOUS_CHANGE, "Show Previous Change"),
@@ -3997,6 +4061,7 @@ impl Render for StatusBarView {
             enc_anchor,
             indent_anchor,
             zoom_notice,
+            status_progress,
             agent_clients,
             agent_busy,
         ) = {
@@ -4017,6 +4082,7 @@ impl Render for StatusBarView {
                 workspace.st_enc_anchor.clone(),
                 workspace.st_indent_anchor.clone(),
                 workspace.zoom_notice().cloned(),
+                workspace.status_progress().cloned(),
                 workspace.agent_clients,
                 workspace.agent_busy,
             )
@@ -4074,6 +4140,30 @@ impl Render for StatusBarView {
         }
         let zoom = zoom_notice.map(|text| {
             status_widget("st-zoom", text, &theme).debug_selector(|| "st-zoom".to_owned())
+        });
+        let progress = status_progress.map(|progress| {
+            let cancel = progress.cancel.clone();
+            div()
+                .id("st-progress")
+                .debug_selector(|| "st-progress".to_owned())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .flex_none()
+                .child(progress.label.clone())
+                .children(cancel.map(|cancel| {
+                    div()
+                        .id("st-progress-cancel")
+                        .debug_selector(|| "st-progress-cancel".to_owned())
+                        .px(px(SPACE_XS))
+                        .rounded(px(CONTROL_RADIUS))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.selection_hover))
+                        .tooltip(|_, cx| tooltip("Cancel the running task", None, cx))
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .child("Cancel")
+                        .on_click(move |_: &ClickEvent, _: &mut Window, _: &mut App| cancel())
+                }))
         });
         let language = language_status.map(|text| {
             // A server that is still starting or importing cannot answer: its line is
@@ -4276,6 +4366,7 @@ impl Render for StatusBarView {
             .flex()
             .items_center()
             .gap(px(SPACE_L))
+            .children(progress)
             .children(zoom)
             .children(agents)
             .children(language)

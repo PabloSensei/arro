@@ -333,6 +333,27 @@ impl Repository {
         })
     }
 
+    /// The text of `path` at `right` against the same file at `left`, for Compare
+    /// Revisions: both sides come from the blobs, so the working tree is not involved.
+    pub fn revision_file_diff(
+        &self,
+        blobs: &mut BlobReader,
+        left: &str,
+        right: &str,
+        path: &str,
+    ) -> io::Result<FileDiff> {
+        let base = blobs.read(&format!("{left}:{path}"))?.unwrap_or_default();
+        let base = text_core::decode(&base).text;
+        let current = blobs.read(&format!("{right}:{path}"))?.unwrap_or_default();
+        let current = text_core::decode(&current).text;
+        let hunks = line_hunks(&base, &current);
+        Ok(FileDiff {
+            base,
+            current,
+            hunks,
+        })
+    }
+
     /// Takes the chosen files as they are on disk, new and deleted ones too, and nothing
     /// else, whatever the index held before. Returns the new commit.
     pub fn commit(&self, request: &CommitRequest) -> io::Result<String> {
@@ -1401,6 +1422,22 @@ impl Repository {
         })
     }
 
+    /// The commits only one of the two revisions has, and the files they differ in, for
+    /// Compare Revisions of the log. The working tree takes no part in it.
+    pub fn compare_revisions(&self, left: &str, right: &str) -> io::Result<Compare> {
+        let only_base = self.commits_in(&format!("{right}..{left}"), COMPARE_LIMIT)?;
+        let only_current = self.commits_in(&format!("{left}..{right}"), COMPARE_LIMIT)?;
+        let mut files = Vec::new();
+        self.collect_files(&mut files, &[left, right])?;
+        files.sort();
+        files.dedup();
+        Ok(Compare {
+            only_base,
+            only_current,
+            files,
+        })
+    }
+
     /// What the working tree changed against `branch`, for Show Diff with Working Tree.
     pub fn working_tree_compare(&self, branch: &str) -> io::Result<Compare> {
         let only_base = self.commits_in(&format!("HEAD..{branch}"), COMPARE_LIMIT)?;
@@ -1496,8 +1533,28 @@ impl Repository {
             let time: i64 = time.trim().parse().unwrap_or(0);
             dated.push((time, position, commit.clone()));
         }
-        dated.sort_by_key(|(time, position, _)| (*time, *position));
+        // Two commits made in the same second keep their order in time from the parent
+        // relation: the log hands them over newest first.
+        dated.sort_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| {
+                if self.is_ancestor(&left.2, &right.2).unwrap_or(false) {
+                    std::cmp::Ordering::Less
+                } else if self.is_ancestor(&right.2, &left.2).unwrap_or(false) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    left.1.cmp(&right.1)
+                }
+            })
+        });
         Ok(dated.into_iter().map(|(_, _, commit)| commit).collect())
+    }
+
+    /// Whether `older` is on the way to `newer` in the history.
+    fn is_ancestor(&self, older: &str, newer: &str) -> io::Result<bool> {
+        Ok(self
+            .git
+            .run(&self.root, ["merge-base", "--is-ancestor", older, newer])
+            .is_ok())
     }
 
     /// The commits from `commit` to HEAD, oldest first, as the Rebase dialog lists them.

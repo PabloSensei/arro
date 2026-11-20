@@ -520,12 +520,12 @@ mod tests {
         assert!(
             windows
                 .iter()
-                .any(|root| root.as_path() == Path::new(r"C:\Program Files\Java"))
+                .any(|root| *root == Path::new(r"C:\Program Files").join("Java"))
         );
         assert!(
             windows
                 .iter()
-                .any(|root| root.as_path() == Path::new(r"C:\Users\user\AppData\Local\Programs"))
+                .any(|root| *root == Path::new(r"C:\Users\user\AppData\Local").join("Programs"))
         );
     }
 

@@ -17,12 +17,20 @@ const HEIGHT: f32 = 620.;
 /// Characters of a commit subject a row shows.
 const SUBJECT: usize = 64;
 
+/// The first seven characters of a commit id, as the log shows them.
+fn short_revision(revision: &str) -> String {
+    revision[..revision.len().min(7)].to_owned()
+}
+
 pub struct CompareView {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
     left: String,
     right: String,
+    /// The full ids of the two revisions, when the window compares commits of the log
+    /// rather than the working tree.
+    revisions: Option<(String, String)>,
     only_left: Vec<Commit>,
     only_right: Vec<Commit>,
     files: Vec<String>,
@@ -51,10 +59,42 @@ impl CompareView {
             focus: cx.focus_handle(),
             left,
             right,
+            revisions: None,
             only_left: report.only_base,
             only_right: report.only_current,
             files: report.files,
             working_tree,
+            scroll_left: ScrollHandle::new(),
+            scroll_right: ScrollHandle::new(),
+            scroll_files: ScrollHandle::new(),
+        });
+        let focus = view.read(cx).focus.clone();
+        workspace.show_overlay(view.into(), focus, window, cx);
+    }
+
+    /// Two revisions of the log side by side: the commits one of them has and the other
+    /// does not, and the files they differ in.
+    pub(crate) fn open_revisions(
+        git: Entity<GitState>,
+        report: Compare,
+        left: String,
+        right: String,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let weak = cx.weak_entity();
+        let view = cx.new(|cx| Self {
+            git,
+            workspace: weak,
+            focus: cx.focus_handle(),
+            left: short_revision(&left),
+            right: short_revision(&right),
+            revisions: Some((left, right)),
+            only_left: report.only_base,
+            only_right: report.only_current,
+            files: report.files,
+            working_tree: false,
             scroll_left: ScrollHandle::new(),
             scroll_right: ScrollHandle::new(),
             scroll_files: ScrollHandle::new(),
@@ -88,6 +128,13 @@ impl CompareView {
         &self.right
     }
 
+    #[cfg(test)]
+    pub(crate) fn revisions(&self) -> Option<(&str, &str)> {
+        self.revisions
+            .as_ref()
+            .map(|(left, right)| (left.as_str(), right.as_str()))
+    }
+
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace
             .update(cx, |workspace, cx| workspace.dismiss(window, cx))
@@ -108,11 +155,16 @@ impl CompareView {
             .collect();
         let index = files.iter().position(|file| *file == path).unwrap_or(0);
         let branch = self.left.clone();
+        let revisions = self.revisions.clone();
         self.workspace
             .update(cx, |_workspace, cx| {
                 let git = self.git.clone();
                 let weak = cx.weak_entity();
-                DiffView::open_branch(git, weak, files, index, branch, window, cx);
+                if let Some((left, right)) = revisions {
+                    DiffView::open_revisions(git, weak, files, index, left, right, window, cx);
+                } else {
+                    DiffView::open_branch(git, weak, files, index, branch, window, cx);
+                }
             })
             .ok();
     }

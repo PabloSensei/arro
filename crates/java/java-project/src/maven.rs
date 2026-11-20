@@ -1078,12 +1078,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_wrapper_without_the_execute_bit_is_made_runnable() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = test_support::TempDir::new("maven-wrapper-bit");
         let script = root.path().join(cmd_script("mvnw"));
         fs::write(&script, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        platform::set_mode(&script, 0o644).unwrap();
         let home = root.path().join("jdk");
         fs::create_dir_all(home.join("bin")).unwrap();
         fs::write(home.join("bin").join("javac"), "").unwrap();
@@ -1104,7 +1102,7 @@ mod tests {
             "{:?}",
             spec.notes()
         );
-        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        let mode = platform::mode(&script).unwrap();
         assert_eq!(mode & 0o111, 0o111);
     }
 

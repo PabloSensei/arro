@@ -1301,7 +1301,7 @@ impl CommitPanel {
         Ok(())
     }
 
-    fn shelve(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn shelve(&mut self, cx: &mut Context<Self>) {
         let paths = self.checked_paths(cx);
         if paths.is_empty() {
             self.git.update(cx, |git, cx| {
@@ -1357,7 +1357,7 @@ impl CommitPanel {
         self.shelves.get(index).cloned()
     }
 
-    fn ask_unshelve(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn ask_unshelve(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(shelf) = self.selected_shelf() else {
             self.git.update(cx, |git, cx| {
                 git.report("Unshelve", "Choose a shelf first".to_string(), cx)

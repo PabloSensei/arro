@@ -71,9 +71,14 @@ fn url_of(path: &Path) -> String {
         .strip_prefix(r"\\?\")
         .unwrap_or(&text)
         .replace('\\', "/");
-    let mut url = match text.strip_prefix("//") {
-        Some(share) => format!("file://{}", encode(share)),
-        None => format!("file:/{}", encode(&text)),
+    // A Unix path already starts with its slash; one more would make `file://home/...`,
+    // where `home` is read as a host and the jar is never found.
+    let mut url = if let Some(share) = text.strip_prefix("//") {
+        format!("file://{}", encode(share))
+    } else if text.starts_with('/') {
+        format!("file:{}", encode(&text))
+    } else {
+        format!("file:/{}", encode(&text))
     };
     if !path.is_file() && !url.ends_with('/') {
         url.push('/');
@@ -116,6 +121,14 @@ mod tests {
         assert_eq!(
             url,
             "file:/C:/Program%20Files/%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82/classes/"
+        );
+    }
+
+    #[test]
+    fn a_unix_path_has_no_host() {
+        assert_eq!(
+            url_of(Path::new("/home/user/.local/share/Arro/helpers/out")),
+            "file:/home/user/.local/share/Arro/helpers/out/"
         );
     }
 

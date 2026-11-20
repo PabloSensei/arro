@@ -45,6 +45,14 @@ const README_URL: &str = "https://github.com/PabloSensei/arro";
 /// The command of a second search for a tool that a language server needs.
 pub const CHECK_LANGUAGE_SETUP: &str = "language.check_setup";
 
+/// A long task the status bar shows while it runs: what it does and, when it can stop,
+/// the callback of its Cancel button.
+#[derive(Clone)]
+pub struct StatusProgress {
+    pub label: SharedString,
+    pub cancel: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
 actions!(
     workspace,
     [
@@ -607,6 +615,8 @@ type ConfigChooseHook = Rc<dyn Fn(bool, &mut Workspace, &mut Window, &mut Contex
 /// What a command does. Commands are found by id: from the keymap, from Find Action
 /// and from scripts.
 pub type CommandFn = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+/// Whether a command applies now, for the grey rows of the menus.
+pub type CommandCheck = Rc<dyn Fn(&Workspace, &App) -> bool>;
 /// Chooses the tab of a tool window with tabs when an action opens it. The answer says
 /// whether the tab moved.
 pub type ToolActivator = Rc<dyn Fn(&str, &mut App) -> bool>;
@@ -711,6 +721,8 @@ pub struct Workspace {
     zoom_notice: Option<SharedString>,
     /// A number that drops a late end of a notice.
     zoom_notice_serial: usize,
+    /// The long task the status bar shows while it runs, with its Cancel button.
+    status_progress: Option<StatusProgress>,
     pub(crate) balloon_visible: bool,
     pub(crate) balloon_serial: usize,
     icons: FileIcons,
@@ -771,6 +783,8 @@ pub struct Workspace {
     key_between: std::rc::Rc<std::cell::Cell<bool>>,
     commands: CommandRegistry,
     handlers: HashMap<&'static str, CommandFn>,
+    /// The commands whose menu row is grey while they do not apply.
+    command_checks: HashMap<&'static str, CommandCheck>,
     tab_listener: Option<TabListener>,
     /// The callbacks of the views that follow the files whose tabs close.
     tab_closed_hooks: Vec<TabListener>,
@@ -1107,6 +1121,7 @@ impl Workspace {
             zen_full_screen: false,
             zoom_notice: None,
             zoom_notice_serial: 0,
+            status_progress: None,
             balloon_visible: false,
             balloon_serial: 0,
             icons,
@@ -1143,6 +1158,7 @@ impl Workspace {
             key_between,
             commands: CommandRegistry::new(),
             handlers: HashMap::new(),
+            command_checks: HashMap::new(),
             tab_listener: None,
             tab_closed_hooks: Vec::new(),
             buffers: HashMap::new(),
@@ -5049,6 +5065,23 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Puts a task in the status bar while a long operation runs, or takes it away with
+    /// `None`. The bar draws the Cancel button from the callback of the task.
+    pub fn set_status_progress(
+        &mut self,
+        progress: Option<StatusProgress>,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_progress = progress;
+        self.status_view.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    /// The task of the status bar, for scripts and tests.
+    pub fn status_progress(&self) -> Option<&StatusProgress> {
+        self.status_progress.as_ref()
+    }
+
     pub fn notify_user(
         &mut self,
         title: impl Into<SharedString>,
@@ -5307,6 +5340,22 @@ impl Workspace {
         self.commands
             .register(id, title, keymap::workspace::CONTEXT);
         self.handlers.insert(id, Rc::new(handler));
+    }
+
+    /// Says whether a command applies, so that its menu row is grey when it does not.
+    pub fn set_command_check(
+        &mut self,
+        id: &'static str,
+        check: impl Fn(&Workspace, &App) -> bool + 'static,
+    ) {
+        self.command_checks.insert(id, Rc::new(check));
+    }
+
+    /// Whether a command applies now; a command without a check always does.
+    pub fn command_applies(&self, id: &str, cx: &App) -> bool {
+        self.command_checks
+            .get(id)
+            .is_none_or(|check| check(self, cx))
     }
 
     /// Adds a command that runs by id but is not listed in Find Action or Search

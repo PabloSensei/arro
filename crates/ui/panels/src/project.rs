@@ -43,7 +43,8 @@ actions!(
         ExpandNode,
         CollapseNode,
         OpenInRightSplitRow,
-        CompareTwoFiles
+        CompareTwoFiles,
+        ReformatRows
     ]
 );
 
@@ -169,6 +170,7 @@ panel_keys![
         None
     ),
     ("ctrl-d", CompareTwoFiles, Some("CompareTwoFiles"), None),
+    ("ctrl-alt-l", ReformatRows, Some("ReformatCode"), None),
 ];
 
 /// What the tree can create, from the application and the basics.
@@ -2442,6 +2444,19 @@ impl ProjectPanel {
                 Self::later(window, log_panel.clone(), cx, open);
             });
             entries.push(show);
+        } else {
+            let (log_panel, log_path) = (cx.weak_entity(), path.clone());
+            let show = MenuEntry::new("Show History", move |window, cx| {
+                let path = log_path.clone();
+                let open = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    let open = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
+                        crate::git_log::show_file(path, workspace, window, cx)
+                    };
+                    this.workspace.update(cx, open).ok();
+                };
+                Self::later(window, log_panel.clone(), cx, open);
+            });
+            entries.push(MenuEntry::submenu("Git", vec![show]));
         }
         // The request file of the HTTP client goes last, so the rows above keep their
         // places in the menu.
@@ -2718,6 +2733,14 @@ impl Render for ProjectPanel {
                         })
                         .ok();
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ReformatRows, window, cx| {
+                let paths = this.selected_paths();
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        crate::reformat::show_paths_dialog(workspace, paths, window, cx)
+                    })
+                    .ok();
             }))
             .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
             .child(self.header(&theme, cx))

@@ -261,6 +261,8 @@ enum Source {
     Commit(String),
     /// The working tree against the head of a branch, as Compare shows it.
     Branch(String),
+    /// The file at two revisions of the log, as Compare Revisions shows it.
+    Revisions(String, String),
     Clipboard,
     /// Another file, the left side of Compare Two Files.
     File(PathBuf),
@@ -979,6 +981,35 @@ impl DiffView {
         );
     }
 
+    /// The file of a Compare Revisions window: the two commits it was opened for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_revisions(
+        git: Entity<GitState>,
+        workspace: WeakEntity<Workspace>,
+        files: Vec<PathBuf>,
+        index: usize,
+        left: String,
+        right: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(path) = files.get(index).cloned() else {
+            return;
+        };
+        Self::open_source(
+            git,
+            workspace,
+            path,
+            Source::Revisions(left, right),
+            files,
+            index,
+            None,
+            None,
+            window,
+            cx,
+        );
+    }
+
     /// Ctrl+D on a file of a shelf: `HEAD` against the version the shelf holds.
     pub fn open_shelf(
         git: Entity<GitState>,
@@ -1138,7 +1169,9 @@ impl DiffView {
             Source::WorkingTree | Source::Branch(_) => {
                 current_document(&path, editor_of(&workspace, &path, cx).as_ref(), cx)
             }
-            Source::Commit(_) | Source::Shelf(_) => (String::new(), FileFormat::default()),
+            Source::Commit(_) | Source::Shelf(_) | Source::Revisions(_, _) => {
+                (String::new(), FileFormat::default())
+            }
             Source::Clipboard | Source::File(_) | Source::Text => {
                 (String::new(), FileFormat::default())
             }
@@ -1154,6 +1187,9 @@ impl DiffView {
                     .file_diff_with(&mut blobs, branch, &relative, &job_text)
                     .ok(),
                 Source::Commit(commit) => repo.commit_file_diff(&mut blobs, commit, &relative).ok(),
+                Source::Revisions(left, right) => repo
+                    .revision_file_diff(&mut blobs, left, right, &relative)
+                    .ok(),
                 Source::Clipboard | Source::File(_) | Source::Shelf(_) | Source::Text => None,
             }
         });
@@ -1163,9 +1199,9 @@ impl DiffView {
                     return;
                 };
                 cx.update(|window, cx| {
-                    // A commit has both sides in the blob; the working tree has the
-                    // current text that was read above.
-                    let current = if matches!(source, Source::Commit(_)) {
+                    // A commit or a pair of revisions has both sides in the blob; the
+                    // working tree has the current text that was read above.
+                    let current = if matches!(source, Source::Commit(_) | Source::Revisions(_, _)) {
                         diff.current
                     } else {
                         current
@@ -1409,6 +1445,13 @@ impl DiffView {
                 format!("Repository Diff: {title}")
             }
             Source::Branch(branch) => format!("Difference between '{branch}' and {title}"),
+            Source::Revisions(left, right) => {
+                format!(
+                    "Difference between '{}' and '{}': {title}",
+                    &left[..left.len().min(7)],
+                    &right[..right.len().min(7)]
+                )
+            }
             Source::Clipboard => format!("Difference between the clipboard and {title}"),
             Source::File(other) => {
                 let other = other.file_name().map_or_else(
@@ -1445,6 +1488,7 @@ impl DiffView {
             Source::WorkingTree => ("HEAD".to_owned(), "Working copy".to_owned()),
             Source::Branch(branch) => (branch.clone(), "Working copy".to_owned()),
             Source::Commit(commit) => (format!("{}^", short(commit)), short(commit)),
+            Source::Revisions(left, right) => (short(left), short(right)),
             Source::Clipboard => ("Clipboard".to_owned(), "Working copy".to_owned()),
             Source::File(other) => (name(other), name(&self.path)),
             Source::Shelf(shelf) => ("HEAD".to_owned(), format!("Shelf {shelf}")),
@@ -2297,7 +2341,7 @@ impl DiffView {
     fn move_file(&mut self, step: isize, last: bool, cx: &mut Context<Self>) {
         if !matches!(
             self.source,
-            Source::WorkingTree | Source::Commit(_) | Source::Branch(_)
+            Source::WorkingTree | Source::Commit(_) | Source::Branch(_) | Source::Revisions(_, _)
         ) {
             return;
         }
@@ -2312,7 +2356,7 @@ impl DiffView {
     fn switch_to(&mut self, index: usize, last: bool, cx: &mut Context<Self>) {
         if !matches!(
             self.source,
-            Source::WorkingTree | Source::Commit(_) | Source::Branch(_)
+            Source::WorkingTree | Source::Commit(_) | Source::Branch(_) | Source::Revisions(_, _)
         ) {
             return;
         }
@@ -2343,6 +2387,9 @@ impl DiffView {
                 Source::Commit(commit) => {
                     repo.commit_file_diff(&mut blobs, &commit, &relative).ok()
                 }
+                Source::Revisions(left, right) => repo
+                    .revision_file_diff(&mut blobs, &left, &right, &relative)
+                    .ok(),
                 Source::Clipboard | Source::File(_) | Source::Shelf(_) | Source::Text => None,
             }
         });
@@ -2356,7 +2403,8 @@ impl DiffView {
                 if this.serial != serial {
                     return;
                 }
-                let current = if matches!(this.source, Source::Commit(_)) {
+                let current = if matches!(this.source, Source::Commit(_) | Source::Revisions(_, _))
+                {
                     diff.current
                 } else {
                     current

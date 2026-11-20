@@ -148,6 +148,37 @@ fn merge_notes(server: Vec<DiagnosticNote>, native: Vec<DiagnosticNote>) -> Vec<
     notes
 }
 
+/// The directory the project tree highlights: a selected folder itself, or the folder
+/// the selected files share. `None` when the tree has no selection.
+fn selection_directory(root: &Path, cx: &App) -> Option<PathBuf> {
+    let panel = cx
+        .try_global::<crate::project::ActiveProjectPanel>()?
+        .0
+        .clone();
+    let paths = panel.read(cx).selected_paths();
+    let first = paths.first()?;
+    let mut folder = if first.is_dir() {
+        first.clone()
+    } else {
+        first
+            .parent()
+            .map_or_else(|| root.to_path_buf(), Path::to_path_buf)
+    };
+    for path in &paths[1..] {
+        let candidate = if path.is_dir() {
+            path.as_path()
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        while !candidate.starts_with(&folder) {
+            if !folder.pop() {
+                break;
+            }
+        }
+    }
+    (!folder.as_os_str().is_empty()).then_some(folder)
+}
+
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
         Severity::Error => "Error",
@@ -329,8 +360,12 @@ impl InspectHub {
             detail: format!("{} files", changed.len()),
             enabled: !changed.is_empty(),
         });
-        let folder = current
-            .and_then(|path| path.parent().map(Path::to_path_buf))
+        let folder = selection_directory(&self.root, cx)
+            .or_else(|| {
+                current
+                    .as_deref()
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+            })
             .unwrap_or_else(|| self.root.clone());
         options.push(ScopeOption {
             scope: Scope::Directory(folder.clone()),
@@ -1291,6 +1326,47 @@ impl Render for ScopePopup {
                     .min_h_0()
                     .overflow_hidden()
                     .children(rows),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(SPACE_M))
+                    .child(
+                        div()
+                            .id("inspect-scope-cancel")
+                            .debug_selector(|| "inspect-scope-cancel".to_owned())
+                            .px(px(SPACE_L))
+                            .h(px(CONTROL_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .rounded(px(CONTROL_RADIUS))
+                            .hover(|style| style.bg(theme.selection_hover))
+                            .tooltip(|_, cx| tooltip("Cancel", Some(SharedString::from("Esc")), cx))
+                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("inspect-scope-run")
+                            .debug_selector(|| "inspect-scope-run".to_owned())
+                            .px(px(SPACE_L))
+                            .h(px(CONTROL_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .rounded(px(CONTROL_RADIUS))
+                            .bg(theme.accent)
+                            .text_color(theme.over_accent)
+                            .tooltip(|_, cx| {
+                                tooltip("Inspect Code", Some(SharedString::from("Enter")), cx)
+                            })
+                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                            .child("Inspect")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick(this.selected, window, cx)
+                            })),
+                    ),
             );
         div()
             .absolute()
@@ -1492,6 +1568,148 @@ pub(crate) struct Row {
     pub(crate) open: bool,
     pub(crate) fixed: bool,
     pub(crate) kind: RowKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExportFormat {
+    Html,
+    Text,
+}
+
+impl ExportFormat {
+    fn default_name(self) -> &'static str {
+        match self {
+            Self::Html => "inspection-results.html",
+            Self::Text => "inspection-results.txt",
+        }
+    }
+}
+
+/// The report of the last inspection, grouped by file, with a line, a severity and the
+/// text of every problem.
+fn render_export(findings: &[Finding], root: &Path, kind: ExportFormat) -> String {
+    let mut groups: BTreeMap<&Path, Vec<&Finding>> = BTreeMap::new();
+    for finding in findings {
+        groups
+            .entry(finding.path.as_path())
+            .or_default()
+            .push(finding);
+    }
+    let rows: usize = groups.values().map(Vec::len).sum();
+    let shown = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+            .replace('\\', "/")
+    };
+    match kind {
+        ExportFormat::Text => {
+            let mut text = format!("Inspection results\n{rows} problems\n");
+            for (path, list) in &groups {
+                text.push('\n');
+                text.push_str(&shown(path));
+                text.push('\n');
+                for finding in list {
+                    text.push_str(&format!(
+                        "  line {}: {}: {}\n",
+                        finding.line + 1,
+                        severity_label(finding.severity),
+                        finding.message.replace(['\r', '\n'], " ")
+                    ));
+                }
+            }
+            text
+        }
+        ExportFormat::Html => {
+            let mut html = String::from(
+                "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+                 <title>Inspection Results</title>\n<style>body{font-family:sans-serif;\
+                 margin:24px}table{border-collapse:collapse;width:100%}th,td{text-align:left;\
+                 padding:4px 8px;border-bottom:1px solid #ddd}th{background:#f4f4f4}\
+                 .severity{white-space:nowrap}</style>\n</head>\n<body>\n",
+            );
+            html.push_str(&format!(
+                "<h1>Inspection Results</h1>\n<p>{rows} problems</p>\n"
+            ));
+            for (path, list) in &groups {
+                html.push_str(&format!(
+                    "<h2>{}</h2>\n<table>\n<thead><tr><th>Line</th><th>Severity</th>\
+                     <th>Problem</th></tr></thead>\n<tbody>\n",
+                    escape_html(&shown(path))
+                ));
+                for finding in list {
+                    html.push_str(&format!(
+                        "<tr><td>{}</td><td class=\"severity\">{}</td><td>{}</td></tr>\n",
+                        finding.line + 1,
+                        severity_label(finding.severity),
+                        escape_html(&finding.message.replace(['\r', '\n'], " "))
+                    ));
+                }
+                html.push_str("</tbody>\n</table>\n");
+            }
+            html.push_str("</body>\n</html>\n");
+            html
+        }
+    }
+}
+
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Asks for a file and writes the report there, off the UI thread.
+fn export(
+    findings: &[Finding],
+    root: &Path,
+    kind: ExportFormat,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let chosen = cx.prompt_for_new_path(root, Some(kind.default_name()));
+    let findings = findings.to_vec();
+    let root = root.to_path_buf();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let Ok(Ok(Some(path))) = chosen.await else {
+            return;
+        };
+        let report = cx
+            .background_executor()
+            .spawn(async move { render_export(&findings, &root, kind) })
+            .await;
+        let target = path.clone();
+        let write_target = target.clone();
+        let result = cx
+            .background_executor()
+            .spawn(async move { std::fs::write(&write_target, report) })
+            .await;
+        workspace
+            .update(cx, |workspace, cx| match result {
+                Ok(()) => workspace.notify_user(
+                    "Inspection Results",
+                    format!("Exported to {}", target.display()),
+                    cx,
+                ),
+                Err(error) => workspace.notify_user(
+                    "Export failed",
+                    format!("{}: {error}", target.display()),
+                    cx,
+                ),
+            })
+            .ok();
+    })
+    .detach();
 }
 
 pub struct InspectPanel {
@@ -1806,6 +2024,42 @@ impl InspectPanel {
         } else if !expandable && event.click_count() >= 2 {
             self.open_index(index, window, cx);
         }
+    }
+
+    /// The Export button: a menu of the two formats, then the system save dialog.
+    fn export_results(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        if self.findings.is_empty() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.notify_user("Inspection Results", "There is nothing to export", cx)
+            });
+            return;
+        }
+        let findings = self.findings.clone();
+        let root = self.root.clone();
+        let weak = self.workspace.clone();
+        let entry = |kind: ExportFormat, label: &'static str| {
+            let findings = findings.clone();
+            let root = root.clone();
+            let workspace = weak.clone();
+            MenuEntry::new(label, move |window, cx| {
+                workspace
+                    .update(cx, |_, cx| export(&findings, &root, kind, window, cx))
+                    .ok();
+            })
+        };
+        let entries = vec![
+            entry(ExportFormat::Html, "HTML..."),
+            entry(ExportFormat::Text, "Text..."),
+        ];
+        let workspace = self.workspace.clone();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, entries, cx)
+            })
+            .ok();
     }
 
     fn show_fixes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2187,6 +2441,20 @@ impl Render for InspectPanel {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_XS))
+                    .child(
+                        div()
+                            .id("inspection-export")
+                            .debug_selector(|| "inspection-export".to_owned())
+                            .px(px(8.))
+                            .rounded(px(CONTROL_RADIUS))
+                            .hover(|style| style.bg(theme.selection_hover))
+                            .tooltip(|_, cx| tooltip("Export Inspection Results", None, cx))
+                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                            .child("Export")
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                this.export_results(event.position(), cx)
+                            })),
+                    )
                     .child(
                         div()
                             .id("inspection-rerun")

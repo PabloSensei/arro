@@ -58,11 +58,9 @@ pub fn prepare(program: &Path) -> std::result::Result<Option<String>, String> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
-        let metadata = std::fs::metadata(program)
+        let mode = platform::mode(program)
             .map_err(|error| format!("cannot read {}: {error}", program.display()))?;
-        if metadata.permissions().mode() & 0o111 != 0 {
+        if mode & 0o111 != 0 {
             return Ok(None);
         }
         platform::make_executable(program).map_err(|error| {
@@ -171,17 +169,16 @@ mod tests {
     #[test]
     fn a_wrapper_without_the_execute_bit_gets_it_and_the_build_says_so() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let folder = test_support::TempDir::new("wrapper-bit");
         let script = Wrapper::Maven.script(folder.path());
         fs::write(&script, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        platform::set_mode(&script, 0o644).unwrap();
 
         let note = prepare(&script).unwrap().expect("the bit was missing");
 
         assert!(note.contains("mvnw"), "{note}");
-        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        let mode = platform::mode(&script).unwrap();
         assert_eq!(mode & 0o111, 0o111);
         assert_eq!(prepare(&script).unwrap(), None);
     }

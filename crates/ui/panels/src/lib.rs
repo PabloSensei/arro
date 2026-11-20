@@ -2066,3 +2066,11 @@ mod window_tests_type_hierarchy_scope;
 
 #[cfg(test)]
 mod window_tests_macos_keys;
+
+#[cfg(test)]
+mod window_tests_log_menu_git;
+
+#[cfg(test)]
+mod window_tests_inspect_scope;
+#[cfg(test)]
+mod window_tests_reformat_scope;

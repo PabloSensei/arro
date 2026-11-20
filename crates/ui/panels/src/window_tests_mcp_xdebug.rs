@@ -231,13 +231,19 @@ fn a_wait_for_pause_answers_the_frame_values_of_the_stop(cx: &mut TestAppContext
     assert!(value.contains("\"name\": \"0\""), "{value}");
     assert!(value.contains("\"value\": \"\\\"a\\\"\""), "{value}");
 
-    call_allowed(
+    // STOP only cleans up: on a loaded machine the stand-in program may have ended already.
+    let stopped = call_allowed(
         cx,
         &gateway,
         &approvals,
         &setup.root,
         "xdebug_control_session",
         json!({"action": "STOP"}),
-    )
-    .expect("the session ends");
+    );
+    if let Err(error) = &stopped {
+        assert!(
+            error.contains("debugging is not running"),
+            "the session ends: {error}"
+        );
+    }
 }

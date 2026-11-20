@@ -1617,24 +1617,28 @@ impl GitState {
         );
     }
 
-    /// Cherry-Pick of the log: the commit on the current branch. A conflict opens the
-    /// Conflicts window, which continues or aborts the operation.
-    pub fn cherry_pick(&mut self, commit: String, cx: &mut Context<Self>) {
+    /// Cherry-Pick of the commits of the log, oldest first. A conflict opens the Conflicts
+    /// window and the rest of the commits wait until it is resolved or aborted.
+    pub fn cherry_pick_many(&mut self, commits: Vec<String>, cx: &mut Context<Self>) {
+        if commits.is_empty() {
+            return;
+        }
         if let Err(message) = self.save_open_files(cx) {
             self.report("Cherry-Pick", message, cx);
             return;
         }
-        let short = short_commit(&commit);
+        let short = short_commit(&commits[0]);
+        let count = commits.len();
+        let message = if count == 1 {
+            format!("Cherry-picked {short}")
+        } else {
+            format!("Cherry-picked {count} commits")
+        };
         self.run(
             "Cherry-Pick",
-            move |repo| repo.cherry_pick(std::slice::from_ref(&commit)),
+            move |repo| repo.cherry_pick(&commits),
             move |this, report, cx| {
-                this.finish_branch_update(
-                    report,
-                    "Cherry-Pick",
-                    format!("Cherry-picked {short}"),
-                    cx,
-                )
+                this.finish_branch_update(report, "Cherry-Pick", message.clone(), cx)
             },
             cx,
         );
@@ -2029,6 +2033,44 @@ impl GitState {
                             .update(cx, |workspace, cx| {
                                 crate::compare::CompareView::open(
                                     git, report, branch, current, false, workspace, window, cx,
+                                )
+                            })
+                            .ok();
+                    })
+                    .ok(),
+                Err(message) => this
+                    .update(cx, |this, cx| this.report("Compare", message, cx))
+                    .ok(),
+            }
+        })
+        .detach();
+    }
+
+    /// The commits and files that differ between two revisions of the log, in the same
+    /// Compare window the branches use.
+    pub fn compare_revisions(&mut self, left: String, right: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let (job_left, job_right) = (left.clone(), right.clone());
+        let job = cx.background_executor().spawn(async move {
+            repo.compare_revisions(&job_left, &job_right)
+                .map_err(|error| error.to_string())
+        });
+        let Some(window) = self.window else {
+            return;
+        };
+        let git = cx.entity();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            match result {
+                Ok(report) => window
+                    .update(cx, |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                crate::compare::CompareView::open_revisions(
+                                    git, report, left, right, workspace, window, cx,
                                 )
                             })
                             .ok();

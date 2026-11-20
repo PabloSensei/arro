@@ -1671,6 +1671,127 @@ fn register_git_commands(workspace: &mut Workspace) {
             cx.defer(move |cx| git.update(cx, |git, cx| git.close_annotations(cx)));
         },
     );
+    workspace.register_command("git.rebase", "Rebase...", |_, window, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        let Some(commit) = panel.read(cx).focused_commit_id() else {
+            return;
+        };
+        let handle = window.window_handle();
+        panel.update(cx, |panel, cx| {
+            panel.open_rebase(commit, handle, cx);
+        });
+    });
+    workspace.register_command("git.cherry_pick", "Cherry-pick", |_, _, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| panel.cherry_pick_picked(cx));
+    });
+    workspace.register_command("git.revert_commit", "Revert Commit", |_, _, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        let Some(commit) = panel.read(cx).focused_commit_id() else {
+            return;
+        };
+        let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+            return;
+        };
+        git.update(cx, |git, cx| git.revert_commit(commit, cx));
+    });
+    workspace.register_command("git.reset_head", "Reset HEAD...", |_, window, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        let Some(commit) = panel.read(cx).focused_commit_id() else {
+            return;
+        };
+        let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+            return;
+        };
+        let workspace = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            git_log::ResetView::open(git, commit, workspace, window, cx)
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    });
+    workspace.register_command("git.shelve", "Shelve Changes...", |_, window, cx| {
+        let Some(panel) = cx
+            .try_global::<ActiveCommitPanel>()
+            .map(|panel| panel.0.clone())
+        else {
+            return;
+        };
+        let workspace = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_tool(workspace::COMMIT_TOOL, window, cx)
+                        })
+                        .ok();
+                    panel.update(cx, |panel, cx| panel.shelve(cx));
+                })
+                .ok();
+        });
+    });
+    workspace.register_command("git.unshelve", "Unshelve...", |_, window, cx| {
+        let Some(panel) = cx
+            .try_global::<ActiveCommitPanel>()
+            .map(|panel| panel.0.clone())
+        else {
+            return;
+        };
+        let workspace = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_tool(workspace::COMMIT_TOOL, window, cx)
+                        })
+                        .ok();
+                    panel.update(cx, |panel, cx| panel.ask_unshelve(window, cx));
+                })
+                .ok();
+        });
+    });
+
+    let repository = |cx: &App| {
+        cx.try_global::<ActiveGit>()
+            .is_some_and(|git| git.0.read(cx).repo().is_some())
+    };
+    let picked = |cx: &App| {
+        cx.try_global::<ActiveGitLog>()
+            .is_some_and(|panel| !panel.0.read(cx).picked_ids().is_empty())
+    };
+    workspace.set_command_check(crate::git::ANNOTATE_COMMAND, move |workspace, cx| {
+        repository(cx) && workspace.active_path().is_some()
+    });
+    workspace.set_command_check("git.show_selection_history", move |workspace, cx| {
+        repository(cx) && workspace.active_path().is_some()
+    });
+    workspace.set_command_check("git.rebase", move |_, cx| repository(cx) && picked(cx));
+    workspace.set_command_check("git.cherry_pick", move |_, cx| repository(cx) && picked(cx));
+    workspace.set_command_check("git.revert_commit", move |_, cx| {
+        repository(cx) && picked(cx)
+    });
+    workspace.set_command_check("git.reset_head", move |_, cx| repository(cx) && picked(cx));
+    workspace.set_command_check("git.shelve", move |_, cx| repository(cx));
+    workspace.set_command_check("git.unshelve", move |_, cx| repository(cx));
 }
 
 /// `host:port`, the form the Attach to JVM prompt takes. Only the user names the host.
