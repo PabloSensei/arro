@@ -43,6 +43,8 @@ struct Link {
     theme: Theme,
     edit: Rc<FieldEdit>,
     start: Option<Rc<FieldStart>>,
+    /// A read-only field is selected and copied, and its edits do nothing.
+    read_only: bool,
 }
 
 impl FieldMouse {
@@ -87,8 +89,23 @@ impl FieldMouse {
                 theme: *cx.global::<Theme>(),
                 edit,
                 start: None,
+                read_only: false,
             }),
         }
+    }
+
+    /// The field can be selected and copied, but not changed: its mouse moves the caret and
+    /// the selection, its menu has Copy and Select All only, and its edits do nothing.
+    pub fn read_only(mut self) -> Self {
+        if let Some(link) = &mut self.link {
+            link.read_only = true;
+        }
+        self
+    }
+
+    /// Whether the field is read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.link.as_ref().is_some_and(|link| link.read_only)
     }
 
     /// Runs `start` on the owner before a left press of the field is heard, so that an owner
@@ -141,9 +158,9 @@ impl FieldMouse {
     }
 
     /// [`FieldMouse::apply`] for a change that edits the text, so the owner's after-edit
-    /// work runs too.
+    /// work runs too. A read-only field takes no edit.
     pub fn apply_edit(&self, cx: &mut App, change: FieldChange<'_>) {
-        if let Some(link) = &self.link {
+        if let Some(link) = self.link.as_ref().filter(|link| !link.read_only) {
             (link.edit)(cx, true, change);
         }
     }
@@ -411,6 +428,8 @@ pub(crate) fn menu(mouse: &FieldMouse, field: &TextField, multiline: bool) -> Op
     let theme = mouse.theme()?;
     let has_selection = field.has_selection();
     let empty = field.text.is_empty();
+    // A read-only field has no Cut and no Paste: its menu only copies.
+    let read_only = mouse.is_read_only();
 
     let close = mouse.clone();
     let cut = mouse.clone();
@@ -424,24 +443,26 @@ pub(crate) fn menu(mouse: &FieldMouse, field: &TextField, multiline: bool) -> Op
         .on_mouse_down_out(move |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
             close.apply(cx, &mut |field, _| field.menu.take().is_some());
         })
-        .child(menu_row(
-            &theme,
-            "Cut",
-            "Ctrl+X",
-            has_selection,
-            move |cx| {
-                cut.apply_edit(cx, &mut |field, app| {
-                    field.menu = None;
-                    if !field.has_selection() {
-                        return true;
-                    }
-                    let text = field.selected_text().to_owned();
-                    app.write_to_clipboard(ClipboardItem::new_string(text));
-                    field.backspace(false);
-                    true
-                });
-            },
-        ))
+        .when(!read_only, |panel| {
+            panel.child(menu_row(
+                &theme,
+                "Cut",
+                "Ctrl+X",
+                has_selection,
+                move |cx| {
+                    cut.apply_edit(cx, &mut |field, app| {
+                        field.menu = None;
+                        if !field.has_selection() {
+                            return true;
+                        }
+                        let text = field.selected_text().to_owned();
+                        app.write_to_clipboard(ClipboardItem::new_string(text));
+                        field.backspace(false);
+                        true
+                    });
+                },
+            ))
+        })
         .child(menu_row(
             &theme,
             "Copy",
@@ -459,22 +480,25 @@ pub(crate) fn menu(mouse: &FieldMouse, field: &TextField, multiline: bool) -> Op
                 });
             },
         ))
-        .child(menu_row(
-            &theme,
-            "Paste",
-            "Ctrl+V",
-            open.can_paste,
-            move |cx| {
-                paste.apply_edit(cx, &mut |field, app| {
-                    field.menu = None;
-                    let Some(text) = app.read_from_clipboard().and_then(|item| item.text()) else {
-                        return true;
-                    };
-                    field.paste(&text, multiline);
-                    true
-                });
-            },
-        ))
+        .when(!read_only, |panel| {
+            panel.child(menu_row(
+                &theme,
+                "Paste",
+                "Ctrl+V",
+                open.can_paste,
+                move |cx| {
+                    paste.apply_edit(cx, &mut |field, app| {
+                        field.menu = None;
+                        let Some(text) = app.read_from_clipboard().and_then(|item| item.text())
+                        else {
+                            return true;
+                        };
+                        field.paste(&text, multiline);
+                        true
+                    });
+                },
+            ))
+        })
         .child(menu_row(
             &theme,
             "Select All",

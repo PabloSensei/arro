@@ -2960,7 +2960,6 @@ impl GitLogPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let branch_empty = self.branch_query.text.is_empty();
         let toolbar = self.branch_toolbar(theme, cx);
         let rows: Vec<AnyElement> = self
             .branch_rows
@@ -3078,7 +3077,7 @@ impl GitLogPanel {
                             .rounded(px(CONTROL_RADIUS))
                             .border_1()
                             .border_color(theme.popup_border)
-                            .children(text_field_children_named(
+                            .children(text_field_children_hinted(
                                 FieldMouse::new(cx, |this| Some(&mut this.branch_query)),
                                 "git-log-branch-search",
                                 &self.branch_query,
@@ -3088,14 +3087,11 @@ impl GitLogPanel {
                                 theme.caret,
                                 16.,
                                 self.branch_search,
+                                FieldHint {
+                                    text: "Branch or tag",
+                                    color: theme.text_secondary,
+                                },
                             ))
-                            .when(branch_empty, |this| {
-                                this.child(
-                                    div()
-                                        .text_color(theme.text_secondary)
-                                        .child("Branch or tag"),
-                                )
-                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.branch_search = true;
                                 this.path_search = false;
@@ -3468,8 +3464,6 @@ impl GitLogPanel {
     /// The filters over the commits: the text, the Branch, User, Date and Paths
     /// dropdowns, Refresh and Cherry-pick.
     fn filter_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let filter_empty = self.filter.text.is_empty();
-        let path_empty = self.path_query.text.is_empty();
         let dropdown = |id: &'static str, label: String, theme: &Theme| {
             div()
                 .id(id)
@@ -3542,12 +3536,7 @@ impl GitLogPanel {
                             .rounded(px(CONTROL_RADIUS))
                             .border_1()
                             .border_color(theme.popup_border)
-                            .text_color(if filter_empty {
-                                theme.text_secondary
-                            } else {
-                                theme.text
-                            })
-                            .children(text_field_children_named(
+                            .children(text_field_children_hinted(
                                 FieldMouse::with_edit(
                                     cx,
                                     |this| Some(&mut this.filter),
@@ -3561,8 +3550,11 @@ impl GitLogPanel {
                                 theme.caret,
                                 16.,
                                 !self.branch_search,
+                                FieldHint {
+                                    text: "Text or hash",
+                                    color: theme.text_secondary,
+                                },
                             ))
-                            .when(filter_empty, |this| this.child("Text or hash"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.branch_search = false;
                                 this.path_search = false;
@@ -3670,12 +3662,7 @@ impl GitLogPanel {
                             .rounded(px(CONTROL_RADIUS))
                             .border_1()
                             .border_color(theme.popup_border)
-                            .text_color(if path_empty {
-                                theme.text_secondary
-                            } else {
-                                theme.text
-                            })
-                            .children(text_field_children_named(
+                            .children(text_field_children_hinted(
                                 FieldMouse::new(cx, |this| Some(&mut this.path_query)),
                                 "git-log-path-filter",
                                 &self.path_query,
@@ -3685,8 +3672,11 @@ impl GitLogPanel {
                                 theme.caret,
                                 16.,
                                 self.path_search,
+                                FieldHint {
+                                    text: "Path or folder",
+                                    color: theme.text_secondary,
+                                },
                             ))
-                            .when(path_empty, |this| this.child("Path or folder"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.branch_search = false;
                                 this.path_search = true;

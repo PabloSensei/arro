@@ -14,7 +14,6 @@ use workspace::Workspace;
 use crate::prompt::TextField;
 
 const WIDTH: f32 = 760.;
-const FIELD_HEIGHT: f32 = 26.;
 
 const NO_ANSWER: &str = "The language server did not answer";
 const NO_SUPPORT: &str = "Change Signature is not supported by this language";
@@ -490,7 +489,7 @@ fn field_box(
         .debug_selector(move || selector)
         .flex()
         .items_center()
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .min_w(px(0.))
         .flex_1()
         .px(px(SPACE_M))
@@ -515,21 +514,6 @@ fn field_box(
         ))
 }
 
-fn labelled(label: &str, field: Stateful<Div>, theme: &Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(SPACE_M))
-        .child(
-            div()
-                .w(px(96.))
-                .flex_none()
-                .text_color(theme.text_muted)
-                .child(label.to_owned()),
-        )
-        .child(field)
-}
-
 fn small_button(
     id: impl Into<ElementId>,
     selector: String,
@@ -544,7 +528,7 @@ fn small_button(
         .flex()
         .items_center()
         .justify_center()
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_M))
         .rounded(px(CONTROL_RADIUS))
         .border_1()
@@ -562,6 +546,7 @@ impl Render for ChangeSignatureDialog {
         let width = px(WIDTH);
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.12;
+        let label_width = form_label_width(window, &["Name", "Visibility", "Return type"]);
         let active = self.active;
 
         let name = field_box(
@@ -670,7 +655,7 @@ impl Render for ChangeSignatureDialog {
                         &theme,
                     )
                     .debug_selector(move || format!("change-signature-up-{index}"))
-                    .size(px(FIELD_HEIGHT))
+                    .size(px(CONTROL_HEIGHT))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.move_parameter(index, -1, cx);
                     })),
@@ -684,7 +669,7 @@ impl Render for ChangeSignatureDialog {
                         &theme,
                     )
                     .debug_selector(move || format!("change-signature-down-{index}"))
-                    .size(px(FIELD_HEIGHT))
+                    .size(px(CONTROL_HEIGHT))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.move_parameter(index, 1, cx);
                     })),
@@ -698,7 +683,7 @@ impl Render for ChangeSignatureDialog {
                         &theme,
                     )
                     .debug_selector(move || format!("change-signature-remove-{index}"))
-                    .size(px(FIELD_HEIGHT))
+                    .size(px(CONTROL_HEIGHT))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_parameter(index, cx);
                     })),
@@ -770,9 +755,9 @@ impl Render for ChangeSignatureDialog {
             .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .child(labelled("Name", name, &theme))
-            .child(labelled("Visibility", visibility, &theme))
-            .child(labelled("Return type", return_type, &theme))
+            .child(form_row(label_width, "Name", name, &theme))
+            .child(form_row(label_width, "Visibility", visibility, &theme))
+            .child(form_row(label_width, "Return type", return_type, &theme))
             .child(
                 div()
                     .flex()

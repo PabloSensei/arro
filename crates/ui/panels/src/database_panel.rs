@@ -5172,19 +5172,21 @@ impl DatabasePanel {
                 }),
             );
         }
-        bar = bar.child(
-            icon_button(
-                "database-console-stop",
-                "run/stop",
-                "Stop",
-                Some("Ctrl+F2".into()),
-                theme,
-            )
-            .debug_selector(|| "database-console-stop".to_owned())
-            .when(running, |this| {
-                this.on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
-            }),
-        );
+        // The Stop square is drawn only while a statement runs: over an empty result it
+        // would look like a checkbox with no label.
+        if running {
+            bar = bar.child(
+                icon_button(
+                    "database-console-stop",
+                    "run/stop",
+                    "Stop",
+                    Some("Ctrl+F2".into()),
+                    theme,
+                )
+                .debug_selector(|| "database-console-stop".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+            );
+        }
         if let Some(source) = &selected {
             let id = source.clone();
             let manual = !self.auto_commit(source);
@@ -6154,6 +6156,7 @@ impl DatabasePanel {
                 None,
                 theme,
             )
+            .debug_selector(|| "database-refresh".to_owned())
             .on_click(cx.listener(|this, _, _, cx| {
                 this.refresh_catalog();
                 if let Some(source) = this.selected.clone() {

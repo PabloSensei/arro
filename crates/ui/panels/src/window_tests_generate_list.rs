@@ -46,7 +46,7 @@ impl SyntaxProvider for NoSyntax {
 /// `unknown` makes every answer say the server does not know; `symbols` set, the language
 /// has symbols and the caret is inside the classes they name; `applied` is the answer to
 /// an apply request, the edit of a chosen part or of the parts none of which was chosen.
-struct GenerateLanguage {
+pub(crate) struct GenerateLanguage {
     syntax: NoSyntax,
     answers: Mutex<Vec<(GenerateKind, Generation)>>,
     unknown: Mutex<bool>,
@@ -55,7 +55,7 @@ struct GenerateLanguage {
 }
 
 impl GenerateLanguage {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             syntax: NoSyntax(Queries::default()),
             answers: Mutex::new(Vec::new()),
@@ -174,7 +174,7 @@ impl LanguageSupport for GenerateLanguage {
     }
 }
 
-fn open_window(
+pub(crate) fn open_window(
     cx: &mut TestAppContext,
     root: PathBuf,
     language: Arc<GenerateLanguage>,
@@ -235,7 +235,7 @@ fn open_window(
 }
 
 /// A file `src/A.txt` with `text` in the project `name`.
-fn project(name: &str, text: &str) -> (PathBuf, PathBuf) {
+pub(crate) fn project(name: &str, text: &str) -> (PathBuf, PathBuf) {
     let root = scratch(name);
     let path = root.join("src").join("A.txt");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -293,7 +293,7 @@ fn list_rows(
 
 /// Alt+Insert with the caret at `line`, `column`. Waits until the list opens or its note
 /// shows, and gives the labels of the list, or `None` when the list stayed closed.
-fn alt_insert(
+pub(crate) fn alt_insert(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     path: &Path,

@@ -7,6 +7,8 @@ use std::ops::Range;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::Theme;
+use crate::metrics::{CONTROL_HEIGHT, CONTROL_RADIUS, SPACE_M};
 use crate::text_field_mouse::{self, FieldMouse};
 
 /// The menu that a right click opened on a field: where it stands, and whether Paste
@@ -422,6 +424,41 @@ impl TextField {
         self.key_with_clipboard(event, false, cx)
     }
 
+    /// The keys of a field that cannot be changed. The caret moves and the selection grows as in
+    /// [`TextField::key`], Ctrl+A selects all and Ctrl+C copies the selection. A key that would
+    /// edit the text is taken and changes nothing. Enter, Escape and Tab are left to the owner.
+    /// Returns whether the key was taken.
+    pub fn key_read_only(&mut self, event: &KeyDownEvent, cx: &mut App) -> bool {
+        let stroke = &event.keystroke;
+        let modifiers = stroke.modifiers;
+        let primary = modifiers.control || modifiers.platform;
+        if modifiers.alt {
+            return false;
+        }
+        match stroke.key.as_str() {
+            "c" if primary => {
+                if self.has_selection() {
+                    let text = self.selected_text().to_owned();
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                true
+            }
+            "a" if primary => {
+                self.select_all();
+                true
+            }
+            "x" | "v" if primary => true,
+            "enter" | "escape" | "tab" => false,
+            "left" | "right" | "home" | "end" => {
+                self.key(event, false);
+                true
+            }
+            "backspace" | "delete" => true,
+            _ if primary => false,
+            _ => stroke.key_char.is_some(),
+        }
+    }
+
     fn vertical(&mut self, step: isize, shift: bool) {
         let line = self.text[..self.caret]
             .bytes()
@@ -457,6 +494,16 @@ struct Look {
     caret: Hsla,
     caret_height: f32,
     show_caret: bool,
+}
+
+/// The grey text of an empty field, such as `Commit Message`. It stands after the caret of the
+/// first line, so the caret and the hint share the place where the text will start, and it goes
+/// as soon as the field holds a character. A field with a name gets the selector
+/// `{name}-placeholder` on the hint.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldHint {
+    pub text: &'static str,
+    pub color: Hsla,
 }
 
 /// The parts of a field for drawing: its text split at the selection, with the caret bar
@@ -579,6 +626,109 @@ pub fn text_field_lines_named(
     )
 }
 
+/// [`text_field_children_named`] with a hint that shows while the field is empty.
+#[allow(clippy::too_many_arguments)]
+pub fn text_field_children_hinted(
+    mouse: FieldMouse,
+    name: &'static str,
+    field: &TextField,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+    hint: FieldHint,
+) -> Vec<AnyElement> {
+    field_children_hinted(
+        mouse,
+        Some(name),
+        field,
+        false,
+        Look {
+            text: text_color,
+            selected: selected_color,
+            selection: selection_color,
+            caret: caret_color,
+            caret_height,
+            show_caret,
+        },
+        Some(hint),
+    )
+}
+
+/// [`text_field_lines_named`] with a hint that shows while the field is empty. The hint stands
+/// after the caret of the first line.
+#[allow(clippy::too_many_arguments)]
+pub fn text_field_lines_hinted(
+    mouse: FieldMouse,
+    name: &'static str,
+    field: &TextField,
+    text_color: Hsla,
+    selected_color: Hsla,
+    selection_color: Hsla,
+    caret_color: Hsla,
+    caret_height: f32,
+    show_caret: bool,
+    hint: FieldHint,
+) -> Vec<AnyElement> {
+    field_children_hinted(
+        mouse,
+        Some(name),
+        field,
+        true,
+        Look {
+            text: text_color,
+            selected: selected_color,
+            selection: selection_color,
+            caret: caret_color,
+            caret_height,
+            show_caret,
+        },
+        Some(hint),
+    )
+}
+
+/// A field whose text can be selected and copied but not changed. It is drawn as a field, with
+/// a frame and a background a little dimmer than the window, and it shows no caret. `mouse`
+/// should be [`FieldMouse::read_only`]; the keys of its owner go to [`TextField::key_read_only`].
+pub fn read_only_field(
+    id: impl Into<ElementId>,
+    selector: String,
+    name: &'static str,
+    mouse: FieldMouse,
+    field: &TextField,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || selector)
+        .flex()
+        .items_center()
+        .h(px(CONTROL_HEIGHT))
+        .min_w(px(0.))
+        .flex_1()
+        .px(px(SPACE_M))
+        .rounded(px(CONTROL_RADIUS))
+        .border_1()
+        .border_color(theme.control_border)
+        .bg(theme.main_bg)
+        .overflow_hidden()
+        .cursor_text()
+        .text_color(theme.text)
+        .children(text_field_children_named(
+            mouse,
+            name,
+            field,
+            theme.text,
+            theme.text,
+            theme.selection,
+            theme.caret,
+            16.,
+            false,
+        ))
+}
+
 /// The rows of a field, one per line, then the element that covers the field for the
 /// pointer, and the menu when a right click opened one. A row of a multiline field is
 /// `caret_height` tall. Each row also measures its text when the field has a mouse.
@@ -589,6 +739,19 @@ fn field_children(
     multiline: bool,
     look: Look,
 ) -> Vec<AnyElement> {
+    field_children_hinted(mouse, name, field, multiline, look, None)
+}
+
+/// [`field_children`] with the hint of an empty field, which stands after the caret of the first
+/// line.
+fn field_children_hinted(
+    mouse: FieldMouse,
+    name: Option<&'static str>,
+    field: &TextField,
+    multiline: bool,
+    look: Look,
+    hint: Option<FieldHint>,
+) -> Vec<AnyElement> {
     let ranges = line_ranges(field, multiline);
     let lines = mouse.is_on().then(|| text_field_mouse::lines(ranges.len()));
     let mut children = Vec::new();
@@ -598,6 +761,9 @@ fn field_children(
             row = row.h(px(look.caret_height));
         }
         row = row.children(range_children(name, field, range.clone(), look));
+        if let Some(hint) = hint.filter(|_| index == 0 && field.text.is_empty()) {
+            row = row.child(hint_text(name, hint));
+        }
         if let Some(lines) = &lines {
             let text = &field.text[range.clone()];
             row = row.child(text_field_mouse::measure_line(
@@ -698,6 +864,28 @@ fn segment(name: Option<&'static str>, text: &str, selected: bool, look: Look) -
         })
         .child(text.to_owned())
         .into_any_element()
+}
+
+/// The text of a hint. A named field marks it with `{name}-placeholder`, and the tests of the
+/// window read its label from the frame.
+fn hint_text(name: Option<&'static str>, hint: FieldHint) -> AnyElement {
+    let text = div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_color(hint.color)
+        .when_some(name, |this, name| {
+            this.debug_selector(move || format!("{name}-placeholder"))
+        })
+        .child(hint.text);
+    #[cfg(any(test, feature = "test-support"))]
+    let text = match name {
+        Some(name) => text.child(crate::bounds_probe(
+            format!("{name}-placeholder"),
+            Some(hint.text.into()),
+        )),
+        None => text,
+    };
+    text.into_any_element()
 }
 
 fn caret(color: Hsla, height: f32, name: Option<&'static str>) -> AnyElement {

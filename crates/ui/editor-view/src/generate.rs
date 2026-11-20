@@ -120,6 +120,22 @@ fn is_typed_key(key: &str) -> bool {
 }
 
 impl EditorView {
+    /// The pick list of the Generate menu, under the heading "Generate". An empty list shows
+    /// the note of `empty` and leaves the open list alone.
+    fn show_generate_picks(
+        &mut self,
+        at: usize,
+        rows: Vec<Pick>,
+        empty: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let listed = !rows.is_empty();
+        self.show_picks(at, rows, empty, cx);
+        if listed && let Some(menu) = self.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+            menu.title = Some("Generate");
+        }
+    }
+
     /// Alt+Insert: the list of what applies here. The server says which parts exist; where
     /// it does not know, the symbols of the class say. A row is left out only on positive
     /// evidence, so a language that answers nothing keeps the full list.
@@ -200,7 +216,7 @@ impl EditorView {
                     state.version() as i32 == version && state.selections().primary().head == caret
                 });
                 if current {
-                    this.show_picks(caret, rows, "Nothing to generate", cx);
+                    this.show_generate_picks(caret, rows, "Nothing to generate", cx);
                 }
             })
             .ok();
@@ -224,7 +240,7 @@ impl EditorView {
                 })
                 .map(crate::actions::Pick::Action)
                 .collect();
-            this.show_picks(caret, rows, "Nothing to generate here", cx);
+            this.show_generate_picks(caret, rows, "Nothing to generate here", cx);
         });
     }
 

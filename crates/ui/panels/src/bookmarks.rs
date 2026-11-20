@@ -167,21 +167,15 @@ impl BookmarksPanel {
             Row::File { path, .. } => path
                 .file_name()
                 .map_or(String::new(), |name| name.to_string_lossy().into_owned()),
-            Row::Bookmark { group, path, line } => self.bookmark_label(group, &path, line, cx),
+            Row::Bookmark { path, line, .. } => self.bookmark_label(&path, line, cx),
         })
     }
 
-    /// The line of a bookmark as the tree writes it: its mnemonic, its number from one
-    /// and the text of the line.
-    fn bookmark_label(&mut self, group: usize, path: &Path, line: u32, cx: &App) -> String {
-        let place = self.place(group, path, line, cx);
-        let mnemonic = place
-            .as_ref()
-            .and_then(|place| place.mnemonic)
-            .map(|letter| format!("{letter} "))
-            .unwrap_or_default();
+    /// The line of a bookmark as the tree writes it: its number from one and the text of
+    /// the line. The mnemonic stands on the icon of the row.
+    fn bookmark_label(&mut self, path: &Path, line: u32, cx: &App) -> String {
         let text = snippet(&self.line_text(path, line, cx));
-        format!("{mnemonic}{}: {text}", line + 1)
+        format!("{}: {text}", line + 1)
     }
 
     /// The groups and descriptions go to the saved layout of the project.
@@ -859,7 +853,7 @@ impl Render for BookmarksPanel {
         let mut rows = Vec::with_capacity(self.rows.len());
         for index in 0..self.rows.len() {
             let row = self.rows[index].clone();
-            let (depth, icon, label, hint, expandable, open) = match &row {
+            let (depth, icon, label, hint, expandable, open, mnemonic) = match &row {
                 Row::Group { group: group_index } => {
                     let (name, is_default) = editor_view::bookmark_groups(cx)
                         .get(*group_index)
@@ -873,6 +867,7 @@ impl Render for BookmarksPanel {
                         is_default.then(|| "default".to_owned()),
                         true,
                         !self.closed_groups.contains(group_index),
+                        None,
                     )
                 }
                 Row::File { path, .. } => {
@@ -890,14 +885,15 @@ impl Render for BookmarksPanel {
                         None,
                         true,
                         !self.closed_files.contains(path),
+                        None,
                     )
                 }
                 Row::Bookmark { group, path, line } => {
-                    let label = self.bookmark_label(*group, path, *line, cx);
-                    let hint = self
-                        .place(*group, path, *line, cx)
-                        .and_then(|place| place.description);
-                    (2, BOOKMARK_ICON, label, hint, false, false)
+                    let place = self.place(*group, path, *line, cx);
+                    let label = self.bookmark_label(path, *line, cx);
+                    let hint = place.as_ref().and_then(|place| place.description.clone());
+                    let mnemonic = place.and_then(|place| place.mnemonic);
+                    (2, BOOKMARK_ICON, label, hint, false, false, mnemonic)
                 }
             };
             let selected = self.selected == Some(index);
@@ -934,6 +930,25 @@ impl Render for BookmarksPanel {
                         cx.notify();
                     }),
                 );
+            // The mnemonic of a bookmark stands on its icon, as the gutter of IDEA shows it.
+            let badge = mnemonic.map(|letter| {
+                div()
+                    .id(("bookmark-mnemonic", index))
+                    .debug_selector(move || format!("bookmark-mnemonic-{index}"))
+                    .absolute()
+                    .left(px(depth as f32 * 19. + ROW_PADDING_X + ICON + SPACE_S + 8.))
+                    .top(px(11.))
+                    .size(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(2.))
+                    .bg(theme.popup_bg)
+                    .text_size(px(8.))
+                    .text_color(theme.accent)
+                    .child(letter.to_uppercase().to_string())
+            });
+            let tree = div().relative().child(tree).children(badge);
             rows.push(div().w_full().px(px(ROW_MARGIN)).child(tree));
         }
         island(&theme)

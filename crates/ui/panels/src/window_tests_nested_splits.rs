@@ -124,7 +124,7 @@ fn globals(cx: &mut TestAppContext) {
 
 /// A window built the way the application builds it, from a layout and a store that came
 /// from an earlier run.
-fn open_saved_window(
+pub(crate) fn open_saved_window(
     cx: &mut TestAppContext,
     root: &Path,
     state_dir: &Path,

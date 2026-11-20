@@ -1149,6 +1149,9 @@ impl Render for CompareResponses {
                 if event.keystroke.key == "enter" {
                     this.compare(window, cx);
                     cx.stop_propagation();
+                } else if event.keystroke.key == "escape" {
+                    this.close(window, cx);
+                    cx.stop_propagation();
                 }
             }));
         let contents = div()

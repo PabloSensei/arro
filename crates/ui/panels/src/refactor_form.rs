@@ -14,7 +14,6 @@ use workspace::Workspace;
 use crate::prompt::TextField;
 
 const WIDTH: f32 = 560.;
-const FIELD_HEIGHT: f32 = 26.;
 
 const NO_ANSWER: &str = "The language server did not answer";
 const NO_SUPPORT: &str = "This language has no refactorings with values";
@@ -369,7 +368,7 @@ fn row_box(
         .flex()
         .items_center()
         .gap(px(SPACE_M))
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_S))
         .rounded(px(CONTROL_RADIUS))
         .text_color(theme.text)
@@ -433,6 +432,12 @@ impl Render for RefactorFormDialog {
             );
         }
 
+        let labels: Vec<&str> = self
+            .fields
+            .iter()
+            .map(|(field, _)| field.label.as_str())
+            .collect();
+        let label_width = form_label_width(window, &labels);
         let mut field_rows = Vec::with_capacity(self.fields.len());
         for (index, (field, text)) in self.fields.iter().enumerate() {
             let value = div()
@@ -443,7 +448,7 @@ impl Render for RefactorFormDialog {
                 })
                 .flex()
                 .items_center()
-                .h(px(FIELD_HEIGHT))
+                .h(px(CONTROL_HEIGHT))
                 .flex_1()
                 .px(px(SPACE_M))
                 .rounded(px(CONTROL_RADIUS))
@@ -473,18 +478,10 @@ impl Render for RefactorFormDialog {
                     active == Some(Row::Field(index)),
                 ));
             field_rows.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .w(px(120.))
-                            .flex_none()
-                            .text_color(theme.text_muted)
-                            .child(field.label.clone()),
-                    )
-                    .child(value.on_click(cx.listener(move |this, _, window, cx| {
+                form_row(
+                    label_width,
+                    &field.label,
+                    value.on_click(cx.listener(move |this, _, window, cx| {
                         this.active = this
                             .rows
                             .iter()
@@ -492,8 +489,10 @@ impl Render for RefactorFormDialog {
                             .unwrap_or(0);
                         window.focus(&this.focus, cx);
                         cx.notify();
-                    })))
-                    .into_any_element(),
+                    })),
+                    &theme,
+                )
+                .into_any_element(),
             );
         }
 

@@ -415,10 +415,11 @@ fn the_arrows_of_the_search_walk_the_pages(cx: &mut TestAppContext) {
         "the window opens on Appearance"
     );
 
+    // Keymap follows Appearance, as in the settings of IDEA.
     press(cx, window, "down");
     draw(cx, window);
     assert!(
-        has(cx, window, "settings-soft-wrap"),
+        has(cx, window, "keymap-reset-all"),
         "Down moves to the next page of the tree"
     );
 

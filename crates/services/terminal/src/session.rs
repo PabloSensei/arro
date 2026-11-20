@@ -15,7 +15,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounde
 
 use crate::conpty::{Backend, Pty};
 use crate::engine::Engine;
-use crate::keys::{KeyEvent, ShiftEnter, encode, encode_text};
+use crate::keys::{Key, KeyEvent, ShiftEnter, encode, encode_text, wheel_report};
 use crate::screen::{Modes, Screen, SearchResults};
 
 const READ_BUFFER: usize = 64 * 1024;
@@ -29,6 +29,9 @@ const CONTROLS: usize = 64;
 const WRITE_CHUNK: usize = 16 * 1024;
 /// The shortest gap between two snapshots of the process table while output flows.
 const ADOPT_INTERVAL: Duration = Duration::from_millis(250);
+/// Lines one notch of the wheel moves, as Windows gives them by default. A notch is one mouse
+/// report for a program that asked for mouse reports.
+const WHEEL_LINES: u32 = 3;
 
 /// What to start. `env` is the whole environment of the child, see `allowlisted`.
 #[derive(Clone, Debug)]
@@ -86,6 +89,8 @@ pub(crate) enum Control {
     Resize,
     Scroll(i32),
     ScrollToBottom,
+    /// Moves the view to this many lines back into history, 0 being the live screen.
+    ScrollTo(usize),
     /// The match of the latest answer of the search the view should show.
     RevealMatch(usize),
     Search {
@@ -318,6 +323,46 @@ impl TerminalSession {
         drop(self.control.try_send(Control::ScrollToBottom));
     }
 
+    /// Moves the view to `offset` lines back into history, 0 being the live screen.
+    pub fn scroll_to(&self, offset: usize) {
+        drop(self.control.try_send(Control::ScrollTo(offset)));
+    }
+
+    /// One turn of the wheel over the screen cell `cell` (column and row, from 0), `lines` up
+    /// when positive. The modes in force decide where it goes: see `wheel_route`.
+    pub fn wheel(&self, lines: i32, cell: (u16, u16), shift: bool) -> Result<(), InputError> {
+        let modes = self.modes();
+        match wheel_route(modes, shift) {
+            WheelRoute::History => {
+                self.scroll(lines);
+                Ok(())
+            }
+            WheelRoute::Mouse => {
+                let notches = lines.unsigned_abs().div_ceil(WHEEL_LINES);
+                let mut bytes = Vec::new();
+                for _ in 0..notches {
+                    bytes
+                        .extend(wheel_report(lines > 0, cell, modes.sgr_mouse).unwrap_or_default());
+                }
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                self.send(bytes)
+            }
+            WheelRoute::Arrows => {
+                let key = KeyEvent::plain(if lines > 0 { Key::Up } else { Key::Down });
+                let mut bytes = Vec::new();
+                for _ in 0..lines.unsigned_abs() {
+                    bytes.extend(encode(key, modes, self.shift_enter));
+                }
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                self.send(bytes)
+            }
+        }
+    }
+
     /// Scrolls the view to the match `index` of the latest answer of the search. The
     /// lines of an answer move when the program prints more, so the engine finds the
     /// line of the match again when the view asks for it.
@@ -381,6 +426,31 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         // The threads see the end of the stream and leave on their own.
         self.terminate();
+    }
+}
+
+/// Where a turn of the wheel goes: the history of the terminal, a program that asked for mouse
+/// reports, or the arrow keys of a full-screen program that asked for neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelRoute {
+    History,
+    Mouse,
+    Arrows,
+}
+
+/// The route of a turn of the wheel, as xterm, IDEA and Windows Terminal have it: a program that
+/// asked for mouse reports gets the wheel, whichever screen it draws on, and Shift keeps the
+/// wheel for the history. Without mouse reports the alternate screen gets the arrow keys, as
+/// xterm's alternate scroll does, and the main screen, which has history, scrolls it.
+fn wheel_route(modes: Modes, shift: bool) -> WheelRoute {
+    if shift {
+        WheelRoute::History
+    } else if modes.mouse {
+        WheelRoute::Mouse
+    } else if modes.alt_screen {
+        WheelRoute::Arrows
+    } else {
+        WheelRoute::History
     }
 }
 
@@ -505,6 +575,27 @@ mod tests {
     #[test]
     fn a_paste_cannot_close_its_own_bracket() {
         assert_eq!(sanitize("a\x1b[201~b\r\nc\rd"), "a[201~b\nc\nd");
+    }
+
+    #[test]
+    fn the_wheel_goes_to_the_program_that_asked_for_the_mouse() {
+        let alt = Modes {
+            alt_screen: true,
+            ..Modes::default()
+        };
+        let alt_mouse = Modes { mouse: true, ..alt };
+        let main_mouse = Modes {
+            mouse: true,
+            ..Modes::default()
+        };
+        assert_eq!(wheel_route(Modes::default(), false), WheelRoute::History);
+        assert_eq!(wheel_route(alt, false), WheelRoute::Arrows);
+        assert_eq!(wheel_route(alt_mouse, false), WheelRoute::Mouse);
+        assert_eq!(wheel_route(main_mouse, false), WheelRoute::Mouse);
+        // Shift scrolls the history whatever the program asked for.
+        assert_eq!(wheel_route(main_mouse, true), WheelRoute::History);
+        assert_eq!(wheel_route(alt_mouse, true), WheelRoute::History);
+        assert_eq!(wheel_route(alt, true), WheelRoute::History);
     }
 
     /// A program that prints one line, starts a long child and then stays quiet.

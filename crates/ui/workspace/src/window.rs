@@ -415,7 +415,7 @@ pub const MIN_EDITOR_SIZE: f32 = 320.;
 /// How much one press of a resize key changes a dock.
 const KEYBOARD_RESIZE_STEP: f32 = 40.;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DockSide {
     Left,
     Right,
@@ -1770,6 +1770,8 @@ impl Workspace {
         focus: Option<FocusHandle>,
         cx: &mut App,
     ) {
+        // A project that saw a Move to opens the window where the user left it.
+        let side = self.layout.tool_side(id).unwrap_or(side);
         let view = ChromeView::tool(view, cx);
         let restore = side == DockSide::Bottom && self.layout.bottom_tool.as_deref() == Some(id);
         let dock = self.dock_mut(side);
@@ -2248,6 +2250,64 @@ impl Workspace {
     pub fn focused_tool_id(&self, window: &Window, cx: &App) -> Option<&'static str> {
         let side = self.focused_dock(window, cx)?;
         self.dock(side).active_tool().map(|tool| tool.id)
+    }
+
+    /// The dock that holds a tool window, for scripts and tests.
+    pub fn tool_side(&self, id: &str) -> Option<DockSide> {
+        self.find_tool(id).map(|(side, _)| side)
+    }
+
+    /// Move to: the tool window leaves its dock and opens in `side`. The place goes with
+    /// the layout of the project. A window already there stays where it is.
+    pub fn move_tool(
+        &mut self,
+        id: &str,
+        side: DockSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((from, index)) = self.find_tool(id) else {
+            return;
+        };
+        if from == side {
+            return;
+        }
+        if self.dock(from).tools.get(index).is_none() {
+            return;
+        }
+        let tool = self.dock_mut(from).tools.remove(index);
+        // The source dock shows its neighbour, or closes when the moved window was the
+        // last one there.
+        let source = self.dock_mut(from);
+        if source.active >= source.tools.len() {
+            source.active = source.tools.len().saturating_sub(1);
+        } else if source.active > index {
+            source.active -= 1;
+        }
+        if source.tools.is_empty() && source.slide.is_open() {
+            source.slide.toggle();
+        }
+        let focus = {
+            let dock = self.dock_mut(side);
+            dock.tools.push(tool);
+            let at = dock.tools.len() - 1;
+            dock.active = at;
+            if !dock.slide.is_open() {
+                dock.slide.toggle();
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            dock.slide.finish();
+            dock.tools[at].focus.clone()
+        };
+        self.maximized = None;
+        self.last_tool = Some(side);
+        self.layout.set_tool_side(id, side);
+        match focus {
+            Some(focus) => window.focus(&focus, cx),
+            None => self.focus_active(window, cx),
+        }
+        self.layout_changed(cx);
+        cx.notify();
     }
 
     /// Whether the tool window is the one shown in an open dock.
@@ -5539,6 +5599,14 @@ impl Workspace {
                 Some((tab.path.clone(), (bundle.layout)(cx)))
             })
             .collect();
+        let mut tool_sides = Vec::new();
+        for (side, dock) in [
+            (DockSide::Left, &self.left),
+            (DockSide::Right, &self.right),
+            (DockSide::Bottom, &self.bottom),
+        ] {
+            tool_sides.extend(dock.tools.iter().map(|tool| (tool.id.to_owned(), side)));
+        }
         Layout {
             window: self.placement,
             left: self.left.state(),
@@ -5551,6 +5619,7 @@ impl Workspace {
             tree_expanded: self.layout.tree_expanded.clone(),
             tree_selected: self.layout.tree_selected.clone(),
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
+            tool_sides,
             recent_edited: self.recent_edited.clone(),
             preview_modes,
             bundle_modes,

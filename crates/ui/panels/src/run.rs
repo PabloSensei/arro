@@ -6252,6 +6252,65 @@ impl Render for RunPanel {
             .console_search
             .filter_open
             .then(|| self.filter_row(&theme, cx));
+        let nothing_to_run = self.configs.is_empty()
+            && self.lines.is_empty()
+            && self.draining.is_empty()
+            && !self.tests.active()
+            && self.live.is_none()
+            && !self.busy();
+        let console_body: AnyElement = if nothing_to_run {
+            let add_config = cx.listener(|this, _, window, cx| {
+                let workspace = this.workspace.clone();
+                let panel = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            crate::run_configs::RunConfigDialog::show(panel, workspace, window, cx)
+                        })
+                        .ok();
+                });
+            });
+            div()
+                .debug_selector(|| "run-empty".to_owned())
+                .flex()
+                .flex_col()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap(px(SPACE_S))
+                .text_color(theme.text_secondary)
+                .child("Nothing to run")
+                .child(
+                    div()
+                        .id("run-empty-configs")
+                        .debug_selector(|| "run-empty-configs".to_owned())
+                        .cursor_pointer()
+                        .text_color(theme.accent)
+                        .child("Add configuration…")
+                        .on_click(add_config),
+                )
+                .into_any_element()
+        } else {
+            scrollable(
+                "run-console",
+                &self.scroll,
+                div().size_full().child(
+                    uniform_list(
+                        "run-console",
+                        count,
+                        cx.processor(move |this, range, _, cx| this.rows(range, &theme, view, cx)),
+                    )
+                    .track_scroll(&self.scroll)
+                    .size_full(),
+                ),
+                &theme,
+                window,
+                cx,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
         let console = div()
             .flex()
             .flex_col()
@@ -6273,28 +6332,7 @@ impl Render for RunPanel {
             .child(tools)
             .children(search)
             .children(filter)
-            .child(
-                scrollable(
-                    "run-console",
-                    &self.scroll,
-                    div().size_full().child(
-                        uniform_list(
-                            "run-console",
-                            count,
-                            cx.processor(move |this, range, _, cx| {
-                                this.rows(range, &theme, view, cx)
-                            }),
-                        )
-                        .track_scroll(&self.scroll)
-                        .size_full(),
-                    ),
-                    &theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_h_0(),
-            )
+            .child(console_body)
             .into_any_element();
         let body = if self.tests.active() {
             self.tests_body(console, &theme, window, cx)

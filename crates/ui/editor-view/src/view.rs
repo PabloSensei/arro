@@ -822,6 +822,15 @@ struct ContextInfo {
     lines: Vec<String>,
 }
 
+/// What the last frame showed of the caret: its head, the scroll and whether the whole row
+/// was on screen. A row that stops showing while none of these changed is revealed again.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CaretWatch {
+    pub head: usize,
+    pub scroll_top: f32,
+    pub shown: bool,
+}
+
 /// The list of the neighbours of one declaration, which a click on its breadcrumb opens:
 /// the other members of the same class, or the other declarations of the file.
 pub(crate) struct CrumbMenu {
@@ -1100,6 +1109,8 @@ pub struct EditorView {
     pub(crate) reveal_center: bool,
     pub(crate) caret_on: bool,
     pub(crate) viewport: Size<Pixels>,
+    /// What the last frame showed of the caret, see [`CaretWatch`].
+    pub(crate) caret_watch: Option<CaretWatch>,
     pub(crate) layout: Option<Rc<Layout>>,
     pub(crate) gutter_hovered: bool,
     pub(crate) run_marks: Vec<RunMark>,
@@ -1684,6 +1695,7 @@ impl EditorView {
             reveal_center: false,
             caret_on: true,
             viewport: Size::default(),
+            caret_watch: None,
             layout: None,
             gutter_hovered: false,
             run_marks: Vec::new(),
@@ -2402,6 +2414,18 @@ impl EditorView {
     /// it is anchored by. `None` before the first frame laid the text out.
     pub fn popup_at_caret(&self, height: f32) -> Option<(Point<Pixels>, Anchor)> {
         self.popup_position(self.head_offset()?, height)
+    }
+
+    /// The line of the caret in window coordinates, as the last frame drew it. `None` while
+    /// the frame did not draw the row of the caret.
+    pub fn caret_line_bounds(&self) -> Option<Bounds<Pixels>> {
+        let (layout, state) = (self.layout.as_ref()?, self.state.as_ref()?);
+        let at = state.display().to_display(state.head());
+        let shown = layout.rows.iter().find(|shown| shown.row == at.row)?;
+        Some(Bounds::new(
+            point(layout.bounds.left(), shown.y),
+            size(layout.bounds.size.width, px(self.style.line_height)),
+        ))
     }
 
     /// Edits from outside the keyboard. One undo step, the buffer becomes dirty.
@@ -3861,8 +3885,18 @@ impl EditorView {
         self.go_to(Spot::Line { line, column: 0 }, cx);
     }
 
+    /// The height of the text: the viewport less the horizontal scrollbar under the text.
+    fn text_height(&self) -> f32 {
+        f32::from(self.viewport.height)
+            - if self.horizontal_bar {
+                crate::scrollbar::HORIZONTAL_HEIGHT
+            } else {
+                0.
+            }
+    }
+
     fn page_rows(&self) -> usize {
-        (f32::from(self.viewport.height) / self.style.line_height)
+        (self.text_height() / self.style.line_height)
             .floor()
             .max(1.) as usize
     }
@@ -3940,6 +3974,7 @@ impl EditorView {
 
     /// Ctrl+Up and Ctrl+Down: scroll a line and keep the caret in view.
     fn scroll_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let text_height = self.text_height();
         let Some(state) = &mut self.state else {
             return;
         };
@@ -3947,9 +3982,7 @@ impl EditorView {
         let display = state.display();
         let rows = display.row_count();
         let caret_row = display.to_display(state.head()).row as isize;
-        let visible = (f32::from(self.viewport.height) / line_height)
-            .floor()
-            .max(1.) as isize;
+        let visible = (text_height / line_height).floor().max(1.) as isize;
         let last = (rows.saturating_sub(visible as usize)) as isize;
         let top = (self.scroll_top / line_height).round() as isize;
         let new_top = (top + delta).clamp(0, last.max(0));
@@ -3997,7 +4030,7 @@ impl EditorView {
         let line_height = self.style.line_height.max(1.);
         let display = state.display();
         let row = display.to_display(state.head()).row as f32;
-        let height = f32::from(self.viewport.height).max(line_height);
+        let height = self.text_height().max(line_height);
         let last = (display.row_count() as f32 * line_height - height).max(0.);
         let margin = (height - line_height) / 2.;
         self.scroll_top = (row * line_height - margin).clamp(0., last);
@@ -6390,10 +6423,21 @@ impl EditorView {
         if let Some(menu) = &lsp.actions
             && let Some((position, anchor)) = self.popup_position(
                 menu.at,
-                (menu.window().len() + 1) as f32 * self.style.line_height + 8.,
+                (menu.window().len() + 1 + usize::from(menu.title.is_some())) as f32
+                    * self.style.line_height
+                    + 8.,
             )
         {
             let mut rows: Vec<Div> = Vec::new();
+            if let Some(title) = menu.title {
+                rows.push(
+                    div()
+                        .debug_selector(|| "actions-title".to_owned())
+                        .px_2()
+                        .text_color(theme.text_muted)
+                        .child(title),
+                );
+            }
             let sections = menu.has_sections();
             for row in menu.window() {
                 let selected = row == menu.selected;
@@ -6558,7 +6602,11 @@ impl EditorView {
             );
         }
         if let Some(field) = &lsp.rename
-            && let Some(position) = self.below(field.at)
+            && let Some((position, anchor)) = self.popup_position(
+                field.at,
+                (if field.summary.is_some() { 3. } else { 2. }) * (self.style.line_height + 4.)
+                    + 12.,
+            )
         {
             let body = surface(&theme)
                 .debug_selector(|| "rename-popup".to_owned())
@@ -6585,6 +6633,7 @@ impl EditorView {
             popups.push(
                 deferred(
                     anchored()
+                        .anchor(anchor)
                         .position(position)
                         .snap_to_window_with_margin(px(SPACE_M))
                         .child(body),

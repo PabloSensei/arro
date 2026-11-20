@@ -165,7 +165,10 @@ pub enum Mode {
 struct ActionEntry {
     id: &'static str,
     title: String,
+    /// The main shortcut, spelled as the menus spell it.
     shortcut: Option<String>,
+    /// The icon the menu row of the command shows, or `""`.
+    icon: &'static str,
 }
 
 #[derive(Clone, PartialEq)]
@@ -268,6 +271,33 @@ fn kind_icon(kind: SymbolKind) -> &'static str {
     }
 }
 
+/// Commands in alphabetical order, without regard to case. The name as written and the id
+/// come last, so that the order is the same from one run to the next.
+fn action_order(left: &ActionEntry, right: &ActionEntry) -> std::cmp::Ordering {
+    left.title
+        .to_lowercase()
+        .cmp(&right.title.to_lowercase())
+        .then_with(|| left.title.cmp(&right.title))
+        .then_with(|| left.id.cmp(right.id))
+}
+
+/// The icon of each menu row that runs a command, by the command id, from the rows of the
+/// main menu and of their submenus.
+fn menu_icons(entries: &[MenuEntry]) -> HashMap<String, &'static str> {
+    let mut found = HashMap::new();
+    collect_menu_icons(entries, &mut found);
+    found
+}
+
+fn collect_menu_icons(entries: &[MenuEntry], found: &mut HashMap<String, &'static str>) {
+    for entry in entries {
+        if let (Some(id), Some(icon)) = (&entry.id, entry.icon) {
+            found.entry(id.to_string()).or_insert(icon);
+        }
+        collect_menu_icons(&entry.submenu, found);
+    }
+}
+
 pub struct Palette {
     project: ProjectIndex,
     files: Entity<Arc<Vec<PathBuf>>>,
@@ -317,13 +347,17 @@ impl Palette {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        // The icons come from the rows of the main menu, by command: the same rows the menus
+        // show, so that a command has the icon of its menu row here as well.
+        let menu_icons = menu_icons(&workspace.main_menu(cx));
         let actions = workspace
             .commands()
             .visible()
             .map(|command| ActionEntry {
                 id: command.id,
                 title: command.title.clone(),
-                shortcut: workspace.shortcut_of(command.id),
+                shortcut: workspace.shortcut_of_key(command.id),
+                icon: menu_icons.get(command.id).copied().unwrap_or(""),
             })
             .collect();
         let recent = navigation::recent(cx);
@@ -667,19 +701,30 @@ impl Palette {
     fn action_rows(&self, limit: usize) -> Vec<RowData> {
         let mut matcher = NameMatcher::new();
         let matcher: &mut dyn FuzzyMatcher = &mut matcher;
-        let found = rank(
+        // Every match is ranked before the cut, so that the order of the ties decides which
+        // commands stay in the list.
+        let mut found = rank(
             matcher,
             &self.query.text,
             self.actions.iter(),
             |action| &action.title,
-            limit,
+            self.actions.len(),
         );
+        // The commands with the same score come alphabetically, not by the length of their
+        // names. On an empty query every command has the same score.
+        found.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| action_order(left.item, right.item))
+        });
+        found.truncate(limit);
         found
             .into_iter()
             .map(|ranked| RowData {
                 title: ranked.item.title.clone(),
                 detail: String::new(),
-                icon: "",
+                icon: ranked.item.icon,
                 shortcut: ranked.item.shortcut.clone(),
                 indent: 0,
                 toggle: None,
@@ -870,7 +915,9 @@ impl Palette {
                         group("Actions", self.action_rows(limit), &mut rows);
                     }
                     if tab == Tab::Actions && !searching {
-                        rows = self.action_rows(MAX_ROWS);
+                        // Every command, so that the alphabetical end of the list is reachable
+                        // without a query; the settings follow them.
+                        rows = self.action_rows(self.actions.len());
                         rows.extend(self.setting_rows(MAX_ROWS, cx));
                     }
                 }
@@ -961,6 +1008,17 @@ impl Palette {
         self.rows
             .iter()
             .map(|row| (row.title.clone(), row.detail.clone()))
+            .collect()
+    }
+
+    /// The commands on screen with the key at their right edge and the icon at their left,
+    /// for scripts and tests. The settings below them are left out.
+    #[cfg(test)]
+    pub(crate) fn action_rows_text(&self) -> Vec<(String, Option<String>, &'static str)> {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row.item, Some(Item::Action(_))))
+            .map(|row| (row.title.clone(), row.shortcut.clone(), row.icon))
             .collect()
     }
 
@@ -1385,6 +1443,12 @@ impl Palette {
                     .when(!data.icon.is_empty(), |this| {
                         this.child(icon(data.icon, theme))
                     })
+                    // A command without an icon keeps the place of one, as a menu row does, so
+                    // that the names of the list stand in one column.
+                    .when(
+                        data.icon.is_empty() && matches!(data.item, Some(Item::Action(_))),
+                        |this| this.child(div().size(px(ICON)).flex_none()),
+                    )
                     .child(data.title)
                     .children(signature.map(|signature| {
                         div()

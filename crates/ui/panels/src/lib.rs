@@ -2133,4 +2133,35 @@ mod tool_menu;
 mod window_tests_tool_headers;
 
 #[cfg(test)]
+mod window_tests_database_sources_rows;
+#[cfg(test)]
 mod window_tests_field_mouse;
+#[cfg(test)]
+mod window_tests_find_action;
+#[cfg(test)]
+mod window_tests_form_columns;
+#[cfg(test)]
+mod window_tests_panel_icons_rows;
+
+// The stand-in program of these tests is a PowerShell script, so they run on Windows only.
+#[cfg(test)]
+mod window_tests_finder_scope;
+#[cfg(all(test, windows))]
+mod window_tests_terminal_wheel;
+
+#[cfg(test)]
+mod window_tests_project_structure_select;
+
+#[cfg(test)]
+mod window_tests_database_blank;
+
+#[cfg(test)]
+mod window_tests_caret_reveal;
+#[cfg(test)]
+mod window_tests_change_tree_gap;
+#[cfg(test)]
+mod window_tests_dialog_windows;
+#[cfg(test)]
+mod window_tests_find_window;
+#[cfg(test)]
+mod window_tests_new_project_form;

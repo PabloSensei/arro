@@ -10,7 +10,7 @@ use lang_api::{Counters, CoverageReport, LineState, TypeCoverage};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::Workspace;
+use workspace::{COVERAGE_TOOL, Workspace};
 
 use crate::navigation;
 use crate::run::RunPanel;
@@ -419,33 +419,32 @@ impl Render for CoveragePanel {
         workspace::note_view_render(cx, "coverage");
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
-        let hide_coverage = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-            workspace
-                .update(cx, |workspace, cx| workspace.hide_coverage(window, cx))
-                .ok();
+        let hide_coverage = {
+            let workspace = workspace.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                workspace
+                    .update(cx, |workspace, cx| workspace.hide_coverage(window, cx))
+                    .ok();
+            }
         };
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .text_size(px(UI_SIZE))
-            .font_weight(FontWeight::MEDIUM)
-            .child("Coverage")
-            .child(
-                icon_button(
-                    "coverage-hide",
-                    "general/hide",
-                    "Hide Coverage",
-                    None,
-                    &theme,
-                )
-                .debug_selector(|| "coverage-hide".to_owned())
-                .on_click(hide_coverage),
-            );
+        let options =
+            crate::tool_menu::options_menu_with_hide(workspace, COVERAGE_TOOL, |_| Vec::new(), {
+                let workspace = self.workspace.clone();
+                move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.hide_coverage(window, cx))
+                        .ok();
+                }
+            });
+        let header = panel_header(
+            "Coverage",
+            GROUP,
+            "coverage",
+            options,
+            hide_coverage,
+            &theme,
+        )
+        .debug_selector(|| "coverage-header".to_owned());
         let columns = div()
             .flex()
             .items_center()
@@ -483,13 +482,55 @@ impl Render for CoveragePanel {
                 }),
             );
         let empty = self.rows.is_empty();
-        let hint = empty.then(|| {
+        let body: AnyElement = if empty {
+            let run = cx.listener(|this, _, window, cx| {
+                let workspace = this.workspace.clone();
+                workspace
+                    .update(cx, |workspace, cx| workspace.run_with_coverage(window, cx))
+                    .ok();
+            });
             div()
-                .px(px(SPACE_L))
-                .py(px(SPACE_S))
+                .flex()
+                .flex_col()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap(px(SPACE_S))
                 .text_color(theme.text_secondary)
                 .child("No coverage data")
-        });
+                .child(
+                    div()
+                        .id("coverage-empty-run")
+                        .debug_selector(|| "coverage-empty-run".to_owned())
+                        .cursor_pointer()
+                        .text_color(theme.accent)
+                        .child("Run with Coverage…")
+                        .on_click(run),
+                )
+                .into_any_element()
+        } else {
+            scrollable(
+                "coverage-rows",
+                &self.scroll,
+                div().size_full().child(
+                    uniform_list(
+                        "coverage-rows",
+                        self.rows.len(),
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            this.rows_element(range, &theme, cx)
+                        }),
+                    )
+                    .track_scroll(&self.scroll)
+                    .size_full(),
+                ),
+                &theme,
+                window,
+                cx,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
         island(&theme)
             .id("coverage-panel")
             .key_context("CoveragePanel ToolWindow")
@@ -498,28 +539,6 @@ impl Render for CoveragePanel {
             .h_full()
             .child(header)
             .child(columns)
-            .children(hint)
-            .child(
-                scrollable(
-                    "coverage-rows",
-                    &self.scroll,
-                    div().size_full().child(
-                        uniform_list(
-                            "coverage-rows",
-                            self.rows.len(),
-                            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                this.rows_element(range, &theme, cx)
-                            }),
-                        )
-                        .track_scroll(&self.scroll)
-                        .size_full(),
-                    ),
-                    &theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_h_0(),
-            )
+            .child(body)
     }
 }

@@ -5078,7 +5078,37 @@ impl DebugPanel {
         } else if matches!(self.snapshot.state, DebugState::Terminated) {
             empty_pane("debug-empty", "Finished", theme)
         } else {
-            empty_pane("debug-empty", "Not started", theme)
+            let open = cx.listener(|this, _, window, cx| {
+                let workspace = this.workspace.clone();
+                window.defer(cx, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.choose_config(true, window, cx)
+                        })
+                        .ok();
+                });
+            });
+            div()
+                .debug_selector(|| "debug-empty".to_owned())
+                .flex()
+                .flex_col()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap(px(SPACE_S))
+                .text_size(px(TEXT_SMALL))
+                .text_color(theme.text_secondary)
+                .child("No debug sessions")
+                .child(
+                    div()
+                        .id("debug-empty-debug")
+                        .debug_selector(|| "debug-empty-debug".to_owned())
+                        .cursor_pointer()
+                        .text_color(theme.accent)
+                        .child("Debug…")
+                        .on_click(open),
+                )
+                .into_any_element()
         };
         div()
             .debug_selector(|| "debug-body".to_owned())

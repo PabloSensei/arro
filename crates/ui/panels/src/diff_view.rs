@@ -3126,7 +3126,7 @@ impl DiffView {
                         .items_center()
                         .justify_center()
                         .when(checked, |this| {
-                            this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                            this.child(ui_kit::icon_sized("general/check", 10., theme))
                         }),
                 ),
         )

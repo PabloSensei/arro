@@ -2,22 +2,28 @@
 //! reads open tabs from their buffers. Replace writes through the open tabs where a
 //! file is open and through one `WorkspaceTransaction` for the rest.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ::base::Cancel;
 use editor_view::{EditorView, Languages, Spot};
 use futures_util::StreamExt;
 use search::{FileHits, SearchError, TextQuery, find_in_files, find_in_selection, replace_edits};
+use serde::{Deserialize, Serialize};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::Workspace;
+use workspace::{FileIcons, USAGES_TOOL, Workspace};
 use workspace_core::{DocumentStore, EditSource, LoadedFile, SaveRequest, WorkspaceTransaction};
 
+use crate::git::ActiveGit;
+use crate::items::{Item, PanelRow};
 use crate::navigation;
 use crate::preview::{self, FilePreview, PreviewTarget};
+use crate::project_structure::ProjectEnvironmentGlobal;
+use crate::usages::{ActiveUsages, UsagesHub};
 
 const CONTEXT: &str = "FindInFiles";
 const WIDTH: f32 = 900.;
@@ -30,7 +36,7 @@ const MAX_LINES: usize = 1000;
 
 actions!(
     find_in_files,
-    [Previous, Next, Open, SwitchField, ReplaceAll]
+    [Previous, Next, Open, SwitchField, CtrlEnter]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -39,8 +45,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", Next, Some(CONTEXT)),
         KeyBinding::new("enter", Open, Some(CONTEXT)),
         KeyBinding::new("tab", SwitchField, Some(CONTEXT)),
-        KeyBinding::new("ctrl-enter", ReplaceAll, Some(CONTEXT)),
     ]);
+    // Replace All in Replace, Open in Find Window otherwise; the window branches on its mode.
+    let row = workspace::KeyRow {
+        keys: "ctrl-enter",
+        mac: Some("cmd-enter"),
+        action: "find_in_files::CtrlEnter",
+        context: Some(CONTEXT),
+        idea: None,
+    };
+    for key in row.keys_for(keymap::platform()) {
+        cx.bind_keys([KeyBinding::new(key, CtrlEnter, Some(CONTEXT))]);
+    }
 }
 
 /// The Find in Files window that is on screen, if any.
@@ -60,6 +76,56 @@ impl Global for SearchHistory {}
 
 /// The file of the state folder that keeps the queries.
 const HISTORY_FILE: &str = "find-in-files-history.txt";
+
+/// Where the next search looks, as the row under the query says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Scope {
+    /// Every file of the project.
+    #[default]
+    Project,
+    /// The files under one folder.
+    Directory,
+    /// The files of the open tabs, with their unsaved text.
+    OpenFiles,
+    /// The files under the source and resource folders of one module of the project.
+    Module,
+    /// The files that Local Changes of Git lists: the changed and the new ones.
+    ChangedFiles,
+}
+
+/// What Find in Files remembers between openings for one project: the scope, the folder
+/// of the Directory scope, the module of the Module scope, and the file mask. It lives in
+/// the state folder like the queries do.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct FinderState {
+    scope: Scope,
+    directory: Option<PathBuf>,
+    module: Option<String>,
+    mask: String,
+    mask_on: bool,
+}
+
+/// The dropdowns under the scope row: the modules of the project, or the scopes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowList {
+    Module,
+    Scope,
+}
+
+/// The key of the state of Find in Files of one project.
+fn state_key(root: &std::path::Path) -> String {
+    format!("finder:{}", root.display())
+}
+
+/// What the project remembered, or the defaults.
+fn load_state(store: Option<&store::Store>, root: &std::path::Path) -> FinderState {
+    store
+        .and_then(|store| store.get(&state_key(root)).ok().flatten())
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
 
 /// Reads the queries of Find in Files that the state folder keeps.
 pub(crate) fn install_history(state_dir: &std::path::Path, cx: &mut App) {
@@ -113,6 +179,16 @@ pub struct Finder {
     regex: bool,
     /// A replacement takes the case of the text it replaces.
     preserve_case: bool,
+    /// Where the search looks.
+    scope: Scope,
+    /// The folder of the Directory scope, when one is chosen.
+    directory: Option<PathBuf>,
+    /// The module of the Module scope, by its id in the model of the project.
+    module: Option<String>,
+    /// The dropdown under the scope row that is open, if any.
+    list: Option<RowList>,
+    /// Whether the file mask filters the search.
+    mask_on: bool,
     results: Vec<FileHits>,
     truncated: bool,
     message: Option<String>,
@@ -149,7 +225,8 @@ pub struct Finder {
     pinned: bool,
 }
 
-type Found = (Result<(), SearchError>, Vec<FileHits>);
+/// The answer of one search: its error, and every file with hits.
+pub(crate) type Found = (Result<(), SearchError>, Vec<FileHits>);
 
 impl Finder {
     pub fn show(
@@ -163,6 +240,7 @@ impl Finder {
         let weak = cx.weak_entity();
         let mask_hint = project_mask(files.read(cx).as_slice(), cx);
         let store = workspace.store();
+        let remembered = load_state(store.as_deref(), root.as_path());
         let saved = preview::load(store.as_deref(), root.as_path());
         let preview_height = saved
             .finder_height
@@ -188,6 +266,11 @@ impl Finder {
             whole_words: false,
             regex: false,
             preserve_case: false,
+            scope: remembered.scope,
+            directory: remembered.directory.clone(),
+            module: remembered.module.clone(),
+            list: None,
+            mask_on: remembered.mask_on,
             results: Vec::new(),
             truncated: false,
             message: None,
@@ -198,7 +281,7 @@ impl Finder {
             serial: 0,
             cancel: Cancel::new(),
             task: None,
-            mask: TextField::default(),
+            mask: TextField::from_text(remembered.mask),
             mask_popup: false,
             mask_hint,
             history: cx
@@ -277,53 +360,15 @@ impl Finder {
             cx.notify();
             return;
         }
-        let open: HashMap<PathBuf, String> = self
-            .open_views(cx)
-            .into_iter()
-            .filter_map(|(path, view)| Some((path, view.read(cx).text()?)))
-            .collect();
-        let files: Vec<PathBuf> = self
-            .files
-            .read(cx)
-            .iter()
-            .filter(|path| accepts_mask(&self.mask.text, path))
-            .cloned()
-            .collect();
-        let query = self.query();
+        let plan = self.request(cx).plan(cx);
         let cancel = self.cancel.clone();
         let serial = self.serial;
-        let selection_requested = self.in_selection;
-        let selection = selection_requested
-            .then(|| self.selection_text(cx))
-            .flatten();
         let (sender, mut receiver) = futures_channel::mpsc::unbounded::<FileHits>();
         let search = cx.background_executor().spawn(async move {
-            if selection_requested && selection.is_none() {
-                return (Ok(()), Vec::new());
-            }
-            if let Some((path, text, range)) = selection {
-                let found = match find_in_selection(&query, &path, &text, range) {
-                    Ok(hits) => vec![hits],
-                    Err(_) => Vec::new(),
-                };
-                for hits in &found {
-                    let _ = sender.unbounded_send(hits.clone());
-                }
-                return (Ok(()), found);
-            }
-            let found = Mutex::new(Vec::new());
             let on_file = |hits: FileHits| {
-                let _ = sender.unbounded_send(hits.clone());
-                found
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .push(hits)
+                let _ = sender.unbounded_send(hits);
             };
-            let result = find_in_files(&query, &files, &open, &cancel, &on_file);
-            let found = found
-                .into_inner()
-                .unwrap_or_else(|poison| poison.into_inner());
-            (result, found)
+            plan.run(&cancel, &on_file)
         });
         self.searching = true;
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -362,6 +407,157 @@ impl Finder {
             self.mask_hint = hint;
             cx.notify();
         }
+    }
+
+    /// The scope, the folder and the mask go to the state folder, so the next opening of
+    /// the window starts where this one did.
+    fn remember_settings(&self) {
+        let state = FinderState {
+            scope: self.scope,
+            directory: self.directory.clone(),
+            module: self.module.clone(),
+            mask: self.mask.text.clone(),
+            mask_on: self.mask_on,
+        };
+        let Ok(json) = serde_json::to_string(&state) else {
+            return;
+        };
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(error) = store.put(&state_key(self.root.as_path()), &json) {
+            eprintln!("the settings of Find in Files are not saved: {error}");
+        }
+    }
+
+    /// A scope of the row under the query, or of the Scope dropdown: the search starts
+    /// again there. Changed Files needs a Git repository, and stays unchosen without one.
+    fn choose_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        if scope == Scope::ChangedFiles && !changed_available(cx) {
+            return;
+        }
+        self.list = None;
+        if scope == Scope::Directory && self.directory.is_none() {
+            self.scope = scope;
+            self.mask_popup = false;
+            self.remember_settings();
+            cx.notify();
+            return;
+        }
+        self.scope = scope;
+        self.mask_popup = false;
+        self.remember_settings();
+        self.refresh(cx);
+    }
+
+    /// A module of the Module dropdown: the search keeps to its source and resource folders.
+    fn choose_module(&mut self, module: String, cx: &mut Context<Self>) {
+        self.module = Some(module);
+        self.scope = Scope::Module;
+        self.list = None;
+        self.mask_popup = false;
+        self.remember_settings();
+        self.refresh(cx);
+    }
+
+    /// A dropdown of the scope row opens, or closes when it is open already.
+    fn toggle_list(&mut self, list: RowList, cx: &mut Context<Self>) {
+        self.list = if self.list == Some(list) {
+            None
+        } else {
+            Some(list)
+        };
+        self.mask_popup = false;
+        cx.notify();
+    }
+
+    /// The request of the search the window asks for now, as the Find window keeps it.
+    fn request(&self, cx: &App) -> FindRequest {
+        FindRequest {
+            query: self.query(),
+            scope: self.scope,
+            directory: self.directory.clone(),
+            module: self.module.clone(),
+            mask: if self.mask_on {
+                self.mask.text.clone()
+            } else {
+                String::new()
+            },
+            in_selection: self.in_selection,
+            selection: self.in_selection.then(|| self.selection_text(cx)).flatten(),
+            files: self.files.clone(),
+            workspace: self.workspace.clone(),
+        }
+    }
+
+    /// The module the Module scope names in the window: the one the user picked, or the
+    /// first module of the model when the picked one is not in the model.
+    fn module_in_force(&self, cx: &App) -> Option<String> {
+        let model = environment_model(cx)?;
+        chosen_module(self.module.as_deref(), &model)
+    }
+
+    /// The Escape key closes an open dropdown first.
+    fn key_closes_list(&mut self, key: &str) -> bool {
+        if self.list.is_some() && key == "escape" {
+            self.list = None;
+            return true;
+        }
+        false
+    }
+
+    /// Ctrl+Enter outside Replace, and the button under the list: the places of the search
+    /// move to the Find window as a tab with the query, and this window closes.
+    fn open_in_find_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replace_mode || self.find.text.trim().is_empty() {
+            return;
+        }
+        self.remember_query();
+        self.remember_global(cx);
+        let request = self.request(cx);
+        // A search that has not answered yet is run again by the Find window itself.
+        let found = (!self.searching).then(|| (Ok(()), self.results.clone()));
+        let hub = cx.try_global::<ActiveUsages>().map(|hub| hub.0.clone());
+        self.dismiss(window, cx);
+        if let Some(hub) = hub {
+            hub.update(cx, |hub, cx| hub.add_find_tab(request, found, cx));
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(USAGES_TOOL, window, cx);
+            })
+            .ok();
+    }
+
+    /// The folder button of the Directory scope: the search keeps to the folder the user
+    /// picks.
+    fn choose_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let chosen = paths.await.ok().and_then(Result::ok).flatten();
+            if let Some(folder) = chosen.and_then(|paths| paths.into_iter().next()) {
+                this.update(cx, |this, cx| {
+                    this.directory = Some(folder);
+                    this.scope = Scope::Directory;
+                    this.remember_settings();
+                    this.refresh(cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The File mask checkbox: the mask filters the search only while it is on.
+    fn toggle_mask(&mut self, cx: &mut Context<Self>) {
+        self.mask_on = !self.mask_on;
+        self.remember_settings();
+        self.refresh(cx);
     }
 
     fn arrived(&mut self, serial: usize, (result, mut found): Found, cx: &mut Context<Self>) {
@@ -436,15 +632,26 @@ impl Finder {
 
     fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = &event.keystroke;
+        if self.key_closes_list(&key.key) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.mask_popup {
             match key.key.as_str() {
-                "escape" => self.mask_popup = false,
+                "escape" => {
+                    self.mask_popup = false;
+                    self.remember_settings();
+                }
                 "enter" => {
                     self.mask_popup = false;
+                    self.remember_settings();
                     self.refresh(cx);
                 }
                 _ => {
                     if self.mask.key_with_clipboard(event, false, cx) {
+                        self.mask_on = !self.mask.text.is_empty();
+                        self.remember_settings();
                         self.refresh(cx);
                     } else {
                         return;
@@ -736,6 +943,7 @@ impl Finder {
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_settings();
         cx.set_global(ActiveFinder(None));
         self.workspace
             .update(cx, |workspace, cx| workspace.dismiss(window, cx))
@@ -824,6 +1032,374 @@ impl Finder {
         &self.files
     }
 
+    /// The project the window searches, for a test that opens the window again.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> &Arc<PathBuf> {
+        &self.root
+    }
+
+    /// The scope in force, for tests.
+    #[cfg(test)]
+    pub(crate) fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// Whether the mask filters the search, for tests.
+    #[cfg(test)]
+    pub(crate) fn mask_on(&self) -> bool {
+        self.mask_on
+    }
+
+    /// Sets the scope and the folder of the Directory scope from a test.
+    #[cfg(test)]
+    pub(crate) fn set_scope(
+        &mut self,
+        scope: Scope,
+        directory: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.scope = scope;
+        self.directory = directory;
+        self.remember_settings();
+        self.refresh(cx);
+    }
+
+    /// Chooses a module of the Module dropdown from a test, and searches.
+    #[cfg(test)]
+    pub(crate) fn set_module(&mut self, module: &str, cx: &mut Context<Self>) {
+        self.choose_module(module.to_owned(), cx);
+    }
+
+    /// Whether a scope can be chosen now: Changed Files needs a Git repository.
+    #[cfg(test)]
+    pub(crate) fn scope_available(&self, scope: Scope, cx: &App) -> bool {
+        scope != Scope::ChangedFiles || changed_available(cx)
+    }
+
+    /// The names of the modules the Module dropdown lists, for tests.
+    #[cfg(test)]
+    pub(crate) fn module_names(&self, cx: &App) -> Vec<String> {
+        modules_of(cx).into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// Sets the file mask and its checkbox from a test.
+    #[cfg(test)]
+    pub(crate) fn set_mask(&mut self, mask: &str, on: bool, cx: &mut Context<Self>) {
+        self.mask = TextField::from_text(mask.to_owned());
+        self.mask_on = on;
+        self.remember_settings();
+        self.refresh(cx);
+    }
+
+    /// One choice of the scope row under the query.
+    fn scope_chip(
+        &self,
+        scope: Scope,
+        label: &'static str,
+        id: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let chosen = self.scope == scope;
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .items_center()
+            .h(px(26.))
+            .px(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(if chosen {
+                theme.tab_selected_border
+            } else {
+                theme.control_border
+            })
+            .when(chosen, |this| this.bg(theme.tab_selected))
+            .text_color(if chosen {
+                theme.text
+            } else {
+                theme.text_secondary
+            })
+            .cursor_pointer()
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| this.choose_scope(scope, cx)))
+    }
+
+    /// The row under the query: the scope of the search and the file mask, as IDEA shows
+    /// them.
+    fn scope_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div()
+            .id("finder-scope-row")
+            .debug_selector(|| "finder-scope-row".to_owned())
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .flex_none()
+            .gap(px(SPACE_S))
+            .mb(px(POPUP_PADDING))
+            .child(div().text_color(theme.text_secondary).child("In:"))
+            .child(self.scope_chip(Scope::Project, "Project", "finder-scope-project", theme, cx))
+            .child(self.module_field(theme, cx))
+            .child(self.scope_chip(
+                Scope::Directory,
+                "Directory",
+                "finder-scope-directory",
+                theme,
+                cx,
+            ))
+            .child(self.scope_field(theme, cx));
+        if self.scope == Scope::Directory {
+            let label = match self.directory.as_deref() {
+                Some(directory) => directory
+                    .strip_prefix(self.root.as_path())
+                    .unwrap_or(directory)
+                    .display()
+                    .to_string(),
+                None => "No folder chosen".to_owned(),
+            };
+            let chosen = self.directory.is_some();
+            row = row.child(
+                div()
+                    .id("finder-directory")
+                    .debug_selector(|| "finder-directory".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_M))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.control_border)
+                    .child(
+                        div()
+                            .max_w(px(220.))
+                            .overflow_hidden()
+                            .truncate()
+                            .text_color(if chosen { theme.text } else { theme.text_muted })
+                            .child(label),
+                    )
+                    .child(
+                        icon_button(
+                            "finder-choose-directory",
+                            "general/folder",
+                            "Choose Directory",
+                            None,
+                            theme,
+                        )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.choose_directory(window, cx)),
+                        ),
+                    ),
+            );
+        }
+        let mask_empty = self.mask.text.is_empty();
+        let mask_field = div()
+            .id("finder-mask")
+            .debug_selector(|| "finder-mask".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .w(px(220.))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(if self.mask_popup {
+                theme.accent
+            } else {
+                theme.control_border
+            })
+            .overflow_hidden()
+            .cursor_text()
+            .when(mask_empty && !self.mask_popup, |this| {
+                this.text_color(theme.text_muted)
+                    .child(self.mask_hint.clone())
+            })
+            .children(text_field_children(
+                FieldMouse::with_edit(
+                    cx,
+                    |this| Some(&mut this.mask),
+                    |this, cx| {
+                        this.mask_on = !this.mask.text.is_empty();
+                        this.remember_settings();
+                        this.refresh(cx);
+                    },
+                ),
+                &self.mask,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                16.,
+                self.mask_popup,
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.mask_popup = true;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }),
+            );
+        row.child(div().flex_1())
+            .child(
+                div()
+                    .id("finder-mask-check")
+                    .debug_selector(|| "finder-mask-check".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_XS))
+                    .cursor_pointer()
+                    .child(checkbox(self.mask_on, theme))
+                    .child("File mask")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mask(cx))),
+            )
+            .child(mask_field)
+            .into_any_element()
+    }
+
+    /// The Module dropdown of the scope row: the module the search keeps to, and the modules
+    /// of the project under it.
+    fn module_field(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let open = self.list == Some(RowList::Module);
+        let label = match (self.scope, self.module_in_force(cx)) {
+            (Scope::Module, Some(id)) => modules_of(cx)
+                .into_iter()
+                .find(|(module, _)| *module == id)
+                .map_or_else(|| "Module".to_owned(), |(_, name)| name),
+            _ => "Module".to_owned(),
+        };
+        select_field("finder-module-field", label, open, theme)
+            .debug_selector(|| "finder-module".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_list(RowList::Module, cx)))
+    }
+
+    /// The Scope dropdown of the scope row: Project Files, Open Files or Changed Files.
+    fn scope_field(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let open = self.list == Some(RowList::Scope);
+        let label = match self.scope {
+            Scope::Project => "Project Files",
+            Scope::OpenFiles => "Open Files",
+            Scope::ChangedFiles => "Changed Files",
+            Scope::Directory | Scope::Module => "Scope",
+        };
+        select_field("finder-scope-field", label, open, theme)
+            .debug_selector(|| "finder-scope".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_list(RowList::Scope, cx)))
+    }
+
+    /// The list of the open dropdown, drawn under the scope row. Changed Files is grey with
+    /// a hint in a project that is not in a Git repository.
+    fn scope_list(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let list = self.list?;
+        let menu = select_menu(theme).debug_selector(|| "finder-list".to_owned());
+        let menu = match list {
+            RowList::Module => {
+                let modules = modules_of(cx);
+                if modules.is_empty() {
+                    menu.child(
+                        div()
+                            .text_color(theme.text_muted)
+                            .child("The project has no modules"),
+                    )
+                } else {
+                    let chosen = self.module_in_force(cx);
+                    modules
+                        .into_iter()
+                        .enumerate()
+                        .fold(menu, |menu, (index, (id, name))| {
+                            let picked = self.scope == Scope::Module
+                                && chosen.as_deref() == Some(id.as_str());
+                            let selector = format!("finder-module-item-{index}");
+                            menu.child(
+                                select_option(
+                                    ("finder-module-option", index),
+                                    name,
+                                    picked,
+                                    false,
+                                    theme,
+                                )
+                                .debug_selector(move || selector.clone())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.choose_module(id.clone(), cx),
+                                )),
+                            )
+                        })
+                }
+            }
+            RowList::Scope => {
+                let available = changed_available(cx);
+                let scopes = [
+                    (Scope::Project, "Project Files", "finder-scope-item-project"),
+                    (
+                        Scope::OpenFiles,
+                        "Open Files",
+                        "finder-scope-item-open-files",
+                    ),
+                    (
+                        Scope::ChangedFiles,
+                        "Changed Files",
+                        "finder-scope-item-changed-files",
+                    ),
+                ];
+                scopes
+                    .into_iter()
+                    .fold(menu, |menu, (scope, label, selector)| {
+                        let option =
+                            select_option(selector, label, self.scope == scope, false, theme)
+                                .debug_selector(move || selector.to_owned());
+                        let option = if scope == Scope::ChangedFiles && !available {
+                            option.text_color(theme.text_muted).child(
+                                div()
+                                    .ml_auto()
+                                    .text_size(px(TEXT_SMALL))
+                                    .child("Not a Git repository"),
+                            )
+                        } else {
+                            option.on_click(
+                                cx.listener(move |this, _, _, cx| this.choose_scope(scope, cx)),
+                            )
+                        };
+                        menu.child(option)
+                    })
+            }
+        };
+        Some(menu.into_any_element())
+    }
+
+    /// The button under the window that moves the places to the Find window. Replace has
+    /// no such button: its Ctrl+Enter replaces everything.
+    fn find_window_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let shortcut = keymap::shortcut_label("ctrl-enter", keymap::platform());
+        let hover = theme.hover;
+        div()
+            .flex()
+            .justify_end()
+            .flex_none()
+            .mt(px(SPACE_S))
+            .child(
+                div()
+                    .id("finder-open-in-find-window")
+                    .debug_selector(|| "finder-open-in-find-window".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_M))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.control_border)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child("Open in Find Window")
+                    .child(div().text_color(theme.text_muted).child(shortcut))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_in_find_window(window, cx)),
+                    ),
+            )
+    }
+
     fn input(
         &self,
         field: Field,
@@ -853,6 +1429,16 @@ impl Finder {
                 theme.control_border
             })
             .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.field = field;
+                    if matches!(field, Field::Find) {
+                        this.mask_popup = false;
+                    }
+                    cx.notify();
+                }),
+            )
             .when(value.text.is_empty() && !active, |this| {
                 this.text_color(theme.text_secondary)
                     .child(label.to_owned())
@@ -875,6 +1461,7 @@ impl Finder {
                                 },
                                 move |this: &mut Self, cx| {
                                     if matches!(field, Field::Find) {
+                                        this.mask_popup = false;
                                         this.refresh(cx);
                                     }
                                 },
@@ -1138,47 +1725,6 @@ impl Render for Finder {
                 .child(pin),
         );
         let find_label = "Search for";
-        let mask_row = div()
-            .id("find-mask")
-            .debug_selector(|| "find-mask".to_owned())
-            .flex()
-            .items_center()
-            .flex_none()
-            .gap(px(SPACE_S))
-            .mb(px(POPUP_PADDING))
-            .h(px(CONTROL_HEIGHT))
-            .px(px(SPACE_M))
-            .rounded(px(CONTROL_RADIUS))
-            .border_2()
-            .border_color(theme.accent)
-            .child(div().text_color(theme.text_secondary).child("File mask:"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_1()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .children(text_field_children(
-                        FieldMouse::with_edit(
-                            cx,
-                            |this| Some(&mut this.mask),
-                            |this, cx| this.refresh(cx),
-                        ),
-                        &self.mask,
-                        theme.text,
-                        theme.text,
-                        theme.selection,
-                        theme.caret,
-                        16.,
-                        true,
-                    )),
-            )
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child(self.mask_hint.clone()),
-            );
         let history_rows: Vec<_> = self
             .history
             .iter()
@@ -1226,6 +1772,46 @@ impl Render for Finder {
             .mb(px(POPUP_PADDING))
         });
 
+        let empty_hint = self.find.text.is_empty().then(|| {
+            let hint = div()
+                .debug_selector(|| "finder-empty".to_owned())
+                .flex()
+                .flex_1()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(SPACE_XS))
+                .text_size(px(TEXT_SMALL))
+                .text_color(theme.text_muted)
+                .child("Type to search in the project");
+            #[cfg(test)]
+            let hint = hint.child(bounds_probe(
+                "finder-empty-hint",
+                Some("Type to search in the project".into()),
+            ));
+            hint.child("Enter opens the selected match")
+        });
+        let list: AnyElement = match empty_hint {
+            Some(hint) => hint.into_any_element(),
+            None => scrollable(
+                "find-list",
+                &self.scroll,
+                div()
+                    .id("find-list")
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .children(items),
+                &theme,
+                window,
+                cx,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element(),
+        };
+
         let body = surface(&theme)
             .id("finder")
             .debug_selector(|| "finder".to_owned())
@@ -1237,7 +1823,13 @@ impl Render for Finder {
             .on_action(cx.listener(|this, _: &Previous, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &Next, _, cx| this.move_selection(1, cx)))
             .on_action(cx.listener(|this, _: &SwitchField, _, cx| this.switch_field(cx)))
-            .on_action(cx.listener(|this, _: &ReplaceAll, _, cx| this.replace_all(cx)))
+            .on_action(cx.listener(|this, _: &CtrlEnter, window, cx| {
+                if this.replace_mode {
+                    this.replace_all(cx);
+                } else {
+                    this.open_in_find_window(window, cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &Open, window, cx| this.open(this.selected, window, cx)),
             )
@@ -1277,7 +1869,8 @@ impl Render for Finder {
                         |this| this.regex = !this.regex,
                     )),
             )
-            .when(self.mask_popup, |this| this.child(mask_row))
+            .child(self.scope_row(&theme, cx))
+            .children(self.scope_list(&theme, cx))
             .children(history)
             .when(self.replace_mode, |this| {
                 this.child(
@@ -1339,24 +1932,7 @@ impl Render for Finder {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        scrollable(
-                            "find-list",
-                            &self.scroll,
-                            div()
-                                .id("find-list")
-                                .flex()
-                                .flex_col()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.scroll)
-                                .children(items),
-                            &theme,
-                            window,
-                            cx,
-                        )
-                        .flex_1()
-                        .min_h_0(),
-                    )
+                    .child(list)
                     .child(
                         div()
                             .id("finder-splitter")
@@ -1405,7 +1981,10 @@ impl Render for Finder {
                             .overflow_hidden()
                             .child(self.preview.clone()),
                     ),
-            );
+            )
+            .when(!self.replace_mode, |this| {
+                this.child(self.find_window_button(&theme, cx))
+            });
 
         popup_window(
             PopupSpec {
@@ -1420,6 +1999,273 @@ impl Render for Finder {
             cx,
         )
     }
+}
+
+/// What one search of Find in Files looks at. The window builds it from its scope; the Find
+/// window keeps it, so that its rerun repeats the search on the files and the open tabs as
+/// they are at that time.
+#[derive(Clone)]
+pub(crate) struct FindRequest {
+    query: TextQuery,
+    scope: Scope,
+    directory: Option<PathBuf>,
+    module: Option<String>,
+    /// The file mask in force; empty when the mask is off.
+    mask: String,
+    in_selection: bool,
+    /// The text of the selection of the active editor, and the file it is in.
+    selection: Option<(PathBuf, String, Range<usize>)>,
+    files: Entity<Arc<Vec<PathBuf>>>,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl FindRequest {
+    /// The query without the spaces around it: the name of a tab of the Find window.
+    pub(crate) fn pattern(&self) -> String {
+        self.query.pattern.trim().to_owned()
+    }
+
+    /// The files the search reads now, the texts of the open tabs that replace the disk,
+    /// and the selection when the search keeps to it.
+    fn plan(&self, cx: &App) -> SearchPlan {
+        let open = open_texts(&self.workspace, cx);
+        let candidates: Vec<PathBuf> = if self.in_selection {
+            Vec::new()
+        } else {
+            match self.scope {
+                Scope::Project => self.files.read(cx).as_slice().to_vec(),
+                Scope::Directory => {
+                    let directory = self.directory.as_deref();
+                    self.files
+                        .read(cx)
+                        .iter()
+                        .filter(|path| {
+                            directory.is_some_and(|directory| path.starts_with(directory))
+                        })
+                        .cloned()
+                        .collect()
+                }
+                Scope::OpenFiles => open.keys().cloned().collect(),
+                Scope::Module => {
+                    let roots = environment_model(cx)
+                        .and_then(|model| {
+                            let id = chosen_module(self.module.as_deref(), &model)?;
+                            model.module(&id).map(module_roots)
+                        })
+                        .unwrap_or_default();
+                    self.files
+                        .read(cx)
+                        .iter()
+                        .filter(|path| roots.iter().any(|root| path.starts_with(root)))
+                        .cloned()
+                        .collect()
+                }
+                Scope::ChangedFiles => {
+                    let changed: HashSet<PathBuf> =
+                        changed_paths(cx).unwrap_or_default().into_iter().collect();
+                    self.files
+                        .read(cx)
+                        .iter()
+                        .filter(|path| changed.contains(*path))
+                        .cloned()
+                        .collect()
+                }
+            }
+        };
+        let files = candidates
+            .into_iter()
+            .filter(|path| accepts_mask(&self.mask, path))
+            .collect();
+        SearchPlan {
+            query: self.query.clone(),
+            files,
+            open,
+            in_selection: self.in_selection,
+            selection: self.selection.clone(),
+        }
+    }
+}
+
+/// The files one search reads, the texts of the open tabs that replace the disk, and the
+/// selection when the search keeps to it.
+struct SearchPlan {
+    query: TextQuery,
+    files: Vec<PathBuf>,
+    open: HashMap<PathBuf, String>,
+    in_selection: bool,
+    selection: Option<(PathBuf, String, Range<usize>)>,
+}
+
+impl SearchPlan {
+    /// The search on the calling thread. Every file with hits goes to `on_file` as it is
+    /// found, and the files with hits come back with the answer.
+    fn run(&self, cancel: &Cancel, on_file: &(dyn Fn(FileHits) + Sync)) -> Found {
+        if self.in_selection && self.selection.is_none() {
+            return (Ok(()), Vec::new());
+        }
+        if let Some((path, text, range)) = &self.selection {
+            let found = match find_in_selection(&self.query, path, text, range.clone()) {
+                Ok(hits) => vec![hits],
+                Err(_) => Vec::new(),
+            };
+            for hits in &found {
+                on_file(hits.clone());
+            }
+            return (Ok(()), found);
+        }
+        let found = Mutex::new(Vec::new());
+        let collect = |hits: FileHits| {
+            on_file(hits.clone());
+            found
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(hits);
+        };
+        let result = find_in_files(&self.query, &self.files, &self.open, cancel, &collect);
+        let found = found
+            .into_inner()
+            .unwrap_or_else(|poison| poison.into_inner());
+        (result, found)
+    }
+}
+
+/// Repeats a search for a tab of the Find window. The search runs on the background
+/// executor, and its places replace the tab's when they come.
+pub(crate) fn repeat_search(
+    hub: WeakEntity<UsagesHub>,
+    serial: u64,
+    request: &FindRequest,
+    cx: &mut App,
+) {
+    let plan = request.plan(cx);
+    let search = cx
+        .background_executor()
+        .spawn(async move { plan.run(&Cancel::new(), &|_: FileHits| {}) });
+    cx.spawn(async move |cx| {
+        let outcome = search.await;
+        hub.update(cx, |hub, cx| hub.replace_find(serial, outcome, cx))
+            .ok();
+    })
+    .detach();
+}
+
+/// The places of a search as the Find window lists them: every file with its count of
+/// matching lines, and under it the lines that match, with their places.
+pub(crate) fn find_tree(
+    results: &[FileHits],
+    root: &Path,
+    icons: &FileIcons,
+) -> (Vec<Item>, Vec<PanelRow>) {
+    let mut items = Vec::new();
+    let mut rows = Vec::new();
+    for hits in results {
+        let relative = hits.path.strip_prefix(root).unwrap_or(&hits.path);
+        rows.push(PanelRow::Group {
+            label: format!("{}  ({})", relative.display(), hits.lines.len()),
+            depth: 0,
+            icon: icons.icon_for(&hits.path),
+        });
+        for hit in &hits.lines {
+            let column = hit
+                .matches
+                .first()
+                .map_or(0, |found| hit.text[..found.start].chars().count());
+            rows.push(PanelRow::Item {
+                index: items.len(),
+                depth: 1,
+                excluded: false,
+            });
+            items.push(Item {
+                path: hits.path.clone(),
+                line: (hit.line as usize).saturating_sub(1),
+                column,
+                label: hit.text.trim().to_owned(),
+                hint: format!("{}:{}", hit.line, column + 1),
+                icon: "general/search",
+            });
+        }
+    }
+    (items, rows)
+}
+
+/// The text of every open tab that has an editor, by path: the unsaved text when the
+/// editor has it.
+fn open_texts(workspace: &WeakEntity<Workspace>, cx: &App) -> HashMap<PathBuf, String> {
+    let Some(workspace) = workspace.upgrade() else {
+        return HashMap::new();
+    };
+    let workspace = workspace.read(cx);
+    workspace
+        .open_tabs()
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            let view = workspace.view_of(&path)?.downcast::<EditorView>().ok()?;
+            let text = view.read(cx).text()?;
+            Some((path, text))
+        })
+        .collect()
+}
+
+/// The model of the project as Project Structure reads it, once the import has made it.
+fn environment_model(cx: &App) -> Option<Arc<project_model::ProjectModel>> {
+    cx.try_global::<ProjectEnvironmentGlobal>()?
+        .0
+        .as_ref()?
+        .model()
+}
+
+/// The module the Module scope searches: the chosen one when the model has it, else the
+/// first module of the model.
+fn chosen_module(chosen: Option<&str>, model: &project_model::ProjectModel) -> Option<String> {
+    chosen
+        .filter(|id| model.module(id).is_some())
+        .or_else(|| model.modules.first().map(|module| module.id.as_str()))
+        .map(str::to_owned)
+}
+
+/// The modules of the project model, by id and name, in the order of the model.
+fn modules_of(cx: &App) -> Vec<(String, String)> {
+    environment_model(cx)
+        .map(|model| {
+            model
+                .modules
+                .iter()
+                .map(|module| (module.id.clone(), module.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The folders a module searches: the source and the resource folders of all its units.
+fn module_roots(module: &project_model::Module) -> Vec<PathBuf> {
+    module
+        .units
+        .iter()
+        .flat_map(|unit| unit.source_roots.iter().chain(&unit.resource_roots))
+        .cloned()
+        .collect()
+}
+
+/// The changed and the new files of the repository of the project that are on disk, as
+/// Local Changes lists them. `None` when the project is not in a Git repository.
+fn changed_paths(cx: &App) -> Option<Vec<PathBuf>> {
+    let git = cx.try_global::<ActiveGit>()?.0.read(cx);
+    let root = git.repo()?.root().to_path_buf();
+    Some(
+        git.status()
+            .files
+            .iter()
+            .map(|file| root.join(&file.path))
+            .filter(|path| path.is_file())
+            .collect(),
+    )
+}
+
+/// Whether the project is in a Git repository, so that Changed Files has a list.
+fn changed_available(cx: &App) -> bool {
+    cx.try_global::<ActiveGit>()
+        .is_some_and(|git| git.0.read(cx).repo().is_some())
 }
 
 /// What the mask field of Find in Files offers for a project: the mask of the language
@@ -1467,7 +2313,8 @@ pub(crate) fn project_mask(files: &[std::path::PathBuf], cx: &App) -> String {
 }
 
 /// Whether a file passes the mask: positive patterns keep a file, `!` patterns drop it.
-/// The name is the file name; a pattern with a slash matches the whole path.
+/// The name is the file name; a pattern with a slash matches the whole path. The patterns
+/// come as IDEA writes them, separated by commas or spaces.
 pub(crate) fn accepts_mask(mask: &str, path: &std::path::Path) -> bool {
     let name = path
         .file_name()
@@ -1476,7 +2323,7 @@ pub(crate) fn accepts_mask(mask: &str, path: &std::path::Path) -> bool {
     let full = path.to_string_lossy().replace('\\', "/");
     let mut positive = false;
     let mut kept = false;
-    for pattern in mask.split_whitespace() {
+    for pattern in mask.split(|character: char| character.is_whitespace() || character == ',') {
         let (pattern, include) = match pattern.strip_prefix('!') {
             Some(pattern) => (pattern, false),
             None => (pattern, true),
@@ -1553,6 +2400,16 @@ mod tests {
         assert!(wildcard("Own?r.*", "Owner.txt"));
         assert!(wildcard("*Test.txt", "OwnerTest.txt"));
         assert!(!wildcard("*Test.txt", "Owner.txt"));
+    }
+
+    #[test]
+    fn a_mask_list_takes_commas_and_spaces() {
+        let text = std::path::Path::new("Owner.txt");
+        let other = std::path::Path::new("Owner.rst");
+        assert!(accepts_mask("*.txt,*.md", text));
+        assert!(!accepts_mask("*.txt,*.md", other));
+        assert!(accepts_mask("*.txt, *.md", text));
+        assert!(!accepts_mask("*.txt,!Owner.txt", text));
     }
 
     #[test]

@@ -21,8 +21,6 @@ const WIDTH: f32 = 980.;
 /// The share of the window height the dialog takes, as the Settings window does.
 const HEIGHT_SHARE: f32 = 0.8;
 const LIST_WIDTH: f32 = 260.;
-const LABEL_WIDTH: f32 = 150.;
-const FIELD_HEIGHT: f32 = 26.;
 const CHECKBOX: f32 = 14.;
 
 /// One configuration of the dialog and what the last read of it was.
@@ -969,6 +967,11 @@ impl RunConfigDialog {
 impl Render for RunConfigDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        // The label column fits the widest label of the form: the fixed ones and the labels of
+        // the fields of the configuration type.
+        let mut labels = vec!["Name", "Configurations", "Environment file"];
+        labels.extend(self.rows.iter().map(|row| row.field.label));
+        let label_width = form_label_width(window, &labels);
         let viewport = window.viewport_size();
         let width = px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING));
         let height =
@@ -1261,7 +1264,7 @@ impl Render for RunConfigDialog {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_S))
-                    .h(px(FIELD_HEIGHT))
+                    .h(px(CONTROL_HEIGHT))
                     .px(px(SPACE_XS))
                     .rounded(px(CONTROL_RADIUS))
                     .when(selected, |this| this.bg(theme.selection))
@@ -1459,7 +1462,7 @@ impl Render for RunConfigDialog {
                         .flex()
                         .items_center()
                         .gap(px(SPACE_S))
-                        .h(px(FIELD_HEIGHT))
+                        .h(px(CONTROL_HEIGHT))
                         .child(div().flex_1().min_w_0().truncate().child(name.clone()))
                         .child(remove)
                 });
@@ -1494,13 +1497,7 @@ impl Render for RunConfigDialog {
                             .flex()
                             .items_center()
                             .gap(px(SPACE_S))
-                            .child(
-                                div()
-                                    .w(px(LABEL_WIDTH))
-                                    .flex_none()
-                                    .text_color(theme.text_muted)
-                                    .child("Configurations"),
-                            )
+                            .child(form_label(label_width, "Configurations", &theme))
                             .children(add),
                     )
                     .children(rows)
@@ -1523,7 +1520,7 @@ impl Render for RunConfigDialog {
                             })
                             .flex()
                             .items_center()
-                            .h(px(FIELD_HEIGHT))
+                            .h(px(CONTROL_HEIGHT))
                             .child(
                                 div()
                                     .flex_none()
@@ -1645,12 +1642,10 @@ impl Render for RunConfigDialog {
                         }
                     }
                 };
-                let hint = row.field.hint.map(|hint| {
-                    div()
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.text_muted)
-                        .child(hint)
-                });
+                let hint = row
+                    .field
+                    .hint
+                    .map(|hint| form_hint(label_width, hint, &theme));
                 div()
                     .flex()
                     .flex_col()
@@ -1660,13 +1655,7 @@ impl Render for RunConfigDialog {
                             .flex()
                             .items_center()
                             .gap(px(SPACE_M))
-                            .child(
-                                div()
-                                    .w(px(LABEL_WIDTH))
-                                    .flex_none()
-                                    .text_color(theme.text_muted)
-                                    .child(row.field.label),
-                            )
+                            .child(form_label(label_width, row.field.label, &theme))
                             .child(control),
                     )
                     .children(hint)
@@ -1863,13 +1852,7 @@ impl Render for RunConfigDialog {
                                         .flex()
                                         .items_center()
                                         .gap(px(SPACE_M))
-                                        .child(
-                                            div()
-                                                .w(px(LABEL_WIDTH))
-                                                .flex_none()
-                                                .text_color(theme.text_muted)
-                                                .child("Name"),
-                                        )
+                                        .child(form_label(label_width, "Name", &theme))
                                         .child(name)
                                         .child(store),
                                 )
@@ -1883,13 +1866,7 @@ impl Render for RunConfigDialog {
                                         .flex()
                                         .items_center()
                                         .gap(px(SPACE_M))
-                                        .child(
-                                            div()
-                                                .w(px(LABEL_WIDTH))
-                                                .flex_none()
-                                                .text_color(theme.text_muted)
-                                                .child("Environment file"),
-                                        )
+                                        .child(form_label(label_width, "Environment file", &theme))
                                         .child(environment),
                                 )
                                 .child(multiple)
@@ -1976,7 +1953,7 @@ fn field_box(
         .debug_selector(move || selector)
         .flex()
         .items_center()
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .min_w(px(0.))
         .flex_1()
         .px(px(SPACE_M))
@@ -2021,7 +1998,7 @@ fn small_button(
         .flex()
         .items_center()
         .justify_center()
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_M))
         .rounded(px(CONTROL_RADIUS))
         .border_1()

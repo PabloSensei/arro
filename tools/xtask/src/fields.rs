@@ -152,8 +152,10 @@ const CRATES: &[&str] = &["crates/ui/panels/src", "crates/ui/editor-view/src"];
 const RENDERERS: &[&str] = &[
     "text_field_children",
     "text_field_children_named",
+    "text_field_children_hinted",
     "text_field_lines",
     "text_field_lines_named",
+    "text_field_lines_hinted",
 ];
 
 pub fn run(root: &Path) -> Result {

@@ -90,11 +90,12 @@ pub(crate) fn bind_commands(workspace: &mut Workspace, _cx: &mut Context<Workspa
     workspace.register_command(
         "settings.import_idea",
         "Import Settings from IntelliJ IDEA...",
-        import,
+        open,
     );
 }
 
-fn import(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+/// Opens the dialog over the window, as the File menu does.
+pub(crate) fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let weak = cx.weak_entity();
     let settings_dir = workspace.settings_dir().to_path_buf();
     let dialog = cx.new(|cx| IdeaImportDialog {
@@ -1146,8 +1147,9 @@ impl IdeaImportDialog {
 impl Render for IdeaImportDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        let left = (window.viewport_size().width - px(WIDTH)) / 2.;
-        let top = window.viewport_size().height * 0.12;
+        let viewport = window.viewport_size();
+        let left = (f32::from(viewport.width) - WIDTH) / 2.;
+        let top = f32::from(viewport.height) * 0.12;
         let source_rows: Vec<Stateful<Div>> = self
             .sources
             .iter()
@@ -1219,29 +1221,17 @@ impl Render for IdeaImportDialog {
                     .child(line.clone())
             })
             .collect();
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("idea-import")
             .debug_selector(|| "idea-import".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(px(WIDTH))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(SPACE_XS))
-                    .child(
-                        div()
-                            .text_size(px(TEXT_TITLE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Import Settings from IntelliJ IDEA"),
-                    )
-                    .child(div().text_color(theme.text_secondary).child(source_note)),
-            )
+            .child(div().text_color(theme.text_secondary).child(source_note))
             .child(div().flex().flex_col().children(source_rows))
             .child(
                 div()
@@ -1299,11 +1289,26 @@ impl Render for IdeaImportDialog {
                             .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("idea-import-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "idea-import",
+                title: "Import Settings from IntelliJ IDEA".into(),
+                extra: None,
+                place: DialogPlace {
+                    left,
+                    top,
+                    width: WIDTH,
+                    height: None,
+                },
+                min: (420., 320.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

@@ -267,6 +267,11 @@ pub struct SettingsView {
     runtimes: Vec<RuntimeInfo>,
     /// The local repository the settings file names, read in the background.
     repository: String,
+    /// The text of the read-only field that shows the repository. It keeps the selection of the
+    /// field from one frame to the next.
+    repository_text: TextField,
+    /// The page whose read-only repository field has the keys, while it has them.
+    repository_focus: Option<SettingsPage>,
     /// What the Test button of the Git page found.
     git_version: Option<String>,
     testing_git: bool,
@@ -395,6 +400,8 @@ impl SettingsView {
             mcp_error: None,
             runtimes: Vec::new(),
             repository: String::new(),
+            repository_text: TextField::default(),
+            repository_focus: None,
             git_version: None,
             testing_git: false,
             choice_open: None,
@@ -411,6 +418,7 @@ impl SettingsView {
         cx.spawn(async move |_, cx| {
             let repository = repository.await;
             read_repository.update(cx, |view, cx| {
+                view.repository_text = TextField::from_text(repository.clone());
                 view.repository = repository;
                 cx.notify();
             });
@@ -1129,6 +1137,7 @@ impl SettingsView {
             return false;
         }
         self.editing = Some(id);
+        self.repository_focus = None;
         self.search_editing = false;
         self.todo_new_editing = false;
         self.choice_open = None;
@@ -1197,6 +1206,14 @@ impl SettingsView {
             }
             cx.stop_propagation();
             return;
+        }
+        if self.repository_focus == Some(self.page) {
+            // The read-only repository field copies and selects; typed text changes nothing.
+            if self.repository_text.key_read_only(event, cx) {
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
         }
         if let Some(id) = self.editing {
             if self.text_field.key_with_clipboard(event, false, cx) {
@@ -1647,6 +1664,7 @@ impl SettingsView {
         cx.spawn(async move |_, cx| {
             let repository = read.await;
             view.update(cx, |view, cx| {
+                view.repository_text = TextField::from_text(repository.clone());
                 view.repository = repository;
                 cx.notify();
             })
@@ -1887,16 +1905,22 @@ fn slug(text: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
+/// A row of a setting. A text value stands in the label column of `label_width`, so the
+/// fields of a page start on one vertical line; other rows put the control at the right edge.
 fn setting_row(
     entry: &Setting,
     control: impl IntoElement,
     highlighted: bool,
     chosen: bool,
+    label_width: Option<f32>,
     theme: &Theme,
 ) -> Div {
     let id = entry.id;
-    row(entry.title, control, theme)
-        .px(px(ROW_PADDING_X))
+    let line = match label_width {
+        Some(width) => form_row(width, entry.title, control, theme),
+        None => row(entry.title, control, theme),
+    };
+    line.px(px(ROW_PADDING_X))
         .rounded(px(CONTROL_RADIUS))
         .when(chosen, |this| {
             this.debug_selector(move || format!("settings-chosen-{}", id.replace('_', "-")))
@@ -3212,6 +3236,13 @@ impl Render for SettingsView {
                 if self.page == SettingsPage::EditorCodeStyle {
                     content.push(self.project_style_row(&theme, cx));
                 }
+                // The text values of the page share one label column.
+                let value_labels: Vec<&str> = settings_catalog::all()
+                    .iter()
+                    .filter(|entry| entry.page == self.page && entry.kind == SettingKind::Text)
+                    .map(|entry| entry.title)
+                    .collect();
+                let value_width = form_label_width(window, &value_labels);
                 let mut last_section: Option<&'static str> = None;
                 for entry in settings_catalog::all()
                     .iter()
@@ -3286,12 +3317,20 @@ impl Render for SettingsView {
                             if entry.field == SettingField::BuildToolSecondRuntimeHome {
                                 self.runtime_select(entry, &theme, cx).into_any_element()
                             } else if entry.field == SettingField::BuildToolFirstRepository {
-                                field(
-                                    FieldMouse::off(),
+                                let mouse =
+                                    FieldMouse::new(cx, |this| Some(&mut this.repository_text))
+                                        .read_only()
+                                        .starting(cx, |this, _| {
+                                            this.editing = None;
+                                            this.repository_focus = Some(this.page);
+                                            true
+                                        });
+                                read_only_field(
                                     entry.id,
-                                    &TextField::from_text(self.repository.clone()),
-                                    "Read from the settings file",
-                                    false,
+                                    "settings-repository".to_owned(),
+                                    "settings-repository-field",
+                                    mouse,
+                                    &self.repository_text,
                                     &theme,
                                 )
                                 .into_any_element()
@@ -3354,7 +3393,15 @@ impl Render for SettingsView {
                         }
                         SettingKind::Toggle => div().into_any_element(),
                     };
-                    content.push(setting_row(entry, control, highlighted, chosen_row, &theme));
+                    let label_width = (entry.kind == SettingKind::Text).then_some(value_width);
+                    content.push(setting_row(
+                        entry,
+                        control,
+                        highlighted,
+                        chosen_row,
+                        label_width,
+                        &theme,
+                    ));
                     if self
                         .choice_open
                         .as_ref()

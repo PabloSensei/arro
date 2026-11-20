@@ -9,6 +9,7 @@ use ui_kit::metrics::*;
 use crate::editor::BundleLayout;
 use crate::editor::PreviewLayout;
 use crate::split::SplitLayout;
+use crate::window::DockSide;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DockState {
@@ -106,6 +107,9 @@ pub struct Layout {
     pub tree_selected: Option<PathBuf>,
     /// The tool window the bottom dock showed.
     pub bottom_tool: Option<String>,
+    /// The dock of each tool window. A window without a row opens where its kind puts
+    /// it; Move to writes the row, and the next opening of the project follows it.
+    pub tool_sides: Vec<(String, DockSide)>,
     /// Files that were edited in the project, the latest first. Opening a file alone
     /// does not put it here; saving does not take it away.
     pub recent_edited: Vec<PathBuf>,
@@ -146,6 +150,7 @@ impl Default for Layout {
             tree_expanded: Vec::new(),
             tree_selected: None,
             bottom_tool: None,
+            tool_sides: Vec::new(),
             recent_edited: Vec::new(),
             preview_modes: Vec::new(),
             bundle_modes: Vec::new(),
@@ -154,6 +159,22 @@ impl Default for Layout {
             services_show_all: false,
             bookmarks: BookmarkLayout::default(),
         }
+    }
+}
+
+impl Layout {
+    /// The dock the project kept for a tool window, if a Move to ever chose one.
+    pub fn tool_side(&self, id: &str) -> Option<DockSide> {
+        self.tool_sides
+            .iter()
+            .find(|(tool, _)| tool == id)
+            .map(|(_, side)| *side)
+    }
+
+    /// Remembers the dock of a tool window.
+    pub fn set_tool_side(&mut self, id: &str, side: DockSide) {
+        self.tool_sides.retain(|(tool, _)| tool != id);
+        self.tool_sides.push((id.to_owned(), side));
     }
 }
 

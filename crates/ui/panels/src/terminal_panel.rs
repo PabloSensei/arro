@@ -19,8 +19,7 @@ use workspace::{Settings, ToggleTerminal, Workspace};
 use crate::navigation;
 use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
-    CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, pressed,
-    scroll_lines, send_key,
+    CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, pressed, send_key,
 };
 use crate::term_links::{LinkKind, LinkText};
 use crate::term_tabs::{self, Split, TabState, TabsState};
@@ -1986,7 +1985,6 @@ impl TerminalPanel {
                     .search
                     .current
                     .and_then(|current| found.search.matches().get(current).copied());
-                let scrolled = session.clone();
                 let view = GridView {
                     session: session.clone(),
                     focused,
@@ -2005,7 +2003,6 @@ impl TerminalPanel {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .on_scroll(move |event, _, _| scrolled.scroll(scroll_lines(event)))
                     .child(grid(view));
                 if let Some(code) = session.exit_code().filter(|_| session.is_closed()) {
                     body = body.child(

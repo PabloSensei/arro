@@ -332,6 +332,78 @@ pub(crate) fn sticky_height(count: usize, line_height: f32) -> f32 {
     }
 }
 
+/// How far a row may stick out of the text area and still count as shown: float rounding.
+const SHOWN_SLACK: f32 = 0.5;
+
+/// The most steps a reveal takes. The pinned declarations are few, so a reveal ends long
+/// before this bound, which only guards against a text area smaller than one row.
+const REVEAL_STEPS: usize = 64;
+
+/// The top of the row `row` as the painter places it for the scroll `scroll`, and the height
+/// the pinned declarations cover over the top of the text. `pinned_at` gives the number of
+/// declarations pinned over the rows that start at the row it is given.
+pub(crate) fn row_top(
+    row: usize,
+    scroll: f32,
+    line_height: f32,
+    pinned_at: &impl Fn(usize) -> usize,
+) -> (f32, f32) {
+    let first = (scroll / line_height) as usize;
+    match pinned_at(first) {
+        0 => (row as f32 * line_height - scroll, 0.),
+        count => (
+            STICKY_GAP + (row as f32 - first as f32) * line_height,
+            sticky_height(count, line_height),
+        ),
+    }
+}
+
+/// Whether the whole row `row` is on screen in a text area of `height` at the scroll `scroll`.
+pub(crate) fn row_shown(
+    row: usize,
+    scroll: f32,
+    line_height: f32,
+    height: f32,
+    pinned_at: &impl Fn(usize) -> usize,
+) -> bool {
+    let (top, covered) = row_top(row, scroll, line_height, pinned_at);
+    top >= covered - SHOWN_SLACK && top + line_height <= height + SHOWN_SLACK
+}
+
+/// The scroll that shows the whole row `row`, as near `scroll` as the rows allow. A row above
+/// the view becomes the first row on screen, a row below it the last one. Under pinned
+/// declarations the rows start further down, so the steps go on until the row clears them.
+pub(crate) fn scroll_showing_row(
+    row: usize,
+    scroll: f32,
+    line_height: f32,
+    height: f32,
+    pinned_at: &impl Fn(usize) -> usize,
+) -> f32 {
+    if row_shown(row, scroll, line_height, height, pinned_at) {
+        return scroll;
+    }
+    let (top, covered) = row_top(row, scroll, line_height, pinned_at);
+    let above = top < covered;
+    let aligned = row as f32 * line_height;
+    let mut next = if above {
+        aligned
+    } else {
+        ((row + 1) as f32 * line_height - height).clamp(0., aligned)
+    };
+    for _ in 0..REVEAL_STEPS {
+        if row_shown(row, next, line_height, height, pinned_at) {
+            break;
+        }
+        next = if above {
+            (next - line_height).max(0.)
+        } else {
+            (next + line_height).min(aligned)
+        };
+    }
+    next
+}
+
 /// The declarations whose first line is above `top_line` while their body still reaches
 /// it, outermost first, the innermost `STICKY_MAX` of them.
 pub(crate) fn pinned_items(
@@ -926,6 +998,7 @@ impl Element for EditorElement {
         let mut horizontal_bar = false;
         let mut scroll_top = view.scroll_top;
         let mut reveal_center = view.reveal_center;
+        let mut caret_watch: Option<crate::view::CaretWatch> = None;
         let mut widest_row = None;
         if let Some(state) = &view.state
             && let Some(display) = &display
@@ -949,12 +1022,35 @@ impl Element for EditorElement {
                 } else {
                     0.
                 };
-            if view.autoscroll {
-                let row = display.to_display(state.selections().primary().head).row;
-                let top = row as f32 * line_height;
-                let near_bottom = top + line_height > scroll_top + height;
-                let near_top = top < scroll_top;
+            let head = state.selections().primary().head;
+            let row = display.to_display(head).row;
+            let store = state.store();
+            // The rows under the pinned declarations are not shown, so the reveal counts the
+            // declarations the way the painter does for the rows that start at `first`.
+            let pinned_at = |first: usize| {
+                if !options.sticky_lines {
+                    return 0;
+                }
+                let top_line = if first < display.row_count() {
+                    display.row_to_line(first)
+                } else {
+                    store.line_count()
+                };
+                pinned_items(view.outline(), top_line, |at| {
+                    store.offset_to_line(at.min(store.len()))
+                })
+                .len()
+            };
+            // A caret that the last frame showed stays shown when a row opens above it, such as
+            // a code lens that arrives late, unless the view or the caret moved since.
+            let kept = view.caret_watch.is_some_and(|watch| {
+                watch.head == head && watch.scroll_top == scroll_top && watch.shown
+            });
+            if view.autoscroll || kept {
                 if reveal_center {
+                    let top = row as f32 * line_height;
+                    let near_bottom = top + line_height > scroll_top + height;
+                    let near_top = top < scroll_top;
                     // A jump to a place centers the line when it is out of sight or at
                     // the edge, as IDEA does.
                     let edge = line_height * 2.;
@@ -965,12 +1061,16 @@ impl Element for EditorElement {
                         scroll_top = (top - margin).max(0.);
                     }
                     reveal_center = false;
-                } else if near_top {
-                    scroll_top = top;
-                } else if near_bottom {
-                    scroll_top = top + line_height - height;
+                } else {
+                    scroll_top =
+                        scroll_showing_row(row, scroll_top, line_height, height, &pinned_at);
                 }
             }
+            caret_watch = Some(crate::view::CaretWatch {
+                head,
+                scroll_top,
+                shown: row_shown(row, scroll_top, line_height, height, &pinned_at),
+            });
         }
 
         let mut rows = Vec::new();
@@ -1010,7 +1110,12 @@ impl Element for EditorElement {
             } else {
                 store.line_count()
             };
-            let pinned = pinned_items(view.outline(), top_line, line_of);
+            // The pinned declarations move the rows only while their panel is drawn.
+            let pinned = if options.sticky_lines {
+                pinned_items(view.outline(), top_line, line_of)
+            } else {
+                Vec::new()
+            };
             // The panel of pinned declarations takes whole rows and the gap under them:
             // the text starts on a row boundary below it, so no letter is cut in half.
             let offset = if pinned.is_empty() {
@@ -1870,6 +1975,7 @@ impl Element for EditorElement {
             view.autoscroll = false;
             view.reveal_center = reveal_center;
             view.scroll_top = scroll_top;
+            view.caret_watch = caret_watch;
             view.scroll_left = scroll_left;
             view.horizontal_bar = horizontal.is_some();
             if let Some(widest) = widest_row {
@@ -2988,5 +3094,52 @@ mod token_checks {
         let out = runs(&spans, &tokens, &[], 0..16, &style);
         assert_eq!(out.iter().map(|run| run.len).sum::<usize>(), 16);
         assert!(out.iter().all(|run| run.len > 0));
+    }
+}
+
+#[cfg(test)]
+mod reveal_checks {
+    use super::{row_shown, scroll_showing_row, sticky_height};
+
+    const LINE: f32 = 20.;
+
+    #[test]
+    fn a_row_is_shown_only_when_all_of_it_fits_between_the_edges() {
+        let none = |_: usize| 0;
+        // A text area 100 high shows the rows 0 to 4 at the scroll 0.
+        assert!(row_shown(4, 0., LINE, 100., &none));
+        assert!(!row_shown(5, 0., LINE, 100., &none));
+        // Scrolled by 10, the top row is cut.
+        assert!(!row_shown(0, 10., LINE, 100., &none));
+    }
+
+    #[test]
+    fn a_row_below_the_view_ends_on_the_bottom_edge() {
+        let none = |_: usize| 0;
+        let scroll = scroll_showing_row(9, 0., LINE, 100., &none);
+        assert_eq!(scroll, 100.);
+        assert!(row_shown(9, scroll, LINE, 100., &none));
+    }
+
+    #[test]
+    fn a_row_above_the_view_becomes_the_first_row() {
+        let none = |_: usize| 0;
+        assert_eq!(scroll_showing_row(2, 60., LINE, 100., &none), 40.);
+    }
+
+    #[test]
+    fn the_rows_under_pinned_declarations_are_not_shown() {
+        // Two declarations pinned: the panel covers two rows and the gap under them.
+        let two = |_: usize| 2;
+        assert_eq!(sticky_height(2, LINE), 44.);
+        assert!(!row_shown(10, 200., LINE, 100., &two));
+        assert!(row_shown(12, 200., LINE, 100., &two));
+    }
+
+    #[test]
+    fn a_row_below_the_view_under_pinned_declarations_clears_the_bottom_edge() {
+        let two = |_: usize| 2;
+        let scroll = scroll_showing_row(30, 0., LINE, 200., &two);
+        assert!(row_shown(30, scroll, LINE, 200., &two), "scroll {scroll}");
     }
 }

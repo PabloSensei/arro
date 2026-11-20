@@ -1,7 +1,8 @@
 //! Console program for the tests of this crate: shows what really reaches a program.
 //! `lines` hashes stdin up to a line `END`, `keys` prints console key records, `sleep` writes
 //! READY into a file and waits, `children <pid>` lists the children of a process, `attach <line>`
-//! hosts a command in this console.
+//! hosts a command in this console, `tui <modes>` sets the modes it names and prints the raw bytes
+//! of its input.
 
 #[cfg(windows)]
 use std::io::Write;
@@ -18,7 +19,9 @@ use terminal::{ShiftEnter, SpawnSpec, TerminalSession, allowlisted, attach_conso
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
-    GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+    GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleMode,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -98,6 +101,66 @@ fn keys() {
     }
 }
 
+/// A full-screen program of the wheel tests. It sets the modes its arguments name, prints READY and
+/// then prints what each read of its input brings, with the escapes made visible.
+#[cfg(windows)]
+fn tui(modes: &[&str]) {
+    use std::io::Read;
+
+    let mut picture = String::new();
+    for mode in modes {
+        match *mode {
+            "alt" => picture.push_str("\x1b[?1049h\x1b[2J\x1b[H"),
+            "mouse" => picture.push_str("\x1b[?1000h"),
+            "drag" => picture.push_str("\x1b[?1002h"),
+            "motion" => picture.push_str("\x1b[?1003h"),
+            "sgr" => picture.push_str("\x1b[?1006h"),
+            "cursor" => picture.push_str("\x1b[?1h"),
+            "erase" => picture.push_str("\x1b[2J\x1b[3J\x1b[H"),
+            "lines" => {
+                for number in 1..=60 {
+                    picture.push_str(&format!("line {number:02}\r\n"));
+                }
+            }
+            _ => {}
+        }
+    }
+    // The escapes above are commands only with VT output on; the input is raw bytes, without
+    // line editing and without echo.
+    unsafe {
+        let output = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(output, &mut mode) != 0 {
+            SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+        SetConsoleMode(
+            GetStdHandle(STD_INPUT_HANDLE),
+            ENABLE_VIRTUAL_TERMINAL_INPUT,
+        );
+    }
+    // No line break after READY: a line break there would scroll the screen after the test sees
+    // READY, and a wheel turn sent in between would then land one line off.
+    print!("{picture}READY");
+    io::stdout().flush().expect("stdout");
+    let mut buffer = [0u8; 256];
+    loop {
+        let count = match io::stdin().read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        let shown: String = buffer[..count]
+            .iter()
+            .map(|&byte| match byte {
+                0x1b => "^[".to_string(),
+                b'\r' => "^M".to_string(),
+                other => char::from(other).to_string(),
+            })
+            .collect();
+        print!("\r\nGOT {shown}");
+        io::stdout().flush().expect("stdout");
+    }
+}
+
 #[cfg(windows)]
 fn attach(command_line: &str) {
     let (cols, rows) = console_size().expect("a console");
@@ -125,6 +188,10 @@ fn main() {
         ["children", pid] => children(pid.parse().expect("pid")),
         #[cfg(windows)]
         ["attach", line] => attach(line),
-        _ => eprintln!("usage: term-probe lines|keys|sleep <file>|children <pid>|attach <line>"),
+        #[cfg(windows)]
+        ["tui", modes @ ..] => tui(modes),
+        _ => eprintln!(
+            "usage: term-probe lines|keys|sleep <file>|children <pid>|attach <line>|tui <modes>"
+        ),
     }
 }

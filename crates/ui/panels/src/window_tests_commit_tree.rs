@@ -81,7 +81,7 @@ fn show_commit(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     draw(cx, window);
 }
 
-fn commit_panel(cx: &TestAppContext) -> Entity<CommitPanel> {
+pub(crate) fn commit_panel(cx: &TestAppContext) -> Entity<CommitPanel> {
     cx.read(|cx| cx.global::<ActiveCommitPanel>().0.clone())
 }
 
@@ -97,12 +97,12 @@ fn ticked(cx: &mut TestAppContext, path: &str) -> bool {
 
 /// A selector built at run time. A test lives as long as the process, so a name leaked here
 /// costs nothing that matters.
-fn selector(name: String) -> &'static str {
+pub(crate) fn selector(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
 }
 
 /// The selector of the row of the changed file whose path ends with `name`.
-fn row_of(cx: &TestAppContext, state: &Entity<GitState>, name: &str) -> &'static str {
+pub(crate) fn row_of(cx: &TestAppContext, state: &Entity<GitState>, name: &str) -> &'static str {
     let index = state.read_with(cx, |state, _| {
         state
             .status()
@@ -117,7 +117,7 @@ fn row_of(cx: &TestAppContext, state: &Entity<GitState>, name: &str) -> &'static
 }
 
 /// The selector of the icon `name` in the theme of the window.
-fn icon_selector(set: &str, name: &str, dark: bool) -> &'static str {
+pub(crate) fn icon_selector(set: &str, name: &str, dark: bool) -> &'static str {
     selector(icon_file(set, name, dark, ICON).to_string())
 }
 
@@ -139,7 +139,7 @@ fn icon_in_row(
     );
 }
 
-fn theme_of(cx: &mut TestAppContext) -> (&'static str, bool) {
+pub(crate) fn theme_of(cx: &mut TestAppContext) -> (&'static str, bool) {
     cx.read(|cx| {
         let theme = cx.global::<Theme>();
         (theme.icon_set(), theme.dark)
@@ -148,7 +148,7 @@ fn theme_of(cx: &mut TestAppContext) -> (&'static str, bool) {
 
 /// Opens the window of the repository, waits for its four changed files and shows the Commit
 /// window with them.
-fn open_commit(
+pub(crate) fn open_commit(
     cx: &mut TestAppContext,
     name: &str,
 ) -> (PathBuf, WindowHandle<Workspace>, Entity<GitState>) {

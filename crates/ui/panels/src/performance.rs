@@ -18,6 +18,8 @@ use workspace::{PERFORMANCE_TOOL, Workspace};
 
 /// How often a finished snapshot replaces the one on screen.
 const REFRESH: Duration = Duration::from_secs(1);
+/// The group of the header: the Hide button shows while the pointer is over the window.
+const GROUP: &str = "bottom-panel";
 /// The window the percentiles describe.
 const WINDOW: Duration = Duration::from_secs(300);
 /// The values of `budgets.toml`, embedded at build time: the panel must show the same
@@ -529,44 +531,53 @@ fn widths() -> [Pixels; 6] {
 impl Render for PerformancePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        let header = div()
+        let workspace = self.workspace.clone();
+        let hide = {
+            let workspace = workspace.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_tool(PERFORMANCE_TOOL, window, cx)
+                    })
+                    .ok();
+            }
+        };
+        let options = crate::tool_menu::options_menu(workspace, PERFORMANCE_TOOL, |_| Vec::new());
+        let copy = div()
+            .id("perf-copy")
+            .debug_selector(|| "perf-copy".to_owned())
             .flex()
             .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Performance Monitor"),
+            .h(px(24.))
+            .px(px(8.))
+            .rounded(px(4.))
+            .text_size(px(UI_SIZE))
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| this.copy(cx)),
             )
-            .child(
-                div()
-                    .id("perf-copy")
-                    .debug_selector(|| "perf-copy".to_owned())
-                    .flex()
-                    .items_center()
-                    .h(px(24.))
-                    .px(px(8.))
-                    .rounded(px(4.))
-                    .text_size(px(UI_SIZE))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.copy(cx)),
-                    )
-                    .child("Copy as Text"),
-            );
+            .child("Copy as Text");
+        let header = tool_header(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .child("Performance Monitor"),
+            copy,
+            GROUP,
+            "performance",
+            options,
+            hide,
+            &theme,
+        )
+        .debug_selector(|| "performance-header".to_owned());
         let body = self.render_body(&theme, window, cx);
         island(&theme)
             .id(PERFORMANCE_TOOL)
             .debug_selector(|| "performance".to_owned())
             .key_context("PerformanceMonitor ToolWindow")
             .track_focus(&self.focus)
-            .group("bottom-panel")
+            .group(GROUP)
             .h_full()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 let key = &event.keystroke;

@@ -16,7 +16,7 @@ use crate::start::StartScreen;
 use crate::window_tests::{click, draw, scratch, wait_for_signal};
 
 /// A screen with the generators of the application, already in the New Project mode.
-fn open(
+pub(crate) fn open(
     cx: &mut TestAppContext,
     name: &str,
     generators: Vec<Arc<dyn Generator>>,
@@ -38,7 +38,7 @@ fn open(
 
 /// The generators of the application, with the wrapper of the build tool off: a test
 /// must not run the build tool of the machine.
-fn generators(name: &str) -> Vec<Arc<dyn Generator>> {
+pub(crate) fn generators(name: &str) -> Vec<Arc<dyn Generator>> {
     let options = window_language::NewProjectOptions {
         wrapper: false,
         ..Default::default()

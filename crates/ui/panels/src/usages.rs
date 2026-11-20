@@ -17,8 +17,9 @@ use lang_api::{
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{Settings, USAGES_TOOL, Workspace};
+use workspace::{FileIcons, Settings, USAGES_TOOL, Workspace};
 
+use crate::finder::{FindRequest, Found, find_tree, repeat_search};
 use crate::items::{HeaderButton, Item, ItemsPanel, PanelRow};
 use crate::navigation;
 use crate::outline::OpenEditors;
@@ -79,6 +80,16 @@ struct UsagesTab {
     /// The options of the search; `None` for a search that used the defaults.
     options: Option<FindUsagesOptions>,
     pinned: bool,
+    /// The places of a Find in Files search; `None` for the uses of a symbol.
+    find: Option<FindView>,
+}
+
+/// The places of a Find in Files search in a tab of the Find window, and the search that
+/// the Rerun button of its header repeats.
+struct FindView {
+    items: Vec<Item>,
+    rows: Vec<PanelRow>,
+    request: FindRequest,
 }
 
 /// Keeps the latest usages and the window that lists them.
@@ -376,6 +387,7 @@ impl UsagesHub {
             usages,
             options: options.clone(),
             pinned: false,
+            find: None,
         };
         if new_tab {
             self.tabs.push(tab);
@@ -400,6 +412,89 @@ impl UsagesHub {
     ) {
         self.structural = Some(StructuralView { title, items, rows });
         self.regroup(cx);
+    }
+
+    /// Adds a tab with the query to the Find window: the places of a Find in Files search,
+    /// as a tree of files. A search that has not answered yet has no places; the tab runs
+    /// the search itself and shows its places when they come.
+    pub(crate) fn add_find_tab(
+        &mut self,
+        request: FindRequest,
+        found: Option<Found>,
+        cx: &mut Context<Self>,
+    ) {
+        self.structural = None;
+        self.serial += 1;
+        let serial = self.serial;
+        let name = request.pattern();
+        let (items, rows) = match &found {
+            Some((_, results)) => {
+                let icons = self.file_icons(cx);
+                find_tree(results, &self.root, &icons)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        self.tabs.push(UsagesTab {
+            serial,
+            name: name.clone(),
+            prefix: format!("Find \"{name}\""),
+            usages: Vec::new(),
+            excluded: Vec::new(),
+            options: None,
+            pinned: false,
+            find: Some(FindView {
+                items,
+                rows,
+                request: request.clone(),
+            }),
+        });
+        self.active = self.tabs.len() - 1;
+        self.regroup(cx);
+        if found.is_none() {
+            repeat_search(cx.weak_entity(), serial, &request, cx);
+        }
+    }
+
+    /// The places a repeated search found, for the tab that asked for them.
+    pub(crate) fn replace_find(
+        &mut self,
+        serial: u64,
+        (outcome, found): Found,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.serial == serial && tab.find.is_some())
+        else {
+            return;
+        };
+        if let Err(error) = outcome {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user("Find in Files", error.to_string(), cx)
+                })
+                .ok();
+        }
+        let icons = self.file_icons(cx);
+        let (items, rows) = find_tree(&found, &self.root, &icons);
+        if let Some(view) = self.tabs[index].find.as_mut() {
+            view.items = items;
+            view.rows = rows;
+        }
+        if index == self.active {
+            self.regroup(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// The icons of the files of the project, as the workspace has them.
+    fn file_icons(&self, cx: &App) -> FileIcons {
+        self.workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).icons().clone())
+            .unwrap_or_default()
     }
 
     /// Asks the language for the member and hierarchy searches of the options, then
@@ -739,6 +834,37 @@ impl UsagesHub {
                 panel.set_header_buttons(Vec::new(), cx);
                 panel.set_view(items, rows, cx);
                 panel.set_counted_title(&title, cx);
+            });
+            return;
+        }
+        let find = self.tabs.get(self.active).and_then(|tab| {
+            let view = tab.find.as_ref()?;
+            Some((
+                tab.serial,
+                tab.prefix.clone(),
+                view.items.clone(),
+                view.rows.clone(),
+                view.request.clone(),
+            ))
+        });
+        if let Some((serial, prefix, items, rows, request)) = find {
+            let weak = cx.weak_entity();
+            let rerun = HeaderButton {
+                id: "find-rerun",
+                label: "Rerun".to_owned(),
+                active: false,
+                icon: Some("general/refresh"),
+                tooltip: Some("Rerun".to_owned()),
+                shortcut: None,
+                run: std::rc::Rc::new(move |_, cx| {
+                    repeat_search(weak.clone(), serial, &request, cx)
+                }),
+            };
+            self.sources = (0..items.len()).collect();
+            self.panel.update(cx, |panel, cx| {
+                panel.set_header_buttons(vec![rerun], cx);
+                panel.set_view(items, rows, cx);
+                panel.set_counted_title(&prefix, cx);
             });
             return;
         }
@@ -1607,9 +1733,8 @@ impl Render for FindUsagesSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let viewport = window.viewport_size();
-        let width = px(420.);
-        let left = (viewport.width - width) / 2.;
-        let top = viewport.height * 0.2;
+        let left = (f32::from(viewport.width) - 420.) / 2.;
+        let top = f32::from(viewport.height) * 0.2;
         let hover = theme.hover;
         let scopes: Vec<_> = FindUsagesScope::ALL
             .iter()
@@ -1749,21 +1874,16 @@ impl Render for FindUsagesSettings {
                 }
             }
         }
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("find-usages-settings")
             .debug_selector(|| "find-usages-settings".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
             .p(px(DIALOG_PADDING))
             .gap(px(SPACE_S))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .pb(px(SPACE_S))
-                    .child("Find Usages"),
-            )
             .child(div().text_color(theme.text_secondary).child("Search in"))
             .children(scopes)
             .child(
@@ -1812,11 +1932,26 @@ impl Render for FindUsagesSettings {
                             .child("Find"),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("find-usages-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.dismiss(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "find-usages",
+                title: "Find Usages".into(),
+                extra: None,
+                place: DialogPlace {
+                    left,
+                    top,
+                    width: 420.,
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

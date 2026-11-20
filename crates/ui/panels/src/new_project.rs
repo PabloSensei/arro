@@ -574,10 +574,9 @@ impl NewProject {
         let visible = self.visible_rows();
         let folder = self.folder();
         let active = self.active;
-        let (accent, over, pressed, hover, muted) = (
+        let (accent, over, hover, muted) = (
             theme.accent,
             theme.over_accent,
-            theme.pressed,
             theme.hover,
             theme.text_muted,
         );
@@ -607,20 +606,26 @@ impl NewProject {
             })
             .collect();
 
+        // One label column for the whole form, as wide as its widest label. The labels are
+        // measured in the font they are drawn with.
+        let mut labels: Vec<String> = vec!["Name".to_owned(), "Location".to_owned()];
+        labels.extend(
+            visible
+                .iter()
+                .map(|&index| self.rows[index].field.label.clone()),
+        );
+        let label_names: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let width = form_label_width(window, &label_names);
+
         let mut content = div()
             .id("new-project-fields")
             .flex()
             .flex_col()
             .gap(px(DIALOG_GAP))
             .p(px(SPACE_S))
-            .child(label_text(
+            .child(form_row(
+                width,
                 "Name",
-                None,
-                self.message_at(Where::Name),
-                active == Active::Name,
-                &theme,
-            ))
-            .child(
                 text_box(
                     FieldMouse::new(cx, |this| Some(&mut this.name)),
                     "new-project-name",
@@ -632,23 +637,12 @@ impl NewProject {
                     this.wizard.active = Active::Name;
                     this.run_wizard_step(Step::Changed, window, cx);
                 })),
-            )
-            .child(
-                label_text(
-                    "Location",
-                    None,
-                    self.message_at(Where::Location),
-                    active == Active::Location,
-                    &theme,
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "new-project-path".to_owned())
-                        .text_color(theme.text_secondary)
-                        .child(format!("Project will be created in: {}", folder.display())),
-                ),
-            )
-            .child(
+                &theme,
+            ))
+            .children(message_under(width, self.message_at(Where::Name), &theme))
+            .child(form_row(
+                width,
+                "Location",
                 text_box(
                     FieldMouse::new(cx, |this| Some(&mut this.location)),
                     "new-project-location",
@@ -660,8 +654,24 @@ impl NewProject {
                     this.wizard.active = Active::Location;
                     this.run_wizard_step(Step::Changed, window, cx);
                 })),
-            )
-            .child(
+                &theme,
+            ))
+            .child(form_aligned(
+                width,
+                div()
+                    .debug_selector(|| "new-project-path".to_owned())
+                    .pt(px(SPACE_XS))
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
+                    .child(format!("Project will be created in: {}", folder.display())),
+            ))
+            .children(message_under(
+                width,
+                self.message_at(Where::Location),
+                &theme,
+            ))
+            .child(form_aligned(
+                width,
                 div()
                     .id("new-project-git")
                     .debug_selector(|| "new-project-git".to_owned())
@@ -676,7 +686,7 @@ impl NewProject {
                     }))
                     .child(checkbox(self.git, &theme))
                     .child("Create Git repository"),
-            );
+            ));
 
         for index in visible {
             let row = &self.rows[index];
@@ -688,10 +698,11 @@ impl NewProject {
             let empty_query = row.text.text.is_empty();
             let error = self.message_at(Where::Row(index));
             let active = self.active == Active::Row(index);
-            content = content.child(label_text(&label, hint, error, active, &theme));
             match kind {
                 Kind::Text => {
-                    content = content.child(
+                    content = content.child(form_row(
+                        width,
+                        &label,
                         text_box(
                             FieldMouse::new(cx, move |this| {
                                 this.wizard.rows.get_mut(index).map(|row| &mut row.text)
@@ -707,106 +718,113 @@ impl NewProject {
                                 this.run_wizard_step(Step::Changed, window, cx);
                             },
                         )),
-                    );
+                        &theme,
+                    ));
                 }
-                Kind::Choice => content = content.child(self.choice_row(index, &theme, cx)),
-                Kind::Toggle => content = content.child(self.toggle_row(index, &theme, cx)),
+                Kind::Choice => {
+                    content = content.child(form_row(
+                        width,
+                        &label,
+                        self.choice_row(index, &theme, cx),
+                        &theme,
+                    ));
+                }
+                // A toggle is a checkbox with its own label, so it takes the field column
+                // without a label of its own.
+                Kind::Toggle => {
+                    content =
+                        content.child(form_aligned(width, self.toggle_row(index, &theme, cx)));
+                }
                 Kind::Many => {
+                    let search = div()
+                        .id(format!("new-project-search-{key}"))
+                        .debug_selector({
+                            let selector = format!("new-project-search-{key}");
+                            move || selector.clone()
+                        })
+                        .when(empty_query && !active, |this| {
+                            this.child(
+                                div()
+                                    .px(px(SPACE_M))
+                                    .h(px(CONTROL_HEIGHT))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(CONTROL_RADIUS))
+                                    .border_2()
+                                    .border_color(theme.border)
+                                    .text_color(muted)
+                                    .child("Search dependencies"),
+                            )
+                        })
+                        .when(!empty_query || active, |this| {
+                            this.child(text_box(
+                                FieldMouse::new(cx, move |this| {
+                                    this.wizard.rows.get_mut(index).map(|row| &mut row.text)
+                                }),
+                                &format!("new-project-search-{key}-field"),
+                                &text,
+                                active,
+                                &theme,
+                            ))
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.wizard.active = Active::Row(index);
+                            this.run_wizard_step(Step::Changed, window, cx);
+                        }));
                     content = content
-                        .child(self.chips_row(index, &theme, cx))
-                        .child(
-                            div()
-                                .id(format!("new-project-search-{key}"))
-                                .debug_selector({
-                                    let selector = format!("new-project-search-{key}");
-                                    move || selector.clone()
-                                })
-                                .when(empty_query && !active, |this| {
-                                    this.child(
-                                        div()
-                                            .px(px(SPACE_M))
-                                            .h(px(32.))
-                                            .flex()
-                                            .items_center()
-                                            .rounded(px(CONTROL_RADIUS))
-                                            .border_2()
-                                            .border_color(theme.border)
-                                            .text_color(muted)
-                                            .child("Search dependencies"),
-                                    )
-                                })
-                                .when(!empty_query || active, |this| {
-                                    this.child(text_box(
-                                        FieldMouse::new(cx, move |this| {
-                                            this.wizard.rows.get_mut(index).map(|row| &mut row.text)
-                                        }),
-                                        &format!("new-project-search-{key}-field"),
-                                        &text,
-                                        active,
-                                        &theme,
-                                    ))
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.wizard.active = Active::Row(index);
-                                    this.run_wizard_step(Step::Changed, window, cx);
-                                })),
-                        )
-                        .child(self.dependency_list(index, &theme, cx));
+                        .child(form_row(width, &label, search, &theme))
+                        .child(form_aligned(width, self.chips_row(index, &theme, cx)))
+                        .child(form_aligned(width, self.dependency_list(index, &theme, cx)));
                 }
             }
+            // The hint of the field and the message of a wrong value stand under the field.
+            if let Some(hint) = hint {
+                content = content.child(form_hint(width, &hint, &theme));
+            }
+            content = content.children(message_under(width, error, &theme));
         }
 
         let enabled = self.can_create();
         let loading = self.loading;
-        let create = div()
-            .id("new-project-create")
-            .debug_selector(|| "new-project-create".to_owned())
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(CONTROL_HEIGHT))
-            .px(px(SPACE_L))
-            .rounded(px(CONTROL_RADIUS))
-            .when(enabled, |this| {
-                this.bg(accent)
-                    .text_color(over)
-                    .hover(move |style| style.bg(hover))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let step = this.wizard.create_step();
-                        this.run_wizard_step(step, window, cx);
-                    }))
-            })
-            .when(!enabled, |this| this.bg(pressed).text_color(muted))
-            .child(if loading { "Loading..." } else { "Create" });
-        let reload = self.reloads().then(|| {
-            div()
-                .id("new-project-reload")
-                .debug_selector(|| "new-project-reload".to_owned())
-                .flex()
-                .items_center()
-                .h(px(CONTROL_HEIGHT))
-                .px(px(SPACE_M))
-                .rounded(px(CONTROL_RADIUS))
-                .bg(pressed)
-                .hover(move |style| style.bg(hover))
-                .child("Reload metadata")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.run_wizard_step(Step::Load, window, cx);
-                }))
+        // Create is the primary button of the form; Reload stands at the left edge, as the
+        // extra buttons of the other dialogs do.
+        let create = dialog_button(
+            "new-project-create",
+            "new-project-create".to_owned(),
+            if loading { "Loading..." } else { "Create" },
+            true,
+            enabled,
+            &theme,
+        )
+        .when(enabled, |this| {
+            this.on_click(cx.listener(|this, _, window, cx| {
+                let step = this.wizard.create_step();
+                this.run_wizard_step(step, window, cx);
+            }))
         });
+        let reload = self.reloads().then(|| {
+            dialog_button(
+                "new-project-reload",
+                "new-project-reload".to_owned(),
+                "Reload metadata",
+                false,
+                true,
+                &theme,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.run_wizard_step(Step::Load, window, cx);
+            }))
+        });
+        let mut buttons = DialogButtons::new().primary(create);
+        if let Some(reload) = reload {
+            buttons = buttons.extra(reload);
+        }
         let mut footer = div()
             .flex()
             .flex_col()
             .gap(px(SPACE_S))
             .px(px(SPACE_S))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(SPACE_M))
-                    .child(create)
-                    .children(reload),
-            );
+            .child(buttons.into_row());
         if let Some((Where::Create, text)) = self.error.clone() {
             footer = footer.child(
                 div()
@@ -1091,40 +1109,18 @@ impl NewProject {
     }
 }
 
-/// A label over a field, with an optional hint and the message of a wrong value.
-fn label_text(
-    label: &str,
-    hint: Option<String>,
-    error: Option<SharedString>,
-    active: bool,
-    theme: &Theme,
-) -> Div {
-    let mut column = div().flex().flex_col().gap(px(SPACE_XS)).child(
-        div()
-            .text_color(if active {
-                theme.accent
-            } else {
-                theme.text_secondary
-            })
-            .child(label.to_owned()),
-    );
-    if let Some(hint) = hint {
-        column = column.child(
-            div()
-                .text_color(theme.text_muted)
-                .text_size(px(TEXT_SMALL))
-                .child(hint),
-        );
-    }
-    if let Some(text) = error {
-        column = column.child(
+/// The message of a wrong value, under its field: in the column of the fields, in the colour of
+/// errors.
+fn message_under(width: f32, message: Option<SharedString>, theme: &Theme) -> Option<Div> {
+    message.map(|text| {
+        form_aligned(
+            width,
             div()
                 .debug_selector(|| "new-project-error".to_owned())
                 .text_color(theme.stripe_error)
                 .child(text),
-        );
-    }
-    column
+        )
+    })
 }
 
 /// The frame of one line of text, drawn by the one renderer of `ui-kit`.
@@ -1141,7 +1137,7 @@ fn text_box(
         .debug_selector(move || debug.clone())
         .flex()
         .items_center()
-        .h(px(32.))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_M))
         .rounded(px(CONTROL_RADIUS))
         .border_2()

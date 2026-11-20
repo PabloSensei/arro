@@ -60,11 +60,18 @@ fn a_keymap_file_written_on_disk_reaches_the_window_without_a_poll(cx: &mut Test
             .read_with(cx, |workspace, _| workspace.keymap_generation() > before)
             .unwrap()
     });
-    let shortcut = window
+    // The file's shortcut is listed after the main one of the default layout, which stays
+    // the one a menu writes.
+    let listed = window
         .read_with(cx, |workspace, _| {
-            workspace.shortcut_of(editor_keys::DUPLICATE)
+            workspace
+                .keymap()
+                .shortcuts_for(editor_keys::DUPLICATE)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
         })
         .unwrap();
-    assert_eq!(shortcut.as_deref(), Some("ctrl-alt-shift-d"));
+    assert_eq!(listed, ["ctrl-d", "ctrl-alt-shift-d"]);
     draw(cx, window);
 }

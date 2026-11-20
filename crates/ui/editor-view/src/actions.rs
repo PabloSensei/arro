@@ -207,6 +207,8 @@ pub(crate) struct ActionMenu {
     /// The question for the preview of the selected row, while the language computes
     /// the edit on resolve. Dropping it cancels the question.
     pub preview_task: Option<Task<()>>,
+    /// The heading of the list, for the menus that have one, such as Generate.
+    pub title: Option<&'static str>,
 }
 
 impl ActionMenu {
@@ -552,6 +554,7 @@ impl EditorView {
                 sections: Vec::new(),
                 selected: 0,
                 preview_task: None,
+                title: None,
             });
             cx.notify();
         }
@@ -819,6 +822,7 @@ impl EditorView {
             sections,
             selected: 0,
             preview_task: None,
+            title: None,
         });
         cx.notify();
         self.request_action_preview(cx);

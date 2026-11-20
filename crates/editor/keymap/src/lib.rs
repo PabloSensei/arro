@@ -92,13 +92,23 @@ pub enum Lookup {
     None,
 }
 
+/// What a binding runs, and where it stands in the keymap: `order` counts the bindings in
+/// the order they were added, which is the order of the file for the defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bound {
+    action: &'static str,
+    order: usize,
+}
+
 /// Bindings per context. A binding of a later `add` replaces the earlier one. Contexts
 /// nest: the editor sits inside the workspace, and a key looks in the innermost first.
 #[derive(Clone, Debug, Default)]
 pub struct Keymap {
-    keys: HashMap<(String, Vec<Keystroke>), &'static str>,
+    keys: HashMap<(String, Vec<Keystroke>), Bound>,
     prefixes: HashSet<(String, Keystroke)>,
-    doubles: HashMap<Modifier, &'static str>,
+    doubles: HashMap<Modifier, Bound>,
+    /// The order the next new binding takes.
+    added: usize,
 }
 
 impl Keymap {
@@ -126,23 +136,45 @@ impl Keymap {
         }
         match shortcut {
             Shortcut::Double(modifier) => {
-                self.doubles.insert(*modifier, action);
+                let previous = self.doubles.get(modifier).copied();
+                let order = self.order_for(previous, action);
+                self.doubles.insert(*modifier, Bound { action, order });
             }
             Shortcut::Keys(keys) => {
                 let keys: Vec<Keystroke> =
                     keys.iter().cloned().map(Keystroke::normalized).collect();
-                self.keys.insert((context.to_owned(), keys), action);
+                let key = (context.to_owned(), keys);
+                let previous = self.keys.get(&key).copied();
+                let order = self.order_for(previous, action);
+                self.keys.insert(key, Bound { action, order });
                 self.rebuild_prefixes();
             }
         }
         Ok(())
     }
 
+    /// The order of a binding. A key that already runs `action` keeps its place, so that
+    /// adding it again does not move it behind the others.
+    fn order_for(&mut self, previous: Option<Bound>, action: &str) -> usize {
+        match previous {
+            Some(bound) if bound.action == action => bound.order,
+            _ => {
+                let order = self.added;
+                self.added += 1;
+                order
+            }
+        }
+    }
+
     /// Takes one shortcut away from one action. A key of another action stays.
     pub fn remove_shortcut(&mut self, context: &str, shortcut: &Shortcut, action: &str) {
         match shortcut {
             Shortcut::Double(modifier) => {
-                if self.doubles.get(modifier) == Some(&action) {
+                if self
+                    .doubles
+                    .get(modifier)
+                    .is_some_and(|bound| bound.action == action)
+                {
                     self.doubles.remove(modifier);
                 }
             }
@@ -150,7 +182,11 @@ impl Keymap {
                 let keys: Vec<Keystroke> =
                     keys.iter().cloned().map(Keystroke::normalized).collect();
                 let key = (context.to_owned(), keys);
-                if self.keys.get(&key) == Some(&action) {
+                if self
+                    .keys
+                    .get(&key)
+                    .is_some_and(|bound| bound.action == action)
+                {
                     self.keys.remove(&key);
                     self.rebuild_prefixes();
                 }
@@ -160,8 +196,8 @@ impl Keymap {
 
     /// Every shortcut of an action, leaving the other actions alone.
     pub fn remove_action(&mut self, action: &str) {
-        self.keys.retain(|_, bound| *bound != action);
-        self.doubles.retain(|_, bound| *bound != action);
+        self.keys.retain(|_, bound| bound.action != action);
+        self.doubles.retain(|_, bound| bound.action != action);
         self.rebuild_prefixes();
     }
 
@@ -169,7 +205,12 @@ impl Keymap {
     /// [`Keymap::lookup`], but the list tells a keymap editor about a conflict.
     pub fn actions_on(&self, context: &str, shortcut: &Shortcut) -> Vec<&'static str> {
         let mut found: Vec<&'static str> = match shortcut {
-            Shortcut::Double(modifier) => self.doubles.get(modifier).copied().into_iter().collect(),
+            Shortcut::Double(modifier) => self
+                .doubles
+                .get(modifier)
+                .map(|bound| bound.action)
+                .into_iter()
+                .collect(),
             Shortcut::Keys(keys) => {
                 let keys: Vec<Keystroke> =
                     keys.iter().cloned().map(Keystroke::normalized).collect();
@@ -178,7 +219,7 @@ impl Keymap {
                     .filter(|((bound_context, bound), _)| {
                         bound_context == context && *bound == keys
                     })
-                    .map(|(_, action)| *action)
+                    .map(|(_, bound)| bound.action)
                     .collect()
             }
         };
@@ -209,8 +250,8 @@ impl Keymap {
     pub fn lookup(&self, keys: &[Keystroke], contexts: &[&str]) -> Lookup {
         let normalized: Vec<Keystroke> = keys.iter().cloned().map(Keystroke::normalized).collect();
         for context in contexts {
-            if let Some(action) = self.keys.get(&((*context).to_owned(), normalized.clone())) {
-                return Lookup::Action(action);
+            if let Some(bound) = self.keys.get(&((*context).to_owned(), normalized.clone())) {
+                return Lookup::Action(bound.action);
             }
         }
         let prefix = |context: &&str| {
@@ -228,7 +269,7 @@ impl Keymap {
     }
 
     pub fn double(&self, modifier: Modifier) -> Option<&'static str> {
-        self.doubles.get(&modifier).copied()
+        self.doubles.get(&modifier).map(|bound| bound.action)
     }
 
     /// Every key sequence binding with its context, for checks and keymap lists.
@@ -237,8 +278,8 @@ impl Keymap {
         let mut found: Vec<(String, Shortcut, &'static str)> = self
             .keys
             .iter()
-            .map(|((context, keys), action)| {
-                (context.clone(), Shortcut::Keys(keys.clone()), *action)
+            .map(|((context, keys), bound)| {
+                (context.clone(), Shortcut::Keys(keys.clone()), bound.action)
             })
             .collect();
         found.sort_by(|left, right| {
@@ -247,23 +288,31 @@ impl Keymap {
         found
     }
 
-    /// Every shortcut of `action`, for menus and Find Action. Sorted, so stable.
+    /// Every shortcut of `action`, for menus and Find Action, in the order of the keymap
+    /// file: the first one is the main shortcut that the menus write, `ctrl-z` for Undo.
+    /// A keymap file that adds a shortcut puts it after the defaults.
     pub fn shortcuts_for(&self, action: &str) -> Vec<Shortcut> {
-        let mut found: Vec<Shortcut> = self
+        let mut found: Vec<(usize, Shortcut)> = self
             .keys
             .iter()
-            .filter(|(_, bound)| **bound == action)
-            .map(|((_, keys), _)| Shortcut::Keys(keys.clone()))
+            .filter(|(_, bound)| bound.action == action)
+            .map(|((_, keys), bound)| (bound.order, Shortcut::Keys(keys.clone())))
             .chain(
                 self.doubles
                     .iter()
-                    .filter(|(_, bound)| **bound == action)
-                    .map(|(modifier, _)| Shortcut::Double(*modifier)),
+                    .filter(|(_, bound)| bound.action == action)
+                    .map(|(modifier, bound)| (bound.order, Shortcut::Double(*modifier))),
             )
             .collect();
-        found.sort_by_key(ToString::to_string);
-        found.dedup();
-        found
+        found.sort_by_key(|(order, _)| *order);
+        // The same shortcut in two contexts is listed once, where it comes first.
+        let mut shortcuts: Vec<Shortcut> = Vec::with_capacity(found.len());
+        for (_, shortcut) in found {
+            if !shortcuts.contains(&shortcut) {
+                shortcuts.push(shortcut);
+            }
+        }
+        shortcuts
     }
 }
 
@@ -1240,6 +1289,60 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(shortcuts, ["ctrl-c", "ctrl-insert"]);
+    }
+
+    fn listed(keymap: &Keymap, action: &str) -> Vec<String> {
+        keymap
+            .shortcuts_for(action)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn shortcuts_for_keeps_the_order_of_the_file() {
+        let (_, keymap) = default_keymap_for(Platform::Windows);
+        // The first shortcut of each action is the one the file gives first: the menus and
+        // Find Action write it, so Undo shows Ctrl+Z and not the alternative.
+        assert_eq!(listed(&keymap, editor::UNDO), ["ctrl-z", "alt-backspace"]);
+        assert_eq!(
+            listed(&keymap, editor::REDO),
+            ["ctrl-shift-z", "alt-shift-backspace"]
+        );
+    }
+
+    #[test]
+    fn shortcuts_follow_the_order_they_were_added_in() {
+        let mut registry = ActionRegistry::default();
+        registry.register(&["undo"]);
+        let mut keymap = Keymap::default();
+        keymap
+            .add(
+                &registry,
+                editor::CONTEXT,
+                &[("ctrl-z", "undo"), ("alt-backspace", "undo")],
+            )
+            .unwrap();
+        assert_eq!(listed(&keymap, "undo"), ["ctrl-z", "alt-backspace"]);
+
+        // The same key again keeps its place, and the same key in another context is listed
+        // once, where it came first.
+        keymap
+            .add(&registry, editor::CONTEXT, &[("ctrl-z", "undo")])
+            .unwrap();
+        keymap
+            .add(&registry, workspace::CONTEXT, &[("ctrl-z", "undo")])
+            .unwrap();
+        assert_eq!(listed(&keymap, "undo"), ["ctrl-z", "alt-backspace"]);
+
+        // A key added later comes after the others.
+        keymap
+            .add(&registry, editor::CONTEXT, &[("ctrl-alt-z", "undo")])
+            .unwrap();
+        assert_eq!(
+            listed(&keymap, "undo"),
+            ["ctrl-z", "alt-backspace", "ctrl-alt-z"]
+        );
     }
 
     #[test]

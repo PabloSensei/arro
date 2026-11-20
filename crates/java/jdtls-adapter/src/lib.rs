@@ -28,6 +28,7 @@ use tokio::sync::watch;
 
 mod code_style;
 mod import;
+mod install;
 mod startup;
 
 pub use import::{BuildTool, ImportFailure, is_build_file};
@@ -278,6 +279,8 @@ pub struct Jdtls {
     config: JdtlsConfig,
     root: CanonPath,
     launcher_jar: PathBuf,
+    /// The release this state folder belongs to; another one clears the OSGi cache.
+    installation: install::InstallMark,
     autobuild: Autobuild,
     heap_mb: AtomicU32,
     /// `java.configuration.runtimes` as the server reads it at every start. Project
@@ -310,6 +313,7 @@ impl Jdtls {
     pub fn new(config: JdtlsConfig) -> io::Result<Self> {
         let root = CanonPath::new(&config.project_root)?;
         let launcher_jar = equinox_launcher(&config.jdtls_home)?;
+        let installation = install::InstallMark::of(&config.jdtls_home, &launcher_jar)?;
         fs::create_dir_all(&config.state_dir)?;
         let code_style = code_style::read_project_style(&config.project_root)
             .map(|style| code_style::prepare(&config.state_dir, &style));
@@ -341,6 +345,7 @@ impl Jdtls {
             config,
             root,
             launcher_jar,
+            installation,
             autobuild: Autobuild::default(),
             heap_mb: AtomicU32::new(first_heap_mb(platform::physical_memory())),
             started: Mutex::new(None),
@@ -977,10 +982,17 @@ fn next_heap(heap: u32) -> u32 {
 
 impl ServerSpec for Jdtls {
     fn preflight(&self) -> Result<(), String> {
-        match startup::version_problem(&self.config.java_home) {
-            Some(problem) => Err(problem),
-            None => Ok(()),
+        if let Some(problem) = startup::version_problem(&self.config.java_home) {
+            return Err(problem);
         }
+        // The cache of another release would fail the import of the build tool, so no
+        // server starts on it. The journal keeps the reason too.
+        install::prepare(&self.config.state_dir, &self.installation).map_err(|error| {
+            let message =
+                format!("the OSGi configuration of an older jdtls is not removed: {error}");
+            eprintln!("{message}");
+            message
+        })
     }
 
     fn starting(&self) {

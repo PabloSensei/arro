@@ -14,7 +14,6 @@ use workspace::Workspace;
 use crate::prompt::TextField;
 
 const WIDTH: f32 = 560.;
-const FIELD_HEIGHT: f32 = 26.;
 /// How many types of the project the field hints at once.
 const SUGGESTIONS: usize = 6;
 
@@ -380,7 +379,7 @@ fn row_box(
         .flex()
         .items_center()
         .gap(px(SPACE_M))
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_S))
         .rounded(px(CONTROL_RADIUS))
         .text_color(theme.text)
@@ -410,6 +409,7 @@ fn check_box(checked: bool, theme: &Theme) -> Div {
 impl Render for MoveMembersDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let label_width = form_label_width(window, &[self.target_label.as_str()]);
         let viewport = window.viewport_size();
         let width = px(WIDTH);
         let left = (viewport.width - width) / 2.;
@@ -446,7 +446,7 @@ impl Render for MoveMembersDialog {
             .debug_selector(|| "move-members-field".to_owned())
             .flex()
             .items_center()
-            .h(px(FIELD_HEIGHT))
+            .h(px(CONTROL_HEIGHT))
             .flex_1()
             .px(px(SPACE_M))
             .rounded(px(CONTROL_RADIUS))
@@ -478,13 +478,7 @@ impl Render for MoveMembersDialog {
             .flex()
             .items_center()
             .gap(px(SPACE_M))
-            .child(
-                div()
-                    .w(px(120.))
-                    .flex_none()
-                    .text_color(theme.text_muted)
-                    .child(self.target_label.clone()),
-            )
+            .child(form_label(label_width, &self.target_label, &theme))
             .child(field);
 
         // The types of the project that match the typed text are the hint of the field.
