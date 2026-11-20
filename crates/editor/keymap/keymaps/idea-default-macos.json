@@ -1020,7 +1020,7 @@
       "alt-down"
     ],
     "ShowSettings": [
-      "alt-cmd-s"
+      "cmd-,"
     ],
     "ShowSettingsAndFindUsages": [
       "ctrl-alt-shift-f7"
@@ -1153,9 +1153,7 @@
     "UsageFiltering.ReadAccess": [
       "cmd-r"
     ],
-    "UsageFiltering.WriteAccess": [
-      "cmd-w"
-    ],
+    "UsageFiltering.WriteAccess": [],
     "UsageGrouping.Directory": [
       "alt-cmd-p"
     ],

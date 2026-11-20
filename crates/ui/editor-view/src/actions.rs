@@ -32,6 +32,10 @@ pub(crate) enum Own {
     ExtractField,
     ExtractConstant,
     IntroduceParameter,
+    PullMembersUp,
+    PushMembersDown,
+    ExtractSuperclass,
+    IntroduceParameterObject,
     Inline,
 }
 
@@ -72,6 +76,12 @@ pub(crate) enum Pick {
         label: String,
         hint: String,
         own: Own,
+    },
+    /// One expression the server offers under the caret for an extract.
+    Expression {
+        label: String,
+        span: TextSpan,
+        refactoring: crate::refactor::Refactoring,
     },
     /// An action of the server that asks for values in a form before it runs.
     Form {
@@ -148,6 +158,7 @@ impl Pick {
             Self::Action(entry) => &entry.title,
             Self::ChangeSignature { label }
             | Self::Refactor { label, .. }
+            | Self::Expression { label, .. }
             | Self::Form { label, .. }
             | Self::Place { label, .. }
             | Self::Generate { label, .. }
@@ -354,6 +365,17 @@ impl EditorView {
         change: WorkspaceChange,
         cx: &mut Context<Self>,
     ) {
+        self.apply_change_labeled(version, change, None, cx);
+    }
+
+    /// Applies a change and gives the refactoring a name for Local History.
+    pub(crate) fn apply_change_labeled(
+        &mut self,
+        version: i32,
+        change: WorkspaceChange,
+        label: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
         self.catch_up(cx);
         let (Some(lsp), Some(state)) = (&self.lsp, &self.state) else {
             return;
@@ -367,7 +389,10 @@ impl EditorView {
                 .iter()
                 .all(|source| source.uri == lsp.uri || source.edits.is_empty());
         if !local {
-            cx.emit(EditorEvent::ApplyChange(change));
+            cx.emit(EditorEvent::ApplyChange {
+                change,
+                label: label.map(str::to_owned),
+            });
             return;
         }
         let caret = state.selections().primary().head;
@@ -384,11 +409,34 @@ impl EditorView {
     }
 
     fn apply_entry(&mut self, version: i32, entry: ActionEntry, cx: &mut Context<Self>) {
+        self.apply_entry_labeled(version, entry, None, cx);
+    }
+
+    /// Applies the entry, or first opens the field of the name it introduces.
+    pub(crate) fn apply_entry_labeled(
+        &mut self,
+        version: i32,
+        entry: ActionEntry,
+        label: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        // The place the server marks is the name of the extract. The parameter of
+        // Introduce Parameter is placed by its type, which is not a name to type.
+        let introduces_a_name = entry.code.as_deref().is_some_and(|code| {
+            code.starts_with("refactor.extract.variable")
+                || code.starts_with("refactor.extract.constant")
+                || code.starts_with("refactor.extract.field")
+                || code.starts_with("refactor.extract.function")
+        });
+        if entry.rename.is_some() && introduces_a_name {
+            self.start_extract_name(version, entry, label, cx);
+            return;
+        }
         let change = WorkspaceChange {
             edits: entry.edits,
             renames: entry.renames,
         };
-        self.apply_change(version, change, cx);
+        self.apply_change_labeled(version, change, label, cx);
     }
 
     /// Applies a correction of a misspelled word. A piece of a declaration name
@@ -1228,6 +1276,12 @@ impl EditorView {
                     }
                     (Some(Pick::ChangeSignature { .. }), _) => self.change_signature(cx),
                     (Some(Pick::Refactor { own, .. }), _) => self.run_own(own, cx),
+                    (
+                        Some(Pick::Expression {
+                            span, refactoring, ..
+                        }),
+                        _,
+                    ) => self.refactor_span(refactoring, span, cx),
                     (Some(Pick::Form { handle, .. }), _) => {
                         cx.emit(EditorEvent::RefactorForm(handle))
                     }
@@ -1543,6 +1597,7 @@ mod tests {
             renames: Vec::new(),
             handle: None,
             resolve: None,
+            rename: None,
         };
         // The unused import comes back as a quick fix and as a source action, with the
         // same title and the same edit but a code of its own kind.
@@ -1572,6 +1627,7 @@ mod tests {
             renames: Vec::new(),
             handle: Some(text.to_owned()),
             resolve: None,
+            rename: None,
         };
         let rows = without_duplicate_actions(vec![entry("first"), entry("first"), entry("second")]);
         assert_eq!(rows.len(), 2, "the same form is one row");

@@ -2,9 +2,12 @@
 //! dialog remembered; the dialog can also organize imports and format only the lines
 //! changed since HEAD.
 
+use std::collections::HashSet;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use ::base::Cancel;
 use ::platform::CanonPath;
 use editor_view::{EditorView, Semantic};
 use futures_util::StreamExt;
@@ -15,7 +18,7 @@ use lang_api::{
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::Workspace;
+use workspace::{StatusProgress, Workspace};
 
 use crate::git::ActiveGit;
 
@@ -387,7 +390,7 @@ fn only_changed(
 }
 
 fn start(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     view: Entity<EditorView>,
     path: PathBuf,
     target: Target,
@@ -399,8 +402,17 @@ fn start(
         .try_global::<Semantic>()
         .map(|semantic| semantic.0.clone())
     else {
+        workspace.notify_user("Reformat", "No language server for this file", cx);
         return;
     };
+    if support.format().is_none() && support.range_format().is_none() {
+        workspace.notify_user(
+            "Reformat",
+            "The language server cannot format this file",
+            cx,
+        );
+        return;
+    }
     let (uri, version, text, tab_size, insert_spaces) = {
         let view = view.read(cx);
         let Some(version) = view.version() else {
@@ -570,4 +582,472 @@ fn merge(text: &str, mut edits: Vec<DocumentEdit>) -> Vec<DocumentEdit> {
         kept.push(edit);
     }
     kept
+}
+
+/// The status line entry of a reformat that is still running.
+fn progress(label: String, cancel: &Cancel) -> StatusProgress {
+    let cancel = cancel.clone();
+    StatusProgress {
+        label: label.into(),
+        cancel: Some(Arc::new(move || cancel.cancel())),
+    }
+}
+
+/// The files Git changed, as the keys two spellings of one path share. `None` when the
+/// project has no repository and the list is not available.
+fn changed_files(cx: &App) -> Option<HashSet<PathBuf>> {
+    let git = cx.try_global::<ActiveGit>()?.0.read(cx);
+    git.repo()?;
+    Some(
+        git.status()
+            .files
+            .iter()
+            .filter_map(|file| git.absolute(&file.path))
+            .map(|path| ::platform::path_key(&path))
+            .collect(),
+    )
+}
+
+/// Ctrl+Alt+L in the project tree: a dialog over the selected folders and files.
+pub(crate) fn show_paths_dialog(
+    workspace: &mut Workspace,
+    paths: Vec<PathBuf>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if paths.is_empty() {
+        return;
+    }
+    let settings = cx
+        .try_global::<workspace::Settings>()
+        .cloned()
+        .unwrap_or_default();
+    let changed = changed_files(cx).map(|files| files.len());
+    let weak = cx.weak_entity();
+    let view = cx.new(|cx| PathsDialog {
+        workspace: weak,
+        focus: cx.focus_handle(),
+        paths,
+        optimize: settings.reformat_optimize_imports,
+        only_changed: false,
+        changed,
+    });
+    let focus = view.read(cx).focus.clone();
+    workspace.show_overlay(view.into(), focus, window, cx);
+}
+
+struct PathsDialog {
+    workspace: WeakEntity<Workspace>,
+    focus: FocusHandle,
+    paths: Vec<PathBuf>,
+    optimize: bool,
+    only_changed: bool,
+    /// How many files Git changed, or `None` when its list is not available.
+    changed: Option<usize>,
+}
+
+impl PathsDialog {
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+            .ok();
+    }
+
+    fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (paths, optimize, only_changed) = (
+            self.paths.clone(),
+            self.optimize,
+            self.only_changed && self.changed.is_some(),
+        );
+        self.close(window, cx);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                run_paths(workspace, paths, optimize, only_changed, window, cx)
+            })
+            .ok();
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                self.accept(window, cx);
+                cx.stop_propagation();
+            }
+            "escape" => {
+                self.close(window, cx);
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Render for PathsDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let left = (window.viewport_size().width - px(WIDTH)) / 2.;
+        let top = window.viewport_size().height * 0.2;
+        let summary = match self.paths.as_slice() {
+            [one] => one.display().to_string(),
+            paths => format!("{} selected items", paths.len()),
+        };
+        let check =
+            |id: &'static str, on: bool, enabled: bool, label: &'static str, theme: &Theme| {
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .h(px(ROW_HEIGHT))
+                    .px(px(ROW_PADDING_X))
+                    .rounded(px(ROW_RADIUS))
+                    .text_color(if enabled {
+                        theme.text
+                    } else {
+                        theme.text_disabled
+                    })
+                    .when(enabled, |this| {
+                        this.hover(|style| style.bg(theme.selection_hover))
+                    })
+                    .child(checkbox(on, theme))
+                    .child(label)
+            };
+        let only = check(
+            "reformat-only-changed",
+            self.only_changed,
+            self.changed.is_some(),
+            "Only changed files",
+            &theme,
+        );
+        let only = if self.changed.is_some() {
+            only.on_click(cx.listener(|this, _, _, cx| {
+                this.only_changed = !this.only_changed;
+                cx.notify();
+            }))
+        } else {
+            only
+        };
+        let body = surface(&theme)
+            .id("reformat-dialog")
+            .debug_selector(|| "reformat-dialog".to_owned())
+            .track_focus(&self.focus)
+            .occlude()
+            .w(px(WIDTH))
+            .p(px(DIALOG_PADDING))
+            .gap(px(DIALOG_GAP))
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .child(
+                div()
+                    .debug_selector(|| "reformat-title".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_XS))
+                    .child(
+                        div()
+                            .text_size(px(TEXT_TITLE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Reformat Code"),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.text_secondary)
+                            .child(SharedString::from(summary)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        check(
+                            "reformat-optimize",
+                            self.optimize,
+                            true,
+                            "Optimize imports",
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.optimize = !this.optimize;
+                            cx.notify();
+                        })),
+                    )
+                    .child(only),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(SPACE_M))
+                    .child(
+                        div()
+                            .id("reformat-cancel")
+                            .debug_selector(|| "reformat-cancel".to_owned())
+                            .px(px(SPACE_L))
+                            .h(px(CONTROL_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .rounded(px(CONTROL_RADIUS))
+                            .hover(|style| style.bg(theme.selection_hover))
+                            .tooltip(|_, cx| tooltip("Cancel", Some(SharedString::from("Esc")), cx))
+                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("reformat-run")
+                            .debug_selector(|| "reformat-run".to_owned())
+                            .px(px(SPACE_L))
+                            .h(px(CONTROL_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .rounded(px(CONTROL_RADIUS))
+                            .bg(theme.accent)
+                            .text_color(theme.over_accent)
+                            .tooltip(|_, cx| {
+                                tooltip("Reformat Code", Some(SharedString::from("Enter")), cx)
+                            })
+                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                            .child("Reformat")
+                            .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
+                    ),
+            );
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .child(enter("reformat-enter", body))
+    }
+}
+
+/// Formats every file under the selected paths that the language server can format, as
+/// one change of the window: one undo step and the snapshots of Local History that a
+/// refactoring of several files takes.
+fn run_paths(
+    workspace: &mut Workspace,
+    paths: Vec<PathBuf>,
+    optimize: bool,
+    only_changed: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(support) = cx
+        .try_global::<Semantic>()
+        .map(|semantic| semantic.0.clone())
+    else {
+        workspace.notify_user("Reformat", "No language server for these files", cx);
+        return;
+    };
+    if support.format().is_none() {
+        workspace.notify_user(
+            "Reformat",
+            "The language server cannot format these files",
+            cx,
+        );
+        return;
+    }
+    let changed = if only_changed {
+        let Some(changed) = changed_files(cx) else {
+            workspace.notify_user("Reformat", "The project is not in a repository", cx);
+            return;
+        };
+        Some(changed)
+    } else {
+        None
+    };
+    let cancel = Cancel::new();
+    workspace.set_status_progress(Some(progress("Collecting files".to_owned(), &cancel)), cx);
+    let collect_cancel = cancel.clone();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let mut files = cx
+            .background_executor()
+            .spawn(async move { collect_files(paths, collect_cancel) })
+            .await;
+        if let Some(changed) = changed {
+            files.retain(|path| changed.contains(&::platform::path_key(path)));
+        }
+        files.retain(|path| support.matches(path));
+        let total = files.len();
+        if total == 0 {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.set_status_progress(None, cx);
+                    workspace.notify_user("Reformat", "Nothing to reformat", cx);
+                })
+                .ok();
+            return;
+        }
+        let format = support.format();
+        let actions = optimize.then(|| support.actions()).flatten();
+        let server = support.server();
+        let mut change = WorkspaceChange::default();
+        for (done, path) in files.iter().enumerate() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let label = format!("Reformatting {} of {}", done + 1, total);
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.set_status_progress(Some(progress(label, &cancel)), cx);
+                })
+                .ok();
+            let Ok(uri) = CanonPath::new(path) else {
+                continue;
+            };
+            let uri = uri.to_uri();
+            let open = workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .view_of(path)
+                        .and_then(|view| view.downcast::<EditorView>().ok())
+                        .and_then(|view| {
+                            let view = view.read(cx);
+                            Some((view.version()?, view.text()?, view.formatting_options()))
+                        })
+                })
+                .ok()
+                .flatten();
+            let (version, temporary, text, tab_size, insert_spaces) = match open {
+                Some((version, text, (tab_size, insert_spaces))) => {
+                    (version, false, text, tab_size, insert_spaces)
+                }
+                None => {
+                    let target = path.clone();
+                    let text = cx
+                        .background_executor()
+                        .spawn(
+                            async move { text_core::read_file(&target).ok().map(|file| file.text) },
+                        )
+                        .await
+                        .unwrap_or_default();
+                    let target = path.clone();
+                    let (tab_size, insert_spaces) = cx
+                        .background_executor()
+                        .spawn(async move { formatting_options_of(&target) })
+                        .await;
+                    // A document the server already holds is asked at the version it
+                    // has; a closed file is opened for the time of the request.
+                    if let Some(version) = server.and_then(|server| server.version(&uri)) {
+                        (version, false, text, tab_size, insert_spaces)
+                    } else {
+                        if let Some(server) = server {
+                            server.open(&uri, 1, text.clone().into());
+                        }
+                        (1, true, text, tab_size, insert_spaces)
+                    }
+                }
+            };
+            let mut edits = Vec::new();
+            if let Some(provider) = format {
+                let mut replies = ask(
+                    provider,
+                    FormatQuery {
+                        uri: uri.clone(),
+                        version,
+                        tab_size,
+                        insert_spaces,
+                    },
+                );
+                if let Some(answer) = replies.next().await {
+                    edits.extend(answer.value);
+                }
+            }
+            if let Some(provider) = actions {
+                let mut replies = ask(
+                    provider,
+                    ActionQuery {
+                        uri: uri.clone(),
+                        version,
+                        span: whole(&text),
+                        only: Some(ActionKind::OrganizeImports),
+                    },
+                );
+                if let Some(answer) = replies.next().await
+                    && let Some(entry) = answer.value.into_iter().next()
+                {
+                    for source in entry.edits {
+                        if source.uri == uri {
+                            edits.extend(source.edits);
+                        }
+                    }
+                }
+            }
+            if temporary && let Some(server) = server {
+                server.close(&uri);
+            }
+            let edits = merge(&text, edits);
+            if edits.is_empty() {
+                continue;
+            }
+            change.edits.push(SourceEdit { uri, edits });
+        }
+        let cancelled = cancel.is_cancelled();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.set_status_progress(None, cx);
+                if cancelled {
+                    workspace.notify_user("Reformat", "Reformat cancelled", cx);
+                } else if change.edits.is_empty() {
+                    workspace.notify_user("Reformat", "Nothing to reformat", cx);
+                } else {
+                    crate::changes::apply(workspace, change, window, cx);
+                }
+            })
+            .ok();
+    })
+    .detach();
+}
+
+/// Every file under the paths, without hidden folders and without following links.
+/// A cancel stops the walk as soon as it reaches the next folder entry.
+fn collect_files(paths: Vec<PathBuf>, cancel: Cancel) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in paths {
+        if cancel.is_cancelled() {
+            break;
+        }
+        walk_files(&path, &cancel, &mut files);
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn walk_files(path: &Path, cancel: &Cancel, files: &mut Vec<PathBuf>) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if metadata.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let child = entry.path();
+            let hidden = child
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+            if hidden {
+                continue;
+            }
+            walk_files(&child, cancel, files);
+        }
+    } else if metadata.is_file() {
+        files.push(path.to_path_buf());
+    }
+}
+
+/// The tab size and the spaces flag of a file that is not open, from the
+/// `.editorconfig` files around it. Runs off the UI thread.
+fn formatting_options_of(path: &Path) -> (u32, bool) {
+    text_core::for_file(path)
+        .indentation()
+        .map_or((4, true), |(tabs, size, _)| (size as u32, !tabs))
 }

@@ -725,11 +725,16 @@ fn the_rebase_dialog_has_no_crossing_controls(cx: &mut TestAppContext) {
     std::thread::sleep(Duration::from_millis(300));
     cx.run_until_parked();
     redraw(cx, window);
-    let background = dialog_background(cx, window);
     right_click(cx, window, "log-commit-1");
     wait_for(cx, "the commit menu", |cx| {
         has_selector(cx, window, "menu-0")
     });
+    // The click selects the commit, and the Changed files of the log behind the dialog
+    // fill with its files: they are part of the background, not of the dialog.
+    wait_for(cx, "the files of the commit", |cx| {
+        has_selector(cx, window, "log-file-0")
+    });
+    let background = dialog_background(cx, window);
     crate::window_tests::click(cx, window, "menu-9");
     wait_for(cx, "the rebase dialog", |cx| {
         has_selector(cx, window, "rebase-row-1")

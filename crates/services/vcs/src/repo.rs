@@ -42,6 +42,14 @@ pub struct Commit {
     pub committer: String,
 }
 
+/// A file a commit changed and the change the commit made to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitChange {
+    /// Relative to the repository root, with `/`. A renamed file has its new name.
+    pub path: String,
+    pub change: Change,
+}
+
 /// What the details pane of the log shows about one commit besides the fields of
 /// [`Commit`]: the whole message and the branches the commit belongs to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -270,14 +278,23 @@ impl Repository {
     }
 
     pub fn status(&self) -> io::Result<Status> {
+        self.status_with_ignored(false)
+    }
+
+    /// The status of the working tree. With `include_ignored`, the files `.gitignore`
+    /// leaves out are listed too, with the `!` code of `git status`.
+    pub fn status_with_ignored(&self, include_ignored: bool) -> io::Result<Status> {
         self.status_reads.fetch_add(1, Ordering::Relaxed);
-        let args = [
+        let mut args = vec![
             "status",
             "--porcelain=v2",
             "-z",
             "--branch",
             "--untracked-files=all",
         ];
+        if include_ignored {
+            args.push("--ignored=traditional");
+        }
         Ok(parse_status(&self.git.run(&self.root, args)?))
     }
 
@@ -312,6 +329,27 @@ impl Repository {
         Ok(FileDiff {
             base,
             current: current.to_owned(),
+            hunks,
+        })
+    }
+
+    /// The text of `path` at `right` against the same file at `left`, for Compare
+    /// Revisions: both sides come from the blobs, so the working tree is not involved.
+    pub fn revision_file_diff(
+        &self,
+        blobs: &mut BlobReader,
+        left: &str,
+        right: &str,
+        path: &str,
+    ) -> io::Result<FileDiff> {
+        let base = blobs.read(&format!("{left}:{path}"))?.unwrap_or_default();
+        let base = text_core::decode(&base).text;
+        let current = blobs.read(&format!("{right}:{path}"))?.unwrap_or_default();
+        let current = text_core::decode(&current).text;
+        let hunks = line_hunks(&base, &current);
+        Ok(FileDiff {
+            base,
+            current,
             hunks,
         })
     }
@@ -1015,6 +1053,55 @@ impl Repository {
             .collect())
     }
 
+    /// The files a commit changed against its first parent, each with its change. Renames
+    /// are found, so a moved file is one entry under its new name.
+    pub fn commit_changes(&self, commit: &str) -> io::Result<Vec<CommitChange>> {
+        let line = self.run(["rev-list", "--parents", "-n", "1", commit])?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let mut args = vec![
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-M",
+            "-z",
+        ];
+        match fields.get(1) {
+            Some(parent) => {
+                args.push(parent);
+                args.push(commit);
+            }
+            None => {
+                args.push("--root");
+                args.push(commit);
+            }
+        }
+        let output = self.git.run(&self.root, &args)?;
+        // With -z every field ends with a NUL: the change, then the path. A rename or a copy
+        // names the old path before the new one, and the new one is the file's path.
+        let mut records = output
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty());
+        let mut changes = Vec::new();
+        while let Some(status) = records.next() {
+            let letter = status.first().copied().unwrap_or_default();
+            let path = if matches!(letter, b'R' | b'C') {
+                records.next();
+                records.next()
+            } else {
+                records.next()
+            };
+            let Some(path) = path else {
+                break;
+            };
+            changes.push(CommitChange {
+                path: String::from_utf8_lossy(path).into_owned(),
+                change: Change::from_letter(letter),
+            });
+        }
+        Ok(changes)
+    }
+
     /// The text of `path` at `commit` against its first parent, for the diff popup.
     pub fn commit_file_diff(
         &self,
@@ -1335,6 +1422,22 @@ impl Repository {
         })
     }
 
+    /// The commits only one of the two revisions has, and the files they differ in, for
+    /// Compare Revisions of the log. The working tree takes no part in it.
+    pub fn compare_revisions(&self, left: &str, right: &str) -> io::Result<Compare> {
+        let only_base = self.commits_in(&format!("{right}..{left}"), COMPARE_LIMIT)?;
+        let only_current = self.commits_in(&format!("{left}..{right}"), COMPARE_LIMIT)?;
+        let mut files = Vec::new();
+        self.collect_files(&mut files, &[left, right])?;
+        files.sort();
+        files.dedup();
+        Ok(Compare {
+            only_base,
+            only_current,
+            files,
+        })
+    }
+
     /// What the working tree changed against `branch`, for Show Diff with Working Tree.
     pub fn working_tree_compare(&self, branch: &str) -> io::Result<Compare> {
         let only_base = self.commits_in(&format!("HEAD..{branch}"), COMPARE_LIMIT)?;
@@ -1430,8 +1533,28 @@ impl Repository {
             let time: i64 = time.trim().parse().unwrap_or(0);
             dated.push((time, position, commit.clone()));
         }
-        dated.sort_by_key(|(time, position, _)| (*time, *position));
+        // Two commits made in the same second keep their order in time from the parent
+        // relation: the log hands them over newest first.
+        dated.sort_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| {
+                if self.is_ancestor(&left.2, &right.2).unwrap_or(false) {
+                    std::cmp::Ordering::Less
+                } else if self.is_ancestor(&right.2, &left.2).unwrap_or(false) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    left.1.cmp(&right.1)
+                }
+            })
+        });
         Ok(dated.into_iter().map(|(_, _, commit)| commit).collect())
+    }
+
+    /// Whether `older` is on the way to `newer` in the history.
+    fn is_ancestor(&self, older: &str, newer: &str) -> io::Result<bool> {
+        Ok(self
+            .git
+            .run(&self.root, ["merge-base", "--is-ancestor", older, newer])
+            .is_ok())
     }
 
     /// The commits from `commit` to HEAD, oldest first, as the Rebase dialog lists them.

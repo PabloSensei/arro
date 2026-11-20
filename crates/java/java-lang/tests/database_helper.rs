@@ -93,6 +93,7 @@ fn model(root: &Path, jar: PathBuf) -> ProjectModel {
                 }],
                 ..Unit::default()
             }],
+            ..Module::default()
         }],
         resolved: true,
         ..ProjectModel::default()

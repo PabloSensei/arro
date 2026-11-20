@@ -31,12 +31,6 @@ pub struct Deviation {
 pub const DEVIATIONS: &[Deviation] = &[
     Deviation {
         context: "global",
-        keys: "alt-2",
-        idea_action: Some("ActivateBookmarksToolWindow"),
-        reason: "Bookmarks live in the editor (F11); the AI assistant uses the tool window slot.",
-    },
-    Deviation {
-        context: "global",
         keys: "ctrl-alt-shift-left",
         idea_action: Some("MoveElementLeft"),
         reason: "Moves the selected element left in the editor; outside the editor it moves focus to the previous split group. Tool windows are resized by dragging.",

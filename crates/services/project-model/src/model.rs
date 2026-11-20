@@ -15,10 +15,29 @@ pub struct ProjectModel {
     /// What each module depends on, when the tool resolved it.
     #[serde(default)]
     pub dependencies: Vec<ModuleDependencies>,
+    /// The named settings the build files of the project declare. A tool without them
+    /// leaves the list empty.
+    #[serde(default)]
+    pub profiles: Vec<BuildProfile>,
     /// False for a model read from project files alone, without the tool: it knows the
     /// modules and their roots, not their dependencies.
     pub resolved: bool,
     pub problems: Vec<String>,
+}
+
+/// One way the build of a project may be configured, as its files declare it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BuildProfile {
+    /// The name the build tool gives the setting.
+    pub name: String,
+    /// The build turns the setting on when the user says nothing.
+    pub active_by_default: bool,
+    /// The file that declares the setting.
+    pub source: Option<PathBuf>,
+    /// The condition the build checks before turning the setting on, written as a line
+    /// for the window. The window shows it and never checks it.
+    pub condition: Option<String>,
 }
 
 impl ProjectModel {
@@ -88,6 +107,16 @@ pub struct Module {
     pub id: String,
     pub name: String,
     pub dir: PathBuf,
+    /// The build file that declares the module, when the tool named one.
+    #[serde(default)]
+    pub build_file: Option<PathBuf>,
+    /// Folders the build writes generated sources to. They stay among the source roots,
+    /// which the compiler and the index need, and the page shows them apart.
+    #[serde(default)]
+    pub generated_roots: Vec<PathBuf>,
+    /// Folders the build leaves out of the module.
+    #[serde(default)]
+    pub excluded_roots: Vec<PathBuf>,
     pub units: Vec<Unit>,
 }
 
@@ -359,6 +388,25 @@ mod tests {
         let model: ProjectModel = serde_json::from_str(text).unwrap();
 
         assert!(model.dependencies.is_empty());
+        assert!(model.profiles.is_empty());
         assert_eq!(model.modules[0].name, "a");
+    }
+
+    #[test]
+    fn the_profiles_of_the_project_survive_the_cache() {
+        let model = ProjectModel {
+            profiles: vec![BuildProfile {
+                name: "dev".into(),
+                active_by_default: true,
+                source: Some("p/pom.xml".into()),
+                condition: Some("property debug=true".into()),
+            }],
+            ..ProjectModel::default()
+        };
+
+        let text = serde_json::to_string(&model).unwrap();
+        let read: ProjectModel = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(read.profiles, model.profiles);
     }
 }

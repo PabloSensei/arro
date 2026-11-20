@@ -18,12 +18,12 @@ pub(crate) const DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 /// What the user has to do for one tool call.
 #[derive(Clone, Debug)]
 pub enum EditKind {
-    /// The disk text of a file and the text the agent offers. Nothing is written until
-    /// every hunk is decided.
+    /// The disk text of a file and the text the agent offers, `None` to delete the file.
+    /// Nothing is written until every hunk is decided.
     Propose {
         path: PathBuf,
         base: Option<String>,
-        proposed: String,
+        proposed: Option<String>,
     },
     /// The edits of a rename, which the window applies after the user confirms them.
     Rename {
@@ -32,6 +32,8 @@ pub enum EditKind {
     },
     /// Formatting or Organize Imports: applied at once, with no question of its own.
     Apply { change: WorkspaceChange },
+    /// Opens a file in an editor of the window, for `open_file_in_editor`.
+    Open { path: PathBuf },
 }
 
 /// What became of one request. A request that times out says so and leaves the file as it
@@ -167,6 +169,13 @@ pub(crate) fn bind_actions(workspace: &mut Workspace) {
             panel.update(cx, |panel, cx| panel.answer_rename(apply, cx));
         });
     }
+    workspace.register_command("ai.mcp.undo-delete", "Undo Delete", |_, _, cx| {
+        let Some(panel) = cx.try_global::<crate::agents::ActiveAgents>() else {
+            return;
+        };
+        let panel = panel.0.clone();
+        panel.update(cx, |panel, cx| panel.undo_delete(cx));
+    });
 }
 
 #[cfg(test)]

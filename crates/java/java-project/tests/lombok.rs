@@ -44,6 +44,7 @@ fn model(coordinates: &str, path: Option<PathBuf>) -> ProjectModel {
                 }],
                 ..Unit::default()
             }],
+            ..Module::default()
         }],
         ..ProjectModel::default()
     }

@@ -1,7 +1,7 @@
 //! The Git Log tool window: the commits of the branch or of one file, the files a commit
 //! changed, the diff of one of them and the actions a right click on a commit opens.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ui_kit::metrics::*;
@@ -9,15 +9,15 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use vcs::graph;
 use vcs::{
-    Branch, CommandRecord, Commit, CommitDetails, RebaseAction, RebasePlan, RefKind, RefLabel,
-    Repository, ResetMode,
+    Branch, Change, CommandRecord, Commit, CommitDetails, RebaseAction, RebasePlan, RefKind,
+    RefLabel, Repository, ResetMode,
 };
-use workspace::{LOG_TOOL, Workspace};
+use workspace::{FileIcons, LOG_TOOL, Workspace};
 
 use crate::ansi::AnsiParser;
 use crate::commit::CommitPanel;
 use crate::diff_view::DiffView;
-use crate::git::{GitState, relative_of, short_commit};
+use crate::git::{GitState, Kind, relative_of, short_commit};
 use crate::prompt::{Prompt, TextField};
 use crate::run::wrapped_line_element;
 
@@ -171,6 +171,24 @@ struct FileRow {
     file: Option<usize>,
 }
 
+/// The prefix of the keys of the folders in the tree of the changed files.
+const FILES_TREE: &str = "files";
+/// The icon of a folder in the tree of the changed files.
+const FOLDER_ICON: &str = "nodes/folder";
+
+/// The colour kind of a file a commit changed, as Commit colours the same change: a new
+/// file is green, a deleted one grey, and every other change, a move included, blue.
+fn commit_change_kind(change: Change) -> Option<Kind> {
+    match change {
+        Change::Added => Some(Kind::Added),
+        Change::Deleted => Some(Kind::Deleted),
+        Change::Modified | Change::Renamed | Change::Copied | Change::TypeChanged => {
+            Some(Kind::Modified)
+        }
+        Change::Unmodified | Change::Untracked | Change::Ignored | Change::Conflicted => None,
+    }
+}
+
 /// The divider between two panes that the pointer moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitKind {
@@ -286,12 +304,24 @@ pub struct GitLogPanel {
     /// The indices of `commits` that the filter keeps.
     shown: Vec<usize>,
     files: Vec<String>,
+    /// The kind of each changed file of the selected commit by its path, for the colour of
+    /// its name. A file without a kind keeps the colour of the text.
+    file_kinds: HashMap<String, Kind>,
+    /// The row the details and the changed files follow.
     selected: Option<usize>,
+    /// Every selected row of the log, for Cherry-Pick and Compare Revisions.
+    picked: HashSet<usize>,
+    /// The row a Shift click extends the selection from.
+    anchor: Option<usize>,
     /// The file of the right tree the pointer chose, for Diff and Revert.
     selected_file: Option<usize>,
     /// The folders of the file tree the user folded.
     files_collapsed: HashSet<String>,
     filter: TextField,
+    /// The Paths filter: a folder or a file of the project, relative to its root.
+    path_query: TextField,
+    /// The keys go to the Paths field rather than to the filter of the commits.
+    path_search: bool,
     regex: bool,
     match_case: bool,
     user: Option<String>,
@@ -383,10 +413,15 @@ impl GitLogPanel {
                 lanes: 0,
                 shown: Vec::new(),
                 files: Vec::new(),
+                file_kinds: HashMap::new(),
                 selected: None,
+                picked: HashSet::new(),
+                anchor: None,
                 selected_file: None,
                 files_collapsed: HashSet::new(),
                 filter: TextField::default(),
+                path_query: TextField::default(),
+                path_search: false,
                 regex: false,
                 match_case: false,
                 user: None,
@@ -520,6 +555,8 @@ impl GitLogPanel {
         self.shown.clear();
         self.files.clear();
         self.selected = None;
+        self.picked.clear();
+        self.anchor = None;
         self.selected_file = None;
         self.details = None;
         self.offset = 0;
@@ -530,12 +567,51 @@ impl GitLogPanel {
     pub fn set_root(&mut self, root: Option<String>, cx: &mut Context<Self>) {
         self.root = root;
         self.selected = None;
+        self.picked.clear();
+        self.anchor = None;
         self.selected_file = None;
         self.files.clear();
         self.details = None;
         self.want = None;
         self.reload(cx);
         cx.notify();
+    }
+
+    /// The Paths field: a folder or a file of the project, absolute or relative to the
+    /// root. An empty field goes back to the log of the branch.
+    fn apply_path_filter(&mut self, cx: &mut Context<Self>) {
+        let text = self.path_query.text.trim().to_owned();
+        if text.is_empty() {
+            self.path = None;
+            self.clear_log();
+            self.want = None;
+            self.reload(cx);
+            cx.notify();
+            return;
+        }
+        let Some(root) = self
+            .git
+            .read(cx)
+            .repo()
+            .map(|repo| repo.root().to_path_buf())
+        else {
+            return;
+        };
+        let given = PathBuf::from(&text);
+        let path = if given.is_absolute() {
+            given
+        } else {
+            root.join(text.replace('\\', "/"))
+        };
+        self.show_path(path, cx);
+        self.path_query = TextField::from_text(text);
+        self.path_search = false;
+    }
+
+    /// The file or folder of the Paths filter, for a test.
+    #[cfg(test)]
+    pub fn path_filter(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// The menu of the root filter: every root and the project as a whole.
@@ -693,6 +769,8 @@ impl GitLogPanel {
                             .collect();
                         this.rebuild_branches();
                         this.selected = None;
+                        this.picked.clear();
+                        this.anchor = None;
                         this.selected_file = None;
                         this.files.clear();
                         this.details = None;
@@ -849,6 +927,8 @@ impl GitLogPanel {
             .is_some_and(|selected| selected >= self.shown.len())
         {
             self.selected = None;
+            self.picked.clear();
+            self.anchor = None;
             self.selected_file = None;
             self.files.clear();
             self.details = None;
@@ -999,6 +1079,15 @@ impl GitLogPanel {
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.picked.clear();
+        self.picked.insert(index);
+        self.anchor = Some(index);
+        self.select_row(index, cx);
+    }
+
+    /// Makes `index` the row whose files and details show, keeping the other selected
+    /// rows as they are.
+    fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(commit) = self
             .shown
             .get(index)
@@ -1026,9 +1115,9 @@ impl GitLogPanel {
                 .into_iter()
                 .find(|(root, _)| *root == prefix)
                 .map_or_else(|| repo.fork(), |(_, repository)| repository);
-            let files = repository.commit_files(&job_id)?;
+            let changes = repository.commit_changes(&job_id)?;
             let details = repository.commit_details(&job_id)?;
-            Ok::<_, std::io::Error>((files, details))
+            Ok::<_, std::io::Error>((changes, details))
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -1041,8 +1130,15 @@ impl GitLogPanel {
                     return;
                 }
                 match result {
-                    Ok((files, details)) => {
-                        this.files = files;
+                    Ok((changes, details)) => {
+                        this.file_kinds = changes
+                            .iter()
+                            .filter_map(|change| {
+                                commit_change_kind(change.change)
+                                    .map(|kind| (change.path.clone(), kind))
+                            })
+                            .collect();
+                        this.files = changes.into_iter().map(|change| change.path).collect();
                         this.details = Some(details);
                     }
                     Err(message) => this
@@ -1618,7 +1714,12 @@ impl GitLogPanel {
     /// Interactively Rebase from Here: reads the plan of the commits from the chosen one
     /// to HEAD, then opens the dialog of the plan. A commit that is not on the branch, or
     /// a range with a merge, is a notification instead of a dialog.
-    fn open_rebase(&mut self, commit: String, window: AnyWindowHandle, cx: &mut Context<Self>) {
+    pub(crate) fn open_rebase(
+        &mut self,
+        commit: String,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.git.read(cx).repo() else {
             return;
         };
@@ -1709,6 +1810,25 @@ impl GitLogPanel {
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
+        if self.path_search {
+            if stroke.key == "escape" {
+                self.path_search = false;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if stroke.key == "enter" {
+                self.apply_path_filter(cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if self.path_query.key(event, false) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
         if self.branch_search {
             if stroke.key == "escape" {
                 self.branch_search = false;
@@ -1759,6 +1879,96 @@ impl GitLogPanel {
             cx.stop_propagation();
             self.refilter(cx);
         }
+    }
+
+    /// A click on a row: a plain click selects it, Ctrl adds or removes it, and Shift
+    /// takes the range from the last clicked row.
+    fn click_row(&mut self, index: usize, modifiers: Modifiers, cx: &mut Context<Self>) {
+        if modifiers.shift {
+            let anchor = self.anchor.unwrap_or(index);
+            let (from, to) = if anchor <= index {
+                (anchor, index)
+            } else {
+                (index, anchor)
+            };
+            if !modifiers.control {
+                self.picked.clear();
+            }
+            self.picked.extend(from..=to);
+            self.select_row(index, cx);
+        } else if modifiers.control {
+            if !self.picked.remove(&index) {
+                self.picked.insert(index);
+            }
+            if self.picked.contains(&index) {
+                self.select_row(index, cx);
+            } else if self.selected == Some(index) {
+                self.selected = None;
+                self.selected_file = None;
+                self.files.clear();
+                self.details = None;
+                if let Some(next) = self.picked.iter().min().copied() {
+                    self.select_row(next, cx);
+                }
+            }
+            self.anchor = Some(index);
+        } else {
+            self.select(index, cx);
+        }
+    }
+
+    /// The selected commits in the order the log shows them, newest first.
+    fn picked_commits(&self) -> Vec<Commit> {
+        let mut rows: Vec<usize> = self.picked.iter().copied().collect();
+        rows.sort_unstable();
+        rows.into_iter()
+            .filter_map(|index| self.shown.get(index))
+            .filter_map(|index| self.commits.get(*index))
+            .cloned()
+            .collect()
+    }
+
+    /// The commits the git menu and the log actions use: every picked row.
+    pub fn picked_ids(&self) -> Vec<String> {
+        self.picked_commits()
+            .into_iter()
+            .map(|commit| commit.id)
+            .collect()
+    }
+
+    /// The row the details follow, for Rebase, Revert and Reset.
+    pub fn focused_commit_id(&self) -> Option<String> {
+        self.selected_commit().map(|commit| commit.id)
+    }
+
+    /// The two picked commits as `(older, newer)`, for Compare Revisions.
+    fn picked_pair(&self) -> Option<(Commit, Commit)> {
+        let mut rows: Vec<usize> = self.picked.iter().copied().collect();
+        rows.sort_unstable();
+        if rows.len() != 2 {
+            return None;
+        }
+        let newer = self
+            .shown
+            .get(rows[0])
+            .and_then(|index| self.commits.get(*index))
+            .cloned()?;
+        let older = self
+            .shown
+            .get(rows[1])
+            .and_then(|index| self.commits.get(*index))
+            .cloned()?;
+        Some((older, newer))
+    }
+
+    /// Cherry-Pick of every picked commit, in the order git replays them.
+    pub(crate) fn cherry_pick_picked(&mut self, cx: &mut Context<Self>) {
+        let commits = self.picked_ids();
+        if commits.is_empty() {
+            return;
+        }
+        self.git
+            .update(cx, |git, cx| git.cherry_pick_many(commits, cx));
     }
 
     /// Moves the selection of the commits, loading their files as a click does.
@@ -1825,9 +2035,14 @@ impl GitLogPanel {
         Some(text)
     }
 
-    /// The menu of a commit, as a right click of the log of IDEA opens it.
+    /// The menu of a commit, as a right click of the log of IDEA opens it. A click inside
+    /// the selected rows keeps the whole selection.
     fn commit_menu(&mut self, index: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
-        self.select(index, cx);
+        if self.picked.contains(&index) && self.picked.len() > 1 {
+            self.select_row(index, cx);
+        } else {
+            self.select(index, cx);
+        }
         let Some(commit) = self
             .shown
             .get(index)
@@ -1880,12 +2095,12 @@ impl GitLogPanel {
 
         entries.push(MenuEntry::separator());
 
-        let picked = id.clone();
+        let picked = self.picked_ids();
         let state = git.clone();
         entries.push(
             MenuEntry::new("Cherry-Pick", move |_, cx| {
-                let commit = picked.clone();
-                state.update(cx, |git, cx| git.cherry_pick(commit, cx));
+                let commits = picked.clone();
+                state.update(cx, |git, cx| git.cherry_pick_many(commits, cx));
             })
             .icon("general/vcs"),
         );
@@ -1940,6 +2155,27 @@ impl GitLogPanel {
                 state.update(cx, |git, cx| git.show_working_tree_diff(commit, cx));
             })
             .icon("general/vcs"),
+        );
+
+        let pair = self
+            .picked_pair()
+            .map(|(older, newer)| (older.id, newer.id));
+        let pair_enabled = pair.is_some();
+        let panel = cx.weak_entity();
+        entries.push(
+            MenuEntry::new("Compare Revisions", move |_, cx| {
+                if let Some((older, newer)) = pair.clone() {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel
+                                .git
+                                .update(cx, |git, cx| git.compare_revisions(older, newer, cx));
+                        })
+                        .ok();
+                }
+            })
+            .icon("general/vcs")
+            .enabled(pair_enabled),
         );
 
         self.workspace
@@ -2142,7 +2378,7 @@ impl GitLogPanel {
             .enumerate()
             .map(|(index, source)| {
                 let commit = &self.commits[*source];
-                let selected = self.selected == Some(index);
+                let selected = self.picked.contains(&index);
                 let short = &commit.id[..commit.id.len().min(7)];
                 let hover = theme.selection_hover;
                 let subject = commit.subject.clone();
@@ -2165,7 +2401,7 @@ impl GitLogPanel {
                     .when(selected, |this| this.bg(theme.selection_inactive))
                     .when(!selected, |this| this.hover(move |style| style.bg(hover)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.select(index, cx);
+                        this.click_row(index, event.modifiers(), cx);
                         if event.click_count() >= 2 {
                             cx.notify();
                         }
@@ -2260,14 +2496,16 @@ impl GitLogPanel {
             .enumerate()
             .map(|(index, path)| (path.clone(), index))
             .collect();
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // The keys of the folders carry the prefix of the tree, so a count finds its folder.
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for path in &self.files {
             let parts: Vec<&str> = path.split('/').collect();
             for depth in 1..parts.len() {
-                *counts.entry(parts[..depth].join("/")).or_default() += 1;
+                let key = format!("{FILES_TREE}/{}", parts[..depth].join("/"));
+                *counts.entry(key).or_default() += 1;
             }
         }
-        crate::branches::tree_rows(&entries, "files", 0, &self.files_collapsed)
+        crate::branches::tree_rows(&entries, FILES_TREE, 0, &self.files_collapsed)
             .into_iter()
             .map(|row| match row {
                 crate::branches::TreeRow::Folder { key, label, depth } => {
@@ -2291,46 +2529,68 @@ impl GitLogPanel {
             .collect()
     }
 
+    /// The icons of the files, as the workspace gives them to the tabs and the project tree.
+    fn file_icons(&self, cx: &App) -> FileIcons {
+        self.workspace
+            .read_with(cx, |workspace, _| workspace.icons().clone())
+            .unwrap_or_default()
+    }
+
+    /// The icon of a row of the Changed files tree: a folder has the folder icon, and a file
+    /// the icon of its type.
+    fn row_icon(&self, icons: &FileIcons, entry: &FileRow) -> &'static str {
+        match entry.file {
+            Some(index) => match self.files.get(index) {
+                Some(path) => icons.icon_for(Path::new(path)),
+                None => icons.fallback,
+            },
+            None => FOLDER_ICON,
+        }
+    }
+
+    /// The label and the icon of each row of the Changed files tree, in the order of the rows.
+    #[cfg(test)]
+    pub(crate) fn tree_icons(&self, cx: &App) -> Vec<(String, &'static str)> {
+        let icons = self.file_icons(cx);
+        self.file_tree_rows()
+            .iter()
+            .map(|entry| (entry.label.clone(), self.row_icon(&icons, entry)))
+            .collect()
+    }
+
     fn file_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let icons = self.file_icons(cx);
         self.file_tree_rows()
             .into_iter()
             .enumerate()
             .map(|(row, entry)| {
-                let depth = entry.depth;
                 let selected = entry.file.is_some() && self.selected_file == entry.file;
-                let label = entry.label.clone();
                 let debug = entry.file.map_or_else(
                     || format!("log-folder-{row}"),
                     |file| format!("log-file-{file}"),
                 );
+                // A file takes the colour of its change, as Commit colours it; a folder keeps
+                // the colour of the text.
+                let kind = entry
+                    .file
+                    .and_then(|file| self.files.get(file))
+                    .and_then(|path| self.file_kinds.get(path))
+                    .copied();
                 let file = entry.file;
                 let key = entry.key.clone();
-                let icon = if entry.count.is_some() {
-                    if self.files_collapsed.contains(&entry.key) {
-                        "general/chevronRight"
-                    } else {
-                        "general/chevronDown"
-                    }
-                } else {
-                    "fileTypes/text"
+                let node = TreeRow {
+                    id: ("log-file-row", row).into(),
+                    depth: entry.depth,
+                    label: entry.label.clone().into(),
+                    hint: entry.count.map(|count| format!("({count})").into()),
+                    icon: self.row_icon(&icons, &entry),
+                    expandable: file.is_none(),
+                    open: !self.files_collapsed.contains(&key),
+                    selected,
                 };
-                let count = entry.count;
-                div()
-                    .id(("log-file-row", row))
+                tree_row(node, theme)
                     .debug_selector(move || debug)
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .flex_none()
-                    .h(px(ROW_HEIGHT))
-                    .pl(px(ROW_PADDING_X + depth as f32 * SPACE_L))
-                    .pr(px(ROW_PADDING_X))
-                    .rounded(px(ROW_RADIUS))
-                    .when(selected, |this| this.bg(theme.selection_inactive))
-                    .hover({
-                        let hover = theme.selection_hover;
-                        move |style| style.bg(hover)
-                    })
+                    .when_some(kind, |this, kind| this.text_color(kind.color(theme)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if let Some(file) = file {
                             this.selected_file = Some(file);
@@ -2344,19 +2604,6 @@ impl GitLogPanel {
                         } else {
                             cx.notify();
                         }
-                    }))
-                    .child(icon_sized(icon, TEXT_SMALL, theme))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(label),
-                    )
-                    .children(count.map(|count| {
-                        div()
-                            .text_color(theme.text_secondary)
-                            .child(format!("({count})"))
                     }))
             })
             .collect()
@@ -2406,7 +2653,7 @@ impl GitLogPanel {
         self.files_collapsed.clear();
         if !open {
             for row in self.file_tree_rows() {
-                if row.count.is_some() {
+                if row.file.is_none() {
                     self.files_collapsed.insert(row.key);
                 }
             }
@@ -2838,6 +3085,7 @@ impl GitLogPanel {
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.branch_search = true;
+                                this.path_search = false;
                                 cx.notify();
                             })),
                     )
@@ -3210,6 +3458,7 @@ impl GitLogPanel {
     /// dropdowns, Refresh and Cherry-pick.
     fn filter_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let filter_empty = self.filter.text.is_empty();
+        let path_empty = self.path_query.text.is_empty();
         let dropdown = |id: &'static str, label: String, theme: &Theme| {
             div()
                 .id(id)
@@ -3229,22 +3478,33 @@ impl GitLogPanel {
                 })
                 .child(label)
         };
-        let can_cherry = self.selected.is_some();
+        let can_cherry = !self.picked.is_empty();
         let branch_label = self
             .branch_filter
             .clone()
             .unwrap_or_else(|| "All Branches".to_owned());
         let user_label = self.user.clone().unwrap_or_else(|| "All Users".to_owned());
-        let paths = self
-            .root
-            .as_ref()
-            .and_then(|prefix| {
-                self.roots
-                    .iter()
-                    .find(|(root, _)| root == prefix)
-                    .map(|(_, label)| label.clone())
-            })
-            .unwrap_or_else(|| "All Paths".to_owned());
+        let paths = match self.path.as_ref() {
+            Some(path) => {
+                let root = self
+                    .git
+                    .read(cx)
+                    .repo()
+                    .map(|repo| repo.root().to_path_buf())
+                    .unwrap_or_default();
+                relative_of(&root, path)
+            }
+            None => self
+                .root
+                .as_ref()
+                .and_then(|prefix| {
+                    self.roots
+                        .iter()
+                        .find(|(root, _)| root == prefix)
+                        .map(|(_, label)| label.clone())
+                })
+                .unwrap_or_else(|| "All Paths".to_owned()),
+        };
         div()
             .id("log-filter-bar")
             .flex()
@@ -3289,6 +3549,7 @@ impl GitLogPanel {
                             .when(filter_empty, |this| this.child("Text or hash"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.branch_search = false;
+                                this.path_search = false;
                                 cx.notify();
                             })),
                     )
@@ -3356,9 +3617,11 @@ impl GitLogPanel {
                             .child("Cherry-pick")
                             .when(can_cherry, |this| {
                                 this.on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(commit) = this.selected_commit() {
-                                        let id = commit.id;
-                                        this.git.update(cx, |git, cx| git.cherry_pick(id, cx));
+                                    let commits = this.picked_ids();
+                                    if !commits.is_empty() {
+                                        this.git.update(cx, |git, cx| {
+                                            git.cherry_pick_many(commits, cx)
+                                        });
                                     }
                                 }))
                             }),
@@ -3401,7 +3664,42 @@ impl GitLogPanel {
                     )
                     .child(dropdown("log-roots", paths, theme).on_click(cx.listener(
                         |this, _, window, cx| this.root_menu(window.mouse_position(), cx),
-                    ))),
+                    )))
+                    .child(
+                        div()
+                            .id("log-filter-path")
+                            .debug_selector(|| "log-filter-path".to_owned())
+                            .flex()
+                            .items_center()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(CONTROL_HEIGHT))
+                            .px(px(SPACE_M))
+                            .rounded(px(CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(theme.popup_border)
+                            .text_color(if path_empty {
+                                theme.text_secondary
+                            } else {
+                                theme.text
+                            })
+                            .children(text_field_children_named(
+                                "git-log-path-filter",
+                                &self.path_query,
+                                theme.text,
+                                theme.text,
+                                theme.selection,
+                                theme.caret,
+                                16.,
+                                self.path_search,
+                            ))
+                            .when(path_empty, |this| this.child("Path or folder"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.branch_search = false;
+                                this.path_search = true;
+                                cx.notify();
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -3771,7 +4069,7 @@ fn action_button(
 
 /// Reset Current Branch to Here: the four modes of git, each with what it keeps, as the
 /// dialog of IDEA explains them. Hard asks again when the local changes would be lost.
-struct ResetView {
+pub(crate) struct ResetView {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -3779,7 +4077,7 @@ struct ResetView {
 }
 
 impl ResetView {
-    fn open(
+    pub(crate) fn open(
         git: Entity<GitState>,
         commit: String,
         workspace: &mut Workspace,

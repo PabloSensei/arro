@@ -406,6 +406,7 @@ mod tests {
                 name: "app".into(),
                 dir: root.to_path_buf(),
                 units: Vec::new(),
+                ..Module::default()
             }],
             resolved: true,
             ..ProjectModel::default()

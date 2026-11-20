@@ -422,6 +422,7 @@ fn fix_entry(
         renames: Vec::new(),
         handle: None,
         resolve: None,
+        rename: None,
     }
 }
 

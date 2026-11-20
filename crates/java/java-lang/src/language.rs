@@ -8,12 +8,13 @@ use lang_api::{
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
     GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
     InlayHintProvider, InlayHintSettings, LanguageId, LanguageSupport, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveProvider, NavigationProvider, OverridableMethodsProvider,
+    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
+    MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
     PrepareDiagnosticsProvider, ProjectProblemsProvider, Queries, RangeFormatProvider,
     ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer,
     SemanticTokensProvider, SignatureProvider, SourceTextProvider, StructuralEdit, StructuralMatch,
     StructuralQuery, StructuralSearchProvider, StructuralTemplate, SymbolProvider, SyntaxProvider,
-    UnwrapEdit, WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
+    TypeHierarchyProvider, UnwrapEdit, WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use lang_api::{ExpectedTypeProvider, ExternalDocProvider, SignatureInfoProvider};
 use tree_sitter_language::LanguageFn;
@@ -416,6 +417,10 @@ impl LanguageSupport for JavaProject {
         Some(&self.java_messages)
     }
 
+    fn refactor_selections(&self) -> Option<&lang_api::RefactorSelectionsProvider> {
+        Some(self.providers.as_ref())
+    }
+
     fn debug_processes(&self) -> Option<&lang_api::DebugProcessProvider> {
         Some(&crate::debug::DEBUG_PROCESSES)
     }
@@ -473,6 +478,20 @@ impl LanguageSupport for JavaProject {
         Some(self.providers.as_ref())
     }
 
+    fn move_members_form(&self) -> Option<&MoveMembersFormProvider> {
+        Some(&self.move_members)
+    }
+
+    fn move_targets_form(&self) -> Option<&MoveTargetsFormProvider> {
+        Some(&self.move_targets)
+    }
+
+    /// F6 on the declaration of a member moves the member, and on anything else the
+    /// file.
+    fn move_place(&self, text: &str, offset: usize) -> MovePlace {
+        crate::members::move_place(text, offset)
+    }
+
     fn change_signature_info(&self) -> Option<&ChangeSignatureInfoProvider> {
         Some(self.providers.as_ref())
     }
@@ -481,8 +500,20 @@ impl LanguageSupport for JavaProject {
         Some(self.providers.as_ref())
     }
 
+    fn member_action_form(&self) -> Option<&lang_api::MemberActionParametersProvider> {
+        Some(&self.members)
+    }
+
+    fn apply_member_action(&self) -> Option<&lang_api::MemberActionProvider> {
+        Some(&self.members)
+    }
+
     fn hierarchy(&self) -> Option<&HierarchyProvider> {
         Some(self.providers.as_ref())
+    }
+
+    fn type_hierarchy(&self) -> Option<&TypeHierarchyProvider> {
+        Some(self)
     }
 
     fn file_symbols(&self) -> Option<&FileSymbolsProvider> {
@@ -536,6 +567,10 @@ impl LanguageSupport for JavaProject {
     }
 
     fn method_hierarchy(&self) -> Option<&MethodHierarchyProvider> {
+        Some(self)
+    }
+
+    fn run_points(&self) -> Option<&lang_api::RunPointsProvider> {
         Some(self)
     }
 

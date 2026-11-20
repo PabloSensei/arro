@@ -31,7 +31,8 @@ use crate::editor::{
 use crate::external::{OpenRequests, OpenTarget, Request, open_target};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{
-    DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_layout, save_theme,
+    BookmarkLayout, DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_layout,
+    save_theme,
 };
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
@@ -44,6 +45,14 @@ const README_URL: &str = "https://github.com/PabloSensei/arro";
 /// The command of a second search for a tool that a language server needs.
 pub const CHECK_LANGUAGE_SETUP: &str = "language.check_setup";
 
+/// A long task the status bar shows while it runs: what it does and, when it can stop,
+/// the callback of its Cancel button.
+#[derive(Clone)]
+pub struct StatusProgress {
+    pub label: SharedString,
+    pub cancel: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
 actions!(
     workspace,
     [
@@ -52,6 +61,7 @@ actions!(
         ToggleTerminal,
         ToggleRun,
         ToggleAi,
+        ToggleBookmarks,
         ToggleCommit,
         ToggleStructure,
         ToggleServices,
@@ -117,6 +127,9 @@ actions!(
         Rerun,
         // The IDE actions of M11 added after the first batch.
         Compile,
+        BuildModule,
+        RebuildProject,
+        GenerateSources,
         RerunTests,
         StopBackgroundProcesses,
         Synchronize,
@@ -220,7 +233,7 @@ macro_rules! window_keys {
 #[rustfmt::skip]
 window_keys![
     ("alt-1", ToggleProject, None, Some("ActivateProjectToolWindow"), None),
-    ("alt-2", ToggleAi, None, None, Some("cmd-2")),
+    ("alt-2", ToggleBookmarks, None, Some("ActivateBookmarksToolWindow"), None),
     ("alt-3", ToggleUsages, None, Some("ActivateFindToolWindow"), None),
     ("alt-4", ToggleRun, None, Some("ActivateRunToolWindow"), None),
     ("alt-5", ToggleDebug, None, Some("ActivateDebugToolWindow"), None),
@@ -428,6 +441,8 @@ pub const AI_TOOL: &str = "ai";
 /// tab of the connected MCP clients.
 pub const AI_CLIENTS: &str = "ai.mcp.clients";
 pub const TASKS_TOOL: &str = "tasks";
+/// The output of the last build with the tree of its errors and warnings.
+pub const BUILD_TOOL: &str = "build-output";
 pub const COMMIT_TOOL: &str = "commit";
 pub const STRUCTURE_TOOL: &str = "structure";
 pub const PROBLEMS_TOOL: &str = "problems";
@@ -439,6 +454,7 @@ pub const DOCUMENTATION_TOOL: &str = "documentation";
 pub const LOG_TOOL: &str = "log";
 pub const SELECTION_HISTORY_TOOL: &str = "selection-history";
 pub const CALL_HIERARCHY_TOOL: &str = "call-hierarchy";
+pub const TYPE_HIERARCHY_TOOL: &str = "type-hierarchy";
 pub const STACK_TRACE_TOOL: &str = "stack-trace";
 pub const METHOD_HIERARCHY_TOOL: &str = "method-hierarchy";
 pub const INSPECTION_TOOL: &str = "inspection-results";
@@ -449,6 +465,8 @@ pub const DATABASE_TOOL: &str = "database";
 pub const JSHELL_TOOL: &str = "jshell";
 pub const ENDPOINTS_TOOL: &str = "endpoints";
 pub const BEANS_TOOL: &str = "beans";
+/// The Bookmarks window: the groups of the project and their files.
+pub const BOOKMARKS_TOOL: &str = "bookmarks";
 
 pub(crate) struct DockTool {
     pub id: &'static str,
@@ -597,6 +615,8 @@ type ConfigChooseHook = Rc<dyn Fn(bool, &mut Workspace, &mut Window, &mut Contex
 /// What a command does. Commands are found by id: from the keymap, from Find Action
 /// and from scripts.
 pub type CommandFn = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+/// Whether a command applies now, for the grey rows of the menus.
+pub type CommandCheck = Rc<dyn Fn(&Workspace, &App) -> bool>;
 /// Chooses the tab of a tool window with tabs when an action opens it. The answer says
 /// whether the tab moved.
 pub type ToolActivator = Rc<dyn Fn(&str, &mut App) -> bool>;
@@ -701,6 +721,8 @@ pub struct Workspace {
     zoom_notice: Option<SharedString>,
     /// A number that drops a late end of a notice.
     zoom_notice_serial: usize,
+    /// The long task the status bar shows while it runs, with its Cancel button.
+    status_progress: Option<StatusProgress>,
     pub(crate) balloon_visible: bool,
     pub(crate) balloon_serial: usize,
     icons: FileIcons,
@@ -720,6 +742,8 @@ pub struct Workspace {
     pub(crate) agent_busy: bool,
     /// The explanation behind the language status line, for the balloon of a click.
     pub(crate) language_details: Option<SharedString>,
+    /// The command a click on the language status line runs instead of the help balloon.
+    pub(crate) language_action: Option<&'static str>,
     /// A page with the tool the language server did not find, and the label of its button.
     pub(crate) language_download: Option<(SharedString, String)>,
     /// Whether the balloon also offers a second search for the tool.
@@ -739,6 +763,9 @@ pub struct Workspace {
     /// settings.
     icon_sets: IconCatalog,
     keymap: Keymap,
+    /// The keyboard platform the window was opened with. The application chooses it once
+    /// before the first window, and a window keeps it for the keys it was bound with.
+    keys_platform: keymap::Platform,
     /// The actions the keymap knows: the default ones and the plugin commands.
     keymap_actions: ActionRegistry,
     /// What the user adds to and removes from the default layout.
@@ -756,6 +783,8 @@ pub struct Workspace {
     key_between: std::rc::Rc<std::cell::Cell<bool>>,
     commands: CommandRegistry,
     handlers: HashMap<&'static str, CommandFn>,
+    /// The commands whose menu row is grey while they do not apply.
+    command_checks: HashMap<&'static str, CommandCheck>,
     tab_listener: Option<TabListener>,
     /// The callbacks of the views that follow the files whose tabs close.
     tab_closed_hooks: Vec<TabListener>,
@@ -942,6 +971,9 @@ impl Workspace {
         let right_stripe_view = ChromeView::right_stripe(chrome_weak.clone(), cx);
         let bounds = cx.observe_window_bounds(window, |this, window, cx| {
             this.placement = placement_of(window, cx).or(this.placement);
+            // The window changes its screen without the command of the window, by its
+            // green button or the key of the system: the menu follows the window.
+            this.sync_full_screen(window, cx);
             this.layout_changed(cx);
         });
         // Leaving the window for another program writes what is unsaved, as the IDE does.
@@ -949,6 +981,7 @@ impl Workspace {
             if window.is_window_active() {
                 // The menu of the screen follows what the window holds: recent projects,
                 // run configurations, the tabs of the window.
+                this.sync_full_screen(window, cx);
                 this.refresh_platform_menus(cx);
             } else if autosave_on(cx) && save_actions_on(cx) {
                 this.save_all(cx);
@@ -1024,7 +1057,10 @@ impl Workspace {
         cx.set_global(icon_sets.clone());
 
         let keymap_path = settings_dir.join(KEYMAP_FILE);
-        let (keymap_actions, keymap) = keymap::default_keymap();
+        // The application chooses the keyboard platform once, before the first window; the
+        // window keeps the one its keys are bound with.
+        let keys_platform = keymap::platform();
+        let (keymap_actions, keymap) = keymap::default_keymap_for(keys_platform);
 
         let mut workspace = Self {
             name,
@@ -1085,6 +1121,7 @@ impl Workspace {
             zen_full_screen: false,
             zoom_notice: None,
             zoom_notice_serial: 0,
+            status_progress: None,
             balloon_visible: false,
             balloon_serial: 0,
             icons,
@@ -1097,6 +1134,7 @@ impl Workspace {
             agent_clients: 0,
             agent_busy: false,
             language_details: None,
+            language_action: None,
             language_download: None,
             language_check: false,
             run: None,
@@ -1108,6 +1146,7 @@ impl Workspace {
             themes,
             icon_sets,
             keymap,
+            keys_platform,
             keymap_actions,
             keymap_file: KeymapFile::default(),
             keymap_path,
@@ -1119,6 +1158,7 @@ impl Workspace {
             key_between,
             commands: CommandRegistry::new(),
             handlers: HashMap::new(),
+            command_checks: HashMap::new(),
             tab_listener: None,
             tab_closed_hooks: Vec::new(),
             buffers: HashMap::new(),
@@ -1912,12 +1952,48 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+F9: builds the project with its build tool and shows the build console.
+    /// Ctrl+F9: builds the project with its build tool and shows the Build window. The
+    /// focus stays in the editor, as IDEA keeps it.
     pub fn build_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(run) = self.run.clone() {
             (run.build)(window, cx);
-            self.show_tool(RUN_TOOL, window, cx);
+            self.show_build(window, cx);
         }
+    }
+
+    /// Build Module: builds the module of `path` with the build tool.
+    pub fn build_module(
+        &mut self,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(run) = self.run.clone() {
+            (run.build_module)(path, window, cx);
+            self.show_build(window, cx);
+        }
+    }
+
+    /// Rebuild Project: builds the whole project again from scratch.
+    pub fn rebuild_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.rebuild)(window, cx);
+            self.show_build(window, cx);
+        }
+    }
+
+    /// Generate Sources and Update Folders: runs the source generator of the build tool.
+    pub fn generate_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run) = self.run.clone() {
+            (run.generate_sources)(window, cx);
+            self.show_build(window, cx);
+        }
+    }
+
+    /// Opens the Build window without taking the focus from the editor.
+    fn show_build(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_tool(BUILD_TOOL, window, cx);
+        self.focus_active(window, cx);
     }
 
     /// Ctrl+F5: the last configuration or test request again.
@@ -1937,7 +2013,7 @@ impl Workspace {
     ) {
         if let Some(run) = self.run.clone() {
             (run.compile)(path, window, cx);
-            self.show_tool(RUN_TOOL, window, cx);
+            self.show_build(window, cx);
         }
     }
 
@@ -2455,9 +2531,38 @@ impl Workspace {
         self.full_screen
     }
 
+    /// The keyboard platform the window follows: Command leads on macOS, Control elsewhere.
+    pub fn keys_platform(&self) -> keymap::Platform {
+        self.keys_platform
+    }
+
+    /// Takes the keys of `platform` for this window alone. A window of the application
+    /// chooses its platform once at start; a test of the other platform uses this rather
+    /// than the platform of the whole process, which would reach the windows beside it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn use_keys_of(&mut self, platform: keymap::Platform, cx: &mut Context<Self>) {
+        if self.keys_platform == platform {
+            return;
+        }
+        self.keys_platform = platform;
+        self.rebuild_keymap(cx);
+    }
+
     /// Ctrl+Cmd+F on macOS: the window fills the screen or comes back.
     pub fn toggle_full_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_full_screen(!self.full_screen, window);
+        self.refresh_platform_menus(cx);
+        cx.notify();
+    }
+
+    /// Reads the full screen of the window: the green button and the key of the system
+    /// change it without the command of the window, and the menu follows the window.
+    fn sync_full_screen(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let full = window.is_fullscreen();
+        if self.full_screen == full {
+            return;
+        }
+        self.full_screen = full;
         self.refresh_platform_menus(cx);
         cx.notify();
     }
@@ -2567,6 +2672,21 @@ impl Workspace {
 
     pub fn language_status(&self) -> Option<&SharedString> {
         self.language_status.as_ref()
+    }
+
+    /// The command a click on the language status line runs, such as the notification
+    /// of a failed import. Without one, the click opens the help balloon.
+    pub fn language_action(&self) -> Option<&'static str> {
+        self.language_action
+    }
+
+    /// Sets what a click on the language status line does besides opening its balloon.
+    pub fn set_language_action(&mut self, action: Option<&'static str>, cx: &mut Context<Self>) {
+        if self.language_action == action {
+            return;
+        }
+        self.language_action = action;
+        cx.notify();
     }
 
     /// The connected MCP clients and whether one runs an `Execute` tool.
@@ -3612,7 +3732,7 @@ impl Workspace {
 
     /// The default layout with the file of the user on top, then the plugin keys.
     fn rebuild_keymap(&mut self, cx: &mut Context<Self>) {
-        let (_, base) = keymap::default_keymap();
+        let (_, base) = keymap::default_keymap_for(self.keys_platform);
         let mut keymap = match self.keymap_file.apply(&self.keymap_actions, &base) {
             Ok(keymap) => keymap,
             Err(error) => {
@@ -4519,16 +4639,6 @@ impl Workspace {
         }
     }
 
-    /// Closes the open popup and gives the focus back to the editor, as a second press on
-    /// the button that opened it does.
-    pub(crate) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlay.take().is_some() {
-            self.menu_task = None;
-            self.focus_active(window, cx);
-            cx.notify();
-        }
-    }
-
     pub fn show_menu(
         &mut self,
         position: Point<Pixels>,
@@ -4955,6 +5065,23 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Puts a task in the status bar while a long operation runs, or takes it away with
+    /// `None`. The bar draws the Cancel button from the callback of the task.
+    pub fn set_status_progress(
+        &mut self,
+        progress: Option<StatusProgress>,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_progress = progress;
+        self.status_view.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    /// The task of the status bar, for scripts and tests.
+    pub fn status_progress(&self) -> Option<&StatusProgress> {
+        self.status_progress.as_ref()
+    }
+
     pub fn notify_user(
         &mut self,
         title: impl Into<SharedString>,
@@ -5030,6 +5157,36 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A notification with buttons that run commands of the window and one button that
+    /// opens `action_path`. The command buttons come first, the file last.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify_user_with_action_and_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        action: impl Into<SharedString>,
+        action_path: PathBuf,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.balloon = Some(Balloon {
+            title: title.into(),
+            text: text.into(),
+            action: Some((action.into(), action_path)),
+            buttons: buttons
+                .into_iter()
+                .map(|(id, label, command)| BalloonButton {
+                    id,
+                    label,
+                    action: BalloonAction::Command(command),
+                })
+                .collect(),
+        });
+        self.balloon_visible = true;
+        self.balloon_serial += 1;
+        cx.notify();
+    }
+
     /// The last notification, for scripts and tests.
     pub fn last_notification(&self) -> Option<(SharedString, SharedString)> {
         self.balloon
@@ -5050,16 +5207,21 @@ impl Workspace {
             .and_then(|balloon| balloon.action.clone())
     }
 
-    /// The buttons of the last notification, for scripts and tests.
+    /// The buttons of the last notification in the order they are shown, including the
+    /// one that opens a file, for scripts and tests.
     pub fn last_notification_buttons(&self) -> Vec<SharedString> {
         self.balloon
             .as_ref()
             .map(|balloon| {
-                balloon
+                let mut labels: Vec<SharedString> = balloon
                     .buttons
                     .iter()
                     .map(|button| button.label.clone())
-                    .collect()
+                    .collect();
+                if let Some((label, _)) = &balloon.action {
+                    labels.push(label.clone());
+                }
+                labels
             })
             .unwrap_or_default()
     }
@@ -5138,7 +5300,7 @@ impl Workspace {
         let modifiers = event.keystroke.modifiers;
         // Command is the primary modifier of macOS; the Super key of the other systems is
         // not ours and never reaches the keymap.
-        if (modifiers.platform && !cfg!(target_os = "macos"))
+        if (modifiers.platform && !self.keys_platform.uses_command())
             || matches!(
                 key,
                 "shift" | "control" | "alt" | "platform" | "cmd" | "command"
@@ -5178,6 +5340,22 @@ impl Workspace {
         self.commands
             .register(id, title, keymap::workspace::CONTEXT);
         self.handlers.insert(id, Rc::new(handler));
+    }
+
+    /// Says whether a command applies, so that its menu row is grey when it does not.
+    pub fn set_command_check(
+        &mut self,
+        id: &'static str,
+        check: impl Fn(&Workspace, &App) -> bool + 'static,
+    ) {
+        self.command_checks.insert(id, Rc::new(check));
+    }
+
+    /// Whether a command applies now; a command without a check always does.
+    pub fn command_applies(&self, id: &str, cx: &App) -> bool {
+        self.command_checks
+            .get(id)
+            .is_none_or(|check| check(self, cx))
     }
 
     /// Adds a command that runs by id but is not listed in Find Action or Search
@@ -5378,7 +5556,18 @@ impl Workspace {
             services_collapsed: self.layout.services_collapsed.clone(),
             services_selected: self.layout.services_selected.clone(),
             services_show_all: self.layout.services_show_all,
+            bookmarks: self.layout.bookmarks.clone(),
         }
+    }
+
+    /// The Bookmarks window changed its groups or its descriptions: the project keeps
+    /// them with the next layout.
+    pub fn set_bookmarks(&mut self, bookmarks: BookmarkLayout, cx: &mut Context<Self>) {
+        if self.layout.bookmarks == bookmarks {
+            return;
+        }
+        self.layout.bookmarks = bookmarks;
+        self.layout_changed(cx);
     }
 
     /// A tab changed something the saved layout keeps, such as what its preview shows.

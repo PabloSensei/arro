@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use keymap::Platform;
 use project_model::EnvironmentProvider;
 use terminal::{SearchMatch, SearchQuery, ShiftEnter, SpawnSpec, TERM_VARS, TerminalSession};
 use ui_kit::metrics::*;
@@ -16,9 +17,10 @@ use ui_kit::*;
 use workspace::{Settings, ToggleTerminal, Workspace};
 
 use crate::navigation;
+use crate::project_structure::dialog_button;
 use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
-    CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, is_paste, pressed,
+    CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, pressed,
     scroll_lines, send_key,
 };
 use crate::term_links::{LinkKind, LinkText};
@@ -176,6 +178,8 @@ pub struct TerminalPanel {
     store: Option<Arc<store::Store>>,
     tabs: Vec<Tab>,
     active: usize,
+    /// The keyboard platform the panel was opened with: Command leads on macOS.
+    keys_platform: Platform,
     focus: FocusHandle,
     search_focus: FocusHandle,
     /// The tab whose name is being typed, and the field of the new name.
@@ -186,6 +190,24 @@ pub struct TerminalPanel {
     bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// Whether a harness held the IDE protocol when the panel last looked.
     ide_connected: bool,
+    /// The client whose command started in the shell and whose settings have no entry of
+    /// Arro, for the bar above the grid.
+    terminal_suggestion: Option<mcp_discovery::Client>,
+    /// Numbers the reads behind the bar, so a later command wins.
+    suggestion_generation: u64,
+}
+
+/// The client a command line of the prompt starts, when it is `claude` or `codex`.
+fn client_of_command(line: &str) -> Option<mcp_discovery::Client> {
+    let command = line.rsplit(['$', '>', '#', '%']).next()?.trim_start();
+    let word = command.split_whitespace().next()?;
+    let program = word.rsplit(['\\', '/']).next().unwrap_or(word);
+    let program = program.strip_suffix(".exe").unwrap_or(program);
+    match program {
+        "claude" => Some(mcp_discovery::Client::ClaudeCode),
+        "codex" => Some(mcp_discovery::Client::Codex),
+        _ => None,
+    }
 }
 
 /// The shell sees what the user sees in any console, plus the terminal variables and the
@@ -263,18 +285,121 @@ fn prepend_path(env: &mut Vec<(String, String)>, bin: &Path) {
     }
 }
 
+/// A press the terminal takes for itself instead of writing it into the shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalCommand {
+    NewTab,
+    CloseTab,
+    Find,
+    Copy,
+    /// Copies a selection and otherwise goes to the shell, where Ctrl+C interrupts.
+    CopyIfSelected,
+    Paste,
+}
+
+/// The keys of the terminal that act on the window rather than reach the shell. macOS
+/// takes them with Command, as IDEA does, and leaves Control to the shell: Ctrl+C there
+/// interrupts the program. The other systems keep the Control keys of IDEA.
+struct TerminalKeys {
+    new_tab: &'static [&'static str],
+    close_tab: &'static [&'static str],
+    find: &'static [&'static str],
+    copy: &'static [&'static str],
+    copy_selection: &'static [&'static str],
+    paste: &'static [&'static str],
+}
+
+const TERMINAL_KEYS_WINDOWS: TerminalKeys = TerminalKeys {
+    new_tab: &["ctrl-shift-t"],
+    close_tab: &["ctrl-f4", "ctrl-shift-f4"],
+    find: &["ctrl-f"],
+    copy: &["ctrl-shift-c"],
+    copy_selection: &["ctrl-c"],
+    paste: &["ctrl-shift-v", "ctrl-v", "shift-insert"],
+};
+
+const TERMINAL_KEYS_MACOS: TerminalKeys = TerminalKeys {
+    new_tab: &["cmd-t", "cmd-shift-t"],
+    close_tab: &["cmd-w"],
+    find: &["cmd-f"],
+    copy: &["cmd-c"],
+    // Control belongs to the shell on macOS: Ctrl+C keeps interrupting the program.
+    copy_selection: &[],
+    paste: &["cmd-v"],
+};
+
+/// The keys of the terminal of one platform, for the bindings and the press handler.
+fn terminal_keys(platform: Platform) -> &'static TerminalKeys {
+    if platform.uses_command() {
+        &TERMINAL_KEYS_MACOS
+    } else {
+        &TERMINAL_KEYS_WINDOWS
+    }
+}
+
+/// Whether a press is the key of `shortcut`, as the keymap writes it.
+fn is_key(stroke: &Keystroke, shortcut: &str) -> bool {
+    let Ok(wanted) = keymap::Keystroke::parse(shortcut) else {
+        return false;
+    };
+    let modifiers = stroke.modifiers;
+    wanted.key == stroke.key
+        && wanted.ctrl == modifiers.control
+        && wanted.alt == modifiers.alt
+        && wanted.shift == modifiers.shift
+        && wanted.cmd == modifiers.platform
+}
+
+/// What a press means to the terminal of `platform`, `None` when the shell gets it.
+fn terminal_command(stroke: &Keystroke, platform: Platform) -> Option<TerminalCommand> {
+    let keys = terminal_keys(platform);
+    let any = |shortcuts: &[&str]| shortcuts.iter().any(|shortcut| is_key(stroke, shortcut));
+    if any(keys.new_tab) {
+        Some(TerminalCommand::NewTab)
+    } else if any(keys.close_tab) {
+        Some(TerminalCommand::CloseTab)
+    } else if any(keys.find) {
+        Some(TerminalCommand::Find)
+    } else if any(keys.copy) {
+        Some(TerminalCommand::Copy)
+    } else if any(keys.copy_selection) {
+        Some(TerminalCommand::CopyIfSelected)
+    } else if any(keys.paste) {
+        Some(TerminalCommand::Paste)
+    } else {
+        None
+    }
+}
+
 /// The keys of the terminal that the window would take for a tab of the editor or for
 /// going back: in the terminal they mean the sessions, as in IDEA.
 pub(crate) fn bind_keys(cx: &mut App) {
+    bind_keys_for(cx, keymap::platform());
+}
+
+/// Binds the terminal keys of one platform, so that a test reads the macOS keys on every
+/// runner.
+pub(crate) fn bind_keys_for(cx: &mut App, platform: Platform) {
+    let keys = terminal_keys(platform);
     let context = Some("Terminal");
+    for key in keys.new_tab {
+        cx.bind_keys([KeyBinding::new(key, NewTab, context)]);
+    }
+    for key in keys.close_tab {
+        cx.bind_keys([KeyBinding::new(key, CloseTab, context)]);
+    }
+    for key in keys.find {
+        cx.bind_keys([KeyBinding::new(key, Find, context)]);
+    }
+    for key in keys.copy {
+        cx.bind_keys([KeyBinding::new(key, CopySelection, context)]);
+    }
+    for key in keys.paste {
+        cx.bind_keys([KeyBinding::new(key, PasteText, context)]);
+    }
     cx.bind_keys([
-        KeyBinding::new("ctrl-shift-t", NewTab, context),
-        KeyBinding::new("ctrl-f", Find, context),
-        KeyBinding::new("ctrl-f4", CloseTab, context),
         KeyBinding::new("alt-left", PreviousTab, context),
         KeyBinding::new("alt-right", NextTab, context),
-        KeyBinding::new("ctrl-shift-c", CopySelection, context),
-        KeyBinding::new("ctrl-shift-v", PasteText, context),
     ]);
 }
 
@@ -347,6 +472,7 @@ impl TerminalPanel {
                 store,
                 tabs,
                 active,
+                keys_platform: keymap::platform(),
                 focus: cx.focus_handle(),
                 search_focus: cx.focus_handle(),
                 renaming: None,
@@ -354,6 +480,8 @@ impl TerminalPanel {
                 dragging_split: None,
                 bounds: Rc::new(RefCell::new(None)),
                 ide_connected: false,
+                terminal_suggestion: None,
+                suggestion_generation: 0,
             };
             for tab in 0..panel.tabs.len() {
                 for pane in 0..panel.tabs[tab].panes.len() {
@@ -367,6 +495,12 @@ impl TerminalPanel {
 
     pub fn focus(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// The client whose bar the panel shows, for tests.
+    #[cfg(all(test, windows))]
+    pub(crate) fn suggestion_client(&self) -> Option<mcp_discovery::Client> {
+        self.terminal_suggestion
     }
 
     /// The session of the tab the user looks at.
@@ -521,15 +655,39 @@ impl TerminalPanel {
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
         let modifiers = stroke.modifiers;
-        if modifiers.control && modifiers.shift && stroke.key == "t" {
-            cx.stop_propagation();
-            self.new_tab(None, window, cx);
-            return;
-        }
-        if modifiers.control && !modifiers.alt && stroke.key == "f4" {
-            cx.stop_propagation();
-            self.close_tab(self.active, window, cx);
-            return;
+        match terminal_command(stroke, self.keys_platform) {
+            Some(TerminalCommand::NewTab) => {
+                cx.stop_propagation();
+                self.new_tab(None, window, cx);
+                return;
+            }
+            Some(TerminalCommand::CloseTab) => {
+                cx.stop_propagation();
+                self.close_tab(self.active, window, cx);
+                return;
+            }
+            Some(TerminalCommand::Find) => {
+                cx.stop_propagation();
+                self.open_search(window, cx);
+                return;
+            }
+            Some(TerminalCommand::Copy) => {
+                cx.stop_propagation();
+                self.copy_selection(cx);
+                return;
+            }
+            Some(TerminalCommand::CopyIfSelected) => {
+                if self.copy_selection(cx) {
+                    cx.stop_propagation();
+                }
+                // Without a selection the press goes to the shell, where Ctrl+C interrupts.
+            }
+            Some(TerminalCommand::Paste) => {
+                cx.stop_propagation();
+                self.paste(window, cx);
+                return;
+            }
+            None => {}
         }
         if modifiers.alt
             && !modifiers.control
@@ -545,30 +703,6 @@ impl TerminalPanel {
         {
             cx.stop_propagation();
             self.step_tab(1, window, cx);
-            return;
-        }
-        if modifiers.control && !modifiers.alt && !modifiers.shift && stroke.key == "f" {
-            cx.stop_propagation();
-            self.open_search(window, cx);
-            return;
-        }
-        if modifiers.control && modifiers.shift && stroke.key == "c" {
-            cx.stop_propagation();
-            self.copy_selection(cx);
-            return;
-        }
-        if modifiers.control
-            && !modifiers.shift
-            && !modifiers.alt
-            && stroke.key == "c"
-            && self.copy_selection(cx)
-        {
-            cx.stop_propagation();
-            return;
-        }
-        if is_paste(stroke) || (modifiers.control && modifiers.shift && stroke.key == "v") {
-            cx.stop_propagation();
-            self.paste(window, cx);
             return;
         }
         if self.search_open() && matches!(stroke.key.as_str(), "f3") {
@@ -589,9 +723,50 @@ impl TerminalPanel {
             }
             return;
         }
-        if send_key(&session, stroke, cx) {
+        if stroke.key == "enter" && !modifiers.control && !modifiers.alt {
+            self.note_terminal_command(cx);
+        }
+        if send_key(&session, stroke, self.keys_platform, cx) {
             cx.stop_propagation();
         }
+    }
+
+    /// The command line the prompt holds, for the bar of the MCP clients: `claude` and
+    /// `codex` start without an entry of Arro, so the window offers to write one.
+    fn note_terminal_command(&mut self, cx: &mut Context<Self>) {
+        let enabled = cx
+            .try_global::<Settings>()
+            .is_none_or(|settings| settings.mcp_terminal_suggestions);
+        if !enabled {
+            return;
+        }
+        let Some(session) = self.session().cloned() else {
+            return;
+        };
+        let screen = session.screen();
+        let Some((row, _)) = screen.cursor else {
+            return;
+        };
+        let Some(client) = client_of_command(&screen.line(row)) else {
+            return;
+        };
+        self.suggestion_generation += 1;
+        let generation = self.suggestion_generation;
+        let file = client.user_config(&crate::settings::mcp_home_folder(cx));
+        let read = cx
+            .background_executor()
+            .spawn(async move { mcp_discovery::has_entry(client, &file).unwrap_or(false) });
+        cx.spawn(async move |this, cx| {
+            let configured = read.await;
+            this.update(cx, |this, cx| {
+                if this.suggestion_generation == generation {
+                    this.terminal_suggestion = (!configured).then_some(client);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The presses of the search bar, before the ones of the terminal.
@@ -1751,10 +1926,11 @@ impl TerminalPanel {
         )
     }
 
-    fn panes(&self, focused: bool, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn panes(&mut self, focused: bool, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let Some(chosen) = self.tabs.get(self.active) else {
             return div();
         };
+        let suggestion = self.terminal_suggestion;
         let body = div()
             .debug_selector(|| "terminal-panes".to_owned())
             .flex()
@@ -1778,7 +1954,7 @@ impl TerminalPanel {
                     cx.notify();
                 }),
             );
-        match chosen.split {
+        let grid = match chosen.split {
             None => body
                 .flex_col()
                 .child(self.pane_element(self.active, 0, focused, theme, cx)),
@@ -1794,7 +1970,104 @@ impl TerminalPanel {
                     .child(self.divider(way, theme, cx))
                     .child(second.flex_grow(1. - ratio))
             }
+        };
+        match suggestion {
+            Some(client) => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(self.suggestion_bar(client, theme, cx))
+                .child(grid),
+            None => grid,
         }
+    }
+
+    /// The bar above the grid that offers the entry of Arro to a client which just started
+    /// in the shell.
+    fn suggestion_bar(
+        &mut self,
+        client: mcp_discovery::Client,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let configure = dialog_button(
+            "terminal-mcp-suggestion-configure",
+            "terminal-mcp-suggestion-configure".to_owned(),
+            "Auto-Configure",
+            true,
+            true,
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.configure_suggestion(client, cx);
+        }));
+        let close = icon_button(
+            "terminal-mcp-suggestion-close",
+            "general/close",
+            "Hide the suggestion",
+            None,
+            theme,
+        )
+        .debug_selector(|| "terminal-mcp-suggestion-close".to_owned())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.terminal_suggestion = None;
+            cx.notify();
+        }));
+        div()
+            .id("terminal-mcp-suggestion")
+            .debug_selector(|| "terminal-mcp-suggestion".to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_M))
+            .px(px(SPACE_M))
+            .h(px(32.))
+            .flex_none()
+            .bg(theme.island_bg)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().flex_1().text_size(px(TEXT_SMALL)).child(format!(
+                "Configure Arro for {} to give it the tools of the project",
+                client.title()
+            )))
+            .child(configure)
+            .child(close)
+    }
+
+    fn configure_suggestion(&mut self, client: mcp_discovery::Client, cx: &mut Context<Self>) {
+        let home = crate::settings::mcp_home_folder(cx);
+        let project = self.root.clone();
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let command = crate::settings_catalog::mcp_binary(&settings);
+        self.terminal_suggestion = None;
+        cx.notify();
+        let write = cx.background_executor().spawn(async move {
+            mcp_discovery::configure(
+                client,
+                mcp_discovery::Scope::User,
+                mcp_discovery::Transport::Stdio,
+                &mcp_discovery::Server {
+                    command,
+                    url: None,
+                    token: None,
+                },
+                &home,
+                &project,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let written = write.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = written {
+                    this.terminal_suggestion = None;
+                    let _ = error;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -1919,6 +2192,12 @@ pub(crate) fn message(text: impl Into<SharedString>, theme: &Theme) -> Div {
 
 #[cfg(test)]
 impl TerminalPanel {
+    /// Takes the keys of `platform` for this panel alone: a test of the macOS keys does
+    /// not choose the platform of the whole process.
+    pub(crate) fn use_keys_of(&mut self, platform: Platform) {
+        self.keys_platform = platform;
+    }
+
     pub(crate) fn tabs_len(&self) -> usize {
         self.tabs.len()
     }
@@ -1982,5 +2261,95 @@ impl TerminalPanel {
                 .collect(),
             active: self.active,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TerminalCommand, terminal_command};
+    use keymap::Platform;
+    use ui_kit::gpui::Keystroke;
+
+    fn stroke(text: &'static str) -> Keystroke {
+        Keystroke::parse(text).expect("the test keystroke parses")
+    }
+
+    /// macOS takes the window keys with Command and leaves Control to the shell: Ctrl+C
+    /// interrupts the program there, so the terminal does not copy it.
+    #[test]
+    fn the_macos_terminal_takes_command_and_leaves_control_to_the_shell() {
+        assert_eq!(
+            terminal_command(&stroke("cmd-c"), Platform::MacOs),
+            Some(TerminalCommand::Copy)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-c"), Platform::MacOs),
+            None,
+            "Ctrl+C goes to the shell"
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-v"), Platform::MacOs),
+            Some(TerminalCommand::Paste)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-v"), Platform::MacOs),
+            None,
+            "Ctrl+V goes to the shell"
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-t"), Platform::MacOs),
+            Some(TerminalCommand::NewTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-shift-t"), Platform::MacOs),
+            Some(TerminalCommand::NewTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-w"), Platform::MacOs),
+            Some(TerminalCommand::CloseTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-f"), Platform::MacOs),
+            Some(TerminalCommand::Find)
+        );
+    }
+
+    /// Windows keeps the Control keys of the terminal, and Ctrl+C without a selection goes
+    /// to the shell when nothing is selected.
+    #[test]
+    fn the_windows_terminal_keeps_its_control_keys() {
+        assert_eq!(
+            terminal_command(&stroke("ctrl-shift-c"), Platform::Windows),
+            Some(TerminalCommand::Copy)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-c"), Platform::Windows),
+            Some(TerminalCommand::CopyIfSelected)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-shift-v"), Platform::Windows),
+            Some(TerminalCommand::Paste)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-v"), Platform::Windows),
+            Some(TerminalCommand::Paste)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-shift-t"), Platform::Windows),
+            Some(TerminalCommand::NewTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-f4"), Platform::Windows),
+            Some(TerminalCommand::CloseTab)
+        );
+        assert_eq!(
+            terminal_command(&stroke("ctrl-f"), Platform::Windows),
+            Some(TerminalCommand::Find)
+        );
+        assert_eq!(
+            terminal_command(&stroke("cmd-c"), Platform::Windows),
+            None,
+            "the Super key is not ours"
+        );
     }
 }

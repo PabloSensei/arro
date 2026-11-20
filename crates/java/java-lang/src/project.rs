@@ -16,7 +16,7 @@ use lang_api::{
     MethodRelation, NavigationQuery, PrepareDiagnosticsQuery, ProjectProblem, ProjectProblemsQuery,
     Provider, ReferenceQuery, Reply, Severity, SourceId, SourceSpan, SourceTextQuery, SymbolEntry,
     SymbolKind, TestCreateOutcome, TestCreateRequest, TestFixOutcome, TestFixRequest, TestForm,
-    TestFormQuery, TextSpan, ask, offset_in,
+    TestFormQuery, TextSpan, TypeHierarchyItem, TypeHierarchyQuery, TypeKind, ask, offset_in,
 };
 use lsp_client::ServerEvents;
 use lsp_client::lsp_types::{
@@ -34,7 +34,7 @@ use crate::debug::DebugExtension;
 use crate::language::{JavaSyntax, LANGUAGE_ID, is_import_line};
 use crate::lombok::LombokSupport;
 use crate::messages::{JavaMessages, MessageBundles};
-use crate::refactor::RefactorForms;
+use crate::refactor::{MemberRefactorings, RefactorForms};
 use crate::spring::SpringConfigSupport;
 use crate::spring_data::{NativeCompletion, NativeNavigation, SpringDataIndex};
 
@@ -116,6 +116,13 @@ pub struct JavaProject {
     pub(crate) debug: DebugExtension,
     /// The refactorings whose values the window asks for before the server edits.
     pub(crate) forms: RefactorForms,
+    /// Pull Members Up, Push Members Down, Extract Superclass and Introduce Parameter
+    /// Object, computed from the trees of the project.
+    pub(crate) members: MemberRefactorings,
+    /// Move Members: the members of a type and the types of the project that take them.
+    pub(crate) move_members: crate::move_members::MoveMembers,
+    /// A move to a parameter or a field of the type of a method.
+    pub(crate) move_targets: crate::move_targets::MoveTargets,
     /// The Lombok agent: found in the project dependencies and applied with a restart.
     lombok: Arc<LombokSupport>,
     /// Stack traces and thread dumps: the frames of a trace, and `jcmd` for a running
@@ -252,12 +259,16 @@ impl ProjectProblems {
             .borrow()
             .clone()
             .map(|failure| ProjectProblem {
-                file: Some(failure.file),
+                file: (!failure.file.as_os_str().is_empty()).then_some(failure.file),
                 line: failure.line,
                 severity: Severity::Error,
                 message: failure.message,
                 summary: failure.summary,
                 log,
+                tool: failure.tool.map(|tool| match tool {
+                    jdtls_adapter::BuildTool::Maven => 0,
+                    jdtls_adapter::BuildTool::Gradle => 1,
+                }),
             })
             .into_iter()
             .collect()
@@ -555,6 +566,8 @@ impl JavaProject {
                 "java.action.applyRefactoringCommand",
                 "java/getRefactorEdit",
             )
+            // The command of the server that points at the name an extract introduced.
+            .with_refactor_rename("java.action.rename")
             // Extract interface and the two field refactorings need values the user
             // picks: what to extract, the name and the package, where a field starts.
             .with_refactor_steps(semantic_router::RefactorSteps {
@@ -567,7 +580,10 @@ impl JavaProject {
                     "moveStaticMember",
                 ],
             })
-            .with_move_requests("java/getMoveDestinations", "java/move")
+            // The expressions under the caret that an extract may take, innermost first.
+            .with_refactor_selections("java/inferSelection")
+            .with_move_requests("java/getMoveDestinations", "java/move", "moveStaticMember")
+            .with_move_targets_kind("moveInstanceMethod")
             .with_import_line(is_import_line)
             .with_change_signature(
                 "java/getChangeSignatureInfo",
@@ -636,6 +652,19 @@ impl JavaProject {
         };
         let debug = DebugExtension::with_router(router.clone(), autobuild);
         let forms = RefactorForms::new(router.clone(), Handle::current());
+        let members = MemberRefactorings::new(
+            root.clone(),
+            router.clone(),
+            providers.clone(),
+            Handle::current(),
+        );
+        let move_members =
+            crate::move_members::MoveMembers::new(root.clone(), router.clone(), Handle::current());
+        let move_targets = crate::move_targets::MoveTargets::new(
+            router.clone(),
+            providers.clone(),
+            Handle::current(),
+        );
         let stack = crate::stack::StackService::new(
             root.clone(),
             router.clone(),
@@ -665,6 +694,9 @@ impl JavaProject {
             problems,
             debug,
             forms,
+            members,
+            move_members,
+            move_targets,
             lombok,
             stack,
             spring,
@@ -1151,6 +1183,87 @@ impl Provider<MethodHierarchyQuery, Vec<MethodHierarchyEntry>> for JavaProject {
             }
             let _ = reply.send(Answer::new(entries, Confidence::Certain, SOURCE));
         });
+    }
+}
+
+impl Provider<TypeHierarchyQuery, Vec<TypeHierarchyItem>> for JavaProject {
+    fn start(
+        &self,
+        query: TypeHierarchyQuery,
+        cancel: Cancel,
+        mut reply: Reply<Vec<TypeHierarchyItem>>,
+    ) {
+        let providers = self.providers.clone();
+        let router = self.router.clone();
+        self.runtime.spawn(async move {
+            let provider: &dyn Provider<TypeHierarchyQuery, Vec<TypeHierarchyItem>> =
+                providers.as_ref();
+            let mut replies = ask(provider, query);
+            let Some(answer) = replies.next().await else {
+                return;
+            };
+            if cancel.is_cancelled() {
+                return;
+            }
+            let confidence = answer.confidence;
+            let mut items = answer.value;
+            // A server names only a class for a record or an annotation; the source
+            // tells the kind and the `abstract` flag. One read serves every node of a
+            // file.
+            let mut texts: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+            for item in &mut items {
+                let Some(place) = &item.place else {
+                    continue;
+                };
+                let text = texts.entry(place.uri.clone()).or_insert_with(|| {
+                    let uri = Uri::from_str(&place.uri).ok()?;
+                    router.text(&uri).map(|text| text.to_string()).or_else(|| {
+                        file_path(&uri).and_then(|path| std::fs::read_to_string(path).ok())
+                    })
+                });
+                if let Some(text) = text.as_deref() {
+                    refine_type_hierarchy_item(item, text);
+                }
+            }
+            let _ = reply.send(Answer::new(items, confidence, SOURCE));
+        });
+    }
+}
+
+/// The kind and the `abstract` flag of a type from the modifiers of its declaration.
+fn refine_type_hierarchy_item(item: &mut TypeHierarchyItem, text: &str) {
+    let Some(place) = &item.place else {
+        return;
+    };
+    let offset = offset_in(text, place.span.start);
+    let line_start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let head = &text[line_start..offset];
+    let word = |name: &str| {
+        head.split(|character: char| {
+            !character.is_alphanumeric() && character != '@' && character != '_'
+        })
+        .any(|found| found == name)
+    };
+    if head.contains("@interface") {
+        item.kind = TypeKind::Annotation;
+    } else if word("record") {
+        item.kind = TypeKind::Record;
+    } else if word("enum") {
+        item.kind = TypeKind::Enum;
+    } else if word("interface") {
+        item.kind = TypeKind::Interface;
+    }
+    item.abstract_type = item.kind == TypeKind::Class && word("abstract");
+    // The server names the package and the type together; the window shows the package
+    // beside the name.
+    let owner = item
+        .detail
+        .as_deref()
+        .and_then(|detail| detail.strip_suffix(&format!(".{}", item.name)))
+        .map(str::to_owned);
+    if let Some(owner) = owner {
+        item.detail = Some(owner);
     }
 }
 

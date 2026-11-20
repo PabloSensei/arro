@@ -49,6 +49,7 @@ pub struct ProcessSpec {
     ctrl_helper: Option<PathBuf>,
     label: Option<&'static str>,
     reads_input: bool,
+    notes: Vec<String>,
 }
 
 impl ProcessSpec {
@@ -63,6 +64,7 @@ impl ProcessSpec {
             ctrl_helper: None,
             label: None,
             reads_input: false,
+            notes: Vec::new(),
         }
     }
 
@@ -127,6 +129,19 @@ impl ProcessSpec {
     /// Whether the owner writes to the standard input of the program.
     pub fn reads_input(&self) -> bool {
         self.reads_input
+    }
+
+    /// A line that belongs to the output of this command, written before the program
+    /// starts: what the owner changed to make the command run, such as a file it had to
+    /// make executable. The console of the command shows the lines as its first output.
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+
+    /// The lines to write before the program starts, in the order they were added.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// The arguments after the program, for a check of a plan before it starts.

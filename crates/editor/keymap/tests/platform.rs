@@ -15,9 +15,11 @@ fn mac() -> (keymap::ActionRegistry, keymap::Keymap) {
 }
 
 /// The actions the macOS table may leave without a key: their Windows key is Insert, which
-/// an Apple keyboard has no key for, two actions that macOS gives no key of its own, and
-/// the two selections to the ends of the text: IDEA gives them ⇧⌘↑ and ⇧⌘↓, the keys its
-/// editor uses for moving the line, and this editor moves the line as IDEA does.
+/// an Apple keyboard has no key for, two actions that macOS gives no key of its own, the
+/// two selections to the ends of the text (IDEA gives them ⇧⌘↑ and ⇧⌘↓, the keys its
+/// editor uses for moving the line, and this editor moves the line as IDEA does), and the
+/// write-access filter of the usages, whose Ctrl+W is ⌘W, the key that closes the active
+/// tab on macOS.
 const NO_MAC_KEY: &[&str] = &[
     "EditorTextEndWithSelection",
     "EditorTextStartWithSelection",
@@ -25,6 +27,7 @@ const NO_MAC_KEY: &[&str] = &[
     "MaximizeToolWindow",
     "ShowPopupMenu",
     "SwitcherIterateItems",
+    "UsageFiltering.WriteAccess",
     "UsageView.Include",
     "XDebugger.NewWatch",
 ];

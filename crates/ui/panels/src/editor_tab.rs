@@ -365,8 +365,9 @@ fn open(
                             .ok();
                     });
                 }
-                EditorEvent::RefactorForm(handle_text) => {
-                    let handle_text = handle_text.clone();
+                EditorEvent::MemberRefactoring { refactoring, spot } => {
+                    let refactoring = *refactoring;
+                    let spot = spot.clone();
                     let workspace = runner.clone();
                     let handle = window.window_handle();
                     cx.defer(move |cx| {
@@ -374,8 +375,78 @@ fn open(
                             .update(cx, |_, window, cx| {
                                 workspace
                                     .update(cx, |workspace, cx| {
+                                        crate::member_form::MemberFormDialog::show(
+                                            refactoring,
+                                            spot,
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::MoveMembers(spot) => {
+                    let spot = spot.clone();
+                    let origin = view.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::move_members::MoveMembersDialog::show(
+                                            spot,
+                                            Some(origin),
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::MoveTargets(spot) => {
+                    let spot = spot.clone();
+                    let origin = view.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::move_targets::MoveTargetsDialog::show(
+                                            spot,
+                                            Some(origin),
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::RefactorForm(handle_text) => {
+                    let handle_text = handle_text.clone();
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    let origin = view.clone();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
                                         crate::refactor_form::RefactorFormDialog::show(
                                             handle_text.clone(),
+                                            Some(origin),
                                             workspace,
                                             window,
                                             cx,
@@ -456,6 +527,32 @@ fn open(
                                     .update(cx, |workspace, cx| {
                                         workspace.show_tool(
                                             workspace::CALL_HIERARCHY_TOOL,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .ok();
+                    });
+                }
+                EditorEvent::TypeHierarchy(spot) => {
+                    let Some(hub) = cx.try_global::<crate::type_hierarchy::ActiveTypeHierarchy>()
+                    else {
+                        return;
+                    };
+                    let hub = hub.0.clone();
+                    let spot = spot.clone();
+                    hub.update(cx, |hub, cx| hub.start(spot, cx));
+                    let workspace = runner.clone();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.show_tool(
+                                            workspace::TYPE_HIERARCHY_TOOL,
                                             window,
                                             cx,
                                         )
@@ -837,10 +934,9 @@ fn open(
                         .ok();
                 }
                 EditorEvent::ContextMenu(position) => {
-                    let gutter = view.read(cx).gutter_menu_at(*position);
                     let model = runner
                         .read_with(cx, |workspace, _| {
-                            crate::editor_menu::MenuModel::of(workspace).in_gutter(gutter)
+                            crate::editor_menu::MenuModel::of(workspace)
                         })
                         .ok();
                     if let Some(model) = model {
@@ -852,6 +948,24 @@ fn open(
                             cx,
                         );
                     }
+                }
+                EditorEvent::GutterMenu { position, line } => {
+                    crate::gutter_menu::show_gutter(
+                        view.clone(),
+                        runner.clone(),
+                        *position,
+                        *line,
+                        cx,
+                    );
+                }
+                EditorEvent::BlameMenu { position, line } => {
+                    crate::gutter_menu::show_blame(
+                        view.clone(),
+                        runner.clone(),
+                        *position,
+                        *line,
+                        cx,
+                    );
                 }
                 EditorEvent::AddInlineWatch { line, expression } => {
                     let path = view.read(cx).path().to_path_buf();
@@ -953,16 +1067,41 @@ fn open(
                 .update(cx, |workspace, cx| workspace.save_all(cx))
                 .ok();
         }
-        EditorEvent::ApplyChange(change) => {
+        EditorEvent::ApplyChange { change, label } => {
             let change = change.clone();
+            let label = label.clone();
             let workspace = reports.clone();
+            let origin = view.clone();
             handle
                 .update(cx, |_, window, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
-                            crate::changes::apply(workspace, change, window, cx)
+                            crate::changes::apply_from(
+                                workspace,
+                                change,
+                                Some(origin),
+                                label,
+                                window,
+                                cx,
+                            )
                         })
                         .ok();
+                })
+                .ok();
+        }
+        EditorEvent::UndoRefactoring(id) => {
+            let id = *id;
+            reports
+                .update(cx, |workspace, cx| {
+                    crate::refactor_undo::undo(workspace, id, cx)
+                })
+                .ok();
+        }
+        EditorEvent::RedoRefactoring(id) => {
+            let id = *id;
+            reports
+                .update(cx, |workspace, cx| {
+                    crate::refactor_undo::redo(workspace, id, cx)
                 })
                 .ok();
         }

@@ -23,10 +23,19 @@ pub fn register(workspace: &mut Workspace, _window: &mut Window, cx: &mut Contex
         .spawn(async move { std::fs::create_dir_all(state_dir.join("scratches")) })
         .detach();
 
+    // Close Active Tab follows IDEA: with Command leading, the key closes the tab of the
+    // editor, and a tool window with tabs of its own, the terminal, takes the key first.
+    // The other systems keep the Windows key that hides the tool window.
     workspace.register_command(
         keys::CLOSE_ACTIVE_TAB,
         "Close Active Tab",
-        |workspace, window, cx| workspace.close_active_tool_tab(window, cx),
+        |workspace, window, cx| {
+            if workspace.keys_platform().uses_command() {
+                workspace.close_active_tab(window, cx);
+            } else {
+                workspace.close_active_tool_tab(window, cx);
+            }
+        },
     );
     workspace.register_command(
         keys::NEXT_EDITOR_TAB,

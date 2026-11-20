@@ -264,8 +264,8 @@ fn shown_value(name: Option<&str>, value: &Value, project: &Path) -> String {
     }
     match value {
         Value::String(text) => match relative_path(project, text) {
-            Some(path) => hide_url_credentials(&path),
-            None => hide_url_credentials(text),
+            Some(path) => hide_secrets(&path),
+            None => hide_secrets(text),
         },
         Value::Array(items) => format!(
             "[{}]",
@@ -297,6 +297,136 @@ fn relative_path(project: &Path, text: &str) -> Option<String> {
 fn is_secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     SECRET_WORDS.iter().any(|word| name.contains(word))
+}
+
+/// `https://user:token@host/repo` with the whole user information hidden, and a password
+/// that a JDBC address carries as a parameter or a property.
+pub fn hide_secrets(text: &str) -> String {
+    hide_url_credentials(&hide_password_parameters(text))
+}
+
+/// The address without its password, for a file that keeps what a project may share: a
+/// parameter with a password goes away, and the password of a user information is left
+/// out while the user stays.
+pub fn without_password(text: &str) -> String {
+    let text = without_user_password(text);
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let separator = at;
+        let starts_a_value = at == 0 || matches!(bytes[at - 1], b'?' | b'&' | b';');
+        if !starts_a_value {
+            at += 1;
+            continue;
+        }
+        let Some(name) = PASSWORD_NAMES.iter().find(|name| {
+            text.get(at..at + name.len())
+                .is_some_and(|text| text.eq_ignore_ascii_case(name))
+        }) else {
+            at += 1;
+            continue;
+        };
+        let mut cursor = at + name.len();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            at = cursor;
+            continue;
+        }
+        cursor += 1;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !matches!(byte, b'&' | b';' | b'\n' | b'\r' | b' '))
+        {
+            cursor += 1;
+        }
+        // The chunk goes with the separator that opened it, so no `&&` or `;` is left.
+        let start = if separator > 0 && matches!(bytes[separator - 1], b'&' | b';' | b'?') {
+            separator - 1
+        } else {
+            separator
+        };
+        out.push_str(&text[copied..start]);
+        copied = cursor;
+        at = cursor;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+const PASSWORD_NAMES: &[&str] = &["password", "passwd", "pwd"];
+
+/// `scheme://user:password@host` without the password of the user information.
+fn without_user_password(text: &str) -> String {
+    let Some(scheme) = text.find("://") else {
+        return text.to_owned();
+    };
+    let rest = &text[scheme + 3..];
+    let Some(at) = rest.find('@') else {
+        return text.to_owned();
+    };
+    let host_end = rest.find(['/', '?', ';', '#']).unwrap_or(rest.len());
+    if at > host_end {
+        return text.to_owned();
+    }
+    let userinfo = &rest[..at];
+    let Some(colon) = userinfo.find(':') else {
+        return text.to_owned();
+    };
+    format!(
+        "{}{}{}",
+        &text[..scheme + 3],
+        &userinfo[..colon],
+        &rest[at..]
+    )
+}
+
+/// `jdbc:postgresql://host/db?user=app&password=s3cret` and
+/// `jdbc:sqlserver://host;user=app;password=s3cret` with every password hidden.
+fn hide_password_parameters(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let starts_a_value = at == 0 || matches!(bytes[at - 1], b'?' | b'&' | b';');
+        if !starts_a_value {
+            at += 1;
+            continue;
+        }
+        let Some(name) = PASSWORD_NAMES.iter().find(|name| {
+            text.get(at..at + name.len())
+                .is_some_and(|text| text.eq_ignore_ascii_case(name))
+        }) else {
+            at += 1;
+            continue;
+        };
+        let mut cursor = at + name.len();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            at = cursor;
+            continue;
+        }
+        cursor += 1;
+        let value_start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !matches!(byte, b'&' | b';' | b'\n' | b'\r' | b' '))
+        {
+            cursor += 1;
+        }
+        out.push_str(&text[copied..value_start]);
+        out.push_str(HIDDEN);
+        copied = cursor;
+        at = cursor;
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// `https://user:token@host/repo` with the whole user information hidden.
@@ -388,6 +518,42 @@ mod tests {
         );
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(!shown.contains("s3cret"), "{shown}");
+    }
+
+    #[test]
+    fn a_password_of_a_jdbc_address_is_hidden() {
+        for url in [
+            "jdbc:postgresql://db/owners?user=app&password=s3cret",
+            "jdbc:sqlserver://db;user=app;password=s3cret",
+            "jdbc:mysql://user:s3cret@db/owners",
+            "jdbc:h2:mem:test;PASSWORD=s3cret",
+        ] {
+            let shown = arguments(Path::new("project"), &json!({ "url": url }));
+
+            assert!(!shown.contains("s3cret"), "{url}: {shown}");
+            assert!(shown.contains(HIDDEN), "{url}: {shown}");
+        }
+        let plain = arguments(Path::new("project"), &json!({ "url": "jdbc:h2:mem:test" }));
+        assert!(plain.contains("jdbc:h2:mem:test"), "{plain}");
+    }
+
+    #[test]
+    fn an_address_kept_by_a_project_has_no_password() {
+        use super::without_password;
+
+        assert_eq!(
+            without_password("jdbc:postgresql://db/owners?user=app&password=s3cret"),
+            "jdbc:postgresql://db/owners?user=app"
+        );
+        assert_eq!(
+            without_password("jdbc:sqlserver://db;user=app;password=s3cret;encrypt=true"),
+            "jdbc:sqlserver://db;user=app;encrypt=true"
+        );
+        assert_eq!(
+            without_password("jdbc:mysql://user:s3cret@db/owners"),
+            "jdbc:mysql://user@db/owners"
+        );
+        assert_eq!(without_password("jdbc:h2:mem:test"), "jdbc:h2:mem:test");
     }
 
     #[test]

@@ -2,17 +2,18 @@
 //! changes them. The choice of the user lives in the project; the server starts again
 //! when it changes, so no restart of the window is needed.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base::program::executable;
 use java_project::{
-    Jdk, LocalRepositories, ProjectSettings, language_level, resolve_environment, runtime_info,
-    save_settings,
+    Jdk, LocalRepositories, ProjectSettings, language_level, language_level_at,
+    resolve_environment, runtime_info, save_settings, set_language_level,
 };
 use project_model::{
-    EnvironmentDetail, EnvironmentProvider, LanguageLevelInfo, ProjectEnvironmentInfo,
-    ProjectModel, RuntimeInfo,
+    EnvironmentDetail, EnvironmentProvider, LanguageLevelEdit, LanguageLevelInfo,
+    ProjectEnvironmentInfo, ProjectModel, RuntimeInfo,
 };
 
 use crate::JavaProject;
@@ -89,6 +90,15 @@ impl JavaEnvironment {
     }
 }
 
+/// The build file of a module that the model does not name, such as one from an older
+/// cache: the first of the names the language knows that is there.
+fn build_file_of(dir: &Path) -> Option<PathBuf> {
+    ["pom.xml", "build.gradle", "build.gradle.kts"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|file| file.is_file())
+}
+
 /// The folder is not an SDK unless it holds the launcher and the version file.
 fn check_folder(home: &Path) -> Result<Jdk, String> {
     let launcher = home.join("bin").join(executable("java"));
@@ -132,6 +142,59 @@ impl EnvironmentProvider for JavaEnvironment {
         if let Some(project) = &self.project {
             project.set_project_model(&model);
         }
+    }
+
+    fn model(&self) -> Option<Arc<ProjectModel>> {
+        self.model
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    fn module_language(&self, module: &str) -> Option<LanguageLevelInfo> {
+        let model = self.model()?;
+        let found = model.module(module)?;
+        let file = found
+            .build_file
+            .clone()
+            .or_else(|| build_file_of(&found.dir))?;
+        language_level_at(&file)
+    }
+
+    fn language_change(
+        &self,
+        level: &str,
+        module: Option<&str>,
+        text: Option<&str>,
+    ) -> Result<LanguageLevelEdit, String> {
+        let level: u32 = level
+            .parse()
+            .map_err(|_| format!("{level} is not a language level"))?;
+        let file = match module {
+            Some(id) => {
+                let model = self
+                    .model()
+                    .ok_or_else(|| "The project model is not ready yet".to_owned())?;
+                let module = model
+                    .module(id)
+                    .ok_or_else(|| format!("The project has no module {id}"))?;
+                module
+                    .build_file
+                    .clone()
+                    .or_else(|| build_file_of(&module.dir))
+                    .ok_or_else(|| format!("The module {id} names no build file"))?
+            }
+            None => language_level(&self.root)
+                .and_then(|level| level.file)
+                .ok_or_else(|| "The project has no build file to change".to_owned())?,
+        };
+        let text = match text {
+            Some(text) => text.to_owned(),
+            None => {
+                fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?
+            }
+        };
+        set_language_level(&file, &text, level)
     }
 
     fn take_notice(&self) -> Option<String> {

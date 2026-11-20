@@ -190,6 +190,8 @@ pub const OVERRIDES: &[(&str, &[&str])] = &[
     ("ShowIntentionActions", &["alt-enter"]),
     ("ShowPopupMenu", &[]),
     ("ShowReformatFileDialog", &["cmd-alt-shift-l"]),
+    // The first key of the action is the one the menu of the application shows.
+    ("ShowSettings", &["cmd-,"]),
     ("ShowSettingsAndFindUsages", &["ctrl-alt-shift-f7"]),
     ("ShowTypeBookmarks", &["cmd-shift-f3"]),
     ("ShowUsages", &["cmd-alt-f7"]),
@@ -219,7 +221,9 @@ pub const OVERRIDES: &[(&str, &[&str])] = &[
     ("UnselectPreviousOccurrence", &["ctrl-shift-g"]),
     ("UsageFiltering.Imports", &["cmd-i"]),
     ("UsageFiltering.ReadAccess", &["cmd-r"]),
-    ("UsageFiltering.WriteAccess", &["cmd-w"]),
+    // Cmd+W closes the active tab everywhere on macOS, as IDEA has it; the filter keeps
+    // the key of the Windows table nowhere.
+    ("UsageFiltering.WriteAccess", &[]),
     ("UsageGrouping.Directory", &["cmd-alt-p"]),
     ("UsageGrouping.FileStructure", &["cmd-alt-f"]),
     ("UsageGrouping.FlattenModules", &["cmd-alt-o"]),

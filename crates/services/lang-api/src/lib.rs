@@ -20,6 +20,7 @@ mod inspection;
 mod language;
 mod migrations;
 mod profile;
+mod run_points;
 mod semantic;
 mod sequence;
 mod sources;
@@ -64,7 +65,8 @@ pub use hierarchy::{
     DefinitionPreviewQuery, FileSymbol, FileSymbolsProvider, FileSymbolsQuery,
     MethodHierarchyEntry, MethodHierarchyProvider, MethodHierarchyQuery, MethodRelation,
     OverridableMethod, OverridableMethods, OverridableMethodsProvider, OverridableMethodsQuery,
-    ReferenceQuery, ReferenceStringProvider,
+    ReferenceQuery, ReferenceStringProvider, TypeHierarchyItem, TypeHierarchyProvider,
+    TypeHierarchyQuery, TypeKind,
 };
 pub use inlay::{
     InlayHintEntry, InlayHintKind, InlayHintProvider, InlayHintQuery, InlayHintSettings,
@@ -84,6 +86,7 @@ pub use profile::{
     ProfileFrame, ProfileMethod, ProfileNode, ProfileRecording, ProfileReport, ProfileSample,
     ProfileSamples, ProfileSnapshot, ProfileType, ProfileTypeTree, ProfileUnit, bytes_text,
 };
+pub use run_points::{RunPoint, RunPointKind, RunPointQuery, RunPointsProvider};
 pub use semantic::{
     ActionApplyProvider, ActionApplyRequest, ActionChoice, ActionEntry, ActionField, ActionKind,
     ActionMember, ActionOutcome, ActionParameters, ActionParametersProvider, ActionParametersQuery,
@@ -93,13 +96,17 @@ pub use semantic::{
     CompletionLabelDetails, CompletionList, CompletionProvider, CompletionResolveProvider,
     DependencyUpdatesProvider, DependencyVersion, DependencyVersionQuery, DiagnosticEntry,
     DiagnosticsProvider, DiagnosticsQuery, DocumentEdit, DocumentSpot, ExecuteCommandProvider,
-    FileChange, FileRename, FormatProvider, FormatQuery, GenerateApplyProvider,
+    ExtractKind, FileChange, FileRename, FormatProvider, FormatQuery, GenerateApplyProvider,
     GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateProvider, GenerateQuery,
     GeneratedFile, Generation, HierarchyDirection, HierarchyProvider, HierarchyQuery,
-    HighlightProvider, HoverProvider, HoverText, MethodSignature, MoveDestination,
-    MoveDestinationProvider, MoveKind, MoveOutcome, MoveProvider, MoveQuery, MoveRequest,
-    NavigationKind, NavigationProvider, NavigationQuery, ProjectProblem, ProjectProblemsProvider,
-    ProjectProblemsQuery, ReferencesProvider, RenameProvider, RenameQuery, SemanticServer,
+    HighlightProvider, HoverProvider, HoverText, MemberActionForm, MemberActionParametersProvider,
+    MemberActionProvider, MemberActionQuery, MemberActionRequest, MemberChoice, MemberRefactoring,
+    MemberSelection, MemberTarget, MethodSignature, MoveDestination, MoveDestinationProvider,
+    MoveKind, MoveMember, MoveMembersForm, MoveMembersFormProvider, MoveMembersQuery, MoveOutcome,
+    MovePlace, MoveProvider, MoveQuery, MoveRequest, MoveTargetsForm, MoveTargetsFormProvider,
+    MoveTargetsQuery, NavigationKind, NavigationProvider, NavigationQuery, ProjectProblem,
+    ProjectProblemsProvider, ProjectProblemsQuery, RefactorSelectionsProvider, ReferencesProvider,
+    RenamePosition, RenameProvider, RenameQuery, SelectionEntry, SelectionQuery, SemanticServer,
     Severity, SignatureException, SignatureParameter, SignatureProvider, SignatureQuery,
     SignatureText, SourceEdit, SourceSpan, SourceTextProvider, SourceTextQuery, SuppressionQuery,
     SuppressionStyle, SuppressionTarget, SymbolEntry, SymbolQuery, TextPoint, TextSpan,

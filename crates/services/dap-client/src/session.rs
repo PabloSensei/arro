@@ -561,6 +561,7 @@ impl Session {
             Event::Breakpoint { body, .. } => self.apply_breakpoint_event(&body),
             Event::Exited { code } => {
                 let error = code != 0;
+                self.state.exit_code = i32::try_from(code).ok();
                 self.console(format!("The debuggee exited with code {code}"), error);
             }
             Event::Process {

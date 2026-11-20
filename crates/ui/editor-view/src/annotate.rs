@@ -10,6 +10,9 @@ pub struct BlameNote {
     pub label: String,
     /// What a hint over the label shows: the commit, its author, its date and its message.
     pub details: String,
+    /// The time of the commit, in seconds since 1970; the age of the commit fades the
+    /// background of the label.
+    pub time: i64,
 }
 
 impl BlameNote {

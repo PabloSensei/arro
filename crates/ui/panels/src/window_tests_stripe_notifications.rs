@@ -1,12 +1,12 @@
 //! The buttons of the stripes: each one shows its own popup or tool window, whatever was
-//! open before it. The bookmarks popup opens empty with a state of its own, the same
-//! button closes it, and Notifications shows the notifications rather than the bookmarks.
+//! open before it. The Bookmarks button shows its window even when the project has no
+//! bookmarks, the same button closes it, and Notifications shows the notifications.
 
 use ui_kit::gpui;
 use ui_kit::gpui::{TestAppContext, VisualTestContext, WindowHandle};
 
 use workspace::{
-    AI_TOOL, BOOKMARKS_POPUP, COMMIT_TOOL, DEBUG_TOOL, LOG_TOOL, PROBLEMS_TOOL, PROJECT_TOOL,
+    AI_TOOL, BOOKMARKS_TOOL, COMMIT_TOOL, DEBUG_TOOL, LOG_TOOL, PROBLEMS_TOOL, PROJECT_TOOL,
     RECENT_PLACES_POPUP, RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL,
     TODO_TOOL, USAGES_TOOL, Workspace,
 };
@@ -32,25 +32,17 @@ fn tool_open(cx: &TestAppContext, window: WindowHandle<Workspace>, tool: &str) -
         .unwrap()
 }
 
-fn notification_serial(cx: &TestAppContext, window: WindowHandle<Workspace>) -> usize {
-    window
-        .read_with(cx, |workspace, _| workspace.notification_serial())
-        .unwrap()
-}
-
 /// What a button of the right stripe shows.
 #[derive(Clone, Copy)]
 enum Shows {
     Balloon,
     Tool(&'static str),
-    Bookmarks,
 }
 
 fn shows(cx: &mut TestAppContext, window: WindowHandle<Workspace>, item: Shows) -> bool {
     match item {
         Shows::Balloon => has(cx, window, "notification"),
         Shows::Tool(tool) => tool_open(cx, window, tool),
-        Shows::Bookmarks => tag(cx, window) == Some(BOOKMARKS_POPUP),
     }
 }
 
@@ -59,7 +51,7 @@ const RIGHT: [(&str, Shows); 4] = [
     ("stripe-s-notifications", Shows::Balloon),
     ("stripe-s-ai", Shows::Tool(AI_TOOL)),
     ("stripe-s-tasks", Shows::Tool(TASKS_TOOL)),
-    ("stripe-s-bookmarks", Shows::Bookmarks),
+    ("stripe-s-bookmarks", Shows::Tool(BOOKMARKS_TOOL)),
 ];
 
 /// The buttons of the left stripe, the top group and the bottom one.
@@ -108,33 +100,24 @@ fn reset(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
 }
 
 #[ui_kit::gpui::test]
-fn the_empty_bookmarks_open_a_popup_and_notifications_show_their_balloon(cx: &mut TestAppContext) {
+fn the_empty_bookmarks_open_the_window_and_notifications_show_their_balloon(
+    cx: &mut TestAppContext,
+) {
     let (_, window) = open_sample_window(cx, "stripe-bookmarks");
     assert!(
         cx.read(|cx| editor_view::bookmarks(cx).is_empty()),
         "the sample project has no bookmarks"
     );
-    let serial = notification_serial(cx, window);
 
     click(cx, window, "stripe-s-bookmarks");
     draw(cx, window);
-    assert_eq!(
-        notification_serial(cx, window),
-        serial,
-        "the empty list of bookmarks is not a notification"
-    );
-    assert_eq!(
-        tag(cx, window),
-        Some(BOOKMARKS_POPUP),
-        "the bookmarks popup is open, and the button is drawn as chosen while it is"
+    assert!(
+        tool_open(cx, window, BOOKMARKS_TOOL),
+        "the Bookmarks window is open, and the button is drawn as chosen while it is"
     );
     assert!(
-        has(cx, window, "places-popup"),
-        "the bookmarks popup is on screen"
-    );
-    assert!(
-        has(cx, window, "places-empty"),
-        "the popup itself says the list is empty"
+        has(cx, window, "bookmarks-panel"),
+        "the Bookmarks window is on screen"
     );
 
     click(cx, window, "stripe-s-notifications");
@@ -142,10 +125,6 @@ fn the_empty_bookmarks_open_a_popup_and_notifications_show_their_balloon(cx: &mu
     assert!(
         has(cx, window, "notification"),
         "Notifications shows the balloon"
-    );
-    assert!(
-        !has(cx, window, "places-popup"),
-        "the bookmarks popup is closed"
     );
     let shown = window
         .read_with(cx, |workspace, _| workspace.last_notification())
@@ -157,29 +136,29 @@ fn the_empty_bookmarks_open_a_popup_and_notifications_show_their_balloon(cx: &mu
 }
 
 #[ui_kit::gpui::test]
-fn the_bookmarks_button_closes_its_own_popup(cx: &mut TestAppContext) {
+fn the_bookmarks_button_closes_its_own_window(cx: &mut TestAppContext) {
     let (_, window) = open_sample_window(cx, "stripe-bookmarks-toggle");
     draw(cx, window);
 
     click(cx, window, "stripe-s-bookmarks");
     draw(cx, window);
-    assert!(has(cx, window, "places-popup"), "the first press opens it");
-
-    // The press that dismisses a popup outside it is this same press: the button must
-    // not open the popup again behind it.
-    click(cx, window, "stripe-s-bookmarks");
-    draw(cx, window);
     assert!(
-        !has(cx, window, "places-popup"),
-        "the second press closes the popup"
+        tool_open(cx, window, BOOKMARKS_TOOL),
+        "the first press opens the window"
     );
-    assert_eq!(tag(cx, window), None, "no popup is open");
 
     click(cx, window, "stripe-s-bookmarks");
     draw(cx, window);
     assert!(
-        has(cx, window, "places-popup"),
-        "the third press opens the popup again"
+        !tool_open(cx, window, BOOKMARKS_TOOL),
+        "the second press closes the window"
+    );
+
+    click(cx, window, "stripe-s-bookmarks");
+    draw(cx, window);
+    assert!(
+        tool_open(cx, window, BOOKMARKS_TOOL),
+        "the third press opens the window again"
     );
 }
 
@@ -201,16 +180,18 @@ fn the_recent_places_still_open_their_own_popup(cx: &mut TestAppContext) {
         "Recent Locations keeps its popup"
     );
 
-    // The bookmarks replace a popup that is already open: the press that closes the
-    // places must not take the bookmarks with it.
+    // The bookmarks open their own window over a popup that is already open: the press
+    // that closes the places must not take the window with it.
     click(cx, window, "stripe-s-bookmarks");
     draw(cx, window);
-    assert_eq!(
-        tag(cx, window),
-        Some(BOOKMARKS_POPUP),
-        "the bookmarks replace the places of the same popup class"
+    assert!(
+        tool_open(cx, window, BOOKMARKS_TOOL),
+        "the bookmarks open their window over the places"
     );
-    assert!(has(cx, window, "places-empty"));
+    assert!(
+        !has(cx, window, "places-popup"),
+        "the places popup closes under the press"
+    );
 }
 
 #[ui_kit::gpui::test]

@@ -236,6 +236,7 @@ fn action(title: &str, code: &str, handle: Option<&str>) -> ActionEntry {
         renames: Vec::new(),
         handle: handle.map(str::to_owned),
         resolve: None,
+        rename: None,
     }
 }
 

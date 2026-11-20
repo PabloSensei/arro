@@ -201,6 +201,14 @@ impl Mcp {
             .map(|published| published.entry.clone())
     }
 
+    /// The address and the token a client of the settings page copies, while the window
+    /// publishes its entry point.
+    pub(crate) fn endpoint(&self) -> Option<(String, String)> {
+        self.published()
+            .as_ref()
+            .map(|published| (published.entry.url.clone(), published.entry.token.clone()))
+    }
+
     fn published(&self) -> MutexGuard<'_, Option<Published>> {
         self.published
             .lock()
@@ -325,6 +333,8 @@ pub struct AgentsPanel {
     window: AnyWindowHandle,
     /// A rename an MCP client waits on, with the notification of its preview.
     pub(crate) pending_rename: Option<PendingRename>,
+    /// The file the last delete of a tool removed, with its bytes, for Undo.
+    last_deleted: Option<(PathBuf, Vec<u8>)>,
     /// The last view published to the IDE protocol, so an idle frame does no work.
     view_key: Option<u64>,
     /// Numbers the reads of the hunks, so an older answer does not replace a newer one.
@@ -351,6 +361,27 @@ pub struct AgentsPanel {
     /// The Agents tab shows only the calls that run something of the project.
     pub(crate) clients_only_actions: bool,
     pub(crate) clients_scroll: ScrollHandle,
+}
+
+/// The Exposed Tools table of the settings, as the gateway applies it.
+fn tool_exposure(settings: &Settings) -> tool_gateway::ToolExposure {
+    let mut exposure = tool_gateway::ToolExposure::default();
+    for (name, choice) in &settings.mcp_tool_settings {
+        exposure.set_state(
+            name,
+            tool_gateway::ToolState {
+                enabled: choice.enabled,
+                router_only: choice.router_only,
+            },
+        );
+    }
+    if settings.mcp_router_only_mode {
+        exposure.set_router_only(Some(match settings.mcp_router_only_scope {
+            workspace::McpRouterScope::AllAgents => tool_gateway::RouterScope::AllAgents,
+            workspace::McpRouterScope::AcpOnly => tool_gateway::RouterScope::AcpOnly,
+        }));
+    }
+    exposure
 }
 
 /// A short stable name for the state of one project.
@@ -745,6 +776,7 @@ impl AgentsPanel {
                 edits,
                 window,
                 pending_rename: None,
+                last_deleted: None,
                 view_key: None,
                 marks_generation: 0,
                 focus: cx.focus_handle(),
@@ -778,7 +810,11 @@ impl AgentsPanel {
         let allow_trusted = cx.try_global::<Settings>().is_some_and(|settings| {
             settings.mcp_execute_permission == workspace::McpExecutePermission::TrustedProjects
         });
+        let brave = cx.try_global::<Settings>().is_some_and(|settings| {
+            settings.mcp_execute_permission == workspace::McpExecutePermission::WithoutConfirmation
+        });
         self.approvals.set_allow_trusted(allow_trusted);
+        self.approvals.set_brave(brave);
         match (enabled, self.mcp.clone()) {
             (true, None) => {
                 let started = open_mcp(
@@ -802,6 +838,14 @@ impl AgentsPanel {
             }
             (false, Some(mcp)) => mcp.unpublish(),
             (false, None) => {}
+        }
+        // The Exposed Tools table of the settings decides what every client already
+        // connected sees, so it reaches the gateway of the open server at once.
+        if let Some(mcp) = &self.mcp {
+            let exposure = cx
+                .try_global::<Settings>()
+                .map_or_else(tool_gateway::ToolExposure::default, tool_exposure);
+            mcp.gateway.set_exposure(exposure);
         }
         cx.notify();
     }
@@ -895,6 +939,7 @@ impl AgentsPanel {
                         || !change.renames.is_empty();
                     self.defer_apply(request.id, change, EditReply::Applied { changed }, cx);
                 }
+                EditKind::Open { path } => self.defer_open(request.id, path, cx),
             }
         }
     }
@@ -912,7 +957,7 @@ impl AgentsPanel {
                     Waiter::Bridge(diff.id),
                     diff.path,
                     diff.base,
-                    diff.proposed,
+                    Some(diff.proposed),
                     cx,
                 ),
                 BridgeEvent::Close(id) => self.drop_proposal(id, cx),
@@ -927,7 +972,7 @@ impl AgentsPanel {
         waiter: Waiter,
         path: PathBuf,
         base: Option<String>,
-        proposed: String,
+        proposed: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let relative = crate::git::relative_of(&self.root, &path);
@@ -935,7 +980,12 @@ impl AgentsPanel {
         self.next_proposal += 1;
         let proposal = Proposal::new(id, waiter, path.clone(), relative, base, proposed);
         if proposal.review.hunks.is_empty() {
-            self.answer_empty(&proposal, cx);
+            if proposal.review.current.is_none() && proposal.review.base.is_some() {
+                self.proposals.push(proposal);
+                self.resolve_proposal(self.proposals.len() - 1, cx);
+            } else {
+                self.answer_empty(&proposal, cx);
+            }
             return;
         }
         self.proposals.push(proposal);
@@ -1058,6 +1108,31 @@ impl AgentsPanel {
         };
         self.defer_apply(pending.id, pending.change, reply, cx);
         cx.notify();
+    }
+
+    /// Opens a file of a tool after the current update: an editor cannot open while the
+    /// window is being updated.
+    fn defer_open(&self, id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        let window = self.window;
+        let workspace = self.workspace.clone();
+        let edits = self.edits.clone();
+        cx.defer(move |cx| {
+            let opened = window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.open_file(path, window, cx))
+                        .ok()
+                })
+                .ok()
+                .flatten()
+                .is_some();
+            let reply = if opened {
+                EditReply::Applied { changed: false }
+            } else {
+                EditReply::Failed("the window is gone".to_string())
+            };
+            edits.resolve(id, reply);
+        });
     }
 
     /// Applies a change of the language service after the current update is over: an edit
@@ -1225,7 +1300,7 @@ impl AgentsPanel {
         else {
             return;
         };
-        if kept == 0 {
+        if hunks > 0 && kept == 0 {
             match waiter {
                 Waiter::Tool(request) => self.edits.resolve(
                     request,
@@ -1275,10 +1350,23 @@ impl AgentsPanel {
         };
         let written = text.clone();
         let write_path = path.clone();
+        let undo_base = base.clone();
+        let history = crate::history::get(cx);
+        let deleting = written.is_none();
         let job = cx.background_executor().spawn(async move {
             let current = std::fs::read(&write_path).ok();
             if current != base {
                 return Err("the file changed on disk".to_string());
+            }
+            // The Local History keeps what is about to be replaced or removed, so the
+            // window can undo the edit or show it later.
+            if let Some(history) = &history {
+                let cause = if deleting {
+                    local_history::Cause::BeforeDelete
+                } else {
+                    local_history::Cause::BeforeReplace
+                };
+                let _ = history.record_tree(&write_path, cause);
             }
             match written {
                 Some(text) => {
@@ -1291,7 +1379,12 @@ impl AgentsPanel {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                         Err(error.to_string())
                     }
-                    _ => Ok(()),
+                    _ => {
+                        if let Some(history) = &history {
+                            let _ = history.record_removed(&write_path);
+                        }
+                        Ok(())
+                    }
                 },
             }
         });
@@ -1304,6 +1397,13 @@ impl AgentsPanel {
                 }
                 match result {
                     Ok(()) => {
+                        if text.is_none()
+                            && let Some(base) = undo_base
+                        {
+                            let target = path.clone();
+                            this.last_deleted = Some((target.clone(), base));
+                            this.offer_undo_delete(&target, cx);
+                        }
                         match waiter {
                             Waiter::Tool(request) => this.edits.resolve(
                                 request,
@@ -1349,6 +1449,71 @@ impl AgentsPanel {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Offers the Undo of a file the user just deleted, as the notification of the
+    /// window does.
+    fn offer_undo_delete(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let relative = crate::git::relative_of(&self.root, path);
+        let text = format!("Deleted {relative}");
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.notify_user_with_commands(
+                    "Delete",
+                    text,
+                    vec![("undo", SharedString::from("Undo"), "ai.mcp.undo-delete")],
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    /// Puts the file of the last delete back, as the Undo of the notification does.
+    pub(crate) fn undo_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((path, bytes)) = self.last_deleted.take() else {
+            return;
+        };
+        if path.exists() {
+            return;
+        }
+        let history = crate::history::get(cx);
+        let write_path = path.clone();
+        let job = cx.background_executor().spawn(async move {
+            if let Some(parent) = write_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&write_path, &bytes).map_err(|error| error.to_string())?;
+            if let Some(history) = &history {
+                let _ = history.record(
+                    &write_path,
+                    Some(&bytes),
+                    local_history::Cause::BeforeRestore,
+                );
+            }
+            Ok::<(), String>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let written = job.await;
+            this.update(cx, |this, cx| {
+                if written.is_ok() {
+                    OpenEditors::reload(&path, cx);
+                    if let Some(panel) = this.tool_workspace_project(cx) {
+                        panel.update(cx, |panel, cx| panel.reload(cx));
+                    }
+                    if let Some(tracker) = this.tracker() {
+                        tracker.refresh();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn tool_workspace_project(&self, cx: &App) -> Option<Entity<crate::project::ProjectPanel>> {
+        cx.try_global::<crate::project::ActiveProjectPanel>()
+            .map(|panel| panel.0.clone())
     }
 
     /// Accept, reject or walk the hunks of a proposed file.
@@ -1861,7 +2026,7 @@ impl AgentsPanel {
                 cx.stop_propagation();
                 return;
             }
-            if !terminal.is_closed() && send_key(&terminal, stroke, cx) {
+            if !terminal.is_closed() && send_key(&terminal, stroke, keymap::platform(), cx) {
                 // What the user types takes the selection away, as it does in a terminal.
                 self.clear_grid_selection();
                 cx.stop_propagation();

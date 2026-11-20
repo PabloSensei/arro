@@ -1461,6 +1461,15 @@ impl EditorState {
     pub fn toggle_bookmark(&mut self, mnemonic: Option<char>) {
         let store = self.buffer.store();
         let line = store.offset_to_line(self.buffer.selections().primary().head);
+        self.toggle_bookmark_at_line(line, mnemonic);
+    }
+
+    /// F11 from a menu: the bookmark goes to `line`, not to the caret line.
+    pub fn toggle_bookmark_at_line(&mut self, line: usize, mnemonic: Option<char>) {
+        let store = self.buffer.store();
+        if line >= store.line_count() {
+            return;
+        }
         let line_of = |at: usize| store.offset_to_line(at.min(store.len()));
         let here = self
             .bookmarks
@@ -1486,6 +1495,13 @@ impl EditorState {
                 }
             }
         }
+    }
+
+    /// Takes the bookmark of a line away, as Delete of the Bookmarks window does.
+    pub fn remove_bookmark_at_line(&mut self, line: usize) {
+        let store = self.buffer.store();
+        let line_of = |at: usize| store.offset_to_line(at.min(store.len()));
+        self.bookmarks.retain(|(at, _)| line_of(*at) != line);
     }
 
     /// A mnemonic is on one bookmark only.
@@ -1577,15 +1593,21 @@ impl EditorState {
         (store.offset_to_line(*at) == line).then_some(note)
     }
 
-    /// The blame whose label the column paints on `line`: the first line of a run of one
-    /// commit carries the label of the whole run.
+    /// The blame whose label the column paints on `line`. Every line of a run of one
+    /// commit carries the label, as the column of IDEA does.
     pub fn annotation_label_at(&self, line: usize) -> Option<&BlameNote> {
-        let note = self.annotation_of_line(line)?;
-        let follows = line > 0
-            && self
-                .annotation_of_line(line - 1)
-                .is_some_and(|previous| previous.commit == note.commit);
-        (!follows).then_some(note)
+        self.annotation_of_line(line)
+    }
+
+    /// The width of the longest label in characters, for the column that holds it.
+    pub fn annotation_max_chars(&self) -> usize {
+        self.annotations
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|(_, note)| note.label.chars().count())
+            .max()
+            .unwrap_or(0)
     }
 
     /// The painted labels with their line from zero and their commit, for a test.
@@ -1594,19 +1616,16 @@ impl EditorState {
             return Vec::new();
         };
         let store = self.buffer.store();
-        let mut labels = Vec::new();
-        let mut previous: Option<(usize, &BlameNote)> = None;
-        for (at, note) in notes {
-            let line = store.offset_to_line((*at).min(store.len()));
-            let follows = previous.is_some_and(|(before, previous)| {
-                before + 1 == line && previous.commit == note.commit
-            });
-            if !follows {
-                labels.push((line as u32, note.label.clone(), note.commit.clone()));
-            }
-            previous = Some((line, note));
-        }
-        labels
+        notes
+            .iter()
+            .map(|(at, note)| {
+                (
+                    store.offset_to_line((*at).min(store.len())) as u32,
+                    note.label.clone(),
+                    note.commit.clone(),
+                )
+            })
+            .collect()
     }
 
     /// Soft wrap at this many columns, `None` for no wrap.
@@ -3088,6 +3107,7 @@ c",
             commit: commit.to_owned(),
             label: commit.to_owned(),
             details: String::new(),
+            time: 0,
         };
         state.set_annotations(&[(1, note("a")), (2, note("b"))]);
         assert_eq!(
@@ -3097,6 +3117,22 @@ c",
                 (1, "b".to_owned(), "b".to_owned())
             ]
         );
+
+        // Every line of a run of one commit carries its label.
+        state.set_annotations(&[(1, note("a")), (2, note("a")), (3, note("b"))]);
+        assert_eq!(
+            state
+                .annotation_labels()
+                .iter()
+                .map(|(line, label, _)| (*line, label.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "a".to_owned()),
+                (1, "a".to_owned()),
+                (2, "b".to_owned())
+            ]
+        );
+        state.set_annotations(&[(1, note("a")), (2, note("b"))]);
 
         // Enter at the end of the first line: the empty line under it has no label and
         // the label of `two` moves down with its text.

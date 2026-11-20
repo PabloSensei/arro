@@ -25,8 +25,9 @@ use lang_api::{
     OverridableMethods, OverridableMethodsQuery, Provider, RangeFormatQuery, RenameQuery, Reply,
     SemanticServer, SemanticToken, SemanticTokenKind, SemanticTokenModifiers, SemanticTokensQuery,
     Severity, SignatureException, SignatureHelp, SignatureParameter, SignatureQuery, SignatureText,
-    SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery, TextPoint, TextSpan, UsageEntry,
-    UsageKind, WorkspaceChange, WorkspaceDiagnosticsQuery, offset_in,
+    SourceEdit, SourceId, SourceSpan, SymbolEntry, SymbolQuery, TextPoint, TextSpan,
+    TypeHierarchyItem, TypeHierarchyQuery, TypeKind, UsageEntry, UsageKind, WorkspaceChange,
+    WorkspaceDiagnosticsQuery, offset_in,
 };
 use lsp_client::SemanticTokensCapability;
 use lsp_client::lsp_types::{
@@ -102,8 +103,15 @@ pub struct LspProviders {
     refactor_action: Option<&'static str>,
     refactor_edit_request: Option<&'static str>,
     refactor_steps: RefactorSteps,
+    /// The command a server runs to point at the name its refactoring introduced.
+    refactor_rename_command: Option<&'static str>,
+    refactor_selections_request: Option<&'static str>,
     move_destinations_request: Option<&'static str>,
     move_request: Option<&'static str>,
+    /// The `moveKind` a member move asks for, named by the language that has one.
+    move_member_kind: Option<&'static str>,
+    /// The `moveKind` a move to one of the places around a symbol asks for.
+    move_targets_kind: Option<&'static str>,
     change_signature_info_request: Option<&'static str>,
     change_signature_edit_request: Option<&'static str>,
     change_signature_command: Option<&'static str>,
@@ -345,6 +353,7 @@ fn action_entry(
     action: lsp::CodeActionOrCommand,
     edit_command: Option<&str>,
     refactor_action: Option<&str>,
+    rename: Option<lang_api::RenamePosition>,
 ) -> Option<ActionEntry> {
     let (title, code, preferred, edit, command) = match &action {
         lsp::CodeActionOrCommand::Command(command) => (
@@ -378,6 +387,7 @@ fn action_entry(
             renames: Vec::new(),
             handle: None,
             resolve: None,
+            rename: None,
         });
     }
     let (edit, handle, resolve) = match (edit, command) {
@@ -421,6 +431,24 @@ fn action_entry(
         renames: change.renames,
         handle,
         resolve,
+        rename,
+    })
+}
+
+/// The name of the element a resolved refactoring introduced, where the server marks the
+/// place for the client's rename with the command the provider named.
+fn rename_position(
+    command: &serde_json::Value,
+    rename_command: Option<&str>,
+) -> Option<lang_api::RenamePosition> {
+    if Some(command.get("command")?.as_str()?) != rename_command {
+        return None;
+    }
+    let place = command.get("arguments")?.as_array()?.first()?;
+    Some(lang_api::RenamePosition {
+        uri: place.get("uri")?.as_str()?.to_owned(),
+        offset: place.get("offset")?.as_u64()? as u32,
+        length: place.get("length")?.as_u64()? as u32,
     })
 }
 
@@ -435,30 +463,31 @@ async fn resolve_action(
     refactor_action: Option<&str>,
     edit_request: Option<&str>,
     steps: RefactorSteps,
-) -> Option<lsp::CodeActionOrCommand> {
+    rename_command: Option<&str>,
+) -> Option<(lsp::CodeActionOrCommand, Option<lang_api::RenamePosition>)> {
     let lsp::CodeActionOrCommand::CodeAction(mut action) = action else {
-        return Some(action);
+        return Some((action, None));
     };
     if action.edit.is_some() {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     }
     let (Some(command), Some(refactor_action), Some(edit_request)) =
         (&action.command, refactor_action, edit_request)
     else {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     };
     if command.command != refactor_action {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     }
     let arguments = command.arguments.clone().unwrap_or_default();
     let Some(name) = arguments.first().and_then(|name| name.as_str()) else {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     };
     let Some(context) = arguments.get(1).cloned() else {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     };
     if steps.needs_a_form(name) {
-        return Some(lsp::CodeActionOrCommand::CodeAction(action));
+        return Some((lsp::CodeActionOrCommand::CodeAction(action), None));
     }
     let extra = arguments.get(2..).unwrap_or_default();
     let params = serde_json::json!({
@@ -472,8 +501,11 @@ async fn resolve_action(
             let edit = reply
                 .get("edit")
                 .and_then(|edit| serde_json::from_value::<lsp::WorkspaceEdit>(edit.clone()).ok())?;
+            let rename = reply
+                .get("command")
+                .and_then(|command| rename_position(command, rename_command));
             action.edit = Some(edit);
-            Some(lsp::CodeActionOrCommand::CodeAction(action))
+            Some((lsp::CodeActionOrCommand::CodeAction(action), rename))
         }
         // No answer: the row would promise an action that cannot run.
         Err(_) => None,
@@ -487,6 +519,7 @@ async fn action_entries(
     refactor_action: Option<&str>,
     refactor_edit_request: Option<&str>,
     refactor_steps: RefactorSteps,
+    rename_command: Option<&str>,
 ) -> Vec<ActionEntry> {
     let mut entries = Vec::new();
     for action in response.into_iter().flatten() {
@@ -496,10 +529,12 @@ async fn action_entries(
             refactor_action,
             refactor_edit_request,
             refactor_steps,
+            rename_command,
         )
         .await;
-        entries
-            .extend(action.and_then(|action| action_entry(action, edit_command, refactor_action)));
+        entries.extend(action.and_then(|(action, rename)| {
+            action_entry(action, edit_command, refactor_action, rename)
+        }));
     }
     entries
 }
@@ -641,6 +676,7 @@ async fn prompt_entry(
         renames: change.renames,
         handle: None,
         resolve: None,
+        rename: None,
     })
 }
 
@@ -1223,8 +1259,12 @@ impl LspProviders {
             refactor_action: None,
             refactor_edit_request: None,
             refactor_steps: RefactorSteps::default(),
+            refactor_rename_command: None,
+            refactor_selections_request: None,
             move_destinations_request: None,
             move_request: None,
+            move_member_kind: None,
+            move_targets_kind: None,
             change_signature_info_request: None,
             change_signature_edit_request: None,
             change_signature_command: None,
@@ -1275,14 +1315,34 @@ impl LspProviders {
         self
     }
 
+    /// Names the command a server runs to point at the name its refactoring introduced.
+    pub fn with_refactor_rename(mut self, command: &'static str) -> Self {
+        self.refactor_rename_command = Some(command);
+        self
+    }
+
+    /// Names the request that lists the expressions an extract may take under the caret.
+    pub fn with_refactor_selections(mut self, request: &'static str) -> Self {
+        self.refactor_selections_request = Some(request);
+        self
+    }
+
     /// Names the requests that list the places a file can move to and that move it.
     pub fn with_move_requests(
         mut self,
         destinations: &'static str,
         move_request: &'static str,
+        member_kind: &'static str,
     ) -> Self {
         self.move_destinations_request = Some(destinations);
         self.move_request = Some(move_request);
+        self.move_member_kind = Some(member_kind);
+        self
+    }
+
+    /// Names the `moveKind` of a move to one of the places around a symbol.
+    pub fn with_move_targets_kind(mut self, kind: &'static str) -> Self {
+        self.move_targets_kind = Some(kind);
         self
     }
 
@@ -1639,6 +1699,7 @@ impl Provider<ActionResolveQuery, Option<ActionEntry>> for LspProviders {
                 lsp::CodeActionOrCommand::CodeAction(action),
                 edit_command,
                 None,
+                None,
             )))
         });
     }
@@ -1652,6 +1713,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for LspProviders {
         let refactor_action = self.refactor_action;
         let refactor_edit_request = self.refactor_edit_request;
         let refactor_steps = self.refactor_steps;
+        let rename_command = self.refactor_rename_command;
         let prompt_sources = self.prompt_sources.clone();
         self.answer(cancel, reply, async move {
             let place = Place {
@@ -1674,6 +1736,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for LspProviders {
                         refactor_action,
                         refactor_edit_request,
                         refactor_steps,
+                        rename_command,
                     )
                     .await
                 }
@@ -2147,6 +2210,57 @@ fn point_of(point: Position) -> TextPoint {
     }
 }
 
+fn extract_command(kind: lang_api::ExtractKind) -> &'static str {
+    match kind {
+        lang_api::ExtractKind::Method => "extractMethod",
+        lang_api::ExtractKind::Variable => "extractVariable",
+        lang_api::ExtractKind::Constant => "extractConstant",
+        lang_api::ExtractKind::Field => "extractField",
+    }
+}
+
+impl Provider<lang_api::SelectionQuery, Vec<lang_api::SelectionEntry>> for LspProviders {
+    fn start(
+        &self,
+        query: lang_api::SelectionQuery,
+        cancel: Cancel,
+        reply: Reply<Vec<lang_api::SelectionEntry>>,
+    ) {
+        let router = self.router.clone();
+        let Some(request) = self.refactor_selections_request else {
+            self.answer(cancel, reply, async { Some(Ok(Vec::new())) });
+            return;
+        };
+        self.answer(cancel, reply, async move {
+            let place = place(&query.spot)?;
+            let at = position(query.spot.point);
+            let params = serde_json::json!({
+                "command": extract_command(query.kind),
+                "context": {
+                    "textDocument": {"uri": place.uri.as_str()},
+                    "range": {"start": at, "end": at},
+                    "context": {"diagnostics": []},
+                },
+            });
+            let answer = router.extension(request, params).await;
+            Some(answer.map(|value| {
+                value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        Some(lang_api::SelectionEntry {
+                            name: entry.get("name")?.as_str()?.to_owned(),
+                            offset: entry.get("offset")?.as_u64()? as u32,
+                            length: entry.get("length")?.as_u64()? as u32,
+                        })
+                    })
+                    .collect()
+            }))
+        });
+    }
+}
+
 impl Provider<RenameQuery, WorkspaceChange> for LspProviders {
     fn start(&self, query: RenameQuery, cancel: Cancel, reply: Reply<WorkspaceChange>) {
         let router = self.router.clone();
@@ -2157,9 +2271,14 @@ impl Provider<RenameQuery, WorkspaceChange> for LspProviders {
     }
 }
 
-fn move_kind(kind: MoveKind) -> &'static str {
-    match kind {
-        MoveKind::File => "moveResource",
+impl LspProviders {
+    /// The `moveKind` the server expects for a move, when it has one for it.
+    fn move_kind(&self, kind: MoveKind) -> Option<&'static str> {
+        match kind {
+            MoveKind::File => Some("moveResource"),
+            MoveKind::Member => self.move_member_kind,
+            MoveKind::InstanceMethod => self.move_targets_kind,
+        }
     }
 }
 
@@ -2173,16 +2292,28 @@ fn destination_folder(destination: &serde_json::Value) -> Option<PathBuf> {
 impl Provider<MoveQuery, Vec<MoveDestination>> for LspProviders {
     fn start(&self, query: MoveQuery, cancel: Cancel, reply: Reply<Vec<MoveDestination>>) {
         let router = self.router.clone();
-        let Some(request) = self.move_destinations_request else {
+        let (Some(request), Some(kind)) =
+            (self.move_destinations_request, self.move_kind(query.kind))
+        else {
             self.answer(cancel, reply, async { Some(Ok(Vec::new())) });
             return;
         };
         self.answer(cancel, reply, async move {
             let place = place(&query.spot)?;
-            let params = serde_json::json!({
-                "moveKind": move_kind(query.kind),
+            let mut params = serde_json::json!({
+                "moveKind": kind,
                 "sourceUris": [place.uri.as_str()],
             });
+            if query.kind == MoveKind::InstanceMethod {
+                // The server finds the method by the range of the request, as it does for
+                // a move, and lists the places around it that can take it.
+                let at = position(query.spot.point);
+                params["params"] = serde_json::json!({
+                    "textDocument": {"uri": place.uri.as_str()},
+                    "range": {"start": at, "end": at},
+                    "context": {"diagnostics": []},
+                });
+            }
             let answer = router.extension(request, params).await;
             Some(answer.map(|value| {
                 value
@@ -2191,13 +2322,22 @@ impl Provider<MoveQuery, Vec<MoveDestination>> for LspProviders {
                     .into_iter()
                     .flatten()
                     .filter_map(|destination| {
-                        let name = destination.get("displayName")?.as_str()?.to_owned();
+                        // A file destination names a package, a place around a symbol
+                        // names a parameter or a field with the name of its type.
+                        let name = destination
+                            .get("displayName")
+                            .or_else(|| destination.get("name"))?
+                            .as_str()?
+                            .to_owned();
                         let project = destination.get("project").and_then(|v| v.as_str());
                         let path = destination.get("path").and_then(|v| v.as_str());
                         let detail = match (project, path) {
                             (Some(project), Some(path)) => Some(format!("{project}  {path}")),
                             (Some(project), None) => Some(project.to_owned()),
-                            _ => None,
+                            _ => destination
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
                         };
                         let folder = destination_folder(destination);
                         Some(MoveDestination {
@@ -2220,16 +2360,38 @@ impl Provider<MoveRequest, MoveOutcome> for LspProviders {
             self.answer(cancel, reply, async { Some(Ok(MoveOutcome::default())) });
             return;
         };
+        let Some(kind) = self.move_kind(query.kind) else {
+            self.answer(cancel, reply, async {
+                Some(Ok(MoveOutcome {
+                    change: WorkspaceChange::default(),
+                    error: Some("This language has no move of members".to_owned()),
+                }))
+            });
+            return;
+        };
         self.answer(cancel, reply, async move {
             let place = place(&query.spot)?;
-            let destination: serde_json::Value =
-                serde_json::from_str(&query.destination.handle).ok()?;
-            let params = serde_json::json!({
-                "moveKind": move_kind(query.kind),
+            // A destination of a file comes from the server as JSON, a type of a member
+            // move is the name a person typed.
+            let destination = serde_json::from_str(&query.destination.handle)
+                .unwrap_or_else(|_| serde_json::Value::String(query.destination.handle.clone()));
+            let mut params = serde_json::json!({
+                "moveKind": kind,
                 "sourceUris": [place.uri.as_str()],
                 "destination": destination,
                 "updateReferences": query.update_references,
             });
+            if query.kind != MoveKind::File {
+                // A move of a member or of an instance method names the symbol under the
+                // caret in the context of the action, and the server takes the symbol
+                // that is there.
+                let at = position(query.spot.point);
+                params["params"] = serde_json::json!({
+                    "textDocument": {"uri": place.uri.as_str()},
+                    "range": {"start": at, "end": at},
+                    "context": {"diagnostics": []},
+                });
+            }
             let answer = router.extension(request, params).await;
             Some(answer.map(|value| {
                 let error = value
@@ -2428,28 +2590,68 @@ impl Provider<ChangeSignatureRequest, ChangeSignatureOutcome> for LspProviders {
     }
 }
 
-/// One item of a type hierarchy as the raw reply carries it. The server's `kind` is
-/// left out: some servers send a value this LSP shape does not read.
-fn hierarchy_entry(item: &serde_json::Value) -> Option<SymbolEntry> {
+/// The place of one item of a type hierarchy as the raw reply carries it. Some servers
+/// name the declaration with `range`, others the name with `selectionRange`.
+fn hierarchy_place(item: &serde_json::Value) -> Option<SourceSpan> {
     let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
-    let range = item.get("selectionRange")?;
+    let range = item.get("selectionRange").or_else(|| item.get("range"))?;
     let point = |value: &serde_json::Value| {
         Some(TextPoint {
             line: value.get("line")?.as_u64()? as u32,
             character: value.get("character")?.as_u64()? as u32,
         })
     };
+    Some(SourceSpan {
+        uri: text("uri")?.to_owned(),
+        span: TextSpan {
+            start: point(range.get("start")?)?,
+            end: point(range.get("end")?)?,
+        },
+    })
+}
+
+/// One item of a type hierarchy as the raw reply carries it. The server's `kind` is
+/// left out: some servers send a value this LSP shape does not read.
+fn hierarchy_entry(item: &serde_json::Value) -> Option<SymbolEntry> {
+    let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
     Some(SymbolEntry {
         name: text("name")?.to_owned(),
         container: text("detail").map(str::to_owned),
-        place: Some(SourceSpan {
-            uri: text("uri")?.to_owned(),
-            span: TextSpan {
-                start: point(range.get("start")?)?,
-                end: point(range.get("end")?)?,
-            },
-        }),
+        place: hierarchy_place(item),
     })
+}
+
+/// The first item of the hierarchy of a place, as the raw reply carries it.
+async fn prepare_type_hierarchy(
+    router: &Router,
+    uri: &Uri,
+    at: Position,
+) -> Result<Option<serde_json::Value>, RouteError> {
+    let params = serde_json::json!({
+        "textDocument": {"uri": uri.as_str()},
+        "position": {"line": at.line, "character": at.character},
+    });
+    let prepared = router
+        .extension("textDocument/prepareTypeHierarchy", params)
+        .await?;
+    Ok(prepared.as_array().and_then(|items| items.first()).cloned())
+}
+
+/// The types above or below one item of a type hierarchy, as the raw reply carries them.
+async fn type_hierarchy_relations(
+    router: &Router,
+    item: &serde_json::Value,
+    supertypes: bool,
+) -> Result<Vec<serde_json::Value>, RouteError> {
+    let method = if supertypes {
+        "typeHierarchy/supertypes"
+    } else {
+        "typeHierarchy/subtypes"
+    };
+    let reply = router
+        .extension(method, serde_json::json!({"item": item}))
+        .await?;
+    Ok(reply.as_array().cloned().unwrap_or_default())
 }
 
 /// The type hierarchy of a place through the JSON of the protocol, so a server that
@@ -2460,30 +2662,69 @@ async fn type_hierarchy(
     at: Position,
     supertypes: bool,
 ) -> Result<Vec<SymbolEntry>, RouteError> {
-    let params = serde_json::json!({
-        "textDocument": {"uri": uri.as_str()},
-        "position": {"line": at.line, "character": at.character},
-    });
-    let prepared = router
-        .extension("textDocument/prepareTypeHierarchy", params)
-        .await?;
-    let Some(item) = prepared.as_array().and_then(|items| items.first()) else {
+    let Some(item) = prepare_type_hierarchy(router, uri, at).await? else {
         return Ok(Vec::new());
     };
-    let method = if supertypes {
-        "typeHierarchy/supertypes"
-    } else {
-        "typeHierarchy/subtypes"
-    };
-    let reply = router
-        .extension(method, serde_json::json!({"item": item}))
-        .await?;
-    Ok(reply
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(hierarchy_entry)
-        .collect())
+    let items = type_hierarchy_relations(router, &item, supertypes).await?;
+    Ok(items.iter().filter_map(hierarchy_entry).collect())
+}
+
+/// How a type of the hierarchy is declared, from the kind the server sends.
+fn type_hierarchy_kind(kind: Option<u64>) -> TypeKind {
+    match kind {
+        Some(10) => TypeKind::Enum,
+        Some(11) => TypeKind::Interface,
+        Some(23) => TypeKind::Record,
+        _ => TypeKind::Class,
+    }
+}
+
+/// One item of the type hierarchy with the type it declares. The raw item is kept in
+/// `handle`, so the same type can be asked for its own neighbours.
+fn type_hierarchy_item(item: &serde_json::Value) -> Option<TypeHierarchyItem> {
+    let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
+    Some(TypeHierarchyItem {
+        name: text("name")?.to_owned(),
+        detail: text("detail").map(str::to_owned),
+        kind: type_hierarchy_kind(item.get("kind").and_then(serde_json::Value::as_u64)),
+        abstract_type: false,
+        place: hierarchy_place(item),
+        handle: item.to_string(),
+    })
+}
+
+impl Provider<TypeHierarchyQuery, Vec<TypeHierarchyItem>> for LspProviders {
+    fn start(
+        &self,
+        query: TypeHierarchyQuery,
+        cancel: Cancel,
+        reply: Reply<Vec<TypeHierarchyItem>>,
+    ) {
+        let router = self.router.clone();
+        self.answer(cancel, reply, async move {
+            let items = match query {
+                TypeHierarchyQuery::Root(spot) => {
+                    let place = place(&spot)?;
+                    match prepare_type_hierarchy(&router, &place.uri, place.position).await {
+                        Ok(Some(item)) => vec![item],
+                        Ok(None) => Vec::new(),
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                TypeHierarchyQuery::Neighbours { item, direction } => {
+                    let Ok(item) = serde_json::from_str(&item.handle) else {
+                        return Some(Ok(Vec::new()));
+                    };
+                    let supertypes = direction == HierarchyDirection::Supertypes;
+                    match type_hierarchy_relations(&router, &item, supertypes).await {
+                        Ok(items) => items,
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+            };
+            Some(Ok(items.iter().filter_map(type_hierarchy_item).collect()))
+        });
+    }
 }
 
 impl Provider<HierarchyQuery, Vec<SymbolEntry>> for LspProviders {
@@ -3199,6 +3440,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(entry.kind, Some(ActionKind::OrganizeImports));
@@ -3242,6 +3484,7 @@ mod tests {
             })),
             Some("lang.applyEdit"),
             Some("lang.applyRefactoringCommand"),
+            None,
         )
         .unwrap();
         assert_eq!(entry.kind, Some(ActionKind::Refactor));
@@ -3263,6 +3506,7 @@ mod tests {
             })),
             Some("lang.applyEdit"),
             Some("lang.applyRefactor"),
+            None,
         )
         .unwrap();
         assert_eq!(entry.code.as_deref(), Some("refactor.extract.interface"));
@@ -3283,9 +3527,10 @@ mod tests {
                            "end": {"line": 0, "character": 0}},
                  "newText": "import a.C;\n"}]}}],
         });
-        let entry = action_entry(action(command.clone()), Some("lang.applyEdit"), None).unwrap();
+        let entry =
+            action_entry(action(command.clone()), Some("lang.applyEdit"), None, None).unwrap();
         assert_eq!(entry.edits[0].edits[0].text, "import a.C;\n");
-        assert!(action_entry(action(command), None, None).is_none());
+        assert!(action_entry(action(command), None, None, None).is_none());
     }
 
     #[test]

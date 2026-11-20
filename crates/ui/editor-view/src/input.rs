@@ -70,6 +70,7 @@ impl EntityInputHandler for EditorView {
             || self.generation_typed(text, cx)
             || self.move_typed(text, cx)
             || self.rename_typed(text, cx)
+            || self.name_typed(text, cx)
         {
             return;
         }

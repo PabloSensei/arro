@@ -27,18 +27,18 @@ pub fn shells_in(account: Option<&OsStr>, path: &OsStr) -> Vec<Shell> {
     let mut shells = Vec::new();
     if let Some(shell) = account.map(PathBuf::from).filter(|shell| shell.is_file()) {
         let name = shell_name(&shell);
-        push_unique(&mut shells, Shell::new(&name, &shell));
+        push_unique(&mut shells, Shell::login(&name, &shell));
     }
     for program in ["bash", "zsh", "fish", "sh"] {
         if let Some(found) = find_in(path, program) {
             let name = shell_name(&found);
-            push_unique(&mut shells, Shell::new(&name, &found));
+            push_unique(&mut shells, Shell::login(&name, &found));
         }
     }
     // The shell of every Unix is there even when PATH does not name it.
     let sh = PathBuf::from("/bin/sh");
     if sh.is_file() {
-        push_unique(&mut shells, Shell::new("sh", &sh));
+        push_unique(&mut shells, Shell::login("sh", &sh));
     }
     shells
 }
@@ -59,7 +59,22 @@ mod tests {
     fn a_shell_is_quoted_for_the_command_line() {
         let shell = default_shell().expect("a Unix has a shell");
         assert!(shell.starts_with('"'), "{shell}");
-        assert!(shell.ends_with('"'), "{shell}");
+        assert_eq!(shell.matches('"').count(), 2, "{shell}");
+    }
+
+    #[test]
+    fn the_shells_of_the_menu_start_as_login_shells_where_they_know_the_flag() {
+        let path = path_with("shells-unix-login", &["bash", "zsh", "fish"]);
+        let shells = shells_in(None, &path);
+        for shell in &shells {
+            assert_eq!(
+                shell.command_line.ends_with(" -l"),
+                shell.name != "sh",
+                "{}: {}",
+                shell.name,
+                shell.command_line
+            );
+        }
     }
 
     /// A PATH of its own, with the files `names` in the first folder.
@@ -96,6 +111,9 @@ mod tests {
         let account = std::path::Path::new(&folder).join("zsh");
         let shells = shells_in(Some(account.as_os_str()), &path);
         assert_eq!(shells[0].name, "zsh");
-        assert_eq!(shells[0].command_line, format!("\"{}\"", account.display()));
+        assert_eq!(
+            shells[0].command_line,
+            format!("\"{}\" -l", account.display())
+        );
     }
 }

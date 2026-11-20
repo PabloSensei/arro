@@ -1043,6 +1043,7 @@ mod tests {
                         ..Unit::default()
                     },
                 ],
+                ..Module::default()
             }],
             dependencies: vec![ModuleDependencies {
                 module: "app".to_owned(),

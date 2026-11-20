@@ -18,8 +18,8 @@ use futures_util::StreamExt;
 use lang_api::{DumpQuery, ask};
 use proc_sup::ProcessSpec;
 use project_model::{
-    BuildModule, BuildSystem, EnvironmentProvider, ProjectModel, ProjectSession, SyncEvent,
-    TaskOptions, ToolHome, ToolProgress, ToolSetup, open_project,
+    BuildModule, BuildSelection, BuildSystem, EnvironmentProvider, ProjectModel, ProjectSession,
+    SyncEvent, TaskOptions, ToolHome, ToolProgress, ToolSetup, open_project,
 };
 use runner::{
     BeforeLaunchStep, Console, ConsoleEvent, CoverageOwner, FindTests, LiveApplication,
@@ -27,8 +27,8 @@ use runner::{
     Step, Stream, TestProvider, TestRequest, TestRun,
 };
 use tool_gateway::{
-    BuildOutcome, BuildRequest, RunConfiguration, RunOutput, TestCase, TestOutcome, TestsOutcome,
-    TestsRequest,
+    BuildOutcome, BuildProblem, BuildRequest, RunConfiguration, RunOutput, StartRunRequest,
+    TestCase, TestOutcome, TestsOutcome, TestsRequest,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -100,6 +100,40 @@ pub struct ProjectSetup {
 
 /// How long a build step gets to finish after Stop before it is ended.
 const TASK_GRACE: Duration = Duration::from_secs(5);
+
+/// What the last build of the window was, so that Build window can run it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BuildKind {
+    Project,
+    /// The module of the file, or the whole project when no module holds it.
+    Module(Option<PathBuf>),
+    /// Recompile of the file.
+    Compile(Option<PathBuf>),
+    Rebuild,
+    GenerateSources,
+}
+
+/// The last build as the Build window shows it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BuildView {
+    /// The build still runs.
+    pub running: bool,
+    /// A build ended, successfully or not.
+    pub finished: bool,
+    pub success: bool,
+    /// The user stopped the build.
+    pub stopped: bool,
+    /// How long the build took, once it ended.
+    pub duration: Option<Duration>,
+    /// When the build started, so the window tells a new one from the last one.
+    pub started: Option<Instant>,
+    /// The title of the build, such as the tool and the command.
+    pub title: String,
+    /// The output of the build as the console shows it.
+    pub lines: Vec<String>,
+    /// What the build tool reported about the sources.
+    pub problems: Vec<BuildProblem>,
+}
 const POLL: Duration = Duration::from_millis(50);
 /// A build file that changes on disk waits this long for the others of the same batch,
 /// as a branch switch makes many, and then the project is imported once.
@@ -124,6 +158,26 @@ const ANSI_LIGHT: [u32; 16] = [
     0x000000, 0xc7222d, 0x067d17, 0x9e880d, 0x0033b3, 0x871094, 0x0f7b8a, 0x6f737a, 0x818594,
     0xe55765, 0x2e9c3b, 0xb59b1b, 0x3574f0, 0xb350bf, 0x1996a6, 0x1e1f22,
 ];
+/// The field of a configuration that carries an override of a debug start, by the words
+/// of its key. A provider that declares none refuses the override.
+fn override_of(
+    fields: &[runner::ConfigField],
+    words: &[&str],
+    value: &str,
+    what: &str,
+) -> Result<(String, String), String> {
+    let found = fields.iter().find(|field| {
+        let key = field.key.to_ascii_lowercase();
+        words.iter().any(|word| key.contains(word))
+    });
+    match found {
+        Some(field) => Ok((field.key.to_string(), value.to_string())),
+        None => Err(format!(
+            "the configuration does not allow {what} from a tool"
+        )),
+    }
+}
+
 fn color(hex: u32) -> Hsla {
     rgb(hex).into()
 }
@@ -134,7 +188,12 @@ pub struct RunPanel {
     scroll: UniformListScrollHandle,
     root: PathBuf,
     cache_root: PathBuf,
+    /// The state folder of the window, for the file of a complete run log.
+    state_dir: PathBuf,
     tool: Option<Arc<dyn BuildSystem>>,
+    /// The answers of the user for the build: which named settings are on and which
+    /// values it reads. The tool keeps them for the next command, the window shows them.
+    selection: BuildSelection,
     providers: Vec<Arc<dyn RunConfigProvider>>,
     /// The SDKs of the project; it also carries a changed model to the language.
     environment: Option<Arc<dyn EnvironmentProvider>>,
@@ -152,6 +211,9 @@ pub struct RunPanel {
     /// Why the file could not be read. It is never overwritten while this is set.
     store_broken: Option<String>,
     selected: Option<usize>,
+    /// The next run of a configuration with the overrides a tool asked for. It is not in
+    /// the list and is not written to the file.
+    pending_config: Option<RunConfig>,
     console: Option<Console>,
     /// The main process of the console is still running. Output may keep coming after it
     /// ends, but the panel is free for the next run.
@@ -208,6 +270,16 @@ pub struct RunPanel {
     build_console: Option<Console>,
     /// The build process is still running; its late output may come after it ends.
     build_running: bool,
+    /// The last build action, for Restart Build in the Build window.
+    last_build: Option<BuildKind>,
+    /// What the Build window shows of the last build.
+    build_view: BuildView,
+    /// When the current or last build started.
+    build_started: Option<Instant>,
+    /// The verdict of the last build that ended and how long it took.
+    build_verdict: Option<(bool, Duration)>,
+    /// The user stopped the last build.
+    build_stopped: bool,
     /// The lines of a build run with a console of its own: the test console keeps its
     /// own buffers, so an unfinished line of one process cannot join the other.
     build_output: OutputBuffers,
@@ -296,6 +368,8 @@ pub struct RunPanel {
     tool_outputs: VecDeque<(String, tool_gateway::RunOutput)>,
     /// The exit code of the last process of a job an MCP tool asked for.
     tool_exit: Option<Option<i32>>,
+    /// How many lines of the current job were written to its file last.
+    tool_output_lines: usize,
 }
 
 /// The build or test run a tool of the MCP server asked for.
@@ -453,11 +527,16 @@ impl RunPanel {
     pub fn create(
         root: PathBuf,
         setup: ProjectSetup,
+        state_dir: PathBuf,
         workspace: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
             let project_root = root.clone();
+            let selection = setup
+                .tool
+                .as_ref()
+                .map_or_else(BuildSelection::default, |tool| tool.selection(&root));
             let (session, sync) = match setup.tool.clone() {
                 Some(tool) => {
                     let (session, sync) = open_project(tool, root, &setup.cache_root);
@@ -513,7 +592,9 @@ impl RunPanel {
                 scroll: UniformListScrollHandle::new(),
                 root: project_root,
                 cache_root: setup.cache_root.clone(),
+                state_dir,
                 tool: setup.tool,
+                selection,
                 providers,
                 environment: setup.environment.clone(),
                 loading: session.is_some(),
@@ -525,6 +606,7 @@ impl RunPanel {
                 temporary: Vec::new(),
                 store_broken: None,
                 selected: None,
+                pending_config: None,
                 console: None,
                 console_running: false,
                 draining: Vec::new(),
@@ -555,6 +637,11 @@ impl RunPanel {
                 building_project: false,
                 build_console: None,
                 build_running: false,
+                last_build: None,
+                build_view: BuildView::default(),
+                build_started: None,
+                build_verdict: None,
+                build_stopped: false,
                 build_output: OutputBuffers::default(),
                 build_process: None,
                 reload: None,
@@ -594,6 +681,7 @@ impl RunPanel {
                 tool_output: None,
                 tool_outputs: VecDeque::new(),
                 tool_exit: None,
+                tool_output_lines: 0,
             }
         })
     }
@@ -613,6 +701,11 @@ impl RunPanel {
         &self.cache_root
     }
 
+    /// The root of the project, for the panels that show its places.
+    pub(crate) fn root(&self) -> &StdPath {
+        &self.root
+    }
+
     /// The toolbar widget on this panel.
     pub fn controls(panel: &Entity<Self>) -> RunControls {
         let (
@@ -624,6 +717,9 @@ impl RunPanel {
             build,
             rerun,
             compile,
+            build_module,
+            rebuild,
+            generate_sources,
             rerun_tests,
             background,
             save,
@@ -633,7 +729,12 @@ impl RunPanel {
             toggle_coverage,
             profile,
             profile_tests,
+            module_of,
         ) = (
+            panel.clone(),
+            panel.clone(),
+            panel.clone(),
+            panel.clone(),
             panel.clone(),
             panel.clone(),
             panel.clone(),
@@ -664,6 +765,13 @@ impl RunPanel {
             compile: Rc::new(move |path, _, cx| {
                 compile.update(cx, |this, cx| this.compile_current(path, cx))
             }),
+            build_module: Rc::new(move |path, _, cx| {
+                build_module.update(cx, |this, cx| this.build_module(path, cx))
+            }),
+            rebuild: Rc::new(move |_, cx| rebuild.update(cx, |this, cx| this.rebuild_project(cx))),
+            generate_sources: Rc::new(move |_, cx| {
+                generate_sources.update(cx, |this, cx| this.generate_sources(cx))
+            }),
             rerun: Rc::new(move |_, cx| rerun.update(cx, |this, cx| this.rerun_last(cx))),
             rerun_tests: Rc::new(move |_, cx| {
                 rerun_tests.update(cx, |this, cx| this.rerun_tests(cx))
@@ -686,6 +794,10 @@ impl RunPanel {
             profile: Rc::new(move |_, cx| profile.update(cx, |this, cx| this.run_profile(cx))),
             profile_tests: Rc::new(move |_, cx| {
                 profile_tests.update(cx, |this, cx| this.rerun_tests_profile(cx))
+            }),
+            module_of: Rc::new(move |path, cx| {
+                path.and_then(|path| module_of.read(cx).module_of(path))
+                    .map(Into::into)
             }),
         }
     }
@@ -720,6 +832,15 @@ impl RunPanel {
                 .iter()
                 .map(|config| self.is_temporary(&config.name))
                 .collect(),
+            build_tool: self
+                .session
+                .as_ref()
+                .and_then(ProjectSession::model)
+                .map(|_| SharedString::from(self.tool_title())),
+            generates_sources: self
+                .tool
+                .as_ref()
+                .is_some_and(|tool| tool.generates_sources()),
         }
     }
 
@@ -1060,6 +1181,55 @@ impl RunPanel {
         self.tool.clone()
     }
 
+    /// The answers of the user for the build of the project.
+    pub(crate) fn build_selection(&self) -> &BuildSelection {
+        &self.selection
+    }
+
+    /// Whether the build tool takes named values on its command line, so that the build
+    /// window offers to edit them.
+    pub(crate) fn takes_properties(&self) -> bool {
+        self.tool
+            .as_ref()
+            .is_some_and(|tool| tool.takes_properties())
+    }
+
+    /// The next answer for one named setting: the build file, on, off, and the build file
+    /// again. The answer is kept for the commands that follow and the project is imported
+    /// again in the background, as after a change of a build file.
+    pub(crate) fn cycle_profile(&mut self, name: &str, cx: &mut Context<Self>) {
+        let mut next = self.selection.clone();
+        next.cycle(name);
+        self.store_selection(next, cx);
+    }
+
+    /// Takes the named values of the build as the window edited them.
+    pub(crate) fn set_build_properties(&mut self, text: &str, cx: &mut Context<Self>) {
+        let mut next = self.selection.clone();
+        next.set_properties_text(text);
+        self.store_selection(next, cx);
+    }
+
+    /// Keeps the answers through the tool, which every later command of every window and
+    /// provider asks before it starts.
+    fn store_selection(&mut self, next: BuildSelection, cx: &mut Context<Self>) {
+        let Some(tool) = self.tool.clone() else {
+            return;
+        };
+        if let Err(error) = tool.choose(&self.root, &next) {
+            self.tell("Build Settings", error.to_string(), cx);
+            return;
+        }
+        self.selection = next;
+        self.model_file_changed(cx);
+        if let Some(semantic) = cx.try_global::<Semantic>()
+            && let Some(server) = semantic.0.server()
+        {
+            server.reimport();
+        }
+        self.changed(cx);
+    }
+
     /// Why `.arro/run.toml` cannot be read, if it is broken.
     pub(crate) fn store_error(&self) -> Option<String> {
         self.store_broken.clone()
@@ -1124,6 +1294,91 @@ impl RunPanel {
             .ok();
         })
         .detach();
+    }
+
+    /// Whether one run of `config` may change its arguments, folder and variables: its
+    /// provider declares all three fields and it starts no other configuration.
+    fn supports_overrides(&self, config: &RunConfig) -> bool {
+        if config.is_compound() {
+            return false;
+        }
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id() == config.provider)
+        else {
+            return false;
+        };
+        let fields = provider.fields(config);
+        let has = |words: &[&str]| {
+            fields.iter().any(|field| {
+                let key = field.key.to_ascii_lowercase();
+                words.iter().any(|word| key.contains(word))
+            })
+        };
+        has(&["arg"]) && has(&["work", "dir"]) && has(&["env"])
+    }
+
+    /// A copy of the configuration with the overrides of one run. The stored
+    /// configuration and the file do not change.
+    fn configuration_with_overrides(
+        &self,
+        name: &str,
+        program_arguments: Option<&str>,
+        working_directory: Option<&StdPath>,
+        envs: &[String],
+    ) -> Result<RunConfig, String> {
+        let mut config = self
+            .configs
+            .iter()
+            .find(|config| config.name == name)
+            .cloned()
+            .ok_or_else(|| format!("the project has no run configuration {name}"))?;
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id() == config.provider)
+            .cloned()
+            .ok_or_else(|| "the configuration has no provider".to_string())?;
+        let fields = provider.fields(&config);
+        if let Some(arguments) = program_arguments
+            && !arguments.trim().is_empty()
+        {
+            let (key, value) = override_of(&fields, &["arg"], arguments, "program arguments")?;
+            provider.write_field(&mut config, &key, &value);
+        }
+        if let Some(directory) = working_directory {
+            let (key, value) = override_of(
+                &fields,
+                &["work", "dir"],
+                &directory.to_string_lossy(),
+                "a working directory",
+            )?;
+            provider.write_field(&mut config, &key, &value);
+        }
+        if !envs.is_empty() {
+            let (key, _) = override_of(&fields, &["env"], "", "environment variables")?;
+            // The variables of the call add to the ones of the configuration, they do
+            // not replace them.
+            let mut value = provider.read_field(&config, &key);
+            for pair in envs {
+                if !value.is_empty() {
+                    value.push(';');
+                }
+                value.push_str(pair);
+            }
+            provider.write_field(&mut config, &key, &value);
+        }
+        Ok(config)
+    }
+
+    /// Takes the overridden copy of the selected configuration for the launch now, or
+    /// the configuration itself when the next run has no overrides.
+    fn take_launch_config(&mut self, selected: &RunConfig) -> RunConfig {
+        match self.pending_config.take() {
+            Some(pending) if pending.name == selected.name => pending,
+            _ => selected.clone(),
+        }
     }
 
     /// Makes `config` the selected configuration. A name already in the list is selected
@@ -1372,7 +1627,7 @@ impl RunPanel {
 
     /// Plans the selected configuration in the background and starts its console.
     fn start(&mut self, cx: &mut Context<Self>) {
-        let Some(config) = self
+        let Some(selected) = self
             .selected
             .and_then(|index| self.configs.get(index))
             .cloned()
@@ -1382,15 +1637,18 @@ impl RunPanel {
         let model = self.session.as_ref().and_then(ProjectSession::model);
         let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
             self.waiting = true;
-            self.run_config = Some(config.name.clone());
+            self.run_config = Some(selected.name.clone());
             self.run_service = ServiceRun::default();
             self.run_service.starting();
-            self.title = config.name.clone().into();
+            self.title = selected.name.clone().into();
             self.lines.clear();
             self.note("Waiting for the project to load", false);
             self.changed(cx);
             return;
         };
+        // The overrides a tool asked for belong to this run alone: they live in the
+        // copy, never in the list or in the file.
+        let config = self.take_launch_config(&selected);
         let provider = self.providers.iter().find(|p| p.id() == config.provider);
         let Some(provider) = provider.cloned() else {
             let text = format!("Nothing runs configurations of kind {}", config.provider);
@@ -2561,17 +2819,34 @@ impl RunPanel {
                 grace: TASK_GRACE,
             })
         };
+        self.note_build_started(BuildKind::Project);
         if debugging_tests {
             self.launch_build(title, cx, make);
         } else {
             self.building_project = true;
             self.launch(title, None, cx, move || make().map(|plan| (plan, None)));
         }
+        self.refresh_build_view();
     }
 
     /// Ctrl+Shift+F9: compiles the module of `file` with the build tool. Without a file,
     /// or when no module holds it, the whole project compiles.
     pub fn compile_current(&mut self, file: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.compile_in(file.clone(), BuildKind::Compile(file), "Recompile", cx);
+    }
+
+    /// Build Module: compiles the module that holds `file`.
+    pub fn build_module(&mut self, file: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.compile_in(file.clone(), BuildKind::Module(file), "Build Module", cx);
+    }
+
+    fn compile_in(
+        &mut self,
+        file: Option<PathBuf>,
+        kind: BuildKind,
+        command: &str,
+        cx: &mut Context<Self>,
+    ) {
         if self.starting || self.busy() {
             self.tell("Busy", "Stop what is running first", cx);
             return;
@@ -2585,10 +2860,14 @@ impl RunPanel {
             model
                 .modules
                 .iter()
-                .find(|module| file.starts_with(&module.dir))
+                .filter(|module| file.starts_with(&module.dir))
+                .max_by_key(|module| module.dir.components().count())
                 .cloned()
         });
-        let (root, title) = (self.root.clone(), format!("{} Compile", self.tool_title()));
+        let (root, title) = (
+            self.root.clone(),
+            format!("{} {command}", self.tool_title()),
+        );
         let make = move || {
             let program = tool
                 .compile(&root, module.as_ref())
@@ -2602,8 +2881,170 @@ impl RunPanel {
                 None,
             ))
         };
+        self.note_build_started(kind);
         self.building_project = true;
         self.launch(title, None, cx, make);
+        self.refresh_build_view();
+    }
+
+    /// Rebuild Project: builds the whole project again from scratch.
+    pub fn rebuild_project(&mut self, cx: &mut Context<Self>) {
+        if self.starting || self.busy() {
+            self.tell("Busy", "Stop what is running first", cx);
+            return;
+        }
+        let Some(tool) = self.tool.clone() else {
+            self.tell("Cannot rebuild", "The project has no build tool", cx);
+            return;
+        };
+        let (root, tests) = (self.root.clone(), self.debugging_tests);
+        let title = format!("{} Rebuild Project", self.tool_title());
+        let make = move || {
+            let program = tool
+                .rebuild(&root, tests)
+                .map_err(|error| error.to_string())?;
+            Ok((
+                RunPlan {
+                    before: None,
+                    program,
+                    grace: TASK_GRACE,
+                },
+                None,
+            ))
+        };
+        self.note_build_started(BuildKind::Rebuild);
+        self.building_project = true;
+        self.launch(title, None, cx, make);
+        self.refresh_build_view();
+    }
+
+    /// Generate Sources and Update Folders: runs the source generator of the build tool.
+    pub fn generate_sources(&mut self, cx: &mut Context<Self>) {
+        if self.starting || self.busy() {
+            self.tell("Busy", "Stop what is running first", cx);
+            return;
+        }
+        let Some(tool) = self.tool.clone() else {
+            self.tell(
+                "Cannot generate sources",
+                "The project has no build tool",
+                cx,
+            );
+            return;
+        };
+        let root = self.root.clone();
+        let title = format!("{} Generate Sources", self.tool_title());
+        let make = move || {
+            let Some(program) = tool
+                .generate_sources(&root)
+                .map_err(|error| error.to_string())?
+            else {
+                return Err("The build tool has no source generator".to_string());
+            };
+            Ok((
+                RunPlan {
+                    before: None,
+                    program,
+                    grace: TASK_GRACE,
+                },
+                None,
+            ))
+        };
+        self.note_build_started(BuildKind::GenerateSources);
+        self.building_project = true;
+        self.launch(title, None, cx, make);
+        self.refresh_build_view();
+    }
+
+    /// Restart Build of the Build window: runs the last build again.
+    pub fn restart_build(&mut self, cx: &mut Context<Self>) {
+        let Some(kind) = self.last_build.clone() else {
+            return;
+        };
+        match kind {
+            BuildKind::Project => self.build_project(cx),
+            BuildKind::Module(file) => self.build_module(file, cx),
+            BuildKind::Compile(file) => self.compile_current(file, cx),
+            BuildKind::Rebuild => self.rebuild_project(cx),
+            BuildKind::GenerateSources => self.generate_sources(cx),
+        }
+    }
+
+    /// The Stop button of the Build window: stops the build and keeps the output.
+    pub fn stop_build(&mut self, cx: &mut Context<Self>) {
+        if !self.building_project && self.build_console.is_none() {
+            return;
+        }
+        if let Some(console) = &self.build_console {
+            console.stop();
+        }
+        if self.building_project
+            && let Some(console) = &self.console
+        {
+            console.stop();
+        }
+        self.build_console = None;
+        self.building_project = false;
+        self.build_stopped = true;
+        self.build_verdict = Some((
+            false,
+            self.build_started
+                .map_or(Duration::ZERO, |started| started.elapsed()),
+        ));
+        self.refresh_build_view();
+        self.changed(cx);
+    }
+
+    /// The last build as the Build window shows it.
+    pub(crate) fn build_view(&self) -> &BuildView {
+        &self.build_view
+    }
+
+    /// Records the end of a build whose console is the one of the panel or one of its own.
+    fn finish_build(&mut self, code: Option<i32>, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.building_project) {
+            return;
+        }
+        let success = code == Some(0);
+        let duration = self
+            .build_started
+            .map_or(Duration::ZERO, |started| started.elapsed());
+        self.build_verdict = Some((success, duration));
+        self.build_stopped = false;
+        self.refresh_build_view();
+        if success {
+            self.mark_built();
+            self.request_reload(cx);
+        }
+    }
+
+    fn note_build_started(&mut self, kind: BuildKind) {
+        self.last_build = Some(kind);
+        self.build_started = Some(Instant::now());
+        self.build_verdict = None;
+        self.build_stopped = false;
+    }
+
+    /// Reads the problems of the build output again. It runs only while the console holds
+    /// a build: a program run must not replace what the Build window shows.
+    fn refresh_build_view(&mut self) {
+        let lines: Vec<String> = self.lines.iter().map(|line| line.text.clone()).collect();
+        let problems = tool_gateway::build_problems(&lines, &self.root);
+        let (finished, success, duration) = match self.build_verdict {
+            Some((success, duration)) => (true, success, Some(duration)),
+            None => (false, false, None),
+        };
+        self.build_view = BuildView {
+            running: self.building_project,
+            finished,
+            success,
+            stopped: self.build_stopped,
+            duration,
+            started: self.build_started,
+            title: self.title.to_string(),
+            lines,
+            problems,
+        };
     }
 
     /// Alt+Shift+R: the tests of the last run again.
@@ -2643,6 +3084,18 @@ impl RunPanel {
                     .map(|config| RunConfiguration {
                         name: config.name.clone(),
                         kind: config.provider.clone(),
+                        command_line: config
+                            .settings
+                            .get("programArguments")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        working_directory: config
+                            .settings
+                            .get("workingDirectory")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        environment: Vec::new(),
+                        supports_dynamic_launch_overrides: self.supports_overrides(config),
                     })
                     .collect();
                 let _ = job.reply.send(Ok(Answer::Configurations(configurations)));
@@ -2675,7 +3128,7 @@ impl RunPanel {
             }
             ToolRequest::Build(request) => self.start_tool_build(bridge, job, request, cx),
             ToolRequest::Tests(request) => self.start_tool_tests(bridge, job, request, cx),
-            ToolRequest::Start(name) => self.start_tool_run(bridge, job, &name, cx),
+            ToolRequest::Start(request) => self.start_tool_run(bridge, job, &request, cx),
         }
     }
 
@@ -2721,6 +3174,7 @@ impl RunPanel {
         };
         let output = job.output_id();
         self.tool_exit = None;
+        self.tool_output_lines = 0;
         self.tool_job = Some(ToolJob {
             output: output.clone(),
             kind: ToolJobKind::Build,
@@ -2772,6 +3226,7 @@ impl RunPanel {
         }
         let output = job.output_id();
         self.tool_exit = None;
+        self.tool_output_lines = 0;
         self.tool_job = Some(ToolJob {
             output: output.clone(),
             kind: ToolJobKind::Tests,
@@ -2801,7 +3256,7 @@ impl RunPanel {
         &mut self,
         bridge: &Arc<RunBridge>,
         job: Job,
-        name: &str,
+        request: &StartRunRequest,
         cx: &mut Context<Self>,
     ) {
         if self.starting || self.busy() {
@@ -2810,21 +3265,33 @@ impl RunPanel {
         let Some(config) = self
             .configs
             .iter()
-            .find(|config| config.name == name)
+            .find(|config| config.name == request.name)
             .cloned()
         else {
             return self.refuse_tool_job(
                 bridge,
                 job,
-                format!("the project has no run configuration {name}"),
+                format!("the project has no run configuration {}", request.name),
             );
         };
+        let pending = match self.configuration_with_overrides(
+            &request.name,
+            request.program_arguments.as_deref(),
+            request.working_directory.as_deref(),
+            &request.envs,
+        ) {
+            Ok(config) => config,
+            Err(message) => return self.refuse_tool_job(bridge, job, message),
+        };
+        self.pending_config = Some(pending);
         let output = job.output_id();
         self.tool_exit = None;
+        self.tool_output_lines = 0;
         self.tool_output = Some((output.clone(), true));
         self.choose_configuration(config, cx);
         self.run(cx);
         if !(self.starting || self.waiting || self.console.is_some()) {
+            self.pending_config = None;
             self.tool_output = None;
             return self.refuse_tool_job(bridge, job, "the configuration did not start");
         }
@@ -2853,6 +3320,53 @@ impl RunPanel {
             .collect()
     }
 
+    /// The file with the whole log of a job, in the state folder of the window.
+    fn tool_output_file(&self, id: &str) -> PathBuf {
+        self.state_dir
+            .join("run-output")
+            .join(crate::project_state::project_key(&self.root))
+            .join(format!("{id}.log"))
+    }
+
+    /// Brings the file of the whole log up to date. Returns the file once it is there.
+    fn write_tool_output(&mut self, id: &str) -> Option<PathBuf> {
+        let path = self.tool_output_file(id);
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return None;
+        }
+        let count = self.lines.len();
+        let written = self.tool_output_lines;
+        let rewrite = count < written || count >= MAX_LINES || !path.exists();
+        if rewrite {
+            let mut text = String::new();
+            for line in &self.lines {
+                text.push_str(&line.text);
+                text.push('\n');
+            }
+            if std::fs::write(&path, text).is_err() {
+                return None;
+            }
+            self.tool_output_lines = count;
+        } else if count > written {
+            let mut text = String::new();
+            for line in self.lines.iter().skip(written) {
+                text.push_str(&line.text);
+                text.push('\n');
+            }
+            use std::io::Write as _;
+            let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) else {
+                return None;
+            };
+            if file.write_all(text.as_bytes()).is_err() {
+                return None;
+            }
+            self.tool_output_lines = count;
+        }
+        Some(path)
+    }
+
     /// Keeps the output of a job an MCP tool asked for up to date, so `get_run_output`
     /// sees the lines as they come.
     fn refresh_tool_output(&mut self) -> bool {
@@ -2872,11 +3386,13 @@ impl RunPanel {
         } else {
             None
         };
+        let full_output_path = self.write_tool_output(&id);
         let output = RunOutput {
             id: id.clone(),
             running,
             exit_code: exit,
             lines: self.line_tail(),
+            full_output_path,
         };
         self.store_tool_output(output);
         if program && !running {
@@ -2954,6 +3470,7 @@ impl RunPanel {
                     running: false,
                     exit_code: Some(if success { 0 } else { 1 }),
                     lines: self.line_tail(),
+                    full_output_path: None,
                 });
                 let outcome = BuildOutcome {
                     success,
@@ -3006,6 +3523,7 @@ impl RunPanel {
                     running: false,
                     exit_code: Some(if failed > 0 { 1 } else { 0 }),
                     lines: self.line_tail(),
+                    full_output_path: None,
                 });
                 let outcome = TestsOutcome {
                     passed: counts.passed,
@@ -3501,8 +4019,17 @@ impl RunPanel {
                 if let Some(console) = &self.console {
                     console.stop();
                 }
+                if self.building_project {
+                    self.build_stopped = true;
+                    self.build_verdict = Some((
+                        false,
+                        self.build_started
+                            .map_or(Duration::ZERO, |started| started.elapsed()),
+                    ));
+                }
                 self.build_console = None;
                 self.building_project = false;
+                self.refresh_build_view();
                 self.tell("Build", "The build was stopped", cx);
             }
             _ => {}
@@ -3614,7 +4141,15 @@ impl RunPanel {
                         this.console_running = true;
                     }
                     Err(message) => {
+                        if this.building_project {
+                            this.build_verdict = Some((
+                                false,
+                                this.build_started
+                                    .map_or(Duration::ZERO, |started| started.elapsed()),
+                            ));
+                        }
                         this.building_project = false;
+                        this.refresh_build_view();
                         this.run_service.stopped();
                         this.note(&message, true);
                         this.tell("Cannot run", message, cx);
@@ -3648,10 +4183,19 @@ impl RunPanel {
             self.note("Launch cancelled", false);
         }
         self.starting = false;
+        if self.building_project {
+            self.build_stopped = true;
+            self.build_verdict = Some((
+                false,
+                self.build_started
+                    .map_or(Duration::ZERO, |started| started.elapsed()),
+            ));
+        }
         self.building_project = false;
         self.build_console = None;
         self.build_running = false;
         self.console_running = false;
+        self.refresh_build_view();
         self.program_pid = None;
         self.reload = None;
         if self.run_service.state().active() {
@@ -3784,6 +4328,46 @@ impl RunPanel {
         Ok(())
     }
 
+    /// Starts a configuration under the debugger for a tool call, with the arguments, the
+    /// directory and the variables of the call in place of the ones the configuration
+    /// keeps. A configuration whose provider does not declare a field refuses the change.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn debug_configuration_from_tool_with(
+        &mut self,
+        name: &str,
+        program_arguments: Option<&str>,
+        working_directory: Option<&std::path::Path>,
+        envs: &[String],
+        client: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.debug_service.is_none() {
+            return Err("the language server is not running".to_string());
+        }
+        if self
+            .session
+            .as_ref()
+            .and_then(ProjectSession::model)
+            .is_none()
+        {
+            return Err("the project is still loading".to_string());
+        }
+        if self.starting || self.busy() {
+            return Err("the Run window is busy".to_string());
+        }
+        if !self.select_named(name, cx) {
+            return Err(format!("the project has no run configuration {name}"));
+        }
+        let config =
+            self.configuration_with_overrides(name, program_arguments, working_directory, envs)?;
+        // The overrides live in the copy of this one start, so the configuration of the
+        // user keeps its arguments, folder and variables.
+        self.pending_config = Some(config);
+        let handle = cx.active_window();
+        self.start_debug(handle, client, cx);
+        Ok(())
+    }
+
     fn start_debug(
         &mut self,
         handle: Option<ui_kit::gpui::AnyWindowHandle>,
@@ -3802,9 +4386,10 @@ impl RunPanel {
             self.tell("Cannot debug", "There is no configuration to debug", cx);
             return;
         };
-        let Some(config) = self.configs.get(selected).cloned() else {
+        let Some(selected_config) = self.configs.get(selected).cloned() else {
             return;
         };
+        let config = self.take_launch_config(&selected_config);
         let Some(provider) = self
             .providers
             .iter()
@@ -4273,12 +4858,8 @@ impl RunPanel {
         if build_closed {
             self.build_console = None;
         }
-        if let Some(code) = build_exited
-            && std::mem::take(&mut self.building_project)
-            && code == Some(0)
-        {
-            self.mark_built();
-            self.request_reload(cx);
+        if let Some(code) = build_exited {
+            self.finish_build(code, cx);
         }
         if closed && main_console {
             // The program is over and its pipes are closed.
@@ -4295,12 +4876,8 @@ impl RunPanel {
         if built {
             self.mark_built();
         }
-        if let Some(code) = exited
-            && std::mem::take(&mut self.building_project)
-            && code == Some(0)
-        {
-            self.mark_built();
-            self.request_reload(cx);
+        if let Some(code) = exited {
+            self.finish_build(code, cx);
         }
         #[cfg(test)]
         let tests_ran = self.tests.run.is_some();
@@ -4348,6 +4925,9 @@ impl RunPanel {
             }
         }
         changed |= self.poll_tool_jobs(cx);
+        if changed && self.building_project {
+            self.refresh_build_view();
+        }
         // The lines of the console changed, so the filter and the query see the new ones.
         if changed && (self.console_search.open || self.console_search.filtering()) {
             self.rebuild_console_filter();

@@ -12,7 +12,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use database::{ColumnKind, Command, Event, Launch, ResultSet, Secret, Session, Table, Value};
+use database::{
+    ColumnKind, Command, Event, Launch, ResultSet, Secret, Session, Table, TableKind, Value,
+};
 
 fn java() -> PathBuf {
     if let Some(home) = env::var_os("JAVA_HOME") {
@@ -96,8 +98,43 @@ fn helper_jar() -> PathBuf {
 }
 
 fn start() -> Session {
-    let classpath =
-        env::join_paths([helper_jar(), h2_jar()]).expect("the helper and H2 on one classpath");
+    start_with(h2_jar(), "jdbc:h2:mem:t0206;DB_CLOSE_DELAY=-1", "sa", "")
+}
+
+/// The newest PostgreSQL driver of the Maven repository.
+fn postgres_jar() -> PathBuf {
+    let root = repository().join("org/postgresql/postgresql");
+    let mut versions: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap_or_else(|error| panic!("no PostgreSQL driver under {}: {error}", root.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    versions.sort();
+    versions
+        .into_iter()
+        .rev()
+        .find_map(|version| newest_jar(&version))
+        .unwrap_or_else(|| panic!("no PostgreSQL jar under {}", root.display()))
+}
+
+/// The `petshop` database of `team/db/petshop.sql` on the server that the standard
+/// `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE` name.
+fn start_postgres() -> Session {
+    let variable = |name: &str, default: &str| env::var(name).unwrap_or_else(|_| default.into());
+    let url = format!(
+        "jdbc:postgresql://{}:{}/{}",
+        variable("PGHOST", "localhost"),
+        variable("PGPORT", "5432"),
+        variable("PGDATABASE", "petshop")
+    );
+    let password = env::var("PGPASSWORD").expect("set PGPASSWORD of the test server");
+    start_with(postgres_jar(), &url, &variable("PGUSER", "arro"), &password)
+}
+
+fn start_with(driver: PathBuf, url: &str, user: &str, password: &str) -> Session {
+    let classpath = env::join_paths([helper_jar(), driver])
+        .expect("the helper and the driver on one classpath");
     let launch = Launch::new(java())
         .arg("-cp")
         .arg(classpath)
@@ -107,9 +144,9 @@ fn start() -> Session {
     session
         .send(Command::Connect {
             id: 1,
-            url: "jdbc:h2:mem:t0206;DB_CLOSE_DELAY=-1".into(),
-            user: "sa".into(),
-            password: Secret::new(""),
+            url: url.into(),
+            user: user.into(),
+            password: Secret::new(password),
             properties: Vec::new(),
         })
         .expect("the connect request is written");
@@ -340,4 +377,104 @@ fn h2_cancel_stops_a_long_query() {
         Event::Error { cancelled, .. } => assert!(cancelled, "the error says it was cancelled"),
         other => panic!("the statement ended as {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "needs the helper jar, the PostgreSQL driver and the petshop server of team/db"]
+fn postgres_reads_rows_with_nulls_unicode_numbers_dates_and_json() {
+    let session = start_postgres();
+
+    let result = execute(
+        &session,
+        2,
+        "SELECT o.id, o.first_name, o.city, p.weight_kg, p.birth_date, p.vaccinated \
+         FROM owners o JOIN pets p ON p.owner_id = o.id \
+         WHERE o.last_name = 'Иванов'",
+    )
+    .expect("the rows are read");
+    assert_eq!(result.rows.len(), 1, "{result:?}");
+    let row = &result.rows[0];
+    assert_eq!(row[1], Value::Text("Дмитрий".into()));
+    assert_eq!(row[2], Value::Text("Минск".into()));
+    assert_eq!(row[3], Value::Decimal("0.04".into()));
+    assert!(
+        matches!(&row[4], Value::Date(date) if date.starts_with("2020-03-09")),
+        "{row:?}"
+    );
+    assert_eq!(row[5], Value::Boolean(false));
+
+    let visits = execute(
+        &session,
+        3,
+        "SELECT description, cost, details FROM visits ORDER BY id",
+    )
+    .expect("the visits are read");
+    assert_eq!(visits.rows.len(), 7);
+    assert_eq!(visits.rows[5][0], Value::Text("клюв".into()));
+    assert_eq!(visits.rows[6][0], Value::Null);
+    assert_eq!(visits.rows[6][1], Value::Null);
+    assert!(
+        matches!(&visits.rows[0][2], Value::Text(json) if json.contains("Carter")),
+        "jsonb reads as text: {:?}",
+        visits.rows[0][2]
+    );
+
+    let count = execute(&session, 4, "SELECT count(*) FROM owner_pets").expect("the view");
+    assert_eq!(count.rows[0][0], Value::Integer(13));
+}
+
+#[test]
+#[ignore = "needs the helper jar, the PostgreSQL driver and the petshop server of team/db"]
+fn postgres_metadata_lists_tables_views_keys_and_the_second_schema() {
+    let session = start_postgres();
+
+    let tables = metadata(&session, 2);
+    let pets = tables
+        .iter()
+        .find(|table| table.name == "pets" && table.schema == "public")
+        .unwrap_or_else(|| panic!("pets is in the schema: {tables:?}"));
+    assert!(
+        pets.columns
+            .iter()
+            .any(|column| column.name == "id" && column.primary_key)
+    );
+    assert!(
+        pets.foreign_keys
+            .iter()
+            .any(|key| key.referenced_table == "owners"),
+        "{:?}",
+        pets.foreign_keys
+    );
+    assert!(
+        pets.indexes
+            .iter()
+            .any(|index| index.name == "pets_owner_idx"),
+        "{:?}",
+        pets.indexes
+    );
+    assert!(
+        tables
+            .iter()
+            .any(|table| table.name == "owner_pets" && table.kind == TableKind::View),
+        "the view is listed"
+    );
+    assert!(
+        tables
+            .iter()
+            .any(|table| table.name == "vets" && table.schema == "clinic"),
+        "the second schema is listed"
+    );
+}
+
+#[test]
+#[ignore = "needs the helper jar, the PostgreSQL driver and the petshop server of team/db"]
+fn postgres_reports_bad_sql_and_keeps_the_session() {
+    let session = start_postgres();
+    let error = execute(&session, 2, "SELECT * FROM nope").expect_err("the statement fails");
+    assert!(
+        error.contains("nope"),
+        "the server names the table: {error}"
+    );
+    let result = execute(&session, 3, "SELECT 1").expect("the session still works");
+    assert_eq!(result.rows[0][0], Value::Integer(1));
 }

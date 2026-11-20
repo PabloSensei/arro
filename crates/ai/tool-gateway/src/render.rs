@@ -4,14 +4,15 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::backend::{
-    BreakpointId, BreakpointInfo, BuildOutcome, BuildProblem, BuildRequest, CallHierarchy,
-    CallHierarchyQuery, DebugFrame, DebugRunOutcome, DebugRunRequest, DebugSessionState,
-    DebugStack, DebugStackQuery, DebugStateQuery, DebugValue, DebugVariable, DebugVariables,
-    DebugVariablesQuery, DiagnosticsPage, DiagnosticsQuery, EditorContext, FileActionOutcome,
-    FileText, HierarchyNode, ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol,
-    RunConfiguration, RunOutput, SearchPage, SearchQuery, SymbolHit, SymbolInfo, SymbolPage,
-    SymbolQuery, TestOutcome, TestsOutcome, TestsRequest, TypeHierarchy, TypeHierarchyQuery,
-    UsagePage, UsagesQuery, VcsChanges, VcsQuery,
+    AnalyzeCallsQuery, BreakpointId, BreakpointInfo, BuildOutcome, BuildProblem, BuildRequest,
+    CallHierarchy, CallHierarchyQuery, CallTree, DebugFrame, DebugRunOutcome, DebugRunRequest,
+    DebugSessionState, DebugStack, DebugStackQuery, DebugStateQuery, DebugValue, DebugVariable,
+    DebugVariables, DebugVariablesQuery, DiagnosticsPage, DiagnosticsQuery, DirectoryTree,
+    EditorContext, FileActionOutcome, FileText, GitStatus, HierarchyNode, PathPage, PathQuery,
+    ProblemSeverity, ProjectStructure, ProjectStructureQuery, ProposedEdit, RenamedSymbol,
+    RunConfiguration, RunOutput, RunPointInfo, SearchPage, SearchQuery, SessionScope, Severity,
+    SymbolHit, SymbolInfo, SymbolPage, SymbolQuery, TerminalOutput, TestOutcome, TestsOutcome,
+    TestsRequest, TypeHierarchy, TypeHierarchyQuery, UsagePage, UsagesQuery, VcsChanges, VcsQuery,
 };
 
 const CONTEXT_LINES: usize = 2;
@@ -350,6 +351,7 @@ pub(crate) fn search(query: &SearchQuery, page: &SearchPage) -> String {
         items,
         total,
         clipped,
+        timed_out,
         files,
     } = page;
     let pattern = &query.pattern;
@@ -373,6 +375,9 @@ pub(crate) fn search(query: &SearchQuery, page: &SearchPage) -> String {
             text,
             "\nclipped: showing {shown} of {total}, raise the limit or narrow the mask\n"
         );
+    }
+    if *timed_out {
+        text.push_str("\nthe time limit stopped the search: the answer is not complete\n");
     }
     text
 }
@@ -684,16 +689,21 @@ pub(crate) fn file_action(outcome: &FileActionOutcome) -> String {
     }
 }
 
-/// A build tool writes its errors as `path:line: message` or `path:[line,column] message`.
+/// A build tool writes its problems as `path:line: message`, `path:[line,column]
+/// message` or `path:line:column: message`, with `error: ` or `warning: ` before the
+/// message of some tools and a `[ERROR]` or `[WARNING]` prefix on the line of others.
 /// This reads those lines without knowing which tool wrote them; a line without a place
 /// in the sources stays out of the list.
 pub fn build_problems(lines: &[String], root: &Path) -> Vec<BuildProblem> {
     let mut problems: Vec<BuildProblem> = Vec::new();
     for line in lines {
-        let text = line.trim().strip_prefix("[ERROR]").unwrap_or(line.trim());
-        let Some((path, number, message)) = split_problem(text.trim()) else {
+        let Some((severity, text)) = marked_severity(line) else {
             continue;
         };
+        let Some((path, number, column, message)) = split_problem(text.trim()) else {
+            continue;
+        };
+        let (severity, message) = named_severity(severity, message);
         let path = Path::new(path);
         let path = if path.is_absolute() {
             path.to_path_buf()
@@ -702,15 +712,21 @@ pub fn build_problems(lines: &[String], root: &Path) -> Vec<BuildProblem> {
         };
         let message = message.trim().to_string();
         if message.is_empty()
-            || problems
-                .iter()
-                .any(|known| known.path == path && known.line == number && known.message == message)
+            || problems.iter().any(|known| {
+                known.path == path
+                    && known.line == number
+                    && known.column == column
+                    && known.severity == severity
+                    && known.message == message
+            })
         {
             continue;
         }
         problems.push(BuildProblem {
             path,
             line: number,
+            column,
+            severity,
             message,
         });
         if problems.len() >= 50 {
@@ -720,7 +736,46 @@ pub fn build_problems(lines: &[String], root: &Path) -> Vec<BuildProblem> {
     problems
 }
 
-fn split_problem(text: &str) -> Option<(&str, u32, &str)> {
+/// The rest of a line whose bracket prefix names the severity. A line without a prefix is
+/// an error from a tool that writes its own `error:` mark or none at all; `None` is for a
+/// prefix that says nothing about a problem, such as `[INFO]`.
+fn marked_severity(line: &str) -> Option<(ProblemSeverity, &str)> {
+    let text = line.trim();
+    let Some(rest) = text.strip_prefix('[') else {
+        return Some((ProblemSeverity::Error, text));
+    };
+    let Some(close) = rest.find(']') else {
+        return Some((ProblemSeverity::Error, text));
+    };
+    let severity = match rest[..close].trim().to_ascii_uppercase().as_str() {
+        "ERROR" => ProblemSeverity::Error,
+        "WARNING" | "WARN" => ProblemSeverity::Warning,
+        _ => return None,
+    };
+    Some((severity, &rest[close + 1..]))
+}
+
+/// The severity the tool wrote before the message, as in `error: cannot find it`.
+fn named_severity(marked: ProblemSeverity, message: &str) -> (ProblemSeverity, &str) {
+    let lower = message.to_ascii_lowercase();
+    if lower.starts_with("warning:") {
+        return (
+            ProblemSeverity::Warning,
+            message["warning:".len()..].trim_start(),
+        );
+    }
+    if lower.starts_with("error:") {
+        return (
+            ProblemSeverity::Error,
+            message["error:".len()..].trim_start(),
+        );
+    }
+    (marked, message)
+}
+
+/// The path, line, column and message of `path:12: message`, `path:[12,5] message` or
+/// `path:12:5: message`.
+fn split_problem(text: &str) -> Option<(&str, u32, Option<u32>, &str)> {
     let bytes = text.as_bytes();
     for (index, byte) in bytes.iter().enumerate() {
         if *byte != b':' {
@@ -743,16 +798,26 @@ fn split_problem(text: &str) -> Option<(&str, u32, &str)> {
         }
         let number: u32 = text[start..at].parse().ok()?;
         let mut rest = &text[at..];
+        let mut column = None;
         if rest.starts_with(',') {
             // The `[line,column]` form of a build tool.
             let close = rest.find(']')?;
+            column = rest[1..close].trim().parse().ok();
             rest = &rest[close + 1..];
+        } else if rest.starts_with(':') {
+            // The `line:column:` form, where a message follows the third number.
+            let digits = &rest[1..];
+            let width = digits.bytes().take_while(u8::is_ascii_digit).count();
+            if width > 0 && digits.as_bytes().get(width) == Some(&b':') {
+                column = digits[..width].parse().ok();
+                rest = &digits[width..];
+            }
         }
         let message = rest.trim_start_matches([':', ' ', ']']).trim();
         if message.is_empty() {
             continue;
         }
-        return Some((path, number, message));
+        return Some((path, number, column, message));
     }
     None
 }
@@ -781,11 +846,20 @@ pub(crate) fn build(request: &BuildRequest, outcome: &BuildOutcome) -> String {
     if outcome.problems.is_empty() {
         return text;
     }
-    let count = outcome.problems.len();
+    let count = outcome
+        .problems
+        .iter()
+        .filter(|problem| problem.severity == ProblemSeverity::Error)
+        .count();
     let _ = writeln!(text, "{count} compile errors:");
     for problem in &outcome.problems {
         let path = problem.path.display();
-        let _ = writeln!(text, "{path}:{}: {}", problem.line, problem.message);
+        let mark = if problem.severity == ProblemSeverity::Warning {
+            "warning: "
+        } else {
+            ""
+        };
+        let _ = writeln!(text, "{path}:{}: {mark}{}", problem.line, problem.message);
     }
     text
 }
@@ -1036,6 +1110,389 @@ pub(crate) fn debug_value(value: &DebugValue) -> String {
         format!(" ({})", value.type_name)
     };
     format!("{} = {}{type_name}\n", value.expression, value.value)
+}
+
+/// The text of a class or a source the language service decompiled.
+pub(crate) fn source_text(text: &str) -> String {
+    let mut answer = String::from("source:\n");
+    answer.push_str(text);
+    if !answer.ends_with('\n') {
+        answer.push('\n');
+    }
+    answer
+}
+
+fn call_node_json(node: &crate::backend::CallNode) -> serde_json::Value {
+    let children: Vec<serde_json::Value> = node.children.iter().map(call_node_json).collect();
+    serde_json::json!({
+        "name": node.name,
+        "detail": node.detail,
+        "filePath": node.file_path.as_ref().map(|path| path.display().to_string()),
+        "line": node.line,
+        "treePath": node.tree_path,
+        "children": children,
+    })
+}
+
+pub(crate) fn call_tree(query: &AnalyzeCallsQuery, tree: &CallTree) -> String {
+    let root = tree.root.as_ref().map(call_node_json);
+    let answer = serde_json::json!({
+        "symbol": tree.symbol,
+        "analysisKind": tree.direction.name(),
+        "depth": query.depth,
+        "root": root,
+        "more": tree.more,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn file_problems(path: &Path, page: &DiagnosticsPage) -> String {
+    let problems: Vec<serde_json::Value> = page
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "severity": item.severity.name(),
+                "description": item.message,
+                "line": item.line,
+                "column": item.column,
+                "code": item.code,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "filePath": path.display().to_string(),
+        "problems": problems,
+        "more": page.next.is_some(),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn lint_results(
+    _scope: &SessionScope,
+    _severity: Severity,
+    reports: &[(std::path::PathBuf, Result<DiagnosticsPage, String>)],
+) -> String {
+    let files: Vec<serde_json::Value> = reports
+        .iter()
+        .map(|(path, report)| match report {
+            Ok(page) => {
+                let problems: Vec<serde_json::Value> = page
+                    .items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "severity": item.severity.name(),
+                            "description": item.message,
+                            "line": item.line,
+                            "column": item.column,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "filePath": path.display().to_string(),
+                    "problems": problems,
+                    "more": page.next.is_some(),
+                })
+            }
+            Err(message) => serde_json::json!({
+                "filePath": path.display().to_string(),
+                "notAnalyzedReason": message,
+                "problems": [],
+            }),
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "files": files,
+        "more": reports
+            .iter()
+            .any(|(_, report)| report.as_ref().is_ok_and(|page: &DiagnosticsPage| page.next.is_some())),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn project_dependencies(structure: &ProjectStructure) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for module in &structure.modules {
+        for dependency in &module.dependencies {
+            if !names.contains(dependency) {
+                names.push(dependency.clone());
+            }
+        }
+    }
+    let dependencies: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            let modules: Vec<&str> = structure
+                .modules
+                .iter()
+                .filter(|module| module.dependencies.contains(name))
+                .map(|module| module.name.as_str())
+                .collect();
+            serde_json::json!({"name": name, "modules": modules})
+        })
+        .collect();
+    serde_json::json!({
+        "dependencies": dependencies,
+        "resolved": structure.resolved,
+    })
+    .to_string()
+}
+
+pub(crate) fn project_modules(structure: &ProjectStructure) -> String {
+    let modules: Vec<serde_json::Value> = structure
+        .modules
+        .iter()
+        .map(|module| {
+            serde_json::json!({
+                "name": module.name,
+                "type": "module",
+                "path": module.path.display().to_string(),
+                "sourceRoots": module.source_roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "testRoots": module.test_roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "modules": modules,
+        "more": structure.clipped,
+    })
+    .to_string()
+}
+
+pub(crate) fn run_points(scope: &SessionScope, points: &[RunPointInfo]) -> String {
+    let points: Vec<serde_json::Value> = points
+        .iter()
+        .map(|point| {
+            serde_json::json!({
+                "kind": point.kind,
+                "name": point.name,
+                "container": point.container,
+                "filePath": crate::relative_path(&scope.project, &point.file),
+                "line": point.line,
+                "framework": point.framework,
+            })
+        })
+        .collect();
+    serde_json::json!({"runPoints": points}).to_string()
+}
+
+pub(crate) fn run_configurations_details(
+    scope: &SessionScope,
+    configurations: &[RunConfiguration],
+) -> String {
+    let configurations: Vec<serde_json::Value> = configurations
+        .iter()
+        .map(|configuration| {
+            serde_json::json!({
+                "name": configuration.name,
+                "kind": configuration.kind,
+                "commandLine": configuration.command_line,
+                "workingDirectory": configuration.working_directory.as_ref().map(|path| crate::relative_path(&scope.project, Path::new(path))),
+                "envs": configuration.environment.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>(),
+                "supportsDynamicLaunchOverrides": configuration.supports_dynamic_launch_overrides,
+            })
+        })
+        .collect();
+    serde_json::json!({"configurations": configurations}).to_string()
+}
+
+pub(crate) fn executed_run(output: &RunOutput, timed_out: bool) -> String {
+    let answer = serde_json::json!({
+        "id": output.id,
+        "running": output.running,
+        "exitCode": output.exit_code,
+        "fullOutputPath": output.full_output_path.as_ref().map(|path| path.display().to_string()),
+        "timedOut": timed_out,
+        "output": output.lines.join("\n"),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn created_file(scope: &SessionScope, edit: &ProposedEdit) -> String {
+    let answer = serde_json::json!({
+        "filePath": crate::relative_path(&scope.project, &edit.path),
+        "created": edit.outcome == crate::backend::EditOutcome::Accepted,
+        "outcome": edit.outcome.name(),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn opened_file(scope: &SessionScope, path: &Path) -> String {
+    serde_json::json!({"filePath": crate::relative_path(&scope.project, path), "opened": true})
+        .to_string()
+}
+
+pub(crate) fn open_paths(scope: &SessionScope, files: &[std::path::PathBuf]) -> String {
+    let files: Vec<String> = files
+        .iter()
+        .map(|path| crate::relative_path(&scope.project, path))
+        .collect();
+    serde_json::json!({"files": files}).to_string()
+}
+
+pub(crate) fn directory_tree(_scope: &SessionScope, tree: &DirectoryTree) -> String {
+    let mut text = String::new();
+    for entry in &tree.entries {
+        let indent = "  ".repeat(entry.depth);
+        let mark = if entry.directory { "/" } else { "" };
+        let _ = writeln!(text, "{indent}{}{mark}", entry.name);
+    }
+    if tree.clipped {
+        text.push_str("...\n");
+    }
+    if tree.timed_out {
+        text.push_str("the time limit stopped the answer: the list is not complete\n");
+    }
+    text
+}
+
+pub(crate) fn patch_outcome(edit: &ProposedEdit) -> String {
+    edit.outcome.name().to_string()
+}
+
+pub(crate) fn patch_results(
+    scope: &SessionScope,
+    results: &[(std::path::PathBuf, String)],
+) -> String {
+    let files: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(path, outcome)| {
+            serde_json::json!({
+                "filePath": path.display().to_string(),
+                "outcome": outcome,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "projectPath": scope.project.display().to_string(),
+        "files": files,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn path_search(scope: &SessionScope, query: &PathQuery, page: &PathPage) -> String {
+    let files: Vec<String> = page
+        .items
+        .iter()
+        .map(|path| crate::relative_path(&scope.project, path))
+        .collect();
+    let answer = serde_json::json!({
+        "q": query.pattern,
+        "files": files,
+        "total": page.total,
+        "more": page.clipped,
+        "timedOut": page.timed_out,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn search_matches(
+    scope: &SessionScope,
+    _query: &SearchQuery,
+    page: &SearchPage,
+) -> String {
+    let matches: Vec<serde_json::Value> = page
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "filePath": crate::relative_path(&scope.project, &item.path),
+                "line": item.line,
+                "column": item.column,
+                "text": item.content,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "matches": matches,
+        "total": page.total,
+        "more": page.clipped,
+        "timedOut": page.timed_out,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn symbol_search(
+    scope: &SessionScope,
+    query: &SymbolQuery,
+    page: &SymbolPage,
+    paths: &[String],
+) -> String {
+    let symbols: Vec<serde_json::Value> = page
+        .hits
+        .iter()
+        .filter(|hit| {
+            paths.is_empty()
+                || crate::path_allowed(paths, &crate::relative_path(&scope.project, &hit.path))
+        })
+        .map(|hit| {
+            serde_json::json!({
+                "name": hit.name,
+                "kind": hit.kind,
+                "filePath": crate::relative_path(&scope.project, &hit.path),
+                "line": hit.line,
+                "text": hit.content,
+            })
+        })
+        .collect();
+    let answer = serde_json::json!({
+        "q": query.query,
+        "symbols": symbols,
+        "total": symbols.len(),
+        "more": page.next.is_some(),
+    });
+    answer.to_string()
+}
+
+pub(crate) fn terminal_output(output: &TerminalOutput) -> String {
+    let answer = serde_json::json!({
+        "output": output.output,
+        "exitCode": output.exit_code,
+        "timedOut": output.timed_out,
+        "truncated": output.truncated,
+    });
+    answer.to_string()
+}
+
+pub(crate) fn repositories(scope: &SessionScope, roots: &[std::path::PathBuf]) -> String {
+    let repositories: Vec<String> = roots
+        .iter()
+        .map(|path| crate::relative_path(&scope.project, path))
+        .collect();
+    serde_json::json!({"repositories": repositories}).to_string()
+}
+
+pub(crate) fn git_status(scope: &SessionScope, status: &GitStatus) -> String {
+    let repositories: Vec<serde_json::Value> = status
+        .repositories
+        .iter()
+        .map(|repository| {
+            let files: Vec<serde_json::Value> = repository
+                .files
+                .iter()
+                .map(|file| {
+                    serde_json::json!({
+                        "path": file.path,
+                        "index": file.index,
+                        "worktree": file.worktree,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "path": repository.path,
+                "branch": repository.branch,
+                "files": files,
+                "total": repository.total,
+                "more": repository.clipped,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "repositories": repositories,
+        "root": scope.project.display().to_string(),
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -1302,7 +1759,9 @@ mod tests {
             pattern: "foo".to_string(),
             regex: false,
             mask: None,
+            paths: Vec::new(),
             limit: 1,
+            timeout: None,
         };
         let page = SearchPage {
             items: vec![SearchHit {
@@ -1313,6 +1772,7 @@ mod tests {
             }],
             total: 3,
             clipped: true,
+            timed_out: false,
             files: 2,
         };
 
@@ -1359,13 +1819,84 @@ mod tests {
 
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert_eq!(problems[0].line, 12);
+        assert_eq!(problems[0].column, Some(5));
+        assert_eq!(problems[0].severity, ProblemSeverity::Error);
         assert_eq!(problems[0].message, "cannot find symbol");
         assert_eq!(problems[1].line, 3);
-        assert_eq!(problems[1].message, "error: package does not exist");
+        assert_eq!(problems[1].column, None);
+        assert_eq!(problems[1].message, "package does not exist");
         assert_eq!(
             problems[1].path,
             std::path::Path::new("C:\\work\\demo").join("src\\other\\Moved.txt")
         );
+    }
+
+    #[test]
+    fn a_warning_is_not_an_error() {
+        let lines = vec![
+            "[WARNING] C:\\work\\demo\\src\\Main.txt:[2,1] unused name".to_string(),
+            "/work/demo/src/Other.txt:7: warning: unchecked value".to_string(),
+            "/work/demo/src/Other.txt:9: error: unknown name".to_string(),
+            "[ERROR] /work/demo/src/Other.txt:9: unknown name".to_string(),
+        ];
+
+        let problems = build_problems(&lines, std::path::Path::new("C:\\work\\demo"));
+
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert_eq!(problems[0].severity, ProblemSeverity::Warning);
+        assert_eq!(problems[0].column, Some(1));
+        assert_eq!(problems[0].message, "unused name");
+        assert_eq!(problems[1].severity, ProblemSeverity::Warning);
+        assert_eq!(problems[1].line, 7);
+        assert_eq!(problems[1].message, "unchecked value");
+        assert_eq!(problems[2].severity, ProblemSeverity::Error);
+        assert_eq!(problems[2].message, "unknown name");
+    }
+
+    #[test]
+    fn a_line_without_a_place_stays_out() {
+        let lines = [
+            "The build failed".to_string(),
+            "error: no path here".to_string(),
+            "[ERROR] Failed to execute the goal".to_string(),
+            "/work/demo/src/Main.txt:4: cannot find symbol".to_string(),
+        ];
+
+        let problems = build_problems(&lines, std::path::Path::new("/work/demo"));
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].line, 4);
+    }
+
+    #[test]
+    fn a_problem_of_each_file_keeps_its_own_place() {
+        let lines = [
+            "/work/demo/src/Main.txt:[12,5] cannot find symbol".to_string(),
+            "/work/demo/src/Other.txt:[3,2] warning: unused name".to_string(),
+            "/work/demo/src/Main.txt:[20,1] unknown name".to_string(),
+        ];
+
+        let problems = build_problems(&lines, std::path::Path::new("/work/demo"));
+
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|problem| problem.path.ends_with("Main.txt"))
+                .count(),
+            2
+        );
+        assert!(problems[1].path.ends_with("Other.txt"));
+        assert_eq!(problems[1].column, Some(2));
+    }
+
+    #[test]
+    fn the_three_number_form_gives_the_column() {
+        let lines = ["src/Main.txt:12:5: unknown name".to_string()];
+        let problems = build_problems(&lines, std::path::Path::new("/work/demo"));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].column, Some(5));
+        assert_eq!(problems[0].message, "unknown name");
     }
 
     #[test]
@@ -1413,6 +1944,8 @@ mod tests {
             problems: vec![BuildProblem {
                 path: "src/Foo.txt".into(),
                 line: 4,
+                column: None,
+                severity: ProblemSeverity::Error,
                 message: "cannot find symbol".to_string(),
             }],
             duration_ms: 1250,
@@ -1481,6 +2014,7 @@ mod tests {
             running: false,
             exit_code: Some(0),
             lines: vec!["hello from run".to_string()],
+            full_output_path: None,
         };
 
         let text = run_output(&output);
@@ -1493,6 +2027,7 @@ mod tests {
             running: true,
             exit_code: None,
             lines: Vec::new(),
+            full_output_path: None,
         });
         assert!(
             empty.contains("running") && empty.contains("no output"),

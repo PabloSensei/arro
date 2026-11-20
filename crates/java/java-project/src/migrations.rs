@@ -1753,6 +1753,7 @@ mod tests {
                     resource_roots: vec![root.join("src/main/resources")],
                     ..Unit::default()
                 }],
+                ..Module::default()
             }],
             dependencies: vec![ModuleDependencies {
                 module: "app".into(),

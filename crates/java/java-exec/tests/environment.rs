@@ -86,6 +86,7 @@ fn the_build_and_the_run_use_the_chosen_sdk() {
                 output_dirs: vec![output],
                 ..Unit::default()
             }],
+            ..Module::default()
         }],
         ..ProjectModel::default()
     };

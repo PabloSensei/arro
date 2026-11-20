@@ -97,6 +97,7 @@ fn actions_of(path: &Path, text: &str) -> Vec<ActionEntry> {
             renames: Vec::new(),
             handle: None,
             resolve: None,
+            rename: None,
         }
     };
     vec![

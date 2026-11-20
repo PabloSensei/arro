@@ -36,6 +36,56 @@ pub struct PaneState {
     pub pinned: Vec<PathBuf>,
 }
 
+/// One bookmark of a saved project: the line it points at and what the user wrote.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BookmarkState {
+    pub path: PathBuf,
+    /// Buffer line from zero.
+    pub line: u32,
+    pub mnemonic: Option<char>,
+    pub description: Option<String>,
+}
+
+/// A group of saved bookmarks, such as the one named after the project.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BookmarkGroupState {
+    pub name: String,
+    pub bookmarks: Vec<BookmarkState>,
+}
+
+/// The bookmarks of a project. A layout saved before the groups existed holds the plain
+/// list of the old store, or the map the store itself kept: either opens as one group
+/// named after the project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BookmarkLayout {
+    Grouped {
+        groups: Vec<BookmarkGroupState>,
+        default: usize,
+    },
+    Flat(Vec<BookmarkState>),
+    /// The map of files the store of the earlier build held: the lines of each file and
+    /// the mnemonic of a line.
+    ByFile(std::collections::HashMap<PathBuf, Vec<(u32, Option<char>)>>),
+}
+
+impl Default for BookmarkLayout {
+    fn default() -> Self {
+        Self::Grouped {
+            groups: Vec::new(),
+            default: 0,
+        }
+    }
+}
+
+impl BookmarkLayout {
+    pub fn grouped(groups: Vec<BookmarkGroupState>, default: usize) -> Self {
+        Self::Grouped { groups, default }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
@@ -69,6 +119,8 @@ pub struct Layout {
     pub services_selected: Option<String>,
     /// The optional groups of the Services tree list their configurations.
     pub services_show_all: bool,
+    /// The groups of the bookmarks with the description of each one.
+    pub bookmarks: BookmarkLayout,
 }
 
 impl Default for Layout {
@@ -100,6 +152,7 @@ impl Default for Layout {
             services_collapsed: Vec::new(),
             services_selected: None,
             services_show_all: false,
+            bookmarks: BookmarkLayout::default(),
         }
     }
 }

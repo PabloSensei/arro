@@ -7,9 +7,9 @@ use std::sync::Mutex;
 use base::{Cancel, Result};
 use proc_sup::ProcessSpec;
 use project_model::{
-    BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, MAIN_UNIT, Module,
-    ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TEST_UNIT, TaskOptions,
-    ToolHome, ToolProgress, ToolSetup, Unit, cache_file,
+    BuildGroup, BuildModule, BuildSelection, BuildSystem, BuildTask, Exclusion, FileEdit,
+    MAIN_UNIT, Module, ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask,
+    TEST_UNIT, TaskOptions, ToolHome, ToolProgress, ToolSetup, Unit, cache_file,
 };
 use serde::Deserialize;
 
@@ -129,11 +129,18 @@ impl Maven {
     pub(crate) fn command(&self, root: &Path) -> Result<ProcessSpec> {
         let settings = &self.env.build_tools.first;
         let maven = self.resolve(root)?.program;
+        // A wrapper that came without the execute bit, from an archive made on Windows or
+        // from a copy, is made runnable here and the output of the build says so.
+        let note = crate::wrapper::prepare(&maven)?;
         let jdk = self.env.project_jdk(root)?;
+        let selection = crate::build_selection::load_selection(root);
         let mut spec = ProcessSpec::new(maven)
             .cwd(root)
             .args(["-B", "-ntp"])
             .label("Build tool");
+        if let Some(note) = note {
+            spec = spec.note(note);
+        }
         if settings.offline {
             spec = spec.arg("-o");
         }
@@ -146,7 +153,13 @@ impl Maven {
         if let Some(options) = project_model::BuildToolSettings::path(&settings.vm_options) {
             spec = spec.env("MAVEN_OPTS", options);
         }
-        Ok(self.env.apply(spec, &jdk).args(&self.env.maven_args))
+        // Every command of every window and provider goes through here, so the chosen
+        // profiles reach a build, a task, the tests and the import alike.
+        Ok(self
+            .env
+            .apply(spec, &jdk)
+            .args(&self.env.maven_args)
+            .args(crate::build_selection::profile_args(&selection)))
     }
 
     /// Where the fingerprint of the last successful build waits.
@@ -177,7 +190,9 @@ impl BuildSystem for Maven {
             .arg(format!("-Dide.model.out={}", report.display()))
             .arg(MODEL_PHASE);
         run_tool(&spec, cancel)?;
-        parse_report(&fs::read(&report)?, root)
+        let mut model = parse_report(&fs::read(&report)?, root)?;
+        model.profiles = crate::pom::module_profiles(&model.modules);
+        Ok(model)
     }
 
     fn missing_tool(&self, root: &Path) -> Option<ToolSetup> {
@@ -256,6 +271,23 @@ impl BuildSystem for Maven {
             Some(directory) => spec.arg("-pl").arg(directory).arg("-am").arg("compile"),
             None => spec.arg("compile"),
         })
+    }
+
+    fn rebuild(&self, root: &Path, tests: bool) -> Result<ProcessSpec> {
+        let spec = self.command(root)?.arg("clean").arg("compile");
+        Ok(if tests {
+            spec.arg("test-compile")
+        } else {
+            spec
+        })
+    }
+
+    fn generates_sources(&self) -> bool {
+        true
+    }
+
+    fn generate_sources(&self, root: &Path) -> Result<Option<ProcessSpec>> {
+        Ok(Some(self.command(root)?.arg("generate-sources")))
     }
 
     fn tasks(&self, _model: &ProjectModel) -> Vec<String> {
@@ -364,6 +396,14 @@ impl BuildSystem for Maven {
 
     fn supports_skip_tests(&self) -> bool {
         true
+    }
+
+    fn selection(&self, root: &Path) -> BuildSelection {
+        crate::build_selection::load_selection(root)
+    }
+
+    fn choose(&self, root: &Path, selection: &BuildSelection) -> Result {
+        crate::build_selection::save_selection(root, selection)
     }
 
     fn supports_profiler(&self) -> bool {
@@ -590,6 +630,22 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
         };
         let mut test_paths = vec![main_output];
         test_paths.extend(paths(project.test_classpath));
+        // The build folder holds what the compiler writes, generated sources included.
+        let build_dir = project.output_dir.parent().map(Path::to_path_buf);
+        let mut generated_roots: Vec<PathBuf> = project
+            .source_roots
+            .iter()
+            .chain(project.test_source_roots.iter())
+            .filter(|source| {
+                build_dir
+                    .as_ref()
+                    .is_some_and(|dir| source.starts_with(dir))
+            })
+            .cloned()
+            .collect();
+        generated_roots.dedup();
+        let excluded_roots: Vec<PathBuf> = build_dir.into_iter().collect();
+        let build_file = project.build_file.clone();
         let main = Unit {
             name: MAIN_UNIT.into(),
             source_roots: project.source_roots,
@@ -616,6 +672,9 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
                 id: project.id,
                 name,
                 dir: project.base_dir,
+                build_file,
+                generated_roots,
+                excluded_roots,
                 units: vec![main, test],
             },
             dependencies,
@@ -629,6 +688,7 @@ fn parse_report(bytes: &[u8], root: &Path) -> Result<ProjectModel> {
         tool_version: report.tool_version,
         modules,
         dependencies,
+        profiles: Vec::new(),
         resolved: true,
         problems,
     })
@@ -1011,6 +1071,39 @@ mod tests {
 
         assert_eq!(found.origin, MavenOrigin::Wrapper);
         assert_eq!(found.program, root.path().join(cmd_script("mvnw")));
+    }
+
+    /// The wrapper of a project that came without the execute bit is made runnable before
+    /// the build starts, and the build output carries the line about it.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_without_the_execute_bit_is_made_runnable() {
+        let root = test_support::TempDir::new("maven-wrapper-bit");
+        let script = root.path().join(cmd_script("mvnw"));
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        platform::set_mode(&script, 0o644).unwrap();
+        let home = root.path().join("jdk");
+        fs::create_dir_all(home.join("bin")).unwrap();
+        fs::write(home.join("bin").join("javac"), "").unwrap();
+        fs::write(home.join("bin").join("java"), "").unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.2\"\n").unwrap();
+        let jdk = crate::Jdk::at(&home).unwrap();
+        let data = test_support::TempDir::new("maven-wrapper-bit-data");
+        let tool = Maven::new(BuildEnv {
+            jdk: Some(jdk),
+            data_dir: Some(data.path().to_path_buf()),
+            ..BuildEnv::default()
+        });
+
+        let spec = tool.command(root.path()).unwrap();
+
+        assert!(
+            spec.notes().iter().any(|note| note.contains("mvnw")),
+            "{:?}",
+            spec.notes()
+        );
+        let mode = platform::mode(&script).unwrap();
+        assert_eq!(mode & 0o111, 0o111);
     }
 
     #[test]

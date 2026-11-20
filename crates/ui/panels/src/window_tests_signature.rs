@@ -203,6 +203,7 @@ impl Provider<ActionQuery, Vec<ActionEntry>> for FakeLanguage {
             renames: Vec::new(),
             handle: None,
             resolve: None,
+            rename: None,
         }]));
     }
 }

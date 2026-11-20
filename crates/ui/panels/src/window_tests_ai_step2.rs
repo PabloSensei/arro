@@ -431,7 +431,7 @@ fn ask_ai_in_the_editor_menu_runs_the_registered_command(cx: &mut TestAppContext
 
     let body = bounds_of(cx, window, "editor-body-0");
     let first_line = body.top() + px(line_height(cx) / 2.);
-    right_click_at(cx, window, gpui::point(body.left() + px(40.), first_line));
+    right_click_at(cx, window, gpui::point(body.left() + px(300.), first_line));
 
     assert_eq!(
         menu_row_enabled(cx, window, "Ask AI..."),
@@ -470,7 +470,7 @@ fn ask_ai_is_disabled_without_a_selection(cx: &mut TestAppContext) {
 
     let body = bounds_of(cx, window, "editor-body-0");
     let first_line = body.top() + px(line_height(cx) / 2.);
-    right_click_at(cx, window, gpui::point(body.left() + px(40.), first_line));
+    right_click_at(cx, window, gpui::point(body.left() + px(300.), first_line));
     assert_eq!(
         menu_row_enabled(cx, window, "Ask AI..."),
         Some(false),

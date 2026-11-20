@@ -31,6 +31,51 @@ impl Wrapper {
             Self::Gradle => "Gradle",
         }
     }
+
+    /// The script the tool writes on this system, the one the user runs by hand.
+    pub fn script(self, folder: &Path) -> PathBuf {
+        let name = match (self, cfg!(windows)) {
+            (Self::Maven, true) => "mvnw.cmd",
+            (Self::Maven, false) => "mvnw",
+            (Self::Gradle, true) => "gradlew.bat",
+            (Self::Gradle, false) => "gradlew",
+        };
+        folder.join(name)
+    }
+}
+
+/// Makes the wrapper of a project runnable on a Unix system, where a script from an
+/// archive made on Windows or from a copy that dropped the bit fails with a raw
+/// `PermissionDenied`. `Some` is the line the build reports when it starts; `Ok(None)`
+/// means the bit was already there or the system has no permission bits. An error names
+/// the file and the command that fixes it when the bits cannot be changed, such as a file
+/// of another owner.
+pub fn prepare(program: &Path) -> std::result::Result<Option<String>, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = program;
+        Ok(None)
+    }
+    #[cfg(unix)]
+    {
+        let mode = platform::mode(program)
+            .map_err(|error| format!("cannot read {}: {error}", program.display()))?;
+        if mode & 0o111 != 0 {
+            return Ok(None);
+        }
+        platform::make_executable(program).map_err(|error| {
+            format!(
+                "{} is not executable and its permissions cannot be changed: {error}. \
+                 Run `chmod +x {}` and start the build again",
+                program.display(),
+                program.display()
+            )
+        })?;
+        Ok(Some(format!(
+            "{} was not executable; Arro added the execute bit to start it",
+            program.display()
+        )))
+    }
 }
 
 /// Runs the tool in the folder of the new project, where it writes the wrapper of its
@@ -66,6 +111,14 @@ pub fn generate(
     let finished = capture(&spec, cancel)
         .map_err(|error| format!("the {} wrapper could not be written: {error}", kind.label()))?;
     if finished.status.success() {
+        // The tool writes the script for every system; a folder that does not carry the
+        // bits of a Unix file, such as a mounted share, would leave it unrunnable. A file
+        // whose bits cannot be changed is reported by the build that starts it, with the
+        // path and the command that fixes it.
+        let script = kind.script(folder);
+        if script.is_file() {
+            let _ = prepare(&script);
+        }
         return Ok(());
     }
     let mut text = finished.stdout;
@@ -90,5 +143,43 @@ mod tests {
             assert!(generate(Wrapper::Maven, Path::new("."), None, &Cancel::new()).is_err());
         }
         assert_eq!(Wrapper::Gradle.label(), "Gradle");
+    }
+
+    #[test]
+    fn the_script_of_a_wrapper_is_named_as_the_system_names_it() {
+        let folder = Path::new("project");
+        let maven = Wrapper::Maven.script(folder);
+        let gradle = Wrapper::Gradle.script(folder);
+
+        assert_eq!(maven.parent(), Some(folder));
+        assert_eq!(gradle.parent(), Some(folder));
+        assert!(
+            maven
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("mvnw"))
+        );
+        assert!(
+            gradle
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("gradlew"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_without_the_execute_bit_gets_it_and_the_build_says_so() {
+        use std::fs;
+
+        let folder = test_support::TempDir::new("wrapper-bit");
+        let script = Wrapper::Maven.script(folder.path());
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        platform::set_mode(&script, 0o644).unwrap();
+
+        let note = prepare(&script).unwrap().expect("the bit was missing");
+
+        assert!(note.contains("mvnw"), "{note}");
+        let mode = platform::mode(&script).unwrap();
+        assert_eq!(mode & 0o111, 0o111);
+        assert_eq!(prepare(&script).unwrap(), None);
     }
 }

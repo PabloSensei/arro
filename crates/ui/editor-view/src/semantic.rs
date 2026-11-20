@@ -1807,7 +1807,14 @@ pub(crate) struct Lsp {
     pub quick: Option<crate::quick_doc::QuickDoc>,
     pub actions: Option<ActionMenu>,
     pub rename: Option<RenameField>,
+    /// The name an extract introduced, ready to be typed over.
+    pub name: Option<crate::refactor::ExtractNameField>,
     pub move_to: Option<MoveField>,
+    /// A refactoring of several files the window keeps as one step: Ctrl+Z here asks
+    /// the window to take the whole change back.
+    pub workspace_undo: Option<u64>,
+    /// The same change, after its undo: Ctrl+Shift+Z asks the window to apply it again.
+    pub workspace_redo: Option<u64>,
     /// Ctrl+O and Ctrl+I: the methods that can be overridden here.
     pub overrides: Option<crate::hierarchy::OverridePopup>,
     /// Ctrl+Shift+I: the source of the definition at the caret.
@@ -2203,7 +2210,10 @@ impl EditorView {
             quick: None,
             actions: None,
             rename: None,
+            name: None,
             move_to: None,
+            workspace_undo: None,
+            workspace_redo: None,
             overrides: None,
             definition: None,
             generation: None,
@@ -2784,6 +2794,21 @@ impl EditorView {
             });
             cx.notify();
         }
+    }
+
+    /// A message at a place of the document, for a window that found nothing to offer
+    /// there.
+    pub fn note_at(
+        &mut self,
+        point: TextPoint,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let at = offset_in(&state.text(), point);
+        self.show_note(at, text, cx);
     }
 
     /// Ctrl+Space, or typing: asks for entries at the caret. A Ctrl+Space with the list

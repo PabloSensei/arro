@@ -1,6 +1,7 @@
 //! What the user can change in Settings. One JSON file in the settings folder; a missing
 //! or damaged file gives the defaults, a new key an old file does not know gets its default.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -301,6 +302,8 @@ pub enum McpExecutePermission {
     AlwaysAsk,
     /// A project the user trusted runs without a question; another one still asks.
     TrustedProjects,
+    /// Every call of the class `Execute` runs without a question, as brave mode of IDEA.
+    WithoutConfirmation,
 }
 
 impl McpExecutePermission {
@@ -308,15 +311,51 @@ impl McpExecutePermission {
         match self {
             Self::AlwaysAsk => "Always ask",
             Self::TrustedProjects => "Allow for trusted projects",
+            Self::WithoutConfirmation => "Run without confirmation",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
             Self::AlwaysAsk => Self::TrustedProjects,
-            Self::TrustedProjects => Self::AlwaysAsk,
+            Self::TrustedProjects => Self::WithoutConfirmation,
+            Self::WithoutConfirmation => Self::AlwaysAsk,
         }
     }
+}
+
+/// The clients the router-only mode leaves with `execute_tool` alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpRouterScope {
+    /// Every agent and every client outside the window.
+    #[default]
+    AllAgents,
+    /// Only the sessions of the ACP agents.
+    AcpOnly,
+}
+
+impl McpRouterScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllAgents => "All agents",
+            Self::AcpOnly => "ACP only",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::AllAgents => Self::AcpOnly,
+            Self::AcpOnly => Self::AllAgents,
+        }
+    }
+}
+
+/// The two switches of one row of the Exposed Tools table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolChoice {
+    pub enabled: bool,
+    pub router_only: bool,
 }
 
 impl GitUpdateMethod {
@@ -331,6 +370,53 @@ impl GitUpdateMethod {
         match self {
             GitUpdateMethod::Merge => GitUpdateMethod::Rebase,
             GitUpdateMethod::Rebase => GitUpdateMethod::Merge,
+        }
+    }
+}
+
+/// How the blame column names the author of a line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotateNames {
+    /// The family name alone, the default of IDEA.
+    #[default]
+    LastName,
+    FirstName,
+    FullName,
+    /// The initials of the first and the last name.
+    Initials,
+    Email,
+}
+
+impl AnnotateNames {
+    pub fn label(self) -> &'static str {
+        match self {
+            AnnotateNames::LastName => "Last Name",
+            AnnotateNames::FirstName => "First Name",
+            AnnotateNames::FullName => "Full Name",
+            AnnotateNames::Initials => "Initials",
+            AnnotateNames::Email => "Email",
+        }
+    }
+
+    /// The name of the author as the column writes it.
+    pub fn format(self, author: &str, email: &str) -> String {
+        let parts: Vec<&str> = author.split_whitespace().collect();
+        let first = parts.first().copied().unwrap_or_default();
+        let last = parts.last().copied().unwrap_or_default();
+        match self {
+            AnnotateNames::LastName => last.to_owned(),
+            AnnotateNames::FirstName => first.to_owned(),
+            AnnotateNames::FullName => parts.join(" "),
+            AnnotateNames::Initials if first == last => {
+                format!("{}.", first.chars().next().unwrap_or_default())
+            }
+            AnnotateNames::Initials => format!(
+                "{}.{}.",
+                first.chars().next().unwrap_or_default(),
+                last.chars().next().unwrap_or_default()
+            ),
+            AnnotateNames::Email => email.to_owned(),
         }
     }
 }
@@ -501,6 +587,14 @@ pub struct Settings {
     pub git_warn_crlf: bool,
     /// The commit window starts with code analysis.
     pub git_analyze_before_commit: bool,
+    /// The blame column shows the author of a line.
+    pub annotate_author: bool,
+    /// The blame column shows the date of the commit of a line.
+    pub annotate_date: bool,
+    /// The blame column shows the short hash of the commit of a line.
+    pub annotate_commit: bool,
+    /// How the blame column names the author.
+    pub annotate_names: AnnotateNames,
     /// The shell of a new terminal; empty means the one found on this machine.
     pub terminal_shell: String,
     /// Where a new terminal starts; empty means the root of the project.
@@ -558,6 +652,15 @@ pub struct Settings {
     pub mcp_binary: String,
     /// Whether a tool that builds, tests or runs the project asks first.
     pub mcp_execute_permission: McpExecutePermission,
+    /// The Exposed Tools table: the tools the user changed from the state they start with.
+    pub mcp_tool_settings: BTreeMap<String, McpToolChoice>,
+    /// `execute_tool` is the only tool a client sees, reached by name through it.
+    pub mcp_router_only_mode: bool,
+    /// The clients the router-only mode covers.
+    pub mcp_router_only_scope: McpRouterScope,
+    /// A terminal of the window suggests the setup of the MCP client when `claude` or
+    /// `codex` starts in it without an entry of Arro.
+    pub mcp_terminal_suggestions: bool,
 }
 
 impl Default for Settings {
@@ -644,6 +747,10 @@ impl Default for Settings {
             git_update_submodules: true,
             git_warn_crlf: true,
             git_analyze_before_commit: false,
+            annotate_author: true,
+            annotate_date: true,
+            annotate_commit: false,
+            annotate_names: AnnotateNames::LastName,
             terminal_shell: String::new(),
             terminal_start_directory: String::new(),
             terminal_environment: String::new(),
@@ -669,6 +776,10 @@ impl Default for Settings {
             mcp_enabled: true,
             mcp_binary: String::new(),
             mcp_execute_permission: McpExecutePermission::AlwaysAsk,
+            mcp_tool_settings: BTreeMap::new(),
+            mcp_router_only_mode: false,
+            mcp_router_only_scope: McpRouterScope::AllAgents,
+            mcp_terminal_suggestions: true,
         }
     }
 }

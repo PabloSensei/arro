@@ -267,6 +267,7 @@ fn organize_imports_goes_through_the_action_of_the_language(cx: &mut TestAppCont
         renames: Vec::new(),
         handle: None,
         resolve: None,
+        rename: None,
     }]);
     let window = open_window_with(cx, root.clone(), language);
     cx.run_until_parked();

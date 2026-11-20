@@ -124,6 +124,7 @@ impl ResolveLanguage {
                 renames: Vec::new(),
                 handle: None,
                 resolve: Some(token.to_owned()),
+                rename: None,
             });
         entry.edits = vec![SourceEdit {
             uri,
@@ -598,6 +599,7 @@ fn resolved_actions() -> Vec<ActionEntry> {
         renames: Vec::new(),
         handle: None,
         resolve: Some(token.to_owned()),
+        rename: None,
     };
     vec![entry("First", "first"), entry("Second", "second")]
 }

@@ -22,22 +22,23 @@ use crate::editor::{ENCODINGS, IndentChoice, LINE_ENDS};
 use crate::settings::Settings;
 use crate::split::SplitNode;
 use crate::window::{
-    AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_POPUP, BalloonAction, BringAllToFront, BuildProject,
-    COMMIT_TOOL, CheckForUpdatesApp, ChooseDebugConfiguration, ChooseRunConfiguration, CloseTab,
-    Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug, Dismiss, DockSide, EditBreakpoint,
-    Evaluate, FocusNextGroup, FocusPreviousGroup, ForceRunToCursor, ForceStepInto, ForceStepOver,
-    FullyExpandTreeNode, GotoRelated, HTTP_TOOL, HideApp, HideCoverage, HideOtherApps,
-    HideToolWindow, LOG_TOOL, MenuRow, MinimizeWindow, MoveToOtherGroup, NewElementSamePlace,
-    NextProblem, NextProjectWindow, NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL,
-    PinTab, PreviousProblem, PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate,
-    QuitApp, RUN_TOOL, ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown,
+    AI_CLIENTS, AI_TOOL, AboutApp, BOOKMARKS_TOOL, BUILD_TOOL, BalloonAction, BringAllToFront,
+    BuildModule, BuildProject, COMMIT_TOOL, CheckForUpdatesApp, ChooseDebugConfiguration,
+    ChooseRunConfiguration, CloseTab, Compile, CopyElement, DATABASE_TOOL, DEBUG_TOOL, Debug,
+    Dismiss, DockSide, EditBreakpoint, Evaluate, FocusNextGroup, FocusPreviousGroup,
+    ForceRunToCursor, ForceStepInto, ForceStepOver, FullyExpandTreeNode, GenerateSources,
+    GotoRelated, HTTP_TOOL, HideApp, HideCoverage, HideOtherApps, HideToolWindow, LOG_TOOL,
+    MenuRow, MinimizeWindow, MoveToOtherGroup, NewElementSamePlace, NextProblem, NextProjectWindow,
+    NextTab, OpenFolder, Overlay, PROBLEMS_TOOL, PROJECT_TOOL, PinTab, PreviousProblem,
+    PreviousProjectWindow, ProjectStructure, PushChanges, QuickEvaluate, QuitApp, RUN_TOOL,
+    RebuildProject, ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown,
     ResizeToolWindowLeft, ResizeToolWindowRight, ResizeToolWindowUp, Resume, Run,
     RunTestsWithCoverage, RunTestsWithProfiler, RunToCursor, RunWithCoverage, SERVICES_TOOL,
     STRUCTURE_TOOL, SaveAll, ShowAllApps, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
     ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop,
     StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi,
-    ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug, ToggleFullScreen,
-    ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
+    ToggleBookmarks, ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug,
+    ToggleFullScreen, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
     ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
     UpdateProject, VcsQuickList, ViewBreakpoints, Workspace, ZoomWindow,
 };
@@ -490,7 +491,7 @@ impl Workspace {
         &self,
         id: &'static str,
         icon_name: &'static str,
-        label: &'static str,
+        label: impl Into<SharedString>,
         key: Option<&'static str>,
         selected: bool,
         theme: &Theme,
@@ -534,6 +535,7 @@ impl Workspace {
         let structure_open = self.tool_open(STRUCTURE_TOOL);
         let terminal_open = self.tool_open(TERMINAL_TOOL);
         let services_open = self.tool_open(SERVICES_TOOL);
+        let build_open = self.tool_open(BUILD_TOOL);
         div()
             .flex()
             .flex_col()
@@ -615,6 +617,17 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_tool(DEBUG_TOOL, window, cx)
                         })),
+                    )
+                    .child(
+                        button(
+                            "s-build",
+                            "toolwindows/tasks",
+                            "Build",
+                            None,
+                            build_open,
+                            theme,
+                        )
+                        .on_click(toggle(BUILD_TOOL)),
                     )
                     .child(
                         button(
@@ -711,6 +724,10 @@ impl Workspace {
                 .child(kept_spot(scripted, view, format!("stripe-{id}")))
         };
         let separator = div().w(px(ICON)).h(px(DIVIDER_WIDTH)).bg(theme.border);
+        let build_tool = self
+            .run_state(cx)
+            .build_tool
+            .unwrap_or_else(|| "Tasks".into());
         div()
             .flex()
             .flex_col()
@@ -745,14 +762,16 @@ impl Workspace {
             )
             .child(separator)
             .child(
-                button(
+                self.stripe_button(
                     "s-tasks",
                     "toolwindows/tasks",
-                    "Tasks",
+                    build_tool,
                     None,
                     self.tool_open(TASKS_TOOL),
                     theme,
                 )
+                .relative()
+                .child(kept_spot(scripted, view, "stripe-s-tasks".to_string()))
                 .on_click(
                     cx.listener(|this, _, window, cx| this.toggle_tool(TASKS_TOOL, window, cx)),
                 ),
@@ -762,35 +781,14 @@ impl Workspace {
                     "s-bookmarks",
                     "toolwindows/bookmarks",
                     "Bookmarks",
-                    None,
-                    self.overlay_tag() == Some(BOOKMARKS_POPUP),
+                    Some("workspace::ToggleBookmarks"),
+                    self.tool_open(BOOKMARKS_TOOL),
                     theme,
                 )
-                // The open popup hears this press too and closes itself on it, so the
-                // button reads the popup before the pointer does. A second press then
-                // closes the popup instead of opening it again.
-                .capture_any_mouse_down(cx.listener(
-                    |this, event: &MouseDownEvent, window, cx| {
-                        if event.button == MouseButton::Left {
-                            this.toggle_bookmarks(window, cx);
-                        }
-                    },
-                )),
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.toggle_tool(BOOKMARKS_TOOL, window, cx)),
+                ),
             )
-    }
-
-    /// The Bookmarks button of the right stripe: the popup opens, and the same button
-    /// closes it while it is open.
-    fn toggle_bookmarks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlay_tag() == Some(BOOKMARKS_POPUP) {
-            self.close_overlay(window, cx);
-            return;
-        }
-        // A popup that is open now closes on this same press and would take the new one
-        // with it, so the bookmarks open after the press is through.
-        cx.defer_in(window, |this, window, cx| {
-            this.run_command("window.show_bookmarks", window, cx);
-        });
     }
 
     /// The areas of the window controls that the platform reads for hit testing. The title
@@ -1470,6 +1468,17 @@ impl Workspace {
         entry
     }
 
+    /// The row of a command that is grey while the command does not apply.
+    fn command_row_if(
+        &self,
+        weak: &WeakEntity<Workspace>,
+        id: &'static str,
+        label: &'static str,
+        enabled: bool,
+    ) -> MenuEntry {
+        self.command_row(weak, id, label).enabled(enabled)
+    }
+
     /// A window action row with its key from the window bindings.
     fn action_row<A: Action + Clone + 'static>(&self, label: &'static str, action: A) -> MenuEntry {
         let entry = action_entry(label, action);
@@ -1827,6 +1836,9 @@ impl Workspace {
                 self.action_row("Database", ToggleDatabase),
                 command("jshell.open", "JShell Console"),
                 self.action_row("Endpoints", ToggleEndpoints),
+                command("window.show_beans", "Beans")
+                    .icon("nodes/class")
+                    .tip("Opens the Beans window with the Spring beans of the project"),
                 self.action_row("Usages", ToggleUsages),
                 self.action_row("TODO", ToggleTodo),
                 self.action_row("Git", ToggleLog),
@@ -1970,18 +1982,54 @@ impl Workspace {
                         command(editor_keys::INTRODUCE_PARAMETER, "Parameter..."),
                     ],
                 ),
+                MenuEntry::separator(),
+                command(editor_keys::PULL_MEMBERS_UP, "Pull Members Up..."),
+                command(editor_keys::PUSH_MEMBERS_DOWN, "Push Members Down..."),
+                command(editor_keys::EXTRACT_SUPERCLASS, "Extract Superclass..."),
+                command(
+                    editor_keys::INTRODUCE_PARAMETER_OBJECT,
+                    "Introduce Parameter Object...",
+                ),
+                MenuEntry::separator(),
                 command(editor_keys::SAFE_DELETE, "Safe Delete..."),
                 command(editor_keys::UNWRAP, "Unwrap/Remove..."),
             ],
         );
 
-        let build = MenuEntry::submenu(
-            "Build",
-            vec![
-                self.action_row("Build Project", BuildProject),
-                self.action_row("Compile", Compile),
-            ],
+        let build_state = self.run_state(cx);
+        let current = self.active_path();
+        let module = self
+            .run
+            .as_ref()
+            .and_then(|run| (run.module_of)(current.as_deref(), cx));
+        let module_label = module.map_or_else(
+            || "Build Module".to_string(),
+            |module| format!("Build Module '{module}'"),
         );
+        let recompile_label = current
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || "Recompile".to_string(),
+                |name| format!("Recompile '{}'", name.to_string_lossy()),
+            );
+        let mut build_rows = vec![
+            self.action_row("Build Project", BuildProject)
+                .tip("Build the project with its build tool"),
+            self.action_row_named(module_label, BuildModule)
+                .tip("Build the module of the current file"),
+            self.action_row_named(recompile_label, Compile)
+                .tip("Compile the module of the current file again"),
+            self.action_row("Rebuild Project", RebuildProject)
+                .tip("Clean the outputs and build the whole project again"),
+        ];
+        if build_state.generates_sources {
+            build_rows.push(
+                self.action_row("Generate Sources and Update Folders", GenerateSources)
+                    .tip("Run the source generator of the build tool"),
+            );
+        }
+        let build = MenuEntry::submenu("Build", build_rows);
 
         let run_state = self.run_state(cx);
         let profile_label = match run_state.selected {
@@ -2040,9 +2088,62 @@ impl Workspace {
                 command("git.abort", "Abort Merge or Rebase"),
                 MenuEntry::separator(),
                 command("git.show_file_history", "Show History"),
-                command("git.show_selection_history", "Show History for Selection"),
+                command("git.show_selection_history", "Show History for Selection")
+                    .tip("Show the commits that changed the selected lines"),
                 command("git.show_method_history", "Show History for Method"),
                 command("git.show_log", "Git Log"),
+                MenuEntry::separator(),
+                self.command_row_if(
+                    &weak,
+                    "git.annotate",
+                    "Annotate with Git Blame",
+                    self.command_applies("git.annotate", cx),
+                )
+                .tip("Show the commit of every line of the active file"),
+                self.command_row_if(
+                    &weak,
+                    "git.rebase",
+                    "Rebase...",
+                    self.command_applies("git.rebase", cx),
+                )
+                .tip("Rebase the commits of the selected commit onto HEAD interactively"),
+                self.command_row_if(
+                    &weak,
+                    "git.cherry_pick",
+                    "Cherry-pick",
+                    self.command_applies("git.cherry_pick", cx),
+                )
+                .tip("Copy the selected commits of the log onto the current branch"),
+                self.command_row_if(
+                    &weak,
+                    "git.revert_commit",
+                    "Revert Commit",
+                    self.command_applies("git.revert_commit", cx),
+                )
+                .tip("Add a commit that undoes the selected commit of the log"),
+                self.command_row_if(
+                    &weak,
+                    "git.reset_head",
+                    "Reset HEAD...",
+                    self.command_applies("git.reset_head", cx),
+                )
+                .tip("Move the current branch to the selected commit of the log"),
+                MenuEntry::separator(),
+                self.command_row_if(
+                    &weak,
+                    "git.shelve",
+                    "Shelve Changes...",
+                    self.command_applies("git.shelve", cx),
+                )
+                .tip("Put the ticked changes aside as a patch"),
+                self.command_row_if(
+                    &weak,
+                    "git.unshelve",
+                    "Unshelve...",
+                    self.command_applies("git.unshelve", cx),
+                )
+                .tip("Put a shelved patch back into the working tree"),
+                MenuEntry::separator(),
                 command(workspace_keys::ROLLBACK_CHANGED_LINES, "Rollback Lines"),
                 command(workspace_keys::NEXT_CHANGE, "Show Next Change"),
                 command(workspace_keys::PREVIOUS_CHANGE, "Show Previous Change"),
@@ -3035,21 +3136,6 @@ impl Workspace {
         };
         let close = cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_balloon(cx));
         let mut actions = Vec::new();
-        if let Some((label, path)) = self
-            .balloon
-            .as_ref()
-            .and_then(|balloon| balloon.action.clone())
-        {
-            actions.push(NotificationAction {
-                id: "file",
-                label,
-                on_click: Box::new(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.balloon_visible = false;
-                    cx.notify();
-                    this.open_file(path.clone(), window, cx);
-                })),
-            });
-        }
         if let Some(balloon) = self.balloon.as_ref() {
             for button in &balloon.buttons {
                 let id = button.id;
@@ -3082,6 +3168,22 @@ impl Workspace {
                     on_click,
                 });
             }
+        }
+        // The file of a notification comes after the commands, as the last way out.
+        if let Some((label, path)) = self
+            .balloon
+            .as_ref()
+            .and_then(|balloon| balloon.action.clone())
+        {
+            actions.push(NotificationAction {
+                id: "file",
+                label,
+                on_click: Box::new(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.balloon_visible = false;
+                    cx.notify();
+                    this.open_file(path.clone(), window, cx);
+                })),
+            });
         }
         let body = notification(
             title,
@@ -3361,9 +3463,18 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(|this, _: &Run, window, cx| this.run_selected(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &BuildProject, window, cx| this.build_project(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &BuildProject, window, cx| {
+                this.run_command("workspace.build_project", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &BuildModule, window, cx| {
+                this.run_command("workspace.build_module", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RebuildProject, window, cx| {
+                this.run_command("workspace.rebuild_project", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GenerateSources, window, cx| {
+                this.run_command("workspace.generate_sources", window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Compile, window, cx| {
                 this.run_command("workspace.compile", window, cx);
             }))
@@ -3403,6 +3514,9 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_tool(AI_TOOL, window, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleBookmarks, window, cx| {
+                this.toggle_tool(BOOKMARKS_TOOL, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ShowSearch, window, cx| this.show_search(window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(
@@ -3939,6 +4053,7 @@ impl Render for StatusBarView {
             active,
             language_status,
             language_details,
+            language_action,
             branch,
             status,
             branch_anchor,
@@ -3946,6 +4061,7 @@ impl Render for StatusBarView {
             enc_anchor,
             indent_anchor,
             zoom_notice,
+            status_progress,
             agent_clients,
             agent_busy,
         ) = {
@@ -3958,6 +4074,7 @@ impl Render for StatusBarView {
                     .map(|tab| (tab.path.clone(), tab.icon)),
                 workspace.language_status.clone(),
                 workspace.language_details.is_some(),
+                workspace.language_action,
                 workspace.branch.clone(),
                 workspace.active_status(cx),
                 workspace.st_branch_anchor.clone(),
@@ -3965,6 +4082,7 @@ impl Render for StatusBarView {
                 workspace.st_enc_anchor.clone(),
                 workspace.st_indent_anchor.clone(),
                 workspace.zoom_notice().cloned(),
+                workspace.status_progress().cloned(),
                 workspace.agent_clients,
                 workspace.agent_busy,
             )
@@ -4023,6 +4141,30 @@ impl Render for StatusBarView {
         let zoom = zoom_notice.map(|text| {
             status_widget("st-zoom", text, &theme).debug_selector(|| "st-zoom".to_owned())
         });
+        let progress = status_progress.map(|progress| {
+            let cancel = progress.cancel.clone();
+            div()
+                .id("st-progress")
+                .debug_selector(|| "st-progress".to_owned())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .flex_none()
+                .child(progress.label.clone())
+                .children(cancel.map(|cancel| {
+                    div()
+                        .id("st-progress-cancel")
+                        .debug_selector(|| "st-progress-cancel".to_owned())
+                        .px(px(SPACE_XS))
+                        .rounded(px(CONTROL_RADIUS))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.selection_hover))
+                        .tooltip(|_, cx| tooltip("Cancel the running task", None, cx))
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .child("Cancel")
+                        .on_click(move |_: &ClickEvent, _: &mut Window, _: &mut App| cancel())
+                }))
+        });
         let language = language_status.map(|text| {
             // A server that is still starting or importing cannot answer: its line is
             // shown in the warning colour, so the user sees why Ctrl+B waits.
@@ -4030,7 +4172,25 @@ impl Render for StatusBarView {
             let widget = status_widget("st-language", text, &theme)
                 .debug_selector(|| "st-language".to_owned())
                 .when(!ready, |widget| widget.text_color(theme.warning_mark));
-            if language_details {
+            if let Some(action) = language_action {
+                let workspace = self.workspace.clone();
+                widget
+                    .cursor_pointer()
+                    .tooltip(|_, cx| tooltip("Import failed. Click for details.", None, cx))
+                    .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        let shown = workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.run_command(action, window, cx)
+                            })
+                            .unwrap_or(false);
+                        if !shown {
+                            workspace
+                                .update(cx, |workspace, cx| workspace.show_language_help(cx))
+                                .ok();
+                        }
+                    }))
+            } else if language_details {
                 let workspace = self.workspace.clone();
                 widget
                     .cursor_pointer()
@@ -4206,6 +4366,7 @@ impl Render for StatusBarView {
             .flex()
             .items_center()
             .gap(px(SPACE_L))
+            .children(progress)
             .children(zoom)
             .children(agents)
             .children(language)

@@ -7,10 +7,12 @@ use crate::{
     CompletionResolveProvider, DefinitionPreviewProvider, DependencyUpdatesProvider,
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
     GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
-    MethodHierarchyProvider, MoveDestinationProvider, MoveProvider, NavigationProvider,
-    OverridableMethodsProvider, PrepareDiagnosticsProvider, ProjectProblemsProvider,
-    RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
-    SemanticServer, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
+    MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
+    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
+    MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
+    PrepareDiagnosticsProvider, ProjectProblemsProvider, RangeFormatProvider,
+    ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer, SignatureProvider,
+    SourceTextProvider, SymbolProvider, SyntaxProvider, TypeHierarchyProvider,
     WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use crate::{
@@ -190,6 +192,12 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The expressions under the caret that an extract may take, when the server names
+    /// more than the one its action would use.
+    fn refactor_selections(&self) -> Option<&crate::RefactorSelectionsProvider> {
+        None
+    }
+
     /// The processes of the machine that already listen for a debugger, for Attach to
     /// Process. A language that cannot list them makes the window ask for an address.
     fn debug_processes(&self) -> Option<&crate::DebugProcessProvider> {
@@ -231,6 +239,25 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// F6 on a member: the members its type gives away and the types of the project
+    /// that can take them.
+    fn move_members_form(&self) -> Option<&MoveMembersFormProvider> {
+        None
+    }
+
+    /// F6 on a symbol whose new receiver is one of the places around it: the form with
+    /// the places the language offers.
+    fn move_targets_form(&self) -> Option<&MoveTargetsFormProvider> {
+        None
+    }
+
+    /// What F6 works on at a place of a file. A language that moves no members answers
+    /// [`MovePlace::File`].
+    fn move_place(&self, text: &str, offset: usize) -> MovePlace {
+        let _ = (text, offset);
+        MovePlace::File
+    }
+
     /// Ctrl+F6: the signature the caret is on, and the edits of a new one.
     fn change_signature_info(&self) -> Option<&ChangeSignatureInfoProvider> {
         None
@@ -240,7 +267,24 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Pull Members Up, Push Members Down, Extract Superclass and Introduce Parameter
+    /// Object: the members and the places the form offers.
+    fn member_action_form(&self) -> Option<&MemberActionParametersProvider> {
+        None
+    }
+
+    /// The edits of a filled member refactoring form.
+    fn apply_member_action(&self) -> Option<&MemberActionProvider> {
+        None
+    }
+
     fn hierarchy(&self) -> Option<&HierarchyProvider> {
+        None
+    }
+
+    /// Ctrl+H: the type at a place and the types above and below it, one level per
+    /// request.
+    fn type_hierarchy(&self) -> Option<&TypeHierarchyProvider> {
         None
     }
 
@@ -309,6 +353,11 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Ctrl+Shift+H: where the method under a place is defined, inherited or awaited.
     fn method_hierarchy(&self) -> Option<&MethodHierarchyProvider> {
+        None
+    }
+
+    /// The gutter marks of a file: the programs and the tests a Run or a Debug starts.
+    fn run_points(&self) -> Option<&crate::RunPointsProvider> {
         None
     }
 

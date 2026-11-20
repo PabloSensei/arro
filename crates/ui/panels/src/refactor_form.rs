@@ -47,11 +47,14 @@ pub struct RefactorFormDialog {
     error: Option<String>,
     focus: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    /// The editor the refactoring started in, whose Ctrl+Z takes the whole change back.
+    origin: Option<Entity<editor_view::EditorView>>,
 }
 
 impl RefactorFormDialog {
     pub(crate) fn show(
         handle: String,
+        origin: Option<Entity<editor_view::EditorView>>,
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -74,6 +77,7 @@ impl RefactorFormDialog {
             error: None,
             focus: cx.focus_handle(),
             workspace: weak,
+            origin,
         });
         let focus = view.read(cx).focus.clone();
         workspace.show_overlay(view.clone().into(), focus, window, cx);
@@ -265,6 +269,8 @@ impl RefactorFormDialog {
 
         let handle = window.window_handle();
         let workspace = self.workspace.clone();
+        let label = self.title.clone();
+        let origin = self.origin.clone();
         cx.spawn(async move |this, cx| {
             let answer = replies.next().await;
             let Some(answer) = answer else {
@@ -324,7 +330,14 @@ impl RefactorFormDialog {
                     workspace
                         .update(cx, |workspace, cx| {
                             workspace.dismiss(window, cx);
-                            crate::changes::apply(workspace, change, window, cx);
+                            crate::changes::apply_from(
+                                workspace,
+                                change,
+                                origin,
+                                Some(label),
+                                window,
+                                cx,
+                            );
                         })
                         .ok();
                 })

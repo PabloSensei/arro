@@ -733,8 +733,15 @@ pub fn is_paste(stroke: &Keystroke) -> bool {
 }
 
 /// Sends a key press to `session`. Returns false when the press is not for the terminal.
-pub fn send_key(session: &TerminalSession, stroke: &Keystroke, cx: &mut App) -> bool {
-    if is_paste(stroke) {
+/// The keys of the terminal window itself are handled before this: on macOS Control
+/// reaches the shell, so Ctrl+V is a quoted insert there and not a paste.
+pub fn send_key(
+    session: &TerminalSession,
+    stroke: &Keystroke,
+    platform: keymap::Platform,
+    cx: &mut App,
+) -> bool {
+    if is_paste(stroke) && !platform.uses_command() {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let _ = session.paste(&text);
         }

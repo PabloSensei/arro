@@ -30,7 +30,7 @@ mod code_style;
 mod import;
 mod startup;
 
-pub use import::{ImportFailure, is_build_file};
+pub use import::{BuildTool, ImportFailure, is_build_file};
 
 /// The server release this adapter is tested with, for the message about its JDK.
 const JDTLS_VERSION: &str = "1.63";
@@ -113,6 +113,29 @@ const GRADLE_IDLE_TIMEOUT_MS: u64 = 600_000;
 const GRADLE_IDLE_TIMEOUT_PROPERTY: &str = "org.gradle.daemon.idletimeout";
 /// A test asks for a shorter timeout through the environment of the server.
 const GRADLE_IDLE_TIMEOUT_ENV: &str = "IDE_GRADLE_IDLE_TIMEOUT_MS";
+
+/// The daemon registry of the imports of the IDE, under its state folder. A registry of
+/// the machine may still name the JDK of a daemon whose folder was removed, and Gradle
+/// then fails to connect before it starts a daemon on the JVM the user chose. The server
+/// keeps a registry of its own per JVM, so a registry left by another JVM cannot follow
+/// the user to the one just chosen.
+const GRADLE_REGISTRY_PROPERTY: &str = "org.gradle.daemon.registry.base";
+const GRADLE_REGISTRY_DIR: &str = "gradle-daemons";
+
+/// The registry of the JVM that starts Gradle. A new choice of the user is a new folder,
+/// which no daemon of the previous choice can block.
+fn gradle_registry_dir(config: &JdtlsConfig) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let home = config
+        .gradle_java_home
+        .as_ref()
+        .unwrap_or(&config.java_home);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.to_string_lossy().to_lowercase().hash(&mut hasher);
+    config
+        .state_dir
+        .join(format!("{GRADLE_REGISTRY_DIR}-{:016x}", hasher.finish()))
+}
 
 /// Whether the server may compile the project by itself.
 ///
@@ -987,6 +1010,13 @@ impl ServerSpec for Jdtls {
             config.jdtls_home.join(CONFIG_DIRECTORY).display()
         ));
         args.extend(JVM_SETTINGS.iter().map(|arg| (*arg).to_owned()));
+        // Gradle looks at the daemons of the registry before it starts one. A stale
+        // entry that names a removed JDK fails the connection whatever `javaHome` the
+        // import asked for, so the imports of the IDE get a registry of their own.
+        args.push(format!(
+            "-D{GRADLE_REGISTRY_PROPERTY}={}",
+            gradle_registry_dir(config).display()
+        ));
         args.extend(memory_arguments());
         args.push(format!("-Xmx{}m", self.heap_mb.load(Ordering::Relaxed)));
         // The agent is a JVM setting like the rest, so it goes before `-jar`.
@@ -1117,6 +1147,10 @@ mod tests {
     use super::*;
 
     fn jdtls() -> (Jdtls, PathBuf) {
+        jdtls_with_gradle_java_home(None)
+    }
+
+    fn jdtls_with_gradle_java_home(gradle_java_home: Option<PathBuf>) -> (Jdtls, PathBuf) {
         let root = test_support::scratch("jdtls-adapter");
         let plugins = root.join("home").join("plugins");
         fs::create_dir_all(&plugins).unwrap();
@@ -1136,7 +1170,7 @@ mod tests {
             maven_settings: None,
             gradle_home: None,
             gradle_user_home: Some(PathBuf::from(r"E:\gradle")),
-            gradle_java_home: None,
+            gradle_java_home,
             offline: true,
             environment: HashMap::new(),
         };
@@ -1237,6 +1271,42 @@ mod tests {
             arguments().contains("-Dorg.gradle.daemon.idletimeout=600000"),
             "{}",
             arguments()
+        );
+    }
+
+    #[test]
+    fn a_gradle_java_home_of_the_settings_reaches_the_initialization_options() {
+        let (jdtls, _root) = jdtls_with_gradle_java_home(Some(PathBuf::from(r"C:\jdk\21")));
+        let settings = jdtls.settings();
+        assert_eq!(
+            settings["java"]["import"]["gradle"]["java"]["home"],
+            json!("C:/jdk/21")
+        );
+        assert_eq!(
+            settings["java"]["import"]["gradle"]["wrapper"]["enabled"],
+            json!(true)
+        );
+
+        let params = jdtls.initialize_params();
+        let options = params.initialization_options.unwrap();
+        assert_eq!(
+            options["settings"]["java"]["import"]["gradle"]["java"]["home"],
+            json!("C:/jdk/21")
+        );
+
+        let plan = sidecar::ServerSpec::plan(&jdtls);
+        let registry = format!(
+            "-D{GRADLE_REGISTRY_PROPERTY}={}",
+            gradle_registry_dir(&jdtls.config).display()
+        );
+        assert!(
+            plan.args.contains(&registry),
+            "the server keeps a Gradle daemon registry of its own: {:?}",
+            plan.args
+        );
+        assert!(
+            registry.contains(GRADLE_REGISTRY_DIR),
+            "the registry is named for the JVM of Gradle: {registry}"
         );
     }
 

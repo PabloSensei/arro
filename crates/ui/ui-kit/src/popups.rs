@@ -65,6 +65,8 @@ pub struct MenuEntry {
     pub id: Option<SharedString>,
     /// A less important row, such as a temporary run configuration.
     pub muted: bool,
+    /// A row whose action does not apply right now: it is drawn grey and does nothing.
+    pub enabled: bool,
     /// What the row does, shown as its tooltip while the pointer rests on it.
     pub tip: Option<SharedString>,
 }
@@ -83,6 +85,7 @@ impl MenuEntry {
             submenu: Vec::new(),
             id: None,
             muted: false,
+            enabled: true,
             tip: None,
         }
     }
@@ -124,6 +127,17 @@ impl MenuEntry {
         self
     }
 
+    /// Greys the row when its action does not apply, keeping it in place.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Whether the row runs its action now, for the menus a test reads.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled && (self.on_click.is_some() || self.has_submenu())
+    }
+
     /// The hint of the row: a tooltip that says what the row starts or does.
     pub fn tip(mut self, tip: impl Into<SharedString>) -> Self {
         self.tip = Some(tip.into());
@@ -140,6 +154,7 @@ impl MenuEntry {
             submenu: Vec::new(),
             id: None,
             muted: false,
+            enabled: true,
             tip: None,
         }
     }
@@ -158,7 +173,7 @@ impl MenuEntry {
 
     /// A row the arrows stop on: it is not a separator and it is not disabled.
     pub fn selectable(&self) -> bool {
-        !self.label.is_empty() && (self.on_click.is_some() || self.has_submenu())
+        !self.label.is_empty() && self.enabled && (self.on_click.is_some() || self.has_submenu())
     }
 }
 
@@ -646,7 +661,7 @@ fn menu_level(
             continue;
         }
 
-        let disabled = entry.on_click.is_none() && !entry.has_submenu();
+        let disabled = !entry.enabled || (entry.on_click.is_none() && !entry.has_submenu());
         let selected = state.highlighted_at(depth) == Some(index);
         let open = state.is_submenu_open(&path);
 

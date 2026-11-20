@@ -8,8 +8,9 @@ use ui_kit::gpui::{Modifiers, Pixels, TestAppContext, VisualTestContext, WindowH
 use ui_kit::metrics::*;
 use ui_kit::{point, px, size};
 use workspace::{
-    AI_TOOL, COMMIT_TOOL, DEBUG_TOOL, DockSide, LOG_TOOL, PROBLEMS_TOOL, PROJECT_TOOL, RUN_TOOL,
-    SERVICES_TOOL, STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL, USAGES_TOOL, Workspace,
+    AI_TOOL, BOOKMARKS_TOOL, COMMIT_TOOL, DEBUG_TOOL, DockSide, LOG_TOOL, PROBLEMS_TOOL,
+    PROJECT_TOOL, RUN_TOOL, SERVICES_TOOL, STRUCTURE_TOOL, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL,
+    USAGES_TOOL, Workspace,
 };
 
 use crate::run::RunPanel;
@@ -136,14 +137,14 @@ fn the_duplicate_buttons_are_gone_and_ai_sessions_stays_on_the_right_stripe(
         "AI Sessions is the tool of the right dock"
     );
 
-    // Alt+2 keeps working as it did.
-    let open = dock_open(cx, window, DockSide::Right);
+    // Alt+2 opens the Bookmarks window, as the IDEA keymap says.
+    let before = tool_open(cx, window, BOOKMARKS_TOOL);
     press(cx, window, "alt-2");
     draw(cx, window);
     assert_ne!(
-        dock_open(cx, window, DockSide::Right),
-        open,
-        "Alt+2 toggles the same window"
+        tool_open(cx, window, BOOKMARKS_TOOL),
+        before,
+        "Alt+2 toggles the Bookmarks window"
     );
 }
 
@@ -226,15 +227,13 @@ fn every_stripe_button_changes_something(cx: &mut TestAppContext) {
     );
     dismiss(cx, window);
 
-    let before = notification_serial(cx, window);
+    let before = tool_open(cx, window, BOOKMARKS_TOOL);
     click(cx, window, "stripe-s-bookmarks");
     draw(cx, window);
-    assert!(
-        notification_serial(cx, window) > before
-            || window
-                .read_with(cx, |workspace, _| workspace.has_overlay())
-                .unwrap(),
-        "s-bookmarks opens the bookmark list or says it is empty"
+    assert_ne!(
+        tool_open(cx, window, BOOKMARKS_TOOL),
+        before,
+        "s-bookmarks toggles the Bookmarks window"
     );
     dismiss(cx, window);
 
@@ -249,12 +248,6 @@ fn every_stripe_button_changes_something(cx: &mut TestAppContext) {
     );
     click(cx, window, "stripe-s-notifications");
     draw(cx, window);
-}
-
-fn notification_serial(cx: &TestAppContext, window: WindowHandle<Workspace>) -> usize {
-    window
-        .read_with(cx, |workspace, _| workspace.notification_serial())
-        .unwrap()
 }
 
 #[ui_kit::gpui::test]

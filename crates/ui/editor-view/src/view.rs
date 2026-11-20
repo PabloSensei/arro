@@ -450,37 +450,9 @@ pub struct LineDeclaration {
     pub kind: OutlineKind,
 }
 
-/// The bookmarks of all files seen in this window, by path, lines from zero.
-#[derive(Default)]
-struct BookmarkStore(std::collections::HashMap<PathBuf, Vec<(u32, Option<char>)>>);
-
-impl Global for BookmarkStore {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BookmarkEntry {
-    pub path: PathBuf,
-    pub line: u32,
-    pub mnemonic: Option<char>,
-}
-
-/// Every bookmark, files in path order.
-pub fn bookmarks(cx: &App) -> Vec<BookmarkEntry> {
-    let Some(store) = cx.try_global::<BookmarkStore>() else {
-        return Vec::new();
-    };
-    let mut entries: Vec<_> = store
-        .0
-        .iter()
-        .flat_map(|(path, lines)| {
-            lines.iter().map(|(line, mnemonic)| BookmarkEntry {
-                path: path.clone(),
-                line: *line,
-                mnemonic: *mnemonic,
-            })
-        })
-        .collect();
-    entries.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-    entries
+/// Every bookmark of the window, files in path order.
+pub fn bookmarks(cx: &App) -> Vec<crate::bookmarks::BookmarkEntry> {
+    crate::bookmarks::bookmark_entries(cx)
 }
 
 /// What a run mark says about its test.
@@ -668,9 +640,28 @@ pub enum EditorEvent {
     /// Ctrl+S: the window saves every open file, as the IDE does.
     SaveAll,
     /// A refactoring that reaches other files or moves files; the window applies it.
-    ApplyChange(lang_api::WorkspaceChange),
+    /// The label names the refactoring in Local History, when it has one.
+    ApplyChange {
+        change: lang_api::WorkspaceChange,
+        label: Option<String>,
+    },
+    /// Ctrl+Z in the file a refactoring of several files started in: the window takes
+    /// the whole change back, closed files of it included.
+    UndoRefactoring(u64),
+    /// Ctrl+Shift+Z after such an undo: the window applies the whole change again.
+    RedoRefactoring(u64),
     /// Ctrl+F6: the window shows the Change Signature form for this place.
     ChangeSignature(lang_api::DocumentSpot),
+    /// Pull Members Up and the like: the window shows their form for this place.
+    MemberRefactoring {
+        refactoring: lang_api::MemberRefactoring,
+        spot: lang_api::DocumentSpot,
+    },
+    /// F6 on a member: the window shows the form that moves it into another type.
+    MoveMembers(lang_api::DocumentSpot),
+    /// F6 on an instance method: the window shows the form that moves it to one of the
+    /// places around it.
+    MoveTargets(lang_api::DocumentSpot),
     /// Refactor This picked an action of the server that needs values: the window shows
     /// its form, and the handle names the action for the language.
     RefactorForm(String),
@@ -680,6 +671,8 @@ pub enum EditorEvent {
     ShowDocumentation,
     /// Ctrl+Alt+H: the window shows the call hierarchy of this place.
     CallHierarchy(lang_api::DocumentSpot),
+    /// Ctrl+H: the window shows the type hierarchy of this place.
+    TypeHierarchy(lang_api::DocumentSpot),
     /// Ctrl+Shift+H: the window shows the hierarchy of the method at this place.
     MethodHierarchy(lang_api::DocumentSpot),
     /// Ctrl+Alt+Shift+U: the window shows the diagram of the type at this place.
@@ -754,6 +747,18 @@ pub enum EditorEvent {
     ShowUsages(UsagesUpdate),
     /// A right click in the text: the window shows the menu of the editor here.
     ContextMenu(Point<Pixels>),
+    /// A right click in the gutter of the line numbers: the window shows the menu of the
+    /// gutter for this line, counted from zero.
+    GutterMenu {
+        position: Point<Pixels>,
+        line: u32,
+    },
+    /// A right click in the blame column: the window shows the menu of the column for
+    /// this line, counted from zero.
+    BlameMenu {
+        position: Point<Pixels>,
+        line: u32,
+    },
     /// Alt+Enter chose to turn a check off in the settings of the project.
     DisableInspection {
         id: String,
@@ -1070,6 +1075,16 @@ pub struct EditorView {
     stripe_hint: Option<(String, Point<Pixels>)>,
     /// The hint of the blame label under the pointer, and where it stands.
     annotate_hint: Option<(String, Point<Pixels>)>,
+    /// The commit whose labels the pointer rests on: every line of it takes the stronger
+    /// background.
+    pub(crate) annotate_hovered: Option<String>,
+    /// The width of the blame column of the last frame, and the longest label it was
+    /// measured for, so that the column follows the labels of the view.
+    pub(crate) annotation_room: f32,
+    pub(crate) annotation_chars: usize,
+    /// The line whose bookmark the next typed key names, when the command came from a
+    /// menu rather than from the caret.
+    awaiting_mnemonic_line: Option<usize>,
     /// The hint of the coverage stripe under the pointer, and where it stands.
     coverage_hint: Option<(String, Point<Pixels>)>,
     /// The hint of a badge of the gutter under the pointer, and where it stands.
@@ -1100,6 +1115,8 @@ pub struct EditorView {
     pub(crate) disabled_breakpoints: Vec<u32>,
     /// The breakpoints that go away at the first stop, painted as an outline.
     pub(crate) temporary_breakpoints: Vec<u32>,
+    /// The breakpoints an agent set, painted in the colour of the accent.
+    pub(crate) agent_breakpoints: Vec<u32>,
     /// Buffer lines of the method breakpoints, painted as a diamond.
     pub(crate) function_breakpoints: Vec<u32>,
     /// Buffer lines of the field watchpoints, painted as an eye.
@@ -1447,12 +1464,11 @@ impl EditorView {
             view.start_syntax(language.clone(), &state, cx);
         }
         view.state = Some(state);
-        let saved = shows_bookmarks
-            .then(|| cx.try_global::<BookmarkStore>())
-            .flatten()
-            .and_then(|store| store.0.get(&view.path).cloned());
-        if let (Some(saved), Some(state)) = (saved, &mut view.state) {
-            state.set_bookmarks(&saved);
+        if shows_bookmarks {
+            let saved = crate::bookmarks::bookmark_lines(&view.path, cx);
+            if let Some(state) = &mut view.state {
+                state.set_bookmarks(&saved);
+            }
         }
         view.refresh_plain_spans(cx);
         view.attach(cx);
@@ -1566,10 +1582,8 @@ impl EditorView {
                 self.debug_values.clear();
                 // The bookmarks of the file belong to the window, not to this view: read
                 // them again instead of syncing an empty list over the stored ones.
-                let saved = cx
-                    .try_global::<BookmarkStore>()
-                    .and_then(|store| store.0.get(&self.path).cloned());
-                if let (Some(saved), Some(state)) = (saved, &mut self.state) {
+                let saved = crate::bookmarks::bookmark_lines(&self.path, cx);
+                if let Some(state) = &mut self.state {
                     state.set_bookmarks(&saved);
                 }
                 // The server gets the new text and answers with the marks of it.
@@ -1656,6 +1670,10 @@ impl EditorView {
             scrollbar_drag: None,
             stripe_hint: None,
             annotate_hint: None,
+            annotate_hovered: None,
+            annotation_room: ANNOTATE_WIDTH,
+            annotation_chars: 0,
+            awaiting_mnemonic_line: None,
             coverage_hint: None,
             place_hint: None,
             change_mark_hovered: None,
@@ -1674,6 +1692,7 @@ impl EditorView {
             muted_breakpoints: Vec::new(),
             disabled_breakpoints: Vec::new(),
             temporary_breakpoints: Vec::new(),
+            agent_breakpoints: Vec::new(),
             function_breakpoints: Vec::new(),
             field_watchpoints: Vec::new(),
             gutter_marks: Vec::new(),
@@ -1937,6 +1956,18 @@ impl EditorView {
 
     pub fn temporary_breakpoints(&self) -> &[u32] {
         &self.temporary_breakpoints
+    }
+
+    /// Replaces the breakpoints an agent set in the gutter, painted in the accent colour.
+    pub fn set_agent_breakpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
+        if self.agent_breakpoints != lines {
+            self.agent_breakpoints = lines;
+            cx.notify();
+        }
+    }
+
+    pub fn agent_breakpoints(&self) -> &[u32] {
+        &self.agent_breakpoints
     }
 
     /// Replaces the method breakpoints in the gutter, painted as diamonds.
@@ -2409,6 +2440,39 @@ impl EditorView {
         self.changed(change, cx);
     }
 
+    /// Applies the last undone edit again, as the redo key of the editor does.
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        self.catch_up(cx);
+        let change = self
+            .state
+            .as_mut()
+            .and_then(|state| state.perform(keymap::editor::REDO, 1));
+        self.changed(change, cx);
+    }
+
+    /// The change of several files the window keeps as one step, if any.
+    pub fn workspace_undo(&self) -> Option<u64> {
+        self.lsp.as_ref()?.workspace_undo
+    }
+
+    pub fn workspace_redo(&self) -> Option<u64> {
+        self.lsp.as_ref()?.workspace_redo
+    }
+
+    /// The window names the step of its history that this file takes back.
+    pub fn set_workspace_undo(&mut self, group: Option<u64>) {
+        if let Some(lsp) = &mut self.lsp {
+            lsp.workspace_undo = group;
+        }
+    }
+
+    /// The window names the step of its history that this file applies again.
+    pub fn set_workspace_redo(&mut self, group: Option<u64>) {
+        if let Some(lsp) = &mut self.lsp {
+            lsp.workspace_redo = group;
+        }
+    }
+
     fn loaded(&mut self, result: Result<EditorState, LoadError>, cx: &mut Context<Self>) {
         match result {
             Ok(mut state) => {
@@ -2431,10 +2495,8 @@ impl EditorView {
                 self.refresh_plain_spans(cx);
                 self.attach(cx);
                 self.reveal(cx);
-                let saved = cx
-                    .try_global::<BookmarkStore>()
-                    .and_then(|store| store.0.get(&self.path).cloned());
-                if let (Some(saved), Some(state)) = (saved, &mut self.state) {
+                let saved = crate::bookmarks::bookmark_lines(&self.path, cx);
+                if let Some(state) = &mut self.state {
                     state.set_bookmarks(&saved);
                 }
                 if let Some(spot) = self.pending_spot.take() {
@@ -2557,6 +2619,7 @@ impl EditorView {
         {
             state.clear_annotations();
             self.annotate_hint = None;
+            self.annotate_hovered = None;
             cx.notify();
         }
     }
@@ -2576,10 +2639,16 @@ impl EditorView {
             .unwrap_or_default()
     }
 
-    /// The room of the blame column left of the text, from zero when it is off.
+    /// The blame of a line from zero, for the menu of the column.
+    pub fn blame_note_at_line(&self, line: usize) -> Option<BlameNote> {
+        self.state.as_ref()?.annotation_label_at(line).cloned()
+    }
+
+    /// The room of the blame column left of the text, from zero when it is off. The width
+    /// follows the longest label of the column.
     pub(crate) fn annotation_width(&self) -> f32 {
         if self.has_annotations() {
-            ANNOTATE_WIDTH
+            self.annotation_room
         } else {
             0.
         }
@@ -3313,6 +3382,12 @@ impl EditorView {
         // The menu of Alt+Enter belongs to the text and the word it opened on.
         if change.is_some() {
             self.dismiss_actions_popup(cx);
+            // An edit of this file is newer than the refactoring of the window: its
+            // undo step no longer follows this text.
+            if let Some(lsp) = &mut self.lsp {
+                lsp.workspace_undo = None;
+                lsp.workspace_redo = None;
+            }
         } else {
             self.follow_actions_popup(cx);
         }
@@ -3704,6 +3779,43 @@ impl EditorView {
         cx.notify();
     }
 
+    /// A menu of the gutter toggles the bookmark of `line` from zero, not of the caret.
+    pub fn toggle_bookmark_at_line(
+        &mut self,
+        line: usize,
+        mnemonic: Option<char>,
+        cx: &mut Context<Self>,
+    ) {
+        self.catch_up(cx);
+        if let Some(state) = &mut self.state {
+            state.toggle_bookmark_at_line(line, mnemonic);
+        }
+        self.sync_bookmarks(cx);
+        cx.notify();
+    }
+
+    /// Delete of the Bookmarks window takes the bookmark of `line` from zero away.
+    pub fn remove_bookmark_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.catch_up(cx);
+        if let Some(state) = &mut self.state {
+            state.remove_bookmark_at_line(line);
+        }
+        self.sync_bookmarks(cx);
+        cx.notify();
+    }
+
+    /// Ctrl+F11 from a menu: the next typed key names the bookmark of `line`.
+    pub fn await_mnemonic_bookmark_at(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.awaiting_mnemonic = true;
+        self.awaiting_mnemonic_line = Some(line);
+        cx.notify();
+    }
+
+    /// The bookmark of a line from zero, `Some(None)` for one without a mnemonic.
+    pub fn bookmark_at_line(&self, line: usize) -> Option<Option<char>> {
+        self.state.as_ref()?.bookmark_at_line(line)
+    }
+
     /// Tells the window-wide list where the bookmarks of this file are now.
     fn sync_bookmarks(&mut self, cx: &mut Context<Self>) {
         let Some(state) = &self.state else {
@@ -3715,12 +3827,7 @@ impl EditorView {
             return;
         }
         let lines = state.bookmarks();
-        let store = cx.default_global::<BookmarkStore>();
-        if lines.is_empty() {
-            store.0.remove(&self.path);
-        } else {
-            store.0.insert(self.path.clone(), lines);
-        }
+        crate::bookmarks::replace_bookmark_lines(&self.path, &lines, cx);
     }
 
     /// Ctrl+digit: the line of the bookmark with that name, in this file or another.
@@ -4082,8 +4189,13 @@ impl EditorView {
                 .as_deref()
                 .and_then(|text| text.chars().next());
             if let Some(letter) = typed.filter(|c| c.is_alphanumeric() && !modifiers.control) {
-                self.toggle_bookmark(Some(letter.to_ascii_uppercase()), cx);
+                let letter = letter.to_ascii_uppercase();
+                match self.awaiting_mnemonic_line.take() {
+                    Some(line) => self.toggle_bookmark_at_line(line, Some(letter), cx),
+                    None => self.toggle_bookmark(Some(letter), cx),
+                }
             }
+            self.awaiting_mnemonic_line = None;
             cx.stop_propagation();
             return;
         }
@@ -4147,6 +4259,10 @@ impl EditorView {
             return;
         }
         if plain && self.rename_key(&stroke.key, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if plain && self.name_key(&stroke.key, cx) {
             cx.stop_propagation();
             return;
         }
@@ -4241,6 +4357,20 @@ impl EditorView {
 
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
+        // A refactoring of several files is one step of the window's history: this file
+        // asks the window for it instead of taking back its own buffer alone.
+        if action == actions::UNDO
+            && let Some(group) = self.workspace_undo()
+        {
+            cx.emit(EditorEvent::UndoRefactoring(group));
+            return;
+        }
+        if action == actions::REDO
+            && let Some(group) = self.workspace_redo()
+        {
+            cx.emit(EditorEvent::RedoRefactoring(group));
+            return;
+        }
         // A command counts its edits from the carets and folds here, so the changes of
         // the other view of the document come in first.
         self.catch_up(cx);
@@ -4370,6 +4500,19 @@ impl EditorView {
             actions::INLINE => return self.refactor(Refactoring::Inline, cx),
             actions::INTRODUCE_PARAMETER => {
                 return self.refactor(Refactoring::IntroduceParameter, cx);
+            }
+            actions::PULL_MEMBERS_UP => {
+                return self.member_refactoring(lang_api::MemberRefactoring::PullUp, cx);
+            }
+            actions::PUSH_MEMBERS_DOWN => {
+                return self.member_refactoring(lang_api::MemberRefactoring::PushDown, cx);
+            }
+            actions::EXTRACT_SUPERCLASS => {
+                return self.member_refactoring(lang_api::MemberRefactoring::ExtractSuperclass, cx);
+            }
+            actions::INTRODUCE_PARAMETER_OBJECT => {
+                return self
+                    .member_refactoring(lang_api::MemberRefactoring::IntroduceParameterObject, cx);
             }
             actions::REFACTOR_THIS => return self.refactor_this(cx),
             actions::GENERATE => return self.generate_menu(cx),
@@ -4633,6 +4776,18 @@ impl EditorView {
         width > 0.
             && position.x >= layout.bounds.left() + px(self.gutter_width)
             && position.x < layout.bounds.left() + px(self.gutter_width + width)
+    }
+
+    /// The line from zero under `position`, whichever column it falls in. Rows of a
+    /// block speak for the line under them.
+    fn line_at(&self, position: Point<Pixels>) -> Option<u32> {
+        let layout = self.layout.as_ref()?;
+        let line_height = px(self.style.line_height);
+        let shown = layout
+            .rows
+            .iter()
+            .find(|laid_out| position.y >= laid_out.y && position.y < laid_out.y + line_height)?;
+        Some(shown.buffer_line as u32)
     }
 
     /// The label of the blame column under `position`, the line it belongs to and where
@@ -5086,9 +5241,22 @@ impl EditorView {
     /// selection, and then asks the window for the menu of the editor.
     pub(crate) fn right_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.dismiss_click_popups(cx);
-        // The blame column has no text: the menu opens and the caret stays where it is.
+        // The blame column and the line numbers have menus of their own: the rows of the
+        // editor belong to the text alone.
         if self.in_annotations(event.position) {
-            cx.emit(EditorEvent::ContextMenu(event.position));
+            let line = self.line_at(event.position);
+            cx.emit(EditorEvent::BlameMenu {
+                position: event.position,
+                line: line.unwrap_or(0),
+            });
+            return;
+        }
+        if self.in_gutter(event.position) {
+            let line = self.line_at(event.position);
+            cx.emit(EditorEvent::GutterMenu {
+                position: event.position,
+                line: line.unwrap_or(0),
+            });
             return;
         }
         let Some(offset) = self.offset_at(event.position) else {
@@ -5179,6 +5347,14 @@ impl EditorView {
         let annotate_hint = self.annotate_hint_at(event.position);
         if annotate_hint != self.annotate_hint {
             self.annotate_hint = annotate_hint;
+            cx.notify();
+        }
+        let annotate_hovered = self
+            .annotation_under(event.position)
+            .map(|(note, _, _)| note.commit.clone())
+            .filter(|commit| !commit.is_empty());
+        if annotate_hovered != self.annotate_hovered {
+            self.annotate_hovered = annotate_hovered;
             cx.notify();
         }
 
@@ -6399,6 +6575,48 @@ impl EditorView {
                         .summary
                         .clone()
                         .map(|text| div().text_color(theme.text_muted).child(text)),
+                );
+            popups.push(
+                deferred(
+                    anchored()
+                        .position(position)
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
+        if let Some(field) = &lsp.name
+            && let Some(position) = self.below(field.at)
+        {
+            let body = surface(&theme)
+                .debug_selector(|| "extract-name-popup".to_owned())
+                .min_w(px(280.))
+                .max_w(px(640.))
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_size(px(self.style.font_size))
+                .child(div().text_color(theme.text_muted).child(field.label))
+                .child(
+                    div()
+                        .font_family(self.style.font_family.clone())
+                        .text_color(theme.text)
+                        .child(format!("{}|", field.text)),
+                )
+                .children(field.visibility_line().map(|visibility| {
+                    div()
+                        .debug_selector(|| "extract-name-visibility".to_owned())
+                        .text_color(theme.text_muted)
+                        .child(format!("Visibility: {visibility} (Up/Down)"))
+                }))
+                .child(
+                    div()
+                        .debug_selector(|| "extract-name-preview".to_owned())
+                        .text_color(theme.text_muted)
+                        .child(field.preview()),
                 );
             popups.push(
                 deferred(

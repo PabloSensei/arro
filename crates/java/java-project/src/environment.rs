@@ -8,7 +8,7 @@ use base::Result;
 use project_model::{LanguageLevelInfo, RuntimeInfo, RuntimeReason};
 use serde::{Deserialize, Serialize};
 
-use crate::jdk::{Jdk, Requested, choose_jdk, feature_of, find_jdks, requested_jdk};
+use crate::jdk::{Family, Jdk, Requested, choose_jdk, feature_of, find_jdks, requested_jdk};
 use crate::pom::read_pom;
 
 /// The folder of the project that keeps the IDE's own files.
@@ -161,13 +161,19 @@ pub fn project_jdk(root: &Path) -> Result<Jdk> {
 }
 
 fn same_home(one: &Path, other: &Path) -> bool {
-    let canonical = |path: &Path| {
-        fs::canonicalize(path)
-            .unwrap_or_else(|_| path.to_owned())
-            .to_string_lossy()
-            .to_lowercase()
+    same_home_on(Family::current(), one, other)
+}
+
+/// Windows and macOS ignore the case of a path, the other systems keep it: two folders
+/// that differ in case only are two folders on Linux. `family` is a parameter, so a test
+/// checks every system on any machine.
+fn same_home_on(family: Family, one: &Path, other: &Path) -> bool {
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let key = |path: &Path| match family {
+        Family::Windows | Family::MacOs => PathBuf::from(path.to_string_lossy().to_lowercase()),
+        Family::Unix => path.to_path_buf(),
     };
-    canonical(one) == canonical(other)
+    key(&canonical(one)) == key(&canonical(other))
 }
 
 /// What the SDKs page shows for one SDK.
@@ -190,11 +196,26 @@ pub fn runtime_info(jdk: &Jdk, added: bool) -> RuntimeInfo {
 /// The level of the build file, with the line that decides it. A language level written
 /// in a script that cannot be read is not guessed.
 pub fn language_level(root: &Path) -> Option<LanguageLevelInfo> {
-    let pom = level_in_pom(&root.join("pom.xml"));
-    let script = ["build.gradle", "build.gradle.kts"]
+    ["pom.xml", "build.gradle", "build.gradle.kts"]
         .into_iter()
-        .find_map(|name| level_in_gradle(&root.join(name)));
-    let found = pom.or(script)?;
+        .map(|name| root.join(name))
+        .find(|file| file.is_file())
+        .and_then(|file| language_level_at(&file))
+}
+
+/// The level of one build file, for the page of a module. A build file that names no
+/// level still answers, so that the page can offer to add one.
+pub fn language_level_at(file: &Path) -> Option<LanguageLevelInfo> {
+    let name = file.file_name()?.to_str()?;
+    let found = if name.eq_ignore_ascii_case("pom.xml") {
+        level_in_pom(file)?
+    } else if name.eq_ignore_ascii_case("build.gradle")
+        || name.eq_ignore_ascii_case("build.gradle.kts")
+    {
+        level_in_gradle(file)?
+    } else {
+        return None;
+    };
     let mut values: Vec<String> = (8..=NEWEST_LEVEL).map(|level| level.to_string()).collect();
     if let Some(selected) = &found.selected
         && !values.contains(selected)
@@ -215,23 +236,30 @@ struct FoundLevel {
     line: Option<u32>,
 }
 
-/// `maven.compiler.release`, then `target` and `source`, then `java.version`.
+/// `maven.compiler.release`, then `target` and `source`, then `java.version`, then the
+/// configuration of the compiler plugin.
 fn level_in_pom(file: &Path) -> Option<FoundLevel> {
     let text = fs::read_to_string(file).ok()?;
     let release = read_pom(file).ok()?.java_release;
-    let selected = release.and_then(|value| feature_of(&value));
+    let mut selected = release.and_then(|value| feature_of(&value));
     let keys = [
         "maven.compiler.release",
         "maven.compiler.target",
         "maven.compiler.source",
         "java.version",
     ];
-    let line = keys.iter().find_map(|key| {
+    let mut line = keys.iter().find_map(|key| {
         let marker = format!("<{key}>");
         text.lines()
             .position(|line| line.contains(&marker))
             .map(|line| line as u32)
     });
+    if selected.is_none()
+        && let Some((level, at)) = crate::level::plugin_level(&text)
+    {
+        selected = Some(level);
+        line = Some(at);
+    }
     Some(FoundLevel {
         selected: selected.map(|level| level.to_string()),
         file: file.to_owned(),
@@ -240,6 +268,7 @@ fn level_in_pom(file: &Path) -> Option<FoundLevel> {
 }
 
 /// A toolchain line, the older `JavaVersion` constants or a source compatibility line.
+/// A readable script without one still answers, with no level and no line.
 fn level_in_gradle(file: &Path) -> Option<FoundLevel> {
     let text = fs::read_to_string(file).ok()?;
     for (index, line) in text.lines().enumerate() {
@@ -258,7 +287,11 @@ fn level_in_gradle(file: &Path) -> Option<FoundLevel> {
             });
         }
     }
-    None
+    Some(FoundLevel {
+        selected: None,
+        file: file.to_owned(),
+        line: None,
+    })
 }
 
 fn digits_after(line: &str, marker: &str) -> Option<u32> {
@@ -290,6 +323,7 @@ mod tests {
         let home = root.join(name);
         fs::create_dir_all(home.join("bin")).unwrap();
         fs::write(home.join("bin/javac.exe"), "").unwrap();
+        fs::write(home.join("bin/java.exe"), "").unwrap();
         fs::write(
             home.join("release"),
             format!("JAVA_VERSION=\"{version}\"\n"),
@@ -421,6 +455,23 @@ mod tests {
     }
 
     #[test]
+    fn the_level_of_the_compiler_plugin_comes_with_its_line() {
+        let root = scratch("plugin-level");
+        fs::write(
+            root.join("pom.xml"),
+            "<project><build><plugins><plugin>\
+             <artifactId>maven-compiler-plugin</artifactId><configuration>\
+             <release>21</release></configuration></plugin></plugins></build></project>",
+        )
+        .unwrap();
+
+        let level = language_level(&root).unwrap();
+
+        assert_eq!(level.selected.as_deref(), Some("21"));
+        assert!(level.line.is_some());
+    }
+
+    #[test]
     fn the_level_of_a_gradle_script_comes_with_its_line() {
         let root = scratch("gradle-level");
         fs::write(
@@ -440,5 +491,16 @@ mod tests {
         let root = scratch("no-level");
 
         assert!(language_level(&root).is_none());
+    }
+
+    #[test]
+    fn only_windows_and_mac_ignore_the_case_of_a_folder() {
+        let one = Path::new("/jdks/Temurin");
+        let other = Path::new("/jdks/temurin");
+
+        assert!(!same_home_on(Family::Unix, one, other));
+        assert!(same_home_on(Family::Windows, one, other));
+        assert!(same_home_on(Family::MacOs, one, other));
+        assert!(same_home_on(Family::Unix, one, one));
     }
 }

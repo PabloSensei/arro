@@ -161,18 +161,20 @@ fn the_gutter_menu_annotates_the_lines_with_their_authors(cx: &mut TestAppContex
 
     annotate(cx, window, &view);
 
-    // The labels stand on the first line of a run of one commit: both authors show.
+    // Every line of a run of one commit carries the label of that commit.
     let found = labels(cx, &view);
     assert_eq!(
         found
             .iter()
             .map(|(line, label)| (*line, label.contains("Alice") || label.contains("Bob")))
             .collect::<Vec<_>>(),
-        [(0, true), (2, true), (4, true)]
+        [(0, true), (1, true), (2, true), (3, true), (4, true)]
     );
     assert!(found[0].1.contains("Alice"));
-    assert!(found[1].1.contains("Bob"));
-    assert!(found[2].1.contains("Alice"));
+    assert!(found[1].1.contains("Alice"));
+    assert!(found[2].1.contains("Bob"));
+    assert!(found[3].1.contains("Bob"));
+    assert!(found[4].1.contains("Alice"));
 
     // A hint over a label names the commit, its author and its message.
     let at = label_point(cx, window, 0);
@@ -207,12 +209,14 @@ fn a_line_typed_above_keeps_the_labels_with_their_lines(cx: &mut TestAppContext)
 
     wait_for(cx, "the moved labels", |cx| {
         let lines: Vec<u32> = labels(cx, &view).iter().map(|(line, _)| *line).collect();
-        lines == [0, 3, 5]
+        lines == [0, 1, 3, 4, 5]
     });
     let found = labels(cx, &view);
     assert!(found[0].1.contains("Alice"));
-    assert!(found[1].1.contains("Bob"));
-    assert!(found[2].1.contains("Alice"));
+    assert!(found[1].1.contains("Alice"));
+    assert!(found[2].1.contains("Bob"));
+    assert!(found[3].1.contains("Bob"));
+    assert!(found[4].1.contains("Alice"));
 
     // A save reaches the status of Git, and the column is read again: the line that only
     // lives in the working tree is not committed yet.
@@ -236,12 +240,12 @@ fn close_annotations_takes_the_column_away_and_a_label_opens_its_commit(cx: &mut
     let view = editor_of(cx, window, &path);
     annotate(cx, window, &view);
 
-    // The same menu row closes the column now.
+    // The same row of the gutter menu closes the column now: the checkmark goes away.
     open_gutter_menu(cx, window);
     wait_for(cx, "the closing row", |cx| {
-        has_menu_row(cx, window, "Close Annotations")
+        has_menu_row(cx, window, "✓ Annotate with Git Blame")
     });
-    click_menu(cx, window, "Close Annotations");
+    click_menu(cx, window, "✓ Annotate with Git Blame");
     wait_for(cx, "the column to go away", |cx| {
         !view.read_with(cx, |view, _| view.has_annotations())
     });

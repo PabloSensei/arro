@@ -27,8 +27,8 @@ pub(crate) enum Request {
     Tests(TestsRequest),
     /// Lists the configurations the user can start.
     Configurations,
-    /// Starts a configuration by name.
-    Start(String),
+    /// Starts a configuration, with the overrides of this run when it has any.
+    Start(StartRunRequest),
     /// The tail of a run by id.
     Output(String),
     /// Stops a run by id.
@@ -180,7 +180,7 @@ impl ProjectRunner for RunBridge {
         request: &StartRunRequest,
         client: Option<&str>,
     ) -> Result<String, ToolError> {
-        match self.submit(Request::Start(request.name.clone()), client)? {
+        match self.submit(Request::Start(request.clone()), client)? {
             Answer::Started(id) => Ok(id),
             _ => Err(ToolError::Failed("the run answered wrongly".to_string())),
         }

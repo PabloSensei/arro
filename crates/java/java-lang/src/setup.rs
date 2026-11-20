@@ -9,7 +9,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use java_project::feature_of;
+use java_project::{Family, Places, feature_of, homes_under, roots_for};
 use jdtls_adapter::MIN_JAVA_VERSION;
 
 use crate::session::{DEBUG_PLUGIN, JAVA_HOME, JDTLS_HOME};
@@ -97,40 +97,11 @@ impl Search {
     /// folders. `exe_dir` is the folder of `arro.exe`.
     pub fn from_env(exe_dir: Option<&Path>) -> Self {
         let var = |name| env::var_os(name).map(PathBuf::from);
-        let mut jdk_roots = Vec::new();
-        #[cfg(windows)]
-        {
-            let program_files = var("IDE_PROGRAM_FILES").or_else(|| var("ProgramFiles"));
-            if let Some(base) = program_files {
-                jdk_roots.push(base.join("Amazon Corretto"));
-                jdk_roots.push(base.join("Java"));
-                jdk_roots.push(base.join("Eclipse Adoptium"));
-            }
-            if let Some(base) = var("LOCALAPPDATA") {
-                jdk_roots.push(base.join("Programs"));
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // A JDK of macOS is a bundle under one of these folders, as `/usr/libexec/java_home`
-            // reports them.
-            jdk_roots.push(PathBuf::from("/Library/Java/JavaVirtualMachines"));
-            if let Some(home) = base::program::home_dir() {
-                jdk_roots.push(
-                    home.join("Library")
-                        .join("Java")
-                        .join("JavaVirtualMachines"),
-                );
-                jdk_roots.push(home.join(".sdkman").join("candidates").join("java"));
-            }
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            jdk_roots.push(PathBuf::from("/usr/lib/jvm"));
-            if let Some(home) = base::program::home_dir() {
-                jdk_roots.push(home.join(".sdkman").join("candidates").join("java"));
-                jdk_roots.push(home.join(".jdks"));
-            }
+        // The same folders the project SDK search reads, so a JDK found there starts the
+        // server too. `IDE_PROGRAM_FILES` names the install folder of a portable setup.
+        let mut places = Places::from_env();
+        if let Some(base) = var("IDE_PROGRAM_FILES") {
+            places.program_files = vec![base];
         }
         Self {
             exe_dir: exe_dir.map(Path::to_path_buf),
@@ -138,7 +109,7 @@ impl Search {
             jdtls_home: var(JDTLS_HOME),
             debug_plugin: var(DEBUG_PLUGIN),
             tools: var("IDE_TOOLS"),
-            jdk_roots,
+            jdk_roots: roots_for(Family::current(), &places),
             project_java_home: var("JAVA_HOME"),
         }
     }
@@ -237,34 +208,13 @@ fn version_order(name: &str) -> Vec<u64> {
         .collect()
 }
 
-/// A JDK of macOS is a bundle whose `Contents/Home` is the home folder; the other systems
-/// name the home folder itself.
-fn bundle_home(home: PathBuf) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let contents = home.join("Contents").join("Home");
-        if contents.is_dir() {
-            return contents;
-        }
-    }
-    home
-}
-
 /// The newest JDK of [`MIN_JAVA_VERSION`] or newer under the install roots; `JAVA_HOME`
 /// counts only when nothing is installed, the same rule as the script.
 fn find_jdk(search: &Search) -> Option<PathBuf> {
+    let family = Family::current();
     let mut best: Option<(u32, PathBuf)> = None;
     for root in &search.jdk_roots {
-        let mut homes: Vec<PathBuf> = entries(root)
-            .into_iter()
-            .filter(|path| {
-                path.is_dir()
-                    && (name_is(path).starts_with("jdk") || name_is(path).ends_with(".jdk"))
-            })
-            .collect();
-        homes.sort_by_key(|path| name_is(path));
-        for home in homes {
-            let home = bundle_home(home);
+        for home in homes_under(family, root) {
             let Some(feature) = release_feature(&home) else {
                 continue;
             };

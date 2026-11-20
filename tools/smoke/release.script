@@ -13,12 +13,12 @@ hide-tools
 
 # The right stripe: each button shows its own window.
 click:stripe-s-bookmarks
-expect:places-popup
-expect:places-empty
+expect-tool:bookmarks
+click:stripe-s-bookmarks
+expect-no-tool:bookmarks
 close-notification
 click:stripe-s-notifications
 expect:notification
-expect-not:places-popup
 click:stripe-s-ai
 expect-tool:ai
 click:stripe-s-tasks
@@ -62,9 +62,9 @@ close-notification
 click:stripe-s-notifications
 expect:notification
 click:stripe-s-bookmarks
-expect:places-empty
+expect-tool:bookmarks
 click:stripe-s-bookmarks
-expect-not:places-popup
+expect-no-tool:bookmarks
 click:stripe-s-notifications
 expect-not:notification
 
@@ -89,10 +89,9 @@ expect-no-tool:ai
 click:stripe-s-ai
 expect-tool:ai
 click:stripe-s-bookmarks
-expect:places-empty
+expect-tool:bookmarks
 click:stripe-s-bookmarks
-expect-not:places-popup
-click:stripe-s-ai
+expect-no-tool:bookmarks
 expect-no-tool:ai
 
 click:stripe-s-tasks
@@ -116,34 +115,34 @@ expect-no-tool:tasks
 click:stripe-s-tasks
 expect-tool:tasks
 click:stripe-s-bookmarks
-expect:places-empty
+expect-tool:bookmarks
 click:stripe-s-bookmarks
-expect-not:places-popup
-click:stripe-s-tasks
+expect-no-tool:bookmarks
 expect-no-tool:tasks
 
 click:stripe-s-bookmarks
-expect:places-empty
+expect-tool:bookmarks
+click:stripe-s-bookmarks
+expect-no-tool:bookmarks
 close-notification
 click:stripe-s-notifications
 expect:notification
-expect-not:places-popup
 click:stripe-s-notifications
 expect-not:notification
 
 click:stripe-s-bookmarks
-expect:places-empty
+expect-tool:bookmarks
 click:stripe-s-ai
 expect-tool:ai
-expect-not:places-popup
+expect-no-tool:bookmarks
 click:stripe-s-ai
 expect-no-tool:ai
 
 click:stripe-s-bookmarks
-expect:places-empty
+expect-tool:bookmarks
 click:stripe-s-tasks
 expect-tool:tasks
-expect-not:places-popup
+expect-no-tool:bookmarks
 click:stripe-s-tasks
 expect-no-tool:tasks
 

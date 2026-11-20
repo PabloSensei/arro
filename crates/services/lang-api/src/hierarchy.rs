@@ -2,7 +2,7 @@
 //! declarations of a file with their signatures, the methods a type can override, the
 //! call hierarchy, the source of a definition and the reference to a symbol.
 
-use crate::{DocumentSpot, Provider, SymbolKind, TextSpan, WorkspaceChange};
+use crate::{DocumentSpot, HierarchyDirection, Provider, SymbolKind, TextSpan, WorkspaceChange};
 
 /// One declaration of a file as the language server describes it. `detail` is the part
 /// after the name that the server gives, such as the return type of a method.
@@ -84,6 +84,41 @@ pub enum CallHierarchyQuery {
     },
 }
 
+/// How a type of the type hierarchy is declared, for its icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TypeKind {
+    #[default]
+    Class,
+    Interface,
+    Enum,
+    Record,
+    Annotation,
+}
+
+/// One type of the type hierarchy. `handle` is the provider's own value for the type and
+/// is given back unchanged when its supertypes or subtypes are asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypeHierarchyItem {
+    pub name: String,
+    /// The package or the type that holds this one, shown beside the name.
+    pub detail: Option<String>,
+    pub kind: TypeKind,
+    /// The type is declared abstract.
+    pub abstract_type: bool,
+    pub place: Option<crate::SourceSpan>,
+    pub handle: String,
+}
+
+/// Ctrl+H: the type at a place, or the types next to one node of the hierarchy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeHierarchyQuery {
+    Root(DocumentSpot),
+    Neighbours {
+        item: TypeHierarchyItem,
+        direction: HierarchyDirection,
+    },
+}
+
 /// Ctrl+Shift+I: the source of the definition at `spot`, from the start of the
 /// declaration to its end.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,5 +166,6 @@ pub type OverridableMethodsProvider = dyn Provider<OverridableMethodsQuery, Over
 pub type AddOverridableMethodsProvider =
     dyn Provider<AddOverridableMethodsRequest, WorkspaceChange>;
 pub type CallHierarchyProvider = dyn Provider<CallHierarchyQuery, Vec<CallHierarchyItem>>;
+pub type TypeHierarchyProvider = dyn Provider<TypeHierarchyQuery, Vec<TypeHierarchyItem>>;
 pub type DefinitionPreviewProvider = dyn Provider<DefinitionPreviewQuery, DefinitionPreview>;
 pub type ReferenceStringProvider = dyn Provider<ReferenceQuery, String>;

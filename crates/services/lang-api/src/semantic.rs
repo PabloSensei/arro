@@ -389,6 +389,9 @@ pub struct ProjectProblem {
     pub summary: String,
     /// The server log, when it has one, for the Show Log action.
     pub log: Option<PathBuf>,
+    /// The build tool of the project that the problem concerns, by the index of its
+    /// Settings page, when the language names one.
+    pub tool: Option<usize>,
 }
 
 /// The problems of the project itself. The stream stays open and sends the current
@@ -517,7 +520,47 @@ pub struct ActionEntry {
     /// resolve, passed back in [`ActionResolveQuery`]. `None` when the entry already
     /// carries its edits.
     pub resolve: Option<String>,
+    /// Where the name the action introduced sits in the text after its edits, as the
+    /// server marks it: the editor offers to change that name there.
+    pub rename: Option<RenamePosition>,
 }
+
+/// A place in the text after a change, in the coordinates the server names: an offset
+/// and a length in UTF-16 units.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenamePosition {
+    pub uri: String,
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// The kind of an extract, for the expressions the server offers under the caret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractKind {
+    Method,
+    Variable,
+    Constant,
+    Field,
+}
+
+/// The expressions under the caret that an extract may take, in the order of the
+/// server: the innermost first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionQuery {
+    pub spot: DocumentSpot,
+    pub kind: ExtractKind,
+}
+
+/// One expression the server offers: its text and the place it covers, in UTF-16 units
+/// of the text before the change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionEntry {
+    pub name: String,
+    pub offset: u32,
+    pub length: u32,
+}
+
+pub type RefactorSelectionsProvider = dyn Provider<SelectionQuery, Vec<SelectionEntry>>;
 
 /// An action the server described without its edits, asked for them on resolve. The
 /// answer is the same action with its edits, or `None` when the server refused.
@@ -589,6 +632,89 @@ pub struct ActionOutcome {
     pub error: Option<String>,
 }
 
+/// A refactoring that moves members between types or makes a type from them. The window
+/// shows the same form for all of them; the language fills it from its own tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberRefactoring {
+    PullUp,
+    PushDown,
+    ExtractSuperclass,
+    IntroduceParameterObject,
+}
+
+impl MemberRefactoring {
+    /// The row of the Refactor menu and of Refactor This.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::PullUp => "Pull Members Up",
+            Self::PushDown => "Push Members Down",
+            Self::ExtractSuperclass => "Extract Superclass",
+            Self::IntroduceParameterObject => "Introduce Parameter Object",
+        }
+    }
+}
+
+/// One member of a form that moves members or makes a type from them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberChoice {
+    pub name: String,
+    pub detail: Option<String>,
+    pub checked: bool,
+    /// A method may move without its body: the target gets the abstract declaration.
+    pub can_be_abstract: bool,
+    pub abstract_checked: bool,
+    /// The value the language expects back for this row.
+    pub value: String,
+}
+
+/// A place the members may go to: a supertype, a subtype or a package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberTarget {
+    pub name: String,
+    pub detail: Option<String>,
+    /// The language's own value for the target, given back unchanged.
+    pub value: String,
+}
+
+/// What the form of a member refactoring shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemberActionForm {
+    pub title: String,
+    pub targets: Vec<MemberTarget>,
+    pub target_label: String,
+    /// False when the refactoring reaches every target at once, as a push down does.
+    pub targets_selectable: bool,
+    pub members: Vec<MemberChoice>,
+    pub members_label: String,
+    pub fields: Vec<ActionField>,
+    /// What makes the refactoring fail or leave broken code, shown before it applies.
+    pub warning: Option<String>,
+}
+
+/// The place of a member refactoring and what the user asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberActionQuery {
+    pub refactoring: MemberRefactoring,
+    pub spot: DocumentSpot,
+}
+
+/// One member the user ticked in the form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSelection {
+    pub value: String,
+    pub is_abstract: bool,
+}
+
+/// The values of a filled member refactoring form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberActionRequest {
+    pub refactoring: MemberRefactoring,
+    pub spot: DocumentSpot,
+    pub target: Option<String>,
+    pub members: Vec<MemberSelection>,
+    pub fields: Vec<ActionField>,
+}
+
 /// A file that a change moves, by URI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRename {
@@ -617,10 +743,69 @@ pub struct RenameQuery {
 }
 
 /// What F6 moves. A file holds its type, so moving it into another package moves the
-/// type with every reference and its `package` line.
+/// type with every reference and its `package` line. A member leaves its type and the
+/// target type takes it with every reference. An instance method leaves its type too,
+/// but its new receiver is one of the places around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveKind {
     File,
+    Member,
+    InstanceMethod,
+}
+
+/// What F6 works on at a place of a file, as the language sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MovePlace {
+    /// The file itself.
+    File,
+    /// A member that moves into another type.
+    Member,
+    /// An instance method that moves to one of the places around it.
+    InstanceMethod,
+    /// A member that this move cannot take, with the reason the window shows.
+    Unmovable(String),
+}
+
+/// One member that the Move Members form lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveMember {
+    pub name: String,
+    pub detail: Option<String>,
+    pub checked: bool,
+    /// The place of the member's name, given back as the place of the move.
+    pub span: TextSpan,
+}
+
+/// What the Move Members form shows: the members a type gives away and the types of the
+/// project that can take them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoveMembersForm {
+    pub title: String,
+    pub members_label: String,
+    pub members: Vec<MoveMember>,
+    pub target_label: String,
+    pub targets: Vec<MoveDestination>,
+}
+
+/// F6 on a member: the members of its type and the types of the project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveMembersQuery {
+    pub spot: DocumentSpot,
+}
+
+/// The form of a move of one symbol into a place around it: where the language says it
+/// can go, the first one chosen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoveTargetsForm {
+    pub title: String,
+    pub targets: Vec<MoveDestination>,
+}
+
+/// F6 on a symbol that moves into one of the places around it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveTargetsQuery {
+    pub spot: DocumentSpot,
+    pub kind: MoveKind,
 }
 
 /// F6: where the file at `spot` can go.
@@ -814,11 +999,16 @@ pub type ActionResolveProvider = dyn Provider<ActionResolveQuery, Option<ActionE
 /// user picks, as the provider token of its [`ActionEntry`] names it.
 pub type ActionParametersProvider = dyn Provider<ActionParametersQuery, Option<ActionParameters>>;
 pub type ActionApplyProvider = dyn Provider<ActionApplyRequest, ActionOutcome>;
+/// The form of a refactoring that moves members between types or makes a type from them.
+pub type MemberActionParametersProvider = dyn Provider<MemberActionQuery, Option<MemberActionForm>>;
+pub type MemberActionProvider = dyn Provider<MemberActionRequest, ActionOutcome>;
 /// Alt+F7: every use of the symbol at a spot, its declaration included.
 pub type ReferencesProvider = dyn Provider<DocumentSpot, Vec<SourceSpan>>;
 pub type RenameProvider = dyn Provider<RenameQuery, WorkspaceChange>;
 pub type MoveDestinationProvider = dyn Provider<MoveQuery, Vec<MoveDestination>>;
 pub type MoveProvider = dyn Provider<MoveRequest, MoveOutcome>;
+pub type MoveMembersFormProvider = dyn Provider<MoveMembersQuery, Option<MoveMembersForm>>;
+pub type MoveTargetsFormProvider = dyn Provider<MoveTargetsQuery, Option<MoveTargetsForm>>;
 pub type ChangeSignatureInfoProvider = dyn Provider<DocumentSpot, ChangeSignatureInfo>;
 pub type ChangeSignatureProvider = dyn Provider<ChangeSignatureRequest, ChangeSignatureOutcome>;
 pub type HierarchyProvider = dyn Provider<HierarchyQuery, Vec<SymbolEntry>>;

@@ -4,14 +4,19 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 use std::thread;
 
-use axum::extract::{Request, State};
+use axum::extract::{Extension, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use futures_core::Stream;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, InitializeRequestParams,
     InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
@@ -106,9 +111,20 @@ impl ServerHandler for Handler {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools = self.gateway.tools().iter().map(tool).collect();
+        // The Exposed Tools table of the window decides what this client sees: a tool
+        // that is off, a router-only tool and the router-only mode itself.
+        let scope = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<SessionScope>())
+            .cloned();
+        let tools = match scope {
+            Some(scope) => self.gateway.visible_tools(&scope),
+            None => self.gateway.tools().to_vec(),
+        };
+        let tools = tools.iter().map(tool).collect();
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -156,6 +172,200 @@ async fn guard(State(tokens): State<Arc<Tokens>>, mut request: Request, next: Ne
     next.run(request).await
 }
 
+/// The SSE transport of the clients that still speak it: one stream of events per
+/// connection and one POST endpoint that feeds it. The switch of Settings still decides
+/// what a call sees, as it does over Streamable HTTP.
+#[derive(Clone)]
+struct SseState {
+    gateway: Arc<ToolGateway>,
+    sessions: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>>,
+}
+
+impl SseState {
+    fn new(gateway: Arc<ToolGateway>) -> Self {
+        Self {
+            gateway,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// The text of the first event of a stream and the events of the POSTs after it.
+struct SseStream {
+    first: Option<String>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+impl Stream for SseStream {
+    type Item = Result<String, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(first) = self.first.take() {
+            return Poll::Ready(Some(Ok(first)));
+        }
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(text)) => Poll::Ready(Some(Ok(text))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn session_id() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+async fn sse_connect(
+    State(state): State<SseState>,
+    Extension(scope): Extension<SessionScope>,
+) -> Response {
+    let Ok(id) = session_id() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .sessions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(id.clone(), sender);
+    // The client posts every request to the address of this event, with its token.
+    let first = format!("event: endpoint\ndata: /message?sessionId={id}\n\n");
+    let stream = SseStream {
+        first: Some(first),
+        receiver,
+    };
+    let _ = scope;
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn sse_message(
+    State(state): State<SseState>,
+    Extension(scope): Extension<SessionScope>,
+    RawQuery(query): RawQuery,
+    request: Request,
+) -> Response {
+    let Some(id) = query.and_then(|query| query_value(&query, "sessionId")) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let sender = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&id)
+        .cloned();
+    let Some(sender) = sender else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(bytes) = axum::body::to_bytes(request.into_body(), 1_000_000).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let gateway = state.gateway.clone();
+    let answer = tokio::task::spawn_blocking(move || sse_answer(&gateway, &scope, &body)).await;
+    if let Ok(Some(answer)) = answer {
+        let event = format!("event: message\ndata: {answer}\n\n");
+        if sender.send(event).is_err() {
+            state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&id);
+        }
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// The value of one key of a query string, for the session id of an SSE POST.
+fn query_value(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then(|| value.to_string())
+    })
+}
+
+/// The JSON-RPC answer of one SSE request. `None` for a notification, which has none.
+fn sse_answer(gateway: &ToolGateway, scope: &SessionScope, body: &Value) -> Option<Value> {
+    let id = body.get("id").cloned();
+    let method = body
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = body
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let id = id?;
+    let result = match method {
+        "initialize" => {
+            let protocol = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("2025-11-25");
+            Ok(serde_json::json!({
+                "protocolVersion": protocol,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "arro", "version": env!("CARGO_PKG_VERSION")},
+            }))
+        }
+        "ping" => Ok(serde_json::json!({})),
+        "tools/list" => {
+            let tools: Vec<Value> = gateway
+                .visible_tools(scope)
+                .iter()
+                .map(|spec| {
+                    serde_json::json!({
+                        "name": spec.name,
+                        "description": spec.description,
+                        "inputSchema": spec.input_schema,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({"tools": tools}))
+        }
+        "tools/call" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            match gateway.call(scope, name, &arguments) {
+                Ok(text) => Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false,
+                })),
+                Err(error) => Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": error.to_string()}],
+                    "isError": true,
+                })),
+            }
+        }
+        other => Err((-32601, format!("unknown method {other}"))),
+    };
+    match result {
+        Ok(result) => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        })),
+        Err((code, message)) => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message},
+        })),
+    }
+}
+
 /// Serves on a runtime of its own until dropped.
 pub struct McpServer {
     port: u16,
@@ -181,9 +391,13 @@ impl McpServer {
         // Nothing is on the allowlist, so rmcp refuses every Origin too.
         let config = StreamableHttpServerConfig::default().enforce_origin_validation();
         let handler = Handler { gateway };
+        let sse = SseState::new(handler.gateway.clone());
         let service =
             StreamableHttpService::new(move || Ok(handler.clone()), sessions.clone(), config);
         let router = axum::Router::new()
+            .route("/sse", get(sse_connect))
+            .route("/message", post(sse_message))
+            .with_state(sse)
             .nest_service("/mcp", service)
             .layer(middleware::from_fn_with_state(tokens.clone(), guard));
 

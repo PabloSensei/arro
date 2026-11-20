@@ -40,12 +40,12 @@ impl Proposal {
         path: PathBuf,
         relative: String,
         base: Option<String>,
-        proposed: String,
+        proposed: Option<String>,
     ) -> Self {
         let review = FileReview::new(
             relative.clone(),
             base.map(String::into_bytes),
-            Some(proposed.into_bytes()),
+            proposed.map(String::into_bytes),
         );
         let decisions = vec![None; review.hunks.len()];
         Self {
@@ -128,7 +128,7 @@ mod tests {
             PathBuf::from("src/A.txt"),
             "src/A.txt".to_string(),
             Some("alpha\nbeta\ngamma\n".to_string()),
-            "ALPHA\nbeta\nGAMMA\n".to_string(),
+            Some("ALPHA\nbeta\nGAMMA\n".to_string()),
         )
     }
 

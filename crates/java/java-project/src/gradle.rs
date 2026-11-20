@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use base::{Cancel, Result};
 use proc_sup::{ProcessClass, ProcessSpec};
 use project_model::{
-    BuildGroup, BuildModule, BuildSystem, BuildTask, Exclusion, FileEdit, Module,
+    BuildGroup, BuildModule, BuildSelection, BuildSystem, BuildTask, Exclusion, FileEdit, Module,
     ModuleDependencies, PathEntry, PathKind, ProjectModel, RecordedTask, TaskOptions, ToolHome,
     ToolProgress, ToolSetup, Unit, cache_file,
 };
@@ -221,6 +221,19 @@ impl Gradle {
             None => self.tool_jdk(root, &gradle)?,
         };
         let timeout = daemon_idle_timeout(root);
+        // A wrapper that came without the execute bit, from an archive made on Windows or
+        // from a copy, is made runnable here and the output of the build says so. The client
+        // of a wrapper starts from its jar, so a script whose bits cannot be changed only
+        // brings a line; a program the build starts itself has to be runnable.
+        let note = match gradle.origin {
+            GradleOrigin::Wrapper => match crate::wrapper::prepare(&gradle.program) {
+                Ok(note) => note,
+                Err(error) => Some(format!(
+                    "{error}; Gradle starts from the wrapper jar without the script"
+                )),
+            },
+            _ => crate::wrapper::prepare(&gradle.program)?,
+        };
         let spec = match gradle.origin {
             GradleOrigin::Wrapper => {
                 let wrapper = root.join(WRAPPER_JAR);
@@ -249,13 +262,22 @@ impl Gradle {
             .class(ProcessClass::Client)
             .args(COMMON_ARGS)
             .label("Build tool");
+        if let Some(note) = note {
+            spec = spec.note(note);
+        }
         if settings.offline {
             spec = spec.arg("--offline");
         }
         if let Some(home) = settings.user_home_path() {
             spec = spec.env("GRADLE_USER_HOME", home);
         }
-        Ok(self.env.apply(spec, &jdk))
+        // Every command of every window and provider goes through here, so the chosen
+        // values reach a build, a task, the tests and the import alike.
+        let selection = crate::build_selection::load_selection(root);
+        Ok(self
+            .env
+            .apply(spec, &jdk)
+            .args(crate::build_selection::property_args(&selection)))
     }
 }
 
@@ -387,6 +409,18 @@ impl BuildSystem for Gradle {
         self.env.build_tools.second.terminal_path
     }
 
+    fn takes_properties(&self) -> bool {
+        true
+    }
+
+    fn selection(&self, root: &Path) -> BuildSelection {
+        crate::build_selection::load_selection(root)
+    }
+
+    fn choose(&self, root: &Path, selection: &BuildSelection) -> Result {
+        crate::build_selection::save_selection(root, selection)
+    }
+
     fn assemble(&self, root: &Path) -> Result<ProcessSpec> {
         Ok(self.command(root)?.arg("classes"))
     }
@@ -417,6 +451,11 @@ impl BuildSystem for Gradle {
             None => "classes".to_owned(),
         };
         Ok(self.command(root)?.arg(task))
+    }
+
+    fn rebuild(&self, root: &Path, tests: bool) -> Result<ProcessSpec> {
+        let spec = self.command(root)?.arg("clean").arg("classes");
+        Ok(if tests { spec.arg("testClasses") } else { spec })
     }
 
     fn tasks(&self, _model: &ProjectModel) -> Vec<String> {
@@ -651,6 +690,8 @@ struct ReportProject {
     name: String,
     project_dir: PathBuf,
     #[serde(default)]
+    build_dir: Option<PathBuf>,
+    #[serde(default)]
     build_file: Option<PathBuf>,
     source_sets: Vec<ReportSet>,
     #[serde(default)]
@@ -742,19 +783,38 @@ fn parse_reports(files: &[Vec<u8>], root: &Path) -> Result<ProjectModel> {
         model.problems.extend(report.project.problems);
         model.dependencies.push(ModuleDependencies {
             module: report.project.path.clone(),
-            build_file: report.project.build_file,
+            build_file: report.project.build_file.clone(),
             scopes: report.project.dependencies.into_scopes(),
         });
+        let units: Vec<Unit> = report
+            .project
+            .source_sets
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        // The build folder holds what the compiler writes, generated sources included.
+        let mut generated_roots: Vec<PathBuf> = units
+            .iter()
+            .flat_map(|unit| unit.source_roots.iter())
+            .filter(|source| {
+                report
+                    .project
+                    .build_dir
+                    .as_ref()
+                    .is_some_and(|dir| source.starts_with(dir))
+            })
+            .cloned()
+            .collect();
+        generated_roots.dedup();
+        let excluded_roots: Vec<PathBuf> = report.project.build_dir.into_iter().collect();
         model.modules.push(Module {
             id: report.project.path,
             name: report.project.name,
             dir: report.project.project_dir,
-            units: report
-                .project
-                .source_sets
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            build_file: report.project.build_file,
+            generated_roots,
+            excluded_roots,
+            units,
         });
     }
     model.modules.sort_by(|left, right| left.id.cmp(&right.id));

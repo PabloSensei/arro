@@ -56,7 +56,7 @@
 - **Native and fast.** Rust from top to bottom and a GPU-rendered UI on GPUI. No Electron, no web view, no JavaScript in the interface.
 - **Feels like home for IntelliJ users.** The same shortcuts (Shift Shift, Ctrl+N, Alt+Enter, Ctrl+Alt+L, Shift+F10…), the same menus and the same tool windows, so moving over takes minutes, not weeks.
 - **Light.** The IDE itself stays small; the heavy lifting goes to the Eclipse JDT Language Server, which Arro starts, watches and restarts for you.
-- **AI-native.** Claude Code, Codex and any MCP client work with Arro, not around it. They read diagnostics, usages and the project structure from the IDE. Their edits come to you as hunks to accept or reject, and they build and run tests only with your permission.
+- **AI-native.** Claude Code, Codex and any MCP client work with Arro, not around it. They read diagnostics, usages and the project structure from the IDE, set breakpoints and step through a test in Arro's own debugger. Their edits come to you as hunks to accept or reject, they build and run tests only with your permission, and **Fix with AI** sends an error to an agent from where you see it.
 - **Never freezes on a tool.** Builds, Git, the language server and the debugger all run outside the UI thread. A slow Maven import does not stop typing.
 
 ## Features
@@ -77,7 +77,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>Run, test, debug</h3>
-      Maven and Gradle projects, run configurations with Before launch steps, compound runs and <code>.env</code> files, gutter run marks for <code>main</code> and tests, a test tree with rerun of failures, auto-test on save and a history of runs, a debugger with breakpoints, stepping, evaluation, hot swap, variable values inline in the editor, remote JVM attach, marked objects, folded library frames, inline watches and thousands of virtual threads. Analyze Stack Trace turns a pasted trace or thread dump into clickable frames, and Dump Threads reads a running JVM. A Services window shows every Spring Boot app and main class with its state and port.
+      Maven and Gradle projects, run configurations with Before launch steps, compound runs and <code>.env</code> files, gutter run marks for <code>main</code> and tests, a test tree with rerun of failures, auto-test on save and a history of runs, a debugger with breakpoints, stepping, an Evaluate window, hot swap, variable values inline in the editor, Attach to Process with the list of running JVMs, remote attach, marked objects, folded library frames, inline watches and thousands of virtual threads. Analyze Stack Trace turns a pasted trace or thread dump into clickable frames, and Dump Threads reads a running JVM. Run and Debug consoles link to sources and can be searched. A Services window shows every Spring Boot app and main class with its state and port.
     </td>
   </tr>
   <tr>
@@ -87,13 +87,13 @@
     </td>
     <td width="50%" valign="top">
       <h3>Tools in the window</h3>
-      A database console for JDBC sources with a schema tree and a table data editor, an HTTP client for <code>.http</code> files that turns pasted cURL into requests and back, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), heap dumps with retained sizes, dominators and paths to GC roots, Flyway and Liquibase migrations with their state in the database, Kubernetes clusters next to Docker in the Services window, a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, newer dependency versions marked in <code>pom.xml</code> and Gradle files, a table editor for <code>.properties</code> bundles of all locales, library sources on demand, and a Markdown preview with images.
+      An SQL console for JDBC sources with completion, formatting, templates and <code>.sql</code> files, a schema tree and a table data editor, an HTTP client for <code>.http</code> files that turns pasted cURL into requests and back, a profiler on Java Flight Recorder (CPU, allocations, thread timeline; apps, tests and Maven/Gradle tasks), heap dumps with retained sizes, dominators and paths to GC roots, Flyway and Liquibase migrations with their state in the database, Kubernetes clusters next to Docker in the Services window, a JShell console on the classpath of a module, a dependency analyzer for conflicts and duplicates, newer dependency versions marked in <code>pom.xml</code> and Gradle files, a table editor for <code>.properties</code> bundles of all locales, library sources on demand, and a Markdown preview with images.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <h3>Git built in</h3>
-      A branches popup like IntelliJ IDEA's: search, favourites, branches folded by their slashes, and checkout, merge, rebase, compare and push from one arrow. Change markers next to the line numbers show the original text and roll a change back. Commit, diff, log, shelf and stash, conflict resolution, history of a selection or a method, submodules, local history.
+      A branches popup with search, favourites, branches folded by their slashes, and checkout, merge, rebase, compare and push from one arrow. A Git window with Local Changes, a Log with the commit graph, filters and the changed files of each commit, and a Git console. A diff window with a toolbar and a file counter, commits of only the hunks you pick, and a Push window with the target branch, tags and force push with lease. Change markers next to the line numbers show the original text and roll a change back. Shelf and stash, conflict resolution, history of a selection or a method, submodules, local history.
     </td>
     <td width="50%" valign="top">
       <img src=".github/readme/branches.png" alt="The Git branches popup in the Nord theme">
@@ -208,7 +208,7 @@ The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `c
 | Windows 11 x86-64 | ✅ Supported |
 | Linux x86-64 | 🚧 Preview release |
 | macOS (Apple silicon; Intel where a runner builds it) | 🚧 Preview release |
-| AI agents over MCP and the AI Sessions panel (Claude Code, Codex, OpenCode) | 🚧 New |
+| AI agents over MCP (code, run, tests, debugger) and the AI Sessions panel (Claude Code, Codex, OpenCode) | 🚧 New |
 | More languages on the same core | 🗓️ Planned |
 
 ## Support

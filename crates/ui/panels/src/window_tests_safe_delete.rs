@@ -833,6 +833,12 @@ fn generate_to_string_and_getter_and_setter_on_petclinic(cx: &mut TestAppContext
     open_path(cx, window, &probe);
     caret(&editor_of(cx, window, &probe), cx, 2, 0);
     press(cx, window, "alt-insert");
+    crate::window_tests_real::wait_for(
+        cx,
+        "the Generate list",
+        std::time::Duration::from_secs(120),
+        |cx| real_popup_shown(cx, window, "actions-popup"),
+    );
     for _ in 0..5 {
         press(cx, window, "down");
     }
@@ -853,6 +859,12 @@ fn generate_to_string_and_getter_and_setter_on_petclinic(cx: &mut TestAppContext
 
     caret(&editor_of(cx, window, &probe), cx, 2, 0);
     press(cx, window, "alt-insert");
+    crate::window_tests_real::wait_for(
+        cx,
+        "the Generate list",
+        std::time::Duration::from_secs(120),
+        |cx| real_popup_shown(cx, window, "actions-popup"),
+    );
     for _ in 0..3 {
         press(cx, window, "down");
     }

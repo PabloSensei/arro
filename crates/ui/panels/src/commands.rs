@@ -172,6 +172,24 @@ pub fn register(
         |workspace, window, cx| workspace.build_project(window, cx),
     );
     workspace.register_command(
+        "workspace.build_module",
+        "Build Module",
+        |workspace, window, cx| {
+            let path = current_path(workspace, window, cx);
+            workspace.build_module(path, window, cx);
+        },
+    );
+    workspace.register_command(
+        "workspace.rebuild_project",
+        "Rebuild Project",
+        |workspace, window, cx| workspace.rebuild_project(window, cx),
+    );
+    workspace.register_command(
+        "workspace.generate_sources",
+        "Generate Sources and Update Folders",
+        |workspace, window, cx| workspace.generate_sources(window, cx),
+    );
+    workspace.register_command(
         "workspace.profile",
         "Profile with Profiler",
         |workspace, window, cx| workspace.run_with_profiler(window, cx),
@@ -196,31 +214,8 @@ pub fn register(
             crate::http::copy_as_curl_active(::http_client::Shell::Cmd, workspace, window, cx)
         },
     );
-    workspace.register_command("workspace.compile", "Compile", |workspace, window, cx| {
-        // Ctrl+Shift+F9 in a class with `main` debugs that program, as IDEA does; any
-        // other file compiles the module as before.
-        let view = workspace
-            .active_view()
-            .and_then(|view| view.downcast::<EditorView>().ok());
-        if let Some(config) = view.and_then(|view| marks::launch_at_caret(view.read(cx), cx)) {
-            if let Some(panel) = cx.try_global::<ActiveRunPanel>() {
-                let panel = panel.0.clone();
-                panel.update(cx, |panel, cx| {
-                    panel.choose_configuration(config, cx);
-                    panel.debug(window, cx);
-                });
-            }
-            workspace.show_tool(DEBUG_TOOL, window, cx);
-            return;
-        }
-        let selected = cx.try_global::<ActiveProjectPanel>().and_then(|panel| {
-            panel
-                .0
-                .read(cx)
-                .selected_path()
-                .map(|path| path.to_path_buf())
-        });
-        let path = workspace.active_path().or(selected);
+    workspace.register_command("workspace.compile", "Recompile", |workspace, window, cx| {
+        let path = current_path(workspace, window, cx);
         workspace.compile_path(path, window, cx);
     });
     workspace.register_command("debug.attach_jvm", "Attach to JVM…", attach_to_jvm);
@@ -256,7 +251,11 @@ pub fn register(
         "Recent Locations",
         places::show_recent,
     );
-    workspace.register_command("window.show_bookmarks", "Bookmarks", places::show_bookmarks);
+    workspace.register_command(
+        "window.show_bookmarks",
+        "Bookmarks",
+        crate::bookmarks::show_window,
+    );
     workspace.register_command(keys::BACK, "Back", navigation::back);
     workspace.register_command(keys::FORWARD, "Forward", navigation::forward);
     workspace.register_command(keys::SHOW_CONTENT, "Show Content", show_content);
@@ -267,6 +266,25 @@ pub fn register(
         .map(|(_, action)| *action)
     {
         workspace.register_command(action, title_of(action), move |workspace, _, cx| {
+            let view = workspace.active_view();
+            if let Some(view) = view.and_then(|view| view.downcast::<EditorView>().ok()) {
+                view.update(cx, |view, cx| view.run(action, cx));
+            }
+        });
+    }
+
+    // The refactorings of the members have no key in `idea-default.json`, so their
+    // rows name the command and the run of the editor action directly.
+    for (action, title) in [
+        (editor_keys::PULL_MEMBERS_UP, "Pull Members Up..."),
+        (editor_keys::PUSH_MEMBERS_DOWN, "Push Members Down..."),
+        (editor_keys::EXTRACT_SUPERCLASS, "Extract Superclass..."),
+        (
+            editor_keys::INTRODUCE_PARAMETER_OBJECT,
+            "Introduce Parameter Object...",
+        ),
+    ] {
+        workspace.register_command(action, title, move |workspace, _, cx| {
             let view = workspace.active_view();
             if let Some(view) = view.and_then(|view| view.downcast::<EditorView>().ok()) {
                 view.update(cx, |view, cx| view.run(action, cx));
@@ -1653,6 +1671,127 @@ fn register_git_commands(workspace: &mut Workspace) {
             cx.defer(move |cx| git.update(cx, |git, cx| git.close_annotations(cx)));
         },
     );
+    workspace.register_command("git.rebase", "Rebase...", |_, window, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        let Some(commit) = panel.read(cx).focused_commit_id() else {
+            return;
+        };
+        let handle = window.window_handle();
+        panel.update(cx, |panel, cx| {
+            panel.open_rebase(commit, handle, cx);
+        });
+    });
+    workspace.register_command("git.cherry_pick", "Cherry-pick", |_, _, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| panel.cherry_pick_picked(cx));
+    });
+    workspace.register_command("git.revert_commit", "Revert Commit", |_, _, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        let Some(commit) = panel.read(cx).focused_commit_id() else {
+            return;
+        };
+        let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+            return;
+        };
+        git.update(cx, |git, cx| git.revert_commit(commit, cx));
+    });
+    workspace.register_command("git.reset_head", "Reset HEAD...", |_, window, cx| {
+        let Some(panel) = cx.try_global::<ActiveGitLog>().map(|panel| panel.0.clone()) else {
+            return;
+        };
+        let Some(commit) = panel.read(cx).focused_commit_id() else {
+            return;
+        };
+        let Some(git) = cx.try_global::<ActiveGit>().map(|git| git.0.clone()) else {
+            return;
+        };
+        let workspace = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            git_log::ResetView::open(git, commit, workspace, window, cx)
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    });
+    workspace.register_command("git.shelve", "Shelve Changes...", |_, window, cx| {
+        let Some(panel) = cx
+            .try_global::<ActiveCommitPanel>()
+            .map(|panel| panel.0.clone())
+        else {
+            return;
+        };
+        let workspace = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_tool(workspace::COMMIT_TOOL, window, cx)
+                        })
+                        .ok();
+                    panel.update(cx, |panel, cx| panel.shelve(cx));
+                })
+                .ok();
+        });
+    });
+    workspace.register_command("git.unshelve", "Unshelve...", |_, window, cx| {
+        let Some(panel) = cx
+            .try_global::<ActiveCommitPanel>()
+            .map(|panel| panel.0.clone())
+        else {
+            return;
+        };
+        let workspace = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_tool(workspace::COMMIT_TOOL, window, cx)
+                        })
+                        .ok();
+                    panel.update(cx, |panel, cx| panel.ask_unshelve(window, cx));
+                })
+                .ok();
+        });
+    });
+
+    let repository = |cx: &App| {
+        cx.try_global::<ActiveGit>()
+            .is_some_and(|git| git.0.read(cx).repo().is_some())
+    };
+    let picked = |cx: &App| {
+        cx.try_global::<ActiveGitLog>()
+            .is_some_and(|panel| !panel.0.read(cx).picked_ids().is_empty())
+    };
+    workspace.set_command_check(crate::git::ANNOTATE_COMMAND, move |workspace, cx| {
+        repository(cx) && workspace.active_path().is_some()
+    });
+    workspace.set_command_check("git.show_selection_history", move |workspace, cx| {
+        repository(cx) && workspace.active_path().is_some()
+    });
+    workspace.set_command_check("git.rebase", move |_, cx| repository(cx) && picked(cx));
+    workspace.set_command_check("git.cherry_pick", move |_, cx| repository(cx) && picked(cx));
+    workspace.set_command_check("git.revert_commit", move |_, cx| {
+        repository(cx) && picked(cx)
+    });
+    workspace.set_command_check("git.reset_head", move |_, cx| repository(cx) && picked(cx));
+    workspace.set_command_check("git.shelve", move |_, cx| repository(cx));
+    workspace.set_command_check("git.unshelve", move |_, cx| repository(cx));
 }
 
 /// `host:port`, the form the Attach to JVM prompt takes. Only the user names the host.

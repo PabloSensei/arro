@@ -5,6 +5,7 @@ mod actions;
 mod annotate;
 mod bar;
 mod blocks;
+mod bookmarks;
 mod bundle;
 mod code_lens;
 mod completion_usage;
@@ -32,6 +33,12 @@ mod style;
 mod view;
 
 pub use annotate::BlameNote;
+pub use bookmarks::{
+    BookmarkEntry, BookmarkGroup, BookmarkPlace, BookmarkRevision, add_bookmark_group,
+    bookmark_default_group, bookmark_entries, bookmark_groups, delete_bookmark_group,
+    install_bookmarks, make_bookmark_group_default, move_bookmark_to_group, remove_bookmark,
+    rename_bookmark_group, set_bookmark_description,
+};
 pub use bundle::{BundleChanged, BundleHost, BundleMode, BundleModes};
 pub use completion_usage::{CompletionUsage, install_completion_usage};
 pub use decor::PaneDecor;
@@ -63,11 +70,11 @@ pub use style::{EditorStyle, SemanticLook};
 pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
-    ActionMark, AiProblem, BookmarkEntry, CodeStyleLanguages, CoverageMark, CoverageState,
-    DebugValue, DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView,
-    EndpointMark, ExtraTemplates, FileBar, GutterKind, GutterMark, InlayPaint, InlineValue,
-    InlineWatchRow, Languages, LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark,
-    PlaceTarget, PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot,
-    TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
+    ActionMark, AiProblem, CodeStyleLanguages, CoverageMark, CoverageState, DebugValue,
+    DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView, EndpointMark,
+    ExtraTemplates, FileBar, GutterKind, GutterMark, InlayPaint, InlineValue, InlineWatchRow,
+    Languages, LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark, PlaceTarget,
+    PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot, TemplateSettings,
+    Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
     install_clipboard_history_sink, install_keymap, set_clipboard_history,
 };

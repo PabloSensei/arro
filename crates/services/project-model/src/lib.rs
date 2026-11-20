@@ -7,18 +7,20 @@ mod environment;
 mod model;
 mod open;
 pub mod scaffold;
+mod selection;
 mod tool;
 
 pub use build_tools::{BuildToolSettings, BuildTools, ToolHome};
 pub use cache::{cache_file, default_cache_root};
 pub use environment::{
-    EnvironmentDetail, EnvironmentProvider, LanguageLevelInfo, ProjectEnvironmentInfo, RuntimeInfo,
-    RuntimeReason,
+    EnvironmentDetail, EnvironmentProvider, LanguageLevelEdit, LanguageLevelInfo,
+    ProjectEnvironmentInfo, RuntimeInfo, RuntimeReason,
 };
 pub use model::{
-    BuildGroup, BuildModule, BuildTask, Coordinates, Dependency, DependencyScope, Exclusion,
-    FileEdit, MAIN_UNIT, Module, ModuleDependencies, PathEntry, PathKind, ProjectModel, TEST_UNIT,
-    Unit,
+    BuildGroup, BuildModule, BuildProfile, BuildTask, Coordinates, Dependency, DependencyScope,
+    Exclusion, FileEdit, MAIN_UNIT, Module, ModuleDependencies, PathEntry, PathKind, ProjectModel,
+    TEST_UNIT, Unit,
 };
 pub use open::{BuildSystem, ProjectSession, RecordedTask, SyncEvent, TaskOptions, open_project};
+pub use selection::{BuildProperty, BuildSelection, ProfileChoice};
 pub use tool::{ToolProgress, ToolSetup};

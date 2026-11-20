@@ -271,6 +271,7 @@ fn the_settings_of_the_point_survive_a_new_window(cx: &mut TestAppContext) {
         DebugPanel::create(
             root.clone(),
             Some(store.clone()),
+            folder.join("state"),
             WeakEntity::new_invalid(),
             cx,
         )
@@ -289,6 +290,7 @@ fn the_settings_of_the_point_survive_a_new_window(cx: &mut TestAppContext) {
         DebugPanel::create(
             root.clone(),
             Some(store.clone()),
+            folder.join("state"),
             WeakEntity::new_invalid(),
             cx,
         )
