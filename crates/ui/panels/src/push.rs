@@ -284,6 +284,17 @@ impl PushWindow {
             cx.stop_propagation();
             return;
         }
+        // Enter ends the edit of the destination; otherwise it presses Push, the primary button.
+        if key == "enter" {
+            if self.editing_destination {
+                self.editing_destination = false;
+                cx.notify();
+            } else {
+                self.push(false, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.editing_destination && self.destination.key_with_clipboard(event, false, cx) {
             cx.stop_propagation();
             cx.notify();
@@ -692,41 +703,21 @@ impl PushWindow {
     }
 
     fn buttons(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let push = div()
-            .id("push-go")
-            .debug_selector(|| "push-go".to_string())
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(26.))
-            .px(px(12.))
-            .rounded(px(CONTROL_RADIUS))
-            .border_1()
-            .border_color(theme.accent)
-            .bg(theme.accent)
-            .text_color(theme.over_accent)
-            .child("Push")
+        let push = dialog_button("push-go", "push-go".to_owned(), "Push", true, true, theme)
             .on_click(cx.listener(|this, _, _, cx| this.push(false, cx)));
-        let force = div()
-            .id("push-force")
-            .debug_selector(|| "push-force".to_string())
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(26.))
-            .px(px(SPACE_S))
-            .rounded(px(CONTROL_RADIUS))
-            .border_1()
-            .border_color(theme.popup_border)
-            .hover({
-                let hover = theme.hover;
-                move |style| style.bg(hover)
-            })
-            .child("Force Push  ▾")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.force_menu = !this.force_menu;
-                cx.notify();
-            }));
+        // The menu of Force Push is an extra button: it stands at the left edge of the row.
+        let force = dialog_button(
+            "push-force",
+            "push-force".to_owned(),
+            "Force Push  ▾",
+            false,
+            true,
+            theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.force_menu = !this.force_menu;
+            cx.notify();
+        }));
         let force_menu = self.force_menu.then(|| {
             div()
                 .id("push-force-item")
@@ -751,23 +742,15 @@ impl PushWindow {
                     cx.notify();
                 }))
         });
-        let cancel = div()
-            .id("push-cancel")
-            .debug_selector(|| "push-cancel".to_string())
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(26.))
-            .px(px(12.))
-            .rounded(px(CONTROL_RADIUS))
-            .border_1()
-            .border_color(theme.popup_border)
-            .hover({
-                let hover = theme.hover;
-                move |style| style.bg(hover)
-            })
-            .child("Cancel")
-            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
+        let cancel = dialog_button(
+            "push-cancel",
+            "push-cancel".to_owned(),
+            "Cancel",
+            false,
+            true,
+            theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
         let warning = self.force_confirm.then(|| {
             div()
                 .debug_selector(|| "push-force-warning".to_string())
@@ -779,43 +762,35 @@ impl PushWindow {
                 .text_color(theme.stripe_warning)
                 .child("Force Push replaces the remote history.")
                 .child(
-                    div()
-                        .id("push-force-confirm")
-                        .debug_selector(|| "push-force-confirm".to_string())
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(26.))
-                        .px(px(12.))
-                        .rounded(px(CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(theme.stripe_warning)
-                        .hover({
-                            let hover = theme.hover;
-                            move |style| style.bg(hover)
-                        })
-                        .child("Force Push")
-                        .on_click(cx.listener(|this, _, _, cx| this.push(true, cx))),
+                    dialog_button(
+                        "push-force-confirm",
+                        "push-force-confirm".to_owned(),
+                        "Force Push",
+                        false,
+                        true,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.push(true, cx))),
                 )
         });
+        // The bar keeps the padding of the dialog from its right and bottom edges, as the
+        // other dialogs do; the warning of a forced push stands on its own line above the row.
         div()
             .flex()
             .flex_col()
             .flex_none()
             .gap(px(SPACE_S))
-            .px(px(SPACE_M))
-            .py(px(SPACE_M))
+            .px(px(DIALOG_PADDING))
+            .pt(px(SPACE_M))
+            .pb(px(DIALOG_PADDING))
             .children(force_menu)
+            .children(warning)
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_S))
-                    .children(warning)
-                    .child(div().flex_1())
-                    .child(cancel)
-                    .child(force)
-                    .child(push),
+                DialogButtons::new()
+                    .extra(force)
+                    .primary(push)
+                    .other(cancel)
+                    .into_row(),
             )
             .into_any_element()
     }

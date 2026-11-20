@@ -2034,6 +2034,10 @@ impl Render for BuildPanel {
         let loading = self.run.read(cx).is_loading();
         let skip_supported = self.run.read(cx).supports_skip_tests();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::TASKS_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -2152,7 +2156,7 @@ impl Render for BuildPanel {
             .group(GROUP)
             .h_full()
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(panel_header(title, GROUP, hide, &theme))
+            .child(panel_header(title, GROUP, "tasks", options, hide, &theme))
             .child(self.toolbar(&theme, loading, skip_supported, cx))
             .children(properties)
             .child(body)

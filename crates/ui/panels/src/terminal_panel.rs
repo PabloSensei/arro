@@ -17,7 +17,6 @@ use ui_kit::*;
 use workspace::{Settings, ToggleTerminal, Workspace};
 
 use crate::navigation;
-use crate::project_structure::dialog_button;
 use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
     CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, pressed,
@@ -2215,6 +2214,11 @@ impl TerminalPanel {
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let options = crate::tool_menu::options_menu(
+            self.workspace.clone(),
+            workspace::TERMINAL_TOOL,
+            |_| Vec::new(),
+        );
         let hide = |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             window.dispatch_action(Box::new(ToggleTerminal), cx);
         };
@@ -2266,7 +2270,9 @@ impl Render for TerminalPanel {
             .relative()
             .h_full()
             .child(measure)
-            .child(panel_header("Terminal", GROUP, hide, &theme))
+            .child(panel_header(
+                "Terminal", GROUP, "terminal", options, hide, &theme,
+            ))
             .child(body)
     }
 }

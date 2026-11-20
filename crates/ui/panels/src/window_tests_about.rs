@@ -59,8 +59,8 @@ fn about_shows_the_version_and_copies_a_bug_report_line(cx: &mut TestAppContext)
         "About does not say the build is early: {text}"
     );
     assert!(
-        text.contains("Written with AI"),
-        "About does not say the code is written with AI: {text}"
+        !text.contains("AI"),
+        "About says nothing about how the code is written: {text}"
     );
     assert!(
         text.contains("GNU GPL, version 3 or later"),

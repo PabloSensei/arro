@@ -59,6 +59,11 @@ pub trait BuildSystem: Send + Sync {
         "run/run"
     }
 
+    /// The name of the tool, shown as a group of the tree of Run/Debug Configurations.
+    fn tool_name(&self) -> &'static str {
+        "Build tool"
+    }
+
     /// The command that makes the outputs of the project current.
     fn assemble(&self, root: &Path) -> Result<ProcessSpec>;
 

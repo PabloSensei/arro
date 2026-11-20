@@ -224,37 +224,30 @@ impl Render for ReformatDialog {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .id("reformat-cancel")
-                            .debug_selector(|| "reformat-cancel".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .hover(|style| style.bg(theme.selection_hover))
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "reformat-run",
+                            "reformat-run".to_owned(),
+                            "Run",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
                     )
-                    .child(
-                        div()
-                            .id("reformat-run")
-                            .debug_selector(|| "reformat-run".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .bg(theme.accent)
-                            .text_color(theme.over_accent)
-                            .child("Run")
-                            .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
-                    ),
+                    .other(
+                        dialog_button(
+                            "reformat-cancel",
+                            "reformat-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(
@@ -783,43 +776,36 @@ impl Render for PathsDialog {
                     .child(only),
             )
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .id("reformat-cancel")
-                            .debug_selector(|| "reformat-cancel".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .hover(|style| style.bg(theme.selection_hover))
-                            .tooltip(|_, cx| tooltip("Cancel", Some(SharedString::from("Esc")), cx))
-                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "reformat-run",
+                            "reformat-run".to_owned(),
+                            "Reformat",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .tooltip(|_, cx| {
+                            tooltip("Reformat Code", Some(SharedString::from("Enter")), cx)
+                        })
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
                     )
-                    .child(
-                        div()
-                            .id("reformat-run")
-                            .debug_selector(|| "reformat-run".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .bg(theme.accent)
-                            .text_color(theme.over_accent)
-                            .tooltip(|_, cx| {
-                                tooltip("Reformat Code", Some(SharedString::from("Enter")), cx)
-                            })
-                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                            .child("Reformat")
-                            .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
-                    ),
+                    .other(
+                        dialog_button(
+                            "reformat-cancel",
+                            "reformat-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .tooltip(|_, cx| tooltip("Cancel", Some(SharedString::from("Esc")), cx))
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(

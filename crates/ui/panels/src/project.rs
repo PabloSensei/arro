@@ -16,7 +16,7 @@ use workspace::{
 };
 
 use crate::file_tree::{Child, FileTree, read_folder};
-use crate::prompt::Prompt;
+use crate::prompt::{Prompt, PromptKind};
 use crate::tree_ops::{
     Creation, FileTemplate, create_on_disk, delete_on_disk, plan_creation_with_template,
     plan_drop_copy, plan_move, plan_paste, rename_on_disk, renamed, target_folder,
@@ -58,6 +58,14 @@ const SEARCH_TIMEOUT: Duration = Duration::from_millis(1000);
 pub(crate) const MIGRATIONS_LABEL: &str = "Migrations";
 /// The New menu row that writes the next versioned migration of the project.
 const FLYWAY_LABEL: &str = "Flyway Migration";
+/// The kinds of source file that live inside the New Class dialog rather than in the New
+/// list itself.
+const SOURCE_KINDS: [&str; 4] = ["Interface", "Enum", "Record", "Annotation"];
+/// The order the New Class dialog shows the kinds after the main one.
+const SOURCE_KIND_ORDER: [&str; 4] = ["Interface", "Record", "Enum", "Annotation"];
+/// The rows of the New list that are not a source kind: a plain file, a folder, a package
+/// and the file that describes a package.
+const NEW_FIXED: [&str; 4] = ["File", "Directory", "Package", "package-info"];
 /// Expand All reads this many folder levels from the root. A folder deeper than that stays
 /// closed.
 pub(crate) const FULL_EXPAND_MAX_DEPTH: usize = 8;
@@ -184,6 +192,12 @@ panel_keys![
 pub struct FileTemplates(pub Vec<FileTemplate>);
 
 impl Global for FileTemplates {}
+
+/// The kind of source file the New Class dialog chose the last time.
+#[derive(Default)]
+pub struct LastNewKind(pub usize);
+
+impl Global for LastNewKind {}
 
 /// Files of the project tree that Ctrl+C or Ctrl+X took, and whether they are to move.
 #[derive(Default)]
@@ -1398,9 +1412,21 @@ impl ProjectPanel {
             },
         );
         let appearance = MenuEntry::submenu("Tree Appearance", vec![compact]);
+        let hiding = self.workspace.clone();
+        let hide = MenuEntry::new("Hide", move |window, cx| {
+            hiding
+                .update(cx, |workspace, cx| {
+                    workspace.toggle_panel(DockSide::Left, window, cx)
+                })
+                .ok();
+        });
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_menu(position, vec![always_select, appearance], cx)
+                workspace.show_menu(
+                    position,
+                    vec![always_select, appearance, MenuEntry::separator(), hide],
+                    cx,
+                )
             })
             .ok();
     }
@@ -1559,6 +1585,44 @@ impl ProjectPanel {
         });
     }
 
+    /// The kinds of source file the New Class dialog lists: the main kind first, then the
+    /// other kinds in the order the dialog shows them. The plain files, the folders and
+    /// the package file are not kinds.
+    fn source_kinds(&self) -> Vec<FileTemplate> {
+        let mut kinds = Vec::new();
+        if let Some(primary) = self.primary_source() {
+            kinds.push(primary);
+        }
+        for label in SOURCE_KIND_ORDER {
+            if let Some(template) = self
+                .templates
+                .iter()
+                .find(|template| template.label == label)
+            {
+                kinds.push(template.clone());
+            }
+        }
+        for template in &self.templates {
+            if NEW_FIXED.contains(&template.label)
+                || kinds.iter().any(|kind| kind.label == template.label)
+            {
+                continue;
+            }
+            kinds.push(template.clone());
+        }
+        kinds
+    }
+
+    /// The source kind the New list offers: the first one the application gave.
+    fn primary_source(&self) -> Option<FileTemplate> {
+        self.templates
+            .iter()
+            .find(|template| {
+                !NEW_FIXED.contains(&template.label) && !SOURCE_KINDS.contains(&template.label)
+            })
+            .cloned()
+    }
+
     /// Asks for the name of something new in `folder`.
     pub fn ask_new(
         &mut self,
@@ -1570,6 +1634,48 @@ impl ProjectPanel {
         let title = format!("New {}", template.label);
         let panel = cx.weak_entity();
         let handle = window.window_handle();
+        let kinds = if self
+            .primary_source()
+            .is_some_and(|primary| primary.label == template.label)
+        {
+            self.source_kinds()
+        } else {
+            Vec::new()
+        };
+        if kinds.len() > 1 {
+            let prompts = kinds
+                .iter()
+                .map(|template| PromptKind {
+                    label: template.label.into(),
+                    icon: template.icon,
+                })
+                .collect::<Vec<_>>();
+            let chosen = cx.try_global::<LastNewKind>().map_or(0, |last| last.0);
+            let fallback = template.clone();
+            let submit = move |name: String, kind: usize, cx: &mut App| {
+                cx.set_global(LastNewKind(kind));
+                let template = kinds.get(kind).cloned().unwrap_or_else(|| fallback.clone());
+                let (template, folder) = (template.clone(), folder.clone());
+                let (panel, handle) = (panel.clone(), handle);
+                let name = name.clone();
+                cx.defer(move |cx| {
+                    let run = move |_: AnyView, window: &mut Window, cx: &mut App| {
+                        let create = |this: &mut Self, cx: &mut Context<Self>| {
+                            this.make_item(template, folder, name, window, cx)
+                        };
+                        panel.update(cx, create).ok();
+                    };
+                    handle.update(cx, run).ok();
+                });
+            };
+            let ask = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
+                Prompt::show_with_kinds(
+                    &title, "Name", prompts, chosen, submit, workspace, window, cx,
+                )
+            };
+            self.workspace.update(cx, ask).ok();
+            return;
+        }
         let submit = move |name: String, cx: &mut App| {
             let (template, folder) = (template.clone(), folder.clone());
             let panel = panel.clone();
@@ -2243,7 +2349,7 @@ impl ProjectPanel {
                 .as_ref()
                 .map(|(path, folder)| (path.as_path(), *folder)),
         );
-        let entries = self.new_entries(folder, cx);
+        let entries = self.new_submenu(folder, cx);
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.show_menu(position, entries, cx)
@@ -2251,36 +2357,148 @@ impl ProjectPanel {
             .ok();
     }
 
+    /// The one row of the context menu that holds everything the tree makes.
     fn new_entries(&self, folder: PathBuf, cx: &mut Context<Self>) -> Vec<MenuEntry> {
+        let mut new = MenuEntry::submenu("New", self.new_submenu(folder, cx)).icon("general/add");
+        if let Some(hint) = Self::key_hint("project_panel::NewItem") {
+            new = new.shortcut(hint);
+        }
+        vec![new]
+    }
+
+    /// One row of a new file template. The name of the file follows `label`.
+    fn template_entry(
+        template: FileTemplate,
+        label: String,
+        folder: PathBuf,
+        panel: WeakEntity<Self>,
+    ) -> MenuEntry {
+        let icon = template.icon;
+        MenuEntry::new(label, move |window, cx| {
+            let (template, folder) = (template.clone(), folder.clone());
+            let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                this.ask_new(template, folder, window, cx)
+            };
+            Self::later(window, panel.clone(), cx, ask);
+        })
+        .icon(icon)
+    }
+
+    /// The rows of the New list: the source kinds first, then the plain files and
+    /// folders, then the rest of what the application offers.
+    fn new_submenu(&self, folder: PathBuf, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let panel = cx.weak_entity();
-        let templates = self.templates.iter().cloned();
-        let has_migrations = self.migrations.next.is_some();
-        let mut entries: Vec<MenuEntry> = templates
-            .map(|template| {
-                let (panel, folder) = (panel.clone(), folder.clone());
-                let (label, icon) = (format!("New {}", template.label), template.icon);
-                MenuEntry::new(label, move |window, cx| {
-                    let (template, folder) = (template.clone(), folder.clone());
-                    let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-                        this.ask_new(template, folder, window, cx)
+        let find = |label: &str| {
+            self.templates
+                .iter()
+                .find(|template| template.label == label)
+                .cloned()
+        };
+        let mut entries = Vec::new();
+        let primary = self.primary_source();
+        let primary_label = primary.as_ref().map(|template| template.label.to_owned());
+        if let Some(template) = primary {
+            let label = format!("New {}", template.label);
+            entries.push(Self::template_entry(
+                template,
+                label,
+                folder.clone(),
+                panel.clone(),
+            ));
+        }
+        if let Some(template) = find("File") {
+            entries.push(Self::template_entry(
+                template,
+                "New File".to_owned(),
+                folder.clone(),
+                panel.clone(),
+            ));
+        }
+        {
+            let scratch_panel = panel.clone();
+            entries.push(
+                MenuEntry::new("Scratch File", move |window, cx| {
+                    let open = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                crate::window_popups::show_scratch_languages(workspace, window, cx)
+                            })
+                            .ok();
                     };
-                    Self::later(window, panel.clone(), cx, ask);
+                    Self::later(window, scratch_panel.clone(), cx, open);
                 })
-                .icon(icon)
+                .icon("general/newFile"),
+            );
+        }
+        if let Some(template) = find("Directory") {
+            entries.push(Self::template_entry(
+                template,
+                "New Directory".to_owned(),
+                folder.clone(),
+                panel.clone(),
+            ));
+        }
+        if let Some(template) = find("Package") {
+            entries.push(Self::template_entry(
+                template,
+                "New Package".to_owned(),
+                folder.clone(),
+                panel.clone(),
+            ));
+        }
+        if let Some(template) = find("package-info") {
+            let label = format!("New {}.{}", template.label, template.extension);
+            entries.push(Self::template_entry(
+                template,
+                label,
+                folder.clone(),
+                panel.clone(),
+            ));
+        }
+        let mut rest: Vec<FileTemplate> = self
+            .templates
+            .iter()
+            .filter(|template| {
+                primary_label.as_deref() != Some(template.label)
+                    && !NEW_FIXED.contains(&template.label)
+                    && !SOURCE_KINDS.contains(&template.label)
             })
+            .cloned()
             .collect();
-        if has_migrations {
-            let panel = panel.clone();
+        entries.push(MenuEntry::separator());
+        for template in rest.drain(..) {
+            let label = format!("New {}", template.label);
+            entries.push(Self::template_entry(
+                template,
+                label,
+                folder.clone(),
+                panel.clone(),
+            ));
+        }
+        if self.migrations.next.is_some() {
+            let flyway_panel = panel.clone();
             entries.push(
                 MenuEntry::new(format!("New {FLYWAY_LABEL}"), move |window, cx| {
                     let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                         this.ask_flyway_migration(window, cx)
                     };
-                    Self::later(window, panel.clone(), cx, ask);
+                    Self::later(window, flyway_panel.clone(), cx, ask);
                 })
                 .icon("fileTypes/text"),
             );
         }
+        let request_folder = folder.clone();
+        let request_panel = panel.clone();
+        entries.push(
+            MenuEntry::new("New HTTP Request", move |window, cx| {
+                let (template, folder) = (crate::tree_ops::http_request(), request_folder.clone());
+                let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    this.ask_new(template, folder, window, cx)
+                };
+                Self::later(window, request_panel.clone(), cx, ask);
+            })
+            .icon("fileTypes/text"),
+        );
         entries
     }
 
@@ -2474,23 +2692,6 @@ impl ProjectPanel {
             });
             entries.push(MenuEntry::submenu("Git", vec![show]));
         }
-        // The request file of the HTTP client goes last, so the rows above keep their
-        // places in the menu.
-        entries.push(MenuEntry::separator());
-        let (request_panel, request_folder) = (
-            cx.weak_entity(),
-            target_folder(&self.root_path(), Some((path.as_path(), is_folder))),
-        );
-        entries.push(
-            MenuEntry::new("New HTTP Request", move |window, cx| {
-                let (template, folder) = (crate::tree_ops::http_request(), request_folder.clone());
-                let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-                    this.ask_new(template, folder, window, cx)
-                };
-                Self::later(window, request_panel.clone(), cx, ask);
-            })
-            .icon("fileTypes/text"),
-        );
         (position, entries)
     }
 
@@ -2515,7 +2716,7 @@ impl ProjectPanel {
                 })
                 .ok();
         };
-        let tools = div()
+        let actions = div()
             .flex()
             .items_center()
             .gap(px(SPACE_XS))
@@ -2560,39 +2761,19 @@ impl ProjectPanel {
                     theme,
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
-            )
-            .child(
-                tool_button(
-                    "project-view-options",
-                    "general/moreVertical",
-                    "View Options",
-                    None,
-                    theme,
-                )
-                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                    this.show_view_menu(event.position(), cx)
-                })),
-            )
-            .child(panel_tools("left-panel", hide, theme));
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .text_size(px(UI_SIZE))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Project"),
-            )
-            .child(tools)
-            .debug_selector(|| "project-header".to_owned())
+            );
+        let options = cx
+            .listener(|this, event: &ClickEvent, _, cx| this.show_view_menu(event.position(), cx));
+        tool_header(
+            div().font_weight(FontWeight::MEDIUM).child("Project"),
+            actions,
+            "left-panel",
+            "project",
+            options,
+            hide,
+            theme,
+        )
+        .debug_selector(|| "project-header".to_owned())
     }
 
     fn rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<Div> {

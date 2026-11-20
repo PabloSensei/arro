@@ -1143,7 +1143,14 @@ impl Render for CompareResponses {
             .key_context("HttpCompare")
             .track_focus(&self.focus)
             .text_size(px(UI_SIZE))
-            .text_color(theme.text);
+            .text_color(theme.text)
+            // Enter presses Compare, the primary button; the request refuses unless two are chosen.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "enter" {
+                    this.compare(window, cx);
+                    cx.stop_propagation();
+                }
+            }));
         let contents = div()
             .flex()
             .flex_col()
@@ -1162,13 +1169,20 @@ impl Render for CompareResponses {
                     .children(rows),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .justify_end()
-                    .gap(px(SPACE_S))
-                    .child(
-                        crate::project_structure::dialog_button(
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "http-compare-run",
+                            "http-compare-run".to_owned(),
+                            "Compare",
+                            true,
+                            enabled,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.compare(window, cx))),
+                    )
+                    .other(
+                        dialog_button(
                             "http-compare-cancel",
                             "http-compare-cancel".to_owned(),
                             "Cancel",
@@ -1178,17 +1192,7 @@ impl Render for CompareResponses {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     )
-                    .child(
-                        crate::project_structure::dialog_button(
-                            "http-compare-run",
-                            "http-compare-run".to_owned(),
-                            "Compare",
-                            true,
-                            enabled,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.compare(window, cx))),
-                    ),
+                    .into_row(),
             );
         let left = (viewport.width - width) / 2.;
         let top = (viewport.height - height) / 2.;
@@ -1303,6 +1307,8 @@ impl Render for HttpPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::HTTP_TOOL, |_| Vec::new());
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -1409,7 +1415,14 @@ impl Render for HttpPanel {
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()
-            .child(panel_header("HTTP Response", GROUP, hide, &theme))
+            .child(panel_header(
+                "HTTP Response",
+                GROUP,
+                "http",
+                options,
+                hide,
+                &theme,
+            ))
             .child(toolbar)
             .child(tabs)
             .child(

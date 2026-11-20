@@ -434,34 +434,6 @@ fn check_box(checked: bool, theme: &Theme) -> Div {
         )
 }
 
-fn dialog_button(
-    id: impl Into<ElementId>,
-    selector: String,
-    label: &str,
-    primary: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let (hover, pressed) = (theme.hover, theme.pressed);
-    div()
-        .id(id)
-        .debug_selector(move || selector)
-        .flex()
-        .items_center()
-        .h(px(CONTROL_HEIGHT))
-        .px(px(SPACE_L))
-        .rounded(px(CONTROL_RADIUS))
-        .when(primary, |this| {
-            this.bg(theme.accent).text_color(theme.over_accent)
-        })
-        .when(!primary, |this| {
-            this.border_1()
-                .border_color(theme.control_border)
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-        })
-        .child(label.to_owned())
-}
-
 impl Render for MemberFormDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -701,40 +673,41 @@ impl Render for MemberFormDialog {
             .children(warning)
             .children(note)
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
-                        dialog_button(
-                            "member-form-cancel",
-                            "member-form-cancel".to_owned(),
-                            "Cancel",
-                            false,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                    )
-                    .child(
+                DialogButtons::new()
+                    .extra(
                         dialog_button(
                             "member-form-preview",
                             "member-form-preview".to_owned(),
                             "Preview",
                             false,
+                            true,
                             &theme,
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.preview(window, cx))),
                     )
-                    .child(
+                    .primary(
                         dialog_button(
                             "member-form-apply",
                             "member-form-apply".to_owned(),
                             "Refactor",
                             true,
+                            !self.busy && !self.loading,
                             &theme,
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.refactor(window, cx))),
-                    ),
+                    )
+                    .other(
+                        dialog_button(
+                            "member-form-cancel",
+                            "member-form-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
 
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));

@@ -1952,6 +1952,10 @@ impl Render for ProfilerPanel {
         workspace::note_view_render(cx, "profiler");
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::PROFILER_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -1995,7 +1999,9 @@ impl Render for ProfilerPanel {
             .group(GROUP)
             .h_full()
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(panel_header("Profiler", GROUP, hide, &theme))
+            .child(panel_header(
+                "Profiler", GROUP, "profiler", options, hide, &theme,
+            ))
             .child(self.modes(&theme, cx))
             .child(self.tabs(&theme, cx))
             .children(self.choices(&theme, cx))

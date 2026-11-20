@@ -202,7 +202,7 @@ fn invoke_switch_row(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
         .read_with(cx, |workspace, _| workspace.menu_entries().is_some())
         .unwrap();
     if !open {
-        click(cx, window, "project-view-options");
+        click(cx, window, "project-options");
         cx.run_until_parked();
         draw(cx, window);
     }

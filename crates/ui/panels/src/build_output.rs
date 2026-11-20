@@ -598,6 +598,10 @@ impl Render for BuildOutputPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::BUILD_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -615,7 +619,9 @@ impl Render for BuildOutputPanel {
             .group(GROUP)
             .h_full()
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(panel_header("Build", GROUP, hide, &theme))
+            .child(panel_header(
+                "Build", GROUP, BUILD_TOOL, options, hide, &theme,
+            ))
             .child(self.toolbar(&theme, cx))
             .child(
                 div()

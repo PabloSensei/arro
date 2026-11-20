@@ -32,6 +32,9 @@ use crate::settings_catalog::{self, SettingKind};
 const CONTEXT: &str = "SearchEverywhere";
 const WIDTH: f32 = 702.;
 const HEIGHT: f32 = 600.;
+/// The smallest size the window resizes to.
+pub(crate) const MIN_WIDTH: f32 = 420.;
+pub(crate) const MIN_HEIGHT: f32 = 300.;
 /// The width of the preview right of the list of the palette.
 const PREVIEW_WIDTH: f32 = 330.;
 const GROUP_ROWS: usize = 5;
@@ -1441,9 +1444,12 @@ impl Render for Palette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let viewport = window.viewport_size();
-        let width = px(WIDTH);
-        let left = (viewport.width - width) / 2.;
-        let top = viewport.height * 0.205;
+        let first = DialogPlace {
+            left: (f32::from(viewport.width) - WIDTH) / 2.,
+            top: f32::from(viewport.height) * 0.205,
+            width: WIDTH,
+            height: Some(HEIGHT),
+        };
         let query = self.query.clone();
         let collapsed =
             self.rows.is_empty() && query.text.is_empty() && self.mode != Mode::Structure;
@@ -1471,6 +1477,13 @@ impl Render for Palette {
             icon_button("palette-preview", "general/show", "Preview", None, &theme)
                 .debug_selector(|| "palette-preview".to_owned())
                 .when(open, |this| this.bg(theme.selection))
+                // A press on the button is not the start of a drag of the header.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    },
+                )
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
         });
         let chips = div()
@@ -1496,182 +1509,201 @@ impl Render for Palette {
                         theme.popup_bg
                     })
                     .when(chosen, |this| this.bg(theme.tab_selected))
+                    // A press on a chip is not the start of a drag of the header.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                        },
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
                     .child(name)
             }));
 
-        let body = surface(&theme)
-            .id("palette")
-            .debug_selector(|| "palette".to_owned())
-            .key_context(CONTEXT)
-            .track_focus(&self.focus)
-            .occlude()
-            .w(width)
-            .p(px(POPUP_PADDING))
-            .when(!collapsed, |this| this.h(px(HEIGHT)))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .on_action(cx.listener(|this, _: &Previous, window, cx| {
-                this.move_selection(-1, cx);
-                this.ask_for_frame(window);
-            }))
-            .on_action(cx.listener(|this, _: &Next, window, cx| {
-                this.move_selection(1, cx);
-                this.ask_for_frame(window);
-            }))
-            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
-                this.iterate(1, cx);
-                this.ask_for_frame(window);
-            }))
-            .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
-                this.iterate(-1, cx);
-                this.ask_for_frame(window);
-            }))
-            .on_action(cx.listener(|this, _: &NextGroup, window, cx| {
-                this.next_group(1, cx);
-                this.ask_for_frame(window);
-            }))
-            .on_action(cx.listener(|this, _: &PreviousGroup, window, cx| {
-                this.next_group(-1, cx);
-                this.ask_for_frame(window);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleEdited, window, cx| {
-                this.toggle_edited(cx);
-                this.ask_for_frame(window);
-            }))
-            .on_modifiers_changed(
-                cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
-                    if !event.modifiers.control {
-                        this.ctrl_released(window, cx);
-                    }
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &Open, window, cx| {
-                    this.open(this.selected, false, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &OpenDebug, window, cx| {
-                this.open(this.selected, true, window, cx)
-            }))
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
-            .child(
+        let header = div()
+            .flex_none()
+            .h(px(42.))
+            .debug_selector(move || format!("palette-tab-{active_name}"))
+            .child(popup_drag_header(
+                cx,
+                "palette",
+                (MIN_WIDTH, MIN_HEIGHT),
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .flex_none()
-                    .h(px(42.))
+                    .h_full()
                     .px(px(SPACE_XS))
+                    .debug_selector(|| "palette-header".to_owned())
                     .child(match heading {
                         Some(title) => div().px(px(ROW_PADDING_X)).child(title).into_any_element(),
                         None => chips.into_any_element(),
                     })
                     .children(preview_button),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_none()
-                    .debug_selector(|| "palette-input".to_owned())
-                    .gap(px(SPACE_S))
-                    .h(px(CONTROL_HEIGHT))
-                    .mb(px(POPUP_PADDING))
-                    .px(px(SPACE_M))
-                    .rounded(px(CONTROL_RADIUS))
-                    .border_2()
-                    .border_color(theme.accent)
-                    .child(icon("general/search", &theme))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .children(text_field_children(
-                                &self.query,
-                                theme.text,
-                                theme.text,
-                                theme.selection,
-                                theme.caret,
-                                18.,
-                                true,
-                            )),
-                    ),
-            )
-            .when(
-                matches!(
-                    self.mode,
-                    Mode::Recent | Mode::RecentChanged | Mode::Switcher
-                ),
-                |this| {
-                    this.child(
-                        div()
-                            .id("palette-edited-only")
-                            .debug_selector(|| "palette-edited-only".to_owned())
-                            .flex()
-                            .items_center()
-                            .flex_none()
-                            .gap(px(SPACE_S))
-                            .h(px(ROW_HEIGHT))
-                            .mb(px(SPACE_S))
-                            .px(px(ROW_PADDING_X))
-                            .rounded(px(ROW_RADIUS))
-                            .hover(move |style| style.bg(theme.selection_hover))
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_edited(cx)))
-                            .child(checkbox(self.edited_only, &theme))
-                            .child("Show edited only"),
-                    )
-                },
-            )
-            .when(!collapsed, |this| {
-                let list = scrollable(
-                    "palette-list",
-                    &self.scroll,
-                    div()
-                        .id("palette-list")
-                        .flex()
-                        .flex_col()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .children(rows)
-                        .when(empty, |this| {
-                            this.items_center()
-                                .justify_center()
-                                .text_color(theme.text_secondary)
-                                .child("Nothing found")
-                        }),
-                    &theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_h_0();
-                if self.preview_open && self.preview_applies() {
-                    this.child(
-                        div().flex().flex_1().min_h_0().w_full().child(list).child(
-                            div()
-                                .id("palette-preview-box")
-                                .debug_selector(|| "palette-preview-box".to_owned())
-                                .flex_none()
-                                .w(px(PREVIEW_WIDTH))
-                                .h_full()
-                                .overflow_hidden()
-                                .border_l_1()
-                                .border_color(theme.border)
-                                .child(self.preview.clone()),
-                        ),
-                    )
-                } else {
-                    this.child(list)
-                }
-            });
+            ));
 
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .debug_selector(move || format!("palette-tab-{active_name}"))
-            .child(enter("palette-enter", body))
+        let body =
+            surface(&theme)
+                .id("palette")
+                .debug_selector(|| "palette".to_owned())
+                .key_context(CONTEXT)
+                .track_focus(&self.focus)
+                .occlude()
+                .p(px(POPUP_PADDING))
+                .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+                .on_action(cx.listener(|this, _: &Previous, window, cx| {
+                    this.move_selection(-1, cx);
+                    this.ask_for_frame(window);
+                }))
+                .on_action(cx.listener(|this, _: &Next, window, cx| {
+                    this.move_selection(1, cx);
+                    this.ask_for_frame(window);
+                }))
+                .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                    this.iterate(1, cx);
+                    this.ask_for_frame(window);
+                }))
+                .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
+                    this.iterate(-1, cx);
+                    this.ask_for_frame(window);
+                }))
+                .on_action(cx.listener(|this, _: &NextGroup, window, cx| {
+                    this.next_group(1, cx);
+                    this.ask_for_frame(window);
+                }))
+                .on_action(cx.listener(|this, _: &PreviousGroup, window, cx| {
+                    this.next_group(-1, cx);
+                    this.ask_for_frame(window);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleEdited, window, cx| {
+                    this.toggle_edited(cx);
+                    this.ask_for_frame(window);
+                }))
+                .on_modifiers_changed(cx.listener(
+                    |this, event: &ModifiersChangedEvent, window, cx| {
+                        if !event.modifiers.control {
+                            this.ctrl_released(window, cx);
+                        }
+                    },
+                ))
+                .on_action(cx.listener(|this, _: &Open, window, cx| {
+                    this.open(this.selected, false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &OpenDebug, window, cx| {
+                    this.open(this.selected, true, window, cx)
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
+                .child(header)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_none()
+                        .debug_selector(|| "palette-input".to_owned())
+                        .gap(px(SPACE_S))
+                        .h(px(CONTROL_HEIGHT))
+                        .mb(px(POPUP_PADDING))
+                        .px(px(SPACE_M))
+                        .rounded(px(CONTROL_RADIUS))
+                        .border_2()
+                        .border_color(theme.accent)
+                        .child(icon("general/search", &theme))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .children(text_field_children(
+                                    &self.query,
+                                    theme.text,
+                                    theme.text,
+                                    theme.selection,
+                                    theme.caret,
+                                    18.,
+                                    true,
+                                )),
+                        ),
+                )
+                .when(
+                    matches!(
+                        self.mode,
+                        Mode::Recent | Mode::RecentChanged | Mode::Switcher
+                    ),
+                    |this| {
+                        this.child(
+                            div()
+                                .id("palette-edited-only")
+                                .debug_selector(|| "palette-edited-only".to_owned())
+                                .flex()
+                                .items_center()
+                                .flex_none()
+                                .gap(px(SPACE_S))
+                                .h(px(ROW_HEIGHT))
+                                .mb(px(SPACE_S))
+                                .px(px(ROW_PADDING_X))
+                                .rounded(px(ROW_RADIUS))
+                                .hover(move |style| style.bg(theme.selection_hover))
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_edited(cx)))
+                                .child(checkbox(self.edited_only, &theme))
+                                .child("Show edited only"),
+                        )
+                    },
+                )
+                .when(!collapsed, |this| {
+                    let list = scrollable(
+                        "palette-list",
+                        &self.scroll,
+                        div()
+                            .id("palette-list")
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .children(rows)
+                            .when(empty, |this| {
+                                this.items_center()
+                                    .justify_center()
+                                    .text_color(theme.text_secondary)
+                                    .child("Nothing found")
+                            }),
+                        &theme,
+                        window,
+                        cx,
+                    )
+                    .flex_1()
+                    .min_h_0();
+                    if self.preview_open && self.preview_applies() {
+                        this.child(
+                            div().flex().flex_1().min_h_0().w_full().child(list).child(
+                                div()
+                                    .id("palette-preview-box")
+                                    .debug_selector(|| "palette-preview-box".to_owned())
+                                    .flex_none()
+                                    .w(px(PREVIEW_WIDTH))
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .border_l_1()
+                                    .border_color(theme.border)
+                                    .child(self.preview.clone()),
+                            ),
+                        )
+                    } else {
+                        this.child(list)
+                    }
+                });
+
+        popup_window(
+            PopupSpec {
+                key: "palette",
+                place: first,
+                min: (MIN_WIDTH, MIN_HEIGHT),
+                content_height: false,
+                max_height: None,
+            },
+            body,
+            window,
+            cx,
+        )
     }
 }

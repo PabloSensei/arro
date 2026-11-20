@@ -280,7 +280,7 @@ fn items_of(root: &Path, marks: Vec<(PathBuf, Mark)>) -> Vec<Item> {
 }
 
 pub fn create(root: PathBuf, workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<ItemsPanel> {
-    let panel = ItemsPanel::create("TODO", TODO_TOOL, "No TODO or FIXME found.", workspace, cx);
+    let panel = ItemsPanel::create("TODO", TODO_TOOL, "No TODO items found", workspace, cx);
     panel.update(cx, |_, cx| {
         cx.observe_global::<Settings>(settings_changed).detach();
         // The modules of the project are known once the run panel has read the model, and

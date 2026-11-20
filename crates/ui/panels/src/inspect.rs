@@ -1322,45 +1322,38 @@ impl Render for ScopePopup {
                     .children(rows),
             )
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .id("inspect-scope-cancel")
-                            .debug_selector(|| "inspect-scope-cancel".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .hover(|style| style.bg(theme.selection_hover))
-                            .tooltip(|_, cx| tooltip("Cancel", Some(SharedString::from("Esc")), cx))
-                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "inspect-scope-run",
+                            "inspect-scope-run".to_owned(),
+                            "Inspect",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .tooltip(|_, cx| {
+                            tooltip("Inspect Code", Some(SharedString::from("Enter")), cx)
+                        })
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.pick(this.selected, window, cx)),
+                        ),
                     )
-                    .child(
-                        div()
-                            .id("inspect-scope-run")
-                            .debug_selector(|| "inspect-scope-run".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .bg(theme.accent)
-                            .text_color(theme.over_accent)
-                            .tooltip(|_, cx| {
-                                tooltip("Inspect Code", Some(SharedString::from("Enter")), cx)
-                            })
-                            .tooltip_show_delay(ui_kit::tooltip_show_delay())
-                            .child("Inspect")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.pick(this.selected, window, cx)
-                            })),
-                    ),
+                    .other(
+                        dialog_button(
+                            "inspect-scope-cancel",
+                            "inspect-scope-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .tooltip(|_, cx| tooltip("Cancel", Some(SharedString::from("Esc")), cx))
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(
@@ -2393,6 +2386,7 @@ impl Render for InspectPanel {
         workspace::note_view_render(cx, "inspection");
         let theme = *cx.global::<Theme>();
         let (workspace, tool) = (self.workspace.clone(), INSPECTION_TOOL);
+        let options = crate::tool_menu::options_menu(workspace.clone(), tool, |_| Vec::new());
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| workspace.toggle_tool(tool, window, cx))
@@ -2510,7 +2504,7 @@ impl Render for InspectPanel {
             let text = if self.progress.is_some() {
                 "Inspecting the scope..."
             } else {
-                "No problems found."
+                "No problems found"
             };
             div()
                 .p(px(SPACE_L))
@@ -2550,7 +2544,14 @@ impl Render for InspectPanel {
                 }
             }))
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(panel_header(self.title.clone(), GROUP, hide, &theme))
+            .child(panel_header(
+                self.title.clone(),
+                GROUP,
+                "inspection",
+                options,
+                hide,
+                &theme,
+            ))
             .child(toolbar)
             .child(div().flex_1().min_h_0().pt(px(SPACE_S)).child(body))
     }

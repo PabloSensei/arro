@@ -61,6 +61,7 @@ struct LookupLanguage {
     resolve_delay: Mutex<Duration>,
     expected: Mutex<Option<String>>,
     signatures: Mutex<SignatureHelp>,
+    signature_delay: Mutex<Duration>,
     documentation: Mutex<Option<String>>,
     completions: AtomicUsize,
     resolves: AtomicUsize,
@@ -76,6 +77,7 @@ impl LookupLanguage {
             resolve_delay: Mutex::new(Duration::from_millis(0)),
             expected: Mutex::new(None),
             signatures: Mutex::new(SignatureHelp::default()),
+            signature_delay: Mutex::new(Duration::from_millis(0)),
             documentation: Mutex::new(None),
             completions: AtomicUsize::new(0),
             resolves: AtomicUsize::new(0),
@@ -97,6 +99,12 @@ impl LookupLanguage {
 
     fn set_signatures(&self, signatures: SignatureHelp) {
         *self.signatures.lock().unwrap() = signatures;
+    }
+
+    /// Holds the signature answers back, so a test can switch the overload while one is
+    /// still on its way.
+    fn set_signature_delay(&self, delay: Duration) {
+        *self.signature_delay.lock().unwrap() = delay;
     }
 
     fn set_documentation(&self, url: Option<&str>) {
@@ -205,7 +213,16 @@ impl Provider<SignatureQuery, SignatureHelp> for LookupLanguage {
     ) {
         let mut help = self.signatures.lock().unwrap().clone();
         help.active_parameter = self.active_parameter(&query.0);
-        let _ = reply.send(self.answer(help));
+        let answer = self.answer(help);
+        let delay = *self.signature_delay.lock().unwrap();
+        if delay.is_zero() {
+            let _ = reply.send(answer);
+        } else {
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let _ = reply.send(answer);
+            });
+        }
     }
 }
 
@@ -552,16 +569,67 @@ fn parameter_info_follows_the_caret_and_switches_the_overload(cx: &mut TestAppCo
     );
 
     press(cx, window, "ctrl-down");
+    wait_for(cx, "the next overload", Duration::from_secs(5), |cx| {
+        view.read_with(cx, |view, _| view.signature_position()) == Some((1, 0))
+    });
+    press(cx, window, "ctrl-up");
+    // The caret is still in the second argument, so the first overload bolds its second
+    // parameter, as IDEA does: a manual pick keeps the overload, the caret says which
+    // parameter is active.
+    wait_for(
+        cx,
+        "the first overload with its second parameter",
+        Duration::from_secs(5),
+        |cx| view.read_with(cx, |view, _| view.signature_position()) == Some((0, 1)),
+    );
+}
+
+#[ui_kit::gpui::test]
+fn parameter_info_keeps_the_overload_picked_by_hand(cx: &mut TestAppContext) {
+    let root = project(
+        "lookup-parameter-late",
+        &[("src/A.txt", "call(one, two)\n")],
+    );
+    let language = LookupLanguage::new();
+    let two = SignatureHelp {
+        signatures: vec![
+            call(
+                "call(String one, int two) : void",
+                &["String one", "int two"],
+            ),
+            call("call(String one) : void", &["String one"]),
+        ],
+        active_signature: 0,
+        active_parameter: 0,
+    };
+    language.set_signatures(two.clone());
+    // The answer to the caret move below comes slowly, after the user has already picked
+    // another overload by hand.
+    language.set_signature_delay(Duration::from_secs(1));
+    let window = open_window(cx, root.clone(), language.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    let (_, view) = open_file(cx, window, &root, "src/A.txt", "call(one, two)\n", 0, 5);
+
+    press(cx, window, "ctrl-p");
+    wait_for(cx, "the two overloads", Duration::from_secs(10), |cx| {
+        view.read_with(cx, |view, _| {
+            (view.signature_count(), view.signature_position())
+        }) == (Some(2), Some((0, 0)))
+    });
+
+    let mut three = two;
+    three.signatures.push(call("call() : void", &[]));
+    language.set_signatures(three);
+    press(cx, window, "end");
+    press(cx, window, "ctrl-down");
+    wait_for(cx, "the late answer", Duration::from_secs(10), |cx| {
+        view.read_with(cx, |view, _| view.signature_count()) == Some(3)
+    });
     assert_eq!(
         view.read_with(cx, |view, _| view.signature_position()),
         Some((1, 0)),
-        "Ctrl+Down shows the next overload"
-    );
-    press(cx, window, "ctrl-up");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.signature_position()),
-        Some((0, 0)),
-        "Ctrl+Up goes back"
+        "a late answer does not take the overload picked by hand"
     );
 }
 

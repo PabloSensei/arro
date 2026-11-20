@@ -22,6 +22,9 @@ use crate::preview::{self, FilePreview, PreviewTarget};
 const CONTEXT: &str = "FindInFiles";
 const WIDTH: f32 = 900.;
 const HEIGHT: f32 = 640.;
+/// The smallest size the window resizes to.
+pub(crate) const MIN_WIDTH: f32 = 480.;
+pub(crate) const MIN_HEIGHT: f32 = 360.;
 /// More lines than this are no use to look through; the search says so.
 const MAX_LINES: usize = 1000;
 
@@ -142,6 +145,8 @@ pub struct Finder {
     preview_drag: Option<f32>,
     /// The state folder that remembers the height.
     store: Option<Arc<store::Store>>,
+    /// The pin of the window: a click outside does not close it.
+    pinned: bool,
 }
 
 type Found = (Result<(), SearchError>, Vec<FileHits>);
@@ -206,6 +211,7 @@ impl Finder {
             preview_height,
             preview_drag: None,
             store,
+            pinned: false,
         });
         cx.set_global(ActiveFinder(Some(view.clone())));
         let focus = view.read(cx).focus.clone();
@@ -799,6 +805,12 @@ impl Finder {
         &self.mask_hint
     }
 
+    /// Whether the window stays open on a click outside, for tests.
+    #[cfg(test)]
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
     /// The mask the user typed, for tests.
     #[cfg(test)]
     pub(crate) fn mask_text(&self) -> &str {
@@ -1024,9 +1036,12 @@ impl Render for Finder {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let viewport = window.viewport_size();
-        let width = px(WIDTH);
-        let left = (viewport.width - width) / 2.;
-        let top = viewport.height * 0.12;
+        let first = DialogPlace {
+            left: (f32::from(viewport.width) - WIDTH) / 2.,
+            top: f32::from(viewport.height) * 0.12,
+            width: WIDTH,
+            height: Some(HEIGHT),
+        };
         let rows = self.rows();
         let items: Vec<_> = rows
             .iter()
@@ -1067,6 +1082,39 @@ impl Render for Finder {
         } else {
             "Find in Files"
         };
+        let pin = icon_button("finder-pin", "general/pin", "Pin window", None, &theme)
+            .debug_selector(|| "finder-pin".to_owned())
+            .when(self.pinned, |this| {
+                this.bg(theme.tab_selected)
+                    .border_1()
+                    .border_color(theme.tab_selected_border)
+            })
+            // A press on the pin is not the start of a drag of the header.
+            .on_mouse_down(
+                MouseButton::Left,
+                |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                    cx.stop_propagation();
+                },
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.pinned = !this.pinned;
+                cx.notify();
+            }));
+        let header = popup_drag_header(
+            cx,
+            "finder",
+            (MIN_WIDTH, MIN_HEIGHT),
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .flex_none()
+                .h(px(CONTROL_HEIGHT))
+                .px(px(ROW_PADDING_X))
+                .debug_selector(|| "finder-title".to_owned())
+                .child(heading)
+                .child(pin),
+        );
         let find_label = "Search for";
         let mask_row = div()
             .id("find-mask")
@@ -1157,8 +1205,6 @@ impl Render for Finder {
             .key_context("FindInFiles ToolWindow")
             .track_focus(&self.focus)
             .occlude()
-            .w(width)
-            .h(px(HEIGHT))
             .p(px(POPUP_PADDING))
             .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
             .on_action(cx.listener(|this, _: &Previous, _, cx| this.move_selection(-1, cx)))
@@ -1168,14 +1214,12 @@ impl Render for Finder {
             .on_action(
                 cx.listener(|this, _: &Open, window, cx| this.open(this.selected, window, cx)),
             )
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(CONTROL_HEIGHT))
-                    .px(px(ROW_PADDING_X))
-                    .child(heading),
-            )
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                if !this.pinned {
+                    this.dismiss(window, cx);
+                }
+            }))
+            .child(header)
             .child(
                 div()
                     .flex()
@@ -1335,11 +1379,18 @@ impl Render for Finder {
                     ),
             );
 
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("finder-enter", body))
+        popup_window(
+            PopupSpec {
+                key: "finder",
+                place: first,
+                min: (MIN_WIDTH, MIN_HEIGHT),
+                content_height: false,
+                max_height: None,
+            },
+            body,
+            window,
+            cx,
+        )
     }
 }
 

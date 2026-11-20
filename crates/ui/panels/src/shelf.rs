@@ -415,42 +415,30 @@ impl Render for UnshelveDialog {
                     .child("Delete shelf after apply"),
             )
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .id("unshelve-cancel")
-                            .debug_selector(|| "unshelve-cancel".to_owned())
-                            .px(px(12.))
-                            .h(px(26.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .border_1()
-                            .border_color(theme.popup_border)
-                            .hover({
-                                let hover = theme.hover;
-                                move |style| style.bg(hover)
-                            })
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "unshelve-apply",
+                            "unshelve-apply".to_owned(),
+                            "Unshelve",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.unpack(window, cx))),
                     )
-                    .child(
-                        div()
-                            .id("unshelve-apply")
-                            .debug_selector(|| "unshelve-apply".to_owned())
-                            .px(px(12.))
-                            .h(px(26.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .bg(theme.accent)
-                            .text_color(theme.over_accent)
-                            .child("Unshelve")
-                            .on_click(cx.listener(|this, _, window, cx| this.unpack(window, cx))),
-                    ),
+                    .other(
+                        dialog_button(
+                            "unshelve-cancel",
+                            "unshelve-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(

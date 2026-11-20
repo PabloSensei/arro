@@ -65,6 +65,14 @@ impl RunConfigProvider for QuarkusDevProvider {
         PROVIDER_ID
     }
 
+    fn group_name(&self, _config: &RunConfig) -> &'static str {
+        "Quarkus"
+    }
+
+    fn group_icon(&self, _config: &RunConfig) -> &'static str {
+        self.tool.task_icon()
+    }
+
     /// One configuration per module whose dependencies name Quarkus.
     fn discover(&self, model: &ProjectModel) -> Result<Vec<RunConfig>> {
         if !model.resolved {

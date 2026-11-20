@@ -36,7 +36,6 @@ use crate::console_links;
 use crate::console_search::{ConsoleSearch, SearchToggle};
 use crate::mcp_debug::{Answer as ToolAnswer, DebugBridge, Job as ToolJob, Request as ToolRequest};
 use crate::navigation;
-use crate::project_structure::dialog_button;
 use crate::prompt::Prompt;
 
 const CONTEXT: &str = "DebugPanel";
@@ -6873,40 +6872,37 @@ impl Render for EvaluateView {
             .track_focus(&self.focus)
             .text_size(px(CODE_SIZE))
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        // The buttons close the window's contents, below the result, as in the other dialogs.
+        let buttons = DialogButtons::new()
+            .primary(
+                dialog_button(
+                    "evaluate-run",
+                    "evaluate-run".to_owned(),
+                    "Evaluate",
+                    true,
+                    has_text,
+                    &theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.run(cx))),
+            )
+            .other(
+                dialog_button(
+                    "evaluate-add-watch",
+                    "evaluate-add-watch".to_owned(),
+                    "Add to Watches",
+                    false,
+                    has_text,
+                    &theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.add_watch(cx))),
+            )
+            .into_row();
         let contents = div()
             .flex()
             .flex_col()
             .gap(px(SPACE_S))
             .p(px(DIALOG_PADDING))
             .child(field)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_S))
-                    .child(
-                        dialog_button(
-                            "evaluate-run",
-                            "evaluate-run".to_owned(),
-                            "Evaluate",
-                            true,
-                            has_text,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.run(cx))),
-                    )
-                    .child(
-                        dialog_button(
-                            "evaluate-add-watch",
-                            "evaluate-add-watch".to_owned(),
-                            "Add to Watches",
-                            false,
-                            has_text,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.add_watch(cx))),
-                    ),
-            )
             .child(result)
             .when(!history.is_empty(), |this| {
                 this.child(
@@ -6918,7 +6914,8 @@ impl Render for EvaluateView {
                         .child("History"),
                 )
                 .children(history_rows)
-            });
+            })
+            .child(buttons);
         let viewport = window.viewport_size();
         let width = px(560.);
         let left = (viewport.width - width) / 2.;
@@ -7584,6 +7581,10 @@ impl Render for DebugPanel {
         let can_drop = self.restart_frame_enabled();
         let can_restart = self.restart.is_some();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::DEBUG_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -7820,7 +7821,7 @@ impl Render for DebugPanel {
                 )
             }))
             .child(
-                panel_header(self.title.clone(), GROUP, hide, &theme)
+                panel_header(self.title.clone(), GROUP, "debug", options, hide, &theme)
                     .debug_selector(|| "debug-header".to_owned()),
             )
             .child(toolbar)
@@ -8662,12 +8663,13 @@ impl Render for BreakpointsView {
             .text_color(theme.text)
             .text_size(px(UI_SIZE))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
+                // Enter presses Close, the primary button, as Escape does.
+                if matches!(event.keystroke.key.as_str(), "escape" | "enter") {
                     this.close(window, cx);
                     cx.stop_propagation();
                 }
             }));
-        let contents = scrollable(
+        let list = scrollable(
             "breakpoints-dialog",
             &self.scroll,
             div()
@@ -8679,24 +8681,37 @@ impl Render for BreakpointsView {
                 .track_scroll(&self.scroll)
                 .p(px(DIALOG_PADDING))
                 .gap(px(SPACE_M))
-                .children(rows)
-                .child(
-                    div().flex().justify_end().child(
-                        tool_button(
-                            "breakpoints-close",
-                            "general/close",
-                            "Close",
-                            Some("Escape"),
-                            true,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                    ),
-                ),
+                .children(rows),
             &theme,
             window,
             cx,
         );
+        // Close is the one button of the window: it stands in the bottom row, under the list.
+        let close_row = DialogButtons::new()
+            .primary(
+                dialog_button(
+                    "breakpoints-close",
+                    "breakpoints-close".to_owned(),
+                    "Close",
+                    true,
+                    true,
+                    &theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+            )
+            .into_row();
+        let contents = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .child(
+                div()
+                    .px(px(DIALOG_PADDING))
+                    .pb(px(DIALOG_PADDING))
+                    .child(close_row),
+            );
         let viewport = window.viewport_size();
         let width = px(760.);
         let left = (viewport.width - width) / 2.;

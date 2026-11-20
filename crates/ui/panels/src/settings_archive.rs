@@ -341,37 +341,30 @@ impl Render for ImportSettingsDialog {
             )
             .child(div().flex().flex_col().children(rows))
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .id("settings-import-cancel")
-                            .debug_selector(|| "settings-import-cancel".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .hover(|style| style.bg(theme.selection_hover))
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "settings-import-run",
+                            "settings-import-run".to_owned(),
+                            "Import",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
                     )
-                    .child(
-                        div()
-                            .id("settings-import-run")
-                            .debug_selector(|| "settings-import-run".to_owned())
-                            .px(px(SPACE_L))
-                            .h(px(CONTROL_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .rounded(px(CONTROL_RADIUS))
-                            .bg(theme.accent)
-                            .text_color(theme.over_accent)
-                            .child("Import")
-                            .on_click(cx.listener(|this, _, window, cx| this.accept(window, cx))),
-                    ),
+                    .other(
+                        dialog_button(
+                            "settings-import-cancel",
+                            "settings-import-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(

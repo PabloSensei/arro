@@ -22,6 +22,7 @@ use crate::window_tests::{
     click, draw, open_window, press, sample_project, type_text, wait_for_settled_bounds,
     wait_for_signal,
 };
+use crate::window_tests_database_sources::data_sources_of;
 
 const SERVICE: &str = "Arro/database/owners";
 const ACCOUNT: &str = "sa";
@@ -156,6 +157,12 @@ fn open_dialog(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     draw(cx, window);
 }
 
+/// The Save password flag of the Data Sources window, when it is open.
+fn save_flag(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> Option<bool> {
+    let dialog = data_sources_of(cx, window)?;
+    dialog.read_with(cx, |dialog, _| dialog.save_password_for_test())
+}
+
 /// Fills the form through the fields of the dialog, as the user clicks and types.
 fn fill_fields(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     for (selector, text) in [
@@ -181,7 +188,7 @@ fn the_save_password_flag_writes_the_password_of_a_new_source(cx: &mut TestAppCo
 
     open_dialog(cx, window);
     assert_eq!(
-        panel.read_with(cx, |panel, _| panel.dialog_save_password_for_test()),
+        save_flag(cx, window),
         Some(true),
         "the flag is on while the machine has a store"
     );
@@ -264,7 +271,7 @@ fn an_off_flag_removes_the_stored_password_of_the_source(cx: &mut TestAppContext
     click(cx, window, "database-save-password");
     draw(cx, window);
     assert_eq!(
-        panel.read_with(cx, |panel, _| panel.dialog_save_password_for_test()),
+        save_flag(cx, window),
         Some(false),
         "the flag of the form is off"
     );
@@ -296,15 +303,11 @@ fn without_a_store_the_save_password_flag_stays_off(cx: &mut TestAppContext) {
     );
 
     open_dialog(cx, window);
-    assert_eq!(
-        panel.read_with(cx, |panel, _| panel.dialog_save_password_for_test()),
-        Some(false),
-        "the flag starts off"
-    );
+    assert_eq!(save_flag(cx, window), Some(false), "the flag starts off");
     click(cx, window, "database-save-password");
     draw(cx, window);
     assert_eq!(
-        panel.read_with(cx, |panel, _| panel.dialog_save_password_for_test()),
+        save_flag(cx, window),
         Some(false),
         "the flag of a missing store does not turn on"
     );

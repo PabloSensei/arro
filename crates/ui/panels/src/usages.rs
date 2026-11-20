@@ -27,6 +27,9 @@ use crate::project::ActiveProjectPanel;
 const POPUP_CONTEXT: &str = "ShowUsagesPopup";
 const POPUP_WIDTH: f32 = 640.;
 const POPUP_HEIGHT: f32 = 420.;
+/// The smallest size the window resizes to.
+const MIN_WIDTH: f32 = 360.;
+const MIN_HEIGHT: f32 = 240.;
 const SNIPPET: usize = 120;
 const FILE_WIDTH: f32 = 190.;
 
@@ -2293,6 +2296,25 @@ impl Render for ShowUsagesPopup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let searching = !self.done;
+        let viewport = window.viewport_size();
+        let left = f32::from(
+            self.position
+                .x
+                .min(viewport.width - px(POPUP_WIDTH) - px(SPACE_M))
+                .max(px(SPACE_M)),
+        );
+        let top = f32::from(
+            self.position
+                .y
+                .min(viewport.height - px(POPUP_HEIGHT))
+                .max(px(SPACE_M)),
+        );
+        let first = DialogPlace {
+            left,
+            top,
+            width: POPUP_WIDTH,
+            height: None,
+        };
         let title = format!("Usages of \"{}\"", self.name);
         let status = if searching {
             "Searching...".to_owned()
@@ -2310,38 +2332,51 @@ impl Render for ShowUsagesPopup {
             .rounded(px(CONTROL_RADIUS))
             .text_color(theme.accent)
             .hover(move |style| style.bg(theme.hover))
+            // A press on the button is not the start of a drag of the header.
+            .on_mouse_down(
+                MouseButton::Left,
+                |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                    cx.stop_propagation();
+                },
+            )
             .on_click(cx.listener(|this, _, window, cx| this.open_in_window(window, cx)))
             .child("Open in Find Window");
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .gap(px(SPACE_M))
-            .h(px(CONTROL_HEIGHT))
-            .px(px(SPACE_M))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_S))
-                    .min_w_0()
-                    .child(icon("codeInsight/search", &theme))
-                    .child(div().truncate().child(title)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .debug_selector(|| "usages-status".to_owned())
-                            .text_color(theme.text_secondary)
-                            .child(status),
-                    )
-                    .child(open_in_window),
-            );
+        let header = popup_drag_header(
+            cx,
+            "usages-popup",
+            (MIN_WIDTH, MIN_HEIGHT),
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .flex_none()
+                .gap(px(SPACE_M))
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_M))
+                .debug_selector(|| "usages-title".to_owned())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .min_w_0()
+                        .child(icon("codeInsight/search", &theme))
+                        .child(div().truncate().child(title)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .debug_selector(|| "usages-status".to_owned())
+                                .text_color(theme.text_secondary)
+                                .child(status),
+                        )
+                        .child(open_in_window),
+                ),
+        );
         let filter = (!self.query.text.is_empty()).then(|| {
             div()
                 .debug_selector(|| "usages-search".to_owned())
@@ -2447,8 +2482,6 @@ impl Render for ShowUsagesPopup {
             .key_context(POPUP_CONTEXT)
             .track_focus(&self.focus)
             .occlude()
-            .w(px(POPUP_WIDTH))
-            .max_h(px(POPUP_HEIGHT))
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
@@ -2473,22 +2506,17 @@ impl Render for ShowUsagesPopup {
                 .flex_1()
                 .min_h_0(),
             );
-        let viewport = window.viewport_size();
-        let width = px(POPUP_WIDTH);
-        let left = self
-            .position
-            .x
-            .min(viewport.width - width - px(SPACE_M))
-            .max(px(SPACE_M));
-        let top = self
-            .position
-            .y
-            .min(viewport.height - px(80.))
-            .max(px(SPACE_M));
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("usages-enter", body))
+        popup_window(
+            PopupSpec {
+                key: "usages-popup",
+                place: first,
+                min: (MIN_WIDTH, MIN_HEIGHT),
+                content_height: true,
+                max_height: Some(POPUP_HEIGHT),
+            },
+            body,
+            window,
+            cx,
+        )
     }
 }

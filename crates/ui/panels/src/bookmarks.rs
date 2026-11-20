@@ -846,6 +846,8 @@ impl Render for BookmarksPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), BOOKMARKS_TOOL, |_| Vec::new());
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -953,45 +955,25 @@ impl Render for BookmarksPanel {
                     this.rename_selected(window, cx)
                 }),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .h(px(CONTROL_HEIGHT))
-                    .pl(px(SPACE_M))
-                    .pr(px(SPACE_S))
-                    .text_size(px(UI_SIZE))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_XS))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Bookmarks"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_XS))
-                            .child(
-                                icon_button(
-                                    "bookmark-new-group",
-                                    "general/add",
-                                    "New Group",
-                                    None,
-                                    &theme,
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.new_group(window, cx)),
-                                ),
-                            )
-                            .child(panel_tools(GROUP, hide, &theme)),
-                    ),
-            )
-            .child(
+            .child(tool_header(
+                div().font_weight(FontWeight::MEDIUM).child("Bookmarks"),
+                icon_button(
+                    "bookmark-new-group",
+                    "general/add",
+                    "New Group",
+                    None,
+                    &theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.new_group(window, cx))),
+                GROUP,
+                "bookmarks",
+                options,
+                hide,
+                &theme,
+            ))
+            .child(if self.rows.is_empty() {
+                self.empty_state(&theme, cx)
+            } else {
                 scrollable(
                     "bookmark-tree",
                     &self.scroll,
@@ -1008,7 +990,48 @@ impl Render for BookmarksPanel {
                     cx,
                 )
                 .flex_1()
-                .min_h_0(),
+                .min_h_0()
+                .into_any_element()
+            })
+    }
+}
+
+impl BookmarksPanel {
+    /// The empty list: the text and the action that toggles a bookmark at the caret, as F11
+    /// does.
+    fn empty_state(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(px(SPACE_S))
+            .text_color(theme.text_secondary)
+            .child("No bookmarks")
+            .child(
+                div()
+                    .id("bookmarks-empty-toggle")
+                    .debug_selector(|| "bookmarks-empty-toggle".to_owned())
+                    .cursor_pointer()
+                    .text_color(theme.accent)
+                    .child("Toggle Bookmark (F11)")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_caret_bookmark(cx))),
             )
+            .into_any_element()
+    }
+
+    /// Toggles the bookmark at the caret of the active editor.
+    fn toggle_caret_bookmark(&mut self, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some((_, view)) = workspace.active_editor() else {
+                    return;
+                };
+                if let Ok(editor) = view.downcast::<editor_view::EditorView>() {
+                    editor.update(cx, |view, cx| view.toggle_bookmark(None, cx));
+                }
+            })
+            .ok();
     }
 }

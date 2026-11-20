@@ -21,6 +21,7 @@ use workspace::{DATABASE_TOOL, Workspace};
 
 use crate::database_panel::{ActiveDatabase, DatabasePanel};
 use crate::window_tests::{click, draw, open_window, press, sample_project, wait_for_signal};
+use crate::window_tests_database_sources::data_sources_of;
 
 const SOURCE: &str = "owners";
 const VERSION: &str = "42.7.4";
@@ -199,21 +200,24 @@ fn a_source_without_a_driver_names_it_and_offers_the_download(cx: &mut TestAppCo
     );
 }
 
+/// The version the Data Sources window shows for its product, when the window is open.
+fn version_of_form(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> Option<String> {
+    let dialog = data_sources_of(cx, window)?;
+    dialog
+        .read_with(cx, |dialog, _| dialog.version_for_test())
+        .filter(|version| !version.is_empty())
+}
+
 #[ui_kit::gpui::test]
 fn the_source_form_shows_the_version_of_the_repository(cx: &mut TestAppContext) {
-    let (window, panel, _, _) = source_shown(cx, "database-driver-version");
+    let (window, _panel, _, _) = source_shown(cx, "database-driver-version");
 
     click(cx, window, "database-add");
 
     wait_for_signal(cx, "the version of the repository", |cx| {
-        panel
-            .read_with(cx, |panel, _| panel.dialog_version_for_test())
-            .is_some()
+        version_of_form(cx, window).is_some()
     });
-    assert_eq!(
-        panel.read_with(cx, |panel, _| panel.dialog_version_for_test()),
-        Some(VERSION.to_owned())
-    );
+    assert_eq!(version_of_form(cx, window), Some(VERSION.to_owned()));
     assert!(
         shown(cx, window, "database-dialog-download"),
         "the form offers the download of the version it shows"

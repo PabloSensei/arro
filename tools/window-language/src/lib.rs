@@ -206,6 +206,36 @@ pub fn spring_data(root: &Path) -> Arc<dyn LanguageSupport> {
     java_lang::spring_data_support(root.to_path_buf())
 }
 
+/// The database support of the language layer for the project at `root`: the drivers of its
+/// dependencies, and the helper that the Database window starts for a connection. `cache` is
+/// the folder the driver downloads go to.
+pub fn database_support(root: &Path, cache: &Path) -> Arc<dyn database::Support> {
+    Arc::new(java_lang::DatabaseSupport::new(
+        root.to_path_buf(),
+        None,
+        cache.to_path_buf(),
+    ))
+}
+
+/// The newest PostgreSQL driver jar of the Maven repository that `MAVEN_USER_HOME` names, for
+/// the tests that reach a real server. `None` when the repository has no such jar.
+pub fn postgresql_driver_jar() -> Option<PathBuf> {
+    let home = std::env::var_os("MAVEN_USER_HOME")?;
+    let root = PathBuf::from(home).join("repository/org/postgresql/postgresql");
+    let mut versions: Vec<PathBuf> = fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    versions.sort();
+    versions.into_iter().rev().find_map(|version| {
+        let name = format!("postgresql-{}.jar", version.file_name()?.to_string_lossy());
+        let jar = version.join(name);
+        jar.is_file().then_some(jar)
+    })
+}
+
 /// The migrations of a project whose build model the test has read already: the files of
 /// its migration tool, the changelogs of its includes, and their state against a history
 /// table the window hands back.

@@ -775,6 +775,10 @@ impl Render for JShellPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::JSHELL_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -826,7 +830,9 @@ impl Render for JShellPanel {
             .flex()
             .flex_col()
             .h_full()
-            .child(panel_header("JShell", GROUP, hide, &theme))
+            .child(panel_header(
+                "JShell", GROUP, "jshell", options, hide, &theme,
+            ))
             .child(toolbar)
             .children(hint)
             .child(body.flex_1().min_h_0())

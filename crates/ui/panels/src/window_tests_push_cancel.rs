@@ -26,7 +26,7 @@ fn bare_subject(git: &vcs::GitRunner, bare: &Path) -> String {
 }
 
 /// Opens the Push window of a repository whose one local commit waits for its remote.
-fn open_push_window(
+pub(crate) fn open_push_window(
     cx: &mut TestAppContext,
     name: &str,
 ) -> (

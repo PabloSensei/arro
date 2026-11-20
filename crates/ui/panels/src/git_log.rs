@@ -3453,8 +3453,6 @@ impl GitLogPanel {
             .items_center()
             .gap(px(SPACE_XS))
             .flex_none()
-            .px(px(SPACE_M))
-            .pb(px(SPACE_XS))
             .child(tab(
                 "git-tab-local",
                 "Local Changes",
@@ -4382,6 +4380,12 @@ impl RebaseView {
             cx.stop_propagation();
             return;
         }
+        // Enter presses Start Rebasing, the primary button.
+        if key == "enter" && !stroke.modifiers.alt {
+            self.start(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if stroke.modifiers.alt && key == "up" {
             self.move_selected(-1, cx);
             cx.stop_propagation();
@@ -4416,39 +4420,6 @@ impl RebaseView {
                 cx.stop_propagation();
             }
         }
-    }
-
-    fn button(
-        id: &'static str,
-        label: &'static str,
-        primary: bool,
-        theme: &Theme,
-    ) -> Stateful<Div> {
-        let (hover, pressed) = (theme.hover, theme.pressed);
-        div()
-            .id(id)
-            .debug_selector(move || id.to_owned())
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .px(px(SPACE_M))
-            .rounded(px(CONTROL_RADIUS))
-            .border_1()
-            .border_color(if primary {
-                theme.accent
-            } else {
-                theme.popup_border
-            })
-            .when(primary, |this| {
-                this.bg(theme.accent).text_color(theme.over_accent)
-            })
-            .when(!primary, |this| {
-                this.hover(move |style| style.bg(hover))
-                    .active(move |style| style.bg(pressed))
-            })
-            .child(label)
     }
 
     fn row(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -4704,24 +4675,41 @@ impl Render for RebaseView {
             )
             .children(editing_message.then(|| self.message_editor(&theme, cx)))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(SPACE_S))
-                    .flex_none()
-                    .child(
-                        Self::button("rebase-reset", "Reset", false, &theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.reset_plan(cx))),
+                DialogButtons::new()
+                    .extra(
+                        dialog_button(
+                            "rebase-reset",
+                            "rebase-reset".to_owned(),
+                            "Reset",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_plan(cx))),
                     )
-                    .child(
-                        Self::button("rebase-cancel", "Cancel", false, &theme)
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    .primary(
+                        dialog_button(
+                            "rebase-start",
+                            "rebase-start".to_owned(),
+                            "Start Rebasing",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
                     )
-                    .child(
-                        Self::button("rebase-start", "Start Rebasing", true, &theme)
-                            .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
-                    ),
+                    .other(
+                        dialog_button(
+                            "rebase-cancel",
+                            "rebase-cancel".to_owned(),
+                            "Cancel",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(
@@ -4794,32 +4782,40 @@ impl Render for GitLogPanel {
                 panel.update(cx, |panel, cx| panel.load_more(cx)).ok();
             });
         }
-        let branch = self.git.read(cx).status().branch.clone();
-        let root_title = self.root.as_ref().and_then(|prefix| {
-            self.roots
-                .iter()
-                .find(|(root, _)| root == prefix)
-                .map(|(_, label)| label.clone())
-        });
-        let title: SharedString = match &self.path {
-            Some(path) => {
-                let root = self
-                    .git
-                    .read(cx)
-                    .repo()
-                    .map(|repo| repo.root().to_path_buf())
-                    .unwrap_or_default();
-                format!("Git Log: {}", relative_of(&root, path)).into()
-            }
-            None => match (branch, root_title) {
-                (Some(branch), Some(root)) => format!("Git Log: {branch} ({root})").into(),
-                (Some(branch), None) => format!("Git Log: {branch}").into(),
-                (None, Some(root)) => format!("Git Log: {root}").into(),
-                (None, None) => "Git Log".into(),
-            },
-        };
+        let title = "Git";
         let busy = self.loading || self.files_loading;
         let tabs = self.tab_strip(&theme, cx);
+        let workspace = self.workspace.clone();
+        let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.toggle_tool(LOG_TOOL, window, cx)
+                })
+                .ok();
+        };
+        let options =
+            crate::tool_menu::options_menu(self.workspace.clone(), LOG_TOOL, |_| Vec::new());
+        let head = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .min_w_0()
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .debug_selector(|| "log-title".to_owned())
+                    .child(title),
+            )
+            .child(tabs);
+        let actions = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .when(busy, |this| {
+                this.child(div().text_color(theme.text_secondary).child("Loading..."))
+            });
+        let header = tool_header(head, actions, "left-panel", "log", options, hide, &theme)
+            .debug_selector(|| "log-header".to_owned());
         let body: AnyElement = if self.tab == GitTab::Console {
             self.console_panel(&theme, window, cx)
         } else if self.tab == GitTab::LocalChanges {
@@ -4951,6 +4947,7 @@ impl Render for GitLogPanel {
         };
         div()
             .id("git-log")
+            .group("left-panel")
             .debug_selector(|| "git-log".to_owned())
             .key_context("GitLog ToolWindow")
             .track_focus(&self.focus)
@@ -4967,37 +4964,7 @@ impl Render for GitLogPanel {
                 this.ask_branch_from_commit(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowAllAffected, _, cx| this.show_all_affected(cx)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .h(px(CONTROL_HEIGHT))
-                    .pl(px(SPACE_M))
-                    .pr(px(SPACE_S))
-                    .debug_selector(|| "log-header".to_owned())
-                    .border_b_1()
-                    .border_color(theme.toolbar_border)
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .debug_selector(|| "log-title".to_owned())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_S))
-                            .when(busy, |this| {
-                                this.child(
-                                    div().text_color(theme.text_secondary).child("Loading..."),
-                                )
-                            }),
-                    ),
-            )
-            .child(tabs)
+            .child(header)
             .child(body)
     }
 }

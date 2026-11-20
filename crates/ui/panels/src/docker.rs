@@ -1290,6 +1290,45 @@ impl DockerPanel {
             }
         }
         rows.extend(self.kube.tree(theme, cx));
+        if rows.is_empty() {
+            // The empty state of the list: the text and the action that adds a configuration.
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .py(px(SPACE_M))
+                    .text_color(theme.text_muted)
+                    .child("No services configured")
+                    .child(
+                        div()
+                            .id("services-empty-add")
+                            .debug_selector(|| "services-empty-add".to_owned())
+                            .cursor_pointer()
+                            .text_color(theme.accent)
+                            .child("Add service")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let workspace = this.workspace.clone();
+                                window.defer(cx, move |window, cx| {
+                                    workspace
+                                        .update(cx, |workspace, cx| {
+                                            let panel = cx
+                                                .try_global::<crate::script::ActiveRunPanel>()
+                                                .map(|panel| panel.0.clone());
+                                            if let Some(panel) = panel {
+                                                crate::run_configs::RunConfigDialog::show(
+                                                    panel, workspace, window, cx,
+                                                );
+                                            }
+                                        })
+                                        .ok();
+                                });
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
         rows
     }
 
@@ -1499,9 +1538,14 @@ impl DockerPanel {
         Vec::new()
     }
 
-    fn header(&self, theme: &Theme, show_labels: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn header(
+        &self,
+        theme: &Theme,
+        show_labels: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.kube.selected().is_some() {
-            return self.kube.header(theme, show_labels, cx);
+            return Some(self.kube.header(theme, show_labels, cx));
         }
         let (title, hint) = match (self.selected_run(), self.selected_run_group()) {
             (Some(name), _) => (name.into(), self.run_state(name, cx).text().into()),
@@ -1509,58 +1553,64 @@ impl DockerPanel {
                 || (group.into(), SharedString::default()),
                 |(known, members)| (known.title.into(), self.group_counter(&members, cx).into()),
             ),
-            (None, None) => self.selection_title(),
+            (None, None) if self.selected.is_some() => self.selection_title(),
+            (None, None) => (SharedString::default(), SharedString::default()),
         };
         let actions = self.header_actions(cx);
-        div()
-            .flex()
-            .items_center()
-            .gap(px(SPACE_S))
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .px(px(SPACE_M))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .id("docker-title")
-                    .debug_selector(|| "docker-title".to_owned())
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_S))
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .truncate()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(theme.text_secondary)
-                            .child(hint),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .flex_none()
-                    .children(actions.into_iter().map(|(action, icon, label, enabled)| {
-                        action_button(action, icon, label, enabled, show_labels, theme).when(
-                            enabled,
-                            |this| {
-                                this.on_click(cx.listener(move |this, _, window, cx| {
-                                    this.header_action(action, window, cx)
-                                }))
-                            },
+        if title.is_empty() && actions.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .flex_none()
+                .h(px(CONTROL_HEIGHT))
+                .px(px(SPACE_M))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .id("docker-title")
+                        .debug_selector(|| "docker-title".to_owned())
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title),
                         )
-                    })),
-            )
-            .into_any_element()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.text_secondary)
+                                .child(hint),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_XS))
+                        .flex_none()
+                        .children(actions.into_iter().map(|(action, icon, label, enabled)| {
+                            action_button(action, icon, label, enabled, show_labels, theme).when(
+                                enabled,
+                                |this| {
+                                    this.on_click(cx.listener(move |this, _, window, cx| {
+                                        this.header_action(action, window, cx)
+                                    }))
+                                },
+                            )
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn header_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2424,6 +2474,10 @@ impl Render for DockerPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::SERVICES_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -2476,7 +2530,7 @@ impl Render for DockerPanel {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(header)
+            .children(header)
             .children(tabs)
             .child(body);
         island(&theme)
@@ -2485,7 +2539,10 @@ impl Render for DockerPanel {
             .track_focus(&self.focus)
             .group(GROUP)
             .h_full()
-            .child(panel_header("Services", GROUP, hide, &theme))
+            .child(
+                panel_header("Services", GROUP, "services", options, hide, &theme)
+                    .debug_selector(|| "services-header".to_owned()),
+            )
             .child(
                 div()
                     .flex()

@@ -63,11 +63,11 @@ impl RefactorLanguage {
         })
     }
 
-    fn set_actions(&self, actions: Vec<ActionEntry>) {
+    pub(crate) fn set_actions(&self, actions: Vec<ActionEntry>) {
         *self.actions.lock().unwrap() = actions;
     }
 
-    fn set_form(&self, form: ActionParameters) {
+    pub(crate) fn set_form(&self, form: ActionParameters) {
         *self.form.lock().unwrap() = Some(form);
     }
 
@@ -154,7 +154,7 @@ impl LanguageSupport for RefactorLanguage {
     }
 }
 
-fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
+pub(crate) fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let root = scratch(name);
     for (path, text) in files {
         let path = root.join(path);
@@ -226,7 +226,7 @@ pub(crate) fn open_window(
     })
 }
 
-fn action(title: &str, code: &str, handle: Option<&str>) -> ActionEntry {
+pub(crate) fn action(title: &str, code: &str, handle: Option<&str>) -> ActionEntry {
     ActionEntry {
         title: title.to_owned(),
         kind: Some(ActionKind::Refactor),

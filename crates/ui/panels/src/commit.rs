@@ -3072,30 +3072,6 @@ impl Render for AnalysisDialog {
         let width = px(420.);
         let left = (window.viewport_size().width - width) / 2.;
         let top = window.viewport_size().height * 0.32;
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .debug_selector(move || id.to_string())
-                .px(px(12.))
-                .h(px(26.))
-                .flex()
-                .items_center()
-                .rounded(px(CONTROL_RADIUS))
-                .border_1()
-                .border_color(if primary {
-                    theme.accent
-                } else {
-                    theme.popup_border
-                })
-                .when(primary, |this| {
-                    this.bg(theme.accent).text_color(theme.over_accent)
-                })
-                .when(!primary, |this| {
-                    let hover = theme.hover;
-                    this.hover(move |style| style.bg(hover))
-                })
-                .child(label)
-        };
         let shell = surface(&theme)
             .id("analysis-dialog")
             .debug_selector(|| "analysis-dialog".to_owned())
@@ -3111,18 +3087,30 @@ impl Render for AnalysisDialog {
                 self.errors
             )))
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(8.))
-                    .child(
-                        button("analysis-review", "Review", false)
-                            .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
+                DialogButtons::new()
+                    .primary(
+                        dialog_button(
+                            "analysis-commit",
+                            "analysis-commit".to_owned(),
+                            "Commit anyway",
+                            true,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     )
-                    .child(
-                        button("analysis-commit", "Commit anyway", true)
-                            .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
-                    ),
+                    .other(
+                        dialog_button(
+                            "analysis-review",
+                            "analysis-review".to_owned(),
+                            "Review",
+                            false,
+                            true,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
+                    )
+                    .into_row(),
             );
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(
@@ -3156,6 +3144,10 @@ impl Render for CommitPanel {
         let busy = self.git.read(cx).busy();
         let branch = self.git.read(cx).status().branch.clone();
         let workspace = self.workspace.clone();
+        let options =
+            crate::tool_menu::options_menu(workspace.clone(), workspace::COMMIT_TOOL, |_| {
+                Vec::new()
+            });
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
@@ -3349,7 +3341,7 @@ impl Render for CommitPanel {
             .on_action(cx.listener(|this, _: &Unshelve, window, cx| this.ask_unshelve(window, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, window, cx| this.show_diff(window, cx)))
             .children((!self.embedded).then(|| {
-                panel_header(title, GROUP, hide, &theme)
+                panel_header(title, GROUP, "commit", options, hide, &theme)
                     .debug_selector(|| "commit-header".to_owned())
             }))
             .children((!self.embedded).then(|| self.tab_row(&theme, cx)))

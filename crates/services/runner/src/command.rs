@@ -97,6 +97,10 @@ impl RunConfigProvider for CommandProvider {
         PROVIDER_ID
     }
 
+    fn group_name(&self, _config: &RunConfig) -> &'static str {
+        "Shell Script"
+    }
+
     fn discover(&self, _model: &ProjectModel) -> Result<Vec<RunConfig>> {
         Ok(Vec::new())
     }
