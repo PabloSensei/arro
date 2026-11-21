@@ -434,6 +434,38 @@ fn implement_shows_only_the_abstract_methods(cx: &mut TestAppContext) {
 }
 
 #[ui_kit::gpui::test]
+fn override_groups_show_the_short_type_name(cx: &mut TestAppContext) {
+    let root = project(
+        "override-group-heading",
+        &[("src/Circle.txt", "class Circle {\n}\n")],
+    );
+    let path = root.join("src").join("Circle.txt");
+    let language = HierarchyLanguage::new();
+    *language.overridable.lock().unwrap() = vec![method(
+        "some.pkg.JpaRepository<some.pkg.Owner, some.pkg.Integer>",
+        "findAll",
+        &[],
+        true,
+    )];
+    let window = open_window(cx, root.clone(), language);
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &path);
+    press(cx, window, "ctrl-o");
+    draw(cx, window);
+    let view = editor_of(cx, window, &path);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.override_headers()),
+        Some(vec!["JpaRepository<Owner, Integer>".to_owned()]),
+        "the group heading keeps the short type name and its short arguments"
+    );
+    assert!(
+        bounds_of(cx, window, "override-owner-0").size.height > px(0.),
+        "the heading has its own row"
+    );
+}
+
+#[ui_kit::gpui::test]
 fn quick_definition_shows_the_source_and_enter_goes_there(cx: &mut TestAppContext) {
     let root = project(
         "quick-definition",

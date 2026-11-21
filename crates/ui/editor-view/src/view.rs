@@ -2325,6 +2325,23 @@ impl EditorView {
         Some(completion.labels())
     }
 
+    /// The headings of the groups of an open Override or Implement list, as the window
+    /// shows them. A test reads them; the paint uses the same names.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn override_headers(&self) -> Option<Vec<String>> {
+        let popup = self.lsp.as_ref()?.overrides.as_ref()?;
+        let mut headers = Vec::new();
+        let mut owner: Option<&str> = None;
+        for index in &popup.shown {
+            let method = &popup.methods[*index];
+            if owner != Some(method.owner.as_str()) {
+                owner = Some(method.owner.as_str());
+                headers.push(crate::hierarchy::owner_heading(&method.owner).0);
+            }
+        }
+        Some(headers)
+    }
+
     /// The text of the note under the caret, when one is on screen. A test reads it; nothing
     /// else does.
     #[cfg(any(test, feature = "test-support"))]
@@ -6860,19 +6877,42 @@ impl EditorView {
         {
             let mut rows: Vec<AnyElement> = Vec::new();
             let mut owner: Option<&str> = None;
+            let mut group = 0usize;
             for (row, index) in popup.shown.iter().enumerate() {
                 let method = &popup.methods[*index];
                 if owner != Some(method.owner.as_str()) {
                     owner = Some(method.owner.as_str());
+                    let (heading, package) = crate::hierarchy::owner_heading(&method.owner);
+                    let mut text = heading;
+                    let mut highlights = Vec::new();
+                    if let Some(package) = package {
+                        text.push_str("  ");
+                        let start = text.len();
+                        text.push_str(&package);
+                        highlights.push((
+                            start..text.len(),
+                            HighlightStyle {
+                                color: Some(theme.text_muted),
+                                ..HighlightStyle::default()
+                            },
+                        ));
+                    }
                     rows.push(
                         div()
                             .px_2()
                             .pt_1()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_secondary)
-                            .child(method.owner.clone())
+                            .debug_selector(move || format!("override-owner-{group}"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_secondary)
+                                    .child(StyledText::new(text).with_highlights(highlights)),
+                            )
                             .into_any_element(),
                     );
+                    group += 1;
                 }
                 let selected = row == popup.selected;
                 let checked = popup.checked[*index];

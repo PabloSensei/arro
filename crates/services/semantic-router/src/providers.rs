@@ -2878,7 +2878,7 @@ fn return_type_of(method: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|detail| !detail.is_empty())
     {
-        return Some(detail.to_owned());
+        return Some(lang_api::short_type_name(detail));
     }
     let key = method
         .get("bindingKey")
@@ -2886,34 +2886,88 @@ fn return_type_of(method: &serde_json::Value) -> Option<String> {
     type_descriptor(key.rsplit_once(')')?.1)
 }
 
-/// A type name from the descriptor at the end of a binding key: `V`, `[I`,
-/// `Lsome/Type;` or `TName;`.
+/// A type name from the descriptor after a binding key: `V`, `[I`, `Lsome/Type;`,
+/// `TName;`, or a type with arguments: `Lsome/List<Lsome/Owner;>;`. The parts of the
+/// package are dropped and the arguments stay, with wildcards as `? extends X` and
+/// `? super X`.
 fn type_descriptor(descriptor: &str) -> Option<String> {
     let mut rest = descriptor.trim();
+    descriptor_type(&mut rest)
+}
+
+/// One descriptor from the front of `rest`, with its array dimensions.
+fn descriptor_type(rest: &mut &str) -> Option<String> {
     let mut dimensions = 0;
     while let Some(after) = rest.strip_prefix('[') {
         dimensions += 1;
-        rest = after;
+        *rest = after;
     }
     let mut name = match rest.chars().next()? {
-        'V' => "void".to_owned(),
-        'Z' => "boolean".to_owned(),
-        'B' => "byte".to_owned(),
-        'C' => "char".to_owned(),
-        'S' => "short".to_owned(),
-        'I' => "int".to_owned(),
-        'J' => "long".to_owned(),
-        'F' => "float".to_owned(),
-        'D' => "double".to_owned(),
-        'L' | 'T' => {
-            let body = rest.get(1..)?;
-            let erased = body.split(';').next()?;
-            let name = erased.rsplit(['/', '.']).next().unwrap_or(erased);
-            let name = name.split('<').next().unwrap_or(name);
-            if name.is_empty() {
-                return None;
+        'V' => {
+            *rest = &rest[1..];
+            "void".to_owned()
+        }
+        'Z' => {
+            *rest = &rest[1..];
+            "boolean".to_owned()
+        }
+        'B' => {
+            *rest = &rest[1..];
+            "byte".to_owned()
+        }
+        'C' => {
+            *rest = &rest[1..];
+            "char".to_owned()
+        }
+        'S' => {
+            *rest = &rest[1..];
+            "short".to_owned()
+        }
+        'I' => {
+            *rest = &rest[1..];
+            "int".to_owned()
+        }
+        'J' => {
+            *rest = &rest[1..];
+            "long".to_owned()
+        }
+        'F' => {
+            *rest = &rest[1..];
+            "float".to_owned()
+        }
+        'D' => {
+            *rest = &rest[1..];
+            "double".to_owned()
+        }
+        'L' => {
+            *rest = &rest[1..];
+            let end = rest.find(['<', ';'])?;
+            let mut name = short_descriptor_name(&rest[..end])?;
+            *rest = &rest[end..];
+            if let Some(after) = rest.strip_prefix('<') {
+                *rest = after;
+                let mut arguments = Vec::new();
+                loop {
+                    *rest = rest.trim_start_matches([',', ' ']);
+                    if let Some(after) = rest.strip_prefix('>') {
+                        *rest = after;
+                        break;
+                    }
+                    arguments.push(descriptor_argument(rest)?);
+                }
+                name.push('<');
+                name.push_str(&arguments.join(", "));
+                name.push('>');
             }
-            name.to_owned()
+            *rest = rest.strip_prefix(';').unwrap_or(rest);
+            name
+        }
+        'T' => {
+            *rest = &rest[1..];
+            let end = rest.find(';')?;
+            let name = short_descriptor_name(&rest[..end])?;
+            *rest = &rest[end + 1..];
+            name
         }
         _ => return None,
     };
@@ -2921,6 +2975,31 @@ fn type_descriptor(descriptor: &str) -> Option<String> {
         name.push_str("[]");
     }
     Some(name)
+}
+
+/// One type argument of a descriptor: a type, or a wildcard.
+fn descriptor_argument(rest: &mut &str) -> Option<String> {
+    match rest.chars().next()? {
+        '*' => {
+            *rest = &rest[1..];
+            Some("?".to_owned())
+        }
+        '+' => {
+            *rest = &rest[1..];
+            descriptor_type(rest).map(|name| format!("? extends {name}"))
+        }
+        '-' => {
+            *rest = &rest[1..];
+            descriptor_type(rest).map(|name| format!("? super {name}"))
+        }
+        _ => descriptor_type(rest),
+    }
+}
+
+/// The name of a type of a descriptor without the parts of its package.
+fn short_descriptor_name(name: &str) -> Option<String> {
+    let name = name.rsplit(['/', '.', '$']).next().unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn overridable_methods(value: &serde_json::Value, only_abstract: bool) -> OverridableMethods {
@@ -2955,7 +3034,7 @@ fn overridable_methods(value: &serde_json::Value, only_abstract: bool) -> Overri
                 .into_iter()
                 .flatten()
                 .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
+                .map(lang_api::short_type_name)
                 .collect();
             Some(OverridableMethod {
                 name: text("name"),
@@ -3455,8 +3534,8 @@ mod tests {
     use super::destination_folder;
     use super::{
         TextPoint, TextSpan, action_entry, completion_entry, diagnostic, documentation_url,
-        expected_type_from_declaration, inlay_hints, parameter_type, return_type_of,
-        signature_help_info, usage_kind,
+        expected_type_from_declaration, inlay_hints, overridable_methods, parameter_type,
+        return_type_of, signature_help_info, usage_kind,
     };
 
     fn action(value: serde_json::Value) -> lsp::CodeActionOrCommand {
@@ -3596,6 +3675,101 @@ mod tests {
             Some("String".to_owned())
         );
         assert_eq!(return_type_of(&json!({"name": "name"})), None);
+    }
+
+    #[test]
+    fn the_return_type_keeps_the_arguments_of_a_descriptor() {
+        assert_eq!(
+            return_type_of(
+                &json!({"bindingKey": "Lsome/Type;.findAll()Lsome/List<Lsome/Owner;>;"})
+            ),
+            Some("List<Owner>".to_owned())
+        );
+        assert_eq!(
+            return_type_of(
+                &json!({"bindingKey": "Lsome/Type;.all()Lsome/Map<Lsome/Key;Lsome/List<Lsome/Value;>;>;"})
+            ),
+            Some("Map<Key, List<Value>>".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_return_type_keeps_the_bound_of_a_wildcard() {
+        assert_eq!(
+            return_type_of(&json!({"bindingKey": "Lsome/Type;.any()Lsome/List<*>;"})),
+            Some("List<?>".to_owned())
+        );
+        assert_eq!(
+            return_type_of(
+                &json!({"bindingKey": "Lsome/Type;.numbers()Lsome/List<+Lsome/Number;>;"})
+            ),
+            Some("List<? extends Number>".to_owned())
+        );
+        assert_eq!(
+            return_type_of(
+                &json!({"bindingKey": "Lsome/Type;.numbers()Lsome/List<-Lsome/Number;>;"})
+            ),
+            Some("List<? super Number>".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_return_type_keeps_the_dimensions_of_an_array() {
+        assert_eq!(
+            return_type_of(&json!({"bindingKey": "Lsome/Type;.owners()[[Lsome/Owner;"})),
+            Some("Owner[][]".to_owned())
+        );
+        assert_eq!(
+            return_type_of(
+                &json!({"bindingKey": "Lsome/Type;.owners()Lsome/List<[Lsome/Owner;>;"})
+            ),
+            Some("List<Owner[]>".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_return_type_keeps_the_name_of_a_type_variable() {
+        assert_eq!(
+            return_type_of(&json!({"bindingKey": "Lsome/Type;.value()TT;"})),
+            Some("T".to_owned())
+        );
+        assert_eq!(
+            return_type_of(&json!({"bindingKey": "Lsome/Type;.value()Lsome/Optional<TT;>;"})),
+            Some("Optional<T>".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_named_return_type_and_the_parameters_lose_their_packages() {
+        assert_eq!(
+            return_type_of(&json!({"returnType": "some.pkg.List<some.pkg.Owner>"})),
+            Some("List<Owner>".to_owned())
+        );
+        assert_eq!(
+            return_type_of(&json!({
+                "returnType": "some.pkg.Map<some.pkg.Key, some.pkg.List<some.pkg.Value>>[]",
+            })),
+            Some("Map<Key, List<Value>>[]".to_owned())
+        );
+        let methods = overridable_methods(
+            &json!({
+                "type": "some.pkg.Repository",
+                "methods": [{
+                    "name": "save",
+                    "declaringClass": "some.pkg.Base<some.pkg.Owner>",
+                    "parameters": ["some.pkg.Owner", "int"],
+                    "returnType": "some.pkg.List<some.pkg.Owner>",
+                    "unimplemented": true,
+                    "bindingKey": "Lsome/Base;.save(Lsome/Owner;I)Lsome/List<Lsome/Owner;>;",
+                }],
+            }),
+            false,
+        );
+        assert_eq!(methods.methods[0].parameters, ["Owner", "int"]);
+        assert_eq!(
+            methods.methods[0].return_type.as_deref(),
+            Some("List<Owner>")
+        );
     }
 
     #[cfg(windows)]

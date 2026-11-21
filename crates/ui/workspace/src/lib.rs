@@ -48,8 +48,8 @@ pub use launch::{
 #[cfg(any(test, feature = "test-support"))]
 pub use layout::load_layout;
 pub use layout::{
-    BookmarkGroupState, BookmarkLayout, BookmarkState, DockState, Layout, PaneState,
-    WindowPlacement,
+    BookmarkGroupState, BookmarkLayout, BookmarkState, DockState, Layout, Location, LocationLog,
+    PaneState, WindowPlacement,
 };
 pub use native_menu::ScreenMenus;
 pub use run::{DebugControls, DebugRunState, RunControls, RunState};
