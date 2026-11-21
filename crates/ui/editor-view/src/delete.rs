@@ -245,7 +245,9 @@ impl EditorView {
                             target,
                         })
                         .collect();
-                    cx.emit(EditorEvent::Usages(usages));
+                    let search = crate::next_usages_search();
+                    cx.emit(EditorEvent::UsagesSearchStarted { search });
+                    cx.emit(EditorEvent::Usages { search, usages });
                 } else {
                     self.apply_delete(popup.action, cx);
                 }

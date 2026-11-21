@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use editor_view::{DetailedUsage, EditorView, Semantic, Spot, Usage, UsagesUpdate, uri_path};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -20,7 +21,7 @@ use ui_kit::*;
 use workspace::{FileIcons, Settings, USAGES_TOOL, Workspace};
 
 use crate::finder::{FindRequest, Found, find_tree, repeat_search};
-use crate::items::{HeaderButton, Item, ItemsPanel, PanelRow};
+use crate::items::{CodeLine, HeaderButton, Item, ItemsPanel, PanelRow};
 use crate::navigation;
 use crate::outline::OpenEditors;
 use crate::project::ActiveProjectPanel;
@@ -118,6 +119,8 @@ pub struct UsagesHub {
     active: usize,
     /// The number of the next search.
     serial: u64,
+    /// The number of the latest search: an answer of an older one is dropped.
+    latest_search: u64,
     /// The usage of each row of the list, in the order the rows are drawn.
     sources: Vec<usize>,
     /// The places of a structural search, which replace the usages of the tabs until
@@ -125,12 +128,18 @@ pub struct UsagesHub {
     structural: Option<StructuralView>,
     /// The search that waits for the language server, if one does.
     waiting: Option<Waiting>,
+    /// The lines of the files the search found, read off the window thread.
+    lines: HashMap<PathBuf, Arc<Vec<String>>>,
+    /// The files whose lines are on their way.
+    line_tasks: HashSet<PathBuf>,
 }
 
 /// A search that waits for the language server: its tab, and the flag that ends the wait.
 struct Waiting {
     /// The serial of the tab that waits, which the results replace.
     serial: u64,
+    /// The number of the search that waits.
+    search: u64,
     cancel: ::base::Cancel,
     /// Ends the wait when the tool window hides.
     _watch: Option<Subscription>,
@@ -288,9 +297,12 @@ impl UsagesHub {
                 tabs: Vec::new(),
                 active: 0,
                 serial: 0,
+                latest_search: 0,
                 sources: Vec::new(),
                 structural: None,
                 waiting: None,
+                lines: HashMap::new(),
+                line_tasks: HashSet::new(),
             }
         });
         let weak = hub.downgrade();
@@ -318,23 +330,20 @@ impl UsagesHub {
         self.tabs.get(self.active)
     }
 
-    /// Replaces the list with the uses of one symbol, grouped by file.
+    /// Replaces the list with the uses of one symbol, grouped by file. A search of the
+    /// window itself, such as the places of Show Usages, starts a run of its own.
     pub fn set_usages(&mut self, usages: Vec<Usage>, cx: &mut Context<Self>) {
-        let detailed = usages
-            .into_iter()
-            .map(|usage| DetailedUsage {
-                name: usage.name,
-                target: usage.target,
-                kind: UsageKind::Unknown,
-                container: None,
-                module: None,
-            })
-            .collect();
-        self.set_detailed_usages(detailed, cx);
+        let search = editor_view::next_usages_search();
+        self.set_usages_at(search, usages, cx);
     }
 
     /// Replaces the list with the uses of one symbol in this file, as Ctrl+F7 asks.
-    pub fn set_usages_in_file(&mut self, usages: Vec<Usage>, cx: &mut Context<Self>) {
+    pub fn set_usages_in_file_at(
+        &mut self,
+        search: u64,
+        usages: Vec<Usage>,
+        cx: &mut Context<Self>,
+    ) {
         let detailed = usages
             .into_iter()
             .map(|usage| DetailedUsage {
@@ -345,30 +354,89 @@ impl UsagesHub {
                 module: None,
             })
             .collect();
-        self.set_detailed_usages_in_file(detailed, cx);
+        self.set_detailed_usages_in_file(search, detailed, cx);
     }
 
     /// Replaces the list with the uses of one symbol and the grouping the settings ask.
-    pub fn set_detailed_usages(&mut self, usages: Vec<DetailedUsage>, cx: &mut Context<Self>) {
-        self.set_detailed_usages_with(usages, None, false, cx);
+    pub fn set_usages_at(&mut self, search: u64, usages: Vec<Usage>, cx: &mut Context<Self>) {
+        let detailed = usages
+            .into_iter()
+            .map(|usage| DetailedUsage {
+                name: usage.name,
+                target: usage.target,
+                kind: UsageKind::Unknown,
+                container: None,
+                module: None,
+            })
+            .collect();
+        self.set_detailed_usages(search, detailed, cx);
+    }
+
+    /// Replaces the list with the uses of one symbol and the grouping the settings ask.
+    pub fn set_detailed_usages(
+        &mut self,
+        search: u64,
+        usages: Vec<DetailedUsage>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_detailed_usages_with(search, usages, None, false, cx);
     }
 
     /// Replaces the list with the uses of one symbol in this file, as Ctrl+F7 asks.
     pub fn set_detailed_usages_in_file(
         &mut self,
+        search: u64,
         usages: Vec<DetailedUsage>,
         cx: &mut Context<Self>,
     ) {
-        self.set_detailed_usages_with(usages, Some(FindUsagesScope::CurrentFile), true, cx);
+        self.set_detailed_usages_with(search, usages, Some(FindUsagesScope::CurrentFile), true, cx);
+    }
+
+    /// Records that a run of the search started, so its answer is not mistaken for an
+    /// older one. A wait of an older search ends here: the new search takes its place.
+    pub fn start_search(&mut self, search: u64, cx: &mut Context<Self>) {
+        if search <= self.latest_search {
+            return;
+        }
+        self.latest_search = search;
+        if self
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.search < search)
+            && let Some(waiting) = self.waiting.take()
+        {
+            waiting.cancel.cancel();
+            if let Some(index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.serial == waiting.serial)
+            {
+                self.close_tab(index, cx);
+            }
+        }
+    }
+
+    /// Whether the answer of `search` is newer than the list: an answer of a search that
+    /// the user started later never replaces it.
+    fn accepts(&mut self, search: u64) -> bool {
+        if search < self.latest_search {
+            return false;
+        }
+        self.latest_search = search;
+        true
     }
 
     fn set_detailed_usages_with(
         &mut self,
+        search: u64,
         mut usages: Vec<DetailedUsage>,
         scope: Option<FindUsagesScope>,
         already_scoped: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.accepts(search) {
+            return;
+        }
         self.structural = None;
         // The results replace the tab that waited for them; the wait itself is over.
         let waiting = self.waiting.take();
@@ -769,11 +837,18 @@ impl UsagesHub {
     /// `cancel` ends the wait: the tab closes, the window hides or Escape is pressed.
     pub fn wait_for_search(
         &mut self,
+        search: u64,
         name: String,
         in_file: bool,
         cancel: ::base::Cancel,
         cx: &mut Context<Self>,
     ) {
+        // A wait of an older search is over before it starts.
+        if search < self.latest_search {
+            cancel.cancel();
+            return;
+        }
+        self.latest_search = search;
         let previous = self.waiting.take();
         if let Some(previous) = &previous {
             previous.cancel.cancel();
@@ -819,6 +894,7 @@ impl UsagesHub {
         });
         self.waiting = Some(Waiting {
             serial,
+            search,
             cancel,
             _watch: watch,
         });
@@ -1016,7 +1092,8 @@ impl UsagesHub {
             });
             return;
         };
-        let mut rows: Vec<(Vec<String>, usize, Item)> = Vec::new();
+        let mut rows: Vec<(Vec<String>, usize, Item, Option<CodeLine>)> = Vec::new();
+        let mut missing = Vec::new();
         for (index, usage) in tab.usages.iter().enumerate() {
             if !self.shown(usage, &settings) {
                 continue;
@@ -1025,7 +1102,15 @@ impl UsagesHub {
                 continue;
             };
             let keys = self.group_keys(usage, &settings, cx);
-            rows.push((keys, index, item));
+            let code = self.code_line(usage, cx);
+            if code.is_none()
+                && let Some(path) = uri_path(&usage.target.uri)
+                && !self.lines.contains_key(&path)
+                && !self.line_tasks.contains(&path)
+            {
+                missing.push(path);
+            }
+            rows.push((keys, index, item, code));
         }
         let excluded = tab.excluded.clone();
         let prefix = tab.prefix.clone();
@@ -1037,48 +1122,149 @@ impl UsagesHub {
             .upgrade()
             .map(|workspace| workspace.read(cx).icons().clone())
             .unwrap_or_default();
+        let by_file = settings.usage_group_file_structure;
         let mut items = Vec::with_capacity(rows.len());
+        let mut code_lines = Vec::with_capacity(rows.len());
         let mut panel_rows = Vec::new();
         let mut sources = Vec::with_capacity(rows.len());
         let mut previous: Vec<String> = Vec::new();
-        for (keys, index, item) in rows {
+        let mut previous_file: Option<PathBuf> = None;
+        for at in 0..rows.len() {
+            let (keys, index, item, code) = &rows[at];
             let common = previous
                 .iter()
-                .zip(&keys)
+                .zip(keys.iter())
                 .take_while(|(left, right)| left == right)
                 .count();
-            // The group of the file, when the rows group by file, has the icon of its type.
-            let file = settings
-                .usage_group_file_structure
-                .then(|| display_path(item.path.strip_prefix(&self.root).unwrap_or(&item.path)));
+            if common < previous.len() {
+                previous_file = None;
+            }
             for (depth, key) in keys.iter().enumerate().skip(common) {
-                let icon = match &file {
-                    Some(file) if file == key => icons.icon_for(&item.path),
-                    _ => "general/folder",
-                };
                 panel_rows.push(PanelRow::Group {
                     label: key.clone(),
                     depth,
-                    icon,
+                    icon: "general/folder",
+                    hint: None,
                 });
             }
-            previous = keys;
-            let at = items.len();
+            previous = keys.clone();
+            // The header of the file has the name of the file, the number of its matches
+            // and the package in grey, as IDEA lists the uses of a symbol.
+            let depth = if by_file {
+                if previous_file.as_deref() != Some(item.path.as_path()) {
+                    let count = rows[at..]
+                        .iter()
+                        .take_while(|(other_keys, _, other, _)| {
+                            other_keys.as_slice() == keys.as_slice() && other.path == item.path
+                        })
+                        .count();
+                    let name = item.path.file_name().map_or_else(
+                        || display_path(&item.path),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    panel_rows.push(PanelRow::Group {
+                        label: format!("{name}  ({count})"),
+                        depth: keys.len(),
+                        icon: icons.icon_for(&item.path),
+                        hint: self.package_of(&item.path, cx),
+                    });
+                    previous_file = Some(item.path.clone());
+                }
+                keys.len() + 1
+            } else {
+                keys.len()
+            };
+            let at_item = items.len();
             panel_rows.push(PanelRow::Item {
-                index: at,
-                depth: previous.len(),
-                excluded: excluded.get(index).copied().unwrap_or(false),
+                index: at_item,
+                depth,
+                excluded: excluded.get(*index).copied().unwrap_or(false),
             });
-            items.push(item);
-            sources.push(index);
+            items.push(item.clone());
+            code_lines.push(code.clone());
+            sources.push(*index);
         }
         self.sources = sources;
         let buttons = header_buttons(&settings, &self.workspace, cx);
         self.panel.update(cx, |panel, cx| {
             panel.set_header_buttons(buttons, cx);
             panel.set_view(items, panel_rows, cx);
+            panel.set_code(code_lines, cx);
             panel.set_counted_title(&prefix, cx);
         });
+        self.request_lines(missing, cx);
+    }
+
+    /// The line of the file that a use stands on, from the open buffer first and from the
+    /// file of the project second.
+    fn code_line(&self, usage: &DetailedUsage, cx: &App) -> Option<CodeLine> {
+        let path = uri_path(&usage.target.uri)?;
+        let line = usage.target.span.start.line as usize;
+        let text = open_line(&path, line, cx).or_else(|| {
+            self.lines
+                .get(&path)
+                .and_then(|lines| lines.get(line))
+                .cloned()
+        })?;
+        Some(line_code(&text, line, usage))
+    }
+
+    /// The package of the file, or its folder when the language does not name one.
+    fn package_of(&self, path: &Path, cx: &App) -> Option<String> {
+        cx.try_global::<Semantic>()
+            .and_then(|semantic| semantic.0.package_of(path))
+            .filter(|package| !package.is_empty())
+            .or_else(|| {
+                let relative = path.strip_prefix(&self.root).unwrap_or(path);
+                let folder = relative.parent()?;
+                (!folder.as_os_str().is_empty()).then(|| display_path(folder))
+            })
+    }
+
+    /// Reads the files of the results that no editor holds open, once each.
+    fn request_lines(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut wanted = Vec::new();
+        for path in paths {
+            if self.lines.contains_key(&path) || !self.line_tasks.insert(path.clone()) {
+                continue;
+            }
+            if !wanted.contains(&path) {
+                wanted.push(path);
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let background = cx.background_executor().clone();
+            let texts = background
+                .spawn(async move {
+                    wanted
+                        .into_iter()
+                        .map(|path| {
+                            let text = read_text(&path);
+                            (path, text)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |hub, cx| hub.add_lines(texts, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Takes the lines of the files the reader brought. A file that could not be read is
+    /// marked as read, so the list does not ask for it again.
+    fn add_lines(&mut self, texts: Vec<(PathBuf, Option<String>)>, cx: &mut Context<Self>) {
+        for (path, text) in texts {
+            self.line_tasks.remove(&path);
+            let lines: Vec<String> = text
+                .as_deref()
+                .map(|text| text.lines().map(ToOwned::to_owned).collect())
+                .unwrap_or_default();
+            self.lines.insert(path, Arc::new(lines));
+        }
+        self.regroup(cx);
     }
 
     fn shown(&self, usage: &DetailedUsage, settings: &Settings) -> bool {
@@ -1121,19 +1307,8 @@ impl UsagesHub {
                     .map(|part| part.as_os_str().to_string_lossy().into_owned()),
             );
         }
-        if settings.usage_group_file_structure {
-            keys.push(display_path(relative));
-            let container = usage
-                .container
-                .clone()
-                .filter(|container| !container.is_empty())
-                .or_else(|| {
-                    path.file_stem()
-                        .map(|stem| stem.to_string_lossy().into_owned())
-                })
-                .unwrap_or_default();
-            keys.extend(split_name(&container));
-        }
+        // The file itself is the header the list draws for its rows, not a group key: it
+        // carries the count of the matches and the package of the file.
         keys
     }
 
@@ -2156,6 +2331,24 @@ fn byte_at(line: &str, column: u32) -> usize {
         units += character.len_utf16();
     }
     line.len()
+}
+
+/// The line of a file with the place of a use in it, without the indent of the line.
+fn line_code(text: &str, line: usize, usage: &DetailedUsage) -> CodeLine {
+    let skipped = text.len() - text.trim_start().len();
+    let trimmed = &text[skipped..];
+    let start = byte_at(text, usage.target.span.start.character).saturating_sub(skipped);
+    let end = if usage.target.span.end.line as usize == line {
+        byte_at(text, usage.target.span.end.character).saturating_sub(skipped)
+    } else {
+        trimmed.len()
+    };
+    let start = start.min(trimmed.len());
+    CodeLine {
+        number: line + 1,
+        text: trimmed.to_owned(),
+        highlight: start..end.clamp(start, trimmed.len()),
+    }
 }
 
 impl Row {

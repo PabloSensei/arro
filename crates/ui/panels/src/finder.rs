@@ -33,6 +33,8 @@ pub(crate) const MIN_WIDTH: f32 = 480.;
 pub(crate) const MIN_HEIGHT: f32 = 360.;
 /// More lines than this are no use to look through; the search says so.
 const MAX_LINES: usize = 1000;
+/// The least room the list takes above the divider: three rows stay in view.
+const LIST_MIN_HEIGHT: f32 = ROW_HEIGHT * 3.;
 
 actions!(
     find_in_files,
@@ -790,11 +792,49 @@ impl Finder {
         let Some(from) = self.preview_drag else {
             return;
         };
+        // A move with no button held: the release came where no part of the window saw it,
+        // so the drag ends here.
+        if !event.dragging() {
+            self.finish_preview_drag();
+            cx.notify();
+            return;
+        }
         let now = f32::from(event.position.y);
         self.preview_height = (self.preview_height + from - now)
             .clamp(preview::MIN_FINDER_PREVIEW, preview::MAX_FINDER_PREVIEW);
         self.preview_drag = Some(now);
         cx.notify();
+    }
+
+    /// While the divider of the preview is dragged, a layer over the window takes the moves
+    /// and the release of the drag, wherever the pointer goes.
+    fn divider_catcher(&self, cx: &mut Context<Self>) -> Option<Div> {
+        self.preview_drag.is_some().then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .cursor_row_resize()
+                .on_mouse_move(
+                    cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag_preview(event, cx)),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.finish_preview_drag();
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.finish_preview_drag();
+                        cx.notify();
+                    }),
+                )
+        })
     }
 
     /// The drag is over: the height goes to the state folder.
@@ -1510,34 +1550,55 @@ impl Finder {
         match row {
             Row::File(file) => {
                 let hits = &self.results[file];
-                let relative = hits
-                    .path
-                    .strip_prefix(self.root.as_path())
-                    .unwrap_or(&hits.path);
-                let title = format!("{}  ({})", relative.display(), hits.lines.len());
+                let (name, folder) = file_title(self.root.as_path(), &hits.path);
+                let count = format!("({})", hits.lines.len());
                 let file_icon = self
                     .workspace
                     .upgrade()
                     .map_or("fileTypes/text", |workspace| {
                         workspace.read(cx).icons().icon_for(&hits.path)
                     });
-                div()
+                // The text of the row for a test of the paths: the name, the folder, the count.
+                #[cfg(test)]
+                let label = if folder.is_empty() {
+                    format!("{name}  {count}")
+                } else {
+                    format!("{name}  {folder}  {count}")
+                };
+                let row = div()
                     .id(("find-row", at))
                     .debug_selector(move || format!("find-file-{at}"))
+                    .flex()
+                    .items_center()
                     .flex_none()
+                    .gap(px(SPACE_S))
                     .h(px(ROW_HEIGHT))
                     .px(px(ROW_PADDING_X))
-                    .pt(px(SPACE_S))
-                    .text_color(theme.text_secondary)
+                    .overflow_hidden()
+                    .child(icon(file_icon, theme))
+                    .child(div().flex_none().text_color(theme.text).child(name))
+                    .when(!folder.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .flex_shrink(1.)
+                                .truncate()
+                                .text_color(theme.text_muted)
+                                .child(folder),
+                        )
+                    })
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_S))
-                            .child(icon(file_icon, theme))
-                            .child(title),
-                    )
-                    .into_any_element()
+                            .flex_none()
+                            .text_color(theme.text_secondary)
+                            .child(count),
+                    );
+                #[cfg(test)]
+                let row = row.child(bounds_probe(
+                    format!("find-file-label-{at}"),
+                    Some(label.into()),
+                ));
+                row.into_any_element()
             }
             Row::Hit(file, line) => {
                 let hit = &self.results[file].lines[line];
@@ -1547,6 +1608,7 @@ impl Finder {
                 let spans = segments(&hit.text, &hit.matches);
                 div()
                     .id(("find-row", at))
+                    .debug_selector(move || format!("find-hit-{at}"))
                     .flex()
                     .items_center()
                     .flex_none()
@@ -1581,6 +1643,19 @@ impl Finder {
             }
         }
     }
+}
+
+/// The name of a file and the folder it lies in, for the title of its row in Find in Files.
+/// The folder is relative to the project and has `/` between its parts; a file in the root
+/// of the project has no folder.
+fn file_title(root: &Path, path: &Path) -> (String, String) {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let folder = path
+        .parent()
+        .map_or_else(String::new, |folder| crate::git::relative_of(root, folder));
+    (name, folder)
 }
 
 /// `text` without its indent, cut at the matches: each part and whether it matched.
@@ -1808,7 +1883,7 @@ impl Render for Finder {
                 cx,
             )
             .flex_1()
-            .min_h_0()
+            .min_h(px(LIST_MIN_HEIGHT))
             .into_any_element(),
         };
 
@@ -1951,22 +2026,6 @@ impl Render for Finder {
                                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
                                     this.preview_drag = Some(f32::from(event.position.y));
                                     cx.stop_propagation();
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                                this.drag_preview(event, cx)
-                            }))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.finish_preview_drag();
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_up_out(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.finish_preview_drag();
                                     cx.notify();
                                 }),
                             ),
@@ -1975,9 +2034,12 @@ impl Render for Finder {
                         div()
                             .id("finder-preview")
                             .debug_selector(|| "finder-preview".to_owned())
-                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .flex_shrink(1.)
                             .w_full()
                             .h(px(self.preview_height))
+                            .min_h(px(preview::MIN_FINDER_PREVIEW))
                             .overflow_hidden()
                             .child(self.preview.clone()),
                     ),
@@ -1986,7 +2048,7 @@ impl Render for Finder {
                 this.child(self.find_window_button(&theme, cx))
             });
 
-        popup_window(
+        let popup = popup_window(
             PopupSpec {
                 key: "finder",
                 place: first,
@@ -1997,7 +2059,10 @@ impl Render for Finder {
             body,
             window,
             cx,
-        )
+        );
+        // The divider is two pixels high: while it is dragged, the layer over the window
+        // carries the drag.
+        popup.children(self.divider_catcher(cx))
     }
 }
 
@@ -2164,6 +2229,7 @@ pub(crate) fn find_tree(
             label: format!("{}  ({})", relative.display(), hits.lines.len()),
             depth: 0,
             icon: icons.icon_for(&hits.path),
+            hint: None,
         });
         for hit in &hits.lines {
             let column = hit
@@ -2379,7 +2445,9 @@ fn wildcard(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextQuery, accepts_mask, replace_on_disk, segments, wildcard};
+    use std::path::Path;
+
+    use super::{TextQuery, accepts_mask, file_title, replace_on_disk, segments, wildcard};
 
     #[test]
     fn a_mask_keeps_matching_files_and_drops_the_excluded_ones() {
@@ -2474,5 +2542,19 @@ mod tests {
         let mut permissions = std::fs::metadata(&second).unwrap().permissions();
         permissions.set_readonly(false);
         std::fs::set_permissions(&second, permissions).unwrap();
+    }
+
+    #[test]
+    fn a_file_row_names_its_folder_relative_to_the_project_with_slashes() {
+        let root = Path::new("project");
+        let path = root.join("src").join("main").join("Owner.txt");
+        assert_eq!(
+            file_title(root, &path),
+            ("Owner.txt".to_owned(), "src/main".to_owned())
+        );
+        assert_eq!(
+            file_title(root, &root.join("LICENSE.txt")),
+            ("LICENSE.txt".to_owned(), String::new())
+        );
     }
 }

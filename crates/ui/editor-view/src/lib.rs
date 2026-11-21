@@ -77,5 +77,5 @@ pub use view::{
     Languages, LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark, PlaceTarget,
     PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot, TemplateSettings,
     Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
-    install_clipboard_history_sink, install_keymap, set_clipboard_history,
+    install_clipboard_history_sink, install_keymap, next_usages_search, set_clipboard_history,
 };

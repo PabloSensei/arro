@@ -2256,6 +2256,8 @@ mod window_tests_no_usages;
 mod window_tests_test_marks_menu;
 
 #[cfg(test)]
+mod window_tests_debug_console_ansi;
+#[cfg(test)]
 mod window_tests_debug_console_follow;
 #[cfg(test)]
 mod window_tests_test_enter;
@@ -2265,3 +2267,15 @@ mod window_tests_structure_window;
 
 #[cfg(test)]
 mod window_tests_debug_stop_view;
+
+#[cfg(test)]
+mod window_tests_find_in_files_preview;
+
+#[cfg(test)]
+mod window_tests_surround_list;
+
+#[cfg(test)]
+mod window_tests_usages_rows;
+
+#[cfg(test)]
+mod window_tests_debug_live_shape;

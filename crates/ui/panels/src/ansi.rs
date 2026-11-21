@@ -1,8 +1,26 @@
 //! Console output into lines of styled text. Knows SGR colors and bold, drops every other
-//! escape sequence, and a lone `\r` starts the line over, as a progress bar expects.
+//! escape sequence, and a lone `\r` starts the line over, as a progress bar expects. The
+//! colours of the console and the painting of a line are here too, so the consoles of Run
+//! and Debug show a line the same way.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+
+use ui_kit::{FontWeight, HighlightStyle, Hsla, StyledText, Theme, rgb};
+
+/// The 16 terminal colors, dark theme first.
+const ANSI_DARK: [u32; 16] = [
+    0x5a5d63, 0xf75464, 0x5fb865, 0xe0bb65, 0x548af7, 0xc77dbb, 0x2aacb8, 0xbcbec4, 0x868a91,
+    0xff7a85, 0x89d18e, 0xf2c55c, 0x7aa7ff, 0xe0a0d6, 0x58c9d4, 0xffffff,
+];
+const ANSI_LIGHT: [u32; 16] = [
+    0x000000, 0xc7222d, 0x067d17, 0x9e880d, 0x0033b3, 0x871094, 0x0f7b8a, 0x6f737a, 0x818594,
+    0xe55765, 0x2e9c3b, 0xb59b1b, 0x3574f0, 0xb350bf, 0x1996a6, 0x1e1f22,
+];
+
+fn color(hex: u32) -> Hsla {
+    rgb(hex).into()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Style {
@@ -190,6 +208,83 @@ impl OutputBuffers {
     /// The first line that has not ended yet, for a console that shows one.
     pub fn current(&self) -> Option<&Line> {
         self.unfinished().next()
+    }
+}
+
+/// One line of a console that keeps its text with the codes: the text without the codes
+/// and the styles the codes asked for. A console that stores the raw line for its search
+/// and its links shows it through this.
+pub fn parse_line(text: &str, error: bool) -> Line {
+    let mut parser = AnsiParser::default();
+    let mut done = Vec::new();
+    parser.push(text, error, &mut done);
+    if !parser.current().text.is_empty() {
+        done.push(parser.current().clone());
+    }
+    done.pop().unwrap_or_default()
+}
+
+/// The text of a console line without the escape sequences, for a search, a filter or a
+/// link that reads the line the reader sees.
+pub fn plain(text: &str) -> String {
+    parse_line(text, false).text
+}
+
+/// The text of a line in the colours of the console, with no layout of its own. The
+/// places a search found are painted over those colours.
+pub fn highlighted(line: &Line, theme: &Theme, matches: &[Range<usize>]) -> StyledText {
+    let mut edges = vec![0, line.text.len()];
+    for (range, _) in &line.spans {
+        edges.push(range.start);
+        edges.push(range.end);
+    }
+    for range in matches {
+        edges.push(range.start.min(line.text.len()));
+        edges.push(range.end.min(line.text.len()));
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let mut highlights = Vec::new();
+    for pair in edges.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end || !line.text.is_char_boundary(start) || !line.text.is_char_boundary(end) {
+            continue;
+        }
+        let found = matches
+            .iter()
+            .any(|range| range.start <= start && range.end >= end);
+        let highlight = if found {
+            HighlightStyle {
+                color: Some(theme.match_text),
+                background_color: Some(theme.match_bg),
+                ..HighlightStyle::default()
+            }
+        } else {
+            line.spans
+                .iter()
+                .find(|(range, _)| range.start <= start && range.end >= end)
+                .map_or_else(HighlightStyle::default, |(_, style)| {
+                    console_highlight(style, theme)
+                })
+        };
+        highlights.push((start..end, highlight));
+    }
+    StyledText::new(line.text.clone()).with_highlights(highlights)
+}
+
+/// The style of one span of the console, in the colours of the theme.
+fn console_highlight(style: &Style, theme: &Theme) -> HighlightStyle {
+    let palette = if theme.dark { &ANSI_DARK } else { &ANSI_LIGHT };
+    let color = match (style.input, style.color, style.error) {
+        (true, _, _) => Some(theme.console_input),
+        (false, Some(index), _) => Some(color(palette[usize::from(index)])),
+        (false, None, true) => Some(theme.error),
+        (false, None, false) => None,
+    };
+    HighlightStyle {
+        color,
+        font_weight: style.bold.then_some(FontWeight::BOLD),
+        ..HighlightStyle::default()
     }
 }
 

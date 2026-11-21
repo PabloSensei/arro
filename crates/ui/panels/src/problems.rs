@@ -145,6 +145,7 @@ impl ProblemsState {
                 label: relative.display().to_string().replace('\\', "/"),
                 depth: 0,
                 icon: icons.icon_for(path),
+                hint: None,
             });
             for problem in problems {
                 let index = items.len();

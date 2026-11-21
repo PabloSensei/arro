@@ -72,6 +72,36 @@ impl MockDap {
         Self::start_with_threads(0, Some(source.into()), false, false, false, false, true)
     }
 
+    /// The scenario of an adapter that gives every `scopes` request new references: the
+    /// stop names its source as `source` gives it, the locals sit in a scope called `Local`,
+    /// and the variables come by their own request, after the frames. The stack moves one
+    /// line down at every step.
+    pub fn start_with_fresh_scopes(source: impl Into<String>) -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?.to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let scenario = Scenario {
+            source: Some(source.into()),
+            breakpoint_kinds: false,
+            log_points: false,
+            library_frames: false,
+            identity_objects: false,
+            moving_line: true,
+            fresh_scopes: true,
+        };
+        let thread = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = serve(stream, &recorded, 0, &scenario);
+            }
+        });
+        Ok(Self {
+            address,
+            thread: Some(thread),
+            seen,
+        })
+    }
+
     fn start_with_threads(
         virtual_threads: usize,
         source: Option<String>,
@@ -92,6 +122,7 @@ impl MockDap {
             library_frames,
             identity_objects,
             moving_line,
+            fresh_scopes: false,
         };
         let thread = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
@@ -136,6 +167,9 @@ struct Scenario {
     identity_objects: bool,
     /// The stack moves one line down at every step.
     moving_line: bool,
+    /// The answers of the scenario of fresh scopes: every `scopes` request gets references
+    /// of its own, and the locals of the top frame are in a scope called `Local`.
+    fresh_scopes: bool,
 }
 
 impl Drop for MockDap {
@@ -166,6 +200,8 @@ fn serve(
     let mut text_value = "\"hello\"".to_owned();
     let mut identity_stop = 1;
     let mut line: i64 = 42;
+    // The fresh-scopes scenario gives every `scopes` request references of its own.
+    let mut scope_serial: i64 = 0;
     while let Some(message) = read_message(&mut reader)? {
         if message.get("type").and_then(Value::as_str) != Some("request") {
             continue;
@@ -435,7 +471,12 @@ fn serve(
                 )?
             }
             "stackTrace" => {
-                let stack_frames = if scenario.library_frames {
+                let stack_frames = if scenario.fresh_scopes {
+                    json!([
+                        {"id": 12, "name": "demo.Main.start", "source": {"name": "main.txt", "path": source, "sourceReference": 0}, "line": line, "column": 1},
+                        {"id": 11, "name": "run", "source": {}, "line": 0, "column": 0},
+                    ])
+                } else if scenario.library_frames {
                     json!([
                         {"id": 21, "name": "demo.Main.main", "source": {"path": source}, "line": 42, "column": 1},
                         {"id": 22, "name": "org.example.Lib.run", "source": {"path": "C:/libs/spring-core-6.1.0.jar"}, "line": 10, "column": 1},
@@ -457,21 +498,31 @@ fn serve(
                     json!({"stackFrames": stack_frames}),
                 )?
             }
-            "scopes" => respond(
-                &mut writer,
-                seq,
-                request_seq,
-                command,
-                json!({"scopes": [
-                    {"name": "Locals", "variablesReference": 100, "expensive": false},
-                    {"name": "Statics", "variablesReference": 200, "expensive": true},
-                ]}),
-            )?,
+            "scopes" => {
+                let body = if scenario.fresh_scopes {
+                    scope_serial += 1;
+                    json!({"scopes": [
+                        {"name": "Local", "presentationHint": "locals", "variablesReference": 1000 + scope_serial, "expensive": false},
+                        {"name": "Static", "variablesReference": 2000 + scope_serial, "expensive": true},
+                    ]})
+                } else {
+                    json!({"scopes": [
+                        {"name": "Locals", "variablesReference": 100, "expensive": false},
+                        {"name": "Statics", "variablesReference": 200, "expensive": true},
+                    ]})
+                };
+                respond(&mut writer, seq, request_seq, command, body)?
+            }
             "variables" => {
                 let reference = arguments
                     .get("variablesReference")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                if scenario.fresh_scopes {
+                    let body = fresh_scope_variables(reference, &text_value);
+                    respond(&mut writer, seq, request_seq, command, body)?;
+                    continue;
+                }
                 if scenario.identity_objects && reference == 100 {
                     let variables = if identity_stop == 1 {
                         json!([
@@ -621,6 +672,23 @@ fn serve(
         }
     }
     Ok(())
+}
+
+/// The variables of the fresh-scopes scenario: the locals of a `Local` scope, whose reference
+/// comes from one `scopes` request, and the elements of the list among them. The list has
+/// a reference of its own, numbered from the scope's, so a request for it gets its elements.
+fn fresh_scope_variables(reference: i64, text: &str) -> Value {
+    match reference {
+        1000..=1999 => json!({"variables": [
+            {"name": "text", "value": text, "type": "String", "variablesReference": 0, "evaluateName": "text"},
+            {"name": "items", "value": "ArrayList (2)", "type": "ArrayList", "variablesReference": reference + 2000, "evaluateName": "items"},
+        ]}),
+        3000..=3999 => json!({"variables": [
+            {"name": "0", "value": "\"a\"", "type": "String", "variablesReference": 0, "evaluateName": "items.get(0)"},
+            {"name": "1", "value": "\"b\"", "type": "String", "variablesReference": 0, "evaluateName": "items.get(1)"},
+        ]}),
+        _ => json!({"variables": []}),
+    }
 }
 
 /// The number the fixture keeps for the object a name denotes, when the expression is an

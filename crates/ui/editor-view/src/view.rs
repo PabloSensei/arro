@@ -620,6 +620,13 @@ pub struct AiProblem {
     pub text: String,
 }
 
+/// The number of the next usages search of the process. A late answer of an older search
+/// does not replace the list of a newer one.
+pub fn next_usages_search() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 #[derive(Clone, Debug)]
 pub enum EditorEvent {
     Loaded,
@@ -744,19 +751,39 @@ pub enum EditorEvent {
     },
     /// The language server sent the diagnostics of the file, empty when it has none.
     Diagnostics(Vec<DiagnosticEntry>),
+    /// Alt+F7 or Ctrl+F7 started a search: the Usages window opens at once, and the answer
+    /// comes later under the same number.
+    UsagesSearchStarted {
+        /// The number of the run, which its answer carries.
+        search: u64,
+    },
     /// Alt+F7: the uses of the symbol, for the window that lists them by file.
-    Usages(Vec<Usage>),
+    Usages {
+        search: u64,
+        usages: Vec<Usage>,
+    },
     /// Alt+F7 with the language that tells the kind and the container of a use.
-    UsagesDetailed(Vec<DetailedUsage>),
+    UsagesDetailed {
+        search: u64,
+        usages: Vec<DetailedUsage>,
+    },
     /// Ctrl+F7: the uses of the symbol in this file, for the window that lists them.
-    UsagesInFile(Vec<Usage>),
+    UsagesInFile {
+        search: u64,
+        usages: Vec<Usage>,
+    },
     /// Ctrl+F7 with the language that tells the kind and the container of a use.
-    UsagesDetailedInFile(Vec<DetailedUsage>),
+    UsagesDetailedInFile {
+        search: u64,
+        usages: Vec<DetailedUsage>,
+    },
     /// Ctrl+Alt+F7: the uses of the symbol, for the popup at the caret.
     ShowUsages(UsagesUpdate),
     /// Alt+F7 or Ctrl+F7 while the language server imports: the Usages window opens with a
     /// waiting line. The search runs by itself when the server is ready; `cancel` ends the wait.
     UsagesWaiting {
+        /// The number of the run, which its answer carries.
+        search: u64,
         name: String,
         in_file: bool,
         cancel: ::base::Cancel,

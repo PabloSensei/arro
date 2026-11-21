@@ -162,15 +162,6 @@ const HOLD_MARKER: &str = "\u{0}the hold ends with the run";
 const GROUP: &str = "bottom-panel";
 const LINE_PAD: f32 = SPACE_L;
 
-/// The 16 terminal colors, dark theme first.
-const ANSI_DARK: [u32; 16] = [
-    0x5a5d63, 0xf75464, 0x5fb865, 0xe0bb65, 0x548af7, 0xc77dbb, 0x2aacb8, 0xbcbec4, 0x868a91,
-    0xff7a85, 0x89d18e, 0xf2c55c, 0x7aa7ff, 0xe0a0d6, 0x58c9d4, 0xffffff,
-];
-const ANSI_LIGHT: [u32; 16] = [
-    0x000000, 0xc7222d, 0x067d17, 0x9e880d, 0x0033b3, 0x871094, 0x0f7b8a, 0x6f737a, 0x818594,
-    0xe55765, 0x2e9c3b, 0xb59b1b, 0x3574f0, 0xb350bf, 0x1996a6, 0x1e1f22,
-];
 /// The field of a configuration that carries an override of a debug start, by the words
 /// of its key. A provider that declares none refuses the override.
 fn override_of(
@@ -189,10 +180,6 @@ fn override_of(
             "the configuration does not allow {what} from a tool"
         )),
     }
-}
-
-fn color(hex: u32) -> Hsla {
-    rgb(hex).into()
 }
 
 pub struct RunPanel {
@@ -5984,7 +5971,7 @@ pub(crate) fn line_element_with_matches(
     theme: &Theme,
     matches: &[std::ops::Range<usize>],
 ) -> AnyElement {
-    let text = highlighted(line, theme, matches);
+    let text = crate::ansi::highlighted(line, theme, matches);
     div()
         .h(px(CODE_LINE_HEIGHT))
         .px(px(LINE_PAD))
@@ -6000,7 +5987,7 @@ pub(crate) fn wrapped_line_element(line: &Line, theme: &Theme) -> AnyElement {
         .min_h(px(CODE_LINE_HEIGHT))
         .px(px(LINE_PAD))
         .whitespace_normal()
-        .child(highlighted(line, theme, &[]))
+        .child(crate::ansi::highlighted(line, theme, &[]))
         .into_any_element()
 }
 
@@ -6037,64 +6024,6 @@ fn is_stack_line(line: &str) -> bool {
         || text.starts_with("Caused by:")
         || text.starts_with("Suppressed:")
         || text.starts_with("... ")
-}
-
-/// The text of a line in the colours of the console, with no layout of its own. The
-/// places a search found are painted over those colours.
-fn highlighted(line: &Line, theme: &Theme, matches: &[std::ops::Range<usize>]) -> StyledText {
-    let mut edges = vec![0, line.text.len()];
-    for (range, _) in &line.spans {
-        edges.push(range.start);
-        edges.push(range.end);
-    }
-    for range in matches {
-        edges.push(range.start.min(line.text.len()));
-        edges.push(range.end.min(line.text.len()));
-    }
-    edges.sort_unstable();
-    edges.dedup();
-    let mut highlights = Vec::new();
-    for pair in edges.windows(2) {
-        let (start, end) = (pair[0], pair[1]);
-        if start >= end || !line.text.is_char_boundary(start) || !line.text.is_char_boundary(end) {
-            continue;
-        }
-        let found = matches
-            .iter()
-            .any(|range| range.start <= start && range.end >= end);
-        let highlight = if found {
-            HighlightStyle {
-                color: Some(theme.match_text),
-                background_color: Some(theme.match_bg),
-                ..HighlightStyle::default()
-            }
-        } else {
-            line.spans
-                .iter()
-                .find(|(range, _)| range.start <= start && range.end >= end)
-                .map_or_else(HighlightStyle::default, |(_, style)| {
-                    console_highlight(style, theme)
-                })
-        };
-        highlights.push((start..end, highlight));
-    }
-    StyledText::new(line.text.clone()).with_highlights(highlights)
-}
-
-/// The style of one span of the console, in the colours of the theme.
-fn console_highlight(style: &Style, theme: &Theme) -> HighlightStyle {
-    let palette = if theme.dark { &ANSI_DARK } else { &ANSI_LIGHT };
-    let color = match (style.input, style.color, style.error) {
-        (true, _, _) => Some(theme.console_input),
-        (false, Some(index), _) => Some(color(palette[usize::from(index)])),
-        (false, None, true) => Some(theme.error),
-        (false, None, false) => None,
-    };
-    HighlightStyle {
-        color,
-        font_weight: style.bold.then_some(FontWeight::BOLD),
-        ..HighlightStyle::default()
-    }
 }
 
 /// A button of the search bar that turns one option on or off.

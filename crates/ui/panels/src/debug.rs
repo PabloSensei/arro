@@ -31,7 +31,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{DEBUG_TOOL, Workspace};
 
-use crate::ansi::OutputBuffers;
+use crate::ansi::{self, OutputBuffers};
 use crate::console_follow::ConsoleFollow;
 use crate::console_input::{ConsoleInput, ConsoleKey};
 use crate::console_links;
@@ -673,6 +673,8 @@ pub struct DebugPanel {
     /// The stop the one-stop settings (temporary breakpoints, Force Step Over) last
     /// ended at; a snapshot of the same stop must not end the ones set after it.
     seen_stops: u64,
+    /// The stop and the frame whose first scope the Variables list opened last.
+    opened_frame: Option<(u64, Option<i64>)>,
     /// Smart Step Into waits for the list of calls from the adapter.
     asking_targets: bool,
     asking_targets_window: Option<AnyWindowHandle>,
@@ -850,6 +852,7 @@ impl DebugPanel {
             temporary: None,
             forced_step: None,
             seen_stops: 0,
+            opened_frame: None,
             asking_targets: false,
             asking_targets_window: None,
             window: None,
@@ -1122,7 +1125,7 @@ impl DebugPanel {
             .iter()
             .rev()
             .take(20)
-            .map(|line| line.text.as_str())
+            .map(|line| ansi::plain(&line.text))
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -1165,7 +1168,7 @@ impl DebugPanel {
             .local_console
             .iter()
             .skip(self.tool_output_lines)
-            .map(|line| line.text.clone())
+            .map(|line| ansi::plain(&line.text))
             .collect();
         let rewrite =
             count < self.tool_output_lines || self.tool_output_lines == 0 || count >= MAX_CONSOLE;
@@ -1173,7 +1176,7 @@ impl DebugPanel {
             let text: String = self
                 .local_console
                 .iter()
-                .map(|line| format!("{}\n", line.text))
+                .map(|line| format!("{}\n", ansi::plain(&line.text)))
                 .collect();
             if std::fs::write(&path, text).is_ok() {
                 self.tool_output_lines = count;
@@ -1210,7 +1213,7 @@ impl DebugPanel {
             .iter()
             .rev()
             .take(limit)
-            .map(|line| line.text.clone())
+            .map(|line| ansi::plain(&line.text))
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -2853,7 +2856,22 @@ impl DebugPanel {
     pub(crate) fn console_lines(&self) -> Vec<String> {
         self.local_console
             .iter()
-            .map(|line| line.text.clone())
+            .map(|line| ansi::plain(&line.text))
+            .collect()
+    }
+
+    /// The parts of a console line as the console paints them, with the terminal colours,
+    /// for tests.
+    #[cfg(test)]
+    pub(crate) fn console_line_parts(&self, index: usize) -> Vec<(String, Option<u8>)> {
+        let Some(line) = self.local_console.get(index) else {
+            return Vec::new();
+        };
+        let parsed = ansi::parse_line(&line.text, false);
+        parsed
+            .spans
+            .iter()
+            .map(|(range, style)| (parsed.text[range.clone()].to_owned(), style.color))
             .collect()
     }
 
@@ -2870,7 +2888,9 @@ impl DebugPanel {
         (0..self.console_search.kept_count(total))
             .filter_map(|row| {
                 let index = self.console_search.line_of_row(total, row);
-                self.local_console.get(index).map(|line| line.text.clone())
+                self.local_console
+                    .get(index)
+                    .map(|line| ansi::plain(&line.text))
             })
             .collect()
     }
@@ -3095,6 +3115,7 @@ impl DebugPanel {
         self.asking_targets = false;
         self.asking_targets_window = None;
         self.reveal_stop = None;
+        self.opened_frame = None;
         self.local_console.clear();
         self.seen_console.clear();
         self.console_search.clear();
@@ -4158,6 +4179,16 @@ impl DebugPanel {
         }
         // The inline values follow the stop that the stack and its scopes belong to.
         let stopped = matches!(self.snapshot.state, DebugState::Stopped { .. });
+        // A stop opens its first scope, the locals, as the IDE does, and so does a frame that
+        // is picked in its stack: each `scopes` request gets references of its own, so the
+        // scope of one request is not the scope of the next.
+        let opening = (self.snapshot.stops, self.snapshot.selected_frame);
+        if stopped && !self.snapshot.frames.is_empty() && self.opened_frame != Some(opening) {
+            self.opened_frame = Some(opening);
+            if let Some(scope) = self.snapshot.scopes.first() {
+                self.expanded.insert(scope.reference);
+            }
+        }
         let values_changed = if stopped
             && !self.snapshot.frames.is_empty()
             && self.values_stop != self.snapshot.stops
@@ -5620,18 +5651,14 @@ impl DebugPanel {
     ) -> AnyElement {
         let frame_id = frame.id;
         let menu_frame = frame.clone();
-        let where_ = frame
-            .source
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let text = if frame.line == 0 {
-            format!("{}  {}", frame.name, where_)
-        } else {
-            format!("{}  {}:{}", frame.name, where_, frame.line)
-        };
+        let library = is_library_frame(&frame, &self.root);
+        let text = frame_place(&frame, &self.root);
         row(format!("frame-{}", frame.id), &text, selected, theme)
+            .text_color(if library {
+                theme.text_secondary
+            } else {
+                theme.text
+            })
             .debug_selector(move || format!("frame-{frame_id}"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.send(Command::SelectFrame(frame.id), cx);
@@ -5876,10 +5903,11 @@ impl DebugPanel {
             console_search,
             ..
         } = self;
-        let texts: Vec<&str> = local_console
+        let plain: Vec<String> = local_console
             .iter()
-            .map(|line| line.text.as_str())
+            .map(|line| ansi::plain(&line.text))
             .collect();
+        let texts: Vec<&str> = plain.iter().map(String::as_str).collect();
         console_search.run(&texts);
     }
 
@@ -5891,10 +5919,11 @@ impl DebugPanel {
             console_search,
             ..
         } = self;
-        let texts: Vec<&str> = local_console
+        let plain: Vec<String> = local_console
             .iter()
-            .map(|line| line.text.as_str())
+            .map(|line| ansi::plain(&line.text))
             .collect();
+        let texts: Vec<&str> = plain.iter().map(String::as_str).collect();
         let current = console_search.current_line();
         console_search.apply_filter(&texts);
         if console_search.open {
@@ -6025,7 +6054,11 @@ impl DebugPanel {
 
     /// Opens a frame of the console or a place of a compiler message.
     fn open_console_line(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self.local_console.get(index).map(|line| line.text.clone()) else {
+        let Some(text) = self
+            .local_console
+            .get(index)
+            .map(|line| ansi::plain(&line.text))
+        else {
             return;
         };
         let files = self.file_list(cx);
@@ -6200,9 +6233,10 @@ impl DebugPanel {
                 } else {
                     theme.code
                 };
-                let text = line.text.clone();
+                let text = ansi::plain(&line.text);
                 let linked = console_links::looks_like_link(&text);
                 let ranges = self.console_search.ranges(index).to_vec();
+                let parsed = ansi::parse_line(&line.text, false);
                 let mut element = div()
                     .id(("debug-console-line", index))
                     .debug_selector(move || format!("debug-console-line-{index}"))
@@ -6212,22 +6246,7 @@ impl DebugPanel {
                     .font_family(MONO_FONT)
                     .text_size(px(CODE_SIZE))
                     .text_color(color)
-                    .child(match ranges.is_empty() {
-                        true => text.clone().into_any_element(),
-                        false => {
-                            let highlights = ranges.iter().map(|range| {
-                                let highlight = HighlightStyle {
-                                    color: Some(theme.match_text),
-                                    background_color: Some(theme.match_bg),
-                                    ..HighlightStyle::default()
-                                };
-                                (range.clone(), highlight)
-                            });
-                            StyledText::new(text.clone())
-                                .with_highlights(highlights)
-                                .into_any_element()
-                        }
-                    });
+                    .child(ansi::highlighted(&parsed, theme, &ranges));
                 if linked {
                     element = element
                         .cursor_pointer()
@@ -6298,15 +6317,20 @@ impl DebugPanel {
         cx: &mut Context<Self>,
     ) {
         let reference = scope.reference;
+        let arrow = if self.expanded.contains(&reference) {
+            "▾ "
+        } else {
+            "▸ "
+        };
         rows.push(
             row(
                 format!("scope-{reference}"),
-                &format!("{}{}", indent(depth), scope.name),
+                &format!("{}{arrow}{}", indent(depth), scope.name),
                 false,
                 theme,
             )
             .debug_selector(move || format!("scope-{reference}"))
-            .on_click(cx.listener(move |this, _, _, cx| this.expand(reference, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_expanded(reference, cx)))
             .into_any_element(),
         );
         if !self.expanded.contains(&reference) {
@@ -7484,6 +7508,93 @@ fn parse_renderers(text: &str) -> Vec<TypeRenderer> {
         .collect()
 }
 
+/// The place of a frame in the list: the file and the line of a frame of the project, and
+/// `method:line, Class (package)` for a frame of a runtime image or an archive, as IDEA
+/// names it. A line the adapter does not know, as a native method has, is `-1`.
+fn frame_place(frame: &Frame, root: &Path) -> String {
+    let name = decode_uri(&frame.name);
+    if let Some(source) = &frame.source
+        && !path_under(source, root)
+        && archive_or_image(source)
+    {
+        return library_place(&name, frame.line);
+    }
+    let where_ = frame
+        .source
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|file| decode_uri(&file.to_string_lossy()))
+        .unwrap_or_default();
+    if frame.line == 0 {
+        format!("{name}  {where_}")
+    } else {
+        format!("{name}  {where_}:{}", frame.line)
+    }
+}
+
+/// The place of a frame of a library: `invoke0:-1, NativeMethodAccessorImpl
+/// (jdk.internal.reflect)`. The adapter names a frame `Class.method(arguments)`.
+fn library_place(name: &str, line: u32) -> String {
+    let line = if line == 0 {
+        "-1".to_owned()
+    } else {
+        line.to_string()
+    };
+    let head = name.split_once('(').map_or(name, |(head, _)| head);
+    let Some((class, method)) = head.rsplit_once('.') else {
+        return format!("{name}:{line}");
+    };
+    if class.is_empty() || method.is_empty() {
+        return format!("{name}:{line}");
+    }
+    match class.rsplit_once('.') {
+        Some((package, simple)) => format!("{method}:{line}, {simple} ({package})"),
+        None => format!("{method}:{line}, {class}"),
+    }
+}
+
+/// The text of a source path or a name an adapter sends in the URI form of `jrt:`:
+/// `%3C` is `<`, `%28` is `(`. A malformed escape stays as it came.
+fn decode_uri(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%'
+            && let (Some(high), Some(low)) = (
+                bytes.get(at + 1).copied().and_then(hex_digit),
+                bytes.get(at + 2).copied().and_then(hex_digit),
+            )
+        {
+            out.push(high * 16 + low);
+            at += 3;
+            continue;
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Whether a source is a runtime image or an archive: it holds classes and no files of
+/// the project.
+fn archive_or_image(source: &Path) -> bool {
+    let path = decode_uri(&source.to_string_lossy());
+    path.starts_with("jrt:/")
+        || path.contains(".jar!")
+        || path.ends_with(".jar")
+        || path.ends_with(".zip")
+}
+
 /// Whether a frame belongs to a library rather than to the project: its source is known,
 /// lies outside the project and comes from an archive of dependencies or from a runtime
 /// image. A frame without a source, or one whose source is a directory beside the
@@ -7496,11 +7607,7 @@ fn is_library_frame(frame: &Frame, root: &Path) -> bool {
     if path_under(source, root) {
         return false;
     }
-    let path = source.to_string_lossy();
-    path.starts_with("jrt:/")
-        || path.contains(".jar!")
-        || path.ends_with(".jar")
-        || path.ends_with(".zip")
+    archive_or_image(source)
 }
 
 /// Whether `path` is in the directory of `root`, ignoring the case on Windows.
@@ -10107,17 +10214,11 @@ pub(crate) fn refresh_inline_values(
     }
 }
 
-/// Whether two paths name the same file, without a case difference on Windows.
+/// Whether two paths name the same file. They are compared the way the window compares the
+/// paths of its tabs: by their components, so a `\` of the adapter and a `/` of the join of
+/// a project are one separator, and on Windows the case does not count.
 fn same_file(left: &Path, right: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
+    ::platform::path_key(left) == ::platform::path_key(right)
 }
 
 /// The toolbar and the debug keys of the window.
@@ -10265,6 +10366,7 @@ mod tests {
                 temporary: None,
                 forced_step: None,
                 seen_stops: 0,
+                opened_frame: None,
                 asking_targets: false,
                 asking_targets_window: None,
                 window: None,
@@ -10440,3 +10542,7 @@ mod tests {
 #[cfg(test)]
 #[path = "debug_depth_tests.rs"]
 mod depth_tests;
+
+#[cfg(test)]
+#[path = "debug_frame_tests.rs"]
+mod frame_tests;

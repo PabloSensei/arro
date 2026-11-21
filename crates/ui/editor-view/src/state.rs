@@ -1423,27 +1423,39 @@ impl EditorState {
         })
     }
 
-    /// Collapses the regions that hold no other region, so the structure stays in sight.
+    /// Collapse All folds the bodies of the members, their comments and the imports: every
+    /// region except the outermost ones that hold other regions. The body of the type keeps
+    /// its lines, so the members stay in sight.
     fn fold_all(&mut self) {
         let candidates = self.map.folds.candidates().to_vec();
-        let leaves = candidates.iter().filter(|fold| {
-            !candidates.iter().any(|other| {
-                other.range != fold.range
-                    && fold.range.start <= other.range.start
-                    && other.range.end <= fold.range.end
+        let holds = |outer: &Fold, inner: &Fold| {
+            outer.range != inner.range
+                && outer.range.start <= inner.range.start
+                && inner.range.end <= outer.range.end
+        };
+        let kept: Vec<bool> = candidates
+            .iter()
+            .map(|fold| {
+                !candidates.iter().any(|other| holds(other, fold))
+                    && candidates.iter().any(|other| holds(fold, other))
             })
-        });
-        for fold in leaves.cloned().collect::<Vec<_>>() {
+            .collect();
+        let hidden: Vec<Fold> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(index, fold)| {
+                !kept[*index]
+                    && !candidates
+                        .iter()
+                        .enumerate()
+                        .any(|(other, other_fold)| !kept[other] && holds(other_fold, fold))
+            })
+            .map(|(_, fold)| fold.clone())
+            .collect();
+        for fold in hidden {
             self.map.folds.collapse(fold);
         }
-        let moved = self.buffer.selections().map(|selection| {
-            let hidden =
-                self.map.folds.as_slice().iter().find(|fold| {
-                    fold.range.start < selection.head && selection.head < fold.range.end
-                });
-            hidden.map_or(*selection, |fold| Selection::caret(fold.range.start))
-        });
-        self.buffer.set_selections(moved);
+        self.settle_carets_into_folds();
     }
 
     /// Ctrl+.: the selected lines fold into `...`.
@@ -2049,6 +2061,12 @@ impl EditorState {
             });
             return;
         }
+        // The caret names the region of the line it stands on: a signature, a class
+        // header, a lambda or a block. Only the regions around the caret are left.
+        if let Some(fold) = self.region_of_the_header(head, line) {
+            self.collapse(fold);
+            return;
+        }
         let inner = self
             .map
             .folds
@@ -2060,6 +2078,51 @@ impl EditorState {
         if let Some(fold) = inner {
             self.collapse(fold);
         }
+    }
+
+    /// The region that the caret line names rather than holds. A region that opens on
+    /// the line wins, the one around the caret first; a signature that wraps names the
+    /// body opening below it while no statement ends in between.
+    fn region_of_the_header(&self, head: usize, line: usize) -> Option<Fold> {
+        let store = self.buffer.store();
+        let line_start = store.line_to_offset(line);
+        let line_end = store.line_end(line);
+        let candidates = self.map.folds.candidates();
+        let opening: Vec<&Fold> = candidates
+            .iter()
+            .filter(|fold| line_start <= fold.range.start && fold.range.start < line_end)
+            .collect();
+        let around = opening
+            .iter()
+            .filter(|fold| fold.range.start <= head && head <= fold.range.end)
+            .min_by_key(|fold| fold.range.len());
+        if let Some(fold) = around {
+            return Some((*fold).clone());
+        }
+        let ahead = opening
+            .iter()
+            .filter(|fold| fold.range.start >= head)
+            .min_by_key(|fold| (fold.range.start, fold.range.len()));
+        if let Some(fold) = ahead {
+            return Some((*fold).clone());
+        }
+        if store.line_text(line).trim().is_empty() {
+            return None;
+        }
+        let next = candidates
+            .iter()
+            .filter(|fold| fold.range.start > head)
+            .min_by_key(|fold| (fold.range.start, fold.range.len()))?;
+        let between = store.slice(head..next.range.start);
+        if between.contains([';', '{', '}']) {
+            return None;
+        }
+        let rest: Vec<&str> = between.split('\n').skip(1).collect();
+        let middle = rest.get(..rest.len().saturating_sub(1)).unwrap_or_default();
+        if middle.iter().any(|line| line.trim().is_empty()) {
+            return None;
+        }
+        Some(next.clone())
     }
 
     fn collapse(&mut self, fold: Fold) {
@@ -2076,6 +2139,21 @@ impl EditorState {
     }
 
     fn unfold_at_caret(&mut self) {
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.store().offset_to_line(head);
+        // A region the caret line names opens first, also when its placeholder stands on
+        // a line below a signature that wraps.
+        let named = self.region_of_the_header(head, line).filter(|fold| {
+            self.map
+                .folds
+                .as_slice()
+                .iter()
+                .any(|collapsed| collapsed.range == fold.range)
+        });
+        if let Some(fold) = named {
+            self.map.folds.unfold_at(fold.range.start);
+            return;
+        }
         let display = self.map.snapshot_owned(self.buffer.store());
         let line = display.line(
             display
@@ -3615,3 +3693,7 @@ mod block_checks {
         assert_eq!(again.text(), text);
     }
 }
+
+#[cfg(test)]
+#[path = "fold_tests.rs"]
+mod fold_tests;

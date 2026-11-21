@@ -1563,6 +1563,7 @@ name = "dap-client"
 version = "0.1.26"
 dependencies = [
  "lang-fixture",
+ "platform",
  "proc-sup",
  "serde_json",
  "test-support",
