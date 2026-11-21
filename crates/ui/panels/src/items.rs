@@ -186,6 +186,8 @@ pub struct ItemsPanel {
     code: Vec<Option<CodeLine>>,
     /// The title with the number of the items that are not excluded, when set.
     counted_title: Option<String>,
+    /// Whether a search is still filling the list, which the panel marks with a line.
+    progress: bool,
     /// Told when Delete or Insert changes an item.
     on_toggle: Option<ToggleHandler>,
 }
@@ -217,6 +219,7 @@ impl ItemsPanel {
             excluded: Vec::new(),
             code: Vec::new(),
             counted_title: None,
+            progress: false,
             on_toggle: None,
         })
     }
@@ -363,6 +366,21 @@ impl ItemsPanel {
     #[cfg(test)]
     pub(crate) fn empty_text(&self) -> String {
         self.empty.to_string()
+    }
+
+    /// Marks the list as still being filled by a running search, with a line above it.
+    pub fn set_progress(&mut self, progress: bool, cx: &mut Context<Self>) {
+        if self.progress == progress {
+            return;
+        }
+        self.progress = progress;
+        cx.notify();
+    }
+
+    /// Whether the panel marks a search in progress, for the tests.
+    #[cfg(test)]
+    pub(crate) fn progress_shown(&self) -> bool {
+        self.progress
     }
 
     /// The buttons of the header, for the tests.
@@ -704,6 +722,7 @@ impl Render for ItemsPanel {
         });
         let body = if self.items.is_empty() {
             div()
+                .debug_selector(|| "items-empty".to_owned())
                 .size_full()
                 .flex()
                 .items_center()
@@ -730,6 +749,22 @@ impl Render for ItemsPanel {
             .size_full()
             .into_any_element()
         };
+        // A search that still fills the list marks itself with a line above the body.
+        let body = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .when(self.progress, |this| {
+                this.child(
+                    div()
+                        .debug_selector(|| "items-progress".to_owned())
+                        .flex_none()
+                        .w_full()
+                        .h(px(2.))
+                        .bg(theme.accent),
+                )
+            })
+            .child(body);
         let buttons: Vec<_> = self
             .header_buttons
             .iter()

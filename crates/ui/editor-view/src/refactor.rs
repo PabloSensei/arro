@@ -746,7 +746,11 @@ impl EditorView {
                 let here = in_file.then(|| self.path.clone());
                 // A search that the window can show opens it before the answer comes.
                 if !resumed {
-                    cx.emit(EditorEvent::UsagesSearchStarted { search });
+                    cx.emit(EditorEvent::UsagesSearchStarted {
+                        search,
+                        name: name.clone(),
+                        in_file,
+                    });
                 }
                 cx.spawn(async move |this, cx| {
                     let answer = first(replies).await;
@@ -785,7 +789,11 @@ impl EditorView {
             let replies = ask(provider, spot);
             let here = in_file.then(|| self.path.clone());
             if !resumed {
-                cx.emit(EditorEvent::UsagesSearchStarted { search });
+                cx.emit(EditorEvent::UsagesSearchStarted {
+                    search,
+                    name: name.clone(),
+                    in_file,
+                });
             }
             cx.spawn(async move |this, cx| {
                 let answer = first(replies).await;

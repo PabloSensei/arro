@@ -59,6 +59,29 @@ fn read_text(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+/// The line of the window while the search of a symbol runs.
+fn searching_line(name: &str) -> String {
+    if name.is_empty() {
+        "Searching for usages…".to_owned()
+    } else {
+        format!("Searching for usages of {name}…")
+    }
+}
+
+/// The line of the window while the search waits for the language server. The name of
+/// the server comes from the status line of the language, which names itself, as in
+/// `Fixture: importing`; a line that names none keeps the neutral "language server".
+fn waiting_line(status: Option<&str>) -> String {
+    let named = status
+        .and_then(|text| text.split_once(':'))
+        .map(|(name, _)| name.trim())
+        .filter(|name| !name.is_empty() && !name.to_lowercase().contains("server"));
+    match named {
+        Some(name) => format!("Waiting for the {name} server…"),
+        None => WAITING_LINE.to_owned(),
+    }
+}
+
 actions!(show_usages_popup, [Dismiss]);
 actions!(usages_wait, [CancelWait]);
 
@@ -128,10 +151,18 @@ pub struct UsagesHub {
     structural: Option<StructuralView>,
     /// The search that waits for the language server, if one does.
     waiting: Option<Waiting>,
+    /// The search whose answer is on its way: its tab says so until the answer comes.
+    searching: Option<Searching>,
     /// The lines of the files the search found, read off the window thread.
     lines: HashMap<PathBuf, Arc<Vec<String>>>,
     /// The files whose lines are on their way.
     line_tasks: HashSet<PathBuf>,
+}
+
+/// A search that has started and has not answered yet: its tab shows the search line.
+struct Searching {
+    /// The serial of the tab that the answer replaces.
+    serial: u64,
 }
 
 /// A search that waits for the language server: its tab, and the flag that ends the wait.
@@ -301,6 +332,7 @@ impl UsagesHub {
                 sources: Vec::new(),
                 structural: None,
                 waiting: None,
+                searching: None,
                 lines: HashMap::new(),
                 line_tasks: HashSet::new(),
             }
@@ -392,13 +424,23 @@ impl UsagesHub {
         self.set_detailed_usages_with(search, usages, Some(FindUsagesScope::CurrentFile), true, cx);
     }
 
-    /// Records that a run of the search started, so its answer is not mistaken for an
-    /// older one. A wait of an older search ends here: the new search takes its place.
-    pub fn start_search(&mut self, search: u64, cx: &mut Context<Self>) {
+    /// Records that a run of the search started and opens its tab at once, so the window
+    /// says what it searches while the answer is on its way. A wait of an older search
+    /// ends here, and the tab of the search before this one takes the new name.
+    pub fn start_search(
+        &mut self,
+        search: u64,
+        name: String,
+        in_file: bool,
+        cx: &mut Context<Self>,
+    ) {
         if search <= self.latest_search {
             return;
         }
         self.latest_search = search;
+        // The places of a structural search give way to the search of a symbol.
+        self.structural = None;
+        let mut replaced = None;
         if self
             .waiting
             .as_ref()
@@ -406,14 +448,61 @@ impl UsagesHub {
             && let Some(waiting) = self.waiting.take()
         {
             waiting.cancel.cancel();
-            if let Some(index) = self
+            replaced = self
                 .tabs
                 .iter()
-                .position(|tab| tab.serial == waiting.serial)
-            {
-                self.close_tab(index, cx);
-            }
+                .position(|tab| tab.serial == waiting.serial);
         }
+        if replaced.is_none()
+            && let Some(searching) = self.searching.take()
+            && let Some(index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.serial == searching.serial)
+        {
+            replaced = Some(index);
+        }
+        self.serial += 1;
+        let serial = self.serial;
+        let tab = UsagesTab {
+            serial,
+            name,
+            prefix: if in_file {
+                "Usages in file".to_owned()
+            } else {
+                "Usages".to_owned()
+            },
+            usages: Vec::new(),
+            excluded: Vec::new(),
+            options: None,
+            pinned: false,
+            find: None,
+        };
+        let index = match replaced {
+            Some(index) => {
+                self.tabs[index] = tab;
+                index
+            }
+            None => {
+                let new_tab = self.tabs.is_empty()
+                    || cx
+                        .try_global::<PendingFindUsages>()
+                        .and_then(|pending| pending.0.as_ref())
+                        .is_some_and(|options| options.open_in_new_tab)
+                    || self.tab().is_some_and(|tab| tab.pinned);
+                if new_tab {
+                    self.tabs.push(tab);
+                    self.tabs.len() - 1
+                } else {
+                    let active = self.active;
+                    self.tabs[active] = tab;
+                    active
+                }
+            }
+        };
+        self.active = index;
+        self.searching = Some(Searching { serial });
+        self.regroup(cx);
     }
 
     /// Whether the answer of `search` is newer than the list: an answer of a search that
@@ -438,11 +527,13 @@ impl UsagesHub {
             return;
         }
         self.structural = None;
-        // The results replace the tab that waited for them; the wait itself is over.
+        // The results replace the tab that waited for them or showed the search; the
+        // wait and the search itself are over.
         let waiting = self.waiting.take();
         if let Some(waiting) = &waiting {
             waiting.cancel.cancel();
         }
+        let searching = self.searching.take();
         let mut options = cx
             .try_global::<PendingFindUsages>()
             .and_then(|pending| pending.0.clone());
@@ -451,9 +542,31 @@ impl UsagesHub {
             chosen.scope = scope;
             options = Some(chosen);
         }
+        // The tab of a search keeps its name when the answer names no use.
+        let replaced = waiting
+            .as_ref()
+            .and_then(|waiting| {
+                self.tabs
+                    .iter()
+                    .position(|found| found.serial == waiting.serial)
+            })
+            .or_else(|| {
+                searching.as_ref().and_then(|searching| {
+                    self.tabs
+                        .iter()
+                        .position(|found| found.serial == searching.serial)
+                })
+            });
         let name = usages
             .first()
             .map(|usage| usage.name.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                replaced
+                    .and_then(|index| self.tabs.get(index))
+                    .map(|tab| tab.name.clone())
+                    .filter(|name| !name.is_empty())
+            })
             .unwrap_or_default();
         let mut prefix = "Usages".to_owned();
         if let Some(options) = &options {
@@ -484,11 +597,6 @@ impl UsagesHub {
             pinned: false,
             find: None,
         };
-        let replaced = waiting.and_then(|waiting| {
-            self.tabs
-                .iter()
-                .position(|found| found.serial == waiting.serial)
-        });
         if let Some(index) = replaced {
             self.tabs[index] = tab;
             self.active = index;
@@ -823,6 +931,13 @@ impl UsagesHub {
         {
             waiting.cancel.cancel();
         }
+        if self
+            .searching
+            .as_ref()
+            .is_some_and(|searching| searching.serial == closing)
+        {
+            self.searching = None;
+        }
         self.tabs.remove(index);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
@@ -853,6 +968,8 @@ impl UsagesHub {
         if let Some(previous) = &previous {
             previous.cancel.cancel();
         }
+        // The tab of a search whose answer is still missing becomes the tab of the wait.
+        let previous_searching = self.searching.take();
         self.serial += 1;
         let serial = self.serial;
         let tab = UsagesTab {
@@ -869,11 +986,19 @@ impl UsagesHub {
             pinned: false,
             find: None,
         };
-        let replaced = previous.and_then(|previous| {
-            self.tabs
-                .iter()
-                .position(|found| found.serial == previous.serial)
-        });
+        let replaced = previous
+            .and_then(|previous| {
+                self.tabs
+                    .iter()
+                    .position(|found| found.serial == previous.serial)
+            })
+            .or_else(|| {
+                previous_searching.and_then(|searching| {
+                    self.tabs
+                        .iter()
+                        .position(|found| found.serial == searching.serial)
+                })
+            });
         match replaced {
             Some(index) => {
                 self.tabs[index] = tab;
@@ -1031,14 +1156,34 @@ impl UsagesHub {
     pub fn regroup(&mut self, cx: &mut Context<Self>) {
         cx.notify();
         let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
-        // The list of the tab that waits says so where the rows would be.
+        // The list of the tab that is searched, or that waits for the server, says so
+        // where the rows would be, and the panel marks the search with a line.
+        let searching = self
+            .searching
+            .as_ref()
+            .is_some_and(|searching| self.tab().is_some_and(|tab| tab.serial == searching.serial));
         let waiting = self
             .waiting
             .as_ref()
             .is_some_and(|waiting| self.tab().is_some_and(|tab| tab.serial == waiting.serial));
-        let empty = if waiting { WAITING_LINE } else { NO_USAGES };
-        self.panel
-            .update(cx, |panel, cx| panel.set_empty(empty, cx));
+        let empty = if searching {
+            searching_line(self.tab().map_or("", |tab| tab.name.as_str()))
+        } else if waiting {
+            let status = self.workspace.upgrade().and_then(|workspace| {
+                workspace
+                    .read(cx)
+                    .language_status()
+                    .map(|text| text.to_string())
+            });
+            waiting_line(status.as_deref())
+        } else {
+            NO_USAGES.to_owned()
+        };
+        let progress = searching || waiting;
+        self.panel.update(cx, |panel, cx| {
+            panel.set_empty(&empty, cx);
+            panel.set_progress(progress, cx);
+        });
         if let Some(view) = &self.structural {
             let items = view.items.clone();
             let rows = view.rows.clone();
@@ -1190,7 +1335,12 @@ impl UsagesHub {
             panel.set_header_buttons(buttons, cx);
             panel.set_view(items, panel_rows, cx);
             panel.set_code(code_lines, cx);
-            panel.set_counted_title(&prefix, cx);
+            // A search in progress has no count yet; the title names the run.
+            if searching {
+                panel.set_title(prefix, cx);
+            } else {
+                panel.set_counted_title(&prefix, cx);
+            }
         });
         self.request_lines(missing, cx);
     }
@@ -2344,16 +2494,48 @@ fn line_code(text: &str, line: usize, usage: &DetailedUsage) -> CodeLine {
         trimmed.len()
     };
     let start = start.min(trimmed.len());
+    let range = start..end.clamp(start, trimmed.len());
     CodeLine {
         number: line + 1,
         text: trimmed.to_owned(),
-        highlight: start..end.clamp(start, trimmed.len()),
+        highlight: narrow_to_name(trimmed, range, &usage.name),
     }
+}
+
+/// The bytes of the name inside the range the server gave for a use. A server may name
+/// the whole invocation; the row marks only the name, the first whole-word match in the
+/// range, as IDEA does.
+fn narrow_to_name(text: &str, range: Range<usize>, name: &str) -> Range<usize> {
+    if name.is_empty() {
+        return range;
+    }
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if text.get(start..end) == Some(name) {
+        return range;
+    }
+    let found = text.match_indices(name).find_map(|(at, _)| {
+        let stop = at + name.len();
+        (at >= start && stop <= end && at_word_bounds(text, at, stop)).then_some(at..stop)
+    });
+    found.unwrap_or(range)
+}
+
+/// Whether the range of `text` is a whole word: another name character would make the
+/// name a part of a longer one.
+fn at_word_bounds(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char)
+}
+
+fn is_name_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_' || character == '$'
 }
 
 impl Row {
     /// Takes the line of the file, cutting the snippet and marking the place.
-    fn set_text(&mut self, line: &str) {
+    fn set_text(&mut self, line: &str, name: &str) {
         let text: String = line.chars().take(SNIPPET).collect();
         let start = byte_at(&text, self.start);
         let end = if self.end_line as usize == self.line {
@@ -2362,8 +2544,9 @@ impl Row {
             text.len()
         };
         let end = end.max(start).min(text.len());
+        let highlight = narrow_to_name(&text, start..end, name);
         self.text = text;
-        self.highlight = start..end;
+        self.highlight = highlight;
         self.loaded = true;
         self.loading = false;
     }
@@ -2450,7 +2633,7 @@ impl ShowUsagesPopup {
             loading: false,
         };
         if let Some(text) = open_line(&row.path, row.line, cx) {
-            row.set_text(&text);
+            row.set_text(&text, &self.name);
         }
         Some(row)
     }
@@ -2560,13 +2743,14 @@ impl ShowUsagesPopup {
         if generation != self.generation {
             return;
         }
-        let Some(row) = self.rows.get_mut(index) else {
+        let Some(row) = self.rows.get(index) else {
             return;
         };
         if row.path != path || row.line != line {
             return;
         }
-        row.set_text(&text);
+        let name = self.name.clone();
+        self.rows[index].set_text(&text, &name);
         self.refilter();
     }
 

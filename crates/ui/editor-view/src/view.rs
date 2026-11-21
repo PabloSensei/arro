@@ -751,11 +751,15 @@ pub enum EditorEvent {
     },
     /// The language server sent the diagnostics of the file, empty when it has none.
     Diagnostics(Vec<DiagnosticEntry>),
-    /// Alt+F7 or Ctrl+F7 started a search: the Usages window opens at once, and the answer
-    /// comes later under the same number.
+    /// Alt+F7 or Ctrl+F7 started a search: the Usages window opens at once with the name
+    /// of the symbol, and the answer comes later under the same number.
     UsagesSearchStarted {
         /// The number of the run, which its answer carries.
         search: u64,
+        /// The name of the symbol, the label of the tab while the search runs.
+        name: String,
+        /// Whether the search looks in this file only.
+        in_file: bool,
     },
     /// Alt+F7: the uses of the symbol, for the window that lists them by file.
     Usages {

@@ -1184,13 +1184,19 @@ fn open(
                 })
                 .ok();
         }
-        EditorEvent::UsagesSearchStarted { search } => {
+        EditorEvent::UsagesSearchStarted {
+            search,
+            name,
+            in_file,
+        } => {
             let Some(hub) = cx.try_global::<ActiveUsages>() else {
                 return;
             };
             let hub = hub.0.clone();
-            let search = *search;
-            hub.update(cx, |hub, cx| hub.start_search(search, cx));
+            let (search, name, in_file) = (*search, name.clone(), *in_file);
+            hub.update(cx, |hub, cx| {
+                hub.start_search(search, name, in_file, cx)
+            });
             let workspace = reports.clone();
             handle
                 .update(cx, |_, window, cx| {

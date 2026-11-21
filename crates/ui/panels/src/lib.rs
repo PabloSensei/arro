@@ -2279,3 +2279,15 @@ mod window_tests_usages_rows;
 
 #[cfg(test)]
 mod window_tests_debug_live_shape;
+
+#[cfg(test)]
+mod window_tests_debug_build_front;
+
+#[cfg(test)]
+mod window_tests_debug_frames;
+
+#[cfg(test)]
+mod window_tests_find_action_new;
+
+#[cfg(test)]
+mod window_tests_usages_searching;

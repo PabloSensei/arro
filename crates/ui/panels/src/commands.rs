@@ -234,6 +234,18 @@ pub fn register(
             panel.update(cx, |panel, cx| panel.toggle_mute(cx));
         }
     });
+    // The link of a failed build: the Debug window opens at its Console.
+    workspace.register_command(
+        "debug.show_console",
+        "Show Debug Console",
+        |workspace, window, cx| {
+            workspace.show_tool(DEBUG_TOOL, window, cx);
+            if let Some(panel) = cx.try_global::<ActiveDebug>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.show_console(cx));
+            }
+        },
+    );
     workspace.register_command("window.database", "Database", |workspace, window, cx| {
         workspace.toggle_tool(DATABASE_TOOL, window, cx)
     });

@@ -231,6 +231,11 @@ impl FileTree {
         true
     }
 
+    /// The source roots of the project model, where a new item goes when no file is open.
+    pub fn source_roots(&self) -> &[PathBuf] {
+        &self.source_roots
+    }
+
     pub fn toggle(&mut self, folder: &Path) {
         if !self.expanded.remove(folder) {
             self.expanded.insert(folder.to_path_buf());

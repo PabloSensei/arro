@@ -1,6 +1,8 @@
 //! Ctrl+F6: the form of Change Signature. The language describes the signature under
 //! the caret, the form edits it and the language turns the new one into edits.
 
+use std::ops::Range;
+
 use futures_util::StreamExt;
 use lang_api::{
     ChangeSignatureInfo, ChangeSignatureRequest, Confidence, DocumentSpot, MethodSignature,
@@ -15,6 +17,11 @@ use crate::prompt::TextField;
 
 const WIDTH: f32 = 760.;
 
+/// The width of the three buttons at the end of a parameter row: Move Up, Move Down and
+/// Remove. The column of the headers keeps the same width, so a header stands over its
+/// field.
+const ROW_CONTROLS: f32 = 3. * CONTROL_HEIGHT + 2. * SPACE_S;
+
 const NO_ANSWER: &str = "The language server did not answer";
 const NO_SUPPORT: &str = "Change Signature is not supported by this language";
 
@@ -27,6 +34,55 @@ enum Field {
     ParameterType(usize),
     ParameterName(usize),
     ParameterDefault(usize),
+}
+
+/// The modifier in front of a method or a constructor, as the visibility field offers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Visibility {
+    Public,
+    Protected,
+    Package,
+    Private,
+}
+
+impl Visibility {
+    const ALL: [Self; 4] = [Self::Public, Self::Protected, Self::Package, Self::Private];
+
+    /// The value the field shows; a package-private member has no keyword in the text.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Protected => "protected",
+            Self::Package => "package-private",
+            Self::Private => "private",
+        }
+    }
+
+    /// The word the language takes back, and the empty word of a package-private member.
+    fn modifier(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Protected => "protected",
+            Self::Package => "",
+            Self::Private => "private",
+        }
+    }
+
+    fn from_modifier(modifier: &str) -> Self {
+        match modifier.trim() {
+            "public" => Self::Public,
+            "protected" => Self::Protected,
+            "private" => Self::Private,
+            _ => Self::Package,
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|value| *value == self)
+            .unwrap_or(0)
+    }
 }
 
 /// One row of the parameter table.
@@ -62,9 +118,14 @@ impl ParameterRow {
 pub struct ChangeSignatureDialog {
     spot: DocumentSpot,
     name: TextField,
-    visibility: TextField,
+    visibility: Visibility,
+    visibility_open: bool,
+    visibility_marked: usize,
     return_type: TextField,
     parameters: Vec<ParameterRow>,
+    /// The row the keys of the form work on, kept apart from the field that has the
+    /// caret so that Alt+Up and Alt+Down reach a row from the Name field too.
+    selected: usize,
     exceptions: Vec<SignatureException>,
     active: Field,
     loading: bool,
@@ -86,9 +147,12 @@ impl ChangeSignatureDialog {
         let view = cx.new(|cx| Self {
             spot,
             name: TextField::default(),
-            visibility: TextField::default(),
+            visibility: Visibility::Public,
+            visibility_open: false,
+            visibility_marked: 0,
             return_type: TextField::default(),
             parameters: Vec::new(),
+            selected: 0,
             exceptions: Vec::new(),
             active: Field::Name,
             loading: true,
@@ -145,13 +209,16 @@ impl ChangeSignatureDialog {
             self.error = Some(NO_ANSWER.to_owned());
         } else if let Some(signature) = info.signature {
             self.name.text = signature.name;
-            self.visibility.text = signature.visibility;
+            self.visibility = Visibility::from_modifier(&signature.visibility);
+            self.visibility_open = false;
+            self.visibility_marked = self.visibility.index();
             self.return_type.text = signature.return_type;
             self.parameters = signature
                 .parameters
                 .into_iter()
                 .map(ParameterRow::from)
                 .collect();
+            self.selected = 0;
             self.exceptions = signature.exceptions;
         } else {
             self.error = Some("Cannot change the signature here".to_owned());
@@ -181,17 +248,92 @@ impl ChangeSignatureDialog {
         }
         Ok(MethodSignature {
             name: name.to_owned(),
-            visibility: self.visibility.text.trim().to_owned(),
+            visibility: self.visibility.modifier().to_owned(),
             return_type: self.return_type.text.trim().to_owned(),
             parameters,
             exceptions: self.exceptions.clone(),
         })
     }
 
-    /// Keys of the form: text goes to the active field, Tab moves between fields, and
-    /// the buttons have their own click handlers.
+    /// The signature as the fields describe it, the way the preview under the table
+    /// shows it. An empty visibility leaves the modifier out, as a package-private
+    /// member has none, and an empty return type leaves the type out, as in a
+    /// constructor.
+    fn signature_text(&self) -> String {
+        let mut head = Vec::new();
+        if !self.visibility.modifier().is_empty() {
+            head.push(self.visibility.modifier().to_owned());
+        }
+        let return_type = self.return_type.text.trim();
+        if !return_type.is_empty() {
+            head.push(return_type.to_owned());
+        }
+        let name = self.name.text.trim();
+        head.push(if name.is_empty() {
+            "name".to_owned()
+        } else {
+            name.to_owned()
+        });
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|row| {
+                match (
+                    row.type_name.text.trim().is_empty(),
+                    row.name.text.trim().is_empty(),
+                ) {
+                    (true, true) => String::new(),
+                    (true, false) => row.name.text.trim().to_owned(),
+                    (false, true) => row.type_name.text.trim().to_owned(),
+                    (false, false) => {
+                        format!("{} {}", row.type_name.text.trim(), row.name.text.trim())
+                    }
+                }
+            })
+            .filter(|parameter| !parameter.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}({parameters})", head.join(" "))
+    }
+
+    /// The signature of the preview, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn preview_text(&self) -> String {
+        self.signature_text()
+    }
+
+    /// Keys of the form: text goes to the active field, Tab moves between fields, the
+    /// visibility list opens on Space and walks on the arrows, and the parameter row
+    /// under the selection follows Alt+Insert, Alt+Delete, Alt+Up and Alt+Down.
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if self.visibility_open {
+            match key {
+                "escape" => {
+                    self.visibility_open = false;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "up" => {
+                    self.mark_visibility(-1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" => {
+                    self.mark_visibility(1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" => {
+                    self.choose_visibility(self.visibility_marked, cx);
+                    window.focus(&self.focus, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if key == "escape" {
             self.close(window, cx);
             cx.stop_propagation();
@@ -203,23 +345,68 @@ impl ChangeSignatureDialog {
             return;
         }
         if key == "tab" && !event.keystroke.modifiers.control {
+            self.visibility_open = false;
             if event.keystroke.modifiers.shift {
                 self.active = self.previous_field();
             } else {
                 self.active = self.next_field();
             }
+            self.select_active_parameter();
             cx.notify();
             cx.stop_propagation();
             return;
         }
-        let moved = match (event.keystroke.modifiers.alt, key, self.active_parameter()) {
-            (true, "up", Some(index)) => self.move_parameter(index, -1, cx),
-            (true, "down", Some(index)) => self.move_parameter(index, 1, cx),
-            _ => false,
-        };
-        if moved {
-            cx.stop_propagation();
-            return;
+        if event.keystroke.modifiers.alt {
+            match key {
+                "insert" => {
+                    self.add_parameter(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "delete" => {
+                    if let Some(index) = self.selected_parameter() {
+                        self.remove_parameter(index, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "up" => {
+                    if let Some(index) = self.selected_parameter() {
+                        self.move_parameter(index, -1, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" => {
+                    if let Some(index) = self.selected_parameter() {
+                        self.move_parameter(index, 1, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.active == Field::Visibility {
+            match key {
+                "space" => {
+                    self.open_visibility(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "backspace" | "delete" => {
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+            if event.keystroke.key_char.is_some()
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform
+            {
+                cx.stop_propagation();
+                return;
+            }
         }
         let typed = self
             .field_mut()
@@ -235,7 +422,8 @@ impl ChangeSignatureDialog {
     fn field_mut(&mut self) -> Option<&mut TextField> {
         match self.active {
             Field::Name => Some(&mut self.name),
-            Field::Visibility => Some(&mut self.visibility),
+            // The visibility is a list of four values, not a field that takes text.
+            Field::Visibility => None,
             Field::ReturnType => Some(&mut self.return_type),
             Field::ParameterType(index) => {
                 self.parameters.get_mut(index).map(|row| &mut row.type_name)
@@ -274,9 +462,47 @@ impl ChangeSignatureDialog {
         fields[(index + fields.len() - 1) % fields.len()]
     }
 
+    fn open_visibility(&mut self, cx: &mut Context<Self>) {
+        self.visibility_open = true;
+        self.visibility_marked = self.visibility.index();
+        self.active = Field::Visibility;
+        cx.notify();
+    }
+
+    fn mark_visibility(&mut self, step: isize, cx: &mut Context<Self>) {
+        let last = Visibility::ALL.len() - 1;
+        self.visibility_marked =
+            (self.visibility_marked as isize + step).clamp(0, last as isize) as usize;
+        cx.notify();
+    }
+
+    fn choose_visibility(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(value) = Visibility::ALL.get(index).copied() else {
+            return;
+        };
+        self.visibility = value;
+        self.visibility_open = false;
+        self.visibility_marked = self.visibility.index();
+        self.status = None;
+        self.error = None;
+        cx.notify();
+    }
+
+    /// The row the keys work on, kept inside the table after a row leaves.
+    fn selected_parameter(&self) -> Option<usize> {
+        (!self.parameters.is_empty()).then(|| self.selected.min(self.parameters.len() - 1))
+    }
+
+    fn select_active_parameter(&mut self) {
+        if let Some(index) = self.active_parameter() {
+            self.selected = index.min(self.parameters.len().saturating_sub(1));
+        }
+    }
+
     fn add_parameter(&mut self, cx: &mut Context<Self>) {
         self.parameters.push(ParameterRow::new());
-        self.active = Field::ParameterType(self.parameters.len() - 1);
+        self.selected = self.parameters.len() - 1;
+        self.active = Field::ParameterType(self.selected);
         self.status = None;
         self.error = None;
         cx.notify();
@@ -287,7 +513,13 @@ impl ChangeSignatureDialog {
             return;
         }
         self.parameters.remove(index);
+        if self.parameters.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.parameters.len() - 1);
+        }
         self.active = self.settle_field(self.active);
+        self.select_active_parameter();
         self.status = None;
         self.error = None;
         cx.notify();
@@ -323,6 +555,7 @@ impl ChangeSignatureDialog {
         }
         let target = target as usize;
         self.parameters.swap(index, target);
+        self.selected = target;
         self.active = match self.active {
             Field::ParameterType(_) => Field::ParameterType(target),
             Field::ParameterName(_) => Field::ParameterName(target),
@@ -476,15 +709,43 @@ fn summary(change: &WorkspaceChange) -> String {
     text + ". Refactor applies them"
 }
 
+#[allow(clippy::too_many_arguments)]
 fn field_box(
     mouse: FieldMouse,
     id: impl Into<ElementId>,
     selector: String,
     field: &TextField,
     active: bool,
+    hint: Option<FieldHint>,
+    warning: Option<&'static str>,
     theme: &Theme,
 ) -> Stateful<Div> {
-    div()
+    let children = match hint {
+        Some(hint) => text_field_children_hinted(
+            mouse,
+            "change-signature-field",
+            field,
+            theme.text,
+            theme.text,
+            theme.selection,
+            theme.caret,
+            18.,
+            active,
+            hint,
+        ),
+        None => text_field_children_named(
+            mouse,
+            "change-signature-field",
+            field,
+            theme.text,
+            theme.text,
+            theme.selection,
+            theme.caret,
+            18.,
+            active,
+        ),
+    };
+    let frame = div()
         .id(id)
         .debug_selector(move || selector)
         .flex()
@@ -495,23 +756,140 @@ fn field_box(
         .px(px(SPACE_M))
         .rounded(px(CONTROL_RADIUS))
         .border_1()
-        .border_color(if active {
+        .border_color(if warning.is_some() {
+            theme.error
+        } else if active {
             theme.accent
         } else {
             theme.control_border
         })
-        .text_color(theme.text)
-        .children(text_field_children_named(
-            mouse,
-            "change-signature-field",
-            field,
-            theme.text,
-            theme.text,
-            theme.selection,
-            theme.caret,
-            18.,
-            active,
-        ))
+        .text_color(theme.text);
+    let frame = match warning {
+        Some(text) => frame
+            .child(
+                div()
+                    .debug_selector(|| "change-signature-default-warning".to_owned())
+                    .child(icon_sized("status/warning", TEXT_SMALL, theme)),
+            )
+            .tooltip(move |_, cx| tooltip(text, None, cx)),
+        None => frame,
+    };
+    frame.children(children)
+}
+
+/// A header of the parameter table over its column: muted text on the height of a field,
+/// as wide as the field under it.
+fn column_header(id: &'static str, text: &str, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex()
+        .items_center()
+        .flex_1()
+        .min_w(px(0.))
+        .text_size(px(TEXT_SMALL))
+        .text_color(theme.text_muted)
+        .child(text.to_owned())
+}
+
+/// The words of `text[from..to]`: names, types and values of the signature preview.
+fn words_in(text: &str, from: usize, to: usize) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut at = from;
+    while at < to {
+        if bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'$') {
+            let start = at;
+            while at < to && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'$'))
+            {
+                at += 1;
+            }
+            ranges.push(start..at);
+        } else {
+            at += 1;
+        }
+    }
+    ranges
+}
+
+fn highlight(color: Hsla) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(color),
+        ..HighlightStyle::default()
+    }
+}
+
+fn is_modifier(word: &str) -> bool {
+    matches!(
+        word,
+        "public"
+            | "protected"
+            | "private"
+            | "static"
+            | "final"
+            | "abstract"
+            | "default"
+            | "synchronized"
+            | "native"
+            | "strictfp"
+    )
+}
+
+/// The colours of the signature preview: the modifier, the types, the name and the
+/// parameters of the signature as the editor would paint them.
+fn signature_highlights(text: &str, theme: &Theme) -> Vec<(Range<usize>, HighlightStyle)> {
+    let open = text.find('(').unwrap_or(text.len());
+    let close = text.rfind(')').unwrap_or(text.len());
+    let mut highlights = Vec::new();
+    let head = words_in(text, 0, open);
+    if let Some((name, types)) = head.split_last() {
+        for range in types {
+            let word = &text[range.clone()];
+            let color = if is_modifier(word) {
+                theme.keyword
+            } else {
+                theme.semantic_type
+            };
+            highlights.push((range.clone(), highlight(color)));
+        }
+        highlights.push((name.clone(), highlight(theme.semantic_method)));
+    }
+    if open < close {
+        let mut start = open + 1;
+        let mut depth = 0i32;
+        for (offset, character) in text[open + 1..close].char_indices() {
+            match character {
+                '<' | '[' => depth += 1,
+                '>' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    let end = open + 1 + offset;
+                    parameter_highlights(text, start, end, theme, &mut highlights);
+                    start = end + 1;
+                }
+                _ => {}
+            }
+        }
+        parameter_highlights(text, start, close, theme, &mut highlights);
+    }
+    highlights
+}
+
+/// The type words and the name of one parameter of the preview.
+fn parameter_highlights(
+    text: &str,
+    start: usize,
+    end: usize,
+    theme: &Theme,
+    highlights: &mut Vec<(Range<usize>, HighlightStyle)>,
+) {
+    let words = words_in(text, start, end);
+    let Some((name, types)) = words.split_last() else {
+        return;
+    };
+    for range in types {
+        highlights.push((range.clone(), highlight(theme.semantic_type)));
+    }
+    highlights.push((name.clone(), highlight(theme.semantic_parameter)));
 }
 
 fn small_button(
@@ -555,42 +933,87 @@ impl Render for ChangeSignatureDialog {
             "change-signature-name".to_owned(),
             &self.name,
             active == Field::Name,
+            None,
+            None,
             &theme,
         )
         .on_click(cx.listener(|this, _, window, cx| {
             this.active = Field::Name;
+            this.visibility_open = false;
             window.focus(&this.focus, cx);
             cx.notify();
         }));
-        let visibility = field_box(
-            FieldMouse::new(cx, |this| Some(&mut this.visibility)),
-            "change-signature-visibility-field",
-            "change-signature-visibility".to_owned(),
-            &self.visibility,
-            active == Field::Visibility,
+        let visibility_field = select_field(
+            "change-signature-visibility",
+            self.visibility.label(),
+            self.visibility_open,
             &theme,
         )
+        .debug_selector(|| "change-signature-visibility".to_owned())
+        .flex_1()
         .on_click(cx.listener(|this, _, window, cx| {
-            this.active = Field::Visibility;
+            if this.visibility_open {
+                this.visibility_open = false;
+            } else {
+                this.open_visibility(cx);
+            }
             window.focus(&this.focus, cx);
             cx.notify();
         }));
+        let visibility_menu = self.visibility_open.then(|| {
+            let mut menu = select_menu(&theme)
+                .debug_selector(|| "change-signature-visibility-menu".to_owned());
+            for (index, value) in Visibility::ALL.into_iter().enumerate() {
+                let selector = format!("change-signature-visibility-option-{}", value.label());
+                menu = menu.child(
+                    select_option(
+                        ("change-signature-visibility-option", index),
+                        value.label(),
+                        self.visibility == value,
+                        self.visibility_marked == index,
+                        &theme,
+                    )
+                    .debug_selector(move || selector.clone())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_visibility(index, cx);
+                        window.focus(&this.focus, cx);
+                    })),
+                );
+            }
+            menu
+        });
+        let visibility = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_XS))
+            .child(visibility_field)
+            .children(visibility_menu);
         let return_type = field_box(
             FieldMouse::new(cx, |this| Some(&mut this.return_type)),
             "change-signature-return-field",
             "change-signature-return".to_owned(),
             &self.return_type,
             active == Field::ReturnType,
+            None,
+            None,
             &theme,
         )
         .on_click(cx.listener(|this, _, window, cx| {
             this.active = Field::ReturnType;
+            this.visibility_open = false;
             window.focus(&this.focus, cx);
             cx.notify();
         }));
 
         let mut rows = Vec::with_capacity(self.parameters.len());
         for index in 0..self.parameters.len() {
+            let hint = FieldHint {
+                text: "value for call sites",
+                color: theme.text_muted,
+            };
+            let warning = (self.parameters[index].original_index.is_none()
+                && self.parameters[index].default_value.text.trim().is_empty())
+            .then_some("A new parameter needs a value for its call sites");
             let type_field = field_box(
                 FieldMouse::new(cx, move |this| {
                     this.parameters
@@ -601,10 +1024,14 @@ impl Render for ChangeSignatureDialog {
                 format!("change-signature-type-{index}"),
                 &self.parameters[index].type_name,
                 active == Field::ParameterType(index),
+                None,
+                None,
                 &theme,
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.active = Field::ParameterType(index);
+                this.selected = index;
+                this.visibility_open = false;
                 window.focus(&this.focus, cx);
                 cx.notify();
             }));
@@ -618,10 +1045,14 @@ impl Render for ChangeSignatureDialog {
                 format!("change-signature-name-{index}"),
                 &self.parameters[index].name,
                 active == Field::ParameterName(index),
+                None,
+                None,
                 &theme,
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.active = Field::ParameterName(index);
+                this.selected = index;
+                this.visibility_open = false;
                 window.focus(&this.focus, cx);
                 cx.notify();
             }));
@@ -635,10 +1066,14 @@ impl Render for ChangeSignatureDialog {
                 format!("change-signature-default-{index}"),
                 &self.parameters[index].default_value,
                 active == Field::ParameterDefault(index),
+                Some(hint),
+                warning,
                 &theme,
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.active = Field::ParameterDefault(index);
+                this.selected = index;
+                this.visibility_open = false;
                 window.focus(&this.focus, cx);
                 cx.notify();
             }));
@@ -688,16 +1123,29 @@ impl Render for ChangeSignatureDialog {
                         this.remove_parameter(index, cx);
                     })),
                 );
+            let selected = index == self.selected;
             rows.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_S))
-                    .child(type_field)
-                    .child(name_field)
-                    .child(default_field)
-                    .child(buttons)
-                    .into_any_element(),
+                form_aligned(
+                    label_width,
+                    div()
+                        .id(("change-signature-row", index))
+                        .debug_selector(move || format!("change-signature-row-{index}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .rounded(px(ROW_RADIUS))
+                        .when(selected, |this| this.bg(theme.selection_inactive))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.selected = index;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        }))
+                        .child(type_field)
+                        .child(name_field)
+                        .child(default_field)
+                        .child(buttons),
+                )
+                .into_any_element(),
             );
         }
 
@@ -740,6 +1188,63 @@ impl Render for ChangeSignatureDialog {
             })
         };
 
+        let header = form_aligned(
+            label_width,
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .child(column_header(
+                    "change-signature-header-type",
+                    "Type",
+                    &theme,
+                ))
+                .child(column_header(
+                    "change-signature-header-name",
+                    "Name",
+                    &theme,
+                ))
+                .child(column_header(
+                    "change-signature-header-default",
+                    "Default value",
+                    &theme,
+                ))
+                .child(div().flex_none().w(px(ROW_CONTROLS))),
+        );
+
+        let signature = self.signature_text();
+        let highlights = signature_highlights(&signature, &theme);
+        let preview = div()
+            .debug_selector(|| "change-signature-preview".to_owned())
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_XS))
+            .child(
+                div()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_muted)
+                    .child("Signature Preview"),
+            )
+            .child(
+                div()
+                    .id("change-signature-preview-text")
+                    .debug_selector(|| "change-signature-preview-text".to_owned())
+                    .flex()
+                    .items_center()
+                    .min_h(px(CONTROL_HEIGHT))
+                    .px(px(SPACE_M))
+                    .py(px(SPACE_S))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.control_border)
+                    .bg(theme.editor_bg)
+                    .font_family(MONO_FONT)
+                    .text_color(theme.text)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(StyledText::new(signature).with_highlights(highlights)),
+            );
+
         let shell = surface(&theme)
             .id("change-signature")
             .debug_selector(|| "change-signature".to_owned())
@@ -774,9 +1279,11 @@ impl Render for ChangeSignatureDialog {
                         .on_click(cx.listener(|this, _, _, cx| this.add_parameter(cx))),
                     ),
             )
+            .child(header)
             .children(rows)
             .children(exceptions)
             .children(note)
+            .child(preview)
             .child(
                 DialogButtons::new()
                     .extra(

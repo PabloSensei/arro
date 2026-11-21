@@ -54,6 +54,9 @@ const ROW_MARGIN: f32 = SPACE_L;
 const SEARCH_TIMEOUT: Duration = Duration::from_millis(1000);
 /// The label of the migration node and of the entry of the New menu.
 pub(crate) const MIGRATIONS_LABEL: &str = "Migrations";
+/// The group word of the rows of the New menu, and the words a query of Find Action
+/// matches them by besides their titles.
+pub(crate) const NEW_GROUP: &str = "New";
 /// The New menu row that writes the next versioned migration of the project.
 const FLYWAY_LABEL: &str = "Flyway Migration";
 /// The kinds of source file that live inside the New Class dialog rather than in the New
@@ -196,6 +199,40 @@ impl Global for FileTemplates {}
 pub struct LastNewKind(pub usize);
 
 impl Global for LastNewKind {}
+
+/// A row of the New list of the project tree: a kind the application offers, the scratch
+/// list, a migration or the request file. The context menu of the tree and Find Action
+/// list the same rows.
+enum NewRow {
+    Separator,
+    Template {
+        template: FileTemplate,
+        /// The title of the row without the group word: `Class` for `New Class`.
+        title: String,
+    },
+    Scratch,
+    Flyway,
+    HttpRequest,
+}
+
+/// A row of the New list as Find Action lists it. The group word is not part of the
+/// title: the query matches it too, and the row writes it at its right.
+#[derive(Clone)]
+pub(crate) struct NewAction {
+    pub title: String,
+    /// The words the query is matched against: the title and the group of the row.
+    pub search: String,
+    pub icon: &'static str,
+    kind: NewActionKind,
+}
+
+#[derive(Clone)]
+enum NewActionKind {
+    Template(FileTemplate),
+    Scratch,
+    Flyway,
+    HttpRequest,
+}
 
 /// Files of the project tree that Ctrl+C or Ctrl+X took, and whether they are to move.
 #[derive(Default)]
@@ -1696,6 +1733,48 @@ impl ProjectPanel {
         self.workspace.update(cx, ask).ok();
     }
 
+    /// Find Action chose a row of the New list: the window it opens is the one of the row
+    /// of the menu, in the folder of the active file.
+    pub(crate) fn ask_new_action(
+        &mut self,
+        action: NewAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action.kind {
+            NewActionKind::Template(template) => {
+                let folder = self.new_item_folder(cx);
+                self.ask_new(template, folder, window, cx);
+            }
+            NewActionKind::Scratch => {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        crate::window_popups::show_scratch_languages(workspace, window, cx)
+                    })
+                    .ok();
+            }
+            NewActionKind::Flyway => self.ask_flyway_migration(window, cx),
+            NewActionKind::HttpRequest => {
+                let folder = self.new_item_folder(cx);
+                self.ask_new(crate::tree_ops::http_request(), folder, window, cx);
+            }
+        }
+    }
+
+    /// The folder a new item of Find Action goes into: the one of the active file, or the
+    /// first source root of the project when no file is open.
+    fn new_item_folder(&self, cx: &mut Context<Self>) -> PathBuf {
+        let active = self
+            .workspace
+            .update(cx, |workspace, _| workspace.active_path())
+            .ok()
+            .flatten();
+        active
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| self.tree.source_roots().first().cloned())
+            .unwrap_or_else(|| self.root_path())
+    }
+
     /// A script step: creates `name` from the template with that label in `folder`.
     pub(crate) fn script_new(
         &mut self,
@@ -2387,119 +2466,165 @@ impl ProjectPanel {
 
     /// The rows of the New list: the source kinds first, then the plain files and
     /// folders, then the rest of what the application offers.
-    fn new_submenu(&self, folder: PathBuf, cx: &mut Context<Self>) -> Vec<MenuEntry> {
-        let panel = cx.weak_entity();
+    fn new_rows(&self) -> Vec<NewRow> {
         let find = |label: &str| {
             self.templates
                 .iter()
                 .find(|template| template.label == label)
                 .cloned()
         };
-        let mut entries = Vec::new();
-        let primary = self.primary_source();
-        let primary_label = primary.as_ref().map(|template| template.label.to_owned());
-        if let Some(template) = primary {
-            let label = format!("New {}", template.label);
-            entries.push(Self::template_entry(
+        let mut rows = Vec::new();
+        if let Some(template) = self.primary_source() {
+            rows.push(NewRow::Template {
+                title: template.label.to_owned(),
                 template,
-                label,
-                folder.clone(),
-                panel.clone(),
-            ));
+            });
         }
         if let Some(template) = find("File") {
-            entries.push(Self::template_entry(
+            rows.push(NewRow::Template {
+                title: "File".to_owned(),
                 template,
-                "New File".to_owned(),
-                folder.clone(),
-                panel.clone(),
-            ));
+            });
         }
-        {
-            let scratch_panel = panel.clone();
-            entries.push(
-                MenuEntry::new("Scratch File", move |window, cx| {
-                    let open = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-                        this.workspace
-                            .update(cx, |workspace, cx| {
-                                crate::window_popups::show_scratch_languages(workspace, window, cx)
-                            })
-                            .ok();
-                    };
-                    Self::later(window, scratch_panel.clone(), cx, open);
-                })
-                .icon("general/newFile"),
-            );
-        }
+        rows.push(NewRow::Scratch);
         if let Some(template) = find("Directory") {
-            entries.push(Self::template_entry(
+            rows.push(NewRow::Template {
+                title: "Directory".to_owned(),
                 template,
-                "New Directory".to_owned(),
-                folder.clone(),
-                panel.clone(),
-            ));
+            });
         }
         if let Some(template) = find("Package") {
-            entries.push(Self::template_entry(
+            rows.push(NewRow::Template {
+                title: "Package".to_owned(),
                 template,
-                "New Package".to_owned(),
-                folder.clone(),
-                panel.clone(),
-            ));
+            });
         }
         if let Some(template) = find("package-info") {
-            let label = format!("New {}.{}", template.label, template.extension);
-            entries.push(Self::template_entry(
+            rows.push(NewRow::Template {
+                title: format!("{}.{}", template.label, template.extension),
                 template,
-                label,
-                folder.clone(),
-                panel.clone(),
-            ));
+            });
         }
-        let mut rest: Vec<FileTemplate> = self
-            .templates
-            .iter()
-            .filter(|template| {
-                primary_label.as_deref() != Some(template.label)
-                    && !NEW_FIXED.contains(&template.label)
-                    && !SOURCE_KINDS.contains(&template.label)
-            })
-            .cloned()
-            .collect();
-        entries.push(MenuEntry::separator());
-        for template in rest.drain(..) {
-            let label = format!("New {}", template.label);
-            entries.push(Self::template_entry(
-                template,
-                label,
-                folder.clone(),
-                panel.clone(),
-            ));
+        rows.push(NewRow::Separator);
+        let primary_label = self.primary_source().map(|template| template.label);
+        for template in &self.templates {
+            if primary_label == Some(template.label)
+                || NEW_FIXED.contains(&template.label)
+                || SOURCE_KINDS.contains(&template.label)
+            {
+                continue;
+            }
+            rows.push(NewRow::Template {
+                title: template.label.to_owned(),
+                template: template.clone(),
+            });
         }
         if self.migrations.next.is_some() {
-            let flyway_panel = panel.clone();
-            entries.push(
-                MenuEntry::new(format!("New {FLYWAY_LABEL}"), move |window, cx| {
-                    let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-                        this.ask_flyway_migration(window, cx)
-                    };
-                    Self::later(window, flyway_panel.clone(), cx, ask);
-                })
-                .icon("fileTypes/text"),
-            );
+            rows.push(NewRow::Flyway);
         }
-        let request_folder = folder.clone();
-        let request_panel = panel.clone();
-        entries.push(
-            MenuEntry::new("New HTTP Request", move |window, cx| {
-                let (template, folder) = (crate::tree_ops::http_request(), request_folder.clone());
-                let ask = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-                    this.ask_new(template, folder, window, cx)
-                };
-                Self::later(window, request_panel.clone(), cx, ask);
-            })
-            .icon("fileTypes/text"),
-        );
+        rows.push(NewRow::HttpRequest);
+        rows
+    }
+
+    /// The rows of the New list as Find Action lists them: the title without the group
+    /// word, the words of the query and the icon of the row. The names come from the file
+    /// templates of the application, as those of the menu do.
+    pub(crate) fn new_actions(&self) -> Vec<NewAction> {
+        let mut actions = Vec::new();
+        for row in self.new_rows() {
+            match row {
+                NewRow::Separator => {}
+                NewRow::Template { template, title } => actions.push(NewAction {
+                    search: format!("{NEW_GROUP} {title}"),
+                    title,
+                    icon: template.icon,
+                    kind: NewActionKind::Template(template),
+                }),
+                NewRow::Scratch => actions.push(NewAction {
+                    title: "Scratch File".to_owned(),
+                    search: format!("{NEW_GROUP} Scratch File"),
+                    icon: "general/newFile",
+                    kind: NewActionKind::Scratch,
+                }),
+                NewRow::Flyway => actions.push(NewAction {
+                    title: FLYWAY_LABEL.to_owned(),
+                    search: format!("{NEW_GROUP} {FLYWAY_LABEL}"),
+                    icon: "fileTypes/text",
+                    kind: NewActionKind::Flyway,
+                }),
+                NewRow::HttpRequest => actions.push(NewAction {
+                    title: "HTTP Request".to_owned(),
+                    search: format!("{NEW_GROUP} HTTP Request"),
+                    icon: "fileTypes/text",
+                    kind: NewActionKind::HttpRequest,
+                }),
+            }
+        }
+        actions
+    }
+
+    fn new_submenu(&self, folder: PathBuf, cx: &mut Context<Self>) -> Vec<MenuEntry> {
+        let panel = cx.weak_entity();
+        let mut entries = Vec::new();
+        for row in self.new_rows() {
+            match row {
+                NewRow::Separator => entries.push(MenuEntry::separator()),
+                NewRow::Template { template, title } => entries.push(Self::template_entry(
+                    template,
+                    format!("{NEW_GROUP} {title}"),
+                    folder.clone(),
+                    panel.clone(),
+                )),
+                NewRow::Scratch => {
+                    let scratch_panel = panel.clone();
+                    entries.push(
+                        MenuEntry::new("Scratch File", move |window, cx| {
+                            let open =
+                                |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                                    this.workspace
+                                        .update(cx, |workspace, cx| {
+                                            crate::window_popups::show_scratch_languages(
+                                                workspace, window, cx,
+                                            )
+                                        })
+                                        .ok();
+                                };
+                            Self::later(window, scratch_panel.clone(), cx, open);
+                        })
+                        .icon("general/newFile"),
+                    );
+                }
+                NewRow::Flyway => {
+                    let flyway_panel = panel.clone();
+                    entries.push(
+                        MenuEntry::new(format!("{NEW_GROUP} {FLYWAY_LABEL}"), move |window, cx| {
+                            let ask =
+                                |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                                    this.ask_flyway_migration(window, cx)
+                                };
+                            Self::later(window, flyway_panel.clone(), cx, ask);
+                        })
+                        .icon("fileTypes/text"),
+                    );
+                }
+                NewRow::HttpRequest => {
+                    let request_folder = folder.clone();
+                    let request_panel = panel.clone();
+                    entries.push(
+                        MenuEntry::new("New HTTP Request", move |window, cx| {
+                            let (template, folder) =
+                                (crate::tree_ops::http_request(), request_folder.clone());
+                            let ask =
+                                |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                                    this.ask_new(template, folder, window, cx)
+                                };
+                            Self::later(window, request_panel.clone(), cx, ask);
+                        })
+                        .icon("fileTypes/text"),
+                    );
+                }
+            }
+        }
         entries
     }
 

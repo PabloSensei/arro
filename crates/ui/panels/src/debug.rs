@@ -754,6 +754,13 @@ pub struct DebugPanel {
     build_output: OutputBuffers,
     /// The process of the build step whose output comes now.
     build_process: Option<u32>,
+    /// The build step of the last launch failed: the status says so until the next session.
+    build_failed: bool,
+    /// The user stopped the build step, so the exit of the build is no failure.
+    build_stopped: bool,
+    /// A stop of the session has been shown in the Debugger tab. Until then a program that
+    /// reads its input keeps the console in front.
+    stop_shown: bool,
     pending: Option<PendingLaunch>,
     /// The launch of the last session, for Rerun.
     restart: Option<Restart>,
@@ -892,6 +899,9 @@ impl DebugPanel {
             build: None,
             build_output: OutputBuffers::default(),
             build_process: None,
+            build_failed: false,
+            build_stopped: false,
+            stop_shown: false,
             pending: None,
             restart: None,
             front: Front::Debugger,
@@ -945,6 +955,20 @@ impl DebugPanel {
     /// The newest snapshot of the session, for scripts and tests.
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// Shows a stack without an adapter, for the tests of the list of frames.
+    #[cfg(test)]
+    pub(crate) fn show_snapshot_for_test(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        let (commands, _commands) = tokio::sync::mpsc::unbounded_channel();
+        let (_snapshots, incoming) = std::sync::mpsc::channel();
+        self.debugger = Some(Debugger::new(commands, incoming));
+        self.seen_stops = snapshot.stops;
+        self.values_stop = snapshot.stops;
+        self.opened_frame = Some((snapshot.stops, snapshot.selected_frame));
+        self.snapshot = snapshot;
+        self.front = Front::Debugger;
+        cx.notify();
     }
 
     /// The project files, to find the sources named in the console.
@@ -3012,6 +3036,8 @@ impl DebugPanel {
                 self.push_output("Building the project", false, cx);
                 self.pending = Some(pending);
                 self.build = Some(Console::start_step(before, Step::Before, plan.grace));
+                // The build is what the window shows first: its output is in the Console.
+                self.front = Front::Console;
             }
             None => {
                 self.pending = Some(pending);
@@ -3123,6 +3149,9 @@ impl DebugPanel {
         self.build = None;
         self.build_output = OutputBuffers::default();
         self.build_process = None;
+        self.build_failed = false;
+        self.build_stopped = false;
+        self.stop_shown = false;
         self.pending = None;
         self.session = None;
         self.tool_output_file = None;
@@ -4128,9 +4157,11 @@ impl DebugPanel {
         self.merge_console();
         self.flush_tool_output();
         self.sync_identities(cx);
-        // A program that reads its input needs the line of the console at hand. A stopped
-        // program reads nothing, so the Debugger tab of a stop stays in front.
+        // A program that reads its input needs the line of the console at hand until its first
+        // stop. After a stop the tab stays where the user left it until the next stop selects
+        // the Debugger; a program that asks for input later gets the console by a click.
         if self.takes_input()
+            && !self.stop_shown
             && !matches!(self.snapshot.state, DebugState::Stopped { .. })
             && self.front != Front::Console
         {
@@ -4152,6 +4183,7 @@ impl DebugPanel {
                 // the snapshot brings the frames.
                 self.front = Front::Debugger;
                 self.reveal_stop = Some(self.snapshot.stops);
+                self.stop_shown = true;
             }
             self.finish_temporary(cx);
             self.finish_temporary_breakpoints(cx);
@@ -4259,7 +4291,7 @@ impl DebugPanel {
             return false;
         };
         let mut changed = false;
-        let mut exit = None;
+        let mut exit: Option<Option<i32>> = None;
         let mut lines: Vec<(String, bool)> = Vec::new();
         let mut done = Vec::new();
         for _ in 0..EVENTS {
@@ -4278,12 +4310,12 @@ impl DebugPanel {
                 }
                 ConsoleEvent::Started { pid, .. } => self.build_process = Some(pid),
                 ConsoleEvent::Failed { message } => lines.push((message, true)),
-                ConsoleEvent::Exited { code, step } => {
+                ConsoleEvent::Exited { code, .. } => {
                     match self.build_process.take() {
                         Some(process) => self.build_output.finish(process, &mut done),
                         None => self.build_output.finish_all(&mut done),
                     }
-                    exit = Some((code, step));
+                    exit = Some(code);
                     break;
                 }
                 ConsoleEvent::Closed => {
@@ -4303,21 +4335,58 @@ impl DebugPanel {
         for (text, error) in lines {
             self.push_output(text, error, cx);
         }
-        if let Some((code, step)) = exit {
+        if let Some(code) = exit {
             self.build = None;
-            let text = if step == Step::Before {
-                format!("Build finished with exit code {}", code_text(code))
-            } else {
-                format!("Process finished with exit code {}", code_text(code))
-            };
-            self.push_output(text, code != Some(0), cx);
             if code == Some(0) {
+                self.push_output(
+                    format!("Build finished with exit code {}", code_text(code)),
+                    false,
+                    cx,
+                );
                 self.launch_pending(cx);
-            } else {
+            } else if self.build_stopped {
+                // Stop asked for the build: the program does not start, and nothing failed.
+                self.push_output("Build stopped", false, cx);
                 self.pending = None;
+            } else {
+                self.build_failed = true;
+                self.push_output(
+                    format!("Build failed: exit code {}", code_text(code)),
+                    true,
+                    cx,
+                );
+                self.pending = None;
+                // A failed launch keeps the console in front, and the balloon names the failure.
+                self.front = Front::Console;
+                self.notify_build_failed(cx);
             }
         }
         changed
+    }
+
+    /// The balloon of a build that failed: the launch that did not start, and a link that
+    /// shows the Console of this window.
+    fn notify_build_failed(&self, cx: &mut Context<Self>) {
+        let name = self
+            .restart
+            .as_ref()
+            .map(|restart| restart.name.clone())
+            .unwrap_or_default();
+        let workspace = self.workspace.clone();
+        // Deferred, like every call into the workspace: the poll may be what the window is in.
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user_with_command(
+                        "Build failed",
+                        format!("{name} did not start: the build output is in the Console."),
+                        "Show Console",
+                        "debug.show_console",
+                        cx,
+                    )
+                })
+                .ok();
+        });
     }
 
     /// Output that comes from the process of a test run, forwarded by the Run panel.
@@ -4734,9 +4803,16 @@ impl DebugPanel {
         cx.notify();
     }
 
+    /// Shows the Console tab, as the link of a failed build does.
+    pub fn show_console(&mut self, cx: &mut Context<Self>) {
+        self.front = Front::Console;
+        cx.notify();
+    }
+
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         if let Some(build) = &self.build {
             build.stop();
+            self.build_stopped = true;
         }
         self.pending = None;
         self.session = None;
@@ -5245,6 +5321,10 @@ impl DebugPanel {
         let Some(path) = frame.source.clone() else {
             return;
         };
+        if path.to_string_lossy().starts_with("jdt://") {
+            self.open_class_frame(frame, window, cx);
+            return;
+        }
         let spot = editor_view::Spot::Line {
             line: frame.line.saturating_sub(1) as usize,
             column: 0,
@@ -5254,6 +5334,63 @@ impl DebugPanel {
                 navigation::go_to(workspace, path, Some(spot), true, window, cx)
             })
             .ok();
+    }
+
+    /// Opens the class of a `jdt://` frame through the language, as a jump into a class of
+    /// a library does. A language without the text of the class does nothing: the frame
+    /// still names its place in the list.
+    fn open_class_frame(&mut self, frame: &Frame, window: &mut Window, cx: &mut App) {
+        let Some(uri) = frame
+            .source
+            .as_ref()
+            .map(|source| source.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        let line = frame.line.saturating_sub(1);
+        let span = lang_api::SourceSpan {
+            uri,
+            span: lang_api::TextSpan {
+                start: lang_api::TextPoint { line, character: 0 },
+                end: lang_api::TextPoint { line, character: 0 },
+            },
+        };
+        // The text of a class gets the language of the project files of the stack, so it
+        // is highlighted and navigable as a source of that language.
+        let extension = self
+            .snapshot
+            .frames
+            .iter()
+            .filter_map(|frame| frame.source.as_deref())
+            .filter(|source| path_under(source, &self.root))
+            .find_map(|source| source.extension())
+            .map(|extension| extension.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let workspace = self.workspace.clone();
+        let handle = window.window_handle();
+        editor_view::show_location(
+            &span,
+            &extension,
+            cx,
+            move |path, cx| {
+                cx.defer(move |cx| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    let spot = Some(editor_view::Spot::Line {
+                                        line: line as usize,
+                                        column: 0,
+                                    });
+                                    navigation::go_to(workspace, path, spot, true, window, cx)
+                                })
+                                .ok();
+                        })
+                        .ok();
+                });
+            },
+            |_| {},
+        );
     }
 
     fn ask_condition(
@@ -5316,14 +5453,43 @@ impl DebugPanel {
     }
 
     /// The state of the session for the right end of the toolbar. Nothing before the
-    /// first session: the empty body says it in place.
-    fn state_text(&self) -> Option<&str> {
+    /// first session: the empty body says it in place. A build before the program shows
+    /// its own state, and so does a build that failed.
+    pub(crate) fn state_text(&self) -> Option<&str> {
+        if self.build.is_some() {
+            return Some("Building…");
+        }
+        if self.build_failed {
+            return Some("Build failed");
+        }
         match &self.snapshot.state {
             DebugState::Inactive => None,
             DebugState::Starting => Some("Starting"),
             DebugState::Running => Some("Running"),
             DebugState::Stopped { reason } => Some(reason.as_str()),
             DebugState::Terminated => Some("Finished"),
+        }
+    }
+
+    /// Whether Rerun has a launch to start again.
+    pub(crate) fn can_rerun(&self) -> bool {
+        self.restart.is_some()
+    }
+
+    /// The line the Debugger tab shows in place of the frames while a session has none: the
+    /// build before the program, and the program that starts or runs. `None` shows the frames,
+    /// or the launch screen when there is no session at all.
+    pub(crate) fn live_text(&self) -> Option<&'static str> {
+        if self.build.is_some() {
+            return Some("Building…");
+        }
+        if !self.state().0 || !self.snapshot.frames.is_empty() {
+            return None;
+        }
+        match self.snapshot.state {
+            DebugState::Starting => Some("Starting…"),
+            DebugState::Running => Some("The program is running"),
+            _ => None,
         }
     }
 
@@ -5335,7 +5501,10 @@ impl DebugPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let body = if self.state().0 {
+        let body = if let Some(text) = self.live_text() {
+            // A session with no frames yet: its state in place of the launch screen.
+            empty_pane("debug-live", text, theme)
+        } else if self.state().0 {
             div()
                 .flex()
                 .flex_1()
@@ -5547,6 +5716,7 @@ impl DebugPanel {
         let frames = self.snapshot.frames.clone();
         let selected_frame = self.snapshot.selected_frame;
         let hide = self.hides_library_frames(cx);
+        let roots = project_source_roots(cx);
         let body = if frames.is_empty() {
             empty_pane("debug-empty-frames", "No frames", theme)
         } else {
@@ -5562,14 +5732,14 @@ impl DebugPanel {
                     if self.expanded_library_groups.contains(&frames[start].id) {
                         for frame in &frames[start..index] {
                             let selected = selected_frame == Some(frame.id);
-                            rows.push(self.frame_row(frame.clone(), selected, theme, cx));
+                            rows.push(self.frame_row(frame.clone(), selected, &roots, theme, cx));
                         }
                     }
                     continue;
                 }
                 let frame = frames[index].clone();
                 let selected = selected_frame == Some(frame.id);
-                rows.push(self.frame_row(frame, selected, theme, cx));
+                rows.push(self.frame_row(frame, selected, &roots, theme, cx));
                 index += 1;
             }
             div()
@@ -5641,25 +5811,33 @@ impl DebugPanel {
             .into_any_element()
     }
 
-    /// One frame of the stack, with its menu.
+    /// One frame of the stack, with its menu. A long place is cut at its end, and the
+    /// tooltip names the whole line.
     fn frame_row(
         &mut self,
         frame: Frame,
         selected: bool,
+        source_roots: &[PathBuf],
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let frame_id = frame.id;
         let menu_frame = frame.clone();
         let library = is_library_frame(&frame, &self.root);
-        let text = frame_place(&frame, &self.root);
-        row(format!("frame-{}", frame.id), &text, selected, theme)
+        let text = frame_place(&frame, source_roots);
+        let hint = text.clone();
+        let element = row(("frame-row", frame.id as u64), &text, selected, theme)
             .text_color(if library {
                 theme.text_secondary
             } else {
                 theme.text
             })
             .debug_selector(move || format!("frame-{frame_id}"))
+            .tooltip(move |_, cx| tooltip(hint.clone(), None, cx))
+            .tooltip_show_delay(TOOLTIP_CREATE_DELAY);
+        #[cfg(test)]
+        let element = element.child(frame_color_probe(frame_id));
+        element
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.send(Command::SelectFrame(frame.id), cx);
                 this.open_frame(&frame, window, cx);
@@ -7508,49 +7686,166 @@ fn parse_renderers(text: &str) -> Vec<TypeRenderer> {
         .collect()
 }
 
-/// The place of a frame in the list: the file and the line of a frame of the project, and
-/// `method:line, Class (package)` for a frame of a runtime image or an archive, as IDEA
-/// names it. A line the adapter does not know, as a native method has, is `-1`.
-fn frame_place(frame: &Frame, root: &Path) -> String {
-    let name = decode_uri(&frame.name);
-    if let Some(source) = &frame.source
-        && !path_under(source, root)
-        && archive_or_image(source)
-    {
-        return library_place(&name, frame.line);
-    }
-    let where_ = frame
+/// The source roots of the project model the run panel holds: the package of a frame of
+/// the project is the path of its file below one of them.
+fn project_source_roots(cx: &App) -> Vec<PathBuf> {
+    let Some(runs) = cx
+        .try_global::<crate::script::ActiveRunPanel>()
+        .map(|active| active.0.clone())
+    else {
+        return Vec::new();
+    };
+    let Some(model) = runs.read(cx).model() else {
+        return Vec::new();
+    };
+    model
+        .modules
+        .iter()
+        .flat_map(|module| module.units.iter())
+        .flat_map(|unit| unit.source_roots.iter().cloned())
+        .collect()
+}
+
+/// The place of a frame in the list, as IDEA names it: `method:line, Class (package)`. The
+/// class and the package come from the name of the frame, from its source or from both. A
+/// line the adapter does not know, as a native method has, is `-1`.
+fn frame_place(frame: &Frame, source_roots: &[PathBuf]) -> String {
+    let (method, name_class, name_package) = name_place(&decode_uri(&frame.name));
+    let source = frame
         .source
-        .as_ref()
-        .and_then(|path| path.file_name())
-        .map(|file| decode_uri(&file.to_string_lossy()))
+        .as_deref()
+        .map(|source| source_place(source, source_roots))
         .unwrap_or_default();
-    if frame.line == 0 {
-        format!("{name}  {where_}")
+    let class = name_class.or(source.class);
+    let package = name_package.or(source.package);
+    let line = if frame.line == 0 {
+        "-1".to_owned()
     } else {
-        format!("{name}  {where_}:{}", frame.line)
+        frame.line.to_string()
+    };
+    match (class, package.filter(|package| !package.is_empty())) {
+        (Some(class), Some(package)) => format!("{method}:{line}, {class} ({package})"),
+        (Some(class), None) => format!("{method}:{line}, {class}"),
+        (None, _) => format!("{method}:{line}"),
     }
 }
 
-/// The place of a frame of a library: `invoke0:-1, NativeMethodAccessorImpl
-/// (jdk.internal.reflect)`. The adapter names a frame `Class.method(arguments)`.
-fn library_place(name: &str, line: u32) -> String {
-    let line = if line == 0 {
-        "-1".to_owned()
-    } else {
-        line.to_string()
+/// The method, the class and the package of a frame name: `Class.method(arguments)` or
+/// `package.Class.method`.
+fn name_place(name: &str) -> (String, Option<String>, Option<String>) {
+    let head = name.split_once('(').map_or(name, |(head, _)| head).trim();
+    let Some((owner, method)) = head.rsplit_once('.') else {
+        return (head.to_owned(), None, None);
     };
-    let head = name.split_once('(').map_or(name, |(head, _)| head);
-    let Some((class, method)) = head.rsplit_once('.') else {
-        return format!("{name}:{line}");
+    let (owner, method) = (owner.trim(), method.trim());
+    if owner.is_empty() || method.is_empty() {
+        return (head.to_owned(), None, None);
+    }
+    match owner.rsplit_once('.') {
+        Some((package, class)) if !package.is_empty() && !class.is_empty() => (
+            method.to_owned(),
+            Some(class.to_owned()),
+            Some(package.to_owned()),
+        ),
+        _ => (method.to_owned(), Some(owner.to_owned()), None),
+    }
+}
+
+/// The class and the package a source names, when it names them: a class of a runtime
+/// image, of an archive or of a `jdt://` buffer, or a file below one of the source roots.
+#[derive(Default)]
+struct SourcePlace {
+    class: Option<String>,
+    package: Option<String>,
+}
+
+fn source_place(source: &Path, source_roots: &[PathBuf]) -> SourcePlace {
+    let text = decode_uri(&source.to_string_lossy());
+    if let Some(rest) = text.strip_prefix("jdt://contents/") {
+        let path = rest.split(['?', '#']).next().unwrap_or(rest);
+        let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        // The first segment names the container: a module of the runtime image or the
+        // archive. A path of an archive may take several segments once its escapes are
+        // decoded, so the package starts after its file. The rest are the package and
+        // the class file.
+        let skip = segments
+            .iter()
+            .position(|part| part.ends_with(".jar") || part.ends_with(".zip"))
+            .map_or(1, |at| at + 1);
+        return class_in_path(&segments, skip);
+    }
+    if let Some(rest) = text.strip_prefix("jrt:/") {
+        let path = rest.split(['?', '#']).next().unwrap_or(rest);
+        let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let skip = if segments.first() == Some(&"modules") {
+            2
+        } else {
+            1
+        };
+        return class_in_path(&segments, skip);
+    }
+    if let Some((_, inner)) = text.split_once('!') {
+        let segments: Vec<&str> = inner.split('/').filter(|part| !part.is_empty()).collect();
+        return class_in_path(&segments, 0);
+    }
+    let decoded = Path::new(&text);
+    for root in source_roots {
+        if let Some(relative) = path_below(decoded, root) {
+            let text = relative.to_string_lossy().into_owned();
+            let segments: Vec<&str> = text
+                .split(['/', '\\'])
+                .filter(|part| !part.is_empty())
+                .collect();
+            return class_in_path(&segments, 0);
+        }
+    }
+    SourcePlace::default()
+}
+
+/// The class and the package of the segments after the first `skip` ones. The last segment
+/// is the file of the class; the rest are its packages, which may be written with dots or
+/// with separators of their own.
+fn class_in_path(segments: &[&str], skip: usize) -> SourcePlace {
+    let Some((class, _)) = segments.split_last() else {
+        return SourcePlace::default();
     };
-    if class.is_empty() || method.is_empty() {
-        return format!("{name}:{line}");
+    if segments.len() <= skip {
+        return SourcePlace::default();
     }
-    match class.rsplit_once('.') {
-        Some((package, simple)) => format!("{method}:{line}, {simple} ({package})"),
-        None => format!("{method}:{line}, {class}"),
+    let class =
+        class.rsplit_once('.').map_or(
+            *class,
+            |(stem, extension)| {
+                if extension.is_empty() { *class } else { stem }
+            },
+        );
+    let package = segments[skip..segments.len() - 1].join(".");
+    SourcePlace {
+        class: (!class.is_empty()).then(|| class.to_owned()),
+        package: (!package.is_empty()).then_some(package),
     }
+}
+
+/// `path` below `root`, ignoring the case of the drive and of the folders on Windows.
+fn path_below(path: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let path_text = path.to_string_lossy().replace('/', "\\");
+        let mut root_text = root.to_string_lossy().replace('/', "\\");
+        if !root_text.ends_with('\\') {
+            root_text.push('\\');
+        }
+        if path_text
+            .to_lowercase()
+            .starts_with(&root_text.to_lowercase())
+        {
+            return Some(PathBuf::from(&path_text[root_text.len()..]));
+        }
+    }
+    None
 }
 
 /// The text of a source path or a name an adapter sends in the URI form of `jrt:`:
@@ -7585,12 +7880,14 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-/// Whether a source is a runtime image or an archive: it holds classes and no files of
-/// the project.
+/// Whether a source is a runtime image, an archive or a `jdt://` buffer: it holds classes
+/// and no files of the project.
 fn archive_or_image(source: &Path) -> bool {
     let path = decode_uri(&source.to_string_lossy());
     path.starts_with("jrt:/")
+        || path.starts_with("jdt://")
         || path.contains(".jar!")
+        || path.contains(".zip!")
         || path.ends_with(".jar")
         || path.ends_with(".zip")
 }
@@ -7633,9 +7930,25 @@ fn library_group_name(frame: &Frame) -> String {
     let Some(source) = &frame.source else {
         return String::new();
     };
-    let path = source.to_string_lossy();
+    let path = decode_uri(&source.to_string_lossy());
     if let Some(rest) = path.strip_prefix("jrt:/") {
-        return rest.split('/').next().unwrap_or_default().to_owned();
+        return rest
+            .split('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or_default()
+            .to_owned();
+    }
+    if let Some(rest) = path.strip_prefix("jdt://contents/") {
+        let container = rest.split('/').next().unwrap_or_default();
+        let file = Path::new(container)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if file.ends_with(".jar") || file.ends_with(".zip") {
+            let name = file.trim_end_matches(".jar").trim_end_matches(".zip");
+            return artifact_name(name);
+        }
+        return container.to_owned();
     }
     let archive = if let Some(at) = path.find(".jar!") {
         &path[..at + 4]
@@ -7716,12 +8029,13 @@ fn row(id: impl Into<ElementId>, text: &str, selected: bool, theme: &Theme) -> S
         .flex()
         .items_center()
         .h(px(ROW_HEIGHT))
+        .min_w_0()
         .px(px(ROW_PADDING_X))
         .cursor_pointer()
         .text_size(px(CODE_SIZE))
         .when(selected, |row| row.bg(theme.selection))
         .hover(|row| row.bg(theme.caret_row))
-        .child(text.to_owned())
+        .child(div().flex_1().min_w_0().truncate().child(text.to_owned()))
 }
 
 /// A toolbar button that shows an icon and names itself, with its key, in a tooltip.
@@ -8080,9 +8394,11 @@ impl Render for DebugPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let (active, stopped) = self.state();
+        // Stop ends a build too, so it is at hand while the build runs.
+        let stoppable = active || self.build.is_some();
         let running = matches!(self.snapshot.state, DebugState::Running);
         let can_drop = self.restart_frame_enabled();
-        let can_restart = self.restart.is_some();
+        let can_restart = self.can_rerun();
         let workspace = self.workspace.clone();
         let options =
             crate::tool_menu::options_menu(workspace.clone(), workspace::DEBUG_TOOL, |_| {
@@ -8140,10 +8456,10 @@ impl Render for DebugPanel {
                     "run/stop",
                     "Stop",
                     Some("Ctrl+F2"),
-                    active,
+                    stoppable,
                     &theme,
                 )
-                .when(active, |button| {
+                .when(stoppable, |button| {
                     button.on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                 }),
             )
@@ -10406,6 +10722,9 @@ mod tests {
                 build: None,
                 build_output: OutputBuffers::default(),
                 build_process: None,
+                build_failed: false,
+                build_stopped: false,
+                stop_shown: false,
                 pending: None,
                 restart: None,
                 front: super::Front::Debugger,
@@ -10537,6 +10856,43 @@ mod tests {
             "the program started after Stop"
         );
     }
+}
+
+// The text colours of the frame rows drawn in the last frame, for the tests of the list.
+#[cfg(test)]
+thread_local! {
+    static FRAME_TEXT_COLORS: std::cell::RefCell<BTreeMap<i64, ui_kit::gpui::Hsla>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// Records the text colour its row gives it, without painting or taking room.
+#[cfg(test)]
+fn frame_color_probe(frame: i64) -> AnyElement {
+    canvas(
+        move |_, window, _| {
+            let color = window.text_style().color;
+            FRAME_TEXT_COLORS.with(|colors| colors.borrow_mut().insert(frame, color));
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .w(px(0.))
+    .h(px(0.))
+    .into_any_element()
+}
+
+/// Forgets the colours of the frames drawn before.
+#[cfg(test)]
+pub(crate) fn clear_frame_colors() {
+    FRAME_TEXT_COLORS.with(|colors| colors.borrow_mut().clear());
+}
+
+/// The colour the frame `id` was drawn in the last frame, for tests.
+#[cfg(test)]
+pub(crate) fn frame_text_color(id: i64) -> Option<ui_kit::gpui::Hsla> {
+    FRAME_TEXT_COLORS.with(|colors| colors.borrow().get(&id).copied())
 }
 
 #[cfg(test)]

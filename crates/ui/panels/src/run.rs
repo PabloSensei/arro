@@ -4714,7 +4714,12 @@ impl RunPanel {
                         if step == Step::Program {
                             self.program_pid = None;
                         }
-                        if step == Step::Program && main_console {
+                        // A build that failed ends the run as well: the configuration is stopped,
+                        // not starting. A build that Stop already ended keeps its stopped state.
+                        if main_console
+                            && (step == Step::Program
+                                || (code != Some(0) && self.run_service.state().active()))
+                        {
                             self.run_service.exited(code);
                         }
                         match self.console_process.take() {
@@ -4722,12 +4727,14 @@ impl RunPanel {
                             None => self.output.finish_all(&mut done),
                         }
                         done.push(Line::default());
-                        done.push(info(exit_text(code, step)));
                         if step == Step::Before && code != Some(0) {
+                            done.push(Line::plain(build_failed_text(code), error_style()));
                             done.push(Line::plain(
                                 "The before launch step failed, so the program did not start",
                                 error_style(),
                             ));
+                        } else {
+                            done.push(info(exit_text(code, step)));
                         }
                         self.console_running = false;
                         if step == Step::Before && code == Some(0) {
@@ -5930,6 +5937,12 @@ fn exit_text(code: Option<i32>, step: Step) -> String {
         Step::Before => format!("Build finished with exit code {code}"),
         Step::Program => format!("Process finished with exit code {code}"),
     }
+}
+
+/// The line of a build step that failed, the same as the Debug window writes it.
+fn build_failed_text(code: Option<i32>) -> String {
+    let code = code.map_or_else(|| "unknown".to_string(), |code| code.to_string());
+    format!("Build failed: exit code {code}")
 }
 
 /// Marks lines the IDE writes itself, not the program.
