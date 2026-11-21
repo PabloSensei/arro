@@ -1114,8 +1114,24 @@ fn connect_project_problems(
         };
         let mut replies = ask(provider, ProjectProblemsQuery);
         let mut notified = String::new();
+        // One repeat per session of the server. A failure that the language says another
+        // import alone clears is imported again instead of shown, and the same failure
+        // after that is a real error.
+        let mut retried = false;
         while let Some(answer) = replies.next().await {
-            let problems = answer.value;
+            let mut problems = answer.value;
+            let retry = problems.first().is_some_and(|problem| problem.retry);
+            if retry && !retried {
+                // The request behind Reload Project, which the user does not have to press.
+                if let Some(server) = support.server() {
+                    server.reimport();
+                    retried = true;
+                }
+            }
+            if retry && retried {
+                // It is on its way out: neither a notification nor a row in Problems.
+                problems.retain(|problem| !problem.retry);
+            }
             let first = problems.first().cloned();
             *last.lock().unwrap_or_else(|poison| poison.into_inner()) = first.clone();
             match &first {
@@ -2133,4 +2149,71 @@ mod tool_menu;
 mod window_tests_tool_headers;
 
 #[cfg(test)]
+mod window_tests_database_sources_rows;
+#[cfg(test)]
 mod window_tests_field_mouse;
+#[cfg(test)]
+mod window_tests_find_action;
+#[cfg(test)]
+mod window_tests_form_columns;
+#[cfg(test)]
+mod window_tests_panel_icons_rows;
+
+// The stand-in program of these tests is a PowerShell script, so they run on Windows only.
+#[cfg(test)]
+mod window_tests_finder_scope;
+#[cfg(all(test, windows))]
+mod window_tests_terminal_wheel;
+
+#[cfg(test)]
+mod window_tests_project_structure_select;
+
+#[cfg(test)]
+mod window_tests_database_blank;
+
+#[cfg(test)]
+mod window_tests_breakpoints_dialog;
+#[cfg(test)]
+mod window_tests_caret_reveal;
+#[cfg(test)]
+mod window_tests_change_tree_gap;
+#[cfg(test)]
+mod window_tests_dialog_windows;
+#[cfg(test)]
+mod window_tests_file_structure_signatures;
+#[cfg(test)]
+mod window_tests_find_window;
+#[cfg(test)]
+mod window_tests_new_project_form;
+
+#[cfg(test)]
+mod window_tests_keymap_tree;
+#[cfg(test)]
+mod window_tests_mcp_reading;
+#[cfg(test)]
+mod window_tests_rename_in_place;
+#[cfg(test)]
+mod window_tests_settings_checks;
+
+#[cfg(test)]
+mod window_tests_debug_idle;
+#[cfg(test)]
+mod window_tests_find_action_tools;
+#[cfg(test)]
+mod window_tests_generate_status;
+#[cfg(test)]
+mod window_tests_run_idle;
+
+#[cfg(test)]
+mod window_tests_database_copy;
+#[cfg(test)]
+mod window_tests_editor_importing;
+#[cfg(test)]
+mod window_tests_find_action_data;
+#[cfg(test)]
+mod window_tests_generate_server;
+#[cfg(test)]
+mod window_tests_import_retry;
+
+#[cfg(test)]
+mod window_tests_completion_members;

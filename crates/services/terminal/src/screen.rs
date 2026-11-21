@@ -91,6 +91,8 @@ pub struct Modes {
     pub alt_screen: bool,
     pub focus_events: bool,
     pub mouse: bool,
+    /// Mouse reports use the SGR encoding (DECSET 1006) instead of the X10 one.
+    pub sgr_mouse: bool,
 }
 
 impl Modes {
@@ -102,6 +104,7 @@ impl Modes {
             self.alt_screen,
             self.focus_events,
             self.mouse,
+            self.sgr_mouse,
         ]
         .iter()
         .enumerate()
@@ -117,6 +120,7 @@ impl Modes {
             alt_screen: on(3),
             focus_events: on(4),
             mouse: on(5),
+            sgr_mouse: on(6),
         }
     }
 }
@@ -131,6 +135,8 @@ pub struct Screen {
     pub cursor: Option<(u16, u16)>,
     /// Lines of history above the live screen that are in view.
     pub display_offset: usize,
+    /// Lines of history above the live screen, all of them, in view or not.
+    pub history: usize,
     pub title: String,
     pub modes: Modes,
     pub links: Vec<Link>,
@@ -178,6 +184,7 @@ mod tests {
             win32_input: true,
             alt_screen: true,
             mouse: true,
+            sgr_mouse: true,
             ..Modes::default()
         };
 

@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use editor_view::{EditorView, LineDeclaration, OutlineItem, OutlineKind, Semantic};
 use futures_util::StreamExt;
-use lang_api::{FileSymbol, FileSymbolsQuery, Symbol, SymbolKind, SymbolProvider, ask, offset_in};
+use lang_api::{
+    Declared, FileSymbol, FileSymbolsQuery, GraphVisibility, Symbol, SymbolKind, SymbolProvider,
+    ask, offset_in,
+};
 use ui_kit::*;
 
 /// How long typing has to pause before the declarations are read again.
@@ -113,12 +116,61 @@ pub fn items_of(symbols: &[Symbol]) -> Vec<OutlineItem> {
         .map(|symbol| OutlineItem {
             name: symbol.name.clone(),
             signature: None,
+            visibility: None,
             kind: kind_of(symbol.kind),
             depth: symbol.depth,
             range: symbol.range.clone(),
             name_range: symbol.name_range.clone(),
         })
         .collect()
+}
+
+/// The declarations of a file with the signatures and the visibility its language gives.
+pub fn items_of_declared(declared: &[Declared]) -> Vec<OutlineItem> {
+    declared
+        .iter()
+        .map(|found| OutlineItem {
+            name: found.symbol.name.clone(),
+            signature: found.signature.clone(),
+            visibility: found.visibility,
+            kind: kind_of(found.symbol.kind),
+            depth: found.symbol.depth,
+            range: found.symbol.range.clone(),
+            name_range: found.symbol.name_range.clone(),
+        })
+        .collect()
+}
+
+/// Adds to the items of the server what the native pass knows and the server does not: the
+/// visibility, and the signature where the server sent none. Declarations meet by the offset
+/// of their name.
+pub fn complete_from(items: &mut [OutlineItem], declared: &[Declared]) {
+    let by_name: HashMap<usize, &Declared> = declared
+        .iter()
+        .map(|found| (found.symbol.name_range.start, found))
+        .collect();
+    for item in items {
+        let Some(found) = by_name.get(&item.name_range.start) else {
+            continue;
+        };
+        item.visibility = found.visibility;
+        if item.signature.is_none() {
+            item.signature.clone_from(&found.signature);
+        }
+    }
+}
+
+/// The mark of a visibility that stands beside the icon of a declaration; `""` when the
+/// declaration has none. A lock is private, a circle public, a diamond protected and a ring
+/// the default of a package.
+pub fn visibility_icon(visibility: Option<GraphVisibility>) -> &'static str {
+    match visibility {
+        Some(GraphVisibility::Public) => "nodes/c_public",
+        Some(GraphVisibility::Protected) => "nodes/c_protected",
+        Some(GraphVisibility::Package) => "nodes/c_plocal",
+        Some(GraphVisibility::Private) => "general/lock",
+        None => "",
+    }
 }
 
 /// The line of a byte offset in `text`, from zero.
@@ -217,6 +269,7 @@ fn server_items(items: &[FileSymbol], text: &str, depth: u32, found: &mut Vec<Ou
         found.push(OutlineItem {
             name: symbol.name.clone(),
             signature: signature_of(symbol),
+            visibility: None,
             kind: kind_of(symbol.kind),
             depth,
             range: offset_in(text, symbol.range.start)..offset_in(text, symbol.range.end),
@@ -279,18 +332,27 @@ pub fn refresh(view: &Entity<EditorView>, wait: bool, cx: &mut App) {
                 declarations = declarations_of_server(&answer.value, &text);
             }
         }
-        if found.is_empty()
-            && let Some(provider) = native
-        {
-            let (items, lines) = cx
-                .background_executor()
-                .spawn(async move {
-                    let symbols = provider.file_symbols(&path, &text);
-                    (items_of(&symbols), declarations_of(&symbols, &text))
-                })
-                .await;
-            found = items;
+        // The native pass runs even when the server answers: the server sends no visibility,
+        // and a server that sends no signature gets the one of the language.
+        let (declared, lines) = match native {
+            Some(provider) => {
+                cx.background_executor()
+                    .spawn(async move {
+                        let declared = provider.file_declarations(&path, &text);
+                        let symbols: Vec<Symbol> =
+                            declared.iter().map(|found| found.symbol.clone()).collect();
+                        let lines = declarations_of(&symbols, &text);
+                        (declared, lines)
+                    })
+                    .await
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        if found.is_empty() {
+            found = items_of_declared(&declared);
             declarations = lines;
+        } else {
+            complete_from(&mut found, &declared);
         }
         weak.update(cx, |view, cx| {
             if view.outline_serial() == serial {
@@ -305,9 +367,12 @@ pub fn refresh(view: &Entity<EditorView>, wait: bool, cx: &mut App) {
 
 #[cfg(test)]
 mod checks {
-    use lang_api::{FileSymbol, Symbol, SymbolKind, TextPoint, TextSpan};
+    use editor_view::{OutlineItem, OutlineKind};
+    use lang_api::{
+        Declared, FileSymbol, GraphVisibility, Symbol, SymbolKind, TextPoint, TextSpan,
+    };
 
-    use super::{icon_of, items_of, signature_of};
+    use super::{complete_from, icon_of, items_of, signature_of, visibility_icon};
 
     fn symbol(name: &str, detail: Option<&str>) -> FileSymbol {
         let span = TextSpan {
@@ -470,5 +535,98 @@ mod checks {
             .expect("the field of the nested class");
         assert_eq!(field.owner.as_deref(), Some("demo.Probe$Inner"));
         assert_eq!(field.line, 5);
+    }
+
+    fn native_declaration(
+        name: &str,
+        at: usize,
+        signature: Option<&str>,
+        visibility: Option<GraphVisibility>,
+    ) -> Declared {
+        Declared {
+            symbol: Symbol {
+                name: name.into(),
+                kind: SymbolKind::Method,
+                container: None,
+                depth: 0,
+                range: at..at + 40,
+                name_range: at..at + name.len(),
+            },
+            signature: signature.map(str::to_owned),
+            visibility,
+        }
+    }
+
+    fn server_item(name: &str, at: usize, signature: Option<&str>) -> OutlineItem {
+        OutlineItem {
+            name: name.into(),
+            signature: signature.map(str::to_owned),
+            visibility: None,
+            kind: OutlineKind::Method,
+            depth: 0,
+            range: at..at + 40,
+            name_range: at..at + name.len(),
+        }
+    }
+
+    #[test]
+    fn a_server_item_takes_the_visibility_and_a_signature_the_server_missed() {
+        let declared = [
+            native_declaration(
+                "getPet",
+                20,
+                Some("getPet(String): Pet"),
+                Some(GraphVisibility::Public),
+            ),
+            native_declaration(
+                "count",
+                80,
+                Some("count: int"),
+                Some(GraphVisibility::Private),
+            ),
+        ];
+        let mut items = vec![
+            server_item("getPet", 20, None),
+            server_item("count", 80, Some("count: long")),
+            server_item("other", 140, None),
+        ];
+        complete_from(&mut items, &declared);
+        assert_eq!(
+            items[0].signature.as_deref(),
+            Some("getPet(String): Pet"),
+            "the signature the server did not send comes from the language"
+        );
+        assert_eq!(items[0].visibility, Some(GraphVisibility::Public));
+        assert_eq!(
+            items[1].signature.as_deref(),
+            Some("count: long"),
+            "the server keeps the signature it sent"
+        );
+        assert_eq!(items[1].visibility, Some(GraphVisibility::Private));
+        assert_eq!(
+            items[2].visibility, None,
+            "a declaration the language did not read has no visibility"
+        );
+    }
+
+    #[test]
+    fn each_visibility_has_a_mark_and_none_has_no_mark() {
+        assert_eq!(
+            visibility_icon(Some(GraphVisibility::Public)),
+            "nodes/c_public"
+        );
+        assert_eq!(
+            visibility_icon(Some(GraphVisibility::Protected)),
+            "nodes/c_protected"
+        );
+        assert_eq!(
+            visibility_icon(Some(GraphVisibility::Package)),
+            "nodes/c_plocal"
+        );
+        assert_eq!(
+            visibility_icon(Some(GraphVisibility::Private)),
+            "general/lock"
+        );
+        assert_eq!(visibility_icon(None), "");
     }
 }

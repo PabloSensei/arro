@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use editor_view::{EditorView, OutlineItem, OutlineKind, Spot};
 use futures_util::StreamExt;
-use lang_api::{SymbolKind, ask};
+use lang_api::{GraphVisibility, SymbolKind, ask};
 use search::{
     FuzzyMatcher, GotoQuery, NameMatcher, SymbolRequest, SymbolRow, SymbolScope, Tab, Target,
     merge_rows, rank, rank_files,
@@ -165,7 +165,12 @@ pub enum Mode {
 struct ActionEntry {
     id: &'static str,
     title: String,
+    /// The text the query is matched against: the title, and the alias of the command.
+    search: String,
+    /// The main shortcut, spelled as the menus spell it.
     shortcut: Option<String>,
+    /// The icon the menu row of the command shows, or `""`.
+    icon: &'static str,
 }
 
 #[derive(Clone, PartialEq)]
@@ -175,8 +180,10 @@ enum Item {
         spot: Option<Spot>,
     },
     Symbol(SymbolRow),
+    /// A declaration of the File Structure: the offset of its name and its visibility.
     Declaration {
         offset: usize,
+        visibility: Option<GraphVisibility>,
     },
     Action(&'static str),
     /// A row of the settings list; choosing it shows that page of Settings.
@@ -244,6 +251,37 @@ const TOOLS: [(&str, &str, &str); 18] = [
     (BUILD_TOOL, "Build", "toolwindows/tasks"),
 ];
 
+/// The commands that open a tool window, with the icon of that window: the icon of its stripe
+/// button, or of its row in the Switcher. Beans has neither, so it takes the leaf of the
+/// Spring icons. Data Sources opens a dialog of the Database tool, so it takes that icon too.
+/// Every other command keeps the icon of its menu row, or none.
+const TOOL_COMMAND_ICONS: [(&str, &str); 12] = [
+    ("window.show_bookmarks", "toolwindows/bookmarks"),
+    ("window.toggle_project", "toolwindows/project"),
+    ("window.toggle_terminal", "toolwindows/terminal"),
+    ("window.toggle_assistant", "own/aiSessions"),
+    ("window.database", "toolwindows/database"),
+    ("window.show_endpoints", "toolwindows/endpoints"),
+    ("window.show_beans", "run/springBoot"),
+    ("console.open", "toolwindows/run"),
+    ("git.show_log", "general/vcs"),
+    ("git.show_file_history", "general/vcs"),
+    ("git.show_console", "general/vcs"),
+    ("database.data_sources", "toolwindows/database"),
+];
+
+/// The words, besides its title, that Find Action matches a command by. The Data Sources window
+/// is also called Data Sources and Drivers, and IDEA's search finds it by that name.
+const COMMAND_ALIASES: [(&str, &str); 1] = [("database.data_sources", "Data Sources and Drivers")];
+
+/// The text that Find Action matches a command against: its title, and its alias if it has one.
+fn search_text(id: &str, title: &str) -> String {
+    match COMMAND_ALIASES.iter().find(|(command, _)| *command == id) {
+        Some((_, alias)) => format!("{title} {alias}"),
+        None => title.to_owned(),
+    }
+}
+
 /// The commands of Search Everywhere that begin with `/`.
 const COMMANDS: [(&str, &str); 8] = [
     ("file", "workspace.goto_file"),
@@ -256,6 +294,11 @@ const COMMANDS: [(&str, &str); 8] = [
     ("switcher", "workspace.switcher"),
 ];
 
+/// The name of a declaration without the parameters a server may put after it.
+fn bare_name(name: &str) -> &str {
+    name.split('(').next().unwrap_or(name)
+}
+
 fn kind_icon(kind: SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Module => "nodes/package",
@@ -265,6 +308,41 @@ fn kind_icon(kind: SymbolKind) -> &'static str {
         SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor => "nodes/method",
         SymbolKind::Field => "nodes/field",
         SymbolKind::Constant => "nodes/constant",
+    }
+}
+
+/// Commands in alphabetical order, without regard to case. The name as written and the id
+/// come last, so that the order is the same from one run to the next.
+fn action_order(left: &ActionEntry, right: &ActionEntry) -> std::cmp::Ordering {
+    left.title
+        .to_lowercase()
+        .cmp(&right.title.to_lowercase())
+        .then_with(|| left.title.cmp(&right.title))
+        .then_with(|| left.id.cmp(right.id))
+}
+
+/// The icon of a command that opens a tool window, from [`TOOL_COMMAND_ICONS`].
+fn tool_command_icon(id: &str) -> Option<&'static str> {
+    TOOL_COMMAND_ICONS
+        .iter()
+        .find(|(command, _)| *command == id)
+        .map(|(_, icon)| *icon)
+}
+
+/// The icon of each menu row that runs a command, by the command id, from the rows of the
+/// main menu and of their submenus.
+fn menu_icons(entries: &[MenuEntry]) -> HashMap<String, &'static str> {
+    let mut found = HashMap::new();
+    collect_menu_icons(entries, &mut found);
+    found
+}
+
+fn collect_menu_icons(entries: &[MenuEntry], found: &mut HashMap<String, &'static str>) {
+    for entry in entries {
+        if let (Some(id), Some(icon)) = (&entry.id, entry.icon) {
+            found.entry(id.to_string()).or_insert(icon);
+        }
+        collect_menu_icons(&entry.submenu, found);
     }
 }
 
@@ -317,13 +395,21 @@ impl Palette {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        // The icons come from the rows of the main menu, by command: the same rows the menus
+        // show, so that a command has the icon of its menu row here as well. A command that
+        // opens a tool window has the icon of that window instead.
+        let menu_icons = menu_icons(&workspace.main_menu(cx));
         let actions = workspace
             .commands()
             .visible()
             .map(|command| ActionEntry {
                 id: command.id,
                 title: command.title.clone(),
-                shortcut: workspace.shortcut_of(command.id),
+                search: search_text(command.id, &command.title),
+                shortcut: workspace.shortcut_of_key(command.id),
+                icon: tool_command_icon(command.id)
+                    .or_else(|| menu_icons.get(command.id).copied())
+                    .unwrap_or(""),
             })
             .collect();
         let recent = navigation::recent(cx);
@@ -667,19 +753,30 @@ impl Palette {
     fn action_rows(&self, limit: usize) -> Vec<RowData> {
         let mut matcher = NameMatcher::new();
         let matcher: &mut dyn FuzzyMatcher = &mut matcher;
-        let found = rank(
+        // Every match is ranked before the cut, so that the order of the ties decides which
+        // commands stay in the list.
+        let mut found = rank(
             matcher,
             &self.query.text,
             self.actions.iter(),
-            |action| &action.title,
-            limit,
+            |action| &action.search,
+            self.actions.len(),
         );
+        // The commands with the same score come alphabetically, not by the length of their
+        // names. On an empty query every command has the same score.
+        found.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| action_order(left.item, right.item))
+        });
+        found.truncate(limit);
         found
             .into_iter()
             .map(|ranked| RowData {
                 title: ranked.item.title.clone(),
                 detail: String::new(),
-                icon: "",
+                icon: ranked.item.icon,
                 shortcut: ranked.item.shortcut.clone(),
                 indent: 0,
                 toggle: None,
@@ -720,41 +817,39 @@ impl Palette {
         if !self.query.text.trim().is_empty() {
             let mut matcher = NameMatcher::new();
             let matcher: &mut dyn FuzzyMatcher = &mut matcher;
+            // The filter looks at the name alone: a type in a signature finds no row.
             let found = rank(
                 matcher,
                 &self.query.text,
                 shown,
-                |item| &item.name,
+                |item| bare_name(&item.name),
                 MAX_ROWS,
             );
             shown = found.into_iter().map(|ranked| ranked.item).collect();
         }
         shown
             .into_iter()
-            .map(|item| RowData {
-                title: item.name.clone(),
-                // The signature without the name is shown in grey after it, as IDEA does.
-                detail: item
-                    .signature
-                    .as_deref()
-                    .map(|signature| {
-                        signature
-                            .strip_prefix(item.name.as_str())
-                            .unwrap_or(signature)
-                            .to_owned()
-                    })
-                    .unwrap_or_default(),
-                icon: crate::outline::icon_of(item.kind),
-                shortcut: None,
-                indent: if self.query.text.trim().is_empty() {
-                    item.depth
-                } else {
-                    0
-                },
-                toggle: None,
-                item: Some(Item::Declaration {
-                    offset: item.name_range.start,
-                }),
+            .map(|item| {
+                let title = bare_name(&item.name);
+                // The signature without the name is shown in grey after it, as IDEA does; a
+                // declaration without a signature shows the parameters the name carries.
+                let label = item.signature.as_deref().unwrap_or(&item.name);
+                RowData {
+                    title: title.to_owned(),
+                    detail: label.strip_prefix(title).unwrap_or(label).to_owned(),
+                    icon: crate::outline::icon_of(item.kind),
+                    shortcut: None,
+                    indent: if self.query.text.trim().is_empty() {
+                        item.depth
+                    } else {
+                        0
+                    },
+                    toggle: None,
+                    item: Some(Item::Declaration {
+                        offset: item.name_range.start,
+                        visibility: item.visibility,
+                    }),
+                }
             })
             .collect()
     }
@@ -870,7 +965,9 @@ impl Palette {
                         group("Actions", self.action_rows(limit), &mut rows);
                     }
                     if tab == Tab::Actions && !searching {
-                        rows = self.action_rows(MAX_ROWS);
+                        // Every command, so that the alphabetical end of the list is reachable
+                        // without a query; the settings follow them.
+                        rows = self.action_rows(self.actions.len());
                         rows.extend(self.setting_rows(MAX_ROWS, cx));
                     }
                 }
@@ -964,6 +1061,32 @@ impl Palette {
             .collect()
     }
 
+    /// The declarations of the File Structure with the mark of their visibility, for tests.
+    #[cfg(test)]
+    pub(crate) fn declaration_marks(&self) -> Vec<(String, &'static str)> {
+        self.rows
+            .iter()
+            .filter_map(|row| match &row.item {
+                Some(Item::Declaration { visibility, .. }) => Some((
+                    row.title.clone(),
+                    crate::outline::visibility_icon(*visibility),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The commands on screen with the key at their right edge and the icon at their left,
+    /// for scripts and tests. The settings below them are left out.
+    #[cfg(test)]
+    pub(crate) fn action_rows_text(&self) -> Vec<(String, Option<String>, &'static str)> {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row.item, Some(Item::Action(_))))
+            .map(|row| (row.title.clone(), row.shortcut.clone(), row.icon))
+            .collect()
+    }
+
     /// The row the keys act on, for scripts and tests.
     #[cfg(test)]
     pub(crate) fn selected_row(&self) -> usize {
@@ -1027,7 +1150,7 @@ impl Palette {
                 )),
                 Target::Uri(_) => None,
             },
-            Item::Declaration { offset } => {
+            Item::Declaration { offset, .. } => {
                 let (path, _) = self.structure.as_ref()?;
                 Some(PreviewTarget::at(path.clone(), Spot::Offset(*offset)))
             }
@@ -1236,7 +1359,7 @@ impl Palette {
                         }
                     }
                     Item::Symbol(row) => open_symbol(workspace, row, split, window, cx),
-                    Item::Declaration { offset } => {
+                    Item::Declaration { offset, .. } => {
                         if let Some(path) = structure_path {
                             let spot = Some(Spot::Offset(offset));
                             if split {
@@ -1319,6 +1442,12 @@ impl Palette {
         let selected = index == self.selected;
         let hover = theme.selection_hover;
         let declaration = matches!(data.item, Some(Item::Declaration { .. }));
+        let badge = match &data.item {
+            Some(Item::Declaration { visibility, .. }) => {
+                crate::outline::visibility_icon(*visibility)
+            }
+            _ => "",
+        };
         let signature = declaration
             .then(|| data.detail.clone())
             .filter(|detail| !detail.is_empty());
@@ -1385,6 +1514,21 @@ impl Palette {
                     .when(!data.icon.is_empty(), |this| {
                         this.child(icon(data.icon, theme))
                     })
+                    // The mark of the visibility stands beside the icon of the kind.
+                    .when(!badge.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .debug_selector(move || format!("palette-badge-{index}"))
+                                .flex_none()
+                                .child(icon(badge, theme)),
+                        )
+                    })
+                    // A command without an icon keeps the place of one, as a menu row does, so
+                    // that the names of the list stand in one column.
+                    .when(
+                        data.icon.is_empty() && matches!(data.item, Some(Item::Action(_))),
+                        |this| this.child(div().size(px(ICON)).flex_none()),
+                    )
                     .child(data.title)
                     .children(signature.map(|signature| {
                         div()

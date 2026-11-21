@@ -154,6 +154,9 @@ pub struct Capabilities {
     pub function_breakpoints: bool,
     pub data_breakpoints: bool,
     pub restart_frame: bool,
+    /// The adapter reads `hitCondition` of a breakpoint. Without it the window hides the
+    /// pass count.
+    pub hit_condition: bool,
 }
 
 /// The kind of a breakpoint: a place in a file, a method, or a field.

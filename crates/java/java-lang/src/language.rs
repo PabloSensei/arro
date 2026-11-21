@@ -50,6 +50,64 @@ const PREFERRED_COMPLETION_NAMES: &[&str] = &[
     "CharSequence",
 ];
 
+/// The keywords and the literals of the language, none of which names a declaration.
+const JAVA_KEYWORDS: &[&str] = &[
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "native",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "true",
+    "try",
+    "void",
+    "volatile",
+    "while",
+    "_",
+];
+
 /// The grammar and the `queries/java` files the editor uses.
 pub struct JavaSyntax {
     queries: Queries,
@@ -468,6 +526,15 @@ impl LanguageSupport for JavaProject {
 
     fn rename(&self) -> Option<&RenameProvider> {
         Some(self.providers.as_ref())
+    }
+
+    fn prepare_rename(&self) -> Option<&lang_api::PrepareRenameProvider> {
+        Some(self.providers.as_ref())
+    }
+
+    /// The words of the grammar that cannot name a declaration.
+    fn reserved_word(&self, name: &str) -> bool {
+        JAVA_KEYWORDS.contains(&name)
     }
 
     fn move_destinations(&self) -> Option<&MoveDestinationProvider> {

@@ -140,6 +140,18 @@ static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 impl EditorView {
     /// Ctrl+O, and Ctrl+I with `only_abstract`.
     pub(crate) fn override_methods(&mut self, only_abstract: bool, cx: &mut Context<Self>) {
+        self.ask_overrides(only_abstract, false, cx);
+    }
+
+    /// Implement Methods of the Generate list. With nothing to implement, the status bar says
+    /// so instead of a note at the caret.
+    pub(crate) fn implement_methods_of_generate(&mut self, cx: &mut Context<Self>) {
+        self.ask_overrides(true, true, cx);
+    }
+
+    /// Asks for the methods that can be overridden or implemented at the caret. With
+    /// `from_generate` an empty answer goes to the status bar.
+    fn ask_overrides(&mut self, only_abstract: bool, from_generate: bool, cx: &mut Context<Self>) {
         let Some((spot, caret)) = self.spot() else {
             return;
         };
@@ -161,6 +173,9 @@ impl EditorView {
             let answer = first(replies).await;
             this.update(cx, |this, cx| match answer {
                 Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
+                Some((methods, _)) if methods.methods.is_empty() && from_generate => {
+                    this.report_status("No methods to implement", cx);
+                }
                 Some((methods, _)) if methods.methods.is_empty() => {
                     let text = if only_abstract {
                         "Nothing to implement here"
@@ -328,11 +343,12 @@ impl EditorView {
             .and_then(|state| state.language().cloned());
         let syntax = self.syntax.clone();
         let replies = ask(provider, DefinitionPreviewQuery(spot));
+        self.importing_note(caret, cx);
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
             let opened = this.update(cx, |this, cx| match answer {
                 Some((_, Confidence::Unknown)) => {
-                    this.show_note(caret, NO_ANSWER, cx);
+                    this.show_unanswered(caret, false, cx);
                     None
                 }
                 Some((preview, _)) if preview.text.trim().is_empty() => {
@@ -465,7 +481,7 @@ impl EditorView {
 
     /// Ctrl+Alt+H: the window shows the call hierarchy of the place.
     pub(crate) fn call_hierarchy(&mut self, cx: &mut Context<Self>) {
-        let Some((spot, _)) = self.spot() else {
+        let Some((spot, caret)) = self.spot() else {
             return;
         };
         if self
@@ -476,6 +492,7 @@ impl EditorView {
         {
             return;
         }
+        self.importing_note(caret, cx);
         cx.emit(EditorEvent::CallHierarchy(spot));
     }
 

@@ -361,7 +361,8 @@ fn refactor_this_lists_the_refactorings_of_the_editor_with_their_keys(cx: &mut T
     draw(cx, window);
     open_path(cx, window, &own);
 
-    // Without an action of the server the first row is Rename, which opens its field.
+    // Without an action of the server the first row is Rename, which changes the name
+    // in the text itself.
     press(cx, window, "ctrl-alt-shift-t");
     draw(cx, window);
     assert!(
@@ -371,7 +372,7 @@ fn refactor_this_lists_the_refactorings_of_the_editor_with_their_keys(cx: &mut T
     press(cx, window, "enter");
     draw(cx, window);
     assert!(
-        bounds_of(cx, window, "rename-popup").size.height > px(0.),
+        bounds_of(cx, window, "rename-in-place-hint").size.height > px(0.),
         "Rename is the first row of the list"
     );
     press(cx, window, "escape");

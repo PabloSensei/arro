@@ -14,7 +14,6 @@ use workspace::Workspace;
 use crate::prompt::TextField;
 
 const WIDTH: f32 = 620.;
-const FIELD_HEIGHT: f32 = 26.;
 
 const NO_ANSWER: &str = "The language server did not answer";
 const NO_SUPPORT: &str = "This language does not move members";
@@ -407,7 +406,7 @@ fn row_box(
         .flex()
         .items_center()
         .gap(px(SPACE_M))
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_S))
         .rounded(px(CONTROL_RADIUS))
         .text_color(theme.text)
@@ -424,7 +423,11 @@ fn check_box(checked: bool, theme: &Theme) -> Div {
         .h(px(14.))
         .rounded(px(3.))
         .border_1()
-        .border_color(theme.control_border)
+        .border_color(if checked {
+            theme.control_border
+        } else {
+            ui_kit::checkbox_border(theme)
+        })
         .when(checked, |box_| box_.bg(theme.accent))
         .child(
             div()
@@ -437,6 +440,12 @@ fn check_box(checked: bool, theme: &Theme) -> Div {
 impl Render for MemberFormDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let labels: Vec<&str> = self
+            .fields
+            .iter()
+            .map(|(field, _)| field.label.as_str())
+            .collect();
+        let label_width = form_label_width(window, &labels);
         let viewport = window.viewport_size();
         let width = px(WIDTH);
         let left = (viewport.width - width) / 2.;
@@ -559,7 +568,7 @@ impl Render for MemberFormDialog {
                 })
                 .flex()
                 .items_center()
-                .h(px(FIELD_HEIGHT))
+                .h(px(CONTROL_HEIGHT))
                 .flex_1()
                 .px(px(SPACE_M))
                 .rounded(px(CONTROL_RADIUS))
@@ -593,13 +602,7 @@ impl Render for MemberFormDialog {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .w(px(140.))
-                            .flex_none()
-                            .text_color(theme.text_muted)
-                            .child(field.label.clone()),
-                    )
+                    .child(form_label(label_width, &field.label, &theme))
                     .child(value.on_click(cx.listener(move |this, _, window, cx| {
                         this.active = this
                             .rows

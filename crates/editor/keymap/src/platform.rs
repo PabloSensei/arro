@@ -121,6 +121,9 @@ fn stroke_label(stroke: &str, platform: Platform) -> String {
 
 /// The name of the key itself, in the spelling of the system's menus.
 fn key_label(key: &str, platform: Platform) -> String {
+    if let Some(label) = numpad_label(key) {
+        return label;
+    }
     if !platform.uses_command() {
         return title(key);
     }
@@ -142,6 +145,24 @@ fn key_label(key: &str, platform: Platform) -> String {
     }
 }
 
+/// The keys of the numeric keypad, in the spelling of the menus of IDEA: `NumPad -`,
+/// `NumPad /`, `NumPad *`, `NumPad +` and `NumPad 0` to `NumPad 9`.
+fn numpad_label(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("numpad")?;
+    let rest = rest.strip_prefix('_').unwrap_or(rest);
+    Some(match rest {
+        "add" => "NumPad +".to_owned(),
+        "subtract" => "NumPad -".to_owned(),
+        "multiply" => "NumPad *".to_owned(),
+        "divide" => "NumPad /".to_owned(),
+        "decimal" => "NumPad .".to_owned(),
+        digits if !digits.is_empty() && digits.chars().all(|digit| digit.is_ascii_digit()) => {
+            format!("NumPad {digits}")
+        }
+        _ => return None,
+    })
+}
+
 /// The first letter in capitals, as a menu writes a key name.
 fn title(text: &str) -> String {
     let mut chars = text.chars();
@@ -149,4 +170,35 @@ fn title(text: &str) -> String {
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Platform, shortcut_label};
+
+    #[test]
+    fn a_numpad_key_is_written_as_idea_writes_it() {
+        assert_eq!(
+            shortcut_label("numpad_subtract", Platform::Windows),
+            "NumPad -"
+        );
+        assert_eq!(
+            shortcut_label("ctrl-numpad_divide", Platform::Windows),
+            "Ctrl+NumPad /"
+        );
+        assert_eq!(
+            shortcut_label("ctrl-numpad_multiply", Platform::Windows),
+            "Ctrl+NumPad *"
+        );
+        assert_eq!(shortcut_label("numpad_add", Platform::Windows), "NumPad +");
+        assert_eq!(shortcut_label("numpad0", Platform::Windows), "NumPad 0");
+        assert_eq!(
+            shortcut_label("ctrl-alt-numpad_subtract", Platform::Windows),
+            "Ctrl+Alt+NumPad -"
+        );
+        assert_eq!(
+            shortcut_label("ctrl-numpad_multiply numpad3", Platform::Windows),
+            "Ctrl+NumPad *, NumPad 3"
+        );
+    }
 }

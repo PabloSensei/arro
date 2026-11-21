@@ -24,14 +24,37 @@ pub fn icon_sized(name: &str, size: f32, theme: &Theme) -> Img {
     image
 }
 
-/// A checkbox: an accent square with a check mark when `on`.
+/// The group of a checkbox row: an empty box brightens its border while the pointer is on the
+/// row, so the label brightens it too.
+const CHECKBOX_ROW: &str = "checkbox-row";
+
+/// The border of an empty checkbox: the secondary text colour, which keeps the box in sight on
+/// the dialogs and the tool windows of every theme. The tests of `checkbox_tests` check it.
+pub fn checkbox_border(theme: &Theme) -> Hsla {
+    theme.text_secondary
+}
+
+/// The border of an empty checkbox under the pointer: the text colour, the brightest one.
+pub fn checkbox_border_hover(theme: &Theme) -> Hsla {
+    theme.text
+}
+
+/// A checkbox: an accent square with a check mark when `on`, and an empty square with the
+/// border of [`checkbox_border`] when off.
 pub fn checkbox(on: bool, theme: &Theme) -> Div {
+    checkbox_box(on, theme, false).children(on.then(|| icon_sized("general/check", 10., theme)))
+}
+
+/// The square of a checkbox without its mark. An empty square brightens its border under the
+/// pointer, and the square of a checkbox row does so while the pointer is on the row.
+fn checkbox_box(on: bool, theme: &Theme, in_row: bool) -> Div {
     let (background, border) = if on {
         (theme.accent, theme.accent)
     } else {
-        (theme.popup_bg, theme.border)
+        (theme.popup_bg, checkbox_border(theme))
     };
-    div()
+    let hover = checkbox_border_hover(theme);
+    let square = div()
         .flex_none()
         .flex()
         .items_center()
@@ -40,8 +63,12 @@ pub fn checkbox(on: bool, theme: &Theme) -> Div {
         .rounded(px(3.))
         .border_1()
         .border_color(border)
-        .bg(background)
-        .children(on.then(|| icon_sized("general/check", 10., theme)))
+        .bg(background);
+    match (on, in_row) {
+        (true, _) => square,
+        (false, true) => square.group_hover(CHECKBOX_ROW, move |style| style.border_color(hover)),
+        (false, false) => square.hover(move |style| style.border_color(hover)),
+    }
 }
 
 /// A checkbox with its label: the whole row takes the click, as a setting of IDEA does,
@@ -59,11 +86,18 @@ pub fn checkbox_row(
     let name = id.to_string();
     #[cfg(any(test, feature = "test-support"))]
     let box_name = format!("{name}-box");
-    let box_ = checkbox(on, theme);
+    let mark = on.then(|| icon_sized("general/check", 10., theme));
+    #[cfg(any(test, feature = "test-support"))]
+    let mark = mark.map(|mark| {
+        let mark_name = format!("{name}-mark");
+        mark.debug_selector(move || mark_name.clone())
+    });
+    let box_ = checkbox_box(on, theme, true).children(mark);
     #[cfg(any(test, feature = "test-support"))]
     let box_ = box_.debug_selector(move || box_name.clone());
     let row = div()
         .id(id)
+        .group(CHECKBOX_ROW)
         .flex()
         .items_center()
         .gap(px(SPACE_S))
@@ -74,7 +108,7 @@ pub fn checkbox_row(
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .child(box_)
-        .child(div().text_color(theme.text).child(label.clone()));
+        .child(div().min_w_0().text_color(theme.text).child(label.clone()));
     #[cfg(any(test, feature = "test-support"))]
     let row = row.child(crate::bounds_probe(name, Some(label)));
     row

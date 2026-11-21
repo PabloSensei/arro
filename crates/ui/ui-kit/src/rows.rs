@@ -111,6 +111,10 @@ pub fn tab(
     tab
 }
 
+/// The gap between the icon of a tree row and the name after it. The project tree and the
+/// change trees of the Commit and Push windows keep it.
+pub const TREE_ICON_GAP: f32 = SPACE_S;
+
 /// What a tree row shows. The list around it sets the side margins.
 pub struct TreeRow {
     pub id: ElementId,
@@ -124,9 +128,28 @@ pub struct TreeRow {
 }
 
 pub fn tree_row(row: TreeRow, theme: &Theme) -> Stateful<Div> {
+    tree_row_with_badge(row, "", theme)
+}
+
+/// A tree row with a small icon right of its icon, such as the mark of a visibility; `""`
+/// shows none.
+pub fn tree_row_with_badge(row: TreeRow, badge: &'static str, theme: &Theme) -> Stateful<Div> {
     let hover = theme.selection_hover;
     #[cfg(any(test, feature = "test-support"))]
     let (name, label) = (row.id.to_string(), Some(row.label.clone()));
+    // The icon and the name carry selectors of their own, so that a test measures the gap
+    // between them. They are not probes: the overlap check reads the probes of a frame.
+    let (icon_id, name_id, badge_id) = (row.id.clone(), row.id.clone(), row.id.clone());
+    let icon_part = div()
+        .ml(px(SPACE_S))
+        .flex_none()
+        .debug_selector(move || format!("{icon_id}-icon"))
+        .child(icon(row.icon, theme));
+    let name_part = div()
+        .ml(px(TREE_ICON_GAP))
+        .flex_none()
+        .debug_selector(move || format!("{name_id}-label"))
+        .child(row.label);
     let row = div()
         .id(row.id)
         .flex()
@@ -154,8 +177,17 @@ pub fn tree_row(row: TreeRow, theme: &Theme) -> Stateful<Div> {
                     this.child(icon(name, theme))
                 }),
         )
-        .child(icon(row.icon, theme).ml(px(SPACE_S)))
-        .child(div().ml(px(SPACE_S)).flex_none().child(row.label))
+        .child(icon_part)
+        .when(!badge.is_empty(), |this| {
+            this.child(
+                div()
+                    .ml(px(SPACE_XS))
+                    .flex_none()
+                    .debug_selector(move || format!("{badge_id}-badge"))
+                    .child(icon(badge, theme)),
+            )
+        })
+        .child(name_part)
         .children(row.hint.map(|hint| {
             div()
                 .ml(px(SPACE_M))

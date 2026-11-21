@@ -157,6 +157,32 @@ fn relative(root: &Path, path: &Path) -> String {
     relative.to_string_lossy().replace('\\', "/")
 }
 
+/// The icon of an event of the history, or `None` when the icon sets have none for it.
+/// The rows without an icon keep its place, so the captions stay in one column.
+fn event_icon(revision: &Revision) -> Option<&'static str> {
+    if revision.is_label() {
+        return Some("general/star");
+    }
+    match revision.cause {
+        Cause::Saved => Some("general/check"),
+        Cause::Auto => Some("general/history"),
+        Cause::BeforeGitCheckout | Cause::BeforeGitPull | Cause::BeforeGitRevert => {
+            Some("general/vcs")
+        }
+        Cause::BeforeRefactoring => Some("codeInsight/intentionBulb"),
+        Cause::BeforeOptimizeImports => Some("general/settings"),
+        _ => None,
+    }
+}
+
+/// The icon of an event, or the empty place of one when the event has none.
+fn event_icon_cell(revision: &Revision, theme: &Theme) -> AnyElement {
+    match event_icon(revision) {
+        Some(name) => icon(name, theme).into_any_element(),
+        None => div().flex_none().size(px(ICON)).into_any_element(),
+    }
+}
+
 impl HistoryView {
     /// Reads the versions in the background and opens the window when they are there.
     pub fn show(
@@ -738,14 +764,25 @@ impl HistoryView {
                     .into_any_element(),
             );
             for (index, revision) in self.deleted.iter().enumerate() {
+                let file_type = self
+                    .workspace
+                    .read_with(cx, |workspace, _| {
+                        workspace.icons().icon_for(&revision.path)
+                    })
+                    .unwrap_or("fileTypes/text");
                 let row = div()
+                    .id(("history-deleted-row", index))
+                    .debug_selector(move || format!("history-deleted-row-{index}"))
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap(px(SPACE_S))
                     .h(px(ROW_HEIGHT))
                     .px(px(SPACE_M))
+                    .child(icon(file_type, theme))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
                             .child(relative(&self.scope, &revision.path)),
                     )
@@ -778,7 +815,7 @@ impl HistoryView {
                     .gap(px(SPACE_S))
                     .h(px(ROW_HEIGHT))
                     .px(px(SPACE_M))
-                    .child(div().flex_1().h(px(1.)).bg(theme.border))
+                    .child(event_icon_cell(revision, theme))
                     .child(div().text_color(theme.text_secondary).child(name))
                     .child(div().flex_1().h(px(1.)).bg(theme.border));
                 rows.push(row.into_any_element());
@@ -788,19 +825,29 @@ impl HistoryView {
             let hover = theme.selection_hover;
             let row = div()
                 .id(("history-row", index))
+                .debug_selector(move || format!("history-row-{index}"))
                 .flex()
-                .flex_col()
-                .justify_center()
+                .items_center()
+                .gap(px(SPACE_S))
                 .h(px(ROW_HEIGHT + SPACE_L))
                 .px(px(SPACE_M))
                 .when(selected, |row| row.bg(theme.selection_inactive))
                 .when(!selected, |row| row.hover(move |style| style.bg(hover)))
                 .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
-                .child(div().truncate().child(self.revision_title(revision)))
+                .child(event_icon_cell(revision, theme))
                 .child(
                     div()
-                        .text_color(theme.text_secondary)
-                        .child(age(revision.at)),
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .child(div().truncate().child(self.revision_title(revision)))
+                        .child(
+                            div()
+                                .text_color(theme.text_secondary)
+                                .child(age(revision.at)),
+                        ),
                 );
             rows.push(row.into_any_element());
         }
@@ -1017,22 +1064,52 @@ impl Render for HistoryView {
             .shown
             .as_ref()
             .is_some_and(|shown| !shown.hunks.is_empty());
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(40.))
-            .px(px(DIALOG_PADDING))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(div().font_weight(FontWeight::MEDIUM).child(scope))
-            .when(can_revert, |header| {
-                header.child(
+        let workspace = self.workspace.clone();
+        let hide = {
+            let workspace = workspace.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                workspace
+                    .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+                    .ok();
+            }
+        };
+        let options = {
+            let workspace = self.workspace.clone();
+            move |event: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                let hiding = workspace.clone();
+                let entries = vec![MenuEntry::new("Hide", move |window, cx| {
+                    hiding
+                        .update(cx, |workspace, cx| workspace.dismiss(window, cx))
+                        .ok();
+                })];
+                let position = event.position();
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.show_menu(position, entries, cx)
+                    })
+                    .ok();
+            }
+        };
+        let header = tool_header(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .debug_selector(|| "history-scope".to_owned())
+                .child(scope),
+            div().when(can_revert, |this| {
+                this.child(
                     Self::button("history-revert", "Revert", &theme)
                         .on_click(cx.listener(|this, _, _, cx| this.revert_all(cx))),
                 )
-            });
+            }),
+            "history-window",
+            "history",
+            options,
+            hide,
+            &theme,
+        )
+        .border_b_1()
+        .border_color(theme.border)
+        .debug_selector(|| "history-header".to_owned());
         let message = self.message.clone().map(|message| {
             div()
                 .px(px(DIALOG_PADDING))
@@ -1043,6 +1120,7 @@ impl Render for HistoryView {
         let shell = surface(&theme)
             .id("history")
             .track_focus(&self.focus)
+            .group("history-window")
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
         let contents = div()
             .flex()

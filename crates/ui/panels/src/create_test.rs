@@ -17,7 +17,6 @@ use crate::prompt::{Prompt, TextField};
 use crate::tree_ops::check_name;
 
 const WIDTH: f32 = 560.;
-const FIELD_HEIGHT: f32 = 26.;
 const NO_ANSWER: &str = "The language did not answer";
 const NO_SUPPORT: &str = "This language cannot create tests";
 const NO_FILE: &str = "The language made no test file";
@@ -570,6 +569,8 @@ impl CreateTestDialog {
 impl Render for CreateTestDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let label_width =
+            form_label_width(window, &["Class name", "Superclass", "Destination package"]);
         let viewport = window.viewport_size();
         let width = px(WIDTH);
         let left = (viewport.width - width) / 2.;
@@ -604,9 +605,9 @@ impl Render for CreateTestDialog {
                     .into_any_element(),
                 );
             }
-            rows.push(self.text_row(Row::ClassName, "Class name", &theme, cx));
-            rows.push(self.text_row(Row::Superclass, "Superclass", &theme, cx));
-            rows.push(self.text_row(Row::Package, "Destination package", &theme, cx));
+            rows.push(self.text_row(Row::ClassName, "Class name", label_width, &theme, cx));
+            rows.push(self.text_row(Row::Superclass, "Superclass", label_width, &theme, cx));
+            rows.push(self.text_row(Row::Package, "Destination package", label_width, &theme, cx));
             for (index, folder) in form.folders.iter().enumerate() {
                 let checked = index == form.folder;
                 rows.push(
@@ -864,7 +865,14 @@ impl CreateTestDialog {
         }
     }
 
-    fn text_row(&self, row: Row, label: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn text_row(
+        &self,
+        row: Row,
+        label: &str,
+        label_width: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let field = match row {
             Row::ClassName => &self.class_name,
             Row::Superclass => &self.superclass,
@@ -880,7 +888,7 @@ impl CreateTestDialog {
             })
             .flex()
             .items_center()
-            .h(px(FIELD_HEIGHT))
+            .h(px(CONTROL_HEIGHT))
             .flex_1()
             .px(px(SPACE_M))
             .rounded(px(CONTROL_RADIUS))
@@ -906,13 +914,7 @@ impl CreateTestDialog {
             .flex()
             .items_center()
             .gap(px(SPACE_M))
-            .child(
-                div()
-                    .w(px(140.))
-                    .flex_none()
-                    .text_color(theme.text_muted)
-                    .child(label.to_owned()),
-            )
+            .child(form_label(label_width, label, theme))
             .child(value.on_click(cx.listener(move |this, _, window, cx| {
                 this.active = this
                     .rows
@@ -971,7 +973,7 @@ fn choice_row(
         .flex()
         .items_center()
         .gap(px(SPACE_M))
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_S))
         .rounded(px(CONTROL_RADIUS))
         .text_color(theme.text)
@@ -986,7 +988,11 @@ fn choice_row(
                 .h(px(14.))
                 .rounded(px(3.))
                 .border_1()
-                .border_color(theme.control_border)
+                .border_color(if checked {
+                    theme.control_border
+                } else {
+                    ui_kit::checkbox_border(theme)
+                })
                 .when(checked, |box_| box_.bg(theme.accent))
                 .child(
                     div()

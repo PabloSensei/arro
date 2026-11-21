@@ -301,13 +301,6 @@ impl PushWindow {
         }
     }
 
-    fn label(&self, text: &str, theme: &Theme) -> Div {
-        div()
-            .flex_none()
-            .text_color(theme.text_secondary)
-            .child(text.to_string())
-    }
-
     fn checkbox(&self, checked: bool, theme: &Theme) -> Div {
         div()
             .flex_none()
@@ -317,7 +310,7 @@ impl PushWindow {
             .border_color(if checked {
                 theme.accent
             } else {
-                theme.text_secondary
+                ui_kit::checkbox_border(theme)
             })
             .when(checked, |this| this.bg(theme.accent))
             .child(
@@ -327,7 +320,7 @@ impl PushWindow {
                     .items_center()
                     .justify_center()
                     .when(checked, |this| {
-                        this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                        this.child(icon_sized("general/check", 10., theme))
                     }),
             )
     }
@@ -572,7 +565,7 @@ impl PushWindow {
         cx.notify();
     }
 
-    fn controls(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn controls(&self, theme: &Theme, label_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let remote = div()
             .id("push-remote")
             .debug_selector(|| "push-remote".to_string())
@@ -628,6 +621,18 @@ impl PushWindow {
                 16.,
                 self.editing_destination,
             ));
+        // The upstream of the branch stands on the row of the Branch field, small and grey.
+        let upstream = div()
+            .debug_selector(|| "push-upstream".to_string())
+            .flex_none()
+            .ml(px(SPACE_M))
+            .text_color(theme.text_secondary)
+            .text_size(px(TEXT_SMALL))
+            .child(match &self.upstream {
+                Some(upstream) => format!("Upstream: {upstream}"),
+                None => "No upstream yet".to_string(),
+            });
+        let branch_row = div().flex().items_center().child(branch).child(upstream);
         let tags = div()
             .id("push-tags")
             .debug_selector(|| "push-tags".to_string())
@@ -688,17 +693,9 @@ impl PushWindow {
             .flex_none()
             .px(px(SPACE_M))
             .py(px(SPACE_S))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_M))
-                    .child(self.label("Remote:", theme))
-                    .child(remote)
-                    .child(self.label("Branch:", theme))
-                    .child(branch)
-                    .child(tags),
-            )
+            .child(form_row(label_width, "Remote:", remote, theme))
+            .child(form_row(label_width, "Branch:", branch_row, theme))
+            .child(form_aligned(label_width, tags))
             .children(remotes)
             .into_any_element()
     }
@@ -820,6 +817,7 @@ fn default_target(branch: &str, upstream: Option<&str>, remotes: &[String]) -> (
 impl Render for PushWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let label_width = form_label_width(window, &["Remote:", "Branch:"]);
         let viewport = window.viewport_size();
         let width = px(WIDTH).min(viewport.width - px(40.));
         let height = viewport.height * 0.65;
@@ -832,19 +830,12 @@ impl Render for PushWindow {
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
-        let upstream = div()
-            .text_color(theme.text_secondary)
-            .text_size(px(TEXT_SMALL))
-            .child(match &self.upstream {
-                Some(upstream) => format!("Upstream: {upstream}"),
-                None => "No upstream yet".to_string(),
-            });
         let contents = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(self.controls(&theme, cx))
+            .child(self.controls(&theme, label_width, cx))
             .child(
                 div()
                     .flex()
@@ -875,7 +866,7 @@ impl Render for PushWindow {
             DialogSpec {
                 key: "push",
                 title: "Push".into(),
-                extra: Some(upstream.into_any_element()),
+                extra: None,
                 place: DialogPlace {
                     left: f32::from(left),
                     top: f32::from(top),

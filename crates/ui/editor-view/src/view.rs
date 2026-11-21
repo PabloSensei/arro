@@ -15,8 +15,8 @@ use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use keymap::{Keymap, Keystroke, Lookup, default_keymap, editor as actions};
 use lang_api::{
-    ActionKind, ActionQuery, DiagnosticEntry, DocumentEdit, FormatQuery, NavigationKind,
-    RangeFormatQuery, Replies, Severity, SourceSpan, TextSpan, ask,
+    ActionKind, ActionQuery, DiagnosticEntry, DocumentEdit, FormatQuery, GraphVisibility,
+    NavigationKind, RangeFormatQuery, Replies, Severity, SourceSpan, TextSpan, ask,
 };
 use syntax::{DocumentId, HighlightSpan, LanguageConfig, SyntaxService};
 use templates::{ExpandWith, FileTemplateDefinition, TemplateLanguage, TemplateOverrides};
@@ -32,6 +32,7 @@ use crate::blocks::{brace_pairs, enclosing_block};
 use crate::element::{ANNOTATE_WIDTH, EditorElement, GUTTER_WIDTH, Layout, StripeKind, TEXT_INSET};
 use crate::live::LiveTemplates;
 use crate::refactor::Refactoring;
+use crate::rename::WAITING_FOR_LANGUAGE;
 use crate::scrollbar::{Axis, Drag};
 use crate::semantic::{
     CompletionMode, Lsp, Reveals, completion_doc_rows, completion_kind_icon, location_label,
@@ -350,6 +351,8 @@ pub struct OutlineItem {
     /// The declaration with its type and parameters, when the language gives them:
     /// `process(int, Owner): String`.
     pub signature: Option<String>,
+    /// How visible the declaration is, when the language says so.
+    pub visibility: Option<GraphVisibility>,
     pub kind: OutlineKind,
     pub depth: u32,
     /// The whole declaration.
@@ -626,6 +629,9 @@ pub enum EditorEvent {
     Dirty(bool),
     Saved,
     Failed(SharedString),
+    /// A message about a language answer that the status bar shows, such as a name the
+    /// language refuses to rename.
+    Status(SharedString),
     /// A save met a language server that could not run its actions; the text went to
     /// the disk without them.
     SaveNote(SharedString),
@@ -748,6 +754,13 @@ pub enum EditorEvent {
     UsagesDetailedInFile(Vec<DetailedUsage>),
     /// Ctrl+Alt+F7: the uses of the symbol, for the popup at the caret.
     ShowUsages(UsagesUpdate),
+    /// Alt+F7 or Ctrl+F7 while the language server imports: the Usages window opens with a
+    /// waiting line. The search runs by itself when the server is ready; `cancel` ends the wait.
+    UsagesWaiting {
+        name: String,
+        in_file: bool,
+        cancel: ::base::Cancel,
+    },
     /// A right click in the text: the window shows the menu of the editor here.
     ContextMenu(Point<Pixels>),
     /// A right click in the gutter of the line numbers: the window shows the menu of the
@@ -787,6 +800,8 @@ pub enum EditorEvent {
     },
     /// The text scrolled: the first visible row in pixels, for a view that follows it.
     Scrolled(f32),
+    /// An action found nothing to do and says so in the status bar of the window.
+    StatusMessage(SharedString),
 }
 
 /// What the Documentation tool window asks about the symbol at the caret: the place, the
@@ -820,6 +835,15 @@ struct ContextInfo {
     /// The caret when the popup opened; a move closes it.
     head: usize,
     lines: Vec<String>,
+}
+
+/// What the last frame showed of the caret: its head, the scroll and whether the whole row
+/// was on screen. A row that stops showing while none of these changed is revealed again.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CaretWatch {
+    pub head: usize,
+    pub scroll_top: f32,
+    pub shown: bool,
 }
 
 /// The list of the neighbours of one declaration, which a click on its breadcrumb opens:
@@ -1100,6 +1124,8 @@ pub struct EditorView {
     pub(crate) reveal_center: bool,
     pub(crate) caret_on: bool,
     pub(crate) viewport: Size<Pixels>,
+    /// What the last frame showed of the caret, see [`CaretWatch`].
+    pub(crate) caret_watch: Option<CaretWatch>,
     pub(crate) layout: Option<Rc<Layout>>,
     pub(crate) gutter_hovered: bool,
     pub(crate) run_marks: Vec<RunMark>,
@@ -1375,6 +1401,19 @@ impl EditorView {
         }
         cx.observe_global::<Reveals>(|this, cx| this.reveal(cx))
             .detach();
+        // The editor lost the focus: a name changed in place is applied, as IDEA applies
+        // it when the user clicks away.
+        let focus = view.focus_handle.clone();
+        cx.on_blur(&focus, window, |view, _window, cx| {
+            if view
+                .lsp
+                .as_ref()
+                .is_some_and(|lsp| lsp.rename_in_place.is_some())
+            {
+                view.leave_rename_in_place(cx);
+            }
+        })
+        .detach();
         // The window lost the focus of the system: its popups go with it, as IDEA
         // closes them.
         cx.observe_window_activation(window, |view, window, cx| {
@@ -1684,6 +1723,7 @@ impl EditorView {
             reveal_center: false,
             caret_on: true,
             viewport: Size::default(),
+            caret_watch: None,
             layout: None,
             gutter_hovered: false,
             run_marks: Vec::new(),
@@ -2246,6 +2286,13 @@ impl EditorView {
         Some(completion.labels())
     }
 
+    /// The text of the note under the caret, when one is on screen. A test reads it; nothing
+    /// else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_text(&self) -> Option<String> {
+        Some(self.lsp.as_ref()?.note.as_ref()?.text.to_string())
+    }
+
     /// The rows of an open completion list on screen and the selected one. A test reads
     /// them; nothing else does.
     #[cfg(any(test, feature = "test-support"))]
@@ -2402,6 +2449,18 @@ impl EditorView {
     /// it is anchored by. `None` before the first frame laid the text out.
     pub fn popup_at_caret(&self, height: f32) -> Option<(Point<Pixels>, Anchor)> {
         self.popup_position(self.head_offset()?, height)
+    }
+
+    /// The line of the caret in window coordinates, as the last frame drew it. `None` while
+    /// the frame did not draw the row of the caret.
+    pub fn caret_line_bounds(&self) -> Option<Bounds<Pixels>> {
+        let (layout, state) = (self.layout.as_ref()?, self.state.as_ref()?);
+        let at = state.display().to_display(state.head());
+        let shown = layout.rows.iter().find(|shown| shown.row == at.row)?;
+        Some(Bounds::new(
+            point(layout.bounds.left(), shown.y),
+            size(layout.bounds.size.width, px(self.style.line_height)),
+        ))
     }
 
     /// Edits from outside the keyboard. One undo step, the buffer becomes dirty.
@@ -3447,6 +3506,18 @@ impl EditorView {
                 lsp.highlights.retain(|range| range.start < range.end);
                 lsp.highlights.sort_by_key(|range| (range.start, range.end));
                 lsp.highlights.dedup();
+                if lsp.rename_in_place.is_some()
+                    && let Some(state) = &self.state
+                {
+                    let support = lsp.support.clone();
+                    let text = state.text();
+                    let version = state.version();
+                    if let Some(rename) = &mut lsp.rename_in_place {
+                        rename.follow(&change.steps, &text, version, false);
+                        let reserved = support.reserved_word(&rename.text);
+                        rename.refresh_problem(reserved);
+                    }
+                }
                 lsp.retain_transformed_marks(&change.steps, len);
                 lsp.retain_transformed_tokens(&change.steps, len);
             }
@@ -3861,8 +3932,18 @@ impl EditorView {
         self.go_to(Spot::Line { line, column: 0 }, cx);
     }
 
+    /// The height of the text: the viewport less the horizontal scrollbar under the text.
+    fn text_height(&self) -> f32 {
+        f32::from(self.viewport.height)
+            - if self.horizontal_bar {
+                crate::scrollbar::HORIZONTAL_HEIGHT
+            } else {
+                0.
+            }
+    }
+
     fn page_rows(&self) -> usize {
-        (f32::from(self.viewport.height) / self.style.line_height)
+        (self.text_height() / self.style.line_height)
             .floor()
             .max(1.) as usize
     }
@@ -3940,6 +4021,7 @@ impl EditorView {
 
     /// Ctrl+Up and Ctrl+Down: scroll a line and keep the caret in view.
     fn scroll_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let text_height = self.text_height();
         let Some(state) = &mut self.state else {
             return;
         };
@@ -3947,9 +4029,7 @@ impl EditorView {
         let display = state.display();
         let rows = display.row_count();
         let caret_row = display.to_display(state.head()).row as isize;
-        let visible = (f32::from(self.viewport.height) / line_height)
-            .floor()
-            .max(1.) as isize;
+        let visible = (text_height / line_height).floor().max(1.) as isize;
         let last = (rows.saturating_sub(visible as usize)) as isize;
         let top = (self.scroll_top / line_height).round() as isize;
         let new_top = (top + delta).clamp(0, last.max(0));
@@ -3997,7 +4077,7 @@ impl EditorView {
         let line_height = self.style.line_height.max(1.);
         let display = state.display();
         let row = display.to_display(state.head()).row as f32;
-        let height = f32::from(self.viewport.height).max(line_height);
+        let height = self.text_height().max(line_height);
         let last = (display.row_count() as f32 * line_height - height).max(0.);
         let margin = (height - line_height) / 2.;
         self.scroll_top = (row * line_height - margin).clamp(0., last);
@@ -4417,7 +4497,7 @@ impl EditorView {
             actions::EXTERNAL_DOC => return self.external_doc(cx),
             actions::HIPPIE_COMPLETION => return self.hippie(true, cx),
             actions::HIPPIE_BACKWARD_COMPLETION => return self.hippie(false, cx),
-            actions::PARAMETER_INFO => return self.parameter_info(cx),
+            actions::PARAMETER_INFO => return self.parameter_info_key(cx),
             actions::GOTO_DECLARATION => return self.navigate(NavigationKind::Definition, cx),
             actions::GOTO_IMPLEMENTATION => {
                 return self.navigate(NavigationKind::Implementation, cx);
@@ -4976,6 +5056,14 @@ impl EditorView {
     }
 
     pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        // A click outside the name applies the rename in place, as Enter does.
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.rename_in_place.is_some())
+        {
+            self.leave_rename_in_place(cx);
+        }
         self.cancel_hover();
         self.close_quick_doc(cx);
         // A click in the editor closes the list of entries in the way.
@@ -6390,10 +6478,21 @@ impl EditorView {
         if let Some(menu) = &lsp.actions
             && let Some((position, anchor)) = self.popup_position(
                 menu.at,
-                (menu.window().len() + 1) as f32 * self.style.line_height + 8.,
+                (menu.window().len() + 1 + usize::from(menu.title.is_some())) as f32
+                    * self.style.line_height
+                    + 8.,
             )
         {
             let mut rows: Vec<Div> = Vec::new();
+            if let Some(title) = menu.title {
+                rows.push(
+                    div()
+                        .debug_selector(|| "actions-title".to_owned())
+                        .px_2()
+                        .text_color(theme.text_muted)
+                        .child(title),
+                );
+            }
             let sections = menu.has_sections();
             for row in menu.window() {
                 let selected = row == menu.selected;
@@ -6424,7 +6523,11 @@ impl EditorView {
                     .gap(px(SPACE_S))
                     .when(selected, |row| row.bg(theme.selection))
                     .when(nested, |row| row.pl(px(SPACE_L)))
-                    .text_color(theme.text);
+                    .text_color(if menu.rows[row].is_waiting() {
+                        theme.text_muted
+                    } else {
+                        theme.text
+                    });
                 if sections {
                     item = item.child(icon_sized(
                         if quick_fix {
@@ -6558,7 +6661,11 @@ impl EditorView {
             );
         }
         if let Some(field) = &lsp.rename
-            && let Some(position) = self.below(field.at)
+            && let Some((position, anchor)) = self.popup_position(
+                field.at,
+                (if field.summary.is_some() { 3. } else { 2. }) * (self.style.line_height + 4.)
+                    + 12.,
+            )
         {
             let body = surface(&theme)
                 .debug_selector(|| "rename-popup".to_owned())
@@ -6585,6 +6692,39 @@ impl EditorView {
             popups.push(
                 deferred(
                     anchored()
+                        .anchor(anchor)
+                        .position(position)
+                        .snap_to_window_with_margin(px(SPACE_M))
+                        .child(body),
+                )
+                .with_priority(1)
+                .into_any_element(),
+            );
+        }
+        if let Some(rename) = &lsp.rename_in_place
+            && let Some((position, anchor)) =
+                self.popup_position(rename.main_start(), self.style.line_height + 2. * SPACE_S)
+        {
+            let hint = rename.problem.unwrap_or(if rename.waiting {
+                WAITING_FOR_LANGUAGE
+            } else {
+                "Enter to rename, Escape to cancel · Shift+F6 for more options"
+            });
+            let body = surface(&theme)
+                .debug_selector(|| "rename-in-place-hint".to_owned())
+                .max_w(px(720.))
+                .p_2()
+                .text_size(px(self.style.font_size))
+                .text_color(if rename.problem.is_some() {
+                    theme.error
+                } else {
+                    theme.text_muted
+                })
+                .child(hint);
+            popups.push(
+                deferred(
+                    anchored()
+                        .anchor(anchor)
                         .position(position)
                         .snap_to_window_with_margin(px(SPACE_M))
                         .child(body),
@@ -7140,6 +7280,7 @@ mod checks {
         OutlineItem {
             name: name.into(),
             signature: None,
+            visibility: None,
             kind,
             depth: 0,
             range: start..end,

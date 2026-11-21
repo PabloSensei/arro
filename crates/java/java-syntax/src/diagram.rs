@@ -365,13 +365,13 @@ fn read_method(node: Node<'_>, text: &str, out: &mut Vec<DiagramMethod>) {
 }
 
 #[derive(Clone, Copy)]
-struct Modifiers {
-    visibility: DiagramVisibility,
+pub(crate) struct Modifiers {
+    pub(crate) visibility: DiagramVisibility,
     static_member: bool,
     abstract_type: bool,
 }
 
-fn modifiers_of(node: Node<'_>, text: &str) -> Modifiers {
+pub(crate) fn modifiers_of(node: Node<'_>, text: &str) -> Modifiers {
     let mut modifiers = Modifiers {
         visibility: DiagramVisibility::Package,
         static_member: false,

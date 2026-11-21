@@ -25,6 +25,7 @@ use tool_gateway::{
     DebugThreadInfo, DebugThreadPage, DebugThreadsQuery, DebugValue, DebugValueNode, DebugVariable,
     DebugVariables,
 };
+use ui_kit::base::InteractiveElementExt;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -185,6 +186,13 @@ struct BreakpointSetting {
     /// A breakpoint that goes away at the first stop.
     #[serde(default)]
     temporary: bool,
+    /// The point goes away once the program reaches its line.
+    #[serde(default)]
+    remove_once: bool,
+    /// Stop every thread, or only the thread that reached the point. The adapter has no
+    /// such setting, so the window keeps it for the next session.
+    #[serde(default)]
+    suspend_thread: bool,
     /// Whether an agent or the user set the point. An agent sees its own points in an
     /// answer with `owner: agent`; the editor paints them apart.
     #[serde(default)]
@@ -256,6 +264,8 @@ impl BreakpointSetting {
             log_expression: None,
             log_message: None,
             temporary: false,
+            remove_once: false,
+            suspend_thread: false,
             owner: BreakpointOwner::User,
         }
     }
@@ -442,6 +452,55 @@ impl DataBreakpointSetting {
     }
 }
 
+/// The exception breakpoints of the window that do not come from a file: the one the
+/// window always lists, and the ones the user named by exception class.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct ExceptionSetting {
+    /// Whether the point is on.
+    enabled: bool,
+    /// Whether the program stops on a caught exception.
+    caught: bool,
+    /// Whether the program stops on an uncaught exception.
+    uncaught: bool,
+}
+
+/// A named exception breakpoint: the class the user typed and how it stops.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ExceptionPointSetting {
+    /// The name of the exception class, as the user typed it.
+    class: String,
+    #[serde(flatten)]
+    setting: ExceptionSetting,
+}
+
+impl ExceptionPointSetting {
+    fn new(class: String) -> Self {
+        Self {
+            class,
+            setting: ExceptionSetting {
+                enabled: true,
+                caught: false,
+                uncaught: true,
+            },
+        }
+    }
+}
+
+fn none_if_empty(text: String) -> Option<String> {
+    let text = text.trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn apply_exception_edit(setting: &mut ExceptionSetting, edit: RowEdit) {
+    match edit {
+        RowEdit::Enabled(on) => setting.enabled = on,
+        RowEdit::Caught(on) => setting.caught = on,
+        RowEdit::Uncaught(on) => setting.uncaught = on,
+        _ => {}
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct SavedState {
@@ -449,6 +508,10 @@ struct SavedState {
     function_breakpoints: Vec<FunctionBreakpointSetting>,
     data_breakpoints: Vec<DataBreakpointSetting>,
     exception_filters: Vec<String>,
+    /// The point of any exception and the names the user gave the adapter's filters.
+    any_exception: ExceptionSetting,
+    /// The exception breakpoints the user named by class.
+    exception_points: Vec<ExceptionPointSetting>,
     #[serde(default)]
     inline_watches: Vec<InlineWatchSetting>,
     /// The window muted the breakpoints; the settings above stay as they are.
@@ -621,6 +684,10 @@ pub struct DebugPanel {
     function_breakpoints: Vec<FunctionBreakpointSetting>,
     /// Field watchpoints, with their properties.
     data_breakpoints: Vec<DataBreakpointSetting>,
+    /// The point the Breakpoints window always lists.
+    any_exception: ExceptionSetting,
+    /// The exception breakpoints the user named by class.
+    exception_points: Vec<ExceptionPointSetting>,
     /// Filters of the adapter the user turned on.
     enabled_filters: BTreeSet<String>,
     watch: Vec<String>,
@@ -748,6 +815,20 @@ impl DebugPanel {
             .and_then(|store| store.get(&state_key(&root)).ok().flatten())
             .and_then(|json| serde_json::from_str::<SavedState>(&json).ok())
             .unwrap_or_default();
+        // A list saved before the window had the point of any exception keeps its
+        // filters: the two the point owns move into it.
+        let mut enabled_filters: BTreeSet<String> =
+            saved.exception_filters.iter().cloned().collect();
+        let mut any_exception = saved.any_exception;
+        if !any_exception.enabled {
+            let caught = enabled_filters.remove("caught");
+            let uncaught = enabled_filters.remove("uncaught");
+            if caught || uncaught {
+                any_exception.enabled = true;
+                any_exception.caught = caught;
+                any_exception.uncaught = uncaught;
+            }
+        }
         bind_keys(cx);
         let panel = cx.new(|cx| Self {
             workspace: workspace.clone(),
@@ -768,7 +849,9 @@ impl DebugPanel {
             breakpoints: saved.breakpoints,
             function_breakpoints: saved.function_breakpoints,
             data_breakpoints: saved.data_breakpoints,
-            enabled_filters: saved.exception_filters.into_iter().collect(),
+            any_exception,
+            exception_points: saved.exception_points,
+            enabled_filters,
             watch: Vec::new(),
             inline_watches: saved.inline_watches,
             labels: Vec::new(),
@@ -3016,6 +3099,11 @@ impl DebugPanel {
         self.setting(file, line).map(|setting| setting.enabled)
     }
 
+    /// Whether the point of any exception is on, for tests.
+    pub fn any_exception_enabled(&self) -> bool {
+        self.any_exception.enabled
+    }
+
     /// Whether the breakpoint on the line suspends the program, for tests.
     pub fn breakpoint_suspends(&self, file: &Path, line: u32) -> Option<bool> {
         self.setting(file, line).map(|setting| setting.suspend)
@@ -3367,134 +3455,6 @@ impl DebugPanel {
         self.changed(cx);
     }
 
-    fn remove_function_breakpoint(&mut self, file: PathBuf, line: u32, cx: &mut Context<Self>) {
-        self.function_breakpoints
-            .retain(|breakpoint| breakpoint.file != file || breakpoint.line != line);
-        self.send_function_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    fn remove_data_breakpoint(&mut self, data_id: String, cx: &mut Context<Self>) {
-        self.data_breakpoints
-            .retain(|watch| watch.data_id != data_id);
-        self.send_data_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    fn set_function_enabled(&mut self, file: PathBuf, line: u32, on: bool, cx: &mut Context<Self>) {
-        if let Some(setting) = self
-            .function_breakpoints
-            .iter_mut()
-            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
-        {
-            setting.enabled = on;
-        }
-        self.send_function_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    fn set_function_condition(
-        &mut self,
-        file: PathBuf,
-        line: u32,
-        text: String,
-        cx: &mut Context<Self>,
-    ) {
-        let text = text.trim().to_owned();
-        if let Some(setting) = self
-            .function_breakpoints
-            .iter_mut()
-            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
-        {
-            setting.condition = (!text.is_empty()).then_some(text);
-        }
-        self.send_function_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    fn set_function_hit_condition(
-        &mut self,
-        file: PathBuf,
-        line: u32,
-        text: String,
-        cx: &mut Context<Self>,
-    ) {
-        let text = text.trim().to_owned();
-        if let Some(setting) = self
-            .function_breakpoints
-            .iter_mut()
-            .find(|breakpoint| breakpoint.file == file && breakpoint.line == line)
-        {
-            setting.hit_condition = (!text.is_empty()).then_some(text);
-        }
-        self.send_function_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    fn set_data_enabled(&mut self, data_id: String, on: bool, cx: &mut Context<Self>) {
-        if let Some(setting) = self
-            .data_breakpoints
-            .iter_mut()
-            .find(|watch| watch.data_id == data_id)
-        {
-            setting.enabled = on;
-        }
-        self.send_data_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    /// Cycles the access of a field watchpoint: write, read, both.
-    fn cycle_data_access(&mut self, data_id: String, cx: &mut Context<Self>) {
-        if let Some(setting) = self
-            .data_breakpoints
-            .iter_mut()
-            .find(|watch| watch.data_id == data_id)
-        {
-            match setting.access() {
-                DataAccessType::Write => {
-                    setting.write = false;
-                    setting.read = true;
-                }
-                DataAccessType::Read => {
-                    setting.write = true;
-                    setting.read = true;
-                }
-                DataAccessType::ReadWrite => {
-                    setting.write = true;
-                    setting.read = false;
-                }
-            }
-        }
-        self.send_data_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    fn set_data_condition(&mut self, data_id: String, text: String, cx: &mut Context<Self>) {
-        let text = text.trim().to_owned();
-        if let Some(setting) = self
-            .data_breakpoints
-            .iter_mut()
-            .find(|watch| watch.data_id == data_id)
-        {
-            setting.condition = (!text.is_empty()).then_some(text);
-        }
-        self.send_data_breakpoints(cx);
-        self.changed(cx);
-    }
-
-    fn set_data_hit_condition(&mut self, data_id: String, text: String, cx: &mut Context<Self>) {
-        let text = text.trim().to_owned();
-        if let Some(setting) = self
-            .data_breakpoints
-            .iter_mut()
-            .find(|watch| watch.data_id == data_id)
-        {
-            setting.hit_condition = (!text.is_empty()).then_some(text);
-        }
-        self.send_data_breakpoints(cx);
-        self.changed(cx);
-    }
-
     /// Drop Frame: the selected frame starts again from its first line.
     pub fn restart_frame(&mut self, cx: &mut Context<Self>) {
         if let Some(frame) = self.selected_frame().cloned() {
@@ -3554,22 +3514,6 @@ impl DebugPanel {
         }
     }
 
-    fn set_hit_condition(
-        &mut self,
-        file: PathBuf,
-        line: u32,
-        text: String,
-        cx: &mut Context<Self>,
-    ) {
-        let text = text.trim().to_owned();
-        if let Some(setting) = self.find(file, line) {
-            setting.hit_condition = (!text.is_empty()).then_some(text);
-            let spec = setting.spec();
-            self.send(Command::SetBreakpoint(spec), cx);
-            self.changed(cx);
-        }
-    }
-
     fn set_enabled(&mut self, file: PathBuf, line: u32, on: bool, cx: &mut Context<Self>) {
         if let Some(setting) = self.find(file, line) {
             setting.enabled = on;
@@ -3619,6 +3563,252 @@ impl DebugPanel {
             let spec = setting.spec();
             self.send(Command::SetBreakpoint(spec), cx);
             self.changed(cx);
+        }
+    }
+
+    /// The lines of the breakpoints the user turned off, for the gutter.
+    fn disabled_breakpoint_lines(&self, file: &Path) -> Vec<u32> {
+        self.breakpoints
+            .iter()
+            .filter(|breakpoint| breakpoint.file == file && !breakpoint.enabled)
+            .map(|breakpoint| breakpoint.line)
+            .collect()
+    }
+
+    /// Applies one property of a row of the Breakpoints window. The line, method and field
+    /// points reach the adapter at once; the exception points become the filter list.
+    fn edit_breakpoint_row(&mut self, row: &BreakpointRow, edit: RowEdit, cx: &mut Context<Self>) {
+        match row {
+            BreakpointRow::Line { file, line } => {
+                let Some(setting) = self.find(file.clone(), *line) else {
+                    return;
+                };
+                match edit {
+                    RowEdit::Enabled(on) => setting.enabled = on,
+                    RowEdit::Suspend(on) => setting.suspend = on,
+                    RowEdit::SuspendThread(on) => setting.suspend_thread = on,
+                    RowEdit::Condition(text) => setting.condition = none_if_empty(text),
+                    RowEdit::HitMessage(on) => setting.hit_message = on,
+                    RowEdit::LogExpression(text) => {
+                        setting.log_message = None;
+                        setting.log_expression = none_if_empty(text);
+                    }
+                    RowEdit::RemoveOnce(on) => setting.remove_once = on,
+                    RowEdit::HitCondition(text) => setting.hit_condition = none_if_empty(text),
+                    RowEdit::Caught(_) | RowEdit::Uncaught(_) => return,
+                }
+                let spec = setting.spec();
+                self.send(Command::SetBreakpoint(spec), cx);
+                self.changed(cx);
+            }
+            BreakpointRow::Function(index) => {
+                let Some(setting) = self.function_breakpoints.get_mut(*index) else {
+                    return;
+                };
+                match edit {
+                    RowEdit::Enabled(on) => setting.enabled = on,
+                    RowEdit::Condition(text) => setting.condition = none_if_empty(text),
+                    RowEdit::HitCondition(text) => setting.hit_condition = none_if_empty(text),
+                    _ => return,
+                }
+                self.send_function_breakpoints(cx);
+                self.changed(cx);
+            }
+            BreakpointRow::Data(data_id) => {
+                let Some(setting) = self
+                    .data_breakpoints
+                    .iter_mut()
+                    .find(|setting| &setting.data_id == data_id)
+                else {
+                    return;
+                };
+                match edit {
+                    RowEdit::Enabled(on) => setting.enabled = on,
+                    RowEdit::Condition(text) => setting.condition = none_if_empty(text),
+                    RowEdit::HitCondition(text) => setting.hit_condition = none_if_empty(text),
+                    _ => return,
+                }
+                self.send_data_breakpoints(cx);
+                self.changed(cx);
+            }
+            BreakpointRow::AnyException => {
+                apply_exception_edit(&mut self.any_exception, edit);
+                self.send_exception_filters(cx);
+            }
+            BreakpointRow::Exception(index) => {
+                let Some(setting) = self.exception_points.get_mut(*index) else {
+                    return;
+                };
+                apply_exception_edit(&mut setting.setting, edit);
+                self.send_exception_filters(cx);
+            }
+            BreakpointRow::Filter(filter) => {
+                let RowEdit::Enabled(on) = edit else {
+                    return;
+                };
+                self.set_filter_enabled(filter.clone(), on, cx);
+            }
+        }
+    }
+
+    /// Turns every point of a group on or off, as the flag of the group does.
+    fn set_group_enabled(&mut self, group: BreakpointGroup, on: bool, cx: &mut Context<Self>) {
+        match group {
+            BreakpointGroup::Line => {
+                for setting in &mut self.breakpoints {
+                    setting.enabled = on;
+                }
+                for spec in self.all_specs() {
+                    self.send(Command::SetBreakpoint(spec), cx);
+                }
+                self.changed(cx);
+            }
+            BreakpointGroup::Function => {
+                for setting in &mut self.function_breakpoints {
+                    setting.enabled = on;
+                }
+                self.send_function_breakpoints(cx);
+                self.changed(cx);
+            }
+            BreakpointGroup::Data => {
+                for setting in &mut self.data_breakpoints {
+                    setting.enabled = on;
+                }
+                self.send_data_breakpoints(cx);
+                self.changed(cx);
+            }
+            BreakpointGroup::Exception => {
+                self.any_exception.enabled = on;
+                for setting in &mut self.exception_points {
+                    setting.setting.enabled = on;
+                }
+                let extra: Vec<String> = self.enabled_filters.iter().cloned().collect();
+                for filter in extra {
+                    if on {
+                        self.enabled_filters.insert(filter);
+                    } else {
+                        self.enabled_filters.remove(&filter);
+                    }
+                }
+                self.send_exception_filters(cx);
+            }
+        }
+    }
+
+    fn group_enabled(&self, group: BreakpointGroup) -> bool {
+        match group {
+            BreakpointGroup::Line => {
+                !self.breakpoints.is_empty()
+                    && self.breakpoints.iter().all(|breakpoint| breakpoint.enabled)
+            }
+            BreakpointGroup::Function => {
+                !self.function_breakpoints.is_empty()
+                    && self
+                        .function_breakpoints
+                        .iter()
+                        .all(|breakpoint| breakpoint.enabled)
+            }
+            BreakpointGroup::Data => {
+                !self.data_breakpoints.is_empty()
+                    && self
+                        .data_breakpoints
+                        .iter()
+                        .all(|breakpoint| breakpoint.enabled)
+            }
+            BreakpointGroup::Exception => {
+                self.any_exception.enabled
+                    || self
+                        .exception_points
+                        .iter()
+                        .any(|point| point.setting.enabled)
+                    || !self.enabled_filters.is_empty()
+            }
+        }
+    }
+
+    /// A method breakpoint the user named in the Breakpoints window.
+    pub(crate) fn add_named_function_breakpoint(&mut self, name: String, cx: &mut Context<Self>) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        let (owner, method) = match name.split_once('#') {
+            Some((owner, method)) => (Some(owner.to_owned()), method.to_owned()),
+            None => (None, name),
+        };
+        self.function_breakpoints
+            .push(FunctionBreakpointSetting::new(
+                PathBuf::new(),
+                0,
+                owner,
+                method,
+            ));
+        self.send_function_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    /// A field watchpoint the user named in the Breakpoints window as `Owner#field`.
+    pub(crate) fn add_named_data_breakpoint(&mut self, name: String, cx: &mut Context<Self>) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        let setting = match name.split_once('#') {
+            Some((owner, field)) => DataBreakpointSetting::from_declaration(
+                PathBuf::new(),
+                0,
+                owner.to_owned(),
+                field.to_owned(),
+            ),
+            None => DataBreakpointSetting::from_variable(name.clone(), name),
+        };
+        if !self
+            .data_breakpoints
+            .iter()
+            .any(|watch| watch.data_id == setting.data_id)
+        {
+            self.data_breakpoints.push(setting);
+        }
+        self.send_data_breakpoints(cx);
+        self.changed(cx);
+    }
+
+    /// An exception breakpoint the user named by class.
+    pub(crate) fn add_named_exception_breakpoint(&mut self, class: String, cx: &mut Context<Self>) {
+        let class = class.trim().to_owned();
+        if class.is_empty() {
+            return;
+        }
+        self.exception_points
+            .push(ExceptionPointSetting::new(class));
+        self.send_exception_filters(cx);
+    }
+
+    fn remove_breakpoint_row(&mut self, row: &BreakpointRow, cx: &mut Context<Self>) {
+        match row {
+            BreakpointRow::Line { file, line } => {
+                self.remove_breakpoint(file.clone(), *line, cx);
+            }
+            BreakpointRow::Function(index) => {
+                if *index < self.function_breakpoints.len() {
+                    self.function_breakpoints.remove(*index);
+                    self.send_function_breakpoints(cx);
+                    self.changed(cx);
+                }
+            }
+            BreakpointRow::Data(data_id) => {
+                self.data_breakpoints
+                    .retain(|setting| &setting.data_id != data_id);
+                self.send_data_breakpoints(cx);
+                self.changed(cx);
+            }
+            BreakpointRow::AnyException | BreakpointRow::Filter(_) => {}
+            BreakpointRow::Exception(index) => {
+                if *index < self.exception_points.len() {
+                    self.exception_points.remove(*index);
+                    self.send_exception_filters(cx);
+                }
+            }
         }
     }
 
@@ -3692,13 +3882,31 @@ impl DebugPanel {
     }
 
     fn filter_list(&self) -> Vec<String> {
-        self.enabled_filters.iter().cloned().collect()
+        let mut filters = self.enabled_filters.clone();
+        if self.any_exception.enabled {
+            if self.any_exception.caught {
+                filters.insert("caught".to_owned());
+            }
+            if self.any_exception.uncaught {
+                filters.insert("uncaught".to_owned());
+            }
+        }
+        filters.into_iter().collect()
     }
 
-    fn toggle_filter(&mut self, filter: String, cx: &mut Context<Self>) {
-        if !self.enabled_filters.remove(&filter) {
+    /// Turns one of the filters of the adapter on or off.
+    fn set_filter_enabled(&mut self, filter: String, on: bool, cx: &mut Context<Self>) {
+        if on {
             self.enabled_filters.insert(filter);
+        } else {
+            self.enabled_filters.remove(&filter);
         }
+        self.send(Command::SetExceptionBreakpoints(self.filter_list()), cx);
+        self.save_state();
+        cx.notify();
+    }
+
+    fn send_exception_filters(&mut self, cx: &mut Context<Self>) {
         self.send(Command::SetExceptionBreakpoints(self.filter_list()), cx);
         self.save_state();
         cx.notify();
@@ -3739,7 +3947,9 @@ impl DebugPanel {
                 .collect(),
             function_breakpoints: self.function_breakpoints.clone(),
             data_breakpoints: self.data_breakpoints.clone(),
-            exception_filters: self.filter_list(),
+            exception_filters: self.enabled_filters.iter().cloned().collect(),
+            any_exception: self.any_exception.clone(),
+            exception_points: self.exception_points.clone(),
             inline_watches: self.inline_watches.clone(),
             muted: self.muted,
         };
@@ -3821,6 +4031,7 @@ impl DebugPanel {
             }
             self.finish_temporary(cx);
             self.finish_temporary_breakpoints(cx);
+            self.finish_remove_once(cx);
             self.finish_forced_step(cx);
         }
         if self.asking_targets
@@ -4565,6 +4776,34 @@ impl DebugPanel {
         self.changed(cx);
     }
 
+    /// Takes away the breakpoints the user marked as removed once hit, when the program
+    /// stopped on their line.
+    fn finish_remove_once(&mut self, cx: &mut Context<Self>) {
+        let Some(frame) = self.snapshot.frames.first() else {
+            return;
+        };
+        let Some(source) = frame.source.as_deref() else {
+            return;
+        };
+        let remove: Vec<(PathBuf, u32)> = self
+            .breakpoints
+            .iter()
+            .filter(|breakpoint| {
+                breakpoint.enabled
+                    && breakpoint.remove_once
+                    && breakpoint.file == source
+                    && breakpoint.line == frame.line
+            })
+            .map(|breakpoint| (breakpoint.file.clone(), breakpoint.line))
+            .collect();
+        if remove.is_empty() {
+            return;
+        }
+        for (file, line) in remove {
+            self.remove_breakpoint(file, line, cx);
+        }
+    }
+
     /// Gives the breakpoints Force Step Over turned off their settings back.
     fn finish_forced_step(&mut self, cx: &mut Context<Self>) {
         let Some(specs) = self.forced_step.take() else {
@@ -4805,12 +5044,35 @@ impl DebugPanel {
         let panel = cx.weak_entity();
         let workspace = self.workspace.clone();
         let handle = window.window_handle();
+        let selected = Some(initial_breakpoint_row(self));
         let view = cx.new(|cx| BreakpointsView {
-            panel,
+            panel: panel.clone(),
             workspace: workspace.clone(),
             focus: cx.focus_handle(),
-            scroll: ScrollHandle::new(),
+            scroll_tree: ScrollHandle::new(),
+            scroll_properties: ScrollHandle::new(),
+            selected,
+            loaded: None,
+            condition: TextField::default(),
+            log_expression: TextField::default(),
+            hit_condition: TextField::default(),
+            focus_field: None,
+            add_menu: false,
+            collapsed: BTreeSet::new(),
+            _panel: None,
         });
+        // A point the editor or an agent adds or takes away reaches the open window.
+        if let Some(panel) = panel.upgrade() {
+            let subscription = view.update(cx, |_, cx| {
+                cx.subscribe(
+                    &panel,
+                    |_: &mut BreakpointsView, _, _: &BreakpointsChanged, cx| {
+                        cx.notify();
+                    },
+                )
+            });
+            view.update(cx, |view, _| view._panel = Some(subscription));
+        }
         let focus = view.read(cx).focus.clone();
         // The key comes through the window while it is being updated: the overlay opens
         // after that update is over.
@@ -4911,139 +5173,6 @@ impl DebugPanel {
             .ok();
     }
 
-    fn ask_function_condition(
-        &mut self,
-        file: PathBuf,
-        line: u32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self
-            .function_breakpoints
-            .iter()
-            .find(|setting| setting.file == file && setting.line == line)
-            .and_then(|setting| setting.condition.clone())
-            .unwrap_or_default();
-        let panel = cx.weak_entity();
-        let submit = move |text: String, cx: &mut App| {
-            panel
-                .update(cx, |panel, cx| {
-                    panel.set_function_condition(file.clone(), line, text, cx)
-                })
-                .ok();
-        };
-        self.workspace
-            .update(cx, |workspace, cx| {
-                Prompt::show_with(
-                    "Method Breakpoint Condition",
-                    &current,
-                    submit,
-                    workspace,
-                    window,
-                    cx,
-                )
-            })
-            .ok();
-    }
-
-    fn ask_function_hit_condition(
-        &mut self,
-        file: PathBuf,
-        line: u32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self
-            .function_breakpoints
-            .iter()
-            .find(|setting| setting.file == file && setting.line == line)
-            .and_then(|setting| setting.hit_condition.clone())
-            .unwrap_or_default();
-        let panel = cx.weak_entity();
-        let submit = move |text: String, cx: &mut App| {
-            panel
-                .update(cx, |panel, cx| {
-                    panel.set_function_hit_condition(file.clone(), line, text, cx)
-                })
-                .ok();
-        };
-        self.workspace
-            .update(cx, |workspace, cx| {
-                Prompt::show_with(
-                    "Method Breakpoint Hit Count",
-                    &current,
-                    submit,
-                    workspace,
-                    window,
-                    cx,
-                )
-            })
-            .ok();
-    }
-
-    fn ask_data_condition(&mut self, data_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self
-            .data_breakpoints
-            .iter()
-            .find(|setting| setting.data_id == data_id)
-            .and_then(|setting| setting.condition.clone())
-            .unwrap_or_default();
-        let panel = cx.weak_entity();
-        let submit = move |text: String, cx: &mut App| {
-            panel
-                .update(cx, |panel, cx| {
-                    panel.set_data_condition(data_id.clone(), text, cx)
-                })
-                .ok();
-        };
-        self.workspace
-            .update(cx, |workspace, cx| {
-                Prompt::show_with(
-                    "Field Watchpoint Condition",
-                    &current,
-                    submit,
-                    workspace,
-                    window,
-                    cx,
-                )
-            })
-            .ok();
-    }
-
-    fn ask_data_hit_condition(
-        &mut self,
-        data_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self
-            .data_breakpoints
-            .iter()
-            .find(|setting| setting.data_id == data_id)
-            .and_then(|setting| setting.hit_condition.clone())
-            .unwrap_or_default();
-        let panel = cx.weak_entity();
-        let submit = move |text: String, cx: &mut App| {
-            panel
-                .update(cx, |panel, cx| {
-                    panel.set_data_hit_condition(data_id.clone(), text, cx)
-                })
-                .ok();
-        };
-        self.workspace
-            .update(cx, |workspace, cx| {
-                Prompt::show_with(
-                    "Field Watchpoint Hit Count",
-                    &current,
-                    submit,
-                    workspace,
-                    window,
-                    cx,
-                )
-            })
-            .ok();
-    }
-
     /// The state of the session for the right end of the toolbar. Nothing before the
     /// first session: the empty body says it in place.
     fn state_text(&self) -> Option<&str> {
@@ -5077,8 +5206,40 @@ impl DebugPanel {
                 .into_any_element()
         } else if matches!(self.snapshot.state, DebugState::Terminated) {
             empty_pane("debug-empty", "Finished", theme)
+        } else if let Some(name) = selected_configuration(cx) {
+            self.debug_idle_body(name, theme, cx)
         } else {
-            empty_pane("debug-empty", "Not started", theme)
+            let open = cx.listener(|this, _, window, cx| {
+                let workspace = this.workspace.clone();
+                window.defer(cx, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.choose_config(true, window, cx)
+                        })
+                        .ok();
+                });
+            });
+            div()
+                .debug_selector(|| "debug-empty".to_owned())
+                .flex()
+                .flex_col()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap(px(SPACE_S))
+                .text_size(px(TEXT_SMALL))
+                .text_color(theme.text_secondary)
+                .child("No debug sessions")
+                .child(
+                    div()
+                        .id("debug-empty-debug")
+                        .debug_selector(|| "debug-empty-debug".to_owned())
+                        .cursor_pointer()
+                        .text_color(theme.accent)
+                        .child("Debug…")
+                        .on_click(open),
+                )
+                .into_any_element()
         };
         div()
             .debug_selector(|| "debug-body".to_owned())
@@ -5087,6 +5248,69 @@ impl DebugPanel {
             .min_w_0()
             .min_h_0()
             .child(body)
+            .into_any_element()
+    }
+
+    /// The Debug window before a session, when a configuration is selected: the configuration
+    /// that Shift+F9 debugs, with the shortcut, and the link to the configurations.
+    fn debug_idle_body(&self, name: String, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let platform = keymap::platform();
+        let shortcut = workspace::window_key("workspace::Debug", platform)
+            .map(|keys| keymap::shortcut_label(keys, platform));
+        // The link runs what Shift+F9 runs, so both starts take the same path.
+        let debug = cx.listener(|this, _, window, cx| {
+            let workspace = this.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| workspace.debug_selected(window, cx))
+                    .ok();
+            });
+        });
+        let edit = cx.listener(|this, _, window, cx| {
+            let workspace = this.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.run_command("run.edit_configurations", window, cx)
+                    })
+                    .ok();
+            });
+        });
+        div()
+            .debug_selector(|| "debug-idle".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(px(SPACE_S))
+            .text_size(px(TEXT_SMALL))
+            .text_color(theme.text_secondary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_M))
+                    .child(
+                        div()
+                            .id("debug-idle-debug")
+                            .debug_selector(|| "debug-idle-debug".to_owned())
+                            .cursor_pointer()
+                            .text_color(theme.accent)
+                            .child(format!("Debug '{name}'"))
+                            .on_click(debug),
+                    )
+                    .children(shortcut.map(|keys| div().child(keys))),
+            )
+            .child(
+                div()
+                    .id("debug-idle-edit")
+                    .debug_selector(|| "debug-idle-edit".to_owned())
+                    .cursor_pointer()
+                    .text_color(theme.accent)
+                    .child("Edit Configurations…")
+                    .on_click(edit),
+            )
             .into_any_element()
     }
 
@@ -7539,6 +7763,16 @@ fn front_tab(
         .into_any_element()
 }
 
+/// The configuration the Run window selects, for the empty Debug window to name it.
+fn selected_configuration(cx: &App) -> Option<String> {
+    let panel = cx.try_global::<crate::script::ActiveRunPanel>()?.0.clone();
+    let state = panel.read(cx).state();
+    state
+        .selected
+        .and_then(|index| state.configs.get(index))
+        .map(|name| name.to_string())
+}
+
 /// One gray line in the middle of a part that has nothing to show.
 fn empty_pane(id: &'static str, text: &'static str, theme: &Theme) -> AnyElement {
     div()
@@ -8050,11 +8284,188 @@ impl Render for BreakpointPopup {
     }
 }
 
+/// A row of the tree of the Breakpoints window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BreakpointRow {
+    /// A breakpoint of a file and a line.
+    Line { file: PathBuf, line: u32 },
+    /// A method breakpoint, by its place in the list of the panel.
+    Function(usize),
+    /// A field watchpoint, by the id the adapter gave the field.
+    Data(String),
+    /// The point of any exception, which the window always lists.
+    AnyException,
+    /// A named exception breakpoint, by its place in the list of the panel.
+    Exception(usize),
+    /// A filter of the adapter.
+    Filter(String),
+}
+
+/// A group of the tree of the Breakpoints window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BreakpointGroup {
+    Line,
+    Function,
+    Data,
+    Exception,
+}
+
+/// A property of the selected row that is typed in a field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PropertyField {
+    Condition,
+    LogExpression,
+    HitCondition,
+}
+
+/// One property the user changed on the selected row.
+#[derive(Clone, Debug)]
+enum RowEdit {
+    Enabled(bool),
+    Suspend(bool),
+    SuspendThread(bool),
+    Condition(String),
+    HitMessage(bool),
+    LogExpression(String),
+    RemoveOnce(bool),
+    HitCondition(String),
+    Caught(bool),
+    Uncaught(bool),
+}
+
+/// The properties of a row, as the window draws them.
+#[derive(Default)]
+struct RowValues {
+    enabled: bool,
+    suspend: bool,
+    suspend_thread: bool,
+    hit_message: bool,
+    remove_once: bool,
+    caught: bool,
+    uncaught: bool,
+    condition: String,
+    log_expression: String,
+    hit_condition: String,
+}
+
+fn row_values(panel: &DebugPanel, row: &BreakpointRow) -> RowValues {
+    let line = |setting: &BreakpointSetting| RowValues {
+        enabled: setting.enabled,
+        suspend: setting.suspend,
+        suspend_thread: setting.suspend_thread,
+        hit_message: setting.hit_message,
+        remove_once: setting.remove_once,
+        condition: setting.condition.clone().unwrap_or_default(),
+        log_expression: setting
+            .log_expression
+            .clone()
+            .or_else(|| setting.log_message.clone())
+            .unwrap_or_default(),
+        hit_condition: setting.hit_condition.clone().unwrap_or_default(),
+        ..RowValues::default()
+    };
+    match row {
+        BreakpointRow::Line { file, line: number } => panel
+            .breakpoints
+            .iter()
+            .find(|setting| &setting.file == file && setting.line == *number)
+            .map(line)
+            .unwrap_or_default(),
+        BreakpointRow::Function(index) => panel
+            .function_breakpoints
+            .get(*index)
+            .map(|setting| RowValues {
+                enabled: setting.enabled,
+                condition: setting.condition.clone().unwrap_or_default(),
+                hit_condition: setting.hit_condition.clone().unwrap_or_default(),
+                ..RowValues::default()
+            })
+            .unwrap_or_default(),
+        BreakpointRow::Data(data_id) => panel
+            .data_breakpoints
+            .iter()
+            .find(|setting| &setting.data_id == data_id)
+            .map(|setting| RowValues {
+                enabled: setting.enabled,
+                condition: setting.condition.clone().unwrap_or_default(),
+                hit_condition: setting.hit_condition.clone().unwrap_or_default(),
+                ..RowValues::default()
+            })
+            .unwrap_or_default(),
+        BreakpointRow::AnyException => RowValues {
+            enabled: panel.any_exception.enabled,
+            caught: panel.any_exception.caught,
+            uncaught: panel.any_exception.uncaught,
+            ..RowValues::default()
+        },
+        BreakpointRow::Exception(index) => panel
+            .exception_points
+            .get(*index)
+            .map(|point| RowValues {
+                enabled: point.setting.enabled,
+                caught: point.setting.caught,
+                uncaught: point.setting.uncaught,
+                ..RowValues::default()
+            })
+            .unwrap_or_default(),
+        BreakpointRow::Filter(filter) => RowValues {
+            enabled: panel.enabled_filters.contains(filter),
+            ..RowValues::default()
+        },
+    }
+}
+
+fn row_exists(panel: &DebugPanel, row: &BreakpointRow) -> bool {
+    match row {
+        BreakpointRow::Line { file, line } => panel
+            .breakpoints
+            .iter()
+            .any(|setting| &setting.file == file && setting.line == *line),
+        BreakpointRow::Function(index) => *index < panel.function_breakpoints.len(),
+        BreakpointRow::Data(data_id) => panel
+            .data_breakpoints
+            .iter()
+            .any(|setting| &setting.data_id == data_id),
+        BreakpointRow::AnyException => true,
+        BreakpointRow::Exception(index) => *index < panel.exception_points.len(),
+        BreakpointRow::Filter(filter) => {
+            panel.enabled_filters.contains(filter)
+                || panel
+                    .snapshot
+                    .exception_filters
+                    .iter()
+                    .any(|item| &item.filter == filter)
+        }
+    }
+}
+
+fn initial_breakpoint_row(panel: &DebugPanel) -> BreakpointRow {
+    panel
+        .breakpoints
+        .first()
+        .map(|setting| BreakpointRow::Line {
+            file: setting.file.clone(),
+            line: setting.line,
+        })
+        .unwrap_or(BreakpointRow::AnyException)
+}
+
 struct BreakpointsView {
     panel: WeakEntity<DebugPanel>,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
-    scroll: ScrollHandle,
+    scroll_tree: ScrollHandle,
+    scroll_properties: ScrollHandle,
+    selected: Option<BreakpointRow>,
+    /// The row whose values the fields hold, so a repaint of the same row keeps them.
+    loaded: Option<BreakpointRow>,
+    condition: TextField,
+    log_expression: TextField,
+    hit_condition: TextField,
+    focus_field: Option<PropertyField>,
+    add_menu: bool,
+    collapsed: BTreeSet<BreakpointGroup>,
+    _panel: Option<Subscription>,
 }
 
 impl BreakpointsView {
@@ -8063,647 +8474,1182 @@ impl BreakpointsView {
             .update(cx, |workspace, cx| workspace.dismiss(window, cx))
             .ok();
     }
+
+    fn edit(&mut self, row: BreakpointRow, edit: RowEdit, cx: &mut Context<Self>) {
+        if let Some(panel) = self.panel.upgrade() {
+            panel.update(cx, |panel, cx| panel.edit_breakpoint_row(&row, edit, cx));
+        }
+        cx.notify();
+    }
+
+    fn load_fields(&mut self, cx: &mut Context<Self>) {
+        self.focus_field = None;
+        let Some(row) = self.selected.clone() else {
+            self.loaded = None;
+            return;
+        };
+        let values = self
+            .panel
+            .upgrade()
+            .map(|panel| row_values(panel.read(cx), &row))
+            .unwrap_or_default();
+        self.condition = TextField::from_text(values.condition);
+        self.log_expression = TextField::from_text(values.log_expression);
+        self.hit_condition = TextField::from_text(values.hit_condition);
+        self.loaded = Some(row);
+    }
+
+    fn commit_field(&mut self, field: PropertyField, cx: &mut Context<Self>) {
+        let Some(row) = self.selected.clone() else {
+            return;
+        };
+        let edit = match field {
+            PropertyField::Condition => RowEdit::Condition(self.condition.text.clone()),
+            PropertyField::LogExpression => {
+                RowEdit::LogExpression(self.log_expression.text.clone())
+            }
+            PropertyField::HitCondition => RowEdit::HitCondition(self.hit_condition.text.clone()),
+        };
+        self.edit(row, edit, cx);
+    }
+
+    /// The keys of the window: Escape closes it, and a property field takes the typing and
+    /// writes it into the point at once.
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" {
+            self.close(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(field) = self.focus_field {
+            let changed = match field {
+                PropertyField::Condition => self.condition.key_with_clipboard(event, false, cx),
+                PropertyField::LogExpression => {
+                    self.log_expression.key_with_clipboard(event, false, cx)
+                }
+                PropertyField::HitCondition => {
+                    self.hit_condition.key_with_clipboard(event, false, cx)
+                }
+            };
+            if changed {
+                self.commit_field(field, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if event.keystroke.key == "enter" {
+                self.commit_field(field, cx);
+                cx.stop_propagation();
+                return;
+            }
+            return;
+        }
+        if event.keystroke.key == "delete" {
+            self.remove_selected(cx);
+            cx.stop_propagation();
+        }
+    }
+
+    fn remove_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.selected.take() else {
+            return;
+        };
+        if let Some(panel) = self.panel.upgrade() {
+            panel.update(cx, |panel, cx| panel.remove_breakpoint_row(&row, cx));
+        }
+        self.loaded = None;
+        cx.notify();
+    }
+
+    /// Opens the file of a line breakpoint at its line and closes the window.
+    fn open_line(&mut self, file: PathBuf, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                navigation::go_to(
+                    workspace,
+                    file,
+                    Some(editor_view::Spot::Line {
+                        line: line.saturating_sub(1) as usize,
+                        column: 0,
+                    }),
+                    true,
+                    window,
+                    cx,
+                );
+                workspace.dismiss(window, cx);
+            })
+            .ok();
+    }
+
+    /// Asks for a name and adds the point the menu named.
+    fn ask_add(&mut self, kind: BreakpointGroup, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = self.panel.clone();
+        self.add_menu = false;
+        match kind {
+            BreakpointGroup::Exception => self.workspace.update(cx, |workspace, cx| {
+                Prompt::show_with(
+                    "Exception Breakpoint",
+                    "",
+                    move |text, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.add_named_exception_breakpoint(text, cx)
+                            })
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            }),
+            BreakpointGroup::Function => self.workspace.update(cx, |workspace, cx| {
+                Prompt::show_with(
+                    "Method Breakpoint",
+                    "",
+                    move |text, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.add_named_function_breakpoint(text, cx)
+                            })
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            }),
+            BreakpointGroup::Data => self.workspace.update(cx, |workspace, cx| {
+                Prompt::show_with(
+                    "Field Watchpoint",
+                    "",
+                    move |text, cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.add_named_data_breakpoint(text, cx))
+                            .ok();
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            }),
+            BreakpointGroup::Line => return,
+        }
+        .ok();
+    }
+
+    /// A row of a group: a flag that turns the group on or off, a chevron that folds it,
+    /// the icon of the kind and its name.
+    #[allow(clippy::too_many_arguments)]
+    fn group_row(
+        &self,
+        id: &'static str,
+        icon_name: &'static str,
+        label: &str,
+        on: bool,
+        open: bool,
+        group: BreakpointGroup,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel = self.panel.clone();
+        let flag = format!("{id}-flag");
+        let click_flag = flag.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .h(px(ROW_HEIGHT))
+            .pl(px(SPACE_M))
+            .pr(px(SPACE_S))
+            .rounded(px(ROW_RADIUS))
+            .child(
+                div()
+                    .id(SharedString::from(flag.clone()))
+                    .debug_selector(move || click_flag.clone())
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(checkbox(on, theme))
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        let on = panel
+                            .read_with(cx, |panel, _| panel.group_enabled(group))
+                            .unwrap_or(false);
+                        if let Some(panel) = panel.upgrade() {
+                            panel.update(cx, |panel, cx| panel.set_group_enabled(group, !on, cx));
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-name")))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed.remove(&group) {
+                            this.collapsed.insert(group);
+                        }
+                        cx.notify();
+                    }))
+                    .child(icon_sized(
+                        if open {
+                            "general/chevronDown"
+                        } else {
+                            "general/chevronRight"
+                        },
+                        TEXT_SMALL,
+                        theme,
+                    ))
+                    .child(icon_sized(icon_name, 14., theme))
+                    .child(div().text_color(theme.text).child(label.to_owned())),
+            )
+            .into_any_element()
+    }
+
+    /// A checkbox of the tree, on its own, with the row it belongs to.
+    fn tree_flag(
+        &self,
+        id: String,
+        on: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let selector = id.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .flex_none()
+            .cursor_pointer()
+            .child(checkbox(on, theme))
+            .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+            .into_any_element()
+    }
+
+    /// One property with a field for a line of text.
+    fn property_field(
+        &self,
+        which: PropertyField,
+        id: &'static str,
+        value: &TextField,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mouse = FieldMouse::new(cx, move |this| {
+            Some(match which {
+                PropertyField::Condition => &mut this.condition,
+                PropertyField::LogExpression => &mut this.log_expression,
+                PropertyField::HitCondition => &mut this.hit_condition,
+            })
+        })
+        .starting(cx, move |this, cx| {
+            if this.focus_field == Some(which) {
+                return false;
+            }
+            this.focus_field = Some(which);
+            cx.notify();
+            true
+        });
+        let text = value.text.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_M))
+            .gap(px(SPACE_XS))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(if self.focus_field == Some(which) {
+                theme.accent
+            } else {
+                theme.control_border
+            })
+            .bg(theme.popup_bg)
+            .text_size(px(CODE_SIZE))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .debug_selector(move || format!("breakpoint-condition-value-{text}")),
+            )
+            .children(text_field_children(
+                mouse,
+                value,
+                theme.text,
+                theme.text,
+                theme.selection,
+                theme.caret,
+                CODE_SIZE,
+                self.focus_field == Some(which),
+            ))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn property_check(
+        &self,
+        id: &'static str,
+        on: bool,
+        row: BreakpointRow,
+        edit: impl Fn(bool) -> RowEdit + 'static,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .child(checkbox(on, theme))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.edit(row.clone(), edit(!on), cx);
+            }))
+            .into_any_element()
+    }
+
+    fn property_row(label: &str, control: AnyElement, theme: &Theme) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_L))
+            .min_h(px(CONTROL_HEIGHT))
+            .child(
+                div()
+                    .w(px(150.))
+                    .flex_none()
+                    .text_color(theme.text_secondary)
+                    .child(label.to_owned()),
+            )
+            .child(div().flex().flex_1().min_w_0().child(control))
+            .into_any_element()
+    }
+
+    /// The properties of the selected row on the right of the tree.
+    fn properties(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.selected.clone() else {
+            return div().into_any_element();
+        };
+        let Some(panel) = self.panel.upgrade() else {
+            return div().into_any_element();
+        };
+        let values = row_values(panel.read(cx), &row);
+        let pass_count = panel.read_with(cx, |panel, _| {
+            panel.debugger.is_none() || panel.snapshot.capabilities.hit_condition
+        });
+        let mut children: Vec<AnyElement> = Vec::new();
+        match &row {
+            BreakpointRow::Line { .. } => {
+                children.push(Self::property_row(
+                    "Enabled",
+                    self.property_check(
+                        "breakpoint-dialog-enabled",
+                        values.enabled,
+                        row.clone(),
+                        RowEdit::Enabled,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Suspend",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_M))
+                        .child(self.property_check(
+                            "breakpoint-dialog-suspend",
+                            values.suspend,
+                            row.clone(),
+                            RowEdit::Suspend,
+                            theme,
+                            cx,
+                        ))
+                        .child(Self::radio(
+                            "breakpoint-dialog-suspend-all",
+                            "All",
+                            !values.suspend_thread,
+                            values.suspend,
+                            theme,
+                            cx.listener({
+                                let row = row.clone();
+                                move |this, _, _, cx| {
+                                    this.edit(row.clone(), RowEdit::SuspendThread(false), cx);
+                                }
+                            }),
+                        ))
+                        .child(Self::radio(
+                            "breakpoint-dialog-suspend-thread",
+                            "Thread",
+                            values.suspend_thread,
+                            values.suspend,
+                            theme,
+                            cx.listener({
+                                let row = row.clone();
+                                move |this, _, _, cx| {
+                                    this.edit(row.clone(), RowEdit::SuspendThread(true), cx);
+                                }
+                            }),
+                        ))
+                        .into_any_element(),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Condition",
+                    self.property_field(
+                        PropertyField::Condition,
+                        "breakpoint-dialog-condition",
+                        &self.condition,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Log message to console",
+                    self.property_check(
+                        "breakpoint-dialog-hit-message",
+                        values.hit_message,
+                        row.clone(),
+                        RowEdit::HitMessage,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Evaluate and log",
+                    self.property_field(
+                        PropertyField::LogExpression,
+                        "breakpoint-dialog-log-expression",
+                        &self.log_expression,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Remove once hit",
+                    self.property_check(
+                        "breakpoint-dialog-temporary",
+                        values.remove_once,
+                        row.clone(),
+                        RowEdit::RemoveOnce,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                if pass_count {
+                    children.push(Self::property_row(
+                        "Pass count",
+                        self.property_field(
+                            PropertyField::HitCondition,
+                            "breakpoint-dialog-hit-condition",
+                            &self.hit_condition,
+                            theme,
+                            cx,
+                        ),
+                        theme,
+                    ));
+                }
+            }
+            BreakpointRow::Function(_) | BreakpointRow::Data(_) => {
+                children.push(Self::property_row(
+                    "Enabled",
+                    self.property_check(
+                        "breakpoint-dialog-enabled",
+                        values.enabled,
+                        row.clone(),
+                        RowEdit::Enabled,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Condition",
+                    self.property_field(
+                        PropertyField::Condition,
+                        "breakpoint-dialog-condition",
+                        &self.condition,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                if pass_count {
+                    children.push(Self::property_row(
+                        "Pass count",
+                        self.property_field(
+                            PropertyField::HitCondition,
+                            "breakpoint-dialog-hit-condition",
+                            &self.hit_condition,
+                            theme,
+                            cx,
+                        ),
+                        theme,
+                    ));
+                }
+            }
+            BreakpointRow::AnyException | BreakpointRow::Exception(_) => {
+                children.push(Self::property_row(
+                    "Enabled",
+                    self.property_check(
+                        "breakpoint-dialog-enabled",
+                        values.enabled,
+                        row.clone(),
+                        RowEdit::Enabled,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Caught",
+                    self.property_check(
+                        "breakpoint-dialog-caught",
+                        values.caught,
+                        row.clone(),
+                        RowEdit::Caught,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+                children.push(Self::property_row(
+                    "Uncaught",
+                    self.property_check(
+                        "breakpoint-dialog-uncaught",
+                        values.uncaught,
+                        row.clone(),
+                        RowEdit::Uncaught,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+            }
+            BreakpointRow::Filter(_) => {
+                children.push(Self::property_row(
+                    "Enabled",
+                    self.property_check(
+                        "breakpoint-dialog-enabled",
+                        values.enabled,
+                        row.clone(),
+                        RowEdit::Enabled,
+                        theme,
+                        cx,
+                    ),
+                    theme,
+                ));
+            }
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_S))
+            .p(px(DIALOG_PADDING))
+            .children(children)
+            .into_any_element()
+    }
+
+    fn radio(
+        id: &'static str,
+        label: &str,
+        chosen: bool,
+        enabled: bool,
+        theme: &Theme,
+        click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .cursor_pointer()
+            .when(!enabled, |row| row.opacity(0.4))
+            .child(
+                div()
+                    .text_color(if chosen {
+                        theme.accent
+                    } else {
+                        theme.text_secondary
+                    })
+                    .child(if chosen { "●" } else { "○" }),
+            )
+            .child(div().text_color(theme.text).child(label.to_owned()))
+            .on_click(click)
+            .into_any_element()
+    }
+
+    /// The tree of the left column: the groups with their points.
+    fn tree(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(panel) = self.panel.upgrade() else {
+            return Vec::new();
+        };
+        let (
+            breakpoints,
+            function_breakpoints,
+            data_breakpoints,
+            any_exception,
+            exception_points,
+            exception_filters,
+            enabled_filters,
+            line_on,
+            function_on,
+            data_on,
+            exception_on,
+        ) = {
+            let panel = panel.read(cx);
+            (
+                panel.breakpoints.clone(),
+                panel.function_breakpoints.clone(),
+                panel.data_breakpoints.clone(),
+                panel.any_exception.clone(),
+                panel.exception_points.clone(),
+                panel.snapshot.exception_filters.clone(),
+                panel.enabled_filters.clone(),
+                panel.group_enabled(BreakpointGroup::Line),
+                panel.group_enabled(BreakpointGroup::Function),
+                panel.group_enabled(BreakpointGroup::Data),
+                panel.group_enabled(BreakpointGroup::Exception),
+            )
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let line_open = !self.collapsed.contains(&BreakpointGroup::Line);
+        if !breakpoints.is_empty() {
+            rows.push(self.group_row(
+                "breakpoints-group-line",
+                "debug/breakpoints",
+                "Line Breakpoints",
+                line_on,
+                line_open,
+                BreakpointGroup::Line,
+                theme,
+                cx,
+            ));
+            if line_open {
+                for (index, setting) in breakpoints.iter().enumerate() {
+                    let row = BreakpointRow::Line {
+                        file: setting.file.clone(),
+                        line: setting.line,
+                    };
+                    let selected = self.selected.as_ref() == Some(&row);
+                    let on = setting.enabled;
+                    let name = setting
+                        .file
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let label = if setting.owner == BreakpointOwner::Agent {
+                        format!("{name}:{} (agent)", setting.line)
+                    } else {
+                        format!("{name}:{}", setting.line)
+                    };
+                    let file = setting.file.clone();
+                    let line = setting.line;
+                    let click_file = file.clone();
+                    let selector = format!("breakpoints-line-row-{index}");
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!("breakpoints-line-{index}")))
+                            .debug_selector(move || selector.clone())
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .h(px(ROW_HEIGHT))
+                            .pl(px(SPACE_XL))
+                            .pr(px(SPACE_S))
+                            .rounded(px(ROW_RADIUS))
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(theme.selection))
+                            .child(self.tree_flag(
+                                format!("breakpoints-line-enabled-{index}"),
+                                on,
+                                theme,
+                                cx,
+                                {
+                                    let row = row.clone();
+                                    move |this, cx| {
+                                        this.edit(row.clone(), RowEdit::Enabled(!on), cx);
+                                    }
+                                },
+                            ))
+                            .child(icon_sized("debug/breakpoints", 14., theme))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_color(if on { theme.text } else { theme.text_disabled })
+                                    .child(label),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = Some(BreakpointRow::Line {
+                                    file: click_file.clone(),
+                                    line,
+                                });
+                                cx.notify();
+                            }))
+                            .on_double_click(cx.listener(move |this, _, window, cx| {
+                                this.open_line(file.clone(), line, window, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        let function_open = !self.collapsed.contains(&BreakpointGroup::Function);
+        if !function_breakpoints.is_empty() {
+            rows.push(self.group_row(
+                "breakpoints-group-function",
+                "debug/functionBreakpoint",
+                "Method Breakpoints",
+                function_on,
+                function_open,
+                BreakpointGroup::Function,
+                theme,
+                cx,
+            ));
+            if function_open {
+                for (index, setting) in function_breakpoints.iter().enumerate() {
+                    let row = BreakpointRow::Function(index);
+                    let selected = self.selected.as_ref() == Some(&row);
+                    let on = setting.enabled;
+                    let selector = format!("breakpoints-function-row-{index}");
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!("breakpoints-function-{index}")))
+                            .debug_selector(move || selector.clone())
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .h(px(ROW_HEIGHT))
+                            .pl(px(SPACE_XL))
+                            .pr(px(SPACE_S))
+                            .rounded(px(ROW_RADIUS))
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(theme.selection))
+                            .child(self.tree_flag(
+                                format!("breakpoints-function-enabled-{index}"),
+                                on,
+                                theme,
+                                cx,
+                                {
+                                    let row = row.clone();
+                                    move |this, cx| {
+                                        this.edit(row.clone(), RowEdit::Enabled(!on), cx);
+                                    }
+                                },
+                            ))
+                            .child(icon_sized("debug/functionBreakpoint", 14., theme))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_color(if on { theme.text } else { theme.text_disabled })
+                                    .child(setting.dap_name()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = Some(BreakpointRow::Function(index));
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        let data_open = !self.collapsed.contains(&BreakpointGroup::Data);
+        if !data_breakpoints.is_empty() {
+            rows.push(self.group_row(
+                "breakpoints-group-data",
+                "debug/fieldWatchpoint",
+                "Field Watchpoints",
+                data_on,
+                data_open,
+                BreakpointGroup::Data,
+                theme,
+                cx,
+            ));
+            if data_open {
+                for (index, setting) in data_breakpoints.iter().enumerate() {
+                    let row = BreakpointRow::Data(setting.data_id.clone());
+                    let selected = self.selected.as_ref() == Some(&row);
+                    let on = setting.enabled;
+                    let data_id = setting.data_id.clone();
+                    let selector = format!("breakpoints-data-row-{index}");
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!("breakpoints-data-{index}")))
+                            .debug_selector(move || selector.clone())
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_S))
+                            .h(px(ROW_HEIGHT))
+                            .pl(px(SPACE_XL))
+                            .pr(px(SPACE_S))
+                            .rounded(px(ROW_RADIUS))
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(theme.selection))
+                            .child(self.tree_flag(
+                                format!("breakpoints-data-enabled-{index}"),
+                                on,
+                                theme,
+                                cx,
+                                {
+                                    let row = row.clone();
+                                    move |this, cx| {
+                                        this.edit(row.clone(), RowEdit::Enabled(!on), cx);
+                                    }
+                                },
+                            ))
+                            .child(icon_sized("debug/fieldWatchpoint", 14., theme))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_color(if on { theme.text } else { theme.text_disabled })
+                                    .child(data_id.clone()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = Some(BreakpointRow::Data(data_id.clone()));
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        let exception_open = !self.collapsed.contains(&BreakpointGroup::Exception);
+        rows.push(self.group_row(
+            "breakpoints-group-exception",
+            "status/error",
+            "Exception Breakpoints",
+            exception_on,
+            exception_open,
+            BreakpointGroup::Exception,
+            theme,
+            cx,
+        ));
+        if exception_open {
+            let row = BreakpointRow::AnyException;
+            let selected = self.selected.as_ref() == Some(&row);
+            let on = any_exception.enabled;
+            rows.push(
+                div()
+                    .id("breakpoints-exception-any")
+                    .debug_selector(|| "breakpoints-exception-any".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .h(px(ROW_HEIGHT))
+                    .pl(px(SPACE_XL))
+                    .pr(px(SPACE_S))
+                    .rounded(px(ROW_RADIUS))
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(theme.selection))
+                    .child(self.tree_flag(
+                        "breakpoints-exception-any-enabled".to_owned(),
+                        on,
+                        theme,
+                        cx,
+                        {
+                            let row = row.clone();
+                            move |this, cx| {
+                                this.edit(row.clone(), RowEdit::Enabled(!on), cx);
+                            }
+                        },
+                    ))
+                    .child(icon_sized("status/error", 14., theme))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(if on { theme.text } else { theme.text_disabled })
+                            .child("Any exception"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(BreakpointRow::AnyException);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            for (index, point) in exception_points.iter().enumerate() {
+                let row = BreakpointRow::Exception(index);
+                let selected = self.selected.as_ref() == Some(&row);
+                let on = point.setting.enabled;
+                let selector = format!("breakpoints-exception-row-{index}");
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("breakpoints-exception-{index}")))
+                        .debug_selector(move || selector.clone())
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .h(px(ROW_HEIGHT))
+                        .pl(px(SPACE_XL))
+                        .pr(px(SPACE_S))
+                        .rounded(px(ROW_RADIUS))
+                        .cursor_pointer()
+                        .when(selected, |row| row.bg(theme.selection))
+                        .child(self.tree_flag(
+                            format!("breakpoints-exception-enabled-{index}"),
+                            on,
+                            theme,
+                            cx,
+                            {
+                                let row = row.clone();
+                                move |this, cx| {
+                                    this.edit(row.clone(), RowEdit::Enabled(!on), cx);
+                                }
+                            },
+                        ))
+                        .child(icon_sized("status/error", 14., theme))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_color(if on { theme.text } else { theme.text_disabled })
+                                .child(point.class.clone()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected = Some(BreakpointRow::Exception(index));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            for filter in &exception_filters {
+                if filter.filter == "caught" || filter.filter == "uncaught" {
+                    continue;
+                }
+                let row = BreakpointRow::Filter(filter.filter.clone());
+                let selected = self.selected.as_ref() == Some(&row);
+                let on = enabled_filters.contains(&filter.filter);
+                let id = filter.filter.clone();
+                let label = filter.label.clone();
+                let selector = format!("breakpoints-filter-{id}");
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("breakpoints-filter-{id}")))
+                        .debug_selector(move || selector.clone())
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_S))
+                        .h(px(ROW_HEIGHT))
+                        .pl(px(SPACE_XL))
+                        .pr(px(SPACE_S))
+                        .rounded(px(ROW_RADIUS))
+                        .cursor_pointer()
+                        .when(selected, |row| row.bg(theme.selection))
+                        .child(self.tree_flag(
+                            format!("breakpoints-filter-enabled-{id}"),
+                            on,
+                            theme,
+                            cx,
+                            {
+                                let row = row.clone();
+                                move |this, cx| {
+                                    this.edit(row.clone(), RowEdit::Enabled(!on), cx);
+                                }
+                            },
+                        ))
+                        .child(icon_sized("status/error", 14., theme))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_color(if on { theme.text } else { theme.text_disabled })
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected = Some(BreakpointRow::Filter(id.clone()));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
+    }
+
+    fn add_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (method_supported, field_supported) =
+            self.panel.upgrade().map_or((true, true), |panel| {
+                let panel = panel.read(cx);
+                (
+                    panel.debugger.is_none() || panel.snapshot.capabilities.function_breakpoints,
+                    panel.debugger.is_none() || panel.snapshot.capabilities.data_breakpoints,
+                )
+            });
+        let mut menu = select_menu(theme).child(
+            select_option(
+                "breakpoints-add-exception",
+                "Exception Breakpoint\u{2026}",
+                false,
+                false,
+                theme,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.ask_add(BreakpointGroup::Exception, window, cx);
+            })),
+        );
+        if method_supported {
+            menu = menu.child(
+                select_option(
+                    "breakpoints-add-method",
+                    "Method Breakpoint\u{2026}",
+                    false,
+                    false,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.ask_add(BreakpointGroup::Function, window, cx);
+                })),
+            );
+        }
+        if field_supported {
+            menu = menu.child(
+                select_option(
+                    "breakpoints-add-field",
+                    "Field Watchpoint\u{2026}",
+                    false,
+                    false,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.ask_add(BreakpointGroup::Data, window, cx);
+                })),
+            );
+        }
+        menu.into_any_element()
+    }
 }
 
 impl Render for BreakpointsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        let panel = self.panel.upgrade();
-        let settings = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).breakpoints.clone())
-            .unwrap_or_default();
-        let answers = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).snapshot.breakpoints.clone())
-            .unwrap_or_default();
-        let function_settings = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).function_breakpoints.clone())
-            .unwrap_or_default();
-        let data_settings = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).data_breakpoints.clone())
-            .unwrap_or_default();
-        let function_answers = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).snapshot.function_breakpoints.clone())
-            .unwrap_or_default();
-        let data_answers = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).snapshot.data_breakpoints.clone())
-            .unwrap_or_default();
-        let filters = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).snapshot.exception_filters.clone())
-            .unwrap_or_default();
-        let enabled_filters = panel
-            .as_ref()
-            .map(|panel| panel.read(cx).enabled_filters.clone())
-            .unwrap_or_default();
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (index, setting) in settings.iter().enumerate() {
-            let answer = answers
-                .iter()
-                .find(|answer| answer.file == setting.file && answer.line == setting.line);
-            let message = answer.and_then(|answer| answer.message.clone());
-            let verified = answer.is_none_or(|answer| answer.verified);
-            let name = setting
-                .file
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let condition = setting.condition.clone().unwrap_or_default();
-            let hit = setting.hit_condition.clone().unwrap_or_default();
-            let on = setting.enabled;
-            let suspend = setting.suspend;
-            let hit_message = setting.hit_message;
-            let log_expression = setting
-                .log_expression
-                .clone()
-                .or_else(|| setting.log_message.clone())
-                .unwrap_or_default();
-            let line = setting.line;
-            let from_agent = setting.owner == BreakpointOwner::Agent;
-            let enable_file = setting.file.clone();
-            let condition_file = setting.file.clone();
-            let hit_file = setting.file.clone();
-            let suspend_file = setting.file.clone();
-            let message_file = setting.file.clone();
-            let log_file = setting.file.clone();
-            let remove_file = setting.file.clone();
-            let row = div()
-                .id(SharedString::from(format!(
-                    "dialog-breakpoint-{}-{line}",
-                    setting.file.display()
-                )))
-                .debug_selector(move || format!("debug-breakpoint-row-{index}"))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .h(px(ROW_HEIGHT))
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-enabled-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .w(px(14.))
-                        .cursor_pointer()
-                        .child(if on { "☑" } else { "☐" })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.set_enabled(enable_file.clone(), line, !on, cx)
-                                });
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .w(px(210.))
-                        .truncate()
-                        .text_color(if on { theme.text } else { theme.text_disabled })
-                        .child(if from_agent {
-                            format!("{name}:{line} (agent)")
-                        } else {
-                            format!("{name}:{line}")
-                        }),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-condition-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .debug_selector(|| "breakpoint-dialog-condition".to_owned())
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if condition.is_empty() {
-                            "if: <none>".to_owned()
-                        } else {
-                            format!("if: {condition}")
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let file = condition_file.clone();
-                            let panel = this.panel.clone();
-                            this.workspace
-                                .update(cx, |workspace, cx| {
-                                    Prompt::show_with(
-                                        "Breakpoint Condition",
-                                        &condition,
-                                        move |text, cx| {
-                                            panel
-                                                .update(cx, |panel, cx| {
-                                                    panel.set_condition(
-                                                        file.clone(),
-                                                        line,
-                                                        text,
-                                                        cx,
-                                                    )
-                                                })
-                                                .ok();
-                                        },
-                                        workspace,
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .ok();
-                        })),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-hit-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .w(px(110.))
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if hit.is_empty() {
-                            "hit: <any>".to_owned()
-                        } else {
-                            format!("hit: {hit}")
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let file = hit_file.clone();
-                            let panel = this.panel.clone();
-                            let hit = hit.clone();
-                            this.workspace
-                                .update(cx, |workspace, cx| {
-                                    Prompt::show_with(
-                                        "Breakpoint Hit Count",
-                                        &hit,
-                                        move |text, cx| {
-                                            panel
-                                                .update(cx, |panel, cx| {
-                                                    panel.set_hit_condition(
-                                                        file.clone(),
-                                                        line,
-                                                        text,
-                                                        cx,
-                                                    )
-                                                })
-                                                .ok();
-                                        },
-                                        workspace,
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .ok();
-                        })),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-suspend-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .debug_selector(|| "breakpoint-dialog-suspend".to_owned())
-                        .w(px(14.))
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if suspend {
-                            "☑ suspend"
-                        } else {
-                            "☐ suspend"
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.set_suspend(suspend_file.clone(), line, !suspend, cx)
-                                });
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-hit-message-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .debug_selector(|| "breakpoint-dialog-hit-message".to_owned())
-                        .w(px(48.))
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if hit_message { "☑ msg" } else { "☐ msg" })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.set_hit_message(
-                                        message_file.clone(),
-                                        line,
-                                        !hit_message,
-                                        cx,
-                                    )
-                                });
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-log-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .debug_selector(|| "breakpoint-dialog-log-expression".to_owned())
-                        .w(px(100.))
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if log_expression.is_empty() {
-                            "log: <none>".to_owned()
-                        } else {
-                            format!("log: {log_expression}")
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let file = log_file.clone();
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.ask_log_expression(file, line, window, cx)
-                                });
-                            }
-                        })),
-                )
-                .child(
-                    icon_button(
-                        SharedString::from(format!(
-                            "dialog-remove-{}-{line}",
-                            setting.file.display()
-                        )),
-                        "general/closeSmall",
-                        "Remove Breakpoint",
-                        None,
-                        &theme,
-                    )
-                    .size(px(20.))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(panel) = this.panel.upgrade() {
-                            panel.update(cx, |panel, cx| {
-                                panel.remove_breakpoint(remove_file.clone(), line, cx)
-                            });
-                        }
-                        cx.notify();
-                    })),
-                );
-            let row = if !verified && on {
-                row.child(
-                    div()
-                        .text_color(theme.warning_mark)
-                        .child(message.unwrap_or_else(|| "not accepted".into())),
-                )
-            } else {
-                row
-            };
-            rows.push(row.into_any_element());
+        if let Some(panel) = self.panel.upgrade() {
+            let row = self.selected.clone();
+            let valid = row
+                .as_ref()
+                .is_some_and(|row| row_exists(panel.read(cx), row));
+            if !valid {
+                self.selected = Some(initial_breakpoint_row(panel.read(cx)));
+            }
         }
-        rows.push(section("Method breakpoints", &theme));
-        for (index, setting) in function_settings.iter().enumerate() {
-            let on = setting.enabled;
-            let file = setting.file.clone();
-            let line = setting.line;
-            let enabled_file = file.clone();
-            let condition_file = file.clone();
-            let hit_file = file.clone();
-            let remove_file = file.clone();
-            let condition = setting.condition.clone().unwrap_or_default();
-            let hit = setting.hit_condition.clone().unwrap_or_default();
-            let answer = function_answers.get(index);
-            let message = answer.and_then(|answer| answer.message.clone());
-            let verified = answer.is_none_or(|answer| answer.verified);
-            let row = div()
-                .id(SharedString::from(format!(
-                    "dialog-function-{}-{line}",
-                    setting.file.display()
-                )))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .py(px(SPACE_S))
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-function-enabled-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .w(px(14.))
-                        .cursor_pointer()
-                        .child(if on { "☑" } else { "☐" })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.set_function_enabled(enabled_file.clone(), line, !on, cx)
-                                });
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(icon_sized("nodes/method", 14., &theme))
-                .child(
-                    div()
-                        .w(px(210.))
-                        .truncate()
-                        .text_color(if on { theme.text } else { theme.text_disabled })
-                        .child(setting.dap_name()),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-function-condition-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if condition.is_empty() {
-                            "if: <none>".to_owned()
-                        } else {
-                            format!("if: {condition}")
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let file = condition_file.clone();
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.ask_function_condition(file, line, window, cx)
-                                });
-                            }
-                        })),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-function-hit-{}-{line}",
-                            setting.file.display()
-                        )))
-                        .w(px(110.))
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if hit.is_empty() {
-                            "hit: <any>".to_owned()
-                        } else {
-                            format!("hit: {hit}")
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let file = hit_file.clone();
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.ask_function_hit_condition(file, line, window, cx)
-                                });
-                            }
-                        })),
-                )
-                .child(
-                    icon_button(
-                        SharedString::from(format!(
-                            "dialog-function-remove-{}-{line}",
-                            setting.file.display()
-                        )),
-                        "general/closeSmall",
-                        "Remove Method Breakpoint",
-                        None,
-                        &theme,
-                    )
-                    .size(px(20.))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(panel) = this.panel.upgrade() {
-                            panel.update(cx, |panel, cx| {
-                                panel.remove_function_breakpoint(remove_file.clone(), line, cx)
-                            });
-                        }
-                        cx.notify();
-                    })),
-                );
-            rows.push(if !verified && on {
-                row.child(
-                    div()
-                        .text_color(theme.warning_mark)
-                        .child(message.unwrap_or_else(|| "not accepted".into())),
-                )
-                .into_any_element()
-            } else {
-                row.into_any_element()
-            });
+        if self.loaded != self.selected {
+            self.load_fields(cx);
         }
-        rows.push(section("Field watchpoints", &theme));
-        for (index, setting) in data_settings.iter().enumerate() {
-            let on = setting.enabled;
-            let data_id = setting.data_id.clone();
-            let enabled_id = data_id.clone();
-            let condition_id = data_id.clone();
-            let hit_id = data_id.clone();
-            let access_id = data_id.clone();
-            let remove_id = data_id.clone();
-            let condition = setting.condition.clone().unwrap_or_default();
-            let hit = setting.hit_condition.clone().unwrap_or_default();
-            let answer = data_answers.get(index);
-            let message = answer.and_then(|answer| answer.message.clone());
-            let verified = answer.is_none_or(|answer| answer.verified);
-            let row = div()
-                .id(SharedString::from(format!("dialog-watch-{data_id}")))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .py(px(SPACE_S))
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-watch-enabled-{data_id}"
-                        )))
-                        .w(px(14.))
-                        .cursor_pointer()
-                        .child(if on { "☑" } else { "☐" })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.set_data_enabled(enabled_id.clone(), !on, cx)
-                                });
-                            }
-                            cx.notify();
-                        })),
+        let rows = self.tree(&theme, cx);
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .pl(px(SPACE_M))
+            .pr(px(SPACE_S))
+            .h(px(CONTROL_HEIGHT))
+            .flex_none()
+            .child(
+                icon_button(
+                    "breakpoints-add",
+                    "general/add",
+                    "Add Breakpoint",
+                    None,
+                    &theme,
                 )
-                .child(icon_sized("nodes/field", 14., &theme))
-                .child(
-                    div()
-                        .w(px(180.))
-                        .truncate()
-                        .text_color(if on { theme.text } else { theme.text_disabled })
-                        .child(data_id.clone()),
+                .debug_selector(|| "breakpoints-add".to_owned())
+                .size(px(20.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.add_menu = !this.add_menu;
+                    cx.notify();
+                })),
+            )
+            .child(
+                icon_button(
+                    "breakpoints-remove",
+                    "general/minus",
+                    "Remove Breakpoint",
+                    None,
+                    &theme,
                 )
-                .child(
-                    div()
-                        .id(SharedString::from(format!("dialog-watch-access-{data_id}")))
-                        .w(px(110.))
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(format!("on: {}", setting.access().label()))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.cycle_data_access(access_id.clone(), cx)
-                                });
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "dialog-watch-condition-{data_id}"
-                        )))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if condition.is_empty() {
-                            "if: <none>".to_owned()
-                        } else {
-                            format!("if: {condition}")
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let id = condition_id.clone();
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.ask_data_condition(id, window, cx)
-                                });
-                            }
-                        })),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!("dialog-watch-hit-{data_id}")))
-                        .w(px(90.))
-                        .truncate()
-                        .cursor_pointer()
-                        .text_color(theme.text_secondary)
-                        .child(if hit.is_empty() {
-                            "hit: <any>".to_owned()
-                        } else {
-                            format!("hit: {hit}")
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let id = hit_id.clone();
-                            if let Some(panel) = this.panel.upgrade() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.ask_data_hit_condition(id, window, cx)
-                                });
-                            }
-                        })),
-                )
-                .child(
-                    icon_button(
-                        SharedString::from(format!("dialog-watch-remove-{data_id}")),
-                        "general/closeSmall",
-                        "Remove Field Watchpoint",
-                        None,
-                        &theme,
-                    )
-                    .size(px(20.))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(panel) = this.panel.upgrade() {
-                            panel.update(cx, |panel, cx| {
-                                panel.remove_data_breakpoint(remove_id.clone(), cx)
-                            });
-                        }
-                        cx.notify();
-                    })),
-                );
-            rows.push(if !verified && on {
-                row.child(
-                    div()
-                        .text_color(theme.warning_mark)
-                        .child(message.unwrap_or_else(|| "not accepted".into())),
-                )
-                .into_any_element()
-            } else {
-                row.into_any_element()
-            });
-        }
-        rows.push(section("Exception breakpoints", &theme));
-        if filters.is_empty() {
-            rows.push(
-                div()
-                    .px(px(4.))
-                    .pb(px(4.))
-                    .text_color(theme.text_secondary)
-                    .child("The adapter lists them when a session starts")
-                    .into_any_element(),
-            );
-        }
-        for filter in &filters {
-            let on = enabled_filters.contains(&filter.filter);
-            let id = filter.filter.clone();
-            let label = filter.label.clone();
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("dialog-filter-{id}")))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .py(px(SPACE_S))
-                    .cursor_pointer()
-                    .child(if on { "☑" } else { "☐" })
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(panel) = this.panel.upgrade() {
-                            panel.update(cx, |panel, cx| panel.toggle_filter(id.clone(), cx));
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
-        let shell = surface(&theme)
-            .id("breakpoints-dialog")
-            .debug_selector(|| "breakpoints-dialog".to_owned())
-            .track_focus(&self.focus)
-            .text_color(theme.text)
-            .text_size(px(UI_SIZE))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                // Enter presses Close, the primary button, as Escape does.
-                if matches!(event.keystroke.key.as_str(), "escape" | "enter") {
-                    this.close(window, cx);
-                    cx.stop_propagation();
-                }
-            }));
+                .debug_selector(|| "breakpoints-remove".to_owned())
+                .size(px(20.))
+                .on_click(cx.listener(|this, _, _, cx| this.remove_selected(cx))),
+            )
+            .child(div().flex_1());
         let list = scrollable(
-            "breakpoints-dialog",
-            &self.scroll,
+            "breakpoints-tree",
+            &self.scroll_tree,
             div()
-                .id("breakpoints-list")
+                .id("breakpoints-tree")
                 .flex()
                 .flex_col()
-                .max_h(px(640.))
+                .flex_1()
+                .min_h_0()
                 .overflow_y_scroll()
-                .track_scroll(&self.scroll)
-                .p(px(DIALOG_PADDING))
-                .gap(px(SPACE_M))
+                .track_scroll(&self.scroll_tree)
+                .p(px(SPACE_S))
                 .children(rows),
             &theme,
             window,
             cx,
         );
-        // Close is the one button of the window: it stands in the bottom row, under the list.
-        let close_row = DialogButtons::new()
+        let mut left = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(340.))
+            .h_full()
+            .min_h_0()
+            .child(header);
+        if self.add_menu {
+            left = left.child(div().px(px(SPACE_M)).child(self.add_menu(&theme, cx)));
+        }
+        left = left.child(list.flex_1());
+        let properties = scrollable(
+            "breakpoints-properties",
+            &self.scroll_properties,
+            div()
+                .id("breakpoints-properties")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_properties)
+                .child(self.properties(&theme, cx)),
+            &theme,
+            window,
+            cx,
+        );
+        let body = div()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(left)
+            .child(div().w(px(1.)).flex_none().h_full().bg(theme.border))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(properties.flex_1()),
+            );
+        let done = DialogButtons::new()
             .primary(
                 dialog_button(
-                    "breakpoints-close",
-                    "breakpoints-close".to_owned(),
-                    "Close",
+                    "breakpoints-done",
+                    "breakpoints-done".to_owned(),
+                    "Done",
                     true,
                     true,
                     &theme,
@@ -8716,17 +9662,27 @@ impl Render for BreakpointsView {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(list)
+            .child(body)
             .child(
                 div()
+                    .flex_none()
                     .px(px(DIALOG_PADDING))
-                    .pb(px(DIALOG_PADDING))
-                    .child(close_row),
+                    .py(px(SPACE_M))
+                    .child(done),
+            );
+        let shell = surface(&theme)
+            .id("breakpoints-dialog")
+            .debug_selector(|| "breakpoints-dialog".to_owned())
+            .track_focus(&self.focus)
+            .text_color(theme.text)
+            .text_size(px(UI_SIZE))
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, window, cx| this.key(event, window, cx)),
             );
         let viewport = window.viewport_size();
-        let width = px(760.);
+        let width = px(820.);
         let left = (viewport.width - width) / 2.;
-        let top = viewport.height * 0.15;
+        let top = viewport.height * 0.12;
         let close = cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx));
         dialog_window(
             DialogSpec {
@@ -8737,9 +9693,9 @@ impl Render for BreakpointsView {
                     left: f32::from(left),
                     top: f32::from(top),
                     width: f32::from(width),
-                    height: None,
+                    height: Some(420.),
                 },
-                min: (480., 240.),
+                min: (620., 320.),
             },
             shell,
             window,
@@ -8749,7 +9705,6 @@ impl Render for BreakpointsView {
         )
     }
 }
-
 /// A path of a value as the language writes it, such as `items[0].name`.
 fn expression_of(path: &[String]) -> String {
     let mut text = String::new();
@@ -8902,12 +9857,23 @@ pub(crate) fn refresh_breakpoints(
         .map(|line| line - 1)
         .collect();
     view.set_breakpoints(lines.clone(), cx);
-    // A muted list is grey in the gutter, as the button of the Debug toolbar greys it.
-    let disabled: Vec<u32> = if panel.read(cx).muted() {
-        lines
+    // A muted list is grey in the gutter, as the button of the Debug toolbar greys it;
+    // a point the user turned off is grey too and keeps its place.
+    let mut disabled: Vec<u32> = if panel.read(cx).muted() {
+        lines.clone()
     } else {
         Vec::new()
     };
+    disabled.extend(
+        panel
+            .read(cx)
+            .disabled_breakpoint_lines(view.path())
+            .into_iter()
+            .filter(|line| *line > 0)
+            .map(|line| line - 1),
+    );
+    disabled.sort_unstable();
+    disabled.dedup();
     view.set_disabled_breakpoints(disabled, cx);
     let muted = panel.read(cx).non_suspending_breakpoint_lines(view.path());
     let muted: Vec<u32> = muted
@@ -9149,6 +10115,8 @@ mod tests {
                 breakpoints: Vec::new(),
                 function_breakpoints: Vec::new(),
                 data_breakpoints: Vec::new(),
+                any_exception: super::ExceptionSetting::default(),
+                exception_points: Vec::new(),
                 enabled_filters: BTreeSet::new(),
                 watch: Vec::new(),
                 inline_watches: Vec::new(),
@@ -9227,6 +10195,8 @@ mod tests {
                 "value".into(),
             )],
             exception_filters: vec!["uncaught".into()],
+            any_exception: super::ExceptionSetting::default(),
+            exception_points: Vec::new(),
             inline_watches: Vec::new(),
             muted: false,
         };

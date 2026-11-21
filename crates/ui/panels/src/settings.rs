@@ -21,7 +21,13 @@ use crate::settings_file_types::{FileTypesPage, IGNORED_FIELD};
 use crate::settings_keymap::KeymapPage;
 use crate::settings_templates::TemplateSection;
 
-const WIDTH: f32 = 800.;
+/// The share of the window the Settings window takes when it first opens: about 70% of its
+/// width and 75% of its height, kept between [`FIRST_MIN`] and [`FIRST_MAX`]. A size the user
+/// has set stays, as the dialog frame keeps it.
+const WIDTH_SHARE: f32 = 0.7;
+const HEIGHT_SHARE: f32 = 0.75;
+const FIRST_MIN: (f32, f32) = (900., 640.);
+const FIRST_MAX: (f32, f32) = (1400., 1000.);
 const MIN_WIDTH: f32 = 640.;
 const MIN_HEIGHT: f32 = 420.;
 /// The narrowest and the widest the tree of pages can be made by its divider.
@@ -169,6 +175,17 @@ pub(crate) fn mcp_home_folder(cx: &App) -> PathBuf {
     mcp_discovery::home_folder()
 }
 
+/// The status a client row shows, as a test reads it from the drawn frame.
+#[cfg(test)]
+fn mcp_status_probe(name: String, status: &str) -> AnyElement {
+    bounds_probe(name, Some(SharedString::from(status.to_owned())))
+}
+
+#[cfg(not(test))]
+fn mcp_status_probe(_name: String, _status: &str) -> AnyElement {
+    div().into_any_element()
+}
+
 /// The address and the token of the MCP server of the project while the window publishes
 /// them.
 fn mcp_endpoint(cx: &App) -> Option<(String, String)> {
@@ -267,6 +284,11 @@ pub struct SettingsView {
     runtimes: Vec<RuntimeInfo>,
     /// The local repository the settings file names, read in the background.
     repository: String,
+    /// The text of the read-only field that shows the repository. It keeps the selection of the
+    /// field from one frame to the next.
+    repository_text: TextField,
+    /// The page whose read-only repository field has the keys, while it has them.
+    repository_focus: Option<SettingsPage>,
     /// What the Test button of the Git page found.
     git_version: Option<String>,
     testing_git: bool,
@@ -340,7 +362,7 @@ impl SettingsView {
         let environment = cx
             .try_global::<ProjectEnvironmentGlobal>()
             .and_then(|global| global.0.clone());
-        let keymap_page = KeymapPage::new(weak.clone());
+        let keymap_page = KeymapPage::new(weak.clone(), &workspace.main_menu(cx));
         let repository = settings
             .build_tools
             .first
@@ -395,6 +417,8 @@ impl SettingsView {
             mcp_error: None,
             runtimes: Vec::new(),
             repository: String::new(),
+            repository_text: TextField::default(),
+            repository_focus: None,
             git_version: None,
             testing_git: false,
             choice_open: None,
@@ -411,6 +435,7 @@ impl SettingsView {
         cx.spawn(async move |_, cx| {
             let repository = repository.await;
             read_repository.update(cx, |view, cx| {
+                view.repository_text = TextField::from_text(repository.clone());
                 view.repository = repository;
                 cx.notify();
             });
@@ -660,6 +685,7 @@ impl SettingsView {
             open,
             theme,
         )
+        .flex_none()
         .debug_selector(move || selector.clone())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.click_choice(id.to_owned(), values.clone(), chosen, cx);
@@ -688,6 +714,7 @@ impl SettingsView {
             open,
             theme,
         )
+        .flex_none()
         .debug_selector(move || selector.clone())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.click_choice(id.to_owned(), values.clone(), chosen, cx);
@@ -1053,16 +1080,30 @@ impl SettingsView {
         if self.search.key_with_clipboard(event, false, cx) {
             let pages = settings_catalog::pages_matching(&self.search.text);
             if !pages.contains(&self.page) {
-                self.page = pages
+                let page = pages
                     .first()
                     .copied()
                     .unwrap_or(SettingsPage::Appearance)
                     .target();
-                self.highlight = None;
+                self.set_page(page, cx);
             }
             cx.notify();
         }
         cx.stop_propagation();
+    }
+
+    /// Moves the window to a page. The MCP rows read the client files the first time the
+    /// page is reached, whether a click, the search field or the arrows brought it here.
+    fn set_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        self.highlight = None;
+        if page == SettingsPage::Mcp && self.mcp_clients_loaded == 0 {
+            self.load_mcp_clients(cx);
+        }
+        cx.notify();
     }
 
     /// Up and Down in the search walk the pages of the tree the query keeps, in its order.
@@ -1082,9 +1123,7 @@ impl SettingsView {
         };
         let page = pages[next];
         if page != self.page {
-            self.page = page.target();
-            self.highlight = None;
-            cx.notify();
+            self.set_page(page.target(), cx);
         }
     }
 
@@ -1129,6 +1168,7 @@ impl SettingsView {
             return false;
         }
         self.editing = Some(id);
+        self.repository_focus = None;
         self.search_editing = false;
         self.todo_new_editing = false;
         self.choice_open = None;
@@ -1197,6 +1237,14 @@ impl SettingsView {
             }
             cx.stop_propagation();
             return;
+        }
+        if self.repository_focus == Some(self.page) {
+            // The read-only repository field copies and selects; typed text changes nothing.
+            if self.repository_text.key_read_only(event, cx) {
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
         }
         if let Some(id) = self.editing {
             if self.text_field.key_with_clipboard(event, false, cx) {
@@ -1647,6 +1695,7 @@ impl SettingsView {
         cx.spawn(async move |_, cx| {
             let repository = read.await;
             view.update(cx, |view, cx| {
+                view.repository_text = TextField::from_text(repository.clone());
                 view.repository = repository;
                 cx.notify();
             })
@@ -1712,6 +1761,8 @@ fn pill(id: impl Into<ElementId>, text: &str, on: bool, theme: &Theme) -> Statef
         .child(text.to_string())
 }
 
+/// A text field of the pages. It always has its border, in the colour of the other fields, so an
+/// empty one reads as a field; the default of an empty field stands inside it as a grey hint.
 fn field(
     mouse: FieldMouse,
     id: &'static str,
@@ -1735,7 +1786,11 @@ fn field(
         .px(px(SPACE_M))
         .rounded(px(CONTROL_RADIUS))
         .border_2()
-        .border_color(if active { theme.accent } else { theme.border })
+        .border_color(if active {
+            theme.accent
+        } else {
+            theme.control_border
+        })
         .text_color(color)
         .children(text_field_children_named(
             mouse,
@@ -1748,7 +1803,10 @@ fn field(
             16.,
             active,
         ))
-        .when(empty, |this| this.child(hint))
+        .when(empty, |this| {
+            let selector = format!("settings-{}-hint", id.replace('_', "-"));
+            this.child(div().debug_selector(move || selector).child(hint))
+        })
 }
 
 fn row(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div {
@@ -1758,12 +1816,13 @@ fn row(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div {
         .justify_between()
         .gap(px(DIALOG_GAP))
         .min_h(px(30.))
-        .child(div().text_color(theme.text).child(label))
+        // The label gives way before the control: a long label wraps, the control keeps its width.
+        .child(div().min_w_0().text_color(theme.text).child(label))
         .child(control)
 }
 
 /// The grey text of an empty text field: the value applied when the field stays empty.
-fn text_hint(field: SettingField) -> &'static str {
+pub(crate) fn text_hint(field: SettingField) -> &'static str {
     match field {
         SettingField::EditorFontFamily => "JetBrains Mono",
         SettingField::BuildToolFirstHome => "Wrapper or bundled",
@@ -1887,16 +1946,23 @@ fn slug(text: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
+/// A row of a setting. A text value stands in the label column of `label_width`, so the
+/// fields of a page start on one vertical line; other rows put the control at the right edge.
 fn setting_row(
     entry: &Setting,
     control: impl IntoElement,
     highlighted: bool,
     chosen: bool,
+    label_width: Option<f32>,
     theme: &Theme,
 ) -> Div {
     let id = entry.id;
-    row(entry.title, control, theme)
-        .px(px(ROW_PADDING_X))
+    let line = match label_width {
+        // The labels of the pages read as text, not as a hint of the form.
+        Some(width) => form_row_colored(width, entry.title, theme.text, control),
+        None => row(entry.title, control, theme),
+    };
+    line.px(px(ROW_PADDING_X))
         .rounded(px(CONTROL_RADIUS))
         .when(chosen, |this| {
             this.debug_selector(move || format!("settings-chosen-{}", id.replace('_', "-")))
@@ -2387,8 +2453,8 @@ impl SettingsView {
         rows
     }
 
-    /// One client of the page: its state, Auto-Configure when the client is on this
-    /// machine, and the menu of the transports under the chevron.
+    /// One client of the page: its state, Configure while its entry is not written, and the
+    /// menu of the transports under the chevron.
     fn mcp_client_row(
         &mut self,
         client: mcp_discovery::Client,
@@ -2399,28 +2465,30 @@ impl SettingsView {
         let state = self.mcp_client_state(client, project).cloned();
         let status = match &state {
             None => "Reading...",
-            Some(state) => match state.status {
-                mcp_discovery::Status::Missing => "Not detected",
-                mcp_discovery::Status::Damaged => "Damaged settings file",
-                mcp_discovery::Status::Found if state.configured => "Configured",
-                mcp_discovery::Status::Found => "Not configured",
-            },
+            Some(state) if state.status == mcp_discovery::Status::Damaged => {
+                "Damaged settings file"
+            }
+            Some(state) if !state.file => "Not configured",
+            Some(state) if state.configured => "Configured",
+            Some(_) => "Different entry",
         };
-        let found = state
+        let configured = state
             .as_ref()
-            .is_some_and(|state| state.status == mcp_discovery::Status::Found);
+            .is_some_and(|state| state.status == mcp_discovery::Status::Found && state.configured);
+        let offer_configure = state.as_ref().is_some_and(|_| !configured);
         let prefix = if project {
             "settings-mcp-project-client"
         } else {
             "settings-mcp-client"
         };
         let id = client.id();
+        let status_name = format!("{prefix}-{id}-status");
         let open = self.mcp_open_client == Some((client, project));
 
         let mut controls = div().flex().items_center().gap(px(SPACE_S)).flex_none();
-        if found {
+        if offer_configure {
             controls = controls.child(
-                pill(format!("{prefix}-{id}-auto"), "Auto-Configure", true, theme)
+                pill(format!("{prefix}-{id}-auto"), "Configure", true, theme)
                     .debug_selector(move || format!("{prefix}-{id}-auto"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let transport = this.mcp_transport;
@@ -2461,12 +2529,13 @@ impl SettingsView {
                 div()
                     .flex_1()
                     .text_size(px(TEXT_SMALL))
-                    .text_color(if state.as_ref().is_some_and(|state| state.configured) {
+                    .text_color(if configured {
                         theme.text
                     } else {
                         theme.text_secondary
                     })
-                    .child(status),
+                    .child(status)
+                    .child(mcp_status_probe(status_name, status)),
             )
             .child(controls);
 
@@ -3059,18 +3128,32 @@ fn note_owned(text: String, theme: &Theme) -> Div {
         .child(text)
 }
 
+/// The size of the Settings window on its first opening in a window of `window_width` by
+/// `window_height`: its share of the window, kept between [`FIRST_MIN`] and [`FIRST_MAX`], and
+/// never larger than the window itself.
+pub(crate) fn first_size(window_width: f32, window_height: f32) -> (f32, f32) {
+    let width = (window_width * WIDTH_SHARE)
+        .clamp(FIRST_MIN.0, FIRST_MAX.0)
+        .min(window_width - 2. * DIALOG_PADDING);
+    let height = (window_height * HEIGHT_SHARE)
+        .clamp(FIRST_MIN.1, FIRST_MAX.1)
+        .min(window_height - 2. * DIALOG_PADDING);
+    (width, height)
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let settings = self.draft.clone();
         let query = self.search.text.trim().to_owned();
         let viewport = window.viewport_size();
-        let width = px(WIDTH).min(viewport.width - px(2. * DIALOG_PADDING));
+        let (window_width, window_height) = (f32::from(viewport.width), f32::from(viewport.height));
+        let (width, height) = first_size(window_width, window_height);
         let place = DialogPlace {
-            left: (f32::from(viewport.width) - f32::from(width)) / 2.,
-            top: f32::from(viewport.height) * 0.08,
-            width: f32::from(width),
-            height: Some(f32::from(viewport.height) * 0.8),
+            left: (window_width - width) / 2.,
+            top: ((window_height - height) / 2.).max(0.),
+            width,
+            height: Some(height),
         };
 
         let navigation = settings_catalog::pages_matching(&query);
@@ -3108,15 +3191,11 @@ impl Render for SettingsView {
                     .tooltip(move |_, cx| tooltip(page.title(), None, cx))
                     .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.page = page.target();
-                        this.highlight = None;
+                        this.set_page(page.target(), cx);
                         this.editing = None;
                         this.search_editing = false;
                         this.todo_new_editing = false;
                         this.choice_open = None;
-                        if this.page == SettingsPage::Mcp && this.mcp_clients_loaded == 0 {
-                            this.load_mcp_clients(cx);
-                        }
                         cx.notify();
                     }))
                     .child(div().min_w_0().truncate().child(page.title()))
@@ -3212,6 +3291,13 @@ impl Render for SettingsView {
                 if self.page == SettingsPage::EditorCodeStyle {
                     content.push(self.project_style_row(&theme, cx));
                 }
+                // The text values of the page share one label column.
+                let value_labels: Vec<&str> = settings_catalog::all()
+                    .iter()
+                    .filter(|entry| entry.page == self.page && entry.kind == SettingKind::Text)
+                    .map(|entry| entry.title)
+                    .collect();
+                let value_width = form_label_width(window, &value_labels);
                 let mut last_section: Option<&'static str> = None;
                 for entry in settings_catalog::all()
                     .iter()
@@ -3286,12 +3372,20 @@ impl Render for SettingsView {
                             if entry.field == SettingField::BuildToolSecondRuntimeHome {
                                 self.runtime_select(entry, &theme, cx).into_any_element()
                             } else if entry.field == SettingField::BuildToolFirstRepository {
-                                field(
-                                    FieldMouse::off(),
+                                let mouse =
+                                    FieldMouse::new(cx, |this| Some(&mut this.repository_text))
+                                        .read_only()
+                                        .starting(cx, |this, _| {
+                                            this.editing = None;
+                                            this.repository_focus = Some(this.page);
+                                            true
+                                        });
+                                read_only_field(
                                     entry.id,
-                                    &TextField::from_text(self.repository.clone()),
-                                    "Read from the settings file",
-                                    false,
+                                    "settings-repository".to_owned(),
+                                    "settings-repository-field",
+                                    mouse,
+                                    &self.repository_text,
                                     &theme,
                                 )
                                 .into_any_element()
@@ -3354,7 +3448,15 @@ impl Render for SettingsView {
                         }
                         SettingKind::Toggle => div().into_any_element(),
                     };
-                    content.push(setting_row(entry, control, highlighted, chosen_row, &theme));
+                    let label_width = (entry.kind == SettingKind::Text).then_some(value_width);
+                    content.push(setting_row(
+                        entry,
+                        control,
+                        highlighted,
+                        chosen_row,
+                        label_width,
+                        &theme,
+                    ));
                     if self
                         .choice_open
                         .as_ref()

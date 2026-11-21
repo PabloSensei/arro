@@ -106,6 +106,8 @@ pub struct JavaProject {
     /// The same providers as the server the window talks to; it also reimports the
     /// project when a build file is added or removed.
     pub(crate) server: JavaServer,
+    /// Whether a Gradle import runs now, for the line of the status bar.
+    importing: watch::Receiver<bool>,
     pub(crate) syntax: JavaSyntax,
     pub(crate) class_files: ClassFiles,
     /// The sources of library classes: the jar, the repository and the attachment.
@@ -269,6 +271,7 @@ impl ProjectProblems {
                     jdtls_adapter::BuildTool::Maven => 0,
                     jdtls_adapter::BuildTool::Gradle => 1,
                 }),
+                retry: failure.retry,
             })
             .into_iter()
             .collect()
@@ -507,11 +510,17 @@ impl JavaProject {
         cache: PathBuf,
         offline: bool,
     ) -> Result<Self, OpenError> {
+        let failures = crate::session::follow_failures(
+            spec.watch_import_failure(),
+            Arc::new(crate::session::ImportRetries::new(&cache)),
+            &Handle::current(),
+        );
         let problems = ProjectProblems {
-            failures: spec.watch_import_failure(),
+            failures,
             log: Some(spec.log_file()),
             runtime: Handle::current(),
         };
+        let importing = spec.watch_importing();
         let (published, revisions) = Published::new();
         let consumer: Arc<dyn ServerEvents> = published.clone();
         let autobuild = spec.autobuild();
@@ -687,6 +696,7 @@ impl JavaProject {
             runtime: Handle::current(),
             providers,
             server,
+            importing,
             syntax: JavaSyntax::new(),
             class_files,
             library_sources,
@@ -717,6 +727,11 @@ impl JavaProject {
     /// The latest import failure, for the line of the status bar.
     pub fn watch_import_failure(&self) -> watch::Receiver<Option<ImportFailure>> {
         self.problems.failures.clone()
+    }
+
+    /// Whether a Gradle import runs now, for the line of the status bar.
+    pub fn watch_importing(&self) -> watch::Receiver<bool> {
+        self.importing.clone()
     }
 
     /// Starts the server again after it stopped, for example for low memory.

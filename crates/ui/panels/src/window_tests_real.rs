@@ -333,28 +333,15 @@ fn navigation_usages_and_refactorings_work(cx: &mut TestAppContext) {
     press(cx, window, "shift-f6");
     draw(cx, window);
     assert!(
-        shown(cx, window, "rename-popup"),
-        "Shift+F6 asks for the new name"
+        shown(cx, window, "rename-in-place-hint"),
+        "Shift+F6 changes the name in the text"
     );
-    press(cx, window, "backspace backspace backspace");
     type_text(cx, window, "sum");
     press(cx, window, "enter");
     draw(cx, window);
-    assert!(
-        buffer_of(cx, &sample_view).contains("int add("),
-        "the first Enter only previews"
-    );
-    // The preview comes from the server asynchronously; an Enter that arrives before it
-    // asks again instead of applying, so keep asking until the text changes.
-    let rename_started = Instant::now();
-    while !buffer_of(cx, &sample_view).contains("int sum(") {
-        assert!(rename_started.elapsed() < LIMIT, "the rename did not apply");
-        press(cx, window, "enter");
-        draw(cx, window);
-        std::thread::sleep(Duration::from_millis(500));
-        cx.executor().advance_clock(TICK);
-        cx.run_until_parked();
-    }
+    wait_for(cx, "the rename", LIMIT, |cx| {
+        buffer_of(cx, &sample_view).contains("int sum(")
+    });
     wait_for(cx, "the other file to change", LIMIT, |cx| {
         buffer_of(cx, &editor_of(cx, window, &other)).contains(".sum(")
     });

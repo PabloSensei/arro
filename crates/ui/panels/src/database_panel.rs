@@ -4344,6 +4344,20 @@ impl DatabasePanel {
         }
     }
 
+    /// Data Sources and Drivers from Find Action: the window opens on the first connection, or on
+    /// a new one when there is none. The panel learns its window when it is drawn, and it is not
+    /// drawn before the Database tool has been shown, so the command passes its own window on.
+    pub(crate) fn open_data_sources_from(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = window.window_handle().downcast::<Workspace>() {
+            self.window = Some(handle);
+        }
+        let opening = self
+            .sources
+            .first()
+            .map_or(Opening::New, |source| Opening::Edit(source.id.clone()));
+        self.open_data_sources(opening, cx);
+    }
+
     /// Opens the Data Sources window on a new connection, or on the connection `opening` names.
     /// The window is built after the update of the panel is over, so it may read the panel.
     pub(crate) fn open_data_sources(&mut self, opening: Opening, cx: &mut Context<Self>) {
@@ -5172,19 +5186,21 @@ impl DatabasePanel {
                 }),
             );
         }
-        bar = bar.child(
-            icon_button(
-                "database-console-stop",
-                "run/stop",
-                "Stop",
-                Some("Ctrl+F2".into()),
-                theme,
-            )
-            .debug_selector(|| "database-console-stop".to_owned())
-            .when(running, |this| {
-                this.on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
-            }),
-        );
+        // The Stop square is drawn only while a statement runs: over an empty result it
+        // would look like a checkbox with no label.
+        if running {
+            bar = bar.child(
+                icon_button(
+                    "database-console-stop",
+                    "run/stop",
+                    "Stop",
+                    Some("Ctrl+F2".into()),
+                    theme,
+                )
+                .debug_selector(|| "database-console-stop".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+            );
+        }
         if let Some(source) = &selected {
             let id = source.clone();
             let manual = !self.auto_commit(source);
@@ -6154,6 +6170,7 @@ impl DatabasePanel {
                 None,
                 theme,
             )
+            .debug_selector(|| "database-refresh".to_owned())
             .on_click(cx.listener(|this, _, _, cx| {
                 this.refresh_catalog();
                 if let Some(source) = this.selected.clone() {

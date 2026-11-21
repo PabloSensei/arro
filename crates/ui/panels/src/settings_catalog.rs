@@ -72,6 +72,7 @@ impl SettingsPage {
     /// The pages in the order the window shows them.
     pub const ALL: [SettingsPage; 29] = [
         SettingsPage::Appearance,
+        SettingsPage::Keymap,
         SettingsPage::Editor,
         SettingsPage::EditorCodeStyle,
         SettingsPage::EditorCompletion,
@@ -82,6 +83,7 @@ impl SettingsPage {
         SettingsPage::EditorPostfix,
         SettingsPage::EditorFileTemplates,
         SettingsPage::EditorTodo,
+        SettingsPage::EditorFileTypes,
         SettingsPage::Debugger,
         SettingsPage::Project,
         SettingsPage::BuildTools,
@@ -93,13 +95,11 @@ impl SettingsPage {
         SettingsPage::ActionsOnSave,
         SettingsPage::Terminal,
         SettingsPage::Kubernetes,
-        SettingsPage::HttpClient,
-        SettingsPage::Plugins,
-        SettingsPage::Keymap,
         SettingsPage::Database,
         SettingsPage::ToolsAi,
         SettingsPage::Mcp,
-        SettingsPage::EditorFileTypes,
+        SettingsPage::HttpClient,
+        SettingsPage::Plugins,
     ];
 
     pub fn title(self) -> &'static str {
@@ -182,9 +182,9 @@ impl SettingsPage {
             | SettingsPage::EditorInspections
             | SettingsPage::EditorSpelling
             | SettingsPage::EditorLiveTemplates
-            | SettingsPage::EditorPostfix
             | SettingsPage::EditorFileTemplates
             | SettingsPage::EditorTodo => Some(SettingsPage::Editor),
+            SettingsPage::EditorPostfix => Some(SettingsPage::EditorLiveTemplates),
             SettingsPage::EditorFileTypes => Some(SettingsPage::Editor),
             SettingsPage::BuildToolsFirst | SettingsPage::BuildToolsSecond => {
                 Some(SettingsPage::BuildTools)
@@ -2018,6 +2018,39 @@ mod tests {
             super::pages_matching("").len(),
             super::SettingsPage::ALL.len()
         );
+    }
+
+    /// The tree draws pages in this order with the indent of their depth, so a page must
+    /// follow its parent with only deeper pages between them, or it looks nested elsewhere.
+    #[test]
+    fn every_page_sits_inside_the_block_of_its_parent() {
+        let all = super::SettingsPage::ALL;
+        for (index, page) in all.iter().enumerate() {
+            let Some(parent) = page.parent() else {
+                assert_eq!(page.depth(), 0, "{} has no parent", page.title());
+                continue;
+            };
+            assert_eq!(page.depth(), parent.depth() + 1, "{}", page.title());
+            let start = all
+                .iter()
+                .position(|other| *other == parent)
+                .expect("the parent is in the list");
+            assert!(
+                start < index,
+                "{} comes after {}",
+                page.title(),
+                parent.title()
+            );
+            for between in &all[start + 1..index] {
+                assert!(
+                    between.depth() > parent.depth(),
+                    "{} is drawn under {} instead of {}",
+                    page.title(),
+                    between.title(),
+                    parent.title()
+                );
+            }
+        }
     }
 
     #[test]

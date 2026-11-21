@@ -10,7 +10,7 @@ use ui_kit::*;
 use workspace::{STRUCTURE_TOOL, Workspace};
 
 use crate::navigation;
-use crate::outline::{OpenEditors, icon_of};
+use crate::outline::{OpenEditors, icon_of, visibility_icon};
 
 const GROUP: &str = "left-panel";
 const ROW_MARGIN: f32 = SPACE_L;
@@ -72,6 +72,15 @@ impl StructurePanel {
             .outline()
             .iter()
             .map(|item| format!("{}{}", "  ".repeat(item.depth as usize), item.label()))
+            .collect()
+    }
+
+    /// The mark of the visibility of each row, for tests.
+    #[cfg(test)]
+    pub fn visibility_marks(&self, cx: &App) -> Vec<&'static str> {
+        self.outline(cx)
+            .iter()
+            .map(|item| visibility_icon(item.visibility))
             .collect()
     }
 
@@ -193,7 +202,7 @@ impl Render for StructurePanel {
                 .map(|(index, item)| {
                     let selected = selected_row
                         .map_or(current == Some(item.name_range.start), |row| row == index);
-                    let row = tree_row(
+                    let row = tree_row_with_badge(
                         TreeRow {
                             id: ("structure-row", index).into(),
                             depth: item.depth as usize,
@@ -204,6 +213,7 @@ impl Render for StructurePanel {
                             open: false,
                             selected,
                         },
+                        visibility_icon(item.visibility),
                         &theme,
                     );
                     div().w_full().px(px(ROW_MARGIN)).child(row.on_click(

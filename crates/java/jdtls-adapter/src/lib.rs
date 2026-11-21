@@ -28,6 +28,7 @@ use tokio::sync::watch;
 
 mod code_style;
 mod import;
+mod install;
 mod startup;
 
 pub use import::{BuildTool, ImportFailure, is_build_file};
@@ -278,6 +279,8 @@ pub struct Jdtls {
     config: JdtlsConfig,
     root: CanonPath,
     launcher_jar: PathBuf,
+    /// The release this state folder belongs to; another one clears the OSGi cache.
+    installation: install::InstallMark,
     autobuild: Autobuild,
     heap_mb: AtomicU32,
     /// `java.configuration.runtimes` as the server reads it at every start. Project
@@ -297,8 +300,8 @@ pub struct Jdtls {
     lombok: Mutex<Option<Lombok>>,
     /// When the last start began, so that a stale log is not read as its cause.
     started: Mutex<Option<SystemTime>>,
-    /// The latest import failure the server reported, for the window.
-    import_failure: watch::Sender<Option<ImportFailure>>,
+    /// The latest import failure the server reported, and the imports running now.
+    imports: import::ImportState,
     /// The legend of the semantic tokens, which the server gives at `initialize`.
     semantic_tokens: SemanticTokensSetup,
     /// What the server gives about its code lenses at `initialize`.
@@ -310,6 +313,7 @@ impl Jdtls {
     pub fn new(config: JdtlsConfig) -> io::Result<Self> {
         let root = CanonPath::new(&config.project_root)?;
         let launcher_jar = equinox_launcher(&config.jdtls_home)?;
+        let installation = install::InstallMark::of(&config.jdtls_home, &launcher_jar)?;
         fs::create_dir_all(&config.state_dir)?;
         let code_style = code_style::read_project_style(&config.project_root)
             .map(|style| code_style::prepare(&config.state_dir, &style));
@@ -330,7 +334,6 @@ impl Jdtls {
             let message = "jdtls already runs for this project in another window";
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, message));
         }
-        let (import_failure, _) = watch::channel(None);
         Ok(Self {
             runtimes: Mutex::new(config.runtimes.clone()),
             inlay: Mutex::new(InlayHints::default()),
@@ -341,10 +344,11 @@ impl Jdtls {
             config,
             root,
             launcher_jar,
+            installation,
             autobuild: Autobuild::default(),
             heap_mb: AtomicU32::new(first_heap_mb(platform::physical_memory())),
             started: Mutex::new(None),
-            import_failure,
+            imports: import::ImportState::new(),
             semantic_tokens: SemanticTokensSetup::new(),
             code_lens: CodeLensSetup::new(),
             _lock: lock,
@@ -546,7 +550,13 @@ impl Jdtls {
 
     /// The latest failure of the build import, and every later one.
     pub fn watch_import_failure(&self) -> watch::Receiver<Option<ImportFailure>> {
-        self.import_failure.subscribe()
+        self.imports.watch_failure()
+    }
+
+    /// Whether a Gradle import runs now, so that the status bar can say `importing`
+    /// while a retry is in flight.
+    pub fn watch_importing(&self) -> watch::Receiver<bool> {
+        self.imports.watch_running()
     }
 
     fn section(&self, section: &str) -> Value {
@@ -977,10 +987,17 @@ fn next_heap(heap: u32) -> u32 {
 
 impl ServerSpec for Jdtls {
     fn preflight(&self) -> Result<(), String> {
-        match startup::version_problem(&self.config.java_home) {
-            Some(problem) => Err(problem),
-            None => Ok(()),
+        if let Some(problem) = startup::version_problem(&self.config.java_home) {
+            return Err(problem);
         }
+        // The cache of another release would fail the import of the build tool, so no
+        // server starts on it. The journal keeps the reason too.
+        install::prepare(&self.config.state_dir, &self.installation).map_err(|error| {
+            let message =
+                format!("the OSGi configuration of an older jdtls is not removed: {error}");
+            eprintln!("{message}");
+            message
+        })
     }
 
     fn starting(&self) {
@@ -1048,7 +1065,7 @@ impl ServerSpec for Jdtls {
 
     fn crashed(&self, exit_code: Option<i32>) {
         // A new server imports the project again, so an old failure says nothing.
-        self.import_failure.send_replace(None);
+        self.imports.reset();
         if exit_code == Some(EXIT_OUT_OF_MEMORY) {
             let _ = self
                 .heap_mb
@@ -1108,7 +1125,7 @@ impl ServerSpec for Jdtls {
     }
 
     fn state_of(&self, method: &str, params: &Value) -> Option<State> {
-        import::observe(method, params, &self.import_failure);
+        self.imports.observe(method, params);
         if method != "language/status" {
             return None;
         }

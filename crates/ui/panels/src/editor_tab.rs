@@ -1062,11 +1062,27 @@ fn open(
                 })
                 .ok();
         }
+        EditorEvent::Status(message) => {
+            let message = message.clone();
+            reports
+                .update(cx, |workspace, cx| {
+                    workspace.set_language_status(Some(message), cx)
+                })
+                .ok();
+        }
         EditorEvent::SaveNote(message) => {
             let message = message.clone();
             reports
                 .update(cx, |workspace, cx| {
                     workspace.notify_user("Actions on Save", message, cx)
+                })
+                .ok();
+        }
+        EditorEvent::StatusMessage(message) => {
+            let message = message.clone();
+            reports
+                .update(cx, |workspace, cx| {
+                    workspace.show_status_message(message, cx)
                 })
                 .ok();
         }
@@ -1223,6 +1239,26 @@ fn open(
             let hub = hub.0.clone();
             let usages = usages.clone();
             hub.update(cx, |hub, cx| hub.set_detailed_usages_in_file(usages, cx));
+            let workspace = reports.clone();
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_tool(USAGES_TOOL, window, cx))
+                        .ok();
+                })
+                .ok();
+        }
+        EditorEvent::UsagesWaiting {
+            name,
+            in_file,
+            cancel,
+        } => {
+            let Some(hub) = cx.try_global::<ActiveUsages>() else {
+                return;
+            };
+            let hub = hub.0.clone();
+            let (name, in_file, cancel) = (name.clone(), *in_file, cancel.clone());
+            hub.update(cx, |hub, cx| hub.wait_for_search(name, in_file, cancel, cx));
             let workspace = reports.clone();
             handle
                 .update(cx, |_, window, cx| {

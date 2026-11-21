@@ -39,7 +39,7 @@ use crate::mcp_approval::{McpApprovals, Reply};
 use crate::mcp_edits::{EditKind, EditReply, EditRequests};
 use crate::outline::OpenEditors;
 use crate::proposal::{Proposal, Waiter};
-use crate::term_grid::{GridPanel, GridView, Position, every_frame, grid, scroll_lines, send_key};
+use crate::term_grid::{GridPanel, GridView, Position, every_frame, grid, send_key};
 use crate::terminal_panel::message;
 use crate::transcript::Transcript;
 use crate::trust::TrustDialog;
@@ -2712,7 +2712,6 @@ impl Render for AgentsPanel {
             (Tab::Agents, _) => body.child(self.clients_view(&theme, window, cx)),
             (Tab::Changes, _) => body.child(self.changes_view(&theme, window, cx)),
             (Tab::Session, Some(terminal)) => {
-                let scrolled = terminal.clone();
                 let view = GridView {
                     session: terminal.clone(),
                     focused,
@@ -2725,8 +2724,7 @@ impl Render for AgentsPanel {
                     pane: 0,
                     metrics: std::rc::Rc::new(std::cell::Cell::new(None)),
                 };
-                body.on_scroll(move |event, _, _| scrolled.scroll(scroll_lines(event)))
-                    .child(grid(view))
+                body.child(grid(view))
             }
             (Tab::Session, None) if self.entries.is_empty() => {
                 body.child(message("No sessions yet", &theme))

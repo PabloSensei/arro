@@ -4,14 +4,16 @@ use std::path::Path;
 
 use lang_api::{
     Confidence, DocumentSpot, GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateQuery,
-    Generation, OverridableMethods, OverridableMethodsQuery, Symbol, SymbolKind, SymbolProvider,
-    ask,
+    Generation, Symbol, SymbolKind, SymbolProvider, ask,
 };
 use ui_kit::*;
 
 use crate::actions::Pick;
 use crate::semantic::{NO_ANSWER, first};
 use crate::view::{EditorEvent, EditorView};
+
+/// The status bar line of a row that asks the language server while the server is not ready.
+const SERVER_NOT_READY: &str = "The language server is not ready yet";
 
 /// The popup with a checkbox for each field or method a generation may include.
 pub(crate) struct GeneratePopup {
@@ -120,6 +122,22 @@ fn is_typed_key(key: &str) -> bool {
 }
 
 impl EditorView {
+    /// The pick list of the Generate menu, under the heading "Generate". An empty list shows
+    /// the note of `empty` and leaves the open list alone.
+    fn show_generate_picks(
+        &mut self,
+        at: usize,
+        rows: Vec<Pick>,
+        empty: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let listed = !rows.is_empty();
+        self.show_picks(at, rows, empty, cx);
+        if listed && let Some(menu) = self.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+            menu.title = Some("Generate");
+        }
+    }
+
     /// Alt+Insert: the list of what applies here. The server says which parts exist; where
     /// it does not know, the symbols of the class say. A row is left out only on positive
     /// evidence, so a language that answers nothing keeps the full list.
@@ -139,6 +157,9 @@ impl EditorView {
         };
         let text = state.text();
         let path = self.path().to_path_buf();
+        // A server that imports or has failed answers late or not at all, so its questions are
+        // not asked then: the rows come from the symbols of the class, as when it does not know.
+        let ready = support.server_ready();
         let version = spot.version;
         cx.spawn(async move |this, cx| {
             // The symbols block, so they are read off the UI thread.
@@ -157,40 +178,28 @@ impl EditorView {
                 return;
             };
             // Every question starts before the first answer is awaited, so they run together.
-            let asked: Vec<_> = kinds
-                .iter()
-                .map(|kind| {
-                    let query = GenerateQuery {
-                        spot: spot.clone(),
-                        kind: *kind,
-                    };
-                    (*kind, ask(provider, query))
-                })
-                .collect();
-            let implement = match support.overridable_methods() {
-                Some(provider) if place.in_class => Some(ask(
-                    provider,
-                    OverridableMethodsQuery {
-                        spot: spot.clone(),
-                        only_abstract: true,
-                    },
-                )),
-                _ => None,
+            let asked: Vec<_> = if ready {
+                kinds
+                    .iter()
+                    .map(|kind| {
+                        let query = GenerateQuery {
+                            spot: spot.clone(),
+                            kind: *kind,
+                        };
+                        (*kind, ask(provider, query))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
             };
             let mut answers = Vec::with_capacity(asked.len());
             for (kind, replies) in asked {
                 answers.push((kind, known(first(replies).await)));
             }
-            let implement = match implement {
-                Some(replies) => known(first(replies).await),
-                None => None,
-            };
             let rows: Vec<Pick> = crate::delete::generate_rows()
                 .into_iter()
                 .filter(|pick| match pick {
-                    Pick::Generate { kind, .. } => {
-                        shows(*kind, &place, &answers, implement.as_ref())
-                    }
+                    Pick::Generate { kind, .. } => shows(*kind, &place, &answers),
                     _ => true,
                 })
                 .collect();
@@ -200,7 +209,7 @@ impl EditorView {
                     state.version() as i32 == version && state.selections().primary().head == caret
                 });
                 if current {
-                    this.show_picks(caret, rows, "Nothing to generate", cx);
+                    this.show_generate_picks(caret, rows, "Nothing to generate", cx);
                 }
             })
             .ok();
@@ -224,17 +233,28 @@ impl EditorView {
                 })
                 .map(crate::actions::Pick::Action)
                 .collect();
-            this.show_picks(caret, rows, "Nothing to generate here", cx);
+            this.show_generate_picks(caret, rows, "Nothing to generate here", cx);
         });
+    }
+
+    /// Whether the language server answers now. A row that asks it says so while it cannot.
+    pub(crate) fn server_ready(&self) -> bool {
+        self.lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.support.server_ready())
     }
 
     /// A row of the Generate list is chosen.
     pub(crate) fn start_generation(&mut self, kind: GenerateKind, cx: &mut Context<Self>) {
+        if !self.server_ready() {
+            self.report_status(SERVER_NOT_READY, cx);
+            return;
+        }
         if kind == GenerateKind::OverrideMethods {
             return self.override_methods(false, cx);
         }
         if kind == GenerateKind::ImplementMethods {
-            return self.override_methods(true, cx);
+            return self.implement_methods_of_generate(cx);
         }
         let Some((spot, caret)) = self.spot() else {
             return;
@@ -312,6 +332,10 @@ impl EditorView {
             self.apply_generation(spot, kind, Vec::new(), cx);
             return;
         }
+        if let Some(text) = nothing_to_generate(kind) {
+            self.report_status(text, cx);
+            return;
+        }
         self.show_note(caret, "Nothing to generate here", cx);
     }
 
@@ -373,6 +397,10 @@ impl EditorView {
         handles: Vec<String>,
         cx: &mut Context<Self>,
     ) {
+        if !self.server_ready() {
+            self.report_status(SERVER_NOT_READY, cx);
+            return;
+        }
         let Some(provider) = self
             .lsp
             .as_ref()
@@ -416,16 +444,25 @@ impl EditorView {
     }
 }
 
-/// The kinds the server is asked about inside a class: the accessors, equals() and
-/// hashCode() (its answer also decides toString()), Delegate Methods and Test.
-const CLASS_PROBES: [GenerateKind; 6] = [
-    GenerateKind::Getter,
-    GenerateKind::Setter,
-    GenerateKind::GetterAndSetter,
+/// The kinds the server is asked about inside a class: equals() and hashCode() (its answer
+/// also decides toString()), Delegate Methods and Test. The accessors and Implement Methods
+/// are always listed in a class, so no question about them is needed for the list.
+const CLASS_PROBES: [GenerateKind; 3] = [
     GenerateKind::EqualsAndHashCode,
     GenerateKind::Delegate,
     GenerateKind::Test,
 ];
+
+/// The status bar message of an accessor row that has nothing to write, or `None` for the
+/// rows that answer for themselves.
+fn nothing_to_generate(kind: GenerateKind) -> Option<&'static str> {
+    match kind {
+        GenerateKind::Getter => Some("No fields without getter were found"),
+        GenerateKind::Setter => Some("No fields without setter were found"),
+        GenerateKind::GetterAndSetter => Some("No fields without getter or setter were found"),
+        _ => None,
+    }
+}
 
 /// Outside a class the list is short: Test is the one row that can apply there.
 const OUTSIDE_PROBES: [GenerateKind; 1] = [GenerateKind::Test];
@@ -434,14 +471,13 @@ const OUTSIDE_PROBES: [GenerateKind; 1] = [GenerateKind::Test];
 struct Place {
     /// False outside a class body: in an interface, or where no type encloses the caret.
     in_class: bool,
-    /// The fields and methods that directly belong to the class around the caret, when the
-    /// language has symbols.
+    /// The fields that directly belong to the class around the caret, when the language has
+    /// symbols.
     members: Option<Members>,
 }
 
 struct Members {
     fields: Vec<String>,
-    methods: Vec<String>,
 }
 
 impl Place {
@@ -491,7 +527,6 @@ impl Place {
             in_class: true,
             members: Some(Members {
                 fields: names(SymbolKind::Field),
-                methods: names(SymbolKind::Method),
             }),
         }
     }
@@ -503,20 +538,23 @@ fn known<T>(answer: Option<(T, Confidence)>) -> Option<T> {
     answer.and_then(|(value, confidence)| (confidence != Confidence::Unknown).then_some(value))
 }
 
-/// Whether a row of the Generate list applies at the caret.
+/// Whether a row of the Generate list applies at the caret. Inside a class the accessors and
+/// Implement Methods always stay: a row that has nothing to write says so when it is chosen,
+/// as IDEA does.
 fn shows(
     kind: GenerateKind,
     place: &Place,
     answers: &[(GenerateKind, Option<Generation>)],
-    implement: Option<&OverridableMethods>,
 ) -> bool {
     match kind {
         GenerateKind::Test => server_or_symbols(kind, place, answers),
         _ if !place.in_class => false,
-        GenerateKind::Constructor | GenerateKind::OverrideMethods => true,
-        GenerateKind::ImplementMethods => {
-            implement.is_none_or(|methods| !methods.methods.is_empty())
-        }
+        GenerateKind::Constructor
+        | GenerateKind::OverrideMethods
+        | GenerateKind::Getter
+        | GenerateKind::Setter
+        | GenerateKind::GetterAndSetter
+        | GenerateKind::ImplementMethods => true,
         _ => server_or_symbols(kind, place, answers),
     }
 }
@@ -552,39 +590,12 @@ fn server_applies(generation: &Generation) -> bool {
                 .is_some_and(|change| !change.is_empty()))
 }
 
-/// The rule of the symbols, used only when the server did not answer. Final fields are not
-/// visible in the symbols, so a Setter stays for a class whose fields are all final.
+/// The rule of the symbols, used only when the server did not answer: equals(), hashCode()
+/// and toString() need a field. The symbols cannot judge the other rows, so they stay.
 fn symbol_applies(kind: GenerateKind, members: &Members) -> bool {
-    let has_getter = |field: &str| {
-        let suffix = capitalized(field);
-        members
-            .methods
-            .iter()
-            .any(|method| *method == format!("get{suffix}") || *method == format!("is{suffix}"))
-    };
-    let has_setter = |field: &str| {
-        members
-            .methods
-            .contains(&format!("set{}", capitalized(field)))
-    };
     match kind {
-        GenerateKind::Getter => members.fields.iter().any(|field| !has_getter(field)),
-        GenerateKind::Setter => members.fields.iter().any(|field| !has_setter(field)),
-        GenerateKind::GetterAndSetter => members
-            .fields
-            .iter()
-            .any(|field| !has_getter(field) || !has_setter(field)),
         GenerateKind::EqualsAndHashCode | GenerateKind::ToString => !members.fields.is_empty(),
-        // The symbols cannot judge the other rows, so they stay.
         _ => true,
-    }
-}
-
-fn capitalized(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
     }
 }
 
@@ -626,22 +637,16 @@ mod tests {
     }
 
     #[test]
-    fn the_symbols_drop_a_row_only_when_they_rule_it_out() {
-        let with_getter = Members {
+    fn the_symbols_drop_equals_and_tostring_only_without_fields() {
+        let with_field = Members {
             fields: vec!["name".to_owned()],
-            methods: vec!["getName".to_owned()],
         };
-        assert!(!symbol_applies(GenerateKind::Getter, &with_getter));
-        assert!(symbol_applies(GenerateKind::Setter, &with_getter));
-        assert!(symbol_applies(
-            GenerateKind::EqualsAndHashCode,
-            &with_getter
-        ));
-        let bare = Members {
-            fields: Vec::new(),
-            methods: Vec::new(),
-        };
+        assert!(symbol_applies(GenerateKind::EqualsAndHashCode, &with_field));
+        assert!(symbol_applies(GenerateKind::ToString, &with_field));
+        let bare = Members { fields: Vec::new() };
+        assert!(!symbol_applies(GenerateKind::EqualsAndHashCode, &bare));
         assert!(!symbol_applies(GenerateKind::ToString, &bare));
-        assert!(symbol_applies(GenerateKind::ImplementMethods, &bare));
+        // The accessors are not judged by the symbols: their rows always stay in a class.
+        assert!(symbol_applies(GenerateKind::Getter, &bare));
     }
 }

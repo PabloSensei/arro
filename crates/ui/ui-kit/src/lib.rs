@@ -7,10 +7,13 @@ pub use gpui_kit::*;
 
 pub use ::theme::{metrics, motion, snapped_code_size};
 
+#[cfg(test)]
+mod checkbox_tests;
 mod dialog;
 mod dialog_buttons;
 mod embedded;
 mod floating;
+mod form;
 pub mod icon_sets;
 mod motions;
 mod palette;
@@ -29,6 +32,10 @@ pub use dialog::{DialogSpec, dialog_window};
 pub use dialog_buttons::{DialogButtons, dialog_button};
 pub use embedded::{Assets, app, init};
 pub use floating::{DialogPlace, DialogPlaces, PopupSpec, popup_drag_header, popup_window};
+pub use form::{
+    FORM_LABEL_MAX, FORM_LABEL_MIN, form_aligned, form_hint, form_label, form_label_width,
+    form_row, form_row_colored, label_column_width,
+};
 pub use icon_sets::{ARRO, INTELLIJ, IconCatalog, IconSet, icon_file};
 pub use motions::{Slide, smoothstep};
 pub use palette::{
@@ -47,8 +54,9 @@ pub use scrollbars::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_bounds::*;
 pub use text_field::{
-    FieldMenu, TextField, text_field_children, text_field_children_named, text_field_lines,
-    text_field_lines_named,
+    FieldHint, FieldMenu, TextField, read_only_field, text_field_children,
+    text_field_children_hinted, text_field_children_named, text_field_lines,
+    text_field_lines_hinted, text_field_lines_named,
 };
 pub use text_field_mouse::FieldMouse;
 pub use widgets::*;

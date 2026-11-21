@@ -10,10 +10,10 @@ use crate::{
     MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
     MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
     MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
-    PrepareDiagnosticsProvider, ProjectProblemsProvider, RangeFormatProvider,
-    ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer, SignatureProvider,
-    SourceTextProvider, SymbolProvider, SyntaxProvider, TypeHierarchyProvider,
-    WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
+    PrepareDiagnosticsProvider, PrepareRenameProvider, ProjectProblemsProvider,
+    RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
+    SemanticServer, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
+    TypeHierarchyProvider, WorkspaceDiagnosticsProvider, WorkspaceSymbolProvider,
 };
 use crate::{
     ExpectedTypeProvider, ExternalDocProvider, LibraryClassProvider, SignatureInfoProvider,
@@ -229,6 +229,17 @@ pub trait LanguageSupport: Send + Sync {
 
     fn rename(&self) -> Option<&RenameProvider> {
         None
+    }
+
+    /// Whether the language can rename the name at a place, and the span of that name.
+    fn prepare_rename(&self) -> Option<&PrepareRenameProvider> {
+        None
+    }
+
+    /// A word the language reserves, so it cannot name a symbol the user renames to.
+    fn reserved_word(&self, name: &str) -> bool {
+        let _ = name;
+        false
     }
 
     fn move_destinations(&self) -> Option<&MoveDestinationProvider> {

@@ -3,7 +3,9 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use crate::{Result, budgets, cargo, fields, icon_sets, layers, scrollbars, spacing, tooltips};
+use crate::{
+    Result, budgets, cargo, dialogs, fields, icon_sets, layers, scrollbars, spacing, tooltips,
+};
 
 const FMT: &[&str] = &["fmt", "--all", "--check"];
 const CLIPPY: &[&str] = &[
@@ -50,6 +52,8 @@ pub fn run(root: &Path) -> Result {
     spacing::run(root)?;
     println!("==> check-tooltips");
     tooltips::run(root)?;
+    println!("==> check-dialogs");
+    dialogs::run(root)?;
     println!("==> check-scrollbars");
     scrollbars::run(root)?;
     println!("==> check-fields");

@@ -338,6 +338,8 @@ const LAST_CHECK_KEY: &str = "updates.last_check";
 const SKIPPED_KEY: &str = "updates.skipped_version";
 /// A submenu opens only after the pointer rests on its row, as IDEA does.
 const MENU_OPEN_DELAY: Duration = Duration::from_millis(220);
+/// How long a message of the status bar stays before it goes away.
+const STATUS_MESSAGE_TIME: Duration = Duration::from_secs(5);
 
 /// The build the distribution README names: the commit and its date.
 pub fn build_version() -> &'static str {
@@ -415,7 +417,7 @@ pub const MIN_EDITOR_SIZE: f32 = 320.;
 /// How much one press of a resize key changes a dock.
 const KEYBOARD_RESIZE_STEP: f32 = 40.;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DockSide {
     Left,
     Right,
@@ -721,6 +723,11 @@ pub struct Workspace {
     zoom_notice: Option<SharedString>,
     /// A number that drops a late end of a notice.
     zoom_notice_serial: usize,
+    /// The message of an action that found nothing to do, shown in the status bar for a
+    /// while.
+    status_message: Option<SharedString>,
+    /// A number that drops a late end of the message.
+    status_message_serial: usize,
     /// The long task the status bar shows while it runs, with its Cancel button.
     status_progress: Option<StatusProgress>,
     pub(crate) balloon_visible: bool,
@@ -1121,6 +1128,8 @@ impl Workspace {
             zen_full_screen: false,
             zoom_notice: None,
             zoom_notice_serial: 0,
+            status_message: None,
+            status_message_serial: 0,
             status_progress: None,
             balloon_visible: false,
             balloon_serial: 0,
@@ -1770,6 +1779,8 @@ impl Workspace {
         focus: Option<FocusHandle>,
         cx: &mut App,
     ) {
+        // A project that saw a Move to opens the window where the user left it.
+        let side = self.layout.tool_side(id).unwrap_or(side);
         let view = ChromeView::tool(view, cx);
         let restore = side == DockSide::Bottom && self.layout.bottom_tool.as_deref() == Some(id);
         let dock = self.dock_mut(side);
@@ -2250,6 +2261,64 @@ impl Workspace {
         self.dock(side).active_tool().map(|tool| tool.id)
     }
 
+    /// The dock that holds a tool window, for scripts and tests.
+    pub fn tool_side(&self, id: &str) -> Option<DockSide> {
+        self.find_tool(id).map(|(side, _)| side)
+    }
+
+    /// Move to: the tool window leaves its dock and opens in `side`. The place goes with
+    /// the layout of the project. A window already there stays where it is.
+    pub fn move_tool(
+        &mut self,
+        id: &str,
+        side: DockSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((from, index)) = self.find_tool(id) else {
+            return;
+        };
+        if from == side {
+            return;
+        }
+        if self.dock(from).tools.get(index).is_none() {
+            return;
+        }
+        let tool = self.dock_mut(from).tools.remove(index);
+        // The source dock shows its neighbour, or closes when the moved window was the
+        // last one there.
+        let source = self.dock_mut(from);
+        if source.active >= source.tools.len() {
+            source.active = source.tools.len().saturating_sub(1);
+        } else if source.active > index {
+            source.active -= 1;
+        }
+        if source.tools.is_empty() && source.slide.is_open() {
+            source.slide.toggle();
+        }
+        let focus = {
+            let dock = self.dock_mut(side);
+            dock.tools.push(tool);
+            let at = dock.tools.len() - 1;
+            dock.active = at;
+            if !dock.slide.is_open() {
+                dock.slide.toggle();
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            dock.slide.finish();
+            dock.tools[at].focus.clone()
+        };
+        self.maximized = None;
+        self.last_tool = Some(side);
+        self.layout.set_tool_side(id, side);
+        match focus {
+            Some(focus) => window.focus(&focus, cx),
+            None => self.focus_active(window, cx),
+        }
+        self.layout_changed(cx);
+        cx.notify();
+    }
+
     /// Whether the tool window is the one shown in an open dock.
     pub fn tool_open(&self, id: &str) -> bool {
         self.find_tool(id).is_some_and(|(side, index)| {
@@ -2514,6 +2583,33 @@ impl Workspace {
     /// The zoom notice of the status bar, while it is shown.
     pub fn zoom_notice(&self) -> Option<&SharedString> {
         self.zoom_notice.as_ref()
+    }
+
+    /// Shows `text` in the status bar for a few seconds: what an action says when it found
+    /// nothing to do. A message that comes later replaces it.
+    pub fn show_status_message(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.status_message = Some(text.into());
+        self.status_message_serial += 1;
+        let serial = self.status_message_serial;
+        self.status_view.update(cx, |_, cx| cx.notify());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATUS_MESSAGE_TIME).await;
+            this.update(cx, |this, cx| {
+                if this.status_message_serial == serial {
+                    this.status_message = None;
+                    this.status_view.update(cx, |_, cx| cx.notify());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The message of the status bar, while it is shown.
+    pub fn status_message(&self) -> Option<&SharedString> {
+        self.status_message.as_ref()
     }
 
     /// The mode of View | Appearance, for the menu, the chrome and the tests.
@@ -5539,6 +5635,14 @@ impl Workspace {
                 Some((tab.path.clone(), (bundle.layout)(cx)))
             })
             .collect();
+        let mut tool_sides = Vec::new();
+        for (side, dock) in [
+            (DockSide::Left, &self.left),
+            (DockSide::Right, &self.right),
+            (DockSide::Bottom, &self.bottom),
+        ] {
+            tool_sides.extend(dock.tools.iter().map(|tool| (tool.id.to_owned(), side)));
+        }
         Layout {
             window: self.placement,
             left: self.left.state(),
@@ -5551,6 +5655,7 @@ impl Workspace {
             tree_expanded: self.layout.tree_expanded.clone(),
             tree_selected: self.layout.tree_selected.clone(),
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
+            tool_sides,
             recent_edited: self.recent_edited.clone(),
             preview_modes,
             bundle_modes,

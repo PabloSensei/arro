@@ -124,10 +124,10 @@ fn tool_window_rows_buttons_and_headers_share_the_metrics(cx: &mut TestAppContex
     click(cx, window, "debug-breakpoints");
     draw(cx, window);
     assert!(
-        has(cx, window, "debug-breakpoint-row-0"),
+        has(cx, window, "breakpoints-line-row-0"),
         "the breakpoint row is on screen"
     );
-    row_height(cx, window, "debug-breakpoint-row-0");
+    row_height(cx, window, "breakpoints-line-row-0");
 
     // Commit: the header and the row of the changed file.
     show_tool(cx, window, COMMIT_TOOL);

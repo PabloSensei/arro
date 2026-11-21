@@ -4120,6 +4120,7 @@ impl Render for StatusBarView {
             enc_anchor,
             indent_anchor,
             zoom_notice,
+            status_message,
             status_progress,
             agent_clients,
             agent_busy,
@@ -4141,6 +4142,7 @@ impl Render for StatusBarView {
                 workspace.st_enc_anchor.clone(),
                 workspace.st_indent_anchor.clone(),
                 workspace.zoom_notice().cloned(),
+                workspace.status_message().cloned(),
                 workspace.status_progress().cloned(),
                 workspace.agent_clients,
                 workspace.agent_busy,
@@ -4199,6 +4201,9 @@ impl Render for StatusBarView {
         }
         let zoom = zoom_notice.map(|text| {
             status_widget("st-zoom", text, &theme).debug_selector(|| "st-zoom".to_owned())
+        });
+        let message = status_message.map(|text| {
+            status_widget("st-message", text, &theme).debug_selector(|| "st-message".to_owned())
         });
         let progress = status_progress.map(|progress| {
             let cancel = progress.cancel.clone();
@@ -4427,6 +4432,7 @@ impl Render for StatusBarView {
             .gap(px(SPACE_L))
             .children(progress)
             .children(zoom)
+            .children(message)
             .children(agents)
             .children(language)
             .children(editor);

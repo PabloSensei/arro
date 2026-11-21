@@ -17,13 +17,20 @@ use lang_api::{
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{Settings, USAGES_TOOL, Workspace};
+use workspace::{FileIcons, Settings, USAGES_TOOL, Workspace};
 
+use crate::finder::{FindRequest, Found, find_tree, repeat_search};
 use crate::items::{HeaderButton, Item, ItemsPanel, PanelRow};
 use crate::navigation;
 use crate::outline::OpenEditors;
 use crate::project::ActiveProjectPanel;
 
+/// The line of the Usages window while the language server imports and the search waits.
+const WAITING_LINE: &str = "Waiting for the language server…";
+/// The line of the Usages window when a search found no uses.
+const NO_USAGES: &str = "No usages found.";
+/// The key context of the window while a search waits, so that Escape ends the wait first.
+const WAITING_CONTEXT: &str = "UsagesWaiting";
 const POPUP_CONTEXT: &str = "ShowUsagesPopup";
 const POPUP_WIDTH: f32 = 640.;
 const POPUP_HEIGHT: f32 = 420.;
@@ -52,8 +59,18 @@ fn read_text(path: &Path) -> Option<String> {
 }
 
 actions!(show_usages_popup, [Dismiss]);
+actions!(usages_wait, [CancelWait]);
 
 pub fn bind_keys(cx: &mut App) {
+    // Escape ends a wait for the language server; the window keeps its other keys. The
+    // predicate matches the focused list, because a binding that matches only the window
+    // loses to the global Escape, which matches the deepest context. The later binding wins
+    // the tie, and this one is registered after the global Escape.
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        CancelWait,
+        Some("UsagesWaiting > ItemsPanel"),
+    )]);
     let row = workspace::KeyRow {
         keys: "escape",
         mac: Some("escape"),
@@ -79,6 +96,16 @@ struct UsagesTab {
     /// The options of the search; `None` for a search that used the defaults.
     options: Option<FindUsagesOptions>,
     pinned: bool,
+    /// The places of a Find in Files search; `None` for the uses of a symbol.
+    find: Option<FindView>,
+}
+
+/// The places of a Find in Files search in a tab of the Find window, and the search that
+/// the Rerun button of its header repeats.
+struct FindView {
+    items: Vec<Item>,
+    rows: Vec<PanelRow>,
+    request: FindRequest,
 }
 
 /// Keeps the latest usages and the window that lists them.
@@ -96,6 +123,17 @@ pub struct UsagesHub {
     /// The places of a structural search, which replace the usages of the tabs until
     /// the next search of a symbol.
     structural: Option<StructuralView>,
+    /// The search that waits for the language server, if one does.
+    waiting: Option<Waiting>,
+}
+
+/// A search that waits for the language server: its tab, and the flag that ends the wait.
+struct Waiting {
+    /// The serial of the tab that waits, which the results replace.
+    serial: u64,
+    cancel: ::base::Cancel,
+    /// Ends the wait when the tool window hides.
+    _watch: Option<Subscription>,
 }
 
 struct StructuralView {
@@ -239,13 +277,7 @@ impl Global for ActiveFindUsagesSettings {}
 
 impl UsagesHub {
     pub fn create(root: PathBuf, workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<Self> {
-        let panel = ItemsPanel::create(
-            "Usages",
-            USAGES_TOOL,
-            "No usages found.",
-            workspace.clone(),
-            cx,
-        );
+        let panel = ItemsPanel::create("Usages", USAGES_TOOL, NO_USAGES, workspace.clone(), cx);
         let hub = cx.new(|cx| {
             cx.observe_global::<Settings>(|this: &mut Self, cx| this.regroup(cx))
                 .detach();
@@ -258,6 +290,7 @@ impl UsagesHub {
                 serial: 0,
                 sources: Vec::new(),
                 structural: None,
+                waiting: None,
             }
         });
         let weak = hub.downgrade();
@@ -337,6 +370,11 @@ impl UsagesHub {
         cx: &mut Context<Self>,
     ) {
         self.structural = None;
+        // The results replace the tab that waited for them; the wait itself is over.
+        let waiting = self.waiting.take();
+        if let Some(waiting) = &waiting {
+            waiting.cancel.cancel();
+        }
         let mut options = cx
             .try_global::<PendingFindUsages>()
             .and_then(|pending| pending.0.clone());
@@ -376,8 +414,17 @@ impl UsagesHub {
             usages,
             options: options.clone(),
             pinned: false,
+            find: None,
         };
-        if new_tab {
+        let replaced = waiting.and_then(|waiting| {
+            self.tabs
+                .iter()
+                .position(|found| found.serial == waiting.serial)
+        });
+        if let Some(index) = replaced {
+            self.tabs[index] = tab;
+            self.active = index;
+        } else if new_tab {
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
         } else {
@@ -400,6 +447,89 @@ impl UsagesHub {
     ) {
         self.structural = Some(StructuralView { title, items, rows });
         self.regroup(cx);
+    }
+
+    /// Adds a tab with the query to the Find window: the places of a Find in Files search,
+    /// as a tree of files. A search that has not answered yet has no places; the tab runs
+    /// the search itself and shows its places when they come.
+    pub(crate) fn add_find_tab(
+        &mut self,
+        request: FindRequest,
+        found: Option<Found>,
+        cx: &mut Context<Self>,
+    ) {
+        self.structural = None;
+        self.serial += 1;
+        let serial = self.serial;
+        let name = request.pattern();
+        let (items, rows) = match &found {
+            Some((_, results)) => {
+                let icons = self.file_icons(cx);
+                find_tree(results, &self.root, &icons)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        self.tabs.push(UsagesTab {
+            serial,
+            name: name.clone(),
+            prefix: format!("Find \"{name}\""),
+            usages: Vec::new(),
+            excluded: Vec::new(),
+            options: None,
+            pinned: false,
+            find: Some(FindView {
+                items,
+                rows,
+                request: request.clone(),
+            }),
+        });
+        self.active = self.tabs.len() - 1;
+        self.regroup(cx);
+        if found.is_none() {
+            repeat_search(cx.weak_entity(), serial, &request, cx);
+        }
+    }
+
+    /// The places a repeated search found, for the tab that asked for them.
+    pub(crate) fn replace_find(
+        &mut self,
+        serial: u64,
+        (outcome, found): Found,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.serial == serial && tab.find.is_some())
+        else {
+            return;
+        };
+        if let Err(error) = outcome {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user("Find in Files", error.to_string(), cx)
+                })
+                .ok();
+        }
+        let icons = self.file_icons(cx);
+        let (items, rows) = find_tree(&found, &self.root, &icons);
+        if let Some(view) = self.tabs[index].find.as_mut() {
+            view.items = items;
+            view.rows = rows;
+        }
+        if index == self.active {
+            self.regroup(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// The icons of the files of the project, as the workspace has them.
+    fn file_icons(&self, cx: &App) -> FileIcons {
+        self.workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).icons().clone())
+            .unwrap_or_default()
     }
 
     /// Asks the language for the member and hierarchy searches of the options, then
@@ -615,6 +745,16 @@ impl UsagesHub {
         if index >= self.tabs.len() {
             return;
         }
+        // A tab that waits for the language server takes its wait with it.
+        let closing = self.tabs[index].serial;
+        if self
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.serial == closing)
+            && let Some(waiting) = self.waiting.take()
+        {
+            waiting.cancel.cancel();
+        }
         self.tabs.remove(index);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
@@ -622,6 +762,90 @@ impl UsagesHub {
             self.active -= 1;
         }
         self.regroup(cx);
+    }
+
+    /// Adds the tab of a search that waits for the language server, and shows it with the
+    /// waiting line. The results replace it. A new wait replaces the one before it, and
+    /// `cancel` ends the wait: the tab closes, the window hides or Escape is pressed.
+    pub fn wait_for_search(
+        &mut self,
+        name: String,
+        in_file: bool,
+        cancel: ::base::Cancel,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.waiting.take();
+        if let Some(previous) = &previous {
+            previous.cancel.cancel();
+        }
+        self.serial += 1;
+        let serial = self.serial;
+        let tab = UsagesTab {
+            serial,
+            name,
+            prefix: if in_file {
+                "Usages in file".to_owned()
+            } else {
+                "Usages".to_owned()
+            },
+            usages: Vec::new(),
+            excluded: Vec::new(),
+            options: None,
+            pinned: false,
+            find: None,
+        };
+        let replaced = previous.and_then(|previous| {
+            self.tabs
+                .iter()
+                .position(|found| found.serial == previous.serial)
+        });
+        match replaced {
+            Some(index) => {
+                self.tabs[index] = tab;
+                self.active = index;
+            }
+            None => {
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+            }
+        }
+        // Closing the tool window hides it, and the wait ends with it.
+        let watch = self.workspace.upgrade().map(|workspace| {
+            cx.observe(&workspace, |hub: &mut Self, workspace, cx| {
+                if !workspace.read(cx).tool_open(USAGES_TOOL) {
+                    hub.cancel_wait(cx);
+                }
+            })
+        });
+        self.waiting = Some(Waiting {
+            serial,
+            cancel,
+            _watch: watch,
+        });
+        self.regroup(cx);
+    }
+
+    /// Ends the wait of the tab that waits for the language server: the tab closes, and the
+    /// search does not run when the server is ready.
+    fn cancel_wait(&mut self, cx: &mut Context<Self>) {
+        let Some(waiting) = self.waiting.take() else {
+            return;
+        };
+        waiting.cancel.cancel();
+        match self
+            .tabs
+            .iter()
+            .position(|tab| tab.serial == waiting.serial)
+        {
+            Some(index) => self.close_tab(index, cx),
+            None => self.regroup(cx),
+        }
+    }
+
+    /// Whether a tab waits for the language server, for the tests.
+    #[cfg(test)]
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.waiting.is_some()
     }
 
     /// Pins or unpins the tab at `index`.
@@ -729,7 +953,16 @@ impl UsagesHub {
 
     /// Builds the rows from the usages, the filters and the grouping of the settings.
     pub fn regroup(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
         let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        // The list of the tab that waits says so where the rows would be.
+        let waiting = self
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| self.tab().is_some_and(|tab| tab.serial == waiting.serial));
+        let empty = if waiting { WAITING_LINE } else { NO_USAGES };
+        self.panel
+            .update(cx, |panel, cx| panel.set_empty(empty, cx));
         if let Some(view) = &self.structural {
             let items = view.items.clone();
             let rows = view.rows.clone();
@@ -739,6 +972,37 @@ impl UsagesHub {
                 panel.set_header_buttons(Vec::new(), cx);
                 panel.set_view(items, rows, cx);
                 panel.set_counted_title(&title, cx);
+            });
+            return;
+        }
+        let find = self.tabs.get(self.active).and_then(|tab| {
+            let view = tab.find.as_ref()?;
+            Some((
+                tab.serial,
+                tab.prefix.clone(),
+                view.items.clone(),
+                view.rows.clone(),
+                view.request.clone(),
+            ))
+        });
+        if let Some((serial, prefix, items, rows, request)) = find {
+            let weak = cx.weak_entity();
+            let rerun = HeaderButton {
+                id: "find-rerun",
+                label: "Rerun".to_owned(),
+                active: false,
+                icon: Some("general/refresh"),
+                tooltip: Some("Rerun".to_owned()),
+                shortcut: None,
+                run: std::rc::Rc::new(move |_, cx| {
+                    repeat_search(weak.clone(), serial, &request, cx)
+                }),
+            };
+            self.sources = (0..items.len()).collect();
+            self.panel.update(cx, |panel, cx| {
+                panel.set_header_buttons(vec![rerun], cx);
+                panel.set_view(items, rows, cx);
+                panel.set_counted_title(&prefix, cx);
             });
             return;
         }
@@ -1011,6 +1275,12 @@ impl Render for UsagesHub {
             .flex()
             .flex_col()
             .size_full()
+            // While a search waits for the language server, Escape ends the wait before the
+            // window gives the focus back to the editor.
+            .when(self.waiting.is_some(), |this| {
+                this.key_context(WAITING_CONTEXT)
+                    .on_action(cx.listener(|this, _: &CancelWait, _, cx| this.cancel_wait(cx)))
+            })
             .children(strip)
             .child(self.panel.clone())
     }
@@ -1607,9 +1877,8 @@ impl Render for FindUsagesSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let viewport = window.viewport_size();
-        let width = px(420.);
-        let left = (viewport.width - width) / 2.;
-        let top = viewport.height * 0.2;
+        let left = (f32::from(viewport.width) - 420.) / 2.;
+        let top = f32::from(viewport.height) * 0.2;
         let hover = theme.hover;
         let scopes: Vec<_> = FindUsagesScope::ALL
             .iter()
@@ -1749,21 +2018,16 @@ impl Render for FindUsagesSettings {
                 }
             }
         }
-        let body = surface(&theme)
+        let shell = surface(&theme)
             .id("find-usages-settings")
             .debug_selector(|| "find-usages-settings".to_owned())
             .track_focus(&self.focus)
-            .occlude()
-            .w(width)
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+        let contents = div()
+            .flex()
+            .flex_col()
             .p(px(DIALOG_PADDING))
             .gap(px(SPACE_S))
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .pb(px(SPACE_S))
-                    .child("Find Usages"),
-            )
             .child(div().text_color(theme.text_secondary).child("Search in"))
             .children(scopes)
             .child(
@@ -1812,11 +2076,26 @@ impl Render for FindUsagesSettings {
                             .child("Find"),
                     ),
             );
-        div()
-            .absolute()
-            .left(left)
-            .top(top)
-            .child(enter("find-usages-enter", body))
+        let close = cx.listener(|this, _: &ClickEvent, window, cx| this.dismiss(window, cx));
+        dialog_window(
+            DialogSpec {
+                key: "find-usages",
+                title: "Find Usages".into(),
+                extra: None,
+                place: DialogPlace {
+                    left,
+                    top,
+                    width: 420.,
+                    height: None,
+                },
+                min: (360., 240.),
+            },
+            shell,
+            window,
+            cx,
+            close,
+            contents,
+        )
     }
 }
 

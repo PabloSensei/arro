@@ -26,10 +26,20 @@ const HEIGHT_SHARE: f32 = 0.8;
 const MIN_SIZE: (f32, f32) = (640., 420.);
 /// The width of the list of connections.
 const LIST_WIDTH: f32 = 240.;
-/// The width of the labels of the form.
-const LABEL_WIDTH: f32 = 96.;
-/// The height of a field of the form.
-const FIELD_HEIGHT: f32 = 26.;
+/// Every label the form can show. The label column is measured with all of them, so it keeps
+/// its width when a row comes and goes.
+const FORM_LABELS: &[&str] = &[
+    "Name",
+    "Database",
+    "Host",
+    "Port",
+    "File",
+    "Address",
+    "User",
+    "Password",
+    "Driver jar",
+    "Driver version",
+];
 /// The file a new H2 or SQLite connection points at, until the user picks another one.
 const DEFAULT_FILE: &str = "~/test";
 /// The products the window offers, in the order of its lists.
@@ -934,11 +944,33 @@ impl DataSourcesDialog {
         cx.notify();
     }
 
-    /// The File field with the button that picks the file of the database on the disk.
-    fn with_browse(&self, input: Stateful<Div>, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let browse = small_button("database-browse-file", "Browse…", theme)
-            .debug_selector(|| "data-sources-browse".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| this.browse_file(cx)));
+    /// A field with the button that picks a file on the disk: the file of the database or
+    /// the jar of a driver.
+    fn with_browse(
+        &self,
+        field: Field,
+        input: Stateful<Div>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (id, selector, label, prompt) = match field {
+            Field::Driver => (
+                "database-browse-driver",
+                "data-sources-browse-driver",
+                "…",
+                "Choose Driver Jar",
+            ),
+            _ => (
+                "database-browse-file",
+                "data-sources-browse",
+                "Browse…",
+                "Choose Database File",
+            ),
+        };
+        let browse = small_button(id, label, theme)
+            .debug_selector(move || selector.to_owned())
+            .tooltip(move |_, cx| tooltip(prompt.to_owned(), None, cx))
+            .on_click(cx.listener(move |this, _, _, cx| this.browse_file(field, cx)));
         div()
             .flex()
             .items_center()
@@ -947,14 +979,19 @@ impl DataSourcesDialog {
             .child(browse)
     }
 
-    /// Asks for the file of the database with the system dialog. The file the user picks goes
-    /// into the File field, and the address is built again from it.
-    fn browse_file(&mut self, cx: &mut Context<Self>) {
+    /// Asks for the file of the database or the jar of a driver with the system dialog. The
+    /// file the user picks goes into the field, and an address is built again from its parts.
+    fn browse_file(&mut self, field: Field, cx: &mut Context<Self>) {
+        let prompt = if field == Field::Driver {
+            "Choose Driver Jar"
+        } else {
+            "Choose Database File"
+        };
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose Database File".into()),
+            prompt: Some(prompt.into()),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else {
@@ -963,19 +1000,27 @@ impl DataSourcesDialog {
             let Some(chosen) = paths.into_iter().next() else {
                 return;
             };
-            this.update(cx, |this, cx| this.file_picked(chosen, cx))
+            this.update(cx, |this, cx| this.picked(field, chosen, cx))
                 .ok();
         })
         .detach();
     }
 
-    /// Puts the file the user picked into the File field of the selected connection.
-    pub(crate) fn file_picked(&mut self, chosen: PathBuf, cx: &mut Context<Self>) {
+    /// Puts the file the user picked into `field` of the selected connection.
+    fn picked(&mut self, field: Field, chosen: PathBuf, cx: &mut Context<Self>) {
         if let Some(draft) = self.selected_draft_mut() {
-            *draft.field_mut(Field::File) = TextField::from_text(chosen.display().to_string());
-            draft.rebuild_url();
+            *draft.field_mut(field) = TextField::from_text(chosen.display().to_string());
+            if field == Field::File {
+                draft.rebuild_url();
+            }
         }
         cx.notify();
+    }
+
+    /// Puts the file the user picked into the File field of the selected connection.
+    #[cfg(test)]
+    pub(crate) fn file_picked(&mut self, chosen: PathBuf, cx: &mut Context<Self>) {
+        self.picked(Field::File, chosen, cx);
     }
 
     /// OK and Apply: every connection of the list goes to the panel, after the removed ones.
@@ -1045,7 +1090,7 @@ impl DataSourcesDialog {
                 .items_center()
                 .flex_1()
                 .min_w(px(0.))
-                .h(px(FIELD_HEIGHT))
+                .h(px(CONTROL_HEIGHT))
                 .px(px(SPACE_M))
                 .rounded(px(CONTROL_RADIUS))
                 .border_1()
@@ -1081,20 +1126,9 @@ impl DataSourcesDialog {
         )
     }
 
-    /// A label and a field of the form on one row.
-    fn row(label: &str, field: impl IntoElement, theme: &Theme) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(SPACE_M))
-            .child(
-                div()
-                    .w(px(LABEL_WIDTH))
-                    .flex_none()
-                    .text_color(theme.text_muted)
-                    .child(label.to_owned()),
-            )
-            .child(field)
+    /// A label and a field of the form on one row, the label in the column of `width`.
+    fn row(width: f32, label: &str, field: impl IntoElement, theme: &Theme) -> Div {
+        form_row(width, label, field, theme)
     }
 
     /// The list of connections with its toolbar, the `+` products and the suggestions.
@@ -1261,8 +1295,9 @@ impl DataSourcesDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let width = form_label_width(window, FORM_LABELS);
         let body = match self.selected_draft() {
-            Some(draft) => self.form_body(draft, theme, cx),
+            Some(draft) => self.form_body(draft, width, theme, cx),
             None => div()
                 .debug_selector(|| "data-sources-empty".to_owned())
                 .text_color(theme.text_muted)
@@ -1288,17 +1323,17 @@ impl DataSourcesDialog {
         .into_any_element()
     }
 
-    fn form_body(&self, draft: &Draft, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn form_body(&self, draft: &Draft, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let visible = self.visible_fields(draft);
         let shows = |field: Field| visible.contains(&field);
         let mut body = div().flex().flex_col().gap(px(SPACE_M)).min_w(px(0.));
         let name = self.text_field(Field::Name, theme, cx);
-        body = body.children(name.map(|field| Self::row("Name", field, theme)));
+        body = body.children(name.map(|field| Self::row(width, "Name", field, theme)));
 
         let kind = self.kind_row(draft, theme, cx);
-        body = body.child(Self::row("Database", kind, theme));
+        body = body.child(Self::row(width, "Database", kind, theme));
         if self.kind_open {
-            let mut list = div().flex().flex_col().pl(px(LABEL_WIDTH));
+            let mut list = div().flex().flex_col();
             for (index, kind) in KINDS.iter().enumerate() {
                 let kind = *kind;
                 let chosen = kind == draft.kind;
@@ -1323,7 +1358,7 @@ impl DataSourcesDialog {
                         .on_click(cx.listener(move |this, _, _, cx| this.set_kind(kind, cx))),
                 );
             }
-            body = body.child(list);
+            body = body.child(form_aligned(width, list));
         }
 
         for (field, label) in [
@@ -1336,28 +1371,29 @@ impl DataSourcesDialog {
                 && let Some(input) = self.text_field(field, theme, cx)
             {
                 let input = if field == Field::File {
-                    self.with_browse(input, theme, cx).into_any_element()
+                    self.with_browse(field, input, theme, cx).into_any_element()
                 } else {
                     input.into_any_element()
                 };
-                body = body.child(Self::row(label, input, theme));
+                body = body.child(Self::row(width, label, input, theme));
             }
         }
         if let Some(input) = self.text_field(Field::Url, theme, cx) {
-            body = body.child(Self::row("Address", input, theme));
+            body = body.child(Self::row(width, "Address", input, theme));
         }
         if let Some(input) = self.text_field(Field::User, theme, cx) {
-            body = body.child(Self::row("User", input, theme));
+            body = body.child(Self::row(width, "User", input, theme));
         }
         if let Some(input) = self.text_field(Field::Password, theme, cx) {
-            body = body.child(Self::row("Password", input, theme));
+            body = body.child(Self::row(width, "Password", input, theme));
         }
         body = body.child(Self::row(
+            width,
             "",
             self.save_password_row(draft, theme, cx),
             theme,
         ));
-        body = body.child(self.driver_section(draft, shows(Field::Version), theme, cx));
+        body = body.child(self.driver_section(draft, shows(Field::Version), width, theme, cx));
         body
     }
 
@@ -1371,7 +1407,7 @@ impl DataSourcesDialog {
             .min_w(px(0.))
             .items_center()
             .justify_between()
-            .h(px(FIELD_HEIGHT))
+            .h(px(CONTROL_HEIGHT))
             .px(px(SPACE_M))
             .rounded(px(CONTROL_RADIUS))
             .border_1()
@@ -1430,6 +1466,7 @@ impl DataSourcesDialog {
         &self,
         draft: &Draft,
         versions_shown: bool,
+        width: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -1452,13 +1489,16 @@ impl DataSourcesDialog {
                 .child(status),
         );
         if let Some(input) = self.text_field(Field::Driver, theme, cx) {
-            section = section.child(Self::row("Driver jar", input, theme));
+            let input = self
+                .with_browse(Field::Driver, input, theme, cx)
+                .into_any_element();
+            section = section.child(Self::row(width, "Driver jar", input, theme));
         }
         let Some(package) = package else {
             return section;
         };
         if versions_shown && let Some(input) = self.text_field(Field::Version, theme, cx) {
-            section = section.child(Self::row("Driver version", input, theme));
+            section = section.child(Self::row(width, "Driver version", input, theme));
         }
         if !self.versions.is_empty() {
             let mut choices = div().flex().flex_wrap().items_center().gap(px(SPACE_XS));
@@ -1477,10 +1517,11 @@ impl DataSourcesDialog {
                         })),
                 );
             }
-            section = section.child(Self::row("", choices, theme));
+            section = section.child(Self::row(width, "", choices, theme));
         }
         if self.versions_loading {
             section = section.child(Self::row(
+                width,
                 "",
                 div()
                     .text_size(px(TEXT_SMALL))
@@ -1490,6 +1531,7 @@ impl DataSourcesDialog {
             ));
         } else if let Some(reason) = self.versions_error.clone() {
             section = section.child(Self::row(
+                width,
                 "",
                 div()
                     .text_size(px(TEXT_SMALL))
@@ -1533,9 +1575,10 @@ impl DataSourcesDialog {
                     package.coordinate, package.license, package.repository
                 )),
         );
-        section = section.child(Self::row("", line, theme));
+        section = section.child(Self::row(width, "", line, theme));
         if let Some(error) = self.driver_error.clone() {
             section = section.child(Self::row(
+                width,
                 "",
                 div()
                     .text_size(px(TEXT_SMALL))

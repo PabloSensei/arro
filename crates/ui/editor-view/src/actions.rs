@@ -150,6 +150,11 @@ pub(crate) enum Pick {
         word: String,
         project: bool,
     },
+    /// A line that says more actions come once the language server has imported the
+    /// project. It is greyed out, and the selection never rests on it.
+    Waiting {
+        label: String,
+    },
 }
 
 impl Pick {
@@ -168,11 +173,17 @@ impl Pick {
             | Self::DisableInspection { label, .. }
             | Self::EditInspection { label, .. }
             | Self::Spelling { label, .. }
-            | Self::SaveSpelling { label, .. } => label,
+            | Self::SaveSpelling { label, .. }
+            | Self::Waiting { label } => label,
             Self::CreateTest { .. } => "Create Test",
             Self::InlineWatch { .. } => "Add Inline Watch",
             Self::FixWithAi { .. } => "Fix with AI",
         }
+    }
+
+    /// Whether the row is the greyed line of a list that waits for the server.
+    pub fn is_waiting(&self) -> bool {
+        matches!(self, Self::Waiting { .. })
     }
 
     /// The key beside the row, as the menus write it.
@@ -207,12 +218,37 @@ pub(crate) struct ActionMenu {
     /// The question for the preview of the selected row, while the language computes
     /// the edit on resolve. Dropping it cancels the question.
     pub preview_task: Option<Task<()>>,
+    /// The heading of the list, for the menus that have one, such as Generate.
+    pub title: Option<&'static str>,
 }
 
 impl ActionMenu {
     pub fn window(&self) -> Range<usize> {
         let start = self.selected.saturating_sub(crate::semantic::MAX_SHOWN - 1);
         start..(start + crate::semantic::MAX_SHOWN).min(self.rows.len())
+    }
+
+    /// Whether the selection may rest on the row: the greyed line of a waiting list may not.
+    pub fn selectable(&self, row: usize) -> bool {
+        self.rows.get(row).is_some_and(|pick| !pick.is_waiting())
+    }
+
+    /// The next selectable row after `from`, moving down or up and wrapping around. `from`
+    /// stays when no other row can be selected.
+    pub fn step(&self, from: usize, down: bool) -> usize {
+        let count = self.rows.len();
+        let mut at = from;
+        for _ in 0..count {
+            at = if down {
+                (at + 1) % count
+            } else {
+                (at + count - 1) % count
+            };
+            if self.selectable(at) {
+                return at;
+            }
+        }
+        from
     }
 
     /// Whether the row is a quick fix, which carries the red bulb and comes first.
@@ -268,6 +304,8 @@ const OVERLAPPING: &str = "The language server sent overlapping edits, nothing w
 
 /// Alt+Enter with nothing to offer.
 const NO_ACTIONS: &str = "No actions available here";
+/// The greyed last line of Alt+Enter while the server imports: more actions come later.
+const IMPORTING_ACTIONS: &str = "More actions after the project is imported";
 
 /// Fix all found no fix it could apply to every place of the check.
 const NO_FIX_ALL: &str = "The language gave no fix for every place of the check";
@@ -552,6 +590,7 @@ impl EditorView {
                 sections: Vec::new(),
                 selected: 0,
                 preview_task: None,
+                title: None,
             });
             cx.notify();
         }
@@ -739,6 +778,19 @@ impl EditorView {
             }
             return;
         };
+        // While the server imports, the editor's own rows show at once with a greyed line
+        // that says more come later, and the server is not asked then.
+        let ready = self.server_ready();
+        if !ready && !own.is_empty() {
+            own.push((
+                MenuSection::Intention,
+                Pick::Waiting {
+                    label: IMPORTING_ACTIONS.to_owned(),
+                },
+            ));
+            self.show_action_sections(caret, own, cx);
+            return;
+        }
         let Some((uri, version, _)) = self.asked_version() else {
             return;
         };
@@ -751,6 +803,9 @@ impl EditorView {
                 only: None,
             },
         );
+        if !ready {
+            self.importing_note(caret, cx);
+        }
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
             this.update(cx, |this, cx| {
@@ -781,7 +836,7 @@ impl EditorView {
                 rows.extend(own);
                 if rows.is_empty() {
                     if unknown {
-                        this.show_transient_note(caret, NO_ANSWER, cx);
+                        this.show_unanswered(caret, true, cx);
                     } else {
                         this.show_transient_note(caret, NO_ACTIONS, cx);
                     }
@@ -819,6 +874,7 @@ impl EditorView {
             sections,
             selected: 0,
             preview_task: None,
+            title: None,
         });
         cx.notify();
         self.request_action_preview(cx);
@@ -1245,16 +1301,19 @@ impl EditorView {
         let Some(menu) = &mut lsp.actions else {
             return false;
         };
-        let rows = menu.rows.len();
         let mut moved = false;
+        // The greyed line of a waiting list picks nothing, and the selection skips it.
+        if matches!(key, "enter" | "tab") && !menu.selectable(menu.selected) {
+            return true;
+        }
         match key {
             "up" => {
-                menu.selected = (menu.selected + rows - 1) % rows;
+                menu.selected = menu.step(menu.selected, false);
                 menu.preview_task = None;
                 moved = true;
             }
             "down" => {
-                menu.selected = (menu.selected + 1) % rows;
+                menu.selected = menu.step(menu.selected, true);
                 menu.preview_task = None;
                 moved = true;
             }

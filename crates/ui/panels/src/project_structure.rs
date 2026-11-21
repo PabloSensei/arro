@@ -29,10 +29,10 @@ const BODY_HEIGHT: f32 = 380.;
 const DIALOG_HEIGHT: f32 = BODY_HEIGHT + 120.;
 const SECTIONS_WIDTH: f32 = 160.;
 const MODULES_WIDTH: f32 = 210.;
-const LABEL_WIDTH: f32 = 130.;
-const FIELD_HEIGHT: f32 = 26.;
-const LEVEL_WIDTH: f32 = 34.;
-const LEVEL_GRID_WIDTH: f32 = 330.;
+/// The language levels the Project page offers, as IDEA does.
+const LANGUAGE_LEVELS: [&str; 5] = ["8", "11", "17", "21", "25"];
+/// The item of the level list that follows the chosen SDK.
+const SDK_DEFAULT: &str = "SDK default";
 /// How many polls a build file gets to appear in an editor before the change gives up.
 const EDITOR_POLLS: usize = 200;
 const EDITOR_POLL: Duration = Duration::from_millis(10);
@@ -94,6 +94,8 @@ pub(crate) struct ProjectStructureDialog {
     language: Option<project_model::LanguageLevelInfo>,
     /// Read-only lines the language fills, such as a dependency it found.
     details: Vec<EnvironmentDetail>,
+    /// The width of the label columns of the pages, measured at the last frame.
+    label_width: f32,
     /// The model of the project, for the Modules page.
     model: Option<Arc<ProjectModel>>,
     /// The module the Modules page shows.
@@ -143,6 +145,7 @@ impl ProjectStructureDialog {
             notice: None,
             language: None,
             details: Vec::new(),
+            label_width: FORM_LABEL_MIN,
             model: None,
             selected_module: None,
             module_tab: ModuleTab::Sources,
@@ -207,7 +210,7 @@ impl ProjectStructureDialog {
             .as_deref()
             .and_then(|home| self.runtimes.iter().find(|runtime| runtime.home == home))
             .map(|runtime| runtime.name.clone())
-            .unwrap_or_else(|| "No SDK".to_owned())
+            .unwrap_or_else(|| SDK_DEFAULT.to_owned())
     }
 
     fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -420,6 +423,21 @@ impl ProjectStructureDialog {
     }
 
     fn choose_language(&mut self, target: LevelTarget, level: String, cx: &mut Context<Self>) {
+        let level = if level == SDK_DEFAULT {
+            // The SDK default is the level of the SDK in force: the build file cannot say
+            // "whatever the SDK says", so the number is written as it is.
+            match self.sdk_default_level() {
+                Some(level) => level,
+                None => {
+                    self.language_open = false;
+                    self.module_language_open = false;
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            level
+        };
         match target {
             LevelTarget::Project => {
                 self.project_level = Some(level);
@@ -432,6 +450,15 @@ impl ProjectStructureDialog {
         }
         self.preview(target, cx);
         cx.notify();
+    }
+
+    /// The language level of the SDK the project uses, when the SDK list knows it.
+    fn sdk_default_level(&self) -> Option<String> {
+        let selected = self.selected.as_deref()?;
+        self.runtimes
+            .iter()
+            .find(|runtime| runtime.home == selected)
+            .map(|runtime| runtime.feature.to_string())
     }
 
     /// Reads what OK would write, so the form can say it before the user presses it.
@@ -795,7 +822,7 @@ impl ProjectStructureDialog {
                 .flex()
                 .items_center()
                 .gap(px(SPACE_XS))
-                .h(px(FIELD_HEIGHT))
+                .h(px(CONTROL_HEIGHT))
                 .pl(px(depth as f32 * SPACE_M))
                 .pr(px(ROW_PADDING_X))
                 .rounded(px(ROW_RADIUS))
@@ -884,14 +911,8 @@ impl ProjectStructureDialog {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_M))
-                    .min_h(px(FIELD_HEIGHT))
-                    .child(
-                        div()
-                            .w(px(LABEL_WIDTH))
-                            .flex_none()
-                            .text_color(theme.text_muted)
-                            .child(label),
-                    )
+                    .min_h(px(CONTROL_HEIGHT))
+                    .child(form_label(self.label_width, label, theme))
                     .child(
                         div()
                             .min_w(px(0.))
@@ -956,7 +977,7 @@ impl ProjectStructureDialog {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_M))
-                    .h(px(FIELD_HEIGHT))
+                    .h(px(CONTROL_HEIGHT))
                     .pl(px(row.depth as f32 * SPACE_M))
                     .pr(px(ROW_PADDING_X))
                     .rounded(px(ROW_RADIUS))
@@ -1081,7 +1102,7 @@ impl ProjectStructureDialog {
                 .debug_selector(move || selector)
                 .flex()
                 .items_center()
-                .h(px(FIELD_HEIGHT))
+                .h(px(CONTROL_HEIGHT))
                 .px(px(SPACE_M))
                 .rounded(px(TAB_RADIUS))
                 .when(chosen, |this| {
@@ -1149,7 +1170,7 @@ impl ProjectStructureDialog {
             .child(content)
     }
 
-    /// The field of one language level: the value, the levels under it and what the
+    /// The field of one language level: the value and the levels under it, and what the
     /// next OK writes.
     fn language_field(
         &self,
@@ -1159,7 +1180,6 @@ impl ProjectStructureDialog {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let values = info.map(|info| info.values.clone()).unwrap_or_default();
         let picked = match target {
             LevelTarget::Project => self.project_level.clone(),
             LevelTarget::Module => self.module_level.clone(),
@@ -1180,92 +1200,75 @@ impl ProjectStructureDialog {
             .and_then(|info| info.file.as_ref())
             .and_then(|file| file.file_name())
             .map(|name| name.to_string_lossy().into_owned());
-        let can_choose = !values.is_empty() && info.and_then(|info| info.file.as_ref()).is_some();
-        let field = div()
-            .id(format!("{prefix}-field"))
+        let can_choose = info.is_some_and(|info| info.file.is_some());
+        let field = select_field(format!("{prefix}-field"), selected, open, theme)
             .debug_selector(move || prefix.to_owned())
-            .flex()
-            .items_center()
-            .h(px(FIELD_HEIGHT))
-            .min_w(px(0.))
             .flex_1()
-            .px(px(SPACE_M))
-            .rounded(px(CONTROL_RADIUS))
-            .border_1()
-            .border_color(if open {
-                theme.accent
-            } else {
-                theme.control_border
-            })
-            .text_color(theme.text)
-            .when(can_choose, |this| this.cursor_pointer())
-            .child(selected)
+            .when(!can_choose, |this| this.cursor_default())
             .on_click(cx.listener(move |this, _, _, cx| {
                 if can_choose {
                     this.toggle_language(target, cx);
                 }
             }));
         let items = open.then(|| {
-            let mut grid = div()
-                .flex()
-                .flex_wrap()
-                .gap(px(SPACE_XS))
-                .w(px(LEVEL_GRID_WIDTH));
-            for value in values {
+            let mut menu = select_menu(theme).debug_selector({
+                let prefix = prefix.to_owned();
+                move || format!("{prefix}-menu")
+            });
+            for value in level_values(info) {
                 let chosen = info
                     .and_then(|info| info.selected.as_deref())
                     .is_some_and(|selected| selected == value)
                     || picked.as_deref() == Some(value.as_str());
                 let level = value.clone();
                 let element_id = format!("{prefix}-{value}");
-                grid = grid.child(
-                    div()
-                        .id(element_id)
-                        .debug_selector({
-                            let prefix = prefix.to_owned();
-                            let value = value.clone();
-                            move || format!("{prefix}-item-{value}")
-                        })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(LEVEL_WIDTH))
-                        .h(px(FIELD_HEIGHT))
-                        .rounded(px(CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(theme.control_border)
-                        .when(chosen, |this| {
-                            this.bg(theme.selection).border_color(theme.accent)
-                        })
-                        .hover({
-                            let hover = theme.hover;
-                            move |style| style.bg(hover)
-                        })
-                        .child(value)
+                let selection = value.clone();
+                let selector = {
+                    let prefix = prefix.to_owned();
+                    move || format!("{prefix}-item-{selection}")
+                };
+                menu = menu.child(
+                    select_option(element_id, value, chosen, chosen, theme)
+                        .debug_selector(selector)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.choose_language(target, level.clone(), cx)
                         })),
                 );
             }
+            menu = menu.child(
+                select_option(
+                    format!("{prefix}-{SDK_DEFAULT}"),
+                    SDK_DEFAULT,
+                    false,
+                    false,
+                    theme,
+                )
+                .debug_selector({
+                    let prefix = prefix.to_owned();
+                    move || format!("{prefix}-item-sdk-default")
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.choose_language(target, SDK_DEFAULT.to_owned(), cx)
+                })),
+            );
+            let note = div()
+                .text_size(px(TEXT_SMALL))
+                .text_color(theme.text_muted)
+                .child(match (&file, target) {
+                    (Some(file), LevelTarget::Project) => {
+                        format!("The level of the whole project, written to {file}")
+                    }
+                    (Some(file), LevelTarget::Module) => {
+                        format!("The level of this module, written to {file}")
+                    }
+                    (None, _) => "The build file names no place for the level".to_owned(),
+                });
             div()
                 .flex()
                 .flex_col()
                 .gap(px(SPACE_XS))
-                .child(grid)
-                .child(
-                    div()
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.text_muted)
-                        .child(match (&file, target) {
-                            (Some(file), LevelTarget::Project) => {
-                                format!("The level of the whole project, written to {file}")
-                            }
-                            (Some(file), LevelTarget::Module) => {
-                                format!("The level of this module, written to {file}")
-                            }
-                            (None, _) => "The build file names no place for the level".to_owned(),
-                        }),
-                )
+                .child(menu)
+                .child(note)
                 .into_any_element()
         });
         let summary = summary.map(|summary| {
@@ -1287,13 +1290,7 @@ impl ProjectStructureDialog {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .w(px(LABEL_WIDTH))
-                            .flex_none()
-                            .text_color(theme.text_muted)
-                            .child("Language level"),
-                    )
+                    .child(form_label(self.label_width, "Language level", theme))
                     .child(field),
             )
             .children(items)
@@ -1302,60 +1299,54 @@ impl ProjectStructureDialog {
 
     fn project_page(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let name = self.selected_name();
-        let dropdown = div()
-            .id("project-structure-sdk")
+        let dropdown = select_field("project-structure-sdk", name, self.sdk_open, theme)
             .debug_selector(|| "project-structure-sdk".to_owned())
-            .flex()
-            .items_center()
-            .h(px(FIELD_HEIGHT))
-            .min_w(px(0.))
             .flex_1()
-            .px(px(SPACE_M))
-            .rounded(px(CONTROL_RADIUS))
-            .border_1()
-            .border_color(if self.sdk_open {
-                theme.accent
-            } else {
-                theme.control_border
-            })
-            .text_color(theme.text)
-            .cursor_pointer()
-            .child(name)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sdk_open = !this.sdk_open;
                 cx.notify();
             }));
 
         let items = self.sdk_open.then(|| {
-            let rows = self.runtimes.iter().enumerate().map(|(index, runtime)| {
+            let mut menu =
+                select_menu(theme).debug_selector(|| "project-structure-sdk-menu".to_owned());
+            menu = menu.child(
+                select_option(
+                    "project-structure-sdk-default",
+                    SDK_DEFAULT,
+                    self.selected.is_none(),
+                    self.selected.is_none(),
+                    theme,
+                )
+                .debug_selector(|| "project-structure-sdk-default".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.selected = None;
+                    this.sdk_open = false;
+                    this.error = None;
+                    cx.notify();
+                })),
+            );
+            for (index, runtime) in self.runtimes.iter().enumerate() {
                 let label = format!("{}  {}", runtime.name, runtime.version);
                 let chosen = self.selected.as_deref() == Some(runtime.home.as_path());
-                div()
-                    .id(("project-structure-sdk-item", index))
+                menu = menu.child(
+                    select_option(
+                        ("project-structure-sdk-item", index),
+                        label,
+                        chosen,
+                        chosen,
+                        theme,
+                    )
                     .debug_selector(move || format!("project-structure-sdk-item-{index}"))
-                    .flex()
-                    .items_center()
-                    .h(px(FIELD_HEIGHT))
-                    .px(px(SPACE_M))
-                    .text_color(if chosen {
-                        theme.text
-                    } else {
-                        theme.text_secondary
-                    })
-                    .when(chosen, |this| this.bg(theme.selection))
-                    .hover({
-                        let hover = theme.hover;
-                        move |style| style.bg(hover)
-                    })
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose(index, cx)))
-            });
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose(index, cx))),
+                );
+            }
             let add = div()
                 .id("project-structure-add-jdk")
                 .debug_selector(|| "project-structure-add-jdk".to_owned())
                 .flex()
                 .items_center()
-                .h(px(FIELD_HEIGHT))
+                .h(px(CONTROL_HEIGHT))
                 .px(px(SPACE_M))
                 .text_color(theme.text)
                 .hover({
@@ -1367,11 +1358,8 @@ impl ProjectStructureDialog {
             div()
                 .flex()
                 .flex_col()
-                .border_1()
-                .border_color(theme.control_border)
-                .rounded(px(CONTROL_RADIUS))
-                .children(rows)
-                .child(add)
+                .gap(px(SPACE_XS))
+                .child(menu.child(add))
                 .into_any_element()
         });
 
@@ -1406,13 +1394,7 @@ impl ProjectStructureDialog {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .w(px(LABEL_WIDTH))
-                            .flex_none()
-                            .text_color(theme.text_muted)
-                            .child("Project SDK"),
-                    )
+                    .child(form_label(self.label_width, "Project SDK", theme))
                     .child(dropdown),
             )
             .children(items)
@@ -1432,13 +1414,7 @@ impl ProjectStructureDialog {
                     .flex()
                     .items_center()
                     .gap(px(SPACE_M))
-                    .child(
-                        div()
-                            .w(px(LABEL_WIDTH))
-                            .flex_none()
-                            .text_color(theme.text_muted)
-                            .child(format!("{}:", detail.label)),
-                    )
+                    .child(form_label(self.label_width, &detail.label, theme))
                     .child(
                         div()
                             .debug_selector(move || {
@@ -1505,7 +1481,7 @@ impl ProjectStructureDialog {
                 .items_center()
                 .justify_between()
                 .gap(px(SPACE_M))
-                .min_h(px(FIELD_HEIGHT))
+                .min_h(px(CONTROL_HEIGHT))
                 .child(
                     div()
                         .flex()
@@ -1612,6 +1588,21 @@ fn reason_text(reason: RuntimeReason) -> &'static str {
     }
 }
 
+/// The levels the field offers: the ones IDEA lists, and the level of the build file when
+/// it is not among them, so that the current value stays visible.
+fn level_values(info: Option<&LanguageLevelInfo>) -> Vec<String> {
+    let mut values: Vec<String> = LANGUAGE_LEVELS
+        .iter()
+        .map(|level| (*level).to_owned())
+        .collect();
+    if let Some(selected) = info.and_then(|info| info.selected.as_deref())
+        && !values.iter().any(|value| value == selected)
+    {
+        values.push(selected.to_owned());
+    }
+    values
+}
+
 fn section_row(
     id: &'static str,
     selector: &'static str,
@@ -1626,7 +1617,7 @@ fn section_row(
         .debug_selector(move || selector.to_owned())
         .flex()
         .items_center()
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(ROW_PADDING_X))
         .rounded(px(CONTROL_RADIUS))
         .text_color(if chosen {
@@ -1656,7 +1647,7 @@ fn small_button(
         .flex()
         .items_center()
         .justify_center()
-        .h(px(FIELD_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_M))
         .rounded(px(CONTROL_RADIUS))
         .border_1()
@@ -1670,6 +1661,23 @@ fn small_button(
 impl Render for ProjectStructureDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        // The label column of every page fits the widest label of the pages: the fixed labels,
+        // and the labels of the details the language reads.
+        let mut labels: Vec<String> = [
+            "Sources",
+            "Tests",
+            "Resources",
+            "Generated",
+            "Excluded",
+            "Language level",
+            "Project SDK",
+        ]
+        .iter()
+        .map(|label| label.to_string())
+        .collect();
+        labels.extend(self.details.iter().map(|detail| detail.label.clone()));
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        self.label_width = form_label_width(window, &refs);
         let viewport = window.viewport_size();
         let width = px(WIDTH);
         let left = (viewport.width - width) / 2.;

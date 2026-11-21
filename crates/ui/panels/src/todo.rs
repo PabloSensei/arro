@@ -18,6 +18,13 @@ use crate::script::ActiveRunPanel;
 const SKIPPED: &[&str] = &[".git", ".idea", "node_modules"];
 /// A bigger file is data, not text a person wrote.
 const MAX_FILE_BYTES: u64 = 1 << 20;
+const MODULE_ICON: &str = "nodes/module";
+const PACKAGE_ICON: &str = "nodes/package";
+const FOLDER_ICON: &str = "nodes/folder";
+/// The icon of a mark, as the TODO window of IDEA shows it.
+const MATCH_ICON: &str = "toolwindows/todo";
+/// The icon of a file whose type the project does not name.
+const FILE_ICON: &str = "fileTypes/text";
 /// The patterns of a project that never opened the Settings window.
 #[cfg(test)]
 const DEFAULT_KEYWORDS: [&str; 2] = ["TODO", "FIXME"];
@@ -259,24 +266,16 @@ fn keywords_of(settings: &Settings) -> Vec<String> {
 fn items_of(root: &Path, marks: Vec<(PathBuf, Mark)>) -> Vec<Item> {
     marks
         .into_iter()
-        .map(|(path, mark)| {
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            let hint = format!("{}:{}", relative.display(), mark.line + 1);
-            let label = if mark.text.is_empty() {
-                mark.keyword.to_string()
-            } else {
-                format!("{} {}", mark.keyword, mark.text)
-            };
-            Item {
-                path,
-                line: mark.line,
-                column: mark.column,
-                label,
-                hint: hint.replace('\\', "/"),
-                icon: "status/info",
-            }
-        })
+        .map(|(path, mark)| item_of(root, &path, &mark, MATCH_ICON))
         .collect()
+}
+
+/// The icon of the file, as the Project tree and the tabs give it.
+fn file_icon(panel: &ItemsPanel, path: &Path, cx: &App) -> &'static str {
+    panel
+        .workspace()
+        .read_with(cx, |workspace, _| workspace.icons().icon_for(path))
+        .unwrap_or(FILE_ICON)
 }
 
 pub fn create(root: PathBuf, workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<ItemsPanel> {
@@ -455,7 +454,7 @@ pub fn regroup(panel: &mut ItemsPanel, cx: &mut Context<ItemsPanel>) {
         .template
         .clone()
         .filter(|name| data.keywords.contains(name));
-    let mut entries: Vec<(Vec<String>, Item)> = data
+    let mut entries: Vec<(Vec<(String, &'static str)>, Item)> = data
         .marks
         .iter()
         .filter(|(path, mark)| {
@@ -473,7 +472,7 @@ pub fn regroup(panel: &mut ItemsPanel, cx: &mut Context<ItemsPanel>) {
             }
         })
         .map(|(path, mark)| {
-            let item = item_of(&root, path, mark);
+            let item = item_of(&root, path, mark, MATCH_ICON);
             let keys = group_keys(path, &root, &settings, cx);
             (keys, item)
         })
@@ -484,24 +483,42 @@ pub fn regroup(panel: &mut ItemsPanel, cx: &mut Context<ItemsPanel>) {
     let mut items = Vec::with_capacity(entries.len());
     let mut rows = Vec::new();
     let mut previous: Vec<String> = Vec::new();
+    let mut previous_file: Option<PathBuf> = None;
     for (keys, item) in entries {
         let common = previous
             .iter()
             .zip(&keys)
-            .take_while(|(left, right)| left == right)
+            .take_while(|(left, right)| left.as_str() == right.0.as_str())
             .count();
+        if common < previous.len() {
+            previous_file = None;
+        }
         for (depth, key) in keys.iter().enumerate().skip(common) {
             rows.push(PanelRow::Group {
-                label: key.clone(),
+                label: key.0.clone(),
                 depth,
-                icon: "general/folder",
+                icon: key.1,
             });
         }
-        previous = keys;
+        previous = keys.iter().map(|(key, _)| key.clone()).collect();
+        // A file under the groups keeps its matches together, as the tree of IDEA does.
+        if previous_file.as_deref() != Some(item.path.as_path()) {
+            let name = item.path.file_name().map_or_else(
+                || item.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let icon = file_icon(panel, &item.path, cx);
+            rows.push(PanelRow::Group {
+                label: name,
+                depth: previous.len(),
+                icon,
+            });
+            previous_file = Some(item.path.clone());
+        }
         let index = items.len();
         rows.push(PanelRow::Item {
             index,
-            depth: previous.len(),
+            depth: previous.len() + 1,
             excluded: false,
         });
         items.push(item);
@@ -536,7 +553,12 @@ fn scope_tabs(scope: TodoScope, changed: bool) -> Vec<PanelTab> {
     .collect()
 }
 
-fn group_keys(path: &Path, root: &Path, settings: &Settings, cx: &App) -> Vec<String> {
+fn group_keys(
+    path: &Path,
+    root: &Path,
+    settings: &Settings,
+    cx: &App,
+) -> Vec<(String, &'static str)> {
     let semantic = cx
         .try_global::<Semantic>()
         .map(|semantic| semantic.0.clone());
@@ -557,7 +579,12 @@ fn group_keys(path: &Path, root: &Path, settings: &Settings, cx: &App) -> Vec<St
                     })
                     .unwrap_or_default()
             });
-        keys.extend(split_name(&module));
+        keys.extend(
+            split_name(&module)
+                .into_iter()
+                .enumerate()
+                .map(|(depth, name)| (name, if depth == 0 { MODULE_ICON } else { FOLDER_ICON })),
+        );
     }
     if settings.todo_group_packages {
         let package = semantic
@@ -570,9 +597,23 @@ fn group_keys(path: &Path, root: &Path, settings: &Settings, cx: &App) -> Vec<St
                     .unwrap_or_default()
             });
         if settings.todo_flatten_packages {
-            keys.push(package);
+            keys.push((package, PACKAGE_ICON));
         } else {
-            keys.extend(split_name(&package));
+            keys.extend(
+                split_name(&package)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(depth, name)| {
+                        (
+                            name,
+                            if depth == 0 {
+                                PACKAGE_ICON
+                            } else {
+                                FOLDER_ICON
+                            },
+                        )
+                    }),
+            );
         }
     }
     keys
@@ -667,7 +708,7 @@ fn header_buttons(
     buttons
 }
 
-fn item_of(root: &Path, path: &Path, mark: &Mark) -> Item {
+fn item_of(root: &Path, path: &Path, mark: &Mark, icon: &'static str) -> Item {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let hint = format!("{}:{}", relative.display(), mark.line + 1);
     let label = if mark.text.is_empty() {
@@ -681,7 +722,7 @@ fn item_of(root: &Path, path: &Path, mark: &Mark) -> Item {
         column: mark.column,
         label,
         hint: hint.replace('\\', "/"),
-        icon: "status/info",
+        icon,
     }
 }
 

@@ -361,7 +361,7 @@ fn tick_box(tick: Tick, partial: String, theme: &Theme) -> Div {
         .border_color(if on {
             theme.accent
         } else {
-            theme.text_secondary
+            ui_kit::checkbox_border(theme)
         })
         .when(on, |this| this.bg(theme.accent))
         .child(
@@ -371,7 +371,7 @@ fn tick_box(tick: Tick, partial: String, theme: &Theme) -> Div {
                 .items_center()
                 .justify_center()
                 .when(tick == Tick::On, |this| {
-                    this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                    this.child(icon_sized("general/check", 10., theme))
                 })
                 .when(tick == Tick::Partial, |this| {
                     this.child(
@@ -2226,6 +2226,8 @@ impl CommitPanel {
     ) -> AnyElement {
         let node = &row.node;
         let (selector, tick_selector, partial_selector) = selectors_of(node, row.bucket);
+        let name_selector = format!("{selector}-name");
+        let icon_box_selector = format!("{selector}-icon");
         let tick = self.tick_of(&node.files, cx);
         let (color, icon_name, pointer) = match node.file {
             Some(_) => {
@@ -2262,6 +2264,8 @@ impl CommitPanel {
                 (color, icon_name, None)
             }
         };
+        // A name after an icon keeps the gap of the project tree; a heading has no icon.
+        let has_icon = icon_name.is_some();
         let count =
             (node.kind == NodeKind::Group).then(|| change_tree::file_count(node.files.len()));
         let arrow = match node.kind {
@@ -2321,10 +2325,18 @@ impl CommitPanel {
                     .children(arrow.map(|name| icon(name, theme))),
             )
             .child(tick_element)
-            .children(icon_name.map(|name| icon(name, theme).ml(px(SPACE_S))))
+            .children(icon_name.map(|name| {
+                div()
+                    .flex_none()
+                    .ml(px(SPACE_S))
+                    .debug_selector(move || icon_box_selector.clone())
+                    .child(icon(name, theme))
+            }))
             .child(
                 div()
                     .flex_none()
+                    .when(has_icon, |this| this.ml(px(TREE_ICON_GAP)))
+                    .debug_selector(move || name_selector.clone())
                     .text_color(color)
                     .when(
                         matches!(
@@ -2712,10 +2724,8 @@ impl CommitPanel {
         div()
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(SPACE_XS))
             .flex_none()
-            .px(px(ROW_MARGIN))
-            .pb(px(4.))
             .child(tab("commit-tab", "Commit", self.tab == Tab::Commit, cx))
             .child(tab("shelf-tab", "Shelf", self.tab == Tab::Shelf, cx))
     }
@@ -3176,6 +3186,18 @@ impl Render for CommitPanel {
             Tab::Commit => "Commit",
             Tab::Shelf => "Shelf",
         };
+        let head = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .min_w_0()
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .debug_selector(|| "commit-title".to_owned())
+                    .child(title),
+            )
+            .child(self.tab_row(&theme, cx));
         let body = if self.tab == Tab::Shelf {
             self.shelf_body(&theme, window, cx)
         } else {
@@ -3233,7 +3255,7 @@ impl Render for CommitPanel {
                                 } else {
                                     theme.text
                                 })
-                                .children(text_field_lines_named(
+                                .children(text_field_lines_hinted(
                                     FieldMouse::with_edit(
                                         cx,
                                         |this| Some(&mut this.message),
@@ -3247,10 +3269,11 @@ impl Render for CommitPanel {
                                     theme.caret,
                                     MESSAGE_LINE_HEIGHT,
                                     message_shown,
-                                ))
-                                .when(message_empty && !message_shown, |this| {
-                                    this.child("Commit message")
-                                }),
+                                    FieldHint {
+                                        text: "Commit Message",
+                                        color: theme.text_secondary,
+                                    },
+                                )),
                         )
                         .child(
                             div()
@@ -3346,10 +3369,9 @@ impl Render for CommitPanel {
             .on_action(cx.listener(|this, _: &Unshelve, window, cx| this.ask_unshelve(window, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, window, cx| this.show_diff(window, cx)))
             .children((!self.embedded).then(|| {
-                panel_header(title, GROUP, "commit", options, hide, &theme)
+                tool_header(head, div(), GROUP, "commit", options, hide, &theme)
                     .debug_selector(|| "commit-header".to_owned())
             }))
-            .children((!self.embedded).then(|| self.tab_row(&theme, cx)))
             .child(body)
     }
 }

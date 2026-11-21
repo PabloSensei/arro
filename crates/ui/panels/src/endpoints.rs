@@ -13,7 +13,7 @@ use runner::LiveRequest;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::Workspace;
+use workspace::{ENDPOINTS_TOOL, Workspace};
 
 use crate::navigation;
 
@@ -625,23 +625,31 @@ impl Render for EndpointsPanel {
         workspace::note_view_render(cx, "endpoints");
         let theme = *cx.global::<Theme>();
         let count = self.handlers();
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .text_size(px(UI_SIZE))
-            .font_weight(FontWeight::MEDIUM)
-            .child("Endpoints")
-            .child(
-                div()
-                    .text_color(theme.text_secondary)
-                    .text_size(px(TEXT_SMALL))
-                    .child(format!("{count}")),
-            );
+        let workspace = self.workspace.clone();
+        let hide = {
+            let workspace = workspace.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_tool(ENDPOINTS_TOOL, window, cx)
+                    })
+                    .ok();
+            }
+        };
+        let options = crate::tool_menu::options_menu(workspace, ENDPOINTS_TOOL, |_| Vec::new());
+        let header = tool_header(
+            div().font_weight(FontWeight::MEDIUM).child("Endpoints"),
+            div()
+                .text_color(theme.text_secondary)
+                .text_size(px(TEXT_SMALL))
+                .child(format!("{count}")),
+            GROUP,
+            "endpoints",
+            options,
+            hide,
+            &theme,
+        )
+        .debug_selector(|| "endpoints-header".to_owned());
         let search = div()
             .flex()
             .items_center()
@@ -704,13 +712,51 @@ impl Render for EndpointsPanel {
                     .map(|method| self.method_button(Some(method), &theme, cx)),
             );
         let empty = self.rows.is_empty();
-        let hint = empty.then(|| {
+        let body: AnyElement = if empty {
+            let hint = match self.support.as_ref() {
+                None => "Waiting for the project to be parsed",
+                Some(support) if support.endpoints().is_none() => {
+                    "No HTTP handlers: the project is not a Spring project"
+                }
+                Some(_) => "No HTTP handlers found",
+            };
             div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
                 .px(px(SPACE_L))
-                .py(px(SPACE_S))
                 .text_color(theme.text_secondary)
-                .child("No HTTP handlers found")
-        });
+                .child(hint)
+                .into_any_element()
+        } else {
+            scrollable(
+                "endpoints-rows",
+                &self.scroll,
+                div().size_full().child(
+                    uniform_list(
+                        "endpoints-rows",
+                        self.rows().len(),
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            range
+                                .filter_map(|index| {
+                                    this.rows.get(index).map(|row| (index, row.clone()))
+                                })
+                                .map(|(index, row)| this.row_element(index, &row, &theme, cx))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&self.scroll)
+                    .size_full(),
+                ),
+                &theme,
+                window,
+                cx,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
         island(&theme)
             .id("endpoints-panel")
             .key_context(FILTER_CONTEXT)
@@ -720,34 +766,7 @@ impl Render for EndpointsPanel {
             .child(header)
             .child(search)
             .child(methods)
-            .children(hint)
-            .child(
-                scrollable(
-                    "endpoints-rows",
-                    &self.scroll,
-                    div().size_full().child(
-                        uniform_list(
-                            "endpoints-rows",
-                            self.rows().len(),
-                            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                range
-                                    .filter_map(|index| {
-                                        this.rows.get(index).map(|row| (index, row.clone()))
-                                    })
-                                    .map(|(index, row)| this.row_element(index, &row, &theme, cx))
-                                    .collect::<Vec<_>>()
-                            }),
-                        )
-                        .track_scroll(&self.scroll)
-                        .size_full(),
-                    ),
-                    &theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_h_0(),
-            )
+            .child(body)
             .capture_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
     }
 }

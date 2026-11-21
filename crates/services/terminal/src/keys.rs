@@ -290,6 +290,23 @@ fn legacy(out: &mut Vec<u8>, event: KeyEvent, modes: Modes) {
     }
 }
 
+/// One notch of the wheel as a mouse report, for a program that asked for mouse reports: button
+/// 64 turns up and 65 down, and the cell is 1-based. SGR carries any cell. X10 carries each number
+/// in one byte with 32 added, so a cell past column or row 222 has no report.
+pub(crate) fn wheel_report(up: bool, cell: (u16, u16), sgr: bool) -> Option<Vec<u8>> {
+    let button: u8 = if up { 64 } else { 65 };
+    let column = u32::from(cell.0) + 1;
+    let row = u32::from(cell.1) + 1;
+    if sgr {
+        return Some(format!("\x1b[<{button};{column};{row}M").into_bytes());
+    }
+    let (column, row) = (column + 32, row + 32);
+    if column > 255 || row > 255 {
+        return None;
+    }
+    Some(vec![0x1b, b'[', b'M', button + 32, column as u8, row as u8])
+}
+
 pub fn encode(event: KeyEvent, modes: Modes, shift_enter: ShiftEnter) -> Vec<u8> {
     let mut out = Vec::new();
     let KeyEvent { key, mods } = event;
@@ -331,6 +348,7 @@ mod tests {
         alt_screen: false,
         focus_events: false,
         mouse: false,
+        sgr_mouse: false,
     };
 
     fn legacy(key: Key, mods: Mods) -> String {
@@ -412,6 +430,50 @@ mod tests {
         assert_eq!(legacy(Key::Tab, Mods::SHIFT), "\x1b[Z");
         assert_eq!(legacy(Key::Char('c'), Mods::CTRL), "\x03");
         assert_eq!(legacy(Key::Char('x'), Mods::ALT), "\x1bx");
+    }
+
+    #[test]
+    fn a_wheel_notch_is_an_sgr_report_at_its_cell() {
+        assert_eq!(wheel_report(true, (4, 2), true).unwrap(), b"\x1b[<64;5;3M");
+        assert_eq!(wheel_report(false, (0, 0), true).unwrap(), b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn a_wheel_notch_is_an_x10_report_with_offsets() {
+        // Button 64 is '`' and 65 is 'a' after the 32 offset; the cell (4, 2) is '%' and '#'.
+        assert_eq!(wheel_report(true, (4, 2), false).unwrap(), b"\x1b[M`%#");
+        assert_eq!(
+            wheel_report(false, (222, 0), false).unwrap(),
+            b"\x1b[Ma\xff!"
+        );
+        assert_eq!(
+            wheel_report(true, (223, 0), false),
+            None,
+            "X10 has one byte per coordinate"
+        );
+    }
+
+    #[test]
+    fn the_wheel_arrows_follow_the_cursor_mode() {
+        let application = Modes {
+            app_cursor: true,
+            ..Modes::default()
+        };
+        let up = KeyEvent::plain(Key::Up);
+        let down = KeyEvent::plain(Key::Down);
+        assert_eq!(
+            encode(up, Modes::default(), ShiftEnter::Win32Record),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            encode(down, Modes::default(), ShiftEnter::Win32Record),
+            b"\x1b[B"
+        );
+        assert_eq!(encode(up, application, ShiftEnter::Win32Record), b"\x1bOA");
+        assert_eq!(
+            encode(down, application, ShiftEnter::Win32Record),
+            b"\x1bOB"
+        );
     }
 
     #[test]

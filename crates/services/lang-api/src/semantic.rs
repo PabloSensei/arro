@@ -392,6 +392,10 @@ pub struct ProjectProblem {
     /// The build tool of the project that the problem concerns, by the index of its
     /// Settings page, when the language names one.
     pub tool: Option<usize>,
+    /// Another import of the project alone may clear this problem, and the window runs
+    /// it once instead of showing the problem. The language sets this only for the
+    /// first such problem of a server session.
+    pub retry: bool,
 }
 
 /// The problems of the project itself. The stream stays open and sends the current
@@ -742,6 +746,14 @@ pub struct RenameQuery {
     pub new_name: String,
 }
 
+/// What `textDocument/prepareRename` says about a place: the name the server would
+/// change. A language that accepts the place without naming the span leaves it `None`,
+/// and the editor takes the word under the caret.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrepareRename {
+    pub span: Option<TextSpan>,
+}
+
 /// What F6 moves. A file holds its type, so moving it into another package moves the
 /// type with every reference and its `package` line. A member leaves its type and the
 /// target type takes it with every reference. An instance method leaves its type too,
@@ -1005,6 +1017,8 @@ pub type MemberActionProvider = dyn Provider<MemberActionRequest, ActionOutcome>
 /// Alt+F7: every use of the symbol at a spot, its declaration included.
 pub type ReferencesProvider = dyn Provider<DocumentSpot, Vec<SourceSpan>>;
 pub type RenameProvider = dyn Provider<RenameQuery, WorkspaceChange>;
+/// Whether the language can rename the name at a spot, and the span of that name.
+pub type PrepareRenameProvider = dyn Provider<DocumentSpot, Option<PrepareRename>>;
 pub type MoveDestinationProvider = dyn Provider<MoveQuery, Vec<MoveDestination>>;
 pub type MoveProvider = dyn Provider<MoveRequest, MoveOutcome>;
 pub type MoveMembersFormProvider = dyn Provider<MoveMembersQuery, Option<MoveMembersForm>>;

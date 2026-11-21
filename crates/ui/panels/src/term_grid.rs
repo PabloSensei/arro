@@ -26,6 +26,10 @@ const ANSI: [u32; 16] = [
     0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff,
 ];
 const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+/// The width of the bar of the history, which sits in the inset at the right edge of the grid,
+/// and the shortest thumb of it, so a long history still shows a grip.
+const BAR_WIDTH: f32 = 4.;
+const BAR_MIN_THUMB: f32 = 16.;
 
 /// Calls `tick` on every refresh while the entity lives.
 pub fn every_frame<T: 'static>(
@@ -273,6 +277,94 @@ impl CellMetrics {
         let row = line + self.offset as i32;
         (row >= 0 && row < self.rows as i32).then_some(row as u16)
     }
+
+    /// The cell under `at` as (column, row) from zero, clamped to the grid: a wheel turn at its
+    /// edge still names a cell of the screen.
+    pub fn screen_cell(&self, at: Point<Pixels>) -> (u16, u16) {
+        let column = (f32::from(at.x - self.origin.x) / f32::from(self.cell_width)).floor();
+        let row = (f32::from(at.y - self.origin.y) / f32::from(self.line_height)).floor();
+        let column = (column.max(0.) as u16).min(self.cols.saturating_sub(1));
+        let row = (row.max(0.) as u16).min(self.rows.saturating_sub(1));
+        (column, row)
+    }
+}
+
+/// The bar of the history at the right edge of a grid: its track in the inset, the thumb that
+/// shows where the view is, and how many lines of history the bar covers.
+#[derive(Clone, Copy, Debug)]
+struct Bar {
+    track: Bounds<Pixels>,
+    grip: Thumb,
+    history: usize,
+    rows: u16,
+}
+
+/// A press that took the thumb of a bar: the session it belongs to, and how far below the top
+/// of the thumb the press was.
+#[derive(Clone, Copy, Debug)]
+struct Grab {
+    session: usize,
+    offset: f32,
+}
+
+/// The thumb the pointer holds, if any. One pointer holds one thumb at a time.
+#[derive(Default)]
+struct Grabbed(Option<Grab>);
+
+impl Global for Grabbed {}
+
+/// Identifies a session by the place of its value, which lives as long as the grid that shows it.
+fn session_key(session: &TerminalSession) -> usize {
+    session as *const TerminalSession as usize
+}
+
+/// A press on the bar: a press on the thumb takes it, and a press beside the thumb turns the
+/// history by a page towards the press.
+fn bar_pressed(session: &TerminalSession, bar: Bar, at: Point<Pixels>, cx: &mut App) {
+    let relative = f32::from(at.y - bar.track.top());
+    if relative < bar.grip.start {
+        session.scroll(i32::from(bar.rows));
+    } else if relative > bar.grip.start + bar.grip.length {
+        session.scroll(-i32::from(bar.rows));
+    } else {
+        let grab = Grab {
+            session: session_key(session),
+            offset: relative - bar.grip.start,
+        };
+        cx.default_global::<Grabbed>().0 = Some(grab);
+    }
+}
+
+/// A move with the thumb held: the thumb follows the pointer and the view follows the thumb.
+fn bar_moved(session: &TerminalSession, bar: Bar, event: &MouseMoveEvent, cx: &mut App) {
+    let grabbed = cx.default_global::<Grabbed>();
+    let Some(grab) = grabbed.0 else {
+        return;
+    };
+    if grab.session != session_key(session) {
+        return;
+    }
+    if event.pressed_button != Some(MouseButton::Left) {
+        grabbed.0 = None;
+        return;
+    }
+    let track = f32::from(bar.track.size.height);
+    let relative = f32::from(event.position.y - bar.track.top()) - grab.offset;
+    let max_scroll = LINE_HEIGHT * bar.history as f32;
+    let top = offset_for_thumb(track, bar.grip.length, relative, max_scroll);
+    let from_top = ((top / LINE_HEIGHT).round().max(0.) as usize).min(bar.history);
+    session.scroll_to(bar.history - from_top);
+}
+
+/// The end of a press: the thumb the pointer held is let go, if this session had it.
+fn bar_released(session: &TerminalSession, cx: &mut App) {
+    let grabbed = cx.default_global::<Grabbed>();
+    if grabbed
+        .0
+        .is_some_and(|grab| grab.session == session_key(session))
+    {
+        grabbed.0 = None;
+    }
 }
 
 fn text_run(len: usize, cell: &Cell, fg: Hsla, base: &Font) -> TextRun {
@@ -396,31 +488,57 @@ fn link_modifier(modifiers: &Modifiers) -> bool {
     modifiers.control || (cfg!(target_os = "macos") && modifiers.platform)
 }
 
-/// The pointer of a grid: who hears it and where its cells are.
+/// The pointer of a grid: who hears it and where its cells are. The host is optional, because the
+/// wheel and the bar of the history need only the session the grid shows.
 struct Pointer<H: GridPanel> {
-    host: Entity<H>,
+    host: Option<Entity<H>>,
     pane: usize,
     metrics: CellMetrics,
     hitbox: Hitbox,
+    session: Arc<TerminalSession>,
+    bar: Option<Bar>,
 }
 
 impl<H: GridPanel> Pointer<H> {
-    /// The clicks select or open a link, a drag extends the selection, and the control
-    /// key shows the link under the pointer.
+    /// The wheel turns the history or goes to the program. The bar of the history takes the
+    /// presses and drags on it before any selection does. The clicks select or open a link, a
+    /// drag extends the selection, and the control key shows the link under the pointer.
     fn listen(self, window: &mut Window) {
         let Pointer {
             host,
             pane,
             metrics,
             hitbox,
+            session,
+            bar,
         } = self;
+
+        let scrolled = hitbox.clone();
+        let wheel = session.clone();
+        window.on_mouse_event(move |event: &ScrollEvent, phase, window, _| {
+            if phase != DispatchPhase::Bubble || !scrolled.should_handle_scroll(window) {
+                return;
+            }
+            let cell = metrics.screen_cell(event.position);
+            let _ = wheel.wheel(scroll_lines(event), cell, event.modifiers.shift);
+        });
 
         let target = host.clone();
         let pressed = hitbox.clone();
+        let pressed_session = session.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble || !pressed.bounds.contains(&event.position) {
                 return;
             }
+            if event.button == MouseButton::Left
+                && let Some(bar) = bar.filter(|bar| bar.track.contains(&event.position))
+            {
+                bar_pressed(&pressed_session, bar, event.position, cx);
+                return;
+            }
+            let Some(target) = target.clone() else {
+                return;
+            };
             let Some(position) = metrics.position(event.position) else {
                 return;
             };
@@ -448,28 +566,41 @@ impl<H: GridPanel> Pointer<H> {
             }
         });
 
-        let moved = host.clone();
-        let hovered = hitbox;
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble {
-                return;
-            }
-            let inside = hovered.bounds.contains(&event.position);
-            let position = inside.then(|| metrics.position(event.position)).flatten();
-            let over_link = moved.update(cx, |panel, cx| {
-                panel.grid_moved(pane, position, link_modifier(&event.modifiers), cx)
+        if let Some(bar) = bar {
+            let dragged = session.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble {
+                    bar_moved(&dragged, bar, event, cx);
+                }
             });
-            if over_link {
-                window.set_cursor_style(CursorStyle::PointingHand, &hovered);
-            }
-        });
+        }
 
-        let released = host;
+        if let Some(moved) = host.clone() {
+            let hovered = hitbox.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let inside = hovered.bounds.contains(&event.position);
+                let position = inside.then(|| metrics.position(event.position)).flatten();
+                let over_link = moved.update(cx, |panel, cx| {
+                    panel.grid_moved(pane, position, link_modifier(&event.modifiers), cx)
+                });
+                if over_link {
+                    window.set_cursor_style(CursorStyle::PointingHand, &hovered);
+                }
+            });
+        }
+
+        let ended = session;
         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
             if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                 return;
             }
-            released.update(cx, |panel, cx| panel.grid_released(pane, cx));
+            bar_released(&ended, cx);
+            if let Some(released) = &host {
+                released.update(cx, |panel, cx| panel.grid_released(pane, cx));
+            }
         });
     }
 }
@@ -647,13 +778,44 @@ fn layout<H: GridPanel>(
         let block = Bounds::new(at, size(cell_width, line_height));
         frame.cursor = Some((block, theme.caret.opacity(alpha)));
     }
+    // The bar of the history: its thumb is the part of the history that the view shows, and it
+    // is drawn only when there is history to show.
+    let track_height = LINE_HEIGHT * rows as f32;
+    let grip = thumb(
+        track_height,
+        track_height,
+        LINE_HEIGHT * (screen.history + rows as usize) as f32,
+        LINE_HEIGHT * screen.history.saturating_sub(metrics.offset) as f32,
+        BAR_MIN_THUMB,
+    );
+    let bar = grip.map(|grip| Bar {
+        track: Bounds::new(
+            point(bounds.right() - px(INSET), origin.y),
+            size(px(INSET), px(track_height)),
+        ),
+        grip,
+        history: screen.history,
+        rows,
+    });
+    if let Some(bar) = bar {
+        let at = point(
+            bar.track.right() - px(BAR_WIDTH + 1.),
+            bar.track.top() + px(bar.grip.start),
+        );
+        let thumb_bounds = Bounds::new(at, size(px(BAR_WIDTH), px(bar.grip.length)));
+        frame
+            .backgrounds
+            .push((thumb_bounds, theme.text_secondary.opacity(0.5)));
+    }
     view.metrics.set(Some(metrics));
     let hitbox = window.insert_hitbox(metrics.bounds, HitboxBehavior::Normal);
-    frame.pointer = view.host.clone().map(|host| Pointer {
-        host,
+    frame.pointer = Some(Pointer {
+        host: view.host.clone(),
         pane: view.pane,
         metrics,
         hitbox,
+        session: view.session.clone(),
+        bar,
     });
     frame
 }
@@ -744,6 +906,10 @@ pub fn send_key(
     platform: keymap::Platform,
     cx: &mut App,
 ) -> bool {
+    if let Some(lines) = page_lines(stroke, session.size().1) {
+        session.scroll(lines);
+        return true;
+    }
     if is_paste(stroke) && !platform.uses_command() {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let _ = session.paste(&text);
@@ -762,10 +928,30 @@ pub fn send_key(
     !events.is_empty()
 }
 
-/// Wheel lines into history lines, three per notch.
+/// Wheel turns into lines, positive up, three per notch. Windows turns Shift+wheel into a
+/// horizontal delta and leaves the vertical one at zero, so the horizontal one counts then.
 pub fn scroll_lines(event: &ScrollEvent) -> i32 {
     let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
-    (f32::from(delta.y) / LINE_HEIGHT).round() as i32
+    let lines = if event.modifiers.shift && f32::from(delta.y) == 0. {
+        delta.x
+    } else {
+        delta.y
+    };
+    (f32::from(lines) / LINE_HEIGHT).round() as i32
+}
+
+/// Shift+PageUp and Shift+PageDown turn the history by a page of `rows` lines, and never reach
+/// the program.
+fn page_lines(stroke: &Keystroke, rows: u16) -> Option<i32> {
+    let modifiers = stroke.modifiers;
+    if !modifiers.shift || modifiers.control || modifiers.alt || modifiers.platform {
+        return None;
+    }
+    match stroke.key.as_str() {
+        "pageup" => Some(i32::from(rows)),
+        "pagedown" => Some(-i32::from(rows)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

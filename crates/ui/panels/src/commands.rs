@@ -16,6 +16,7 @@ use workspace::{
 
 use crate::agents::ASK_AI;
 use crate::choice::{ChoiceDialog, DialogChoice};
+use crate::database_panel::ActiveDatabase;
 use crate::debug::{ActiveDebug, DebugPanel};
 use crate::diff_view::DiffView;
 use crate::documentation::ActiveDocumentation;
@@ -236,6 +237,19 @@ pub fn register(
     workspace.register_command("window.database", "Database", |workspace, window, cx| {
         workspace.toggle_tool(DATABASE_TOOL, window, cx)
     });
+    workspace.register_command(
+        "database.data_sources",
+        "Data Sources…",
+        |_, window, cx| {
+            let Some(panel) = cx
+                .try_global::<ActiveDatabase>()
+                .map(|panel| panel.0.clone())
+            else {
+                return;
+            };
+            panel.update(cx, |panel, cx| panel.open_data_sources_from(window, cx));
+        },
+    );
     workspace.register_command(
         "run.edit_configurations",
         "Edit Configurations…",

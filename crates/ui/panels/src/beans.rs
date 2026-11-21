@@ -16,7 +16,7 @@ use lang_api::{
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::Workspace;
+use workspace::{BEANS_TOOL, Workspace};
 
 use crate::navigation;
 
@@ -403,23 +403,31 @@ impl Render for BeansPanel {
         workspace::note_view_render(cx, "beans");
         let theme = *cx.global::<Theme>();
         let count = self.beans().len();
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .h(px(CONTROL_HEIGHT))
-            .pl(px(SPACE_M))
-            .pr(px(SPACE_S))
-            .text_size(px(UI_SIZE))
-            .font_weight(FontWeight::MEDIUM)
-            .child("Beans")
-            .child(
-                div()
-                    .text_color(theme.text_secondary)
-                    .text_size(px(TEXT_SMALL))
-                    .child(format!("{count}")),
-            );
+        let workspace = self.workspace.clone();
+        let hide = {
+            let workspace = workspace.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_tool(BEANS_TOOL, window, cx)
+                    })
+                    .ok();
+            }
+        };
+        let options = crate::tool_menu::options_menu(workspace, BEANS_TOOL, |_| Vec::new());
+        let header = tool_header(
+            div().font_weight(FontWeight::MEDIUM).child("Beans"),
+            div()
+                .text_color(theme.text_secondary)
+                .text_size(px(TEXT_SMALL))
+                .child(format!("{count}")),
+            GROUP,
+            "beans",
+            options,
+            hide,
+            &theme,
+        )
+        .debug_selector(|| "beans-header".to_owned());
         let search = div()
             .flex()
             .items_center()
@@ -463,13 +471,52 @@ impl Render for BeansPanel {
                 )
             });
         let empty = self.rows.is_empty();
-        let hint = empty.then(|| {
+        let body: AnyElement = if empty {
+            let hint = match self.support.as_ref() {
+                None => "Waiting for the project to be parsed",
+                Some(support) if support.beans().is_none() => {
+                    "No beans: the project is not a Spring project"
+                }
+                Some(_) if !self.query.text.trim().is_empty() => "No beans match the filter",
+                Some(_) => "No beans found",
+            };
             div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
                 .px(px(SPACE_L))
-                .py(px(SPACE_S))
                 .text_color(theme.text_secondary)
-                .child("No beans found")
-        });
+                .child(hint)
+                .into_any_element()
+        } else {
+            scrollable(
+                "beans-rows",
+                &self.scroll,
+                div().size_full().child(
+                    uniform_list(
+                        "beans-rows",
+                        self.rows().len(),
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            range
+                                .filter_map(|index| {
+                                    this.rows.get(index).map(|row| (index, row.clone()))
+                                })
+                                .map(|(index, row)| this.row_element(index, &row, &theme, cx))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&self.scroll)
+                    .size_full(),
+                ),
+                &theme,
+                window,
+                cx,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
         island(&theme)
             .id("beans-panel")
             .key_context(FILTER_CONTEXT)
@@ -478,34 +525,7 @@ impl Render for BeansPanel {
             .h_full()
             .child(header)
             .child(search)
-            .children(hint)
-            .child(
-                scrollable(
-                    "beans-rows",
-                    &self.scroll,
-                    div().size_full().child(
-                        uniform_list(
-                            "beans-rows",
-                            self.rows().len(),
-                            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                range
-                                    .filter_map(|index| {
-                                        this.rows.get(index).map(|row| (index, row.clone()))
-                                    })
-                                    .map(|(index, row)| this.row_element(index, &row, &theme, cx))
-                                    .collect::<Vec<_>>()
-                            }),
-                        )
-                        .track_scroll(&self.scroll)
-                        .size_full(),
-                    ),
-                    &theme,
-                    window,
-                    cx,
-                )
-                .flex_1()
-                .min_h_0(),
-            )
+            .child(body)
             .capture_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
     }
 }

@@ -317,6 +317,7 @@ impl Render for CopyClassDialog {
         let left = (window.viewport_size().width - width) / 2.;
         let top = window.viewport_size().height * 0.22;
         let active = self.active;
+        let label_width = form_label_width(window, &["Name", "Destination package or folder"]);
         let name = field_box(
             FieldMouse::new(cx, |this| Some(&mut this.name)),
             "copy-class-name-field",
@@ -366,8 +367,9 @@ impl Render for CopyClassDialog {
             .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .child(labelled("Name", name, &theme))
-            .child(labelled(
+            .child(form_row(label_width, "Name", name, &theme))
+            .child(form_row(
+                label_width,
                 "Destination package or folder",
                 destination,
                 &theme,
@@ -396,20 +398,6 @@ impl Render for CopyClassDialog {
     }
 }
 
-fn labelled(label: &str, field: Stateful<Div>, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(SPACE_S))
-        .child(
-            div()
-                .text_size(px(UI_SIZE))
-                .text_color(theme.text_secondary)
-                .child(label.to_owned()),
-        )
-        .child(field)
-}
-
 fn field_box(
     mouse: FieldMouse,
     id: impl Into<ElementId>,
@@ -424,7 +412,7 @@ fn field_box(
         .debug_selector(move || selector)
         .flex()
         .items_center()
-        .h(px(30.))
+        .h(px(CONTROL_HEIGHT))
         .px(px(SPACE_M))
         .rounded(px(CONTROL_RADIUS))
         .border_1()

@@ -884,6 +884,7 @@ fn an_answer_of_the_server_moves_the_ranges_the_view_missed(cx: &mut TestAppCont
             vec![OutlineItem {
                 name: "alpha".to_owned(),
                 signature: None,
+                visibility: None,
                 kind: OutlineKind::Function,
                 depth: 0,
                 range: 0..5,

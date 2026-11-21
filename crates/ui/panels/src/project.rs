@@ -11,9 +11,7 @@ use lang_api::MigrationModel;
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
-use workspace::{
-    DockSide, FileIcons, PROJECT_TOOL, Settings, Workspace, checked_label, window_key,
-};
+use workspace::{FileIcons, PROJECT_TOOL, Settings, Workspace, checked_label, window_key};
 
 use crate::file_tree::{Child, FileTree, read_folder};
 use crate::prompt::{Prompt, PromptKind};
@@ -1416,17 +1414,20 @@ impl ProjectPanel {
         let hide = MenuEntry::new("Hide", move |window, cx| {
             hiding
                 .update(cx, |workspace, cx| {
-                    workspace.toggle_panel(DockSide::Left, window, cx)
+                    workspace.toggle_tool(PROJECT_TOOL, window, cx)
                 })
                 .ok();
         });
+        let mut entries = vec![always_select, appearance, MenuEntry::separator()];
+        entries.extend(crate::tool_menu::move_to_entries(
+            &self.workspace,
+            PROJECT_TOOL,
+            cx,
+        ));
+        entries.push(hide);
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_menu(
-                    position,
-                    vec![always_select, appearance, MenuEntry::separator(), hide],
-                    cx,
-                )
+                workspace.show_menu(position, entries, cx)
             })
             .ok();
     }
@@ -2712,7 +2713,7 @@ impl ProjectPanel {
         let hide = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.toggle_panel(DockSide::Left, window, cx)
+                    workspace.toggle_tool(PROJECT_TOOL, window, cx)
                 })
                 .ok();
         };

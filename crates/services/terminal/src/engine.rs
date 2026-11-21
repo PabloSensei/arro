@@ -316,6 +316,7 @@ impl Engine {
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
             focus_events: mode.contains(TermMode::FOCUS_IN_OUT),
             mouse: mode.intersects(TermMode::MOUSE_MODE),
+            sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
         }
     }
 
@@ -333,6 +334,14 @@ impl Engine {
             }
             Control::ScrollToBottom => {
                 self.term.scroll_display(Scroll::Bottom);
+                self.dirty = true;
+            }
+            Control::ScrollTo(offset) => {
+                // Relative to the offset the engine holds, not the one a snapshot showed: a
+                // drag of the bar asks for places the screen has not drawn yet.
+                let current = self.term.grid().display_offset() as i32;
+                self.term
+                    .scroll_display(Scroll::Delta(offset as i32 - current));
                 self.dirty = true;
             }
             Control::RevealMatch(index) => {
@@ -464,6 +473,7 @@ impl Engine {
             cells,
             cursor: visible.then_some((on_screen as u16, cursor.column.0 as u16)),
             display_offset: offset,
+            history: self.term.grid().history_size(),
             title: notes.title.clone(),
             modes: self.modes(),
             links: links.finished,

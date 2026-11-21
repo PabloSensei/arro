@@ -40,7 +40,7 @@ fn open_keymap_page(cx: &mut TestAppContext, window: WindowHandle<workspace::Wor
 }
 
 #[gpui::test]
-fn a_new_shortcut_from_the_file_runs_and_the_menu_and_find_action_show_it(cx: &mut TestAppContext) {
+fn a_new_shortcut_from_the_file_runs_and_comes_after_the_main_one(cx: &mut TestAppContext) {
     let (root, window) = open_sample_window(cx, "keymap-add-file");
     write_keymap(
         cx,
@@ -58,16 +58,27 @@ fn a_new_shortcut_from_the_file_runs_and_the_menu_and_find_action_show_it(cx: &m
         "alpha\nalpha\nbeta\n",
         "the shortcut of the file duplicates the line"
     );
-    let shortcut = window
+    // A menu writes the main shortcut of the default layout; the shortcut of the file comes
+    // after it in the list.
+    let (shortcut, listed) = window
         .read_with(cx, |workspace, _| {
-            workspace.shortcut_of(editor_keys::DUPLICATE)
+            (
+                workspace.shortcut_of(editor_keys::DUPLICATE),
+                workspace
+                    .keymap()
+                    .shortcuts_for(editor_keys::DUPLICATE)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )
         })
         .unwrap();
     assert_eq!(
         shortcut.as_deref(),
-        Some("ctrl-alt-shift-d"),
-        "a menu and Find Action write the first shortcut of the keymap"
+        Some("ctrl-d"),
+        "a menu writes the main shortcut of the default layout"
     );
+    assert_eq!(listed, ["ctrl-d", "ctrl-alt-shift-d"]);
     let file = window
         .read_with(cx, |workspace, _| workspace.keymap_path().to_path_buf())
         .unwrap();
@@ -113,6 +124,8 @@ fn the_page_adds_a_shortcut_and_a_conflict_names_the_other_action(cx: &mut TestA
     type_text(cx, window, "copy");
     draw(cx, window);
 
+    click(cx, window, "keymap-row-editor-copy");
+    draw(cx, window);
     click(cx, window, "keymap-add-editor-copy");
     draw(cx, window);
     // Ctrl+D is Duplicate already: the page asks what to do with it.
@@ -224,6 +237,8 @@ fn a_shortcut_added_on_the_page_runs_in_the_window(cx: &mut TestAppContext) {
     open_keymap_page(cx, window);
     type_text(cx, window, "duplicate");
     draw(cx, window);
+    click(cx, window, "keymap-row-editor-duplicate");
+    draw(cx, window);
     click(cx, window, "keymap-add-editor-duplicate");
     draw(cx, window);
     press(cx, window, "ctrl-alt-shift-d");
@@ -246,7 +261,8 @@ fn a_shortcut_added_on_the_page_runs_in_the_window(cx: &mut TestAppContext) {
                 .shortcut_of(editor_keys::DUPLICATE))
             .unwrap()
             .as_deref(),
-        Some("ctrl-alt-shift-d")
+        Some("ctrl-d"),
+        "the menu keeps the main shortcut; the one added on the page comes after it"
     );
 }
 
@@ -261,17 +277,28 @@ fn a_workspace_action_takes_a_shortcut_from_the_file(cx: &mut TestAppContext) {
             keys::GOTO_FILE
         ),
     );
-    let shortcut = window
-        .read_with(cx, |workspace, _| workspace.shortcut_of(keys::GOTO_FILE))
+    let (shortcut, listed) = window
+        .read_with(cx, |workspace, _| {
+            (
+                workspace.shortcut_of(keys::GOTO_FILE),
+                workspace
+                    .keymap()
+                    .shortcuts_for(keys::GOTO_FILE)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        })
         .unwrap();
-    assert_eq!(shortcut.as_deref(), Some("ctrl-alt-shift-g"));
+    assert_eq!(shortcut.as_deref(), Some("ctrl-shift-n"));
+    assert_eq!(listed, ["ctrl-shift-n", "ctrl-alt-shift-g"]);
     assert_eq!(
         window
             .read_with(cx, |workspace, _| workspace
                 .shortcut_of_key(keys::GOTO_FILE))
             .unwrap()
             .as_deref(),
-        Some("Ctrl+Alt+Shift+G"),
-        "a menu label is built from the keymap"
+        Some("Ctrl+Shift+N"),
+        "a menu label is built from the main shortcut of the keymap"
     );
 }

@@ -3108,7 +3108,7 @@ impl DiffView {
                 .border_color(if checked {
                     theme.accent
                 } else {
-                    theme.text_secondary
+                    ui_kit::checkbox_border(theme)
                 })
                 .when(checked, |this| this.bg(theme.accent))
                 .on_click(cx.listener(move |_this, _, _, cx| {
@@ -3126,7 +3126,7 @@ impl DiffView {
                         .items_center()
                         .justify_center()
                         .when(checked, |this| {
-                            this.child(div().size(px(6.)).rounded(px(1.)).bg(theme.over_accent))
+                            this.child(ui_kit::icon_sized("general/check", 10., theme))
                         }),
                 ),
         )

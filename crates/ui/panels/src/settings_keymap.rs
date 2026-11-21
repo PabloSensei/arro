@@ -1,7 +1,9 @@
-//! The Keymap page of Settings: the actions with their shortcuts, a search by name and
-//! by a pressed shortcut, and the edits that go to `keymap.json`. A changed action is
-//! marked as IDEA marks it, and a shortcut that another action already runs asks what to
-//! do with that action.
+//! The Keymap page of Settings: the actions in the tree of IDEA's groups, the place of every
+//! action in the menu of the window, a search by name and by a pressed shortcut, and the
+//! edits that go to `keymap.json`. A changed action is marked as IDEA marks it, and a
+//! shortcut that another action already runs asks what to do with that action.
+
+use std::collections::{HashMap, HashSet};
 
 use keymap::{Keystroke, Shortcut};
 use ui_kit::metrics::*;
@@ -11,6 +13,12 @@ use workspace::Workspace;
 
 use crate::prompt::TextField;
 use crate::settings::SettingsView;
+
+/// The width of the column the shortcuts of every row stand in, right of the names.
+const SHORTCUTS_COLUMN: f32 = 220.;
+/// The width the three buttons of a row take. It stays even while they are hidden, so that
+/// the shortcuts do not move under the pointer.
+const ROW_BUTTONS: f32 = 66.;
 
 /// A keyboard shortcut as the page writes it: `Ctrl+Shift+N`, `Ctrl+K, Ctrl+C`, and the
 /// glyphs of macOS.
@@ -24,11 +32,174 @@ fn selector_of(prefix: &str, action: &str) -> String {
     format!("{prefix}-{action}")
 }
 
+/// The path of a row of the tree, as a test names it: `Main Menu / Edit`.
+fn place_label(place: Place) -> String {
+    match place {
+        Place::EditorActions => "Editor Actions".to_owned(),
+        Place::MainMenu(section) => format!("Main Menu / {}", section.title()),
+        Place::ToolWindows => "Tool Windows".to_owned(),
+        Place::DebuggerActions => "Debugger Actions".to_owned(),
+        Place::Other => "Other".to_owned(),
+    }
+}
+
+#[cfg(test)]
+fn place_probe(action: &str, place: &str) -> AnyElement {
+    bounds_probe(
+        selector_of("keymap-place", action),
+        Some(SharedString::from(place.to_owned())),
+    )
+}
+
+#[cfg(not(test))]
+fn place_probe(_action: &str, _place: &str) -> AnyElement {
+    div().into_any_element()
+}
+
+#[cfg(test)]
+fn shortcut_label_probe(action: &str, text: &str) -> AnyElement {
+    bounds_probe(
+        selector_of("keymap-shortcuts-label", action),
+        Some(SharedString::from(text.to_owned())),
+    )
+}
+
+#[cfg(not(test))]
+fn shortcut_label_probe(_action: &str, _text: &str) -> AnyElement {
+    div().into_any_element()
+}
+
+/// The sections of the menu bar of the window, in the order the bar shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Section {
+    File,
+    Edit,
+    View,
+    Navigate,
+    Code,
+    Refactor,
+    Build,
+    Run,
+    Git,
+    Window,
+    Help,
+}
+
+impl Section {
+    const ALL: [Section; 11] = [
+        Section::File,
+        Section::Edit,
+        Section::View,
+        Section::Navigate,
+        Section::Code,
+        Section::Refactor,
+        Section::Build,
+        Section::Run,
+        Section::Git,
+        Section::Window,
+        Section::Help,
+    ];
+
+    fn of(label: &str) -> Option<Self> {
+        Some(match label {
+            "File" => Self::File,
+            "Edit" => Self::Edit,
+            "View" => Self::View,
+            "Navigate" => Self::Navigate,
+            "Code" => Self::Code,
+            "Refactor" => Self::Refactor,
+            "Build" => Self::Build,
+            "Run" => Self::Run,
+            "Git" => Self::Git,
+            "Window" => Self::Window,
+            "Help" => Self::Help,
+            _ => return None,
+        })
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::File => "File",
+            Self::Edit => "Edit",
+            Self::View => "View",
+            Self::Navigate => "Navigate",
+            Self::Code => "Code",
+            Self::Refactor => "Refactor",
+            Self::Build => "Build",
+            Self::Run => "Run",
+            Self::Git => "Git",
+            Self::Window => "Window",
+            Self::Help => "Help",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Edit => "edit",
+            Self::View => "view",
+            Self::Navigate => "navigate",
+            Self::Code => "code",
+            Self::Refactor => "refactor",
+            Self::Build => "build-menu",
+            Self::Run => "run",
+            Self::Git => "git",
+            Self::Window => "window",
+            Self::Help => "help",
+        }
+    }
+}
+
+/// Where the Keymap page puts an action: the group of the tree and, for the main menu, the
+/// menu the action belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Place {
+    EditorActions,
+    MainMenu(Section),
+    ToolWindows,
+    DebuggerActions,
+    Other,
+}
+
+/// The actions IDEA keeps in the Tool Windows group of its Keymap, whatever row of a menu
+/// also runs them.
+const TOOL_WINDOW_ACTIONS: &[&str] = &[
+    "workspace.hide_all_windows",
+    "workspace.jump_to_last_window",
+    "workspace.maximize_tool_window",
+];
+
+/// The place of every action the menu of the window shows, by its command or action id.
+fn places(menu: &[MenuEntry]) -> HashMap<String, Place> {
+    let mut places = HashMap::new();
+    for entry in menu {
+        let Some(section) = Section::of(entry.label.as_ref()) else {
+            continue;
+        };
+        collect_places(entry, Place::MainMenu(section), &mut places);
+    }
+    places
+}
+
+fn collect_places(entry: &MenuEntry, place: Place, places: &mut HashMap<String, Place>) {
+    if let Some(id) = &entry.id {
+        places.entry(id.to_string()).or_insert(place);
+    }
+    for row in &entry.submenu {
+        let place = match (place, row.label.as_ref()) {
+            (Place::MainMenu(Section::View), "Tool Windows") => Place::ToolWindows,
+            _ => place,
+        };
+        collect_places(row, place, places);
+    }
+}
+
 /// One action of the page.
 #[derive(Clone)]
 struct KeyRow {
     action: &'static str,
     title: String,
+    place: Place,
     shortcuts: Vec<Shortcut>,
     changed: bool,
 }
@@ -85,11 +256,19 @@ pub struct KeymapPage {
     reset_all: bool,
     /// The action whose row menu is open.
     menu: Option<&'static str>,
+    /// The place of every action of the main menu of the window.
+    places: HashMap<String, Place>,
+    /// The row whose buttons stand even without the pointer: the last one clicked.
+    selected: Option<&'static str>,
+    /// The row under the pointer, whose buttons stand while it is there.
+    hovered: Option<&'static str>,
+    /// The groups and sections the tree has closed.
+    closed: HashSet<String>,
     message: Option<String>,
 }
 
 impl KeymapPage {
-    pub fn new(workspace: WeakEntity<Workspace>) -> Self {
+    pub fn new(workspace: WeakEntity<Workspace>, menu: &[MenuEntry]) -> Self {
         Self {
             workspace,
             search: TextField::default(),
@@ -98,6 +277,10 @@ impl KeymapPage {
             conflict: None,
             reset_all: false,
             menu: None,
+            places: places(menu),
+            selected: None,
+            hovered: None,
+            closed: HashSet::new(),
             message: None,
         }
     }
@@ -318,17 +501,36 @@ impl KeymapPage {
             .map(|command| KeyRow {
                 action: command.id,
                 title: command.title.clone(),
+                place: self.place_of(command.id),
                 shortcuts: keymap.shortcuts_for(command.id),
                 changed: file.is_customized(command.id),
             })
             .collect();
         rows.sort_by(|left, right| {
-            left.title
-                .to_lowercase()
-                .cmp(&right.title.to_lowercase())
+            left.place
+                .cmp(&right.place)
+                .then(left.title.to_lowercase().cmp(&right.title.to_lowercase()))
                 .then(left.action.cmp(right.action))
         });
         rows
+    }
+
+    /// Where the row of an action stands. The place in the menu of the window comes first;
+    /// the actions the editor alone runs are the Editor Actions, and the rest is Other.
+    fn place_of(&self, action: &str) -> Place {
+        if action.starts_with("debug.") {
+            return Place::DebuggerActions;
+        }
+        if TOOL_WINDOW_ACTIONS.contains(&action) {
+            return Place::ToolWindows;
+        }
+        if let Some(place) = self.places.get(action) {
+            return *place;
+        }
+        if action.starts_with("editor.") {
+            return Place::EditorActions;
+        }
+        Place::Other
     }
 
     pub fn render(&mut self, _window: &mut Window, cx: &mut Context<SettingsView>) -> Div {
@@ -421,11 +623,6 @@ impl KeymapPage {
         if self.reset_all {
             page = page.child(self.reset_all_popup(&theme, cx));
         }
-        if let Some(action) = self.menu
-            && let Some(row) = rows.iter().find(|row| row.action == action)
-        {
-            page = page.child(self.row_menu(row, &theme, cx));
-        }
         if let Some(message) = &self.message {
             page = page.child(
                 div()
@@ -440,7 +637,9 @@ impl KeymapPage {
             .into_iter()
             .filter(|row| row.matches(&query, filter.as_ref()))
             .collect();
-        if shown.is_empty() {
+        // A search shows what it found, with the tree open to every row it keeps.
+        let filtering = !query.trim().is_empty() || filter.is_some();
+        if shown.is_empty() && filtering {
             page = page.child(
                 div()
                     .py(px(SPACE_S))
@@ -448,10 +647,144 @@ impl KeymapPage {
                     .child("No action matches."),
             );
         }
-        for row in &shown {
-            page = page.child(self.row(row, &theme, cx));
+        let mut page = self.top_group(page, Place::EditorActions, &shown, filtering, &theme, cx);
+        page = self.main_menu_group(page, &shown, filtering, &theme, cx);
+        page = self.top_group(page, Place::ToolWindows, &shown, filtering, &theme, cx);
+        page = self.top_group(page, Place::DebuggerActions, &shown, filtering, &theme, cx);
+        page = self.top_group(page, Place::Other, &shown, filtering, &theme, cx);
+        page
+    }
+
+    /// One group of the tree with the actions that stand directly in it.
+    fn top_group(
+        &self,
+        mut page: Div,
+        place: Place,
+        rows: &[KeyRow],
+        filtering: bool,
+        theme: &Theme,
+        cx: &mut Context<SettingsView>,
+    ) -> Div {
+        let (label, node) = match place {
+            Place::EditorActions => ("Editor Actions", "editor-actions"),
+            Place::ToolWindows => ("Tool Windows", "tool-windows"),
+            Place::DebuggerActions => ("Debugger Actions", "debugger-actions"),
+            Place::Other => ("Other", "other"),
+            Place::MainMenu(_) => return page,
+        };
+        let members: Vec<&KeyRow> = rows.iter().filter(|row| row.place == place).collect();
+        if filtering && members.is_empty() {
+            return page;
+        }
+        let open = filtering || !self.closed.contains(node);
+        page = page.child(self.group_header(node, label, 0, open, theme, cx));
+        if open {
+            page = self.rows_of(page, &members, 1, theme, cx);
         }
         page
+    }
+
+    /// The Main Menu group: the actions of every menu of the window, under the menu that
+    /// runs them.
+    fn main_menu_group(
+        &self,
+        mut page: Div,
+        rows: &[KeyRow],
+        filtering: bool,
+        theme: &Theme,
+        cx: &mut Context<SettingsView>,
+    ) -> Div {
+        let members = rows
+            .iter()
+            .any(|row| matches!(row.place, Place::MainMenu(_)));
+        if filtering && !members {
+            return page;
+        }
+        let open = filtering || !self.closed.contains("main-menu");
+        page = page.child(self.group_header("main-menu", "Main Menu", 0, open, theme, cx));
+        if !open {
+            return page;
+        }
+        for section in Section::ALL {
+            let rows: Vec<&KeyRow> = rows
+                .iter()
+                .filter(|row| row.place == Place::MainMenu(section))
+                .collect();
+            if filtering && rows.is_empty() {
+                continue;
+            }
+            let node = SharedString::from(format!("main-menu-{}", section.slug()));
+            let open = filtering || !self.closed.contains(node.as_ref());
+            page = page.child(self.group_header(&node, section.title(), 1, open, theme, cx));
+            if open {
+                page = self.rows_of(page, &rows, 2, theme, cx);
+            }
+        }
+        page
+    }
+
+    fn rows_of(
+        &self,
+        mut page: Div,
+        rows: &[&KeyRow],
+        depth: usize,
+        theme: &Theme,
+        cx: &mut Context<SettingsView>,
+    ) -> Div {
+        for row in rows {
+            page = page.child(self.row(row, depth, theme, cx));
+            if self.menu == Some(row.action) {
+                page = page.child(self.row_menu(row, theme, cx));
+            }
+        }
+        page
+    }
+
+    /// The row of a group or of a menu: its arrow and its name.
+    fn group_header(
+        &self,
+        node: &str,
+        label: &'static str,
+        depth: usize,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<SettingsView>,
+    ) -> Stateful<Div> {
+        let arrow = if open {
+            "general/chevronDown"
+        } else {
+            "general/chevronRight"
+        };
+        let selector = format!("keymap-group-{node}");
+        let debug = selector.clone();
+        let clicked = node.to_owned();
+        let hover = theme.hover;
+        div()
+            .id(SharedString::from(selector))
+            .debug_selector(move || debug.clone())
+            .flex()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .pl(px(ROW_PADDING_X + SPACE_L * depth as f32))
+            .pr(px(ROW_PADDING_X))
+            .rounded(px(ROW_RADIUS))
+            .hover(move |style| style.bg(hover))
+            .child(
+                div()
+                    .size(px(14.))
+                    .flex_none()
+                    .child(icon_sized(arrow, 10., theme)),
+            )
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let node = clicked.clone();
+                if !this.keymap_page.closed.remove(&node) {
+                    this.keymap_page.closed.insert(node);
+                }
+                cx.notify();
+            }))
     }
 
     fn search_field(
@@ -494,15 +827,69 @@ impl KeymapPage {
     fn row(
         &self,
         row: &KeyRow,
+        depth: usize,
         theme: &Theme,
         cx: &mut Context<SettingsView>,
     ) -> impl IntoElement + use<> {
         let id = selector_of("keymap-row", row.action);
         let action = row.action;
-        let add_id = SharedString::from(selector_of("keymap-add", row.action));
-        let reset_id = SharedString::from(selector_of("keymap-reset", row.action));
+        let selected = self.selected == Some(action);
+        let active = selected || self.hovered == Some(action);
         let changed = row.changed;
-        let mut line = div()
+        let hover = theme.hover;
+        let place = place_label(row.place);
+        let shortcut_text = row
+            .shortcuts
+            .iter()
+            .map(present)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let shortcuts_selector = selector_of("keymap-shortcuts", row.action);
+        let removed = row.shortcuts.first().cloned();
+
+        let mut buttons = div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(SPACE_XS))
+            .flex_none()
+            .w(px(ROW_BUTTONS));
+        if active {
+            if let Some(shortcut) = removed {
+                let remove_id = SharedString::from(selector_of("keymap-remove", action));
+                buttons = buttons.child(
+                    icon_button(
+                        remove_id,
+                        "general/closeSmall",
+                        "Remove Keyboard Shortcut",
+                        None,
+                        theme,
+                    )
+                    .debug_selector(move || selector_of("keymap-remove", action))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.keymap_page.remove(action, shortcut.clone(), cx);
+                    })),
+                );
+            }
+            let add_id = SharedString::from(selector_of("keymap-add", action));
+            buttons = buttons.child(
+                icon_button(add_id, "general/add", "Add Keyboard Shortcut", None, theme)
+                    .debug_selector(move || selector_of("keymap-add", action))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.keymap_page.open_capture(CaptureKind::Add(action), cx);
+                    })),
+            );
+            let reset_id = SharedString::from(selector_of("keymap-reset", action));
+            buttons = buttons.child(
+                icon_button(reset_id, "general/refresh", "Reset to Default", None, theme)
+                    .debug_selector(move || selector_of("keymap-reset", action))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.keymap_page.reset_action(action, cx);
+                    })),
+            );
+        }
+
+        div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id)
             .flex()
@@ -510,71 +897,56 @@ impl KeymapPage {
             .flex_none()
             .gap(px(SPACE_S))
             .min_h(px(ROW_HEIGHT))
-            .px(px(ROW_PADDING_X))
+            .pl(px(ROW_PADDING_X + SPACE_L * depth as f32))
+            .pr(px(ROW_PADDING_X))
             .rounded(px(ROW_RADIUS))
-            .when(changed, |this| this.bg(theme.selection))
+            .when(selected, |this| this.bg(theme.selection))
+            .when(changed && !selected, |this| this.text_color(theme.accent))
+            .hover(move |style| style.bg(hover))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                let next = hovered.then_some(action);
+                if this.keymap_page.hovered != next {
+                    this.keymap_page.hovered = next;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.keymap_page.selected = Some(action);
+                this.keymap_page.menu = None;
+                cx.notify();
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| {
+                    this.keymap_page.selected = Some(action);
                     this.keymap_page.menu = Some(action);
                     cx.notify();
                 }),
             )
+            .child(div().flex_1().min_w_0().truncate().child(row.title.clone()))
             .child(
                 div()
-                    .flex_1()
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(row.title.clone()),
-            );
-        for (index, shortcut) in row.shortcuts.iter().enumerate() {
-            let remove_id = SharedString::from(format!(
-                "{}-{index}",
-                selector_of("keymap-remove", row.action)
-            ));
-            let remove_selector = remove_id.to_string();
-            let text = present(shortcut);
-            let shortcut = shortcut.clone();
-            line = line.child(
-                div()
+                    .id(SharedString::from(shortcuts_selector.clone()))
+                    .debug_selector(move || shortcuts_selector.clone())
                     .flex()
                     .items_center()
-                    .gap(px(SPACE_XS))
+                    .justify_end()
+                    .flex_none()
+                    .w(px(SHORTCUTS_COLUMN))
+                    .min_w_0()
+                    .text_size(px(TEXT_SMALL))
+                    .text_color(theme.text_secondary)
                     .child(
                         div()
-                            .text_color(theme.text_secondary)
-                            .whitespace_nowrap()
-                            .child(text),
+                            .min_w_0()
+                            .truncate()
+                            .text_align(TextAlign::Right)
+                            .child(shortcut_text.clone()),
                     )
-                    .child(
-                        icon_button(
-                            remove_id,
-                            "general/closeSmall",
-                            "Remove Keyboard Shortcut",
-                            None,
-                            theme,
-                        )
-                        .debug_selector(move || remove_selector.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.keymap_page.remove(action, shortcut.clone(), cx);
-                        })),
-                    ),
-            );
-        }
-        line.child(
-            icon_button(add_id, "general/add", "Add Keyboard Shortcut", None, theme)
-                .debug_selector(move || selector_of("keymap-add", action))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.keymap_page.open_capture(CaptureKind::Add(action), cx);
-                })),
-        )
-        .child(
-            icon_button(reset_id, "general/refresh", "Reset to Default", None, theme)
-                .debug_selector(move || selector_of("keymap-reset", action))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.keymap_page.reset_action(action, cx);
-                })),
-        )
+                    .child(shortcut_label_probe(action, &shortcut_text)),
+            )
+            .child(buttons)
+            .child(place_probe(action, &place))
     }
 
     /// The menu of a row, opened by the right click on it. The buttons of the row do the
@@ -586,21 +958,23 @@ impl KeymapPage {
         cx: &mut Context<SettingsView>,
     ) -> impl IntoElement + use<> {
         let action = row.action;
-        let first = row.shortcuts.first().cloned();
+        let hover = theme.hover;
         let mut menu = div()
             .id("keymap-row-menu")
             .debug_selector(|| "keymap-row-menu".to_owned())
             .flex()
-            .items_center()
+            .flex_col()
             .flex_none()
-            .gap(px(SPACE_S))
-            .py(px(SPACE_S))
-            .px(px(SPACE_M))
+            .gap(px(SPACE_XS))
+            .py(px(SPACE_XS))
+            .px(px(SPACE_S))
+            .ml(px(ROW_PADDING_X + SPACE_L))
             .rounded(px(CONTROL_RADIUS))
             .border_1()
-            .border_color(theme.accent)
+            .border_color(theme.border)
             .child(
                 div()
+                    .text_size(px(TEXT_SMALL))
                     .text_color(theme.text_secondary)
                     .child(row.title.clone()),
             );
@@ -610,20 +984,33 @@ impl KeymapPage {
                 .id(add_id)
                 .debug_selector(move || selector_of("keymap-menu-add", action))
                 .px(px(SPACE_S))
+                .py(px(SPACE_XS))
+                .rounded(px(ROW_RADIUS))
+                .hover(move |style| style.bg(hover))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    this.keymap_page.menu = None;
                     this.keymap_page.open_capture(CaptureKind::Add(action), cx);
                 }))
                 .child("Add Keyboard Shortcut"),
         );
-        if let Some(shortcut) = first {
-            let remove_id = SharedString::from(selector_of("keymap-menu-remove", action));
-            let label = format!("Remove {}", present(&shortcut));
+        for (index, shortcut) in row.shortcuts.iter().enumerate() {
+            let remove_id = SharedString::from(format!(
+                "{}-{index}",
+                selector_of("keymap-menu-remove", action)
+            ));
+            let selector = remove_id.to_string();
+            let label = format!("Remove {}", present(shortcut));
+            let shortcut = shortcut.clone();
             menu = menu.child(
                 div()
                     .id(remove_id)
-                    .debug_selector(move || selector_of("keymap-menu-remove", action))
+                    .debug_selector(move || selector.clone())
                     .px(px(SPACE_S))
+                    .py(px(SPACE_XS))
+                    .rounded(px(ROW_RADIUS))
+                    .hover(move |style| style.bg(hover))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.keymap_page.menu = None;
                         this.keymap_page.remove(action, shortcut.clone(), cx);
                     }))
                     .child(label),
@@ -635,10 +1022,14 @@ impl KeymapPage {
                 .id(reset_id)
                 .debug_selector(move || selector_of("keymap-menu-reset", action))
                 .px(px(SPACE_S))
+                .py(px(SPACE_XS))
+                .rounded(px(ROW_RADIUS))
+                .hover(move |style| style.bg(hover))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    this.keymap_page.menu = None;
                     this.keymap_page.reset_action(action, cx);
                 }))
-                .child("Reset"),
+                .child("Reset Shortcuts"),
         )
     }
 

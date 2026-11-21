@@ -17,6 +17,8 @@ use crate::git_log;
 
 const LIST_WIDTH: f32 = 460.;
 const HISTORY_CONTEXT: &str = "SelectionHistory";
+/// The group of the header: the Hide button shows while the pointer is over the window.
+const GROUP: &str = "bottom-panel";
 
 /// One row of the window: the uncommitted changes of the lines, or a commit.
 enum Entry {
@@ -449,6 +451,58 @@ impl Render for SelectionHistoryPanel {
             None => "History for Selection".into(),
         };
         let can_open_log = self.selected_entry().and_then(Entry::id).is_some();
+        let workspace = self.workspace.clone();
+        let hide = {
+            let workspace = workspace.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_tool(SELECTION_HISTORY_TOOL, window, cx)
+                    })
+                    .ok();
+            }
+        };
+        let options =
+            crate::tool_menu::options_menu(workspace, SELECTION_HISTORY_TOOL, |_| Vec::new());
+        let header = tool_header(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .debug_selector(|| "selection-history-title".to_owned())
+                .child(title),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .when(self.loading, |this| {
+                    this.child(div().text_color(theme.text_secondary).child("Loading..."))
+                })
+                .when(can_open_log, |this| {
+                    this.child(
+                        div()
+                            .id("selection-history-open-log")
+                            .debug_selector(|| "selection-history-open-log".to_owned())
+                            .px(px(SPACE_M))
+                            .rounded(px(CONTROL_RADIUS))
+                            .cursor_pointer()
+                            .hover({
+                                let hover = theme.hover;
+                                move |style| style.bg(hover)
+                            })
+                            .child("Open in Git Log")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_in_log(window, cx)),
+                            ),
+                    )
+                }),
+            GROUP,
+            "selection-history",
+            options,
+            hide,
+            &theme,
+        )
+        .border_b_1()
+        .border_color(theme.toolbar_border)
+        .debug_selector(|| "selection-history-header".to_owned());
         div()
             .id("selection-history")
             .debug_selector(|| "selection-history".to_owned())
@@ -459,54 +513,9 @@ impl Render for SelectionHistoryPanel {
             .size_full()
             .bg(theme.island_bg)
             .text_color(theme.text)
+            .group(GROUP)
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .h(px(CONTROL_HEIGHT))
-                    .pl(px(SPACE_M))
-                    .pr(px(SPACE_S))
-                    .border_b_1()
-                    .border_color(theme.toolbar_border)
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .debug_selector(|| "selection-history-title".to_owned())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_S))
-                            .when(self.loading, |this| {
-                                this.child(
-                                    div().text_color(theme.text_secondary).child("Loading..."),
-                                )
-                            })
-                            .when(can_open_log, |this| {
-                                this.child(
-                                    div()
-                                        .id("selection-history-open-log")
-                                        .debug_selector(|| "selection-history-open-log".to_owned())
-                                        .px(px(SPACE_M))
-                                        .rounded(px(CONTROL_RADIUS))
-                                        .cursor_pointer()
-                                        .hover({
-                                            let hover = theme.hover;
-                                            move |style| style.bg(hover)
-                                        })
-                                        .child("Open in Git Log")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_in_log(window, cx)
-                                        })),
-                                )
-                            }),
-                    ),
-            )
+            .child(header)
             .child(
                 div()
                     .flex()

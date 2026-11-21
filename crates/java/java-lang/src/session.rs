@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use java_project::Jdk;
 use jdtls_adapter::{ImportFailure, JdtlsConfig, Runtime};
@@ -246,12 +247,88 @@ mod runtime_tests {
     }
 }
 
+/// A failed import that another import alone can clear: on a fresh OSGi cache the server
+/// hands Gradle the path of its initialization script before the cache unpacks the
+/// script. The file appears a moment later, so the second import finds it. The first
+/// such failure of a server session is repeated once instead of shown, and a second one
+/// is a real error, as it would otherwise repeat forever.
+pub(crate) struct ImportRetries {
+    /// The `config` folder of the server, where the script lives.
+    config: PathBuf,
+    /// Whether this server session has already asked for the repeat import.
+    used: AtomicBool,
+}
+
+impl ImportRetries {
+    pub(crate) fn new(state_dir: &Path) -> Self {
+        Self {
+            config: state_dir.join("config"),
+            used: AtomicBool::new(false),
+        }
+    }
+
+    /// True when `failure` names a missing initialization script inside the cache of
+    /// this server and the session has not retried such a failure yet.
+    pub(crate) fn retry(&self, failure: &ImportFailure) -> bool {
+        if !names_missing_init_script(failure, &self.config) {
+            return false;
+        }
+        !self.used.swap(true, Ordering::SeqCst)
+    }
+}
+
+/// The server neither imports nor names the script in `failure`, or names one outside
+/// its own cache, which another import does not create.
+fn names_missing_init_script(failure: &ImportFailure, config: &Path) -> bool {
+    let Some(script) = missing_init_script(&failure.message) else {
+        return false;
+    };
+    platform::path_key(Path::new(script)).starts_with(platform::path_key(config))
+}
+
+/// The script of `The specified initialization script '<path>' does not exist`.
+fn missing_init_script(message: &str) -> Option<&str> {
+    let after = message.split_once("initialization script '")?.1;
+    let (script, rest) = after.split_once('\'')?;
+    rest.trim_start()
+        .starts_with("does not exist")
+        .then_some(script)
+}
+
+/// Follows the failures of the server and marks the first one that another import alone
+/// may clear. The status bar and the window read the same channel, so both see one
+/// decision: the line says `importing`, and the window runs the import instead of
+/// telling the user about a failure that is about to go away.
+pub(crate) fn follow_failures(
+    mut raw: watch::Receiver<Option<ImportFailure>>,
+    retries: Arc<ImportRetries>,
+    runtime: &tokio::runtime::Handle,
+) -> watch::Receiver<Option<ImportFailure>> {
+    let (sender, receiver) = watch::channel(None);
+    runtime.spawn(async move {
+        loop {
+            let failure = raw.borrow_and_update().clone().map(|mut failure| {
+                failure.retry = retries.retry(&failure);
+                failure
+            });
+            sender.send_replace(failure);
+            if sender.is_closed() || raw.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
 /// The status bar line for a server state. A failed import is the line itself: the
 /// server may still say `ready`, but completion and checks do not work until the project
-/// is imported, and a `ready` line would hide the reason.
-pub fn status_line(status: &Status, failure: Option<&ImportFailure>) -> String {
+/// is imported, and a `ready` line would hide the reason. A failure that another import
+/// is about to clear, and the import that runs after it, read as `importing`.
+pub fn status_line(status: &Status, failure: Option<&ImportFailure>, importing: bool) -> String {
     match failure {
+        Some(failure) if failure.retry => "Java: importing".to_owned(),
         Some(failure) => format!("Java: import failed: {}", failure.summary),
+        None if importing => "Java: importing".to_owned(),
         None => status_text(status),
     }
 }
@@ -333,11 +410,17 @@ impl JavaSession {
     pub fn watch_status(&self, on_change: impl Fn(String) + Send + 'static) {
         let mut status = self.status();
         let mut failure = self.project().watch_import_failure();
+        let mut importing = self.project().watch_importing();
         self.runtime.spawn(async move {
             let mut shown = String::new();
             loop {
                 let failure_now = failure.borrow_and_update().clone();
-                let text = status_line(&status.borrow_and_update(), failure_now.as_ref());
+                let importing_now = *importing.borrow_and_update();
+                let text = status_line(
+                    &status.borrow_and_update(),
+                    failure_now.as_ref(),
+                    importing_now,
+                );
                 if text != shown {
                     on_change(text.clone());
                     shown = text;
@@ -349,6 +432,11 @@ impl JavaSession {
                         }
                     }
                     changed = failure.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = importing.changed() => {
                         if changed.is_err() {
                             return;
                         }
@@ -386,6 +474,41 @@ mod tests {
         }
     }
 
+    fn failure_with(message: &str) -> ImportFailure {
+        ImportFailure {
+            file: PathBuf::new(),
+            line: 0,
+            message: message.to_owned(),
+            summary: message.to_owned(),
+            jdk: None,
+            tool: None,
+            retry: false,
+        }
+    }
+
+    fn state_dir() -> PathBuf {
+        PathBuf::from("state").join("jdtls").join("demo")
+    }
+
+    fn init_script(state: &Path) -> PathBuf {
+        state
+            .join("config")
+            .join("org.eclipse.osgi")
+            .join("57")
+            .join("0")
+            .join(".cp")
+            .join("gradle")
+            .join("init")
+            .join("init.gradle")
+    }
+
+    fn missing_script(script: &Path) -> String {
+        format!(
+            "The specified initialization script '{}' does not exist",
+            script.display()
+        )
+    }
+
     #[test]
     fn states_read_as_short_lines() {
         assert_eq!(status_text(&status(State::Importing)), "Java: importing");
@@ -412,10 +535,70 @@ mod tests {
             summary: "the cause".into(),
             jdk: None,
             tool: None,
+            retry: false,
         };
         assert_eq!(
-            status_line(&ready, Some(&failure)),
+            status_line(&ready, Some(&failure), false),
             "Java: import failed: the cause"
+        );
+    }
+
+    #[test]
+    fn a_missing_initialization_script_in_the_server_cache_is_retried_once() {
+        let state = state_dir();
+        let retries = ImportRetries::new(&state);
+        let failure = failure_with(&missing_script(&init_script(&state)));
+
+        assert!(
+            retries.retry(&failure),
+            "the fresh cache asks for one more import"
+        );
+        assert!(
+            !retries.retry(&failure),
+            "a second refusal of the same kind is a real error"
+        );
+    }
+
+    #[test]
+    fn another_script_or_cause_is_not_retried() {
+        let state = state_dir();
+        let retries = ImportRetries::new(&state);
+
+        let outside = PathBuf::from("elsewhere")
+            .join("gradle")
+            .join("init")
+            .join("init.gradle");
+        assert!(!retries.retry(&failure_with(&missing_script(&outside))));
+        assert!(!retries.retry(&failure_with(
+            "Task with name 'postRelease' not found in root project 'demo'."
+        )));
+        assert!(!retries.retry(&failure_with(&format!(
+            "The specified initialization script '{}' does not work",
+            init_script(&state).display()
+        ))));
+
+        // Neither refusal used the one repeat of the session.
+        assert!(retries.retry(&failure_with(&missing_script(&init_script(&state)))));
+    }
+
+    #[test]
+    fn an_import_in_flight_or_about_to_start_reads_as_importing() {
+        let ready = status(State::Ready);
+        assert_eq!(status_line(&ready, None, true), "Java: importing");
+
+        let mut failure = failure_with(&missing_script(&init_script(&state_dir())));
+        failure.retry = true;
+        assert_eq!(
+            status_line(&ready, Some(&failure), false),
+            "Java: importing",
+            "the failure the window repeats is not shown"
+        );
+
+        failure.retry = false;
+        assert_eq!(
+            status_line(&ready, Some(&failure), true),
+            format!("Java: import failed: {}", failure.summary),
+            "a real failure is not hidden by an import in flight"
         );
     }
 
