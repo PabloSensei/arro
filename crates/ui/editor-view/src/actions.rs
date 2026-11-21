@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use lang_api::{
     ActionEntry, ActionKind, ActionQuery, ActionResolveQuery, Confidence, DocumentEdit,
-    DocumentSpot, GenerateKind, SourceEdit, SourceSpan, SuppressionQuery, SuppressionTarget,
-    TextPoint, TextSpan, UnwrapEdit, WorkspaceChange, ask,
+    DocumentSpot, GenerateKind, Replies, SourceEdit, SourceSpan, SuppressionQuery,
+    SuppressionTarget, TextPoint, TextSpan, UnwrapEdit, WorkspaceChange, ask,
 };
 use text_core::{Edit, RopeStore, TextStore, editing};
 use ui_kit::*;
@@ -218,6 +218,9 @@ pub(crate) struct ActionMenu {
     /// The question for the preview of the selected row, while the language computes
     /// the edit on resolve. Dropping it cancels the question.
     pub preview_task: Option<Task<()>>,
+    /// The wait for the server's actions while the server imports. Dropping the list ends
+    /// the wait, so a list that closed never takes the actions of another place.
+    pub waiting_task: Option<Task<()>>,
     /// The heading of the list, for the menus that have one, such as Generate.
     pub title: Option<&'static str>,
 }
@@ -590,6 +593,7 @@ impl EditorView {
                 sections: Vec::new(),
                 selected: 0,
                 preview_task: None,
+                waiting_task: None,
                 title: None,
             });
             cx.notify();
@@ -789,6 +793,7 @@ impl EditorView {
                 },
             ));
             self.show_action_sections(caret, own, cx);
+            self.wait_for_server_actions(span, caret, cx);
             return;
         }
         let Some((uri, version, _)) = self.asked_version() else {
@@ -812,27 +817,7 @@ impl EditorView {
                 let unknown = answer
                     .as_ref()
                     .is_none_or(|(_, confidence)| *confidence == Confidence::Unknown);
-                let mut entries: Vec<ActionEntry> = match answer {
-                    Some((mut entries, Confidence::Unknown)) => {
-                        entries.clear();
-                        entries
-                    }
-                    Some((entries, _)) => entries,
-                    None => Vec::new(),
-                };
-                entries.sort_by_key(|entry| {
-                    (section_of(entry) != MenuSection::QuickFix, !entry.preferred)
-                });
-                let entries = without_duplicate_actions(entries);
-                let mut rows: Vec<(MenuSection, Pick)> = entries
-                    .into_iter()
-                    .filter(|entry| {
-                        !entry.edits.is_empty()
-                            || !entry.renames.is_empty()
-                            || entry.resolve.is_some()
-                    })
-                    .map(|entry| (section_of(&entry), Pick::Action(entry)))
-                    .collect();
+                let mut rows = server_rows(answered_entries(answer));
                 rows.extend(own);
                 if rows.is_empty() {
                     if unknown {
@@ -874,8 +859,105 @@ impl EditorView {
             sections,
             selected: 0,
             preview_task: None,
+            waiting_task: None,
             title: None,
         });
+        cx.notify();
+        self.request_action_preview(cx);
+    }
+
+    /// While the server imports, the list of Alt+Enter waits for the server to be ready. Then
+    /// it asks once for the actions of the same place, and they join the list in place of the
+    /// greyed line. The wait belongs to the list: a list that closes ends the wait.
+    fn wait_for_server_actions(&mut self, span: TextSpan, caret: usize, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(Self::WAIT_TICK_MS))
+                    .await;
+                match this.update(cx, |this, _| this.server_ready()) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(_) => return,
+                }
+            }
+            let Ok(Some((version, replies))) =
+                this.update(cx, |this, _| this.ask_server_actions(span))
+            else {
+                return;
+            };
+            let answer = first(replies).await;
+            this.update(cx, |this, cx| {
+                this.join_server_actions(caret, version, answer, cx);
+            })
+            .ok();
+        });
+        if let Some(lsp) = &mut self.lsp
+            && let Some(menu) = &mut lsp.actions
+        {
+            menu.waiting_task = Some(task);
+        }
+    }
+
+    /// The question for the actions of `span` at the text as it stands, with the version of
+    /// the text it is asked on.
+    fn ask_server_actions(&self, span: TextSpan) -> Option<(i32, Replies<Vec<ActionEntry>>)> {
+        let (uri, version, _) = self.asked_version()?;
+        let provider = self.lsp.as_ref()?.support.actions()?;
+        let query = ActionQuery {
+            uri,
+            version,
+            span,
+            only: None,
+        };
+        Some((version, ask(provider, query)))
+    }
+
+    /// The actions of the language join the list that waited for them. The greyed line goes,
+    /// and the selection stays on the row it was on. The list changes only while it is still
+    /// the one that waited: the same place, and the text it was asked on.
+    fn join_server_actions(
+        &mut self,
+        caret: usize,
+        version: i32,
+        answer: Option<(Vec<ActionEntry>, Confidence)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.version() as i32 != version)
+        {
+            return;
+        }
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let Some(menu) = &mut lsp.actions else {
+            return;
+        };
+        if menu.at != caret || !menu.rows.iter().any(Pick::is_waiting) {
+            return;
+        }
+        let selected = menu.selected;
+        // The rows are sorted by section again, as the list builds them: the sort is stable,
+        // so the language's rows keep their order and come before the editor's rows.
+        let mut rows: Vec<(MenuSection, bool, Pick)> = server_rows(answered_entries(answer))
+            .into_iter()
+            .map(|(section, pick)| (section, false, pick))
+            .collect();
+        rows.extend(
+            std::mem::take(&mut menu.rows)
+                .into_iter()
+                .enumerate()
+                .filter(|(_, pick)| !pick.is_waiting())
+                .map(|(row, pick)| (pick.section(), row == selected, pick)),
+        );
+        rows.sort_by_key(|(section, _, _)| *section != MenuSection::QuickFix);
+        menu.selected = rows.iter().position(|(_, chosen, _)| *chosen).unwrap_or(0);
+        menu.sections = rows.iter().map(|(section, _, _)| *section).collect();
+        menu.rows = rows.into_iter().map(|(_, _, pick)| pick).collect();
+        menu.preview_task = None;
         cx.notify();
         self.request_action_preview(cx);
     }
@@ -1590,6 +1672,28 @@ impl EditorView {
             .ok();
         })
         .detach();
+    }
+}
+
+/// The rows of the language's answer for Alt+Enter: the quick fixes first, and the preferred
+/// actions first inside a section. An action with no edit, no rename and no resolve has
+/// nothing to apply, so it is left out.
+fn server_rows(mut entries: Vec<ActionEntry>) -> Vec<(MenuSection, Pick)> {
+    entries.sort_by_key(|entry| (section_of(entry) != MenuSection::QuickFix, !entry.preferred));
+    without_duplicate_actions(entries)
+        .into_iter()
+        .filter(|entry| {
+            !entry.edits.is_empty() || !entry.renames.is_empty() || entry.resolve.is_some()
+        })
+        .map(|entry| (section_of(&entry), Pick::Action(entry)))
+        .collect()
+}
+
+/// The actions of a language answer. An answer that says it is unknown gives none.
+fn answered_entries(answer: Option<(Vec<ActionEntry>, Confidence)>) -> Vec<ActionEntry> {
+    match answer {
+        Some((entries, confidence)) if confidence != Confidence::Unknown => entries,
+        _ => Vec::new(),
     }
 }
 

@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use java_project::Jdk;
 use jdtls_adapter::{ImportFailure, JdtlsConfig, Runtime};
@@ -249,31 +249,47 @@ mod runtime_tests {
 
 /// A failed import that another import alone can clear: on a fresh OSGi cache the server
 /// hands Gradle the path of its initialization script before the cache unpacks the
-/// script. The file appears a moment later, so the second import finds it. The first
-/// such failure of a server session is repeated once instead of shown, and a second one
-/// is a real error, as it would otherwise repeat forever.
+/// script. The file appears a moment later, so the second import finds it.
+///
+/// Buildship reports such a refusal for every Gradle operation of one import, so the
+/// repeats are counted per import attempt, not per refusal: every refusal that names the
+/// script before the repeat import begins belongs to the first attempt and asks for the
+/// same repeat. A refusal after the repeat began is a real error, as it would otherwise
+/// repeat forever.
 pub(crate) struct ImportRetries {
     /// The `config` folder of the server, where the script lives.
     config: PathBuf,
-    /// Whether this server session has already asked for the repeat import.
-    used: AtomicBool,
+    /// The number of imports that had begun when the repeat was asked for in this server
+    /// session, or `None` before the first such refusal.
+    repeated_at: Mutex<Option<u64>>,
 }
 
 impl ImportRetries {
     pub(crate) fn new(state_dir: &Path) -> Self {
         Self {
             config: state_dir.join("config"),
-            used: AtomicBool::new(false),
+            repeated_at: Mutex::new(None),
         }
     }
 
     /// True when `failure` names a missing initialization script inside the cache of
-    /// this server and the session has not retried such a failure yet.
-    pub(crate) fn retry(&self, failure: &ImportFailure) -> bool {
+    /// this server and belongs to the import attempt that still waits for its repeat.
+    /// `imports_started` is the number of Gradle imports that began in the session.
+    pub(crate) fn retry(&self, failure: &ImportFailure, imports_started: u64) -> bool {
         if !names_missing_init_script(failure, &self.config) {
             return false;
         }
-        !self.used.swap(true, Ordering::SeqCst)
+        let mut repeated_at = self
+            .repeated_at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match *repeated_at {
+            None => {
+                *repeated_at = Some(imports_started);
+                true
+            }
+            Some(at) => imports_started <= at,
+        }
     }
 }
 
@@ -295,23 +311,34 @@ fn missing_init_script(message: &str) -> Option<&str> {
         .then_some(script)
 }
 
-/// Follows the failures of the server and marks the first one that another import alone
-/// may clear. The status bar and the window read the same channel, so both see one
-/// decision: the line says `importing`, and the window runs the import instead of
-/// telling the user about a failure that is about to go away.
+/// Follows the failures of the server and marks the refusals of the first import attempt
+/// that another import alone may clear. The status bar and the window read the same
+/// channel, so both see one decision: the line says `importing`, and the window runs the
+/// import instead of telling the user about a failure that is about to go away. The
+/// number of imports that have begun tells a refusal of the first attempt, which asks for
+/// the repeat, from a refusal of the repeat, which is a real error.
 pub(crate) fn follow_failures(
     mut raw: watch::Receiver<Option<ImportFailure>>,
+    started: watch::Receiver<u64>,
     retries: Arc<ImportRetries>,
     runtime: &tokio::runtime::Handle,
 ) -> watch::Receiver<Option<ImportFailure>> {
     let (sender, receiver) = watch::channel(None);
     runtime.spawn(async move {
+        let mut seen: Option<Option<ImportFailure>> = None;
         loop {
-            let failure = raw.borrow_and_update().clone().map(|mut failure| {
-                failure.retry = retries.retry(&failure);
-                failure
-            });
-            sender.send_replace(failure);
+            let current = raw.borrow_and_update().clone();
+            // The retry flag belongs to the refusal, not to the import that runs: the
+            // same refusal keeps its decision while a begin only clears it.
+            if seen.as_ref() != Some(&current) {
+                let imports_started = *started.borrow();
+                let failure = current.clone().map(|mut failure| {
+                    failure.retry = retries.retry(&failure, imports_started);
+                    failure
+                });
+                sender.send_replace(failure);
+                seen = Some(current);
+            }
             if sender.is_closed() || raw.changed().await.is_err() {
                 return;
             }
@@ -544,18 +571,31 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_initialization_script_in_the_server_cache_is_retried_once() {
+    fn refusals_of_one_import_are_one_repeat_and_a_refusal_after_it_is_an_error() {
         let state = state_dir();
         let retries = ImportRetries::new(&state);
         let failure = failure_with(&missing_script(&init_script(&state)));
 
+        // Buildship reports both Gradle operations of the import, and the repeat has not
+        // begun before the second report: neither refusal is an error.
         assert!(
-            retries.retry(&failure),
+            retries.retry(&failure, 1),
             "the fresh cache asks for one more import"
         );
         assert!(
-            !retries.retry(&failure),
-            "a second refusal of the same kind is a real error"
+            retries.retry(&failure, 1),
+            "another refusal of the same import is the same repeat, not an error"
+        );
+
+        // The repeat import began with the next begin of the server: its own refusal is
+        // the one to show, and it does not repeat again.
+        assert!(
+            !retries.retry(&failure, 2),
+            "a refusal after the repeat began is a real error"
+        );
+        assert!(
+            !retries.retry(&failure, 3),
+            "a later import does not repeat the same failure again"
         );
     }
 
@@ -568,17 +608,21 @@ mod tests {
             .join("gradle")
             .join("init")
             .join("init.gradle");
-        assert!(!retries.retry(&failure_with(&missing_script(&outside))));
-        assert!(!retries.retry(&failure_with(
-            "Task with name 'postRelease' not found in root project 'demo'."
-        )));
-        assert!(!retries.retry(&failure_with(&format!(
-            "The specified initialization script '{}' does not work",
-            init_script(&state).display()
-        ))));
+        assert!(!retries.retry(&failure_with(&missing_script(&outside)), 1));
+        assert!(!retries.retry(
+            &failure_with("Task with name 'postRelease' not found in root project 'demo'."),
+            1
+        ));
+        assert!(!retries.retry(
+            &failure_with(&format!(
+                "The specified initialization script '{}' does not work",
+                init_script(&state).display()
+            )),
+            1
+        ));
 
         // Neither refusal used the one repeat of the session.
-        assert!(retries.retry(&failure_with(&missing_script(&init_script(&state)))));
+        assert!(retries.retry(&failure_with(&missing_script(&init_script(&state))), 1));
     }
 
     #[test]

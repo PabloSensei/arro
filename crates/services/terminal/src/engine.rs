@@ -465,13 +465,15 @@ impl Engine {
         }
         let cursor = content.cursor.point;
         let on_screen = cursor.line.0 + offset as i32;
-        let visible = self.term.mode().contains(TermMode::SHOW_CURSOR) && offset == 0;
+        let position = (offset == 0).then_some((on_screen as u16, cursor.column.0 as u16));
+        let visible = self.term.mode().contains(TermMode::SHOW_CURSOR);
         let notes = self.notes.borrow();
         Screen {
             cols: cols as u16,
             rows: rows as u16,
             cells,
-            cursor: visible.then_some((on_screen as u16, cursor.column.0 as u16)),
+            cursor: position.filter(|_| visible),
+            cursor_position: position,
             display_offset: offset,
             history: self.term.grid().history_size(),
             title: notes.title.clone(),

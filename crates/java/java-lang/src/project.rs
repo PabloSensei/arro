@@ -512,6 +512,7 @@ impl JavaProject {
     ) -> Result<Self, OpenError> {
         let failures = crate::session::follow_failures(
             spec.watch_import_failure(),
+            spec.watch_import_starts(),
             Arc::new(crate::session::ImportRetries::new(&cache)),
             &Handle::current(),
         );

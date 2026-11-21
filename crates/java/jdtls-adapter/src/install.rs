@@ -5,8 +5,14 @@
 //! arguments of the daemon. A release unpacked into a new folder, as every update of the
 //! IDE does, therefore leaves a configuration folder that names files of the old folder,
 //! and the import fails until the folder is removed. The mark below tells the releases
-//! apart. The workspace folder (`-data`) holds the model of the project and paths of the
-//! repository rather than paths of the release, so it stays.
+//! apart.
+//!
+//! The workspace folder (`-data`) keeps the model of the projects: their source folders,
+//! their output and the class path the previous import produced, including the JVM Gradle
+//! ran on. A configuration folder that is gone cannot refresh that model, so an import of
+//! the new release that fails leaves the model of the old one in place and the editor
+//! sees the dependencies of that import. The two folders are therefore a pair: the model
+//! goes whenever the configuration goes.
 
 use std::fs;
 use std::io;
@@ -19,6 +25,8 @@ use serde_json::{Value, json};
 const MARK_FILE: &str = "jdtls-install.json";
 /// The name jdtls gives the OSGi configuration folder under the state folder.
 const CONFIG_DIR: &str = "config";
+/// The name jdtls gives the folder of its workspace (`-data`) under the state folder.
+const WORKSPACE_DIR: &str = "workspace";
 /// The bundle whose jar name carries the build of the release.
 const CORE_BUNDLE_PREFIX: &str = "org.eclipse.jdt.ls.core_";
 const JAR_SUFFIX: &str = ".jar";
@@ -100,19 +108,29 @@ fn recorded(state_dir: &Path) -> Option<InstallMark> {
     InstallMark::from_json(&serde_json::from_str(&text).ok()?)
 }
 
-/// Removes the configuration folder of another installation and records `current`.
+/// Removes the configuration folder of another installation, with the model that folder
+/// produced, and records `current`.
+///
+/// A configuration folder that is gone while the mark already names `current` was
+/// removed between two starts, and the model left behind is of the same unknown age, so
+/// it goes as well.
 ///
 /// The caller holds the lock of the state folder, so no other server of this project
 /// reads it. A failure keeps the old mark, so the next start tries again instead of
-/// launching a server on the cache of another release.
+/// launching a server on the cache and the model of another release.
 pub(crate) fn prepare(state_dir: &Path, current: &InstallMark) -> io::Result<()> {
-    let same = recorded(state_dir).is_some_and(|mark| mark.names_same_installation(current));
+    let config = state_dir.join(CONFIG_DIR);
+    let same = recorded(state_dir).is_some_and(|mark| mark.names_same_installation(current))
+        && config.is_dir();
     if same {
         return Ok(());
     }
-    let config = state_dir.join(CONFIG_DIR);
     if config.is_dir() {
         fs::remove_dir_all(&config)?;
+    }
+    let workspace = state_dir.join(WORKSPACE_DIR);
+    if workspace.is_dir() {
+        fs::remove_dir_all(&workspace)?;
     }
     let text = serde_json::to_string_pretty(&current.to_json())
         .unwrap_or_else(|_| current.to_json().to_string());
@@ -182,23 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn a_state_folder_without_a_mark_loses_the_configuration_but_keeps_the_workspace() {
+    fn a_state_folder_without_a_mark_loses_the_configuration_and_the_model() {
         let current = mark("no-mark");
         let state = state("no-mark");
 
         prepare(&state, &current).unwrap();
 
         assert!(!state.join("config").exists());
-        assert_eq!(
-            fs::read_to_string(state.join("workspace").join("index.txt")).unwrap(),
-            "model",
-            "the model of the project does not name the release"
+        assert!(
+            !state.join("workspace").exists(),
+            "the model of the projects is of the same unknown release as the configuration"
         );
         assert_eq!(recorded(&state), Some(current));
     }
 
     #[test]
-    fn a_mark_of_another_folder_clears_the_configuration() {
+    fn a_mark_of_another_folder_clears_the_configuration_and_the_model() {
         let old = mark("other-old");
         let state = state("other");
         fs::write(state.join(MARK_FILE), old.to_json().to_string()).unwrap();
@@ -207,12 +224,12 @@ mod tests {
         prepare(&state, &current).unwrap();
 
         assert!(!state.join("config").exists());
-        assert!(state.join("workspace").join("index.txt").is_file());
+        assert!(!state.join("workspace").exists());
         assert_eq!(recorded(&state), Some(current));
     }
 
     #[test]
-    fn a_new_launcher_of_the_same_folder_clears_the_configuration() {
+    fn a_new_launcher_of_the_same_folder_clears_the_configuration_and_the_model() {
         let home = release("new-launcher", LAUNCHER, BUILD);
         let old = InstallMark::of(&home, &home.join("plugins").join(LAUNCHER)).unwrap();
         let state = state("new-launcher");
@@ -224,12 +241,28 @@ mod tests {
         prepare(&state, &current).unwrap();
 
         assert!(!state.join("config").exists());
-        assert!(state.join("workspace").join("index.txt").is_file());
+        assert!(!state.join("workspace").exists());
         assert_eq!(recorded(&state), Some(current));
     }
 
     #[test]
-    fn the_same_installation_keeps_the_configuration() {
+    fn a_configuration_removed_between_starts_takes_the_model_with_it() {
+        let current = mark("removed");
+        let state = state("removed");
+        fs::write(state.join(MARK_FILE), current.to_json().to_string()).unwrap();
+        fs::remove_dir_all(state.join("config")).unwrap();
+
+        prepare(&state, &current).unwrap();
+
+        assert!(
+            !state.join("workspace").exists(),
+            "a model the removed configuration cannot refresh is not reused"
+        );
+        assert_eq!(recorded(&state), Some(current));
+    }
+
+    #[test]
+    fn the_same_installation_keeps_the_configuration_and_the_model() {
         let current = mark("same");
         let state = state("same");
         fs::write(state.join(MARK_FILE), current.to_json().to_string()).unwrap();
@@ -246,10 +279,11 @@ mod tests {
             .unwrap(),
             "old"
         );
+        assert!(state.join("workspace").join("index.txt").is_file());
     }
 
     #[test]
-    fn a_new_install_gives_the_start_a_clean_configuration_folder() {
+    fn a_new_install_gives_the_start_a_clean_configuration_folder_and_model() {
         let state = test_support::scratch("jdtls-install-plan-state");
         let first = jdtls(&state, &release("plan-old", LAUNCHER, BUILD));
         first.preflight().unwrap();
@@ -257,7 +291,7 @@ mod tests {
         let cache = state.join("config").join("org.eclipse.osgi").join("138");
         fs::create_dir_all(&cache).unwrap();
         fs::write(cache.join("init.gradle"), b"old").unwrap();
-        fs::create_dir_all(state.join("workspace")).unwrap();
+        fs::create_dir_all(state.join("workspace").join(".metadata")).unwrap();
 
         let second = jdtls(
             &state,
@@ -280,7 +314,10 @@ mod tests {
             !state.join("config").exists(),
             "the arguments name the folder the new release builds from scratch"
         );
-        assert!(state.join("workspace").is_dir());
+        assert!(
+            !state.join("workspace").exists(),
+            "the import of the new release writes the model again"
+        );
     }
 
     #[test]

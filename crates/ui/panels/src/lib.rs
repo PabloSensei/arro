@@ -1146,7 +1146,27 @@ fn connect_project_problems(
                     }
                 }
                 Some(_) => {}
-                None => notified.clear(),
+                None => {
+                    // The import ended well, so the notification of the failure this
+                    // window showed closes itself. One that the user closed or another
+                    // one that replaced it stays as it is.
+                    let text = std::mem::take(&mut notified);
+                    if !text.is_empty() {
+                        let expected = format!("import failed: {text}");
+                        let updated = workspace.update(cx, |workspace, cx| {
+                            let ours =
+                                workspace.last_notification().is_some_and(|(title, shown)| {
+                                    title == "Language Server" && shown == expected
+                                });
+                            if ours {
+                                workspace.close_notification(cx);
+                            }
+                        });
+                        if updated.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
             // The hub reads the workspace for the icons of its rows, so it is updated while
             // the workspace is free: a lease of the workspace here would panic in that read.
@@ -2217,3 +2237,12 @@ mod window_tests_import_retry;
 
 #[cfg(test)]
 mod window_tests_completion_members;
+
+#[cfg(test)]
+mod window_tests_import_retry_attempt;
+
+#[cfg(test)]
+mod window_tests_intentions_after_import;
+
+#[cfg(test)]
+mod window_tests_rename_in_place_errors;

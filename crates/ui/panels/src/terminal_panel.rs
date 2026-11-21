@@ -10,7 +10,9 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use keymap::Platform;
 use project_model::EnvironmentProvider;
-use terminal::{SearchMatch, SearchQuery, ShiftEnter, SpawnSpec, TERM_VARS, TerminalSession};
+use terminal::{
+    Screen, SearchMatch, SearchQuery, ShiftEnter, SpawnSpec, TERM_VARS, TerminalSession,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -195,6 +197,20 @@ pub struct TerminalPanel {
     suggestion_generation: u64,
     /// The lines Run Selection in Terminal sends once the shell of a new tab is up.
     pending_run: Option<(usize, Vec<String>)>,
+}
+
+/// The line of the prompt with what the user typed, and the column before the caret when
+/// the caret is shown. A program hides the cursor while it redraws its line, and the
+/// position of a hidden cursor can belong to the redraw, so the whole line is the input
+/// then. A program of the alternate screen draws its own picture: a hidden cursor there
+/// is not a prompt.
+fn prompt_line_of(screen: &Screen) -> Option<(String, Option<u16>)> {
+    let (row, column) = screen.cursor_position?;
+    let shown = screen.cursor.is_some();
+    if !shown && screen.modes.alt_screen {
+        return None;
+    }
+    Some((screen.line(row), shown.then_some(column)))
 }
 
 /// The client a command line of the prompt starts, when it is `claude` or `codex`.
@@ -817,14 +833,10 @@ impl TerminalPanel {
         if !enabled {
             return;
         }
-        let Some(session) = self.session().cloned() else {
+        let Some((line, _)) = self.prompt_line() else {
             return;
         };
-        let screen = session.screen();
-        let Some((row, _)) = screen.cursor else {
-            return;
-        };
-        let Some(client) = client_of_command(&screen.line(row)) else {
+        let Some(client) = client_of_command(&line) else {
             return;
         };
         self.suggestion_generation += 1;
@@ -846,14 +858,20 @@ impl TerminalPanel {
         .detach();
     }
 
+    /// The line of the prompt with what the user typed, and the column before the caret
+    /// when the caret is shown.
+    fn prompt_line(&self) -> Option<(String, Option<u16>)> {
+        prompt_line_of(&self.session()?.screen())
+    }
+
     /// The build or test line the prompt holds, when Ctrl+Enter is to run it in the Run
     /// window. The prompt of the shell is not a part of the line.
     fn typed_build_line(&self) -> Option<String> {
-        let session = self.session()?;
-        let screen = session.screen();
-        let (row, column) = screen.cursor?;
-        let shown = screen.line(row);
-        let left: String = shown.chars().take(column as usize).collect();
+        let (line, column) = self.prompt_line()?;
+        let left: String = match column {
+            Some(column) => line.chars().take(column as usize).collect(),
+            None => line,
+        };
         build_line(&left)
     }
 
@@ -2417,12 +2435,32 @@ impl TerminalPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalCommand, build_line, terminal_command};
+    use super::{TerminalCommand, build_line, prompt_line_of, terminal_command};
     use keymap::Platform;
+    use terminal::{Cell, Screen};
     use ui_kit::gpui::Keystroke;
 
     fn stroke(text: &'static str) -> Keystroke {
         Keystroke::parse(text).expect("the test keystroke parses")
+    }
+
+    /// One row of a terminal with `text`, and the cursor at `cursor` when it is shown at
+    /// `position`.
+    fn screen_of(text: &str, cursor: Option<(u16, u16)>, position: Option<(u16, u16)>) -> Screen {
+        Screen {
+            cols: text.chars().count() as u16,
+            rows: 1,
+            cells: text
+                .chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect(),
+            cursor,
+            cursor_position: position,
+            ..Screen::default()
+        }
     }
 
     /// macOS takes the window keys with Command and leaves Control to the shell: Ctrl+C
@@ -2564,5 +2602,31 @@ mod tests {
         ] {
             assert_eq!(build_line(line), None, "{line}");
         }
+    }
+
+    /// A program hides the cursor while it redraws the prompt. The line is still the
+    /// input then, and the hidden position can belong to the redraw, so the whole line
+    /// counts instead of the text before a column that the redraw set.
+    #[test]
+    fn a_hidden_cursor_still_names_the_line_of_the_prompt() {
+        let line = "PS C:\\work> gradle --version";
+        let end = line.chars().count() as u16;
+        assert_eq!(
+            prompt_line_of(&screen_of(line, Some((0, end)), Some((0, end)))),
+            Some((line.to_owned(), Some(end)))
+        );
+        assert_eq!(
+            prompt_line_of(&screen_of(line, None, Some((0, 5)))),
+            Some((line.to_owned(), None)),
+            "the column of a hidden cursor belongs to the redraw"
+        );
+
+        let mut picture = screen_of(line, None, Some((0, end)));
+        picture.modes.alt_screen = true;
+        assert_eq!(
+            prompt_line_of(&picture),
+            None,
+            "a hidden cursor of a full-screen program is not a prompt"
+        );
     }
 }

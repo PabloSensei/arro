@@ -229,6 +229,26 @@ mod tests {
         drop(instance);
     }
 
+    /// A socket file of a listener that is gone proves nothing by itself: on some systems
+    /// a connection to it succeeds. Only an answer means that a program waits there.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_listener_answers_on_a_socket_file() {
+        let folder = TempDir::new("i-answer");
+        let endpoint = folder.path().join(unix::ENDPOINT);
+        let crashed = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        drop(crashed);
+        assert!(endpoint.exists(), "the file of the dead socket stays");
+        assert!(
+            !unix::answers(&endpoint),
+            "a socket file without a listener answers nothing"
+        );
+
+        let instance = Instance::listen(folder.path(), |_| {}).unwrap();
+        assert!(unix::answers(&endpoint), "the listener answers");
+        drop(instance);
+    }
+
     /// The child of this test is the same test binary with `--exact`: it sends the path
     /// and leaves with the status of a successful run, as a second start of the program
     /// does.

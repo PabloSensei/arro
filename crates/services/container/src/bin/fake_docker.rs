@@ -1,11 +1,17 @@
 //! A stand-in for the `docker` CLI in the tests. Its daemon is a JSON file named by
 //! `FAKE_DOCKER_STATE`: `{"up": true, "containers": [...], "images": [...], "logs": {}}`.
-//! It prints what the real CLI 29 prints for the calls the crate makes.
+//! It prints what the real CLI 29 prints for the calls the crate makes. `"hang": true`
+//! makes it never answer and write its pid into the state, for the timeout test.
 
 use std::io::Write;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// How long a stand-in that hangs or streams may live. Its owner normally ends it, and
+/// this is the net for a run whose owner is gone: a test that returns early must not leave
+/// this executable behind, where the next build cannot remove it.
+const MAX_LIFETIME: Duration = Duration::from_secs(30);
 
 fn main() {
     let path = std::env::var("FAKE_DOCKER_STATE").expect("FAKE_DOCKER_STATE");
@@ -15,6 +21,13 @@ fn main() {
         args.drain(..2);
     }
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    if state["hang"].as_bool().unwrap_or(false) {
+        // A CLI that never answers, for the caller's timeout. The pid is in the state so
+        // that a test can check the process is gone after that timeout.
+        state["pid"] = json!(std::process::id());
+        save(&path, &state);
+        watch_owner();
+    }
     let up = state["up"].as_bool().unwrap_or(false);
     if words.first() == Some(&"context") {
         println!(
@@ -84,6 +97,9 @@ fn main() {
             println!("{id}");
         }
         ["logs", "--follow", "--tail", _, id] => {
+            // The console ends this call, and the owner's death or the lifetime ends it
+            // when the console went away without stopping it.
+            std::thread::spawn(watch_owner);
             let mut stdout = std::io::stdout();
             for line in state["logs"][*id].as_array().into_iter().flatten() {
                 writeln!(stdout, "{}", line.as_str().unwrap()).unwrap();
@@ -111,6 +127,25 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Ends this process when the one that started it is gone, or after [`MAX_LIFETIME`].
+/// Never returns.
+fn watch_owner() {
+    if let Some(parent) = platform::parent_process_id() {
+        match platform::ProcessWaiter::open(parent) {
+            // True when the owner ended, false when the lifetime is over: either way this
+            // stand-in has nothing left to answer.
+            Ok(Some(waiter)) => {
+                let _ = waiter.wait(MAX_LIFETIME);
+                std::process::exit(3);
+            }
+            Ok(None) => std::process::exit(3),
+            Err(_) => {}
+        }
+    }
+    std::thread::sleep(MAX_LIFETIME);
+    std::process::exit(3);
 }
 
 fn set_state(state: &mut Value, id: &str, next: Option<&str>) {

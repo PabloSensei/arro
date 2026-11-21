@@ -181,8 +181,11 @@ fn ctrl_enter_runs_a_build_line_of_the_prompt_in_the_run_window(cx: &mut TestApp
     draw(cx, window);
     type_text(cx, window, "gradle --version");
     let session = session_of(cx, &terminal);
+    // The caret of the drawn prompt is the signal that the shell finished rendering the
+    // line: a key in the middle of a redraw would read a half-drawn prompt.
     wait_for_signal(cx, "the typed line in the shell", |_| {
-        session.screen().contains("gradle --version")
+        let screen = session.screen();
+        screen.cursor.is_some() && screen.contains("gradle --version")
     });
 
     press(

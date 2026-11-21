@@ -80,6 +80,16 @@ pub fn process_table() -> Vec<ProcessEntry> {
         .collect()
 }
 
+/// The id of the process that started this one, as the process table names it. A program
+/// watches it to go when its owner is gone.
+pub fn parent_process_id() -> Option<u32> {
+    let current = std::process::id();
+    process_table()
+        .into_iter()
+        .find(|entry| entry.pid == current)
+        .and_then(|entry| entry.parent)
+}
+
 /// When the process was created, in the units of `FILETIME`. Two processes never share
 /// it, so a caller can tell its own process from one that took the same id later.
 pub fn process_created(pid: u32) -> Option<u64> {

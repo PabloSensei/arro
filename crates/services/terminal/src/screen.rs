@@ -133,6 +133,10 @@ pub struct Screen {
     pub cells: Vec<Cell>,
     /// `(row, col)`, `None` while the cursor is hidden or scrolled out of view.
     pub cursor: Option<(u16, u16)>,
+    /// `(row, col)` of the cursor even while the program hides it: a program hides the
+    /// caret while it redraws a line, and the line still belongs to the prompt. `None`
+    /// while the cursor is scrolled out of view.
+    pub cursor_position: Option<(u16, u16)>,
     /// Lines of history above the live screen that are in view.
     pub display_offset: usize,
     /// Lines of history above the live screen, all of them, in view or not.

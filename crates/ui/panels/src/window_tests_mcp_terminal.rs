@@ -70,12 +70,11 @@ fn a_claude_without_the_entry_gets_a_bar_and_auto_configure_writes_the_test_home
     for key in ["c", "l", "a", "u", "d", "e"] {
         press(cx, window, key);
     }
+    // The caret of the drawn prompt is the signal that the shell finished rendering the
+    // line: pressing `enter` in the middle of a redraw would read a half-drawn prompt.
     wait_for_signal(cx, "the typed command line", |_| {
-        session
-            .screen()
-            .lines()
-            .iter()
-            .any(|line| line.contains("claude"))
+        let screen = session.screen();
+        screen.cursor.is_some() && screen.contains("claude")
     });
     press(cx, window, "enter");
 

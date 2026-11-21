@@ -93,7 +93,7 @@ fn replace_word(text: &str, word: &str, new_word: &str) -> Vec<DocumentEdit> {
 
 /// The language of these tests: preparation and rename over a `TextPoint`, with the
 /// answers the window shows and the queries it sent kept for the assertions.
-struct RenameLanguage {
+pub(crate) struct RenameLanguage {
     syntax: NoSyntax,
     documents: Mutex<HashMap<String, Arc<str>>>,
     rename_queries: Mutex<Vec<RenameQuery>>,
@@ -105,7 +105,7 @@ struct RenameLanguage {
 }
 
 impl RenameLanguage {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             syntax: NoSyntax(Queries::default()),
             documents: Mutex::new(HashMap::new()),
@@ -123,12 +123,12 @@ impl RenameLanguage {
     }
 
     /// The language does not answer the preparation until `answer_held` gives it an answer.
-    fn be_silent(&self) {
+    pub(crate) fn be_silent(&self) {
         *self.silent.lock().unwrap() = true;
     }
 
     /// Answers the last preparation question the language kept open.
-    fn answer_held(&self, answer: Option<PrepareRename>, confidence: Confidence) {
+    pub(crate) fn answer_held(&self, answer: Option<PrepareRename>, confidence: Confidence) {
         if let Some(mut reply) = self.held.lock().unwrap().pop() {
             let _ = reply.send(Answer::new(answer, confidence, SOURCE));
         }
@@ -139,7 +139,7 @@ impl RenameLanguage {
         *self.closed.lock().unwrap() = Some(path);
     }
 
-    fn queries(&self) -> Vec<RenameQuery> {
+    pub(crate) fn queries(&self) -> Vec<RenameQuery> {
         self.rename_queries.lock().unwrap().clone()
     }
 
@@ -274,7 +274,7 @@ impl LanguageSupport for RenameLanguage {
     }
 }
 
-fn open_window(
+pub(crate) fn open_window(
     cx: &mut TestAppContext,
     root: PathBuf,
     language: Arc<RenameLanguage>,
@@ -334,7 +334,7 @@ fn open_window(
     })
 }
 
-fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
+pub(crate) fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let root = scratch(name);
     for (path, text) in files {
         let path = root.join(path);
@@ -476,10 +476,10 @@ fn a_name_the_language_refuses_leaves_the_text_alone_and_says_so_in_the_status_b
 }
 
 /// The method the silent tests change: the loop variable and the argument are `pet`.
-const METHOD: &str =
+pub(crate) const METHOD: &str =
     "void visit(List<Pet> pets) {\n    for (Pet pet : pets) {\n        feed(pet);\n    }\n}\n";
 /// `METHOD` once the name `pet` became `Zz` in every place.
-const RENAMED: &str =
+pub(crate) const RENAMED: &str =
     "void visit(List<Pet> pets) {\n    for (Pet Zz : pets) {\n        feed(Zz);\n    }\n}\n";
 
 #[ui_kit::gpui::test]

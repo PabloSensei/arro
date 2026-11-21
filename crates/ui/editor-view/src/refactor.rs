@@ -615,9 +615,9 @@ impl EditorView {
         self.usages = (!ranges.is_empty()).then_some(ranges);
     }
 
-    /// How often a search that waits for the language server asks whether it is ready, in
-    /// milliseconds.
-    const WAIT_TICK_MS: u64 = 200;
+    /// How often a search or a list that waits for the language server asks whether it is
+    /// ready, in milliseconds.
+    pub(crate) const WAIT_TICK_MS: u64 = 200;
 
     /// Alt+F7 or Ctrl+F7 while the server imports. The Usages window opens at once with the
     /// waiting line, and the search runs by itself when the server is ready, at the caret

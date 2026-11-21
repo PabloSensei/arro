@@ -2349,6 +2349,16 @@ impl EditorView {
         Some(ActionRows { rows, preview })
     }
 
+    /// The label of the selected row of an open Alt+Enter list. A test reads it; nothing else
+    /// does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn actions_selected(&self) -> Option<String> {
+        let menu = self.lsp.as_ref()?.actions.as_ref()?;
+        menu.rows
+            .get(menu.selected)
+            .map(|pick| pick.label().to_owned())
+    }
+
     /// The places of an open Ctrl+B list, from zero. A test reads them; nothing else does.
     #[cfg(any(test, feature = "test-support"))]
     pub fn navigation_targets(&self) -> Option<usize> {
