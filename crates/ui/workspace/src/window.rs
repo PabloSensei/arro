@@ -1533,6 +1533,7 @@ impl Workspace {
             .as_ref()
             .is_none_or(|store| !has_saved_layout(store, &self.root));
         let states = std::mem::take(&mut self.layout.panes);
+        let restored = !states.is_empty();
         let modes: HashMap<PathBuf, PreviewLayout> = self
             .layout
             .preview_modes
@@ -1609,6 +1610,13 @@ impl Workspace {
         self.focus_active(window, cx);
         if first_open {
             self.show_readme(window, cx);
+        }
+        // The tabs came back without a tab change, and the panels that follow the active
+        // file would keep the one of the earlier run.
+        if restored
+            && let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path())
+        {
+            listener(&path, cx);
         }
     }
 

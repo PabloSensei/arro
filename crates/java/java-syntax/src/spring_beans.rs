@@ -133,7 +133,19 @@ impl File {
     }
 }
 
-const TYPE_DECLARATIONS: &[&str] = &[
+/// The annotations that declare a bean of a class.
+pub const STEREOTYPES: &[&str] = &[
+    "Component",
+    "Service",
+    "Repository",
+    "Controller",
+    "RestController",
+    "Configuration",
+];
+/// The annotation of a method that declares a bean in a configuration.
+pub const FACTORY: &str = "Bean";
+
+pub(crate) const TYPE_DECLARATIONS: &[&str] = &[
     "class_declaration",
     "interface_declaration",
     "enum_declaration",
@@ -141,7 +153,7 @@ const TYPE_DECLARATIONS: &[&str] = &[
     "annotation_type_declaration",
 ];
 
-fn parse(text: &str) -> Option<tree_sitter::Tree> {
+pub(crate) fn parse(text: &str) -> Option<tree_sitter::Tree> {
     let mut parser = Parser::new();
     parser.set_language(&super::config().grammar).ok()?;
     parser.parse(text, None)
@@ -196,7 +208,7 @@ fn is_type(node: Node<'_>) -> bool {
     TYPE_DECLARATIONS.contains(&node.kind())
 }
 
-fn text_of<'a>(text: &'a str, node: Node<'_>) -> &'a str {
+pub(crate) fn text_of<'a>(text: &'a str, node: Node<'_>) -> &'a str {
     &text[node.byte_range()]
 }
 
@@ -423,7 +435,7 @@ fn type_arguments(raw: &str) -> Vec<String> {
 }
 
 /// Whether a declaration carries one of the modifiers of its source, `static` for one.
-fn has_modifier(declaration: Node<'_>, text: &str, wanted: &str) -> bool {
+pub(crate) fn has_modifier(declaration: Node<'_>, text: &str, wanted: &str) -> bool {
     let mut cursor = declaration.walk();
     declaration
         .named_children(&mut cursor)
@@ -475,7 +487,7 @@ fn clean_type(raw: &str) -> String {
 
 /// The annotations of a declaration, whether the grammar puts them under `modifiers` or
 /// beside the other children.
-fn annotations(declaration: Node<'_>, text: &str) -> Vec<Annotation> {
+pub(crate) fn annotations(declaration: Node<'_>, text: &str) -> Vec<Annotation> {
     let mut found = Vec::new();
     let mut cursor = declaration.walk();
     for child in declaration.named_children(&mut cursor) {

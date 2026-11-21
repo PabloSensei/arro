@@ -2090,6 +2090,7 @@ impl Element for EditorElement {
         let agent_breakpoints = self.view.read(cx).agent_breakpoints.clone();
         let function_breakpoints = self.view.read(cx).function_breakpoints.clone();
         let field_watchpoints = self.view.read(cx).field_watchpoints.clone();
+        let execution_line = self.view.read(cx).execution_line();
         let show_whitespace = self.view.read(cx).show_whitespace();
         let indent_columns = self.view.read(cx).indent_columns().max(1);
         let code_vision_hovered = self.view.read(cx).code_vision_hovered;
@@ -2205,6 +2206,22 @@ impl Element for EditorElement {
                     ),
                     style.caret_row,
                 ));
+            }
+
+            // The row of the line the stopped program is on takes its tint over the row of
+            // the caret. A wrapped line tints each of its rows.
+            if let Some(stopped) = execution_line {
+                for shown in prepaint.layout.rows.iter().filter(|shown| {
+                    !shown.is_block && !shown.is_doc && shown.buffer_line == stopped
+                }) {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.left(), shown.y),
+                            size(bounds.size.width, height),
+                        ),
+                        style.execution_line,
+                    ));
+                }
             }
 
             // The blame column has a background of its own, so the labels stand apart
@@ -2419,6 +2436,30 @@ impl Element for EditorElement {
                         ui_kit::icon_file(style.icon_set, "toolwindows/services", style.dark, 13.);
                     window
                         .paint_svg(mark, path, None, TransformationMatrix::unit(), color, cx)
+                        .ok();
+                }
+                // The arrow of the line the stopped program is on stands in the gutter over the
+                // other marks of the line.
+                if options.gutter_icons
+                    && !shown.is_doc
+                    && !shown.line.continuation
+                    && execution_line == Some(shown.buffer_line)
+                {
+                    let mark = Bounds::new(
+                        point(bounds.left() + px(RUN_X), shown.y + px(3.)),
+                        size(px(13.), px(13.)),
+                    );
+                    let path =
+                        ui_kit::icon_file(style.icon_set, "general/arrowRight", style.dark, 13.);
+                    window
+                        .paint_svg(
+                            mark,
+                            path,
+                            None,
+                            TransformationMatrix::unit(),
+                            style.accent,
+                            cx,
+                        )
                         .ok();
                 }
                 if options.gutter_icons

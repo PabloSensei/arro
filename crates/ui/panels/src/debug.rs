@@ -32,6 +32,7 @@ use ui_kit::*;
 use workspace::{DEBUG_TOOL, Workspace};
 
 use crate::ansi::OutputBuffers;
+use crate::console_follow::ConsoleFollow;
 use crate::console_input::{ConsoleInput, ConsoleKey};
 use crate::console_links;
 use crate::console_search::{ConsoleSearch, SearchToggle};
@@ -675,6 +676,10 @@ pub struct DebugPanel {
     /// Smart Step Into waits for the list of calls from the adapter.
     asking_targets: bool,
     asking_targets_window: Option<AnyWindowHandle>,
+    /// The window that holds the panel: a stop shows the file of its frame in it.
+    window: Option<AnyWindowHandle>,
+    /// The stop whose frame the window shows once the snapshot brings the frames of it.
+    reveal_stop: Option<u64>,
     /// The window muted the breakpoints: the gutter greys them and the adapter hears an
     /// empty list, while the settings stay.
     muted: bool,
@@ -770,7 +775,9 @@ pub struct DebugPanel {
     tool_output_lines: usize,
     title: SharedString,
     scroll_tree: ScrollHandle,
-    scroll_side: ScrollHandle,
+    /// The console list and the rule that keeps it at the last line while the user
+    /// reads the end.
+    console_scroll: ConsoleFollow,
     scroll_variables: ScrollHandle,
     scroll_watch: ScrollHandle,
     /// The values of the frame at the last stop, by name, for the colour of changed ones.
@@ -845,6 +852,8 @@ impl DebugPanel {
             seen_stops: 0,
             asking_targets: false,
             asking_targets_window: None,
+            window: None,
+            reveal_stop: None,
             muted: saved.muted,
             breakpoints: saved.breakpoints,
             function_breakpoints: saved.function_breakpoints,
@@ -893,7 +902,7 @@ impl DebugPanel {
             tool_output_lines: 0,
             title: "Debug".into(),
             scroll_tree: ScrollHandle::new(),
-            scroll_side: ScrollHandle::new(),
+            console_scroll: ConsoleFollow::new(),
             scroll_variables: ScrollHandle::new(),
             scroll_watch: ScrollHandle::new(),
             stop_values: BTreeMap::new(),
@@ -2440,6 +2449,82 @@ impl DebugPanel {
         Some((frame.source.clone()?, frame.line.saturating_sub(1) as usize))
     }
 
+    /// Puts the caret of the stopped frame on its line, and opens the file of the frame when
+    /// it is not open yet, as a frame click does. It runs after the update that asks for it,
+    /// in the window that holds the panel. It takes no keyboard focus: the focus the window
+    /// had stays with it, and a caret that is on the line already stays where it is. A file
+    /// that is neither open nor on disk has no place to show, and a line past the end of a
+    /// loaded text is no line of its file.
+    fn show_stop_place(&mut self, cx: &mut Context<Self>) {
+        let (Some((path, line)), Some(handle)) = (self.stop_location(), self.window) else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let spot = editor_view::Spot::Line { line, column: 0 };
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let view = workspace
+                                .view_of(&path)
+                                .and_then(|view| view.downcast::<editor_view::EditorView>().ok());
+                            let open = view.is_some();
+                            let in_front =
+                                workspace.active_path().as_deref() == Some(path.as_path());
+                            match view {
+                                // The file in front keeps its tab and its focus: only the caret moves.
+                                Some(editor) if in_front => {
+                                    let (caret, text) = {
+                                        let editor = editor.read(cx);
+                                        (editor.caret_line(), editor.text())
+                                    };
+                                    let past_end =
+                                        text.is_some_and(|text| line > text.matches('\n').count());
+                                    if caret != Some(line) && !past_end {
+                                        editor.update(cx, |editor, cx| editor.go_to(spot, cx));
+                                    }
+                                }
+                                _ if open || path.is_file() => {
+                                    // Selecting a tab takes the focus. The focus the window had
+                                    // comes back, unless it was the editor in front: its focus
+                                    // follows the file that is shown now.
+                                    let front_editor = workspace
+                                        .active_path()
+                                        .and_then(|active| workspace.view_of(&active))
+                                        .and_then(|view| {
+                                            view.downcast::<editor_view::EditorView>().ok()
+                                        })
+                                        .map(|editor| editor.read(cx).focus_handle(cx));
+                                    let keep = window
+                                        .focused(cx)
+                                        .filter(|focused| front_editor.as_ref() != Some(focused));
+                                    navigation::go_to(
+                                        workspace,
+                                        path,
+                                        Some(spot),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                    if let Some(keep) = keep {
+                                        window.focus(&keep, cx);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        })
+                        .ok();
+                })
+                .ok();
+        });
+    }
+
+    /// Gives the panel the window it sits in, so that a stop can show its file there.
+    pub(crate) fn bind_window(&mut self, window: AnyWindowHandle) {
+        self.window = Some(window);
+    }
+
     /// The values of the scopes of the selected frame, by name. A name of the locals
     /// wins over a field of the same name, as the debugger names the one in force.
     fn frame_values(&self) -> BTreeMap<String, (i64, String, String)> {
@@ -2790,6 +2875,14 @@ impl DebugPanel {
             .collect()
     }
 
+    /// The scroll offset of the console, in pixels, for tests.
+    #[cfg(test)]
+    pub(crate) fn console_scroll_y(&self) -> f32 {
+        let handle = self.console_scroll.handle();
+        let state = handle.0.borrow();
+        f32::from(state.base_handle.offset().y)
+    }
+
     /// Shows the Debugger tab, for a test whose program takes input and brings the
     /// console to the front.
     #[cfg(test)]
@@ -3001,6 +3094,7 @@ impl DebugPanel {
         self.seen_stops = 0;
         self.asking_targets = false;
         self.asking_targets_window = None;
+        self.reveal_stop = None;
         self.local_console.clear();
         self.seen_console.clear();
         self.console_search.clear();
@@ -4013,8 +4107,12 @@ impl DebugPanel {
         self.merge_console();
         self.flush_tool_output();
         self.sync_identities(cx);
-        // A program that reads its input needs the line of the console at hand.
-        if self.takes_input() && self.front != Front::Console {
+        // A program that reads its input needs the line of the console at hand. A stopped
+        // program reads nothing, so the Debugger tab of a stop stays in front.
+        if self.takes_input()
+            && !matches!(self.snapshot.state, DebugState::Stopped { .. })
+            && self.front != Front::Console
+        {
             self.front = Front::Console;
         }
         if matches!(self.snapshot.state, DebugState::Terminated) {
@@ -4028,11 +4126,24 @@ impl DebugPanel {
             self.seen_stops = self.snapshot.stops;
             if self.log_stop(cx) {
                 self.send(Command::Continue, cx);
+            } else {
+                // A stop that stays shows the Debugger tab, and its frame in the editor once
+                // the snapshot brings the frames.
+                self.front = Front::Debugger;
+                self.reveal_stop = Some(self.snapshot.stops);
             }
             self.finish_temporary(cx);
             self.finish_temporary_breakpoints(cx);
             self.finish_remove_once(cx);
             self.finish_forced_step(cx);
+        }
+        // The frame of a new stop is shown once the snapshot brings the frames of it.
+        if self.reveal_stop == Some(self.snapshot.stops)
+            && matches!(self.snapshot.state, DebugState::Stopped { .. })
+            && !self.snapshot.frames.is_empty()
+        {
+            self.reveal_stop = None;
+            self.show_stop_place(cx);
         }
         if self.asking_targets
             && let Some(targets) = self.snapshot.step_targets.clone()
@@ -5866,7 +5977,7 @@ impl DebugPanel {
                     .is_some_and(|line| self.console_search.accepts_text(&line.text))
             })
             .count();
-        self.scroll_side.scroll_to_item(row);
+        self.console_scroll.scroll_to(row, ScrollStrategy::Center);
     }
 
     fn toggle_search_option(
@@ -5968,96 +6079,74 @@ impl DebugPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut console_rows: Vec<AnyElement> = Vec::new();
-        let total = self.local_console.len();
-        let kept = self.console_search.kept_count(total);
-        for row in 0..kept {
-            let index = self.console_search.line_of_row(total, row);
-            let Some(line) = self.local_console.get(index) else {
-                continue;
-            };
-            let color = if line.error {
-                theme.warning_mark
-            } else {
-                theme.code
-            };
-            let text = line.text.clone();
-            let linked = console_links::looks_like_link(&text);
-            let ranges = self.console_search.ranges(index).to_vec();
-            let mut element = div()
-                .id(("debug-console-line", index))
-                .debug_selector(move || format!("debug-console-line-{index}"))
-                .px(px(SPACE_M))
-                .py(px(SPACE_XS))
-                .font_family(MONO_FONT)
-                .text_size(px(CODE_SIZE))
-                .text_color(color)
-                .child(match ranges.is_empty() {
-                    true => text.clone().into_any_element(),
-                    false => {
-                        let highlights = ranges.iter().map(|range| {
-                            let highlight = HighlightStyle {
-                                color: Some(theme.match_text),
-                                background_color: Some(theme.match_bg),
-                                ..HighlightStyle::default()
-                            };
-                            (range.clone(), highlight)
-                        });
-                        StyledText::new(text.clone())
-                            .with_highlights(highlights)
-                            .into_any_element()
-                    }
-                });
-            if linked {
-                element = element
-                    .cursor_pointer()
-                    .hover(|style| style.underline())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_console_line(index, window, cx)
-                    }));
-            }
-            console_rows.push(element.into_any_element());
+        let theme = *theme;
+        let kept = self.console_search.kept_count(self.local_console.len());
+        // A reader at the end follows the output; one who scrolled up keeps their
+        // place until they come back to the end. A search keeps its match on screen.
+        if kept > 0 && !self.console_search.open {
+            self.console_scroll.follow_end(kept - 1);
         }
-        if console_rows.is_empty() {
-            console_rows.push(empty_line("debug-empty-console", "No output", theme));
-        }
-        let console = div()
-            .id("debug-console")
-            .debug_selector(|| "debug-console".to_owned())
-            .flex()
-            .flex_col()
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.console_menu(event.position, cx)
-                }),
+        let scrolled = if kept == 0 {
+            scrollable(
+                "debug-console-scroll",
+                self.console_scroll.handle(),
+                div()
+                    .id("debug-console")
+                    .debug_selector(|| "debug-console".to_owned())
+                    .flex()
+                    .flex_col()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.console_menu(event.position, cx)
+                        }),
+                    )
+                    .child(empty_line("debug-empty-console", "No output", &theme)),
+                &theme,
+                window,
+                cx,
             )
-            .children(console_rows);
-        let scrolled = scrollable(
-            "debug-console-scroll",
-            &self.scroll_side,
-            div()
-                .id("debug-console-scroll")
-                .flex()
-                .flex_col()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll_side)
-                .child(console),
-            theme,
-            window,
-            cx,
-        )
+        } else {
+            scrollable(
+                "debug-console-scroll",
+                self.console_scroll.handle(),
+                div()
+                    .id("debug-console")
+                    .debug_selector(|| "debug-console".to_owned())
+                    .size_full()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.console_menu(event.position, cx)
+                        }),
+                    )
+                    .child(
+                        uniform_list(
+                            "debug-console-list",
+                            kept,
+                            cx.processor(move |this, range, _, cx| {
+                                this.console_rows(range, &theme, cx)
+                            }),
+                        )
+                        .track_scroll(self.console_scroll.list_handle())
+                        .size_full(),
+                    ),
+                &theme,
+                window,
+                cx,
+            )
+        }
         .flex_1()
         .min_h_0();
-        let tools = debug_console_tools(self, theme, cx);
+        let tools = debug_console_tools(self, &theme, cx);
         let search = self
             .console_search
             .open
-            .then(|| debug_search_row(self, theme, cx));
+            .then(|| debug_search_row(self, &theme, cx));
         let filter = self
             .console_search
             .filter_open
-            .then(|| debug_filter_row(self, theme, cx));
+            .then(|| debug_filter_row(self, &theme, cx));
         // The line the user types stays at the bottom of the console, so it is at hand
         // however far the output above has scrolled.
         let mut body = div()
@@ -6083,11 +6172,73 @@ impl DebugPanel {
                     .child(self.console_input.element(
                         FieldMouse::new(cx, |this| Some(&mut this.console_input.field)),
                         "debug-console-input",
-                        theme,
+                        &theme,
                     )),
             );
         }
         body.into_any_element()
+    }
+
+    /// The console rows the list draws: the lines the filter keeps, with the places the
+    /// search found painted over them. A row has the height of a code line, so the list
+    /// knows where every line sits without drawing the lines out of view.
+    fn console_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let total = self.local_console.len();
+        range
+            .map(|row| {
+                let index = self.console_search.line_of_row(total, row);
+                let Some(line) = self.local_console.get(index) else {
+                    return div().into_any_element();
+                };
+                let color = if line.error {
+                    theme.warning_mark
+                } else {
+                    theme.code
+                };
+                let text = line.text.clone();
+                let linked = console_links::looks_like_link(&text);
+                let ranges = self.console_search.ranges(index).to_vec();
+                let mut element = div()
+                    .id(("debug-console-line", index))
+                    .debug_selector(move || format!("debug-console-line-{index}"))
+                    .h(px(CODE_LINE_HEIGHT))
+                    .px(px(SPACE_M))
+                    .whitespace_nowrap()
+                    .font_family(MONO_FONT)
+                    .text_size(px(CODE_SIZE))
+                    .text_color(color)
+                    .child(match ranges.is_empty() {
+                        true => text.clone().into_any_element(),
+                        false => {
+                            let highlights = ranges.iter().map(|range| {
+                                let highlight = HighlightStyle {
+                                    color: Some(theme.match_text),
+                                    background_color: Some(theme.match_bg),
+                                    ..HighlightStyle::default()
+                                };
+                                (range.clone(), highlight)
+                            });
+                            StyledText::new(text.clone())
+                                .with_highlights(highlights)
+                                .into_any_element()
+                        }
+                    });
+                if linked {
+                    element = element
+                        .cursor_pointer()
+                        .hover(|style| style.underline())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_console_line(index, window, cx)
+                        }));
+                }
+                element.into_any_element()
+            })
+            .collect()
     }
 
     /// The divider between the frames and the variables: dragging it changes the width
@@ -9913,7 +10064,8 @@ pub(crate) fn refresh_breakpoints(
 }
 
 /// Shows the values of the stopped frame after the lines of the method the editor
-/// shows, or takes them away when the program runs or Settings hides them.
+/// shows, or takes them away when the program runs or Settings hides them. The line the
+/// program stopped on is tinted in the file of its frame.
 pub(crate) fn refresh_inline_values(
     view: &mut editor_view::EditorView,
     cx: &mut Context<editor_view::EditorView>,
@@ -9922,6 +10074,7 @@ pub(crate) fn refresh_inline_values(
         .try_global::<workspace::Settings>()
         .is_none_or(|settings| settings.debug_show_values_inline);
     let Some(panel) = cx.try_global::<ActiveDebug>() else {
+        view.set_execution_line(None, cx);
         view.set_debug_values(None, &[], cx);
         view.set_inline_watches(&[], cx);
         view.set_inline_watch_ready(false, cx);
@@ -9937,6 +10090,7 @@ pub(crate) fn refresh_inline_values(
     });
     match shown {
         Some((file, line, values, watches)) if same_file(&file, &path) => {
+            view.set_execution_line(Some(line), cx);
             match values {
                 Some(values) => view.set_debug_values(Some(line), &values, cx),
                 None => view.set_debug_values(None, &[], cx),
@@ -9945,6 +10099,7 @@ pub(crate) fn refresh_inline_values(
             view.set_inline_watch_ready(true, cx);
         }
         _ => {
+            view.set_execution_line(None, cx);
             view.set_debug_values(None, &[], cx);
             view.set_inline_watches(&[], cx);
             view.set_inline_watch_ready(false, cx);
@@ -10056,8 +10211,9 @@ mod tests {
     use ui_kit::gpui::{AppContext, Entity, ScrollHandle, TestAppContext, WeakEntity};
 
     use super::{
-        BreakpointSpec, ConsoleEvent, DataBreakpointSetting, DebugPanel, DebugService, Debugger,
-        FunctionBreakpointSetting, OutputBuffers, RunPlan, SavedState, Snapshot,
+        BreakpointSpec, ConsoleEvent, ConsoleFollow, DataBreakpointSetting, DebugPanel,
+        DebugService, Debugger, FunctionBreakpointSetting, OutputBuffers, RunPlan, SavedState,
+        Snapshot,
     };
 
     /// Counts the launches; a start after Stop would be a failure of the panel.
@@ -10111,6 +10267,8 @@ mod tests {
                 seen_stops: 0,
                 asking_targets: false,
                 asking_targets_window: None,
+                window: None,
+                reveal_stop: None,
                 muted: false,
                 breakpoints: Vec::new(),
                 function_breakpoints: Vec::new(),
@@ -10159,7 +10317,7 @@ mod tests {
                 tool_output_lines: 0,
                 title: "Debug".into(),
                 scroll_tree: ScrollHandle::new(),
-                scroll_side: ScrollHandle::new(),
+                console_scroll: ConsoleFollow::new(),
                 scroll_variables: ScrollHandle::new(),
                 scroll_watch: ScrollHandle::new(),
                 stop_values: BTreeMap::new(),

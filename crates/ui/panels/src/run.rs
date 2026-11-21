@@ -37,6 +37,7 @@ use workspace::{DEBUG_TOOL, RUN_TOOL, RunControls, RunState, STACK_TRACE_TOOL, W
 use workspace_core::Delivery;
 
 use crate::ansi::{Line, OutputBuffers, Style};
+use crate::console_follow::ConsoleFollow;
 use crate::console_input::{ConsoleInput, ConsoleKey};
 use crate::console_links;
 use crate::console_search::{ConsoleSearch, SearchToggle};
@@ -197,7 +198,9 @@ fn color(hex: u32) -> Hsla {
 pub struct RunPanel {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
-    scroll: UniformListScrollHandle,
+    /// The console list and the rule that keeps it at the last line while the user
+    /// reads the end.
+    follow: ConsoleFollow,
     root: PathBuf,
     cache_root: PathBuf,
     /// The state folder of the window, for the file of a complete run log.
@@ -609,7 +612,7 @@ impl RunPanel {
             Self {
                 workspace,
                 focus: cx.focus_handle(),
-                scroll: UniformListScrollHandle::new(),
+                follow: ConsoleFollow::new(),
                 root: project_root,
                 cache_root: setup.cache_root.clone(),
                 state_dir,
@@ -1045,7 +1048,7 @@ impl RunPanel {
 
     /// The scroll position of the console, shared with the Services window.
     pub(crate) fn console_scroll(&self) -> UniformListScrollHandle {
-        self.scroll.clone()
+        self.follow.handle()
     }
 
     /// Shows the live tab, as a click on its tab does.
@@ -3731,7 +3734,8 @@ impl RunPanel {
 
     /// The line of the console under `position`, from zero.
     fn console_line_at(&self, position: Point<Pixels>) -> Option<usize> {
-        let state = self.scroll.0.borrow();
+        let handle = self.follow.handle();
+        let state = handle.0.borrow();
         let viewport = state.base_handle.bounds();
         if !viewport.contains(&position) {
             return None;
@@ -3869,7 +3873,7 @@ impl RunPanel {
             return;
         };
         if let Some(row) = self.console_search.row_of_line(line) {
-            self.scroll.scroll_to_item(row, ScrollStrategy::Center);
+            self.follow.scroll_to(row, ScrollStrategy::Center);
         }
     }
 
@@ -4977,12 +4981,13 @@ impl RunPanel {
             self.rebuild_console_filter();
         }
         if changed {
-            // The console waits for a line below the last one, so that row is in view too.
-            // A search keeps the view on its match instead.
+            // The console waits for a line below the last one, so that row is in view too,
+            // unless the reader scrolled up: then their place stays. A search keeps the
+            // view on its match instead.
             if !self.console_search.open {
                 let kept = self.console_search.kept_count(self.console_line_count());
                 let last = kept + usize::from(self.takes_input());
-                self.scroll.scroll_to_item(last, ScrollStrategy::Bottom);
+                self.follow.follow_end(last);
             }
             self.changed(cx);
         }
@@ -6371,14 +6376,14 @@ impl Render for RunPanel {
         } else {
             scrollable(
                 "run-console",
-                &self.scroll,
+                self.follow.handle(),
                 div().size_full().child(
                     uniform_list(
                         "run-console",
                         count,
                         cx.processor(move |this, range, _, cx| this.rows(range, &theme, view, cx)),
                     )
-                    .track_scroll(&self.scroll)
+                    .track_scroll(self.follow.list_handle())
                     .size_full(),
                 ),
                 &theme,

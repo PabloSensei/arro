@@ -324,14 +324,14 @@ fn announce_tests(listen: TestListen) {
 }
 
 /// A debug service on the mock adapter that answers `redefineClasses`.
-struct ReloadProbe {
+pub(crate) struct ReloadProbe {
     runtime: tokio::runtime::Runtime,
     server: Mutex<Option<lang_fixture::MockDap>>,
     reloads: AtomicUsize,
 }
 
 impl ReloadProbe {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)

@@ -141,6 +141,10 @@ impl TestProvider for JavaTestProvider {
             .map(|(plan, _)| plan)
     }
 
+    fn supports_coverage(&self) -> bool {
+        true
+    }
+
     fn coverage_plan(
         &self,
         model: &ProjectModel,

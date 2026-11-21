@@ -422,6 +422,12 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The declarations a framework or a test runner calls, read from the text of a file.
+    /// The editor shows no count of zero usages above them.
+    fn implicit_uses(&self) -> Option<&dyn crate::ImplicitUseProvider> {
+        None
+    }
+
     /// The dependency-injection model of the project, read natively in the background.
     /// The answer stream sends the model again after every change of the sources.
     fn beans(&self) -> Option<&dyn crate::BeanProvider> {

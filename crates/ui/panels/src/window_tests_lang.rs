@@ -206,6 +206,8 @@ pub(crate) struct FakeLanguage {
     restarts: AtomicUsize,
     /// The places the spelling check reads, as the test set them.
     spelling: Mutex<Vec<SpellPlace>>,
+    /// The spans of the declarations a framework calls, as the test set them.
+    implicit_spans: Mutex<Vec<std::ops::Range<u32>>>,
 }
 
 impl FakeLanguage {
@@ -226,6 +228,7 @@ impl FakeLanguage {
             closed: Mutex::new(None),
             restarts: AtomicUsize::new(0),
             spelling: Mutex::new(Vec::new()),
+            implicit_spans: Mutex::new(Vec::new()),
         })
     }
 
@@ -273,6 +276,12 @@ impl FakeLanguage {
     /// the command of a click.
     pub(crate) fn set_code_lens(&self, lenses: Vec<(usize, String, String)>) {
         *self.code_lens.lock().unwrap() = lenses;
+    }
+
+    /// The spans of the declarations a framework calls: from the first line of each to the
+    /// line of its name, the end excluded.
+    pub(crate) fn set_implicit_spans(&self, spans: Vec<std::ops::Range<u32>>) {
+        *self.implicit_spans.lock().unwrap() = spans;
     }
 
     pub(crate) fn set_move(&self, target: PathBuf, destinations: Vec<MoveDestination>) {
@@ -617,6 +626,12 @@ impl Provider<FormatQuery, Vec<DocumentEdit>> for FakeLanguage {
     }
 }
 
+impl lang_api::ImplicitUseProvider for FakeLanguage {
+    fn implicit_use_spans(&self, _: &str) -> Vec<std::ops::Range<u32>> {
+        self.implicit_spans.lock().unwrap().clone()
+    }
+}
+
 impl LanguageSupport for FakeLanguage {
     fn id(&self) -> LanguageId {
         LanguageId("fake")
@@ -678,6 +693,10 @@ impl LanguageSupport for FakeLanguage {
     }
 
     fn code_lens_resolve(&self) -> Option<&CodeLensResolveProvider> {
+        Some(self)
+    }
+
+    fn implicit_uses(&self) -> Option<&dyn lang_api::ImplicitUseProvider> {
         Some(self)
     }
 

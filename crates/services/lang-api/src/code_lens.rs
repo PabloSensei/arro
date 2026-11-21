@@ -5,6 +5,8 @@
 //! labels the editor shows. The entry keeps the answer of the server, so that the resolve
 //! request sends it back unchanged.
 
+use std::ops::Range;
+
 use crate::{Provider, TextSpan};
 
 /// What a label tells, when the language sorts its labels for Settings.
@@ -65,6 +67,15 @@ pub type CodeLensProvider = dyn Provider<CodeLensQuery, Vec<CodeLensEntry>>;
 
 /// Commands of the labels the editor shows.
 pub type CodeLensResolveProvider = dyn Provider<CodeLensResolveQuery, CodeLensEntry>;
+
+/// Declarations that nothing in the project names, because a framework or a test runner
+/// calls them. A count of zero usages says nothing about them.
+pub trait ImplicitUseProvider: Send + Sync {
+    /// The spans of one source file where such declarations stand: from the first line of
+    /// a declaration, its annotations included, to the line of its name. Lines count from
+    /// zero and the end of a span is not in it.
+    fn implicit_use_spans(&self, text: &str) -> Vec<Range<u32>>;
+}
 
 /// Which labels Settings shows above the declarations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -198,6 +198,8 @@ tokens! {
     semantic_constant;
     semantic_annotation;
     caret_row;
+    // The line the stopped program is on: the tint of its row and the arrow in the gutter.
+    execution_line;
     caret;
     line_number;
     line_number_current;

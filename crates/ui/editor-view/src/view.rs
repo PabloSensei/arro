@@ -1213,6 +1213,12 @@ pub struct EditorView {
     pending_frames: Vec<Instant>,
     /// The values of the stopped frame, by buffer line, drawn after the line.
     pub(crate) debug_values: Vec<InlineValue>,
+    /// The buffer line the stopped program is on, from zero: its row is tinted and the
+    /// gutter draws the arrow of it.
+    pub(crate) execution_line: Option<usize>,
+    /// The values of the stopped frame that came while the text of the file was still being
+    /// read, with their line: the text names their lines once it is there.
+    debug_source: Option<(usize, Vec<DebugValue>)>,
     /// The inline watches of the stopped program, by buffer line.
     pub(crate) inline_watches: Vec<InlineWatchRow>,
     /// The program is stopped in this file, so a caret expression can become an inline
@@ -1772,6 +1778,8 @@ impl EditorView {
             picture_cache: None,
             pending_frames: Vec::with_capacity(8),
             debug_values: Vec::new(),
+            execution_line: None,
+            debug_source: None,
             inline_watches: Vec::new(),
             inline_watch_ready: false,
             spelling_marks: Vec::new(),
@@ -2392,6 +2400,14 @@ impl EditorView {
         values: &[DebugValue],
         cx: &mut Context<Self>,
     ) {
+        // Until the text is read there are no names to find the values in: the loaded text
+        // takes them from here.
+        self.debug_source = match line {
+            Some(line) if self.state.is_none() && !values.is_empty() => {
+                Some((line, values.to_vec()))
+            }
+            _ => None,
+        };
         let shown = line
             .filter(|_| !values.is_empty())
             .and_then(|line| self.values_on_lines(line, values))
@@ -2400,6 +2416,21 @@ impl EditorView {
             self.debug_values = shown;
             cx.notify();
         }
+    }
+
+    /// Tints the row of `line`, the buffer line the stopped program is on, and draws its
+    /// arrow in the gutter. `None` takes both away, when the program runs or stops nowhere
+    /// in this file.
+    pub fn set_execution_line(&mut self, line: Option<usize>, cx: &mut Context<Self>) {
+        if self.execution_line != line {
+            self.execution_line = line;
+            cx.notify();
+        }
+    }
+
+    /// The buffer line the stopped program is on, from zero, for a test.
+    pub fn execution_line(&self) -> Option<usize> {
+        self.execution_line
     }
 
     /// The values of `values` grouped by the lines that name them, from the start of the
@@ -2567,6 +2598,10 @@ impl EditorView {
                 self.refresh_plain_spans(cx);
                 self.attach(cx);
                 self.reveal(cx);
+                // The values a window gave before the text was read name their lines now.
+                if let Some((line, values)) = self.debug_source.take() {
+                    self.set_debug_values(Some(line), &values, cx);
+                }
                 let saved = crate::bookmarks::bookmark_lines(&self.path, cx);
                 if let Some(state) = &mut self.state {
                     state.set_bookmarks(&saved);

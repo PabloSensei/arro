@@ -213,6 +213,10 @@ fn started(cx: &mut TestAppContext, name: &str) -> (Fixture, gpui::Entity<DebugP
             .read_with(cx, |panel, _| panel.snapshot().frames.clone())
             .is_empty()
     });
+    // A stop shows the Debugger tab. These tests type into the console, so they choose it
+    // as the user does.
+    draw(cx, window);
+    click(cx, window, "debug-tab-console");
     let focus = debug.read_with(cx, |panel, _| panel.focus());
     window
         .update(cx, |_, window, cx| window.focus(&focus, cx))

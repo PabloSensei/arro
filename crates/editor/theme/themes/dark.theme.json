@@ -65,6 +65,7 @@
     "semantic_constant": "#d9a7e8",
     "semantic_annotation": "#5ccfbf",
     "caret_row": "#242220",
+    "execution_line": "#22344d",
     "caret": "#e8e3da",
     "line_number": "#7a756d",
     "line_number_current": "#b3ada3",

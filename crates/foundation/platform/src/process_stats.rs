@@ -5,7 +5,7 @@
 //! shows its image name. The tree is read from a toolhelp snapshot: no WMI and no call
 //! that waits for a process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -213,16 +213,12 @@ fn creation_time(handle: HANDLE) -> Option<u64> {
 pub fn process_tree() -> Vec<ProcessMemory> {
     let root = unsafe { GetCurrentProcessId() };
     let processes = snapshot();
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for process in &processes {
-        children
-            .entry(process.parent)
-            .or_default()
-            .push(process.pid);
-    }
+    let links: Vec<(u32, u32)> = processes
+        .iter()
+        .map(|process| (process.pid, process.parent))
+        .collect();
     let mut found = Vec::new();
-    let mut pending = vec![root];
-    while let Some(pid) = pending.pop() {
+    for pid in tree_order(root, &links) {
         if let Some(process) = processes.iter().find(|process| process.pid == pid) {
             found.push(ProcessMemory {
                 pid: process.pid,
@@ -233,9 +229,6 @@ pub fn process_tree() -> Vec<ProcessMemory> {
                 private_bytes: 0,
                 private_working_set: 0,
             });
-        }
-        if let Some(below) = children.get(&pid) {
-            pending.extend(below.iter().copied());
         }
     }
     prune_roles(&processes);
@@ -254,6 +247,32 @@ pub fn process_tree() -> Vec<ProcessMemory> {
     }
     found.sort_by_key(|process| (process.pid != current, process.pid));
     found
+}
+
+/// The ids below `root`, `root` first, each once. The links are `(pid, parent)` pairs of
+/// one snapshot. Windows reuses process ids, so a parent id can name a younger process
+/// below its own child, and a process can even name itself: the walk visits every id
+/// once, or such a cycle would grow the list without end.
+fn tree_order(root: u32, links: &[(u32, u32)]) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(pid, parent) in links {
+        if pid != parent {
+            children.entry(parent).or_default().push(pid);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    let mut pending = vec![root];
+    while let Some(pid) = pending.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        order.push(pid);
+        if let Some(below) = children.get(&pid) {
+            pending.extend(below.iter().copied());
+        }
+    }
+    order
 }
 
 #[derive(Clone)]
@@ -349,7 +368,7 @@ fn prune_roles(alive: &[Entry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_console_process, label_process, process_tree, subsystem_of};
+    use super::{is_console_process, label_process, process_tree, subsystem_of, tree_order};
     use std::path::PathBuf;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
@@ -386,5 +405,14 @@ mod tests {
         let tree = process_tree();
         // The current process keeps the role of Arro, not the label of a child.
         assert_eq!(tree[0].role, Some("Arro"));
+    }
+
+    #[test]
+    fn a_reused_id_that_closes_a_cycle_is_walked_once() {
+        // 10 -> 20 -> 30, and 30 is named as the parent of 10 after an id was reused;
+        // 40 names itself as its parent.
+        let links = [(20, 10), (30, 20), (10, 30), (40, 40), (50, 40)];
+        assert_eq!(tree_order(10, &links), vec![10, 20, 30]);
+        assert_eq!(tree_order(40, &links), vec![40, 50]);
     }
 }

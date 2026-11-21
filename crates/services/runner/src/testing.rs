@@ -113,6 +113,12 @@ pub trait TestProvider: Send + Sync {
         Err("this test provider cannot read coverage".into())
     }
 
+    /// Whether [`TestProvider::coverage_plan`] makes a plan. The menu of a test offers Run
+    /// with Coverage only when it does.
+    fn supports_coverage(&self) -> bool {
+        false
+    }
+
     /// Whether [`TestProvider::profile_plan`] makes a plan. The actions offer Profile for
     /// the tests only when it does.
     fn supports_profiler(&self) -> bool {

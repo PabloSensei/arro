@@ -178,11 +178,17 @@ pub(crate) fn show_endpoint_menu(
 
 /// The test or class whose mark is on this line, from zero.
 pub(crate) fn request_at_line(view: &EditorView, line: usize, cx: &App) -> Option<TestRequest> {
+    site_at_line(view, line, cx).map(|site| request_of(&site))
+}
+
+/// The test or class whose mark is on this line, from zero.
+fn site_at_line(view: &EditorView, line: usize, cx: &App) -> Option<TestSite> {
     let panel = panel_of(cx)?;
     let text = view.text()?;
     let sites = sites_in(view, &text, panel.read(cx));
-    let site = sites.iter().find(|site| site.line as usize == line + 1)?;
-    Some(request_of(site))
+    sites
+        .into_iter()
+        .find(|site| site.line as usize == line + 1)
 }
 
 fn request_of(site: &TestSite) -> TestRequest {
@@ -336,8 +342,8 @@ pub(crate) fn run_mark_clicked(
         show_launch_menu(view, line, workspace, window, cx);
         return;
     }
-    if let Some(request) = request_at_line(view.read(cx), line, cx) {
-        run_request(request, workspace, window, cx);
+    if let Some(site) = site_at_line(view.read(cx), line, cx) {
+        show_test_menu(&site, workspace, window, cx);
     }
 }
 
@@ -381,6 +387,98 @@ pub(crate) fn show_launch_menu(
     let coverage = panel.read(cx).supports_coverage(&config.provider);
     let entries = launch_menu(panel, config, cx.weak_entity(), coverage);
     workspace.show_menu(window.mouse_position(), entries, cx);
+}
+
+/// The menu of a test or a class of tests whose mark was clicked, at the pointer: Run,
+/// Debug, Run with Coverage when the test provider collects it, and the configurations.
+pub(crate) fn show_test_menu(
+    site: &TestSite,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = panel_of(cx) else {
+        return;
+    };
+    let coverage = panel.read(cx).supports_test_coverage();
+    let request = request_of(site);
+    let name = test_name(site);
+    let run_key = workspace.shortcut_of_key(keymap::workspace::RUN_CLASS);
+    let debug_key = workspace.shortcut_of_key("workspace::Debug");
+    let coverage_key = workspace.shortcut_of_key("workspace::RunWithCoverage");
+    let weak = cx.weak_entity();
+
+    let run_panel = panel.clone();
+    let run_test = request.clone();
+    let run_workspace = weak.clone();
+    let mut run = MenuEntry::new(format!("Run '{name}'"), move |window, cx| {
+        run_panel.update(cx, |panel, cx| panel.run_tests(run_test.clone(), cx));
+        run_workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(RUN_TOOL, window, cx)
+            })
+            .ok();
+    })
+    .icon("run/run");
+    if let Some(hint) = run_key {
+        run = run.shortcut(hint);
+    }
+    let debug_panel = panel.clone();
+    let debug_test = request.clone();
+    let debug_workspace = weak.clone();
+    let mut debug = MenuEntry::new(format!("Debug '{name}'"), move |window, cx| {
+        debug_panel.update(cx, |panel, cx| {
+            panel.debug_tests(debug_test.clone(), window, cx)
+        });
+        debug_workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_tool(DEBUG_TOOL, window, cx)
+            })
+            .ok();
+    })
+    .icon("run/debug");
+    if let Some(hint) = debug_key {
+        debug = debug.shortcut(hint);
+    }
+    let mut entries = vec![run, debug];
+    if coverage {
+        let coverage_panel = panel.clone();
+        let coverage_test = request.clone();
+        let coverage_workspace = weak.clone();
+        let mut entry = MenuEntry::new(format!("Run '{name}' with Coverage"), move |window, cx| {
+            coverage_panel.update(cx, |panel, cx| {
+                panel.run_tests_coverage(coverage_test.clone(), cx)
+            });
+            coverage_workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_tool(COVERAGE_TOOL, window, cx)
+                })
+                .ok();
+        })
+        .icon("run/coverage");
+        if let Some(hint) = coverage_key {
+            entry = entry.shortcut(hint);
+        }
+        entries.push(entry);
+    }
+    let modify_panel = panel;
+    let modify = MenuEntry::new("Modify Run Configuration...", move |window, cx| {
+        weak.update(cx, |workspace, cx| {
+            RunConfigDialog::show(modify_panel.clone(), workspace, window, cx)
+        })
+        .ok();
+    });
+    entries.push(modify);
+    workspace.show_menu(window.mouse_position(), entries, cx);
+}
+
+/// What a menu calls a test: `addPetAddsPersistedPet()` for a method, the simple name of
+/// a class of tests for the class.
+fn test_name(site: &TestSite) -> String {
+    match &site.case {
+        Some(case) => format!("{}()", case.trim_end_matches("()")),
+        None => site.suite.rsplit('.').next().unwrap_or_default().to_owned(),
+    }
 }
 
 /// The innermost test or class around the caret.
