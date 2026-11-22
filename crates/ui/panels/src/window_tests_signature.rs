@@ -579,6 +579,8 @@ fn escape_and_server_errors_leave_the_file_alone(cx: &mut TestAppContext) {
 
 #[ui_kit::gpui::test]
 fn refactor_this_lists_change_signature(cx: &mut TestAppContext) {
+    use crate::window_tests_refactor_this::select_refactoring;
+
     let root = project(
         "signature-refactor-this",
         &[("src/Signature.txt", SIGNATURE)],
@@ -596,6 +598,7 @@ fn refactor_this_lists_change_signature(cx: &mut TestAppContext) {
         bounds_of(cx, window, "actions-popup").size.height > px(0.),
         "Refactor This lists the refactorings"
     );
+    select_refactoring(cx, window, &open, "Change Signature...");
     press(cx, window, "enter");
     draw(cx, window);
     assert!(

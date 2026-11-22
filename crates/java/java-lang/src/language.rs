@@ -6,10 +6,10 @@ use lang_api::{
     ChangeSignatureInfoProvider, ChangeSignatureProvider, CompletionProvider,
     CompletionResolveProvider, DefinitionPreviewProvider, Deletion, DeletionKind,
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
-    GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
-    InlayHintProvider, InlayHintSettings, LanguageId, LanguageSupport, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
-    MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
+    GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverPlace,
+    HoverProvider, InlayHintProvider, InlayHintSettings, LanguageId, LanguageSupport,
+    MethodHierarchyProvider, MoveDestinationProvider, MoveMembersFormProvider, MovePlace,
+    MoveProvider, MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
     PrepareDiagnosticsProvider, ProjectProblemsProvider, Queries, RangeFormatProvider,
     ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer,
     SemanticTokensProvider, SignatureProvider, SourceTextProvider, StructuralEdit, StructuralMatch,
@@ -343,6 +343,10 @@ impl LanguageSupport for JavaProject {
 
     fn hover(&self) -> Option<&HoverProvider> {
         Some(&self.java_messages)
+    }
+
+    fn hover_place(&self, line: &str) -> Option<HoverPlace> {
+        crate::hover_place::split(line)
     }
 
     fn workspace_symbols(&self) -> Option<&WorkspaceSymbolProvider> {

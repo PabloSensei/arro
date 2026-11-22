@@ -56,6 +56,19 @@ impl Navigator {
         paths.map(|path| path.as_path().to_path_buf()).collect()
     }
 
+    /// Files of an earlier run and the tabs it restores go behind the files used so far.
+    /// A file that is gone is left out.
+    fn restore_recent<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(path) = CanonPath::new(path) {
+                self.editors.add_recent(path);
+            }
+        }
+    }
+
     fn place(path: &Path, offset: usize) -> Option<Place> {
         let path = CanonPath::new(path).ok()?;
         Some(Place { path, offset })
@@ -102,7 +115,7 @@ pub fn go_to(
     if remember && let Some((from, caret)) = here(workspace, cx) {
         cx.default_global::<Navigator>().jumped_from(&from, caret);
         if let Some(editor) = editor_of(workspace, &from) {
-            places::remember(&editor, cx);
+            places::remember(&editor, workspace, cx);
         }
     }
     workspace.open_file(path.clone(), window, cx);
@@ -151,6 +164,35 @@ pub fn forward(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
 /// The files recently active, the current one first.
 pub fn recent(cx: &mut App) -> Vec<PathBuf> {
     cx.default_global::<Navigator>().recent()
+}
+
+/// Makes the layout of `workspace` carry Recent Files. The layout the window opened with
+/// gives back its files and its tabs; each layout written later keeps the files under the
+/// root of the project.
+pub fn bind_recent(workspace: &mut Workspace, cx: &mut App) {
+    let root = CanonPath::new(workspace.root()).map_or_else(
+        |_| workspace.root().to_path_buf(),
+        |root| root.as_path().to_path_buf(),
+    );
+    workspace.set_recent_files_source(move |app| recent_in(app, &root));
+    let layout = workspace.layout();
+    let saved = layout
+        .recent_files
+        .iter()
+        .chain(layout.panes.iter().flat_map(|pane| &pane.tabs));
+    cx.default_global::<Navigator>().restore_recent(saved);
+}
+
+/// The files of Recent Files under `root`, the latest first: the list a layout saves.
+fn recent_in(app: &App, root: &Path) -> Vec<PathBuf> {
+    let Some(navigator) = app.try_global::<Navigator>() else {
+        return Vec::new();
+    };
+    navigator
+        .recent()
+        .into_iter()
+        .filter(|path| path.starts_with(root))
+        .collect()
 }
 
 #[cfg(test)]

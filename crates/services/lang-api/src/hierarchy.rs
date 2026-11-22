@@ -42,6 +42,83 @@ pub struct OverridableMethods {
     pub methods: Vec<OverridableMethod>,
 }
 
+/// A type as the editor shows it: without the parts of the package, with the arguments
+/// of a generic type shortened the same way, and with wildcards and arrays kept. A text
+/// that is not one type comes back trimmed and otherwise unchanged.
+pub fn short_type_name(text: &str) -> String {
+    let mut rest = text.trim();
+    match short_type(&mut rest) {
+        Some(name) if rest.trim().is_empty() => name,
+        _ => text.trim().to_owned(),
+    }
+}
+
+/// One type from the front of `rest`: a name, its arguments and its array dimensions.
+fn short_type(rest: &mut &str) -> Option<String> {
+    *rest = rest.trim_start();
+    let mut name = if let Some(after) = rest.strip_prefix('?') {
+        *rest = after.trim_start();
+        let word_end = rest
+            .find(|character: char| !character.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        match &rest[..word_end] {
+            "extends" => {
+                *rest = rest[word_end..].trim_start();
+                format!("? extends {}", short_type(rest)?)
+            }
+            "super" => {
+                *rest = rest[word_end..].trim_start();
+                format!("? super {}", short_type(rest)?)
+            }
+            _ => "?".to_owned(),
+        }
+    } else {
+        let end = rest
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '$' | '.'))
+            })
+            .unwrap_or(rest.len());
+        let qualified = &rest[..end];
+        let simple = qualified.rsplit(['.', '$']).next().unwrap_or(qualified);
+        if simple.is_empty() {
+            return None;
+        }
+        *rest = rest[end..].trim_start();
+        let mut name = simple.to_owned();
+        if let Some(after) = rest.strip_prefix('<') {
+            *rest = after;
+            let mut arguments = Vec::new();
+            loop {
+                *rest = rest.trim_start();
+                if let Some(after) = rest.strip_prefix('>') {
+                    *rest = after;
+                    break;
+                }
+                if !arguments.is_empty() {
+                    *rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+                }
+                arguments.push(short_type(rest)?);
+            }
+            name.push('<');
+            name.push_str(&arguments.join(", "));
+            name.push('>');
+        }
+        name
+    };
+    loop {
+        if let Some(after) = rest.strip_prefix("[]") {
+            *rest = after;
+            name.push_str("[]");
+        } else if let Some(after) = rest.strip_prefix("...") {
+            *rest = after;
+            name.push_str("...");
+        } else {
+            break;
+        }
+    }
+    Some(name)
+}
+
 /// Ctrl+O and Ctrl+I: the methods at `spot` can override. Implement keeps only the
 /// methods without a body.
 #[derive(Clone, Debug, PartialEq, Eq)]

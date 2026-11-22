@@ -20,7 +20,7 @@ use crate::window_tests::{
 };
 use crate::window_tests_database_sources::{StandIn, open as open_data_sources};
 use crate::window_tests_refactor_this::{
-    RefactorLanguage, action, open_window as open_refactor_window, project,
+    RefactorLanguage, action, open_window as open_refactor_window, project, select_refactoring,
 };
 use crate::window_tests_run_configs::{open_dialog as open_run_dialog, open_run};
 
@@ -143,6 +143,7 @@ fn the_fields_of_the_rename_form_start_on_one_line_and_have_one_height(cx: &mut 
     open_path(cx, window, &shape);
     press(cx, window, "ctrl-alt-shift-t");
     draw(cx, window);
+    select_refactoring(cx, window, &shape, "Extract Interface...");
     press(cx, window, "enter");
     draw(cx, window);
 

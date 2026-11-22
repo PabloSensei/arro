@@ -11,6 +11,7 @@ mod doc;
 mod endpoints;
 mod environment;
 mod file_templates;
+mod hover_place;
 mod inspections;
 mod jshell;
 mod language;

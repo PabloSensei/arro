@@ -105,6 +105,15 @@ impl Editors {
         self.recent.iter()
     }
 
+    /// A file that no editor has shown in this run, such as a tab that an earlier run
+    /// kept: it goes behind the files used so far, unless it is in the list already.
+    pub fn add_recent(&mut self, path: CanonPath) {
+        if !self.recent.contains(&path) {
+            self.recent.push_back(path);
+            self.recent.truncate(RECENT);
+        }
+    }
+
     /// Before a jump to another place: `from` is where the caret was.
     pub fn jumped_from(&mut self, from: Place) {
         if self.back.back() == Some(&from) {

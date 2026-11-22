@@ -6,8 +6,8 @@ use crate::{
     ChangeSignatureInfoProvider, ChangeSignatureProvider, CompletionProvider,
     CompletionResolveProvider, DefinitionPreviewProvider, DependencyUpdatesProvider,
     DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
-    GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
-    MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
+    GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverPlace,
+    HoverProvider, MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
     MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
     MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
     PrepareDiagnosticsProvider, PrepareRenameProvider, ProjectProblemsProvider,
@@ -110,6 +110,14 @@ pub trait LanguageSupport: Send + Sync {
     }
 
     fn hover(&self) -> Option<&HoverProvider> {
+        None
+    }
+
+    /// Splits the first line of a hover answer into the declaration and the place it is
+    /// in, when the answer names one after a dash. A language whose answers name no place
+    /// keeps the line as it is.
+    fn hover_place(&self, line: &str) -> Option<HoverPlace> {
+        let _ = line;
         None
     }
 

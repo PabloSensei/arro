@@ -20,7 +20,7 @@ use crate::window_tests::{
 };
 use crate::window_tests_push_cancel::open_push_window;
 use crate::window_tests_refactor_this::{
-    RefactorLanguage, action, open_window as open_refactor_window, project,
+    RefactorLanguage, action, open_window as open_refactor_window, project, select_refactoring,
 };
 use crate::window_tests_run_configs::{open_dialog as open_run_dialog, open_run};
 
@@ -312,6 +312,7 @@ fn the_refactor_form_keeps_its_row_and_its_fields_share_one_edge(cx: &mut TestAp
     open_path(cx, window, &shape);
     press(cx, window, "ctrl-alt-shift-t");
     draw(cx, window);
+    select_refactoring(cx, window, &shape, "Extract Interface...");
     press(cx, window, "enter");
     draw(cx, window);
 

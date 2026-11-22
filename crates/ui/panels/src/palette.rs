@@ -3,8 +3,8 @@
 //! with a mode; rows come from the project index, from the symbol sources and from the
 //! commands of the window.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use editor_view::{EditorView, OutlineItem, OutlineKind, Spot};
@@ -358,6 +358,44 @@ fn collect_menu_icons(entries: &[MenuEntry], found: &mut HashMap<String, &'stati
     }
 }
 
+/// The open tabs in the order the Switcher lists them: the tab on screen first, the files
+/// by last use, then the tabs that no editor has shown in this run, in tab order. The
+/// rows keep the spelling of `open`, so that Enter opens the tab itself.
+pub(crate) fn switcher_order(
+    recent: &[PathBuf],
+    open: &[PathBuf],
+    active: Option<&Path>,
+) -> Vec<PathBuf> {
+    let open_by_key: HashMap<PathBuf, &PathBuf> = open
+        .iter()
+        .map(|path| (::platform::path_key(path), path))
+        .collect();
+    let mut placed = HashSet::new();
+    let mut order = Vec::with_capacity(open.len());
+    let by_use = active
+        .into_iter()
+        .chain(recent.iter().map(PathBuf::as_path));
+    for path in by_use.chain(open.iter().map(PathBuf::as_path)) {
+        let key = ::platform::path_key(path);
+        if let Some(open_path) = open_by_key.get(&key)
+            && placed.insert(key)
+        {
+            order.push(open_path.to_path_buf());
+        }
+    }
+    order
+}
+
+/// The line and the column that a query names, as the spot of the file rows.
+fn file_spot(query: &GotoQuery) -> Option<Spot> {
+    query.line.map(|line| Spot::Line {
+        line: (line as usize).saturating_sub(1),
+        column: query
+            .column
+            .map_or(0, |column| (column as usize).saturating_sub(1)),
+    })
+}
+
 pub struct Palette {
     project: ProjectIndex,
     files: Entity<Arc<Vec<PathBuf>>>,
@@ -376,8 +414,8 @@ pub struct Palette {
     recent: Vec<PathBuf>,
     /// The files that were edited in the project, the latest first.
     edited: Vec<PathBuf>,
-    /// The files of the open tabs, which is what the Switcher lists.
-    open_tabs: Vec<PathBuf>,
+    /// The open tabs in the order the Switcher lists them, see [`switcher_order`].
+    switcher: Vec<PathBuf>,
     /// The Recent Files checkbox: only the files that were edited in the project.
     edited_only: bool,
     structure: Option<(PathBuf, Arc<[OutlineItem]>)>,
@@ -430,6 +468,7 @@ impl Palette {
         let recent = navigation::recent(cx);
         let edited = workspace.recent_edited().to_vec();
         let open_tabs: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
+        let switcher = switcher_order(&recent, &open_tabs, workspace.active_path().as_deref());
         let new_actions = cx
             .try_global::<ActiveProjectPanel>()
             .map(|panel| panel.0.read(cx).new_actions())
@@ -471,7 +510,7 @@ impl Palette {
                 new_actions,
                 recent,
                 edited,
-                open_tabs,
+                switcher,
                 edited_only,
                 structure,
                 symbol_batches: HashMap::new(),
@@ -622,12 +661,6 @@ impl Palette {
 
     fn file_rows(&self, cx: &App, limit: usize) -> Vec<RowData> {
         let query = GotoQuery::parse(&self.query.text);
-        let spot = query.line.map(|line| Spot::Line {
-            line: (line as usize).saturating_sub(1),
-            column: query
-                .column
-                .map_or(0, |column| (column as usize).saturating_sub(1)),
-        });
         let root = self.project.root.as_path();
         // The edited list outlives the tabs and the saves: a file lands there on the
         // first edit and stays after the tab is closed.
@@ -651,6 +684,33 @@ impl Palette {
                 .map(|ranked| ranked.item)
                 .collect()
         };
+        self.file_rows_of(paths, file_spot(&query))
+    }
+
+    /// The Switcher's rows: the open tabs in the order of `switcher`. A query ranks those
+    /// tabs only, so that a tab is not lost behind the files of the whole project.
+    fn switcher_rows(&self, limit: usize) -> Vec<RowData> {
+        let query = GotoQuery::parse(&self.query.text);
+        let paths: Vec<PathBuf> = if query.pattern.is_empty() {
+            self.switcher.iter().take(limit).cloned().collect()
+        } else {
+            let root = self.project.root.as_path();
+            rank_files(
+                &query.pattern,
+                root,
+                self.switcher.iter().map(PathBuf::as_path),
+                limit,
+            )
+            .into_iter()
+            .map(|ranked| ranked.item)
+            .collect()
+        };
+        self.file_rows_of(paths, file_spot(&query))
+    }
+
+    /// The rows of the files `paths`, each with the spot of the query.
+    fn file_rows_of(&self, paths: Vec<PathBuf>, spot: Option<Spot>) -> Vec<RowData> {
+        let root = self.project.root.as_path();
         paths
             .into_iter()
             .map(|path| {
@@ -660,9 +720,13 @@ impl Palette {
                     .to_string_lossy()
                     .into_owned();
                 let parent = path.parent().unwrap_or(&path);
+                // Rebuilt from its parts, so that a path spelled with `/` on Windows shows
+                // the same separators as the others in the list.
                 let detail = parent
                     .strip_prefix(root)
                     .unwrap_or(parent)
+                    .components()
+                    .collect::<PathBuf>()
                     .display()
                     .to_string();
                 let icon = self.icons.icon_for(&path);
@@ -964,15 +1028,13 @@ impl Palette {
         match self.mode {
             Mode::Recent | Mode::RecentChanged => rows = self.file_rows(cx, MAX_ROWS),
             Mode::Switcher => {
-                rows = self.file_rows(cx, MAX_ROWS);
                 // The checkbox brings the whole edited list, also the files whose tab
                 // is closed; without it the Switcher lists the open tabs.
-                if !self.edited_only {
-                    rows.retain(|row| match &row.item {
-                        Some(Item::File { path, .. }) => self.open_tabs.contains(path),
-                        _ => true,
-                    });
-                }
+                rows = if self.edited_only {
+                    self.file_rows(cx, MAX_ROWS)
+                } else {
+                    self.switcher_rows(MAX_ROWS)
+                };
                 rows.extend(self.tool_rows());
             }
             Mode::Structure => rows = self.structure_rows(),

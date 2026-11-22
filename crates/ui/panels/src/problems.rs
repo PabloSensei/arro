@@ -49,6 +49,52 @@ impl Problem {
     fn counts(&self) -> bool {
         matches!(self.severity, Severity::Error | Severity::Warning)
     }
+
+    /// A misspelled word of the spelling check, which the summary of the window names
+    /// apart from the weak warnings.
+    fn is_typo(&self) -> bool {
+        self.severity == Severity::Hint
+            && self
+                .message
+                .strip_prefix(lang_api::SPELLING_TITLE)
+                .is_some_and(|rest| rest.starts_with(':'))
+    }
+}
+
+/// The number of problems of each kind, as the summary of the window names them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProblemCounts {
+    pub errors: usize,
+    pub warnings: usize,
+    pub weak_warnings: usize,
+    pub infos: usize,
+    pub typos: usize,
+}
+
+impl ProblemCounts {
+    pub fn total(&self) -> usize {
+        self.errors + self.warnings + self.weak_warnings + self.infos + self.typos
+    }
+
+    /// The title of the window, such as "Problems (2 errors, 3 typos)". A list with
+    /// nothing in it says so, rather than counting the kinds that are all zero.
+    pub fn title(&self) -> String {
+        if self.total() == 0 {
+            return "No problems".to_owned();
+        }
+        let mut parts = Vec::new();
+        let mut add = |count: usize, one: &str, many: &str| {
+            if count > 0 {
+                parts.push(format!("{count} {}", if count == 1 { one } else { many }));
+            }
+        };
+        add(self.errors, "error", "errors");
+        add(self.warnings, "warning", "warnings");
+        add(self.weak_warnings, "weak warning", "weak warnings");
+        add(self.infos, "info", "infos");
+        add(self.typos, "typo", "typos");
+        format!("Problems ({})", parts.join(", "))
+    }
 }
 
 /// The problems of every file that has some.
@@ -78,6 +124,21 @@ impl ProblemsState {
         let all = self.files.values().flatten();
         let count = |severity| all.clone().filter(|p| p.severity == severity).count();
         (count(Severity::Error), count(Severity::Warning))
+    }
+
+    /// The problems of every file counted by kind, for the summary of the window.
+    pub fn counts(&self) -> ProblemCounts {
+        let mut counts = ProblemCounts::default();
+        for problem in self.files.values().flatten() {
+            match problem.severity {
+                Severity::Error => counts.errors += 1,
+                Severity::Warning => counts.warnings += 1,
+                Severity::Information => counts.infos += 1,
+                Severity::Hint if problem.is_typo() => counts.typos += 1,
+                Severity::Hint => counts.weak_warnings += 1,
+            }
+        }
+        counts
     }
 
     pub fn of_file(&self, path: &Path) -> &[Problem] {
@@ -127,12 +188,48 @@ impl ProblemsState {
             .collect()
     }
 
-    /// The problems of one file, in the order of the text.
-    pub fn items_of_file(&self, root: &Path, path: &Path) -> Vec<Item> {
-        self.of_file(path)
+    /// The current file once, with its problems under it, in the order of the text. A row
+    /// of a problem carries the line at its end rather than the path of the file.
+    pub fn file_view(
+        &self,
+        root: &Path,
+        path: &Path,
+        icons: &FileIcons,
+    ) -> (Vec<Item>, Vec<PanelRow>) {
+        let problems = self.of_file(path);
+        if problems.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let items: Vec<Item> = problems
             .iter()
-            .map(|problem| item_of(root, path, problem))
-            .collect()
+            .map(|problem| item_in_file(path, problem))
+            .collect();
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let name = relative.file_name().map_or_else(
+            || relative.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let folder = relative
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.display().to_string().replace('\\', "/"));
+        let hint = match folder {
+            Some(folder) => format!("{folder} ({})", items.len()),
+            None => items.len().to_string(),
+        };
+        let mut rows = Vec::with_capacity(items.len() + 1);
+        rows.push(PanelRow::Group {
+            label: name,
+            depth: 0,
+            icon: icons.icon_for(path),
+            hint: Some(hint),
+        });
+        rows.extend((0..items.len()).map(|index| PanelRow::Item {
+            index,
+            depth: 1,
+            excluded: false,
+        }));
+        (items, rows)
     }
 
     /// The list of the whole project, with a row per file and its problems under it.
@@ -192,18 +289,35 @@ fn same_path(left: &Path, right: &Path) -> bool {
 fn item_of(root: &Path, path: &Path, problem: &Problem) -> Item {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let hint = format!("{}:{}", relative.display(), problem.line + 1);
-    let icon = match problem.severity {
-        Severity::Error => "status/error",
-        Severity::Warning => "status/warning",
-        Severity::Information | Severity::Hint => "status/info",
-    };
     Item {
         path: path.to_path_buf(),
         line: problem.line,
         column: problem.column,
         label: problem.message.lines().next().unwrap_or("").to_string(),
         hint: hint.replace('\\', "/"),
-        icon,
+        icon: severity_icon(problem.severity),
+    }
+}
+
+/// One row of the Current File tab: the problem without its path, which the row of the
+/// file above already shows, and with the line at the end.
+fn item_in_file(path: &Path, problem: &Problem) -> Item {
+    Item {
+        path: path.to_path_buf(),
+        line: problem.line,
+        column: problem.column,
+        label: problem.message.lines().next().unwrap_or("").to_string(),
+        hint: format!(":{}", problem.line + 1),
+        icon: severity_icon(problem.severity),
+    }
+}
+
+/// The icon of the severity of a problem.
+fn severity_icon(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "status/error",
+        Severity::Warning => "status/warning",
+        Severity::Information | Severity::Hint => "status/info",
     }
 }
 
@@ -353,7 +467,7 @@ impl Global for ActiveProblems {}
 impl ProblemsHub {
     pub fn create(root: PathBuf, workspace: WeakEntity<Workspace>, cx: &mut App) -> Entity<Self> {
         let panel = ItemsPanel::create(
-            "Problems",
+            &ProblemCounts::default().title(),
             PROBLEMS_TOOL,
             "No problems found",
             workspace.clone(),
@@ -459,8 +573,7 @@ impl ProblemsHub {
             .files()
             .map(|(path, problems)| (path.clone(), problems.to_vec()));
         crate::claude_ide::publish_problems(cx, files);
-        let (errors, warnings) = self.state.totals();
-        let title = format!("Problems ({errors} errors, {warnings} warnings)");
+        let title = self.state.counts().title();
         let icons = self
             .workspace
             .upgrade()
@@ -475,14 +588,7 @@ impl ProblemsHub {
             // project rather than an empty window.
             Scope::CurrentFile => match &self.active_file {
                 Some(path) => {
-                    let items = self.state.items_of_file(&self.root, path);
-                    let rows = (0..items.len())
-                        .map(|index| PanelRow::Item {
-                            index,
-                            depth: 0,
-                            excluded: false,
-                        })
-                        .collect();
+                    let (items, rows) = self.state.file_view(&self.root, path, &icons);
                     (items, rows, "No problems in the current file")
                 }
                 _ => {

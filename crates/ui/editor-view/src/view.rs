@@ -2325,6 +2325,23 @@ impl EditorView {
         Some(completion.labels())
     }
 
+    /// The headings of the groups of an open Override or Implement list, as the window
+    /// shows them. A test reads them; the paint uses the same names.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn override_headers(&self) -> Option<Vec<String>> {
+        let popup = self.lsp.as_ref()?.overrides.as_ref()?;
+        let mut headers = Vec::new();
+        let mut owner: Option<&str> = None;
+        for index in &popup.shown {
+            let method = &popup.methods[*index];
+            if owner != Some(method.owner.as_str()) {
+                owner = Some(method.owner.as_str());
+                headers.push(crate::hierarchy::owner_heading(&method.owner).0);
+            }
+        }
+        Some(headers)
+    }
+
     /// The text of the note under the caret, when one is on screen. A test reads it; nothing
     /// else does.
     #[cfg(any(test, feature = "test-support"))]
@@ -2396,6 +2413,25 @@ impl EditorView {
         menu.rows
             .get(menu.selected)
             .map(|pick| pick.label().to_owned())
+    }
+
+    /// The heading of an open list, such as Refactor This. A test reads it; nothing else
+    /// does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn actions_title(&self) -> Option<&'static str> {
+        self.lsp.as_ref()?.actions.as_ref()?.title
+    }
+
+    /// The rows of an open list above which a separator is drawn, counted from zero. A test
+    /// reads them; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn actions_separators(&self) -> Option<Vec<usize>> {
+        let menu = self.lsp.as_ref()?.actions.as_ref()?;
+        Some(
+            (0..menu.rows.len())
+                .filter(|row| menu.separated(*row))
+                .collect(),
+        )
     }
 
     /// The places of an open Ctrl+B list, from zero. A test reads them; nothing else does.
@@ -6574,7 +6610,7 @@ impl EditorView {
                 let selected = row == menu.selected;
                 let quick_fix = menu.quick_fix(row);
                 let nested = menu.nested(row);
-                if sections && row > 0 && quick_fix != menu.quick_fix(row - 1) {
+                if menu.separated(row) {
                     rows.push(
                         div()
                             .debug_selector(|| "actions-separator".to_owned())
@@ -6860,19 +6896,42 @@ impl EditorView {
         {
             let mut rows: Vec<AnyElement> = Vec::new();
             let mut owner: Option<&str> = None;
+            let mut group = 0usize;
             for (row, index) in popup.shown.iter().enumerate() {
                 let method = &popup.methods[*index];
                 if owner != Some(method.owner.as_str()) {
                     owner = Some(method.owner.as_str());
+                    let (heading, package) = crate::hierarchy::owner_heading(&method.owner);
+                    let mut text = heading;
+                    let mut highlights = Vec::new();
+                    if let Some(package) = package {
+                        text.push_str("  ");
+                        let start = text.len();
+                        text.push_str(&package);
+                        highlights.push((
+                            start..text.len(),
+                            HighlightStyle {
+                                color: Some(theme.text_muted),
+                                ..HighlightStyle::default()
+                            },
+                        ));
+                    }
                     rows.push(
                         div()
                             .px_2()
                             .pt_1()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_secondary)
-                            .child(method.owner.clone())
+                            .debug_selector(move || format!("override-owner-{group}"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_secondary)
+                                    .child(StyledText::new(text).with_highlights(highlights)),
+                            )
                             .into_any_element(),
                     );
+                    group += 1;
                 }
                 let selected = row == popup.selected;
                 let checked = popup.checked[*index];

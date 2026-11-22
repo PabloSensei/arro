@@ -53,7 +53,7 @@ pub use markdown_preview::PreviewModes;
 pub use quick_doc::{
     DocAlign, DocBlock, DocHost, DocImage, DocInline, DocLinkHandler, DocPicture, DocSelectEvent,
     DocSelectHandler, display_text as display_documentation, parse as parse_documentation,
-    render_document, split_line_fragment,
+    parse_hover, render_document, split_line_fragment,
 };
 pub use refactor::FolderMove;
 pub use semantic::{

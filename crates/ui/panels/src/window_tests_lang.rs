@@ -1183,6 +1183,8 @@ fn move_shows_packages_applies_the_edit_and_moves_the_tab(cx: &mut TestAppContex
 
 #[ui_kit::gpui::test]
 fn refactoring_keys_apply_their_edits_and_undo_in_one_step(cx: &mut TestAppContext) {
+    use crate::window_tests_refactor_this::select_refactoring;
+
     let root = project("refactor", &[("src/Refactor.txt", "value\n")]);
     let path = root.join("src").join("Refactor.txt");
     let uri = uri_of(&path);
@@ -1225,6 +1227,7 @@ fn refactoring_keys_apply_their_edits_and_undo_in_one_step(cx: &mut TestAppConte
         bounds_of(cx, window, "actions-popup").size.height > px(0.),
         "Refactor This lists the refactorings"
     );
+    select_refactoring(cx, window, &path, "Extract Method...");
     press(cx, window, "enter");
     assert_eq!(buffer_of(cx, &view), "method()\n");
     press(cx, window, "ctrl-z");

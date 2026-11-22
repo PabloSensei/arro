@@ -116,15 +116,19 @@ impl EditorView {
         self.refresh_matches(true, cx);
     }
 
-    /// Ctrl+G.
+    /// Ctrl+G. The field opens with the caret's place as the status bar writes it, and the
+    /// text is selected, so that a number typed at once replaces it.
     pub(crate) fn open_goto(&mut self, cx: &mut Context<Self>) {
         if self.state.is_none() {
             return;
         }
+        let (line, column) = self.caret();
+        let mut query = TextField::from_text(format!("{}:{}", line + 1, column + 1));
+        query.select_all();
         self.bar = Some(Bar {
             kind: BarKind::Goto,
             field: Field::Query,
-            query: TextField::default(),
+            query,
             replacement: TextField::default(),
             options: FindOptions::default(),
             matches: Vec::new(),
@@ -139,6 +143,13 @@ impl EditorView {
             active: true,
         });
         cx.notify();
+    }
+
+    /// The text of the Go to field and the range selected in it, while the field is open.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn goto_field(&self) -> Option<(String, Range<usize>)> {
+        let bar = self.bar.as_ref().filter(|bar| bar.kind == BarKind::Goto)?;
+        Some((bar.query.text.clone(), bar.query.selection()))
     }
 
     pub(crate) fn close_bar(&mut self, cx: &mut Context<Self>) {

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use lang_api::{SourceSpan, TextPoint, TextSpan, ask};
+use lang_api::{HoverPlace, LanguageSupport, SourceSpan, TextPoint, TextSpan, ask};
 use markdown::mdast;
 use syntax::{DocumentId, HighlightSpan, LanguageConfig, SyntaxService};
 use text_core::{Change, RopeStore, TextStore};
@@ -31,6 +31,8 @@ const HOVER_LEAVE_DELAY: Duration = Duration::from_millis(300);
 /// The widest the popup gets.
 const MAX_WIDTH: f32 = 600.;
 const MIN_WIDTH: f32 = 320.;
+/// The room the buttons of the popup take on its right, with a gap to the text.
+const BUTTONS_ROOM: f32 = ICON_BUTTON * 2. + SPACE_XS * 2. + SPACE_S;
 
 static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 
@@ -79,6 +81,9 @@ pub enum DocBlock {
         summary: Vec<DocInline>,
         blocks: Vec<DocBlock>,
     },
+    /// The place a declaration is in, such as the method of a local variable. It is a line of
+    /// its own under the declaration and is drawn in a secondary colour.
+    Place(String),
     Divider,
 }
 
@@ -185,6 +190,40 @@ impl QuickDoc {
 /// dropped while their text stays.
 pub fn parse(text: &str) -> Vec<DocBlock> {
     parse_blocks(text, Reading::Answer).0
+}
+
+/// Turns the answer of a hover request into blocks. The language that answered splits the
+/// place of the declaration off it, see [`split_place`].
+pub fn parse_hover(text: &str, support: &dyn LanguageSupport) -> Vec<DocBlock> {
+    split_place(parse(text), |line| support.hover_place(line))
+}
+
+/// Moves the place off the declaration that a single-line code block holds. The declaration
+/// stays the code, so the grammar colours only the declaration, and the place becomes a line
+/// of its own under it.
+fn split_place(
+    mut blocks: Vec<DocBlock>,
+    split: impl Fn(&str) -> Option<HoverPlace>,
+) -> Vec<DocBlock> {
+    let (language, text) = match blocks.first() {
+        Some(DocBlock::Code { language, text, .. }) => {
+            (language.clone(), text.trim_end_matches('\n').to_owned())
+        }
+        _ => return blocks,
+    };
+    if text.contains('\n') {
+        return blocks;
+    }
+    let Some(HoverPlace { declaration, place }) = split(&text) else {
+        return blocks;
+    };
+    blocks[0] = DocBlock::Code {
+        language,
+        text: declaration,
+        spans: Vec::new(),
+    };
+    blocks.insert(1, DocBlock::Place(format!("in {place}")));
+    blocks
 }
 
 /// The blocks of a markdown file and the line each one starts on, counted from zero.
@@ -920,6 +959,10 @@ fn display_blocks(out: &mut String, blocks: &[DocBlock], depth: usize) {
                 display_blocks(out, blocks, depth);
             }
             DocBlock::Quote(inner) => display_blocks(out, inner, depth),
+            DocBlock::Place(text) => {
+                out.push_str(text);
+                out.push('\n');
+            }
             DocBlock::Divider => out.push('\n'),
         }
     }
@@ -988,6 +1031,10 @@ fn plain_block(out: &mut String, block: &DocBlock) {
             for block in blocks {
                 plain_block(out, block);
             }
+        }
+        DocBlock::Place(text) => {
+            out.push_str(text);
+            out.push('\n');
         }
         DocBlock::Divider => out.push('\n'),
     }
@@ -1829,7 +1876,10 @@ impl EditorView {
                     return;
                 }
                 let diagnostic = this.diagnostic_at(offset);
-                let blocks = parse(&text);
+                let blocks = this.lsp.as_ref().map_or_else(
+                    || parse(&text),
+                    |lsp| parse_hover(&text, lsp.support.as_ref()),
+                );
                 this.show_quick_doc(offset, blocks, diagnostic, Some(range), cx);
             })
             .ok();
@@ -2073,7 +2123,7 @@ impl EditorView {
             .w_full()
             .gap(px(SPACE_S))
             .p(px(SPACE_M))
-            .pr(px(ICON_BUTTON * 2.))
+            .pr(px(BUTTONS_ROOM))
             .child(render_document(
                 &doc.blocks,
                 doc.diagnostic.as_deref(),
@@ -2120,6 +2170,7 @@ impl EditorView {
             .child(body)
             .child(
                 div()
+                    .debug_selector(|| "quick-doc-buttons".to_owned())
                     .absolute()
                     .top(px(SPACE_XS))
                     .right(px(SPACE_XS))
@@ -2438,16 +2489,24 @@ impl DocRender<'_> {
                 if language.as_deref().is_some_and(|name| !name.is_empty()) {
                     column = column.debug_selector(|| format!("{}-code", self.host.name));
                 }
+                let name = self.host.name.clone();
                 let mut at = 0;
                 for line in text.split_inclusive('\n') {
                     let content = line.strip_suffix('\n').unwrap_or(line);
                     let end = at + content.len();
-                    let mut cells = Vec::new();
-                    for (index, character) in content.char_indices() {
+                    // The offset of the line names its chunks, so that no two chunks of the
+                    // popup share a selector.
+                    let line_start = self.cursor;
+                    // A line of the Quick Doc breaks after a space or a separator, so that its
+                    // words wrap in the width of the popup. A document keeps its lines.
+                    let mut chunks: Vec<Vec<AnyElement>> = Vec::new();
+                    let mut chunk = Vec::new();
+                    let mut characters = content.char_indices().peekable();
+                    while let Some((index, character)) = characters.next() {
                         let offset = self.cursor;
                         self.cursor += character.len_utf8();
                         let color = code_color(at + index, spans, style);
-                        cells.push(self.character(
+                        chunk.push(self.character(
                             character,
                             offset,
                             color,
@@ -2456,15 +2515,36 @@ impl DocRender<'_> {
                             false,
                             true,
                         ));
+                        let next = characters.peek().map(|&(_, next)| next);
+                        if !self.document && breaks_after(character, next) {
+                            chunks.push(std::mem::take(&mut chunk));
+                        }
+                    }
+                    if !chunk.is_empty() {
+                        chunks.push(chunk);
                     }
                     self.cursor += 1;
-                    let row = if cells.is_empty() {
+                    let row = if chunks.is_empty() {
                         div().flex().h(px(style.line_height)).into_any_element()
-                    } else {
+                    } else if self.document {
                         div()
                             .flex()
                             .whitespace_nowrap()
-                            .children(cells)
+                            .children(chunks.into_iter().flatten())
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .w_full()
+                            .children(chunks.into_iter().enumerate().map(|(index, chunk)| {
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .debug_selector(|| format!("{name}-chunk-{line_start}-{index}"))
+                                    .children(chunk)
+                            }))
                             .into_any_element()
                     };
                     column = column.child(row);
@@ -2512,6 +2592,14 @@ impl DocRender<'_> {
                     column = column.child(self.block(block, window, cx));
                 }
                 column.into_any_element()
+            }
+            DocBlock::Place(text) => {
+                let inlines = [DocInline::Text(text.clone())];
+                let element = self
+                    .inlines(&inlines, UI_SIZE, theme.text_secondary, false, true)
+                    .into_any_element();
+                self.cursor += 1;
+                element
             }
             DocBlock::Divider => {
                 self.cursor += 1;
@@ -3112,6 +3200,13 @@ impl DocRender<'_> {
     }
 }
 
+/// Whether a line of code breaks after a character: after a space or a separator that a word
+/// follows, so that a long declaration wraps between its words and its names.
+fn breaks_after(character: char, next: Option<char>) -> bool {
+    let separator = character.is_whitespace() || matches!(character, '.' | ',' | '(');
+    separator && next.is_some_and(|next| !next.is_whitespace())
+}
+
 /// What one span of a code line colours at `at`, or `None` when no span covers it.
 fn code_color(at: usize, spans: &[HighlightSpan], style: &EditorStyle) -> Hsla {
     spans
@@ -3210,7 +3305,7 @@ fn estimate_width(doc: &QuickDoc, font_size: f32) -> f32 {
         .map(|line| line.chars().count())
         .max()
         .unwrap_or(0) as f32;
-    (longest * character + 2. * SPACE_M + ICON_BUTTON * 2.).clamp(MIN_WIDTH, MAX_WIDTH)
+    (longest * character + SPACE_M + 2. * SPACE_S + BUTTONS_ROOM).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
 /// A rough height of the popup before layout, for placing it above or below the line.
@@ -3241,6 +3336,7 @@ fn block_rows(block: &DocBlock) -> f32 {
         DocBlock::Image { .. } => 6.,
         DocBlock::Quote(inner) => inner.iter().map(block_rows).sum(),
         DocBlock::Details { blocks, .. } => 1. + blocks.iter().map(block_rows).sum::<f32>(),
+        DocBlock::Place(_) => 1.,
         DocBlock::Divider => 1.,
     }
 }
@@ -3270,8 +3366,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DocAlign, DocBlock, DocInline, display_text, heading_size, parse, parse_with_lines,
-        plain_inlines, split_line_fragment,
+        DocAlign, DocBlock, DocInline, HoverPlace, breaks_after, display_text, heading_size, parse,
+        parse_with_lines, plain_inlines, split_line_fragment, split_place,
     };
 
     const HOVER: &str = "```text\npublic static String format(String format, Object... args)\n```\n\nReturns a formatted string with the **format** string and the `args` that follow it.\n\n**Parameters:**\n`format` - a [pattern](https://example.com/pattern) with `%s`\n`args` - the values\n\n**Returns:**\nthe text\n\n**Throws:**\n`IllegalState` - when the pattern is wrong\n\n<p>See <code>Formatter</code> for the rules.</p>\n\n- one\n- two\n\n---\n";
@@ -3826,6 +3922,70 @@ mod tests {
             })
             .collect();
         assert_eq!(urls, ["https://example.com/a", "https://example.com/b"]);
+    }
+
+    /// A split that takes the text after a dash as the place, the way a language does.
+    fn split_after_dash(line: &str) -> Option<HoverPlace> {
+        let (declaration, place) = line.split_once(" - ")?;
+        Some(HoverPlace {
+            declaration: declaration.to_owned(),
+            place: place.to_owned(),
+        })
+    }
+
+    #[test]
+    fn the_place_of_a_declaration_becomes_a_line_of_its_own() {
+        let blocks = split_place(
+            parse("```text\nPage<Owner> ownersResults - OwnerController.process()\n```\n"),
+            split_after_dash,
+        );
+
+        let DocBlock::Code { text, spans, .. } = &blocks[0] else {
+            panic!("the declaration is a code block: {blocks:?}");
+        };
+        assert_eq!(text, "Page<Owner> ownersResults");
+        assert!(
+            spans.is_empty(),
+            "the colours are read again for the new text"
+        );
+        assert_eq!(
+            blocks[1],
+            DocBlock::Place("in OwnerController.process()".to_owned())
+        );
+        assert_eq!(
+            display_text(&blocks, None),
+            "Page<Owner> ownersResults\nin OwnerController.process()\n"
+        );
+    }
+
+    #[test]
+    fn a_declaration_without_a_place_keeps_its_block() {
+        let before = parse("```text\nString name\n```\n");
+        assert_eq!(split_place(before.clone(), |_| None), before);
+    }
+
+    #[test]
+    fn a_code_block_of_several_lines_is_not_split() {
+        let before = parse("```text\nvoid run() - a\nvoid stop()\n```\n");
+        assert_eq!(split_place(before.clone(), split_after_dash), before);
+    }
+
+    #[test]
+    fn a_line_breaks_after_a_separator_that_a_word_follows() {
+        assert!(breaks_after(' ', Some('x')));
+        assert!(breaks_after('.', Some('x')));
+        assert!(breaks_after(',', Some('x')));
+        assert!(breaks_after('(', Some('x')));
+        assert!(
+            !breaks_after(' ', Some(' ')),
+            "a run of spaces stays together"
+        );
+        assert!(
+            !breaks_after(',', Some(' ')),
+            "a comma keeps the space after it"
+        );
+        assert!(!breaks_after('x', Some('y')));
+        assert!(!breaks_after(' ', None), "the end of a line is no break");
     }
 
     /// The plain text of a paragraph block, for the tests of the blocks after the first.

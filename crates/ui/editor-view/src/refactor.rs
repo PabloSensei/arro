@@ -474,6 +474,114 @@ fn under_source_root(destinations: &[MoveDestination], folder: &Path) -> bool {
     })
 }
 
+/// The groups of Refactor This, in the order IDEA shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RefactorGroup {
+    /// The name of the element: Rename, Change Signature, Move, Copy, Safe Delete.
+    Names,
+    /// Extract and introduce: the extractions of values, members and types.
+    Extractions,
+    /// The members of the type hierarchy: Pull Members Up, Push Members Down.
+    Hierarchy,
+    /// Inline, and the rows of the server that name none of the groups above.
+    Other,
+}
+
+/// The group and the place in it of a row of the editor.
+fn own_place(own: Own) -> (RefactorGroup, usize) {
+    use RefactorGroup::{Extractions, Hierarchy, Names, Other};
+    match own {
+        Own::Rename => (Names, 0),
+        Own::ChangeSignature => (Names, 1),
+        Own::Move => (Names, 2),
+        Own::Copy => (Names, 3),
+        Own::SafeDelete => (Names, 4),
+        Own::ExtractMethod => (Extractions, 0),
+        Own::ExtractVariable => (Extractions, 1),
+        Own::ExtractField => (Extractions, 2),
+        Own::ExtractConstant => (Extractions, 3),
+        Own::IntroduceParameter => (Extractions, 4),
+        Own::IntroduceParameterObject => (Extractions, 5),
+        Own::ExtractSuperclass => (Extractions, 7),
+        Own::PullMembersUp => (Hierarchy, 0),
+        Own::PushMembersDown => (Hierarchy, 1),
+        Own::Inline => (Other, 0),
+    }
+}
+
+/// The place of the server's extractions in their group, by the prefix of the code of the
+/// action. A longer prefix comes first, since a shorter one is a prefix of it too.
+const EXTRACTION_PLACES: [(&str, usize); 8] = [
+    ("refactor.introduce.parameter.object", 5),
+    ("refactor.introduce.parameter", 4),
+    ("refactor.extract.function", 0),
+    ("refactor.extract.variable", 1),
+    ("refactor.extract.field", 2),
+    ("refactor.extract.constant", 3),
+    ("refactor.extract.interface", 6),
+    ("refactor.extract.superclass", 7),
+];
+
+/// The group and the place of a row of the server, by the kind of its action. A kind that
+/// no group names goes to the end of its group, or of the list.
+fn server_place(code: &str) -> (RefactorGroup, usize) {
+    if code.starts_with("refactor.change.signature") {
+        return (RefactorGroup::Names, 1);
+    }
+    if let Some((_, place)) = EXTRACTION_PLACES
+        .iter()
+        .find(|(kind, _)| code.starts_with(*kind))
+    {
+        return (RefactorGroup::Extractions, *place);
+    }
+    if code.starts_with("refactor.extract.") || code.starts_with("refactor.introduce.") {
+        return (RefactorGroup::Extractions, usize::MAX);
+    }
+    if code.starts_with("refactor.pull.up") {
+        return (RefactorGroup::Hierarchy, 0);
+    }
+    if code.starts_with("refactor.push.down") {
+        return (RefactorGroup::Hierarchy, 1);
+    }
+    (RefactorGroup::Other, usize::MAX)
+}
+
+/// The names of Refactor This as the menu spells them. The ellipsis marks a refactoring that
+/// opens a dialog, a form or a field of its own, as the menu of the editor does.
+const MENU_NAMES: [&str; 16] = [
+    "Rename...",
+    "Change Signature...",
+    "Move...",
+    "Copy...",
+    "Safe Delete...",
+    "Extract Method...",
+    "Extract Variable...",
+    "Extract Field...",
+    "Extract Constant...",
+    "Introduce Parameter...",
+    "Introduce Parameter Object...",
+    "Extract Interface...",
+    "Extract Superclass...",
+    "Pull Members Up...",
+    "Push Members Down...",
+    "Inline...",
+];
+
+/// The label of a row of Refactor This as the menu spells it. A name the menu knows takes
+/// its spelling and its ellipsis, in any case and with or without the ellipsis; any other
+/// label stays as the server gave it.
+fn menu_label(label: &str) -> String {
+    let bare = label
+        .trim()
+        .trim_end_matches("...")
+        .trim_end_matches('…')
+        .trim_end();
+    MENU_NAMES
+        .iter()
+        .find(|name| name.trim_end_matches("...").eq_ignore_ascii_case(bare))
+        .map_or_else(|| label.to_owned(), |name| (*name).to_owned())
+}
+
 impl EditorView {
     /// Alt+F7: the uses of the symbol, listed in the Usages window.
     pub fn find_usages(&mut self, cx: &mut Context<Self>) {
@@ -2191,8 +2299,9 @@ impl EditorView {
         }
     }
 
-    /// Ctrl+Alt+Shift+T: every refactoring the server offers at the selection, then the
-    /// ones of the editor that the server did not name, each with its key.
+    /// Ctrl+Alt+Shift+T: every refactoring the server offers at the selection and the ones
+    /// of the editor that the server did not name, each with its key. The rows fall into
+    /// the groups of IDEA under the heading Refactor This, and the first row is selected.
     pub(crate) fn refactor_this(&mut self, cx: &mut Context<Self>) {
         let Some(span) = self.selection_span() else {
             return;
@@ -2306,8 +2415,8 @@ impl EditorView {
             .collect();
         self.ask_actions(span, only, cx, move |this, _, caret, entries, cx| {
             let mut codes = Vec::new();
-            let mut rows: Vec<Pick> = Vec::new();
-            for entry in entries {
+            let mut rows: Vec<(RefactorGroup, usize, Pick)> = Vec::new();
+            for mut entry in entries {
                 let code = entry.code.clone().unwrap_or_default();
                 codes.push(code.clone());
                 // A move of the server needs a destination of its own; the editor's
@@ -2315,34 +2424,54 @@ impl EditorView {
                 if code.starts_with("refactor.move") {
                     continue;
                 }
+                let (group, place) = server_place(&code);
+                entry.title = menu_label(&entry.title);
                 if code.starts_with("refactor.change.signature") {
-                    rows.push(Pick::ChangeSignature { label: entry.title });
+                    rows.push((group, place, Pick::ChangeSignature { label: entry.title }));
                     continue;
                 }
                 if let Some(handle) = entry.handle {
-                    rows.push(Pick::Form {
-                        label: entry.title,
-                        handle,
-                    });
+                    rows.push((
+                        group,
+                        place,
+                        Pick::Form {
+                            label: entry.title,
+                            handle,
+                        },
+                    ));
                     continue;
                 }
                 if !entry.edits.is_empty() || !entry.renames.is_empty() {
-                    rows.push(Pick::Action(entry));
+                    rows.push((group, place, Pick::Action(entry)));
                 }
             }
-            // The editor's own refactorings come after the contextual ones of the
-            // server, and only when the server named no action of that kind.
+            // The editor's own refactorings take their place in their group, and only when
+            // the server named no action of that kind.
             for ((own, label, _, _, code), hint) in own.into_iter().zip(hints) {
                 if code.is_some_and(|code| codes.iter().any(|known| known.starts_with(code))) {
                     continue;
                 }
-                rows.push(Pick::Refactor {
-                    label: label.to_owned(),
-                    hint,
-                    own,
-                });
+                let (group, place) = own_place(own);
+                rows.push((
+                    group,
+                    place,
+                    Pick::Refactor {
+                        label: menu_label(label),
+                        hint,
+                        own,
+                    },
+                ));
             }
-            this.show_picks(caret, rows, "No refactorings here", cx);
+            // The sort is stable: a row keeps the order the server gave it in its group.
+            rows.sort_by_key(|(group, place, _)| (*group, *place));
+            let listed = !rows.is_empty();
+            let groups: Vec<usize> = rows.iter().map(|(group, _, _)| *group as usize).collect();
+            let picks: Vec<Pick> = rows.into_iter().map(|(_, _, pick)| pick).collect();
+            this.show_picks(caret, picks, "No refactorings here", cx);
+            if listed && let Some(menu) = this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+                menu.title = Some("Refactor This");
+                menu.groups = groups;
+            }
         });
     }
 

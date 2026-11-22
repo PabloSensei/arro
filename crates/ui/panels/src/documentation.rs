@@ -9,8 +9,8 @@ use std::time::Duration;
 #[cfg(test)]
 use editor_view::display_documentation;
 use editor_view::{
-    DocBlock, DocHost, DocLinkHandler, EditorStyle, EditorView, Spot, parse_documentation,
-    render_document, split_line_fragment, uri_path,
+    DocBlock, DocHost, DocLinkHandler, EditorStyle, EditorView, Spot, parse_hover, render_document,
+    split_line_fragment, uri_path,
 };
 use futures_util::StreamExt;
 use lang_api::ask;
@@ -163,7 +163,7 @@ impl DocumentationPanel {
                     cx.notify();
                     return;
                 }
-                let blocks = parse_documentation(&text);
+                let blocks = parse_hover(&text, query.support.as_ref());
                 this.push(
                     DocEntry {
                         blocks,

@@ -214,6 +214,9 @@ pub(crate) struct ActionMenu {
     /// The section of every row, of the same length as `rows`. Empty for the flat
     /// lists that have no sections.
     pub sections: Vec<MenuSection>,
+    /// The group of every row, of the same length as `rows`, for a list whose rows fall into
+    /// groups such as Refactor This. Empty for the lists without groups.
+    pub groups: Vec<usize>,
     pub selected: usize,
     /// The question for the preview of the selected row, while the language computes
     /// the edit on resolve. Dropping it cancels the question.
@@ -257,6 +260,17 @@ impl ActionMenu {
     /// Whether the row is a quick fix, which carries the red bulb and comes first.
     pub fn quick_fix(&self, row: usize) -> bool {
         self.sections.get(row) == Some(&MenuSection::QuickFix)
+    }
+
+    /// Whether a separator goes above the row: the quick fixes of Alt+Enter end there, or
+    /// the groups of the list meet there. A group with no row in the list makes no separator.
+    pub fn separated(&self, row: usize) -> bool {
+        if row == 0 {
+            return false;
+        }
+        let quick_fixes = self.has_sections() && self.quick_fix(row) != self.quick_fix(row - 1);
+        let groups = self.groups.get(row) != self.groups.get(row - 1);
+        quick_fixes || groups
     }
 
     /// Whether the row is an item under another one, such as the fix of a whole file
@@ -591,6 +605,7 @@ impl EditorView {
                 at,
                 rows,
                 sections: Vec::new(),
+                groups: Vec::new(),
                 selected: 0,
                 preview_task: None,
                 waiting_task: None,
@@ -857,6 +872,7 @@ impl EditorView {
             at,
             rows,
             sections,
+            groups: Vec::new(),
             selected: 0,
             preview_task: None,
             waiting_task: None,

@@ -22,6 +22,7 @@ use workspace::{FileIcons, Launch, Layout, Settings, Workspace};
 use crate::index::SearchSetup;
 use crate::window_tests::{bounds_of, draw, editor_of, open_path, press, project_setup, scratch};
 use crate::window_tests_lang::{edit_in, uri_of};
+use crate::window_tests_refactor_this::select_refactoring;
 use crate::{AgentOptions, LanguageServer, connect, install};
 
 const SOURCE: SourceId = SourceId::new("member-server");
@@ -266,17 +267,14 @@ fn refactor_this_lists_pull_members_up_and_applies_its_form(cx: &mut TestAppCont
         .unwrap();
     assert_eq!(commands, 4, "all four rows are commands");
 
-    // Refactor This lists the rows of the editor; Pull Members Up is after the other
-    // eleven own rows.
+    // Refactor This lists the rows of the editor; Pull Members Up is one of the hierarchy rows.
     press(cx, window, "ctrl-alt-shift-t");
     draw(cx, window);
     assert!(
         bounds_of(cx, window, "actions-popup").size.height > px(0.),
         "Refactor This lists the refactorings"
     );
-    for _ in 0..10 {
-        press(cx, window, "down");
-    }
+    select_refactoring(cx, window, &shape, "Pull Members Up...");
     press(cx, window, "enter");
     draw(cx, window);
     assert!(
@@ -332,9 +330,7 @@ fn the_form_of_a_member_refactoring_shows_its_warning(cx: &mut TestAppContext) {
 
     press(cx, window, "ctrl-alt-shift-t");
     draw(cx, window);
-    for _ in 0..10 {
-        press(cx, window, "down");
-    }
+    select_refactoring(cx, window, &owner, "Pull Members Up...");
     press(cx, window, "enter");
     draw(cx, window);
     assert!(

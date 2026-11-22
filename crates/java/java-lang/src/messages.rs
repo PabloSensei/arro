@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use lang_api::{
     ActionEntry, ActionKind, ActionProvider, ActionQuery, Answer, CompletionEntry, CompletionKind,
     CompletionList, CompletionProvider, Confidence, DiagnosticEntry, DiagnosticsProvider,
-    DiagnosticsQuery, DocumentEdit, DocumentSpot, HoverProvider, HoverText, LanguageId,
+    DiagnosticsQuery, DocumentEdit, DocumentSpot, HoverPlace, HoverProvider, HoverText, LanguageId,
     LanguageSupport, NavigationKind, NavigationProvider, NavigationQuery, Provider, Queries,
     RenameProvider, RenameQuery, Reply, SemanticServer, Severity, SourceEdit, SourceId, SourceSpan,
     SyntaxProvider, TextPoint, TextSpan, UsageEntry, UsageKind, UsageProvider, WorkspaceChange,
@@ -2097,6 +2097,10 @@ impl LanguageSupport for MessageBundles {
 
     fn hover(&self) -> Option<&HoverProvider> {
         Some(self)
+    }
+
+    fn hover_place(&self, line: &str) -> Option<HoverPlace> {
+        crate::hover_place::split(line)
     }
 
     fn navigation(&self) -> Option<&NavigationProvider> {

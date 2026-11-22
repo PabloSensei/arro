@@ -151,6 +151,15 @@ pub struct NavigationQuery {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HoverText(pub String);
 
+/// The first line of a hover answer split into the declaration and the place it is in,
+/// such as the method that declares a local variable. `place` is the short form the
+/// answer shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HoverPlace {
+    pub declaration: String,
+    pub place: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymbolEntry {
     pub name: String,
