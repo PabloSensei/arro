@@ -26,6 +26,8 @@ use crate::window_tests::{
 };
 use crate::{AgentOptions, LanguageServer, connect, install};
 
+use crate::change_signature::ChangeSignatureDialog;
+
 const SOURCE: SourceId = SourceId::new("fake-server");
 
 unsafe extern "C" fn no_grammar() -> *const () {
@@ -402,6 +404,18 @@ fn shown(cx: &mut TestAppContext, window: WindowHandle<Workspace>, selector: &'s
     visual.debug_bounds(selector).is_some()
 }
 
+/// The signature the form previews, read from the dialog itself.
+fn preview_of(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> String {
+    let view = window
+        .read_with(cx, |workspace, _| workspace.overlay_view())
+        .unwrap()
+        .expect("the Change Signature form is open");
+    let Ok(form) = view.downcast::<ChangeSignatureDialog>() else {
+        panic!("the overlay is the Change Signature form");
+    };
+    form.read_with(cx, |form, _| form.preview_text())
+}
+
 const SIGNATURE: &str = "class Signature {\n    public String combine(String left, String right) {\n        return left + right;\n    }\n\n    public String use() {\n        return combine(\"a\", \"b\");\n    }\n}\n";
 
 const CALLER: &str =
@@ -588,4 +602,174 @@ fn refactor_this_lists_change_signature(cx: &mut TestAppContext) {
         bounds_of(cx, window, "change-signature").size.height > px(0.),
         "the row opens Change Signature"
     );
+}
+
+/// Opens the Change Signature form on the `combine` method of a fresh project. The form is
+/// shown as the editor shows it, without a key press, and the language stays alive for the
+/// test.
+fn open_form(
+    cx: &mut TestAppContext,
+    name: &str,
+) -> (WindowHandle<Workspace>, Arc<FakeLanguage>, PathBuf) {
+    let root = project(name, &[("src/Signature.txt", SIGNATURE)]);
+    let open = root.join("src").join("Signature.txt");
+    let language = FakeLanguage::new();
+    let window = open_window_with(cx, root, language.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &open);
+    let spot = DocumentSpot {
+        uri: uri_of(&open),
+        version: 1,
+        point: TextPoint {
+            line: 1,
+            character: 20,
+        },
+    };
+    window
+        .update(cx, |workspace, window, cx| {
+            ChangeSignatureDialog::show(spot, workspace, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+    (window, language, open)
+}
+
+#[ui_kit::gpui::test]
+fn parameter_headers_stand_over_their_fields(cx: &mut TestAppContext) {
+    let (window, _language, _open) = open_form(cx, "signature-headers");
+    assert!(
+        bounds_of(cx, window, "change-signature").size.height > px(0.),
+        "the form is on screen"
+    );
+    for (header, field) in [
+        ("change-signature-header-type", "change-signature-type-0"),
+        ("change-signature-header-name", "change-signature-name-0"),
+        (
+            "change-signature-header-default",
+            "change-signature-default-0",
+        ),
+    ] {
+        let head = bounds_of(cx, window, header);
+        let cell = bounds_of(cx, window, field);
+        let dx = f32::from(head.origin.x) - f32::from(cell.origin.x);
+        let dw = f32::from(head.size.width) - f32::from(cell.size.width);
+        assert!(
+            dx.abs() < 0.5 && dw.abs() < 0.5,
+            "{header} is not over {field}: x {dx}, width {dw}"
+        );
+    }
+    assert!(
+        shown(cx, window, "change-signature-field-placeholder"),
+        "an empty Default value field has its hint"
+    );
+    assert!(
+        shown(cx, window, "change-signature-close"),
+        "the title bar has its close cross"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn visibility_is_chosen_from_a_list_and_the_preview_follows(cx: &mut TestAppContext) {
+    let (window, _language, _open) = open_form(cx, "signature-visibility");
+    assert_eq!(
+        preview_of(cx, window),
+        "public String combine(String left, String right)"
+    );
+
+    click(cx, window, "change-signature-visibility");
+    draw(cx, window);
+    assert!(
+        shown(cx, window, "change-signature-visibility-menu"),
+        "the field opens the list of the four values"
+    );
+    for option in [
+        "change-signature-visibility-option-public",
+        "change-signature-visibility-option-protected",
+        "change-signature-visibility-option-package-private",
+        "change-signature-visibility-option-private",
+    ] {
+        assert!(shown(cx, window, option), "{option} is in the list");
+    }
+
+    click(cx, window, "change-signature-visibility-option-private");
+    draw(cx, window);
+    assert!(
+        !shown(cx, window, "change-signature-visibility-menu"),
+        "a choice closes the list"
+    );
+    assert_eq!(
+        preview_of(cx, window),
+        "private String combine(String left, String right)"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn alt_keys_add_move_and_remove_a_parameter_in_the_preview(cx: &mut TestAppContext) {
+    let (window, _language, _open) = open_form(cx, "signature-alt-keys");
+
+    press(cx, window, "alt-insert");
+    draw(cx, window);
+    assert!(
+        shown(cx, window, "change-signature-default-warning"),
+        "a new parameter without a default value is marked"
+    );
+    click(cx, window, "change-signature-type-2");
+    type_text(cx, window, "int");
+    click(cx, window, "change-signature-name-2");
+    type_text(cx, window, "times");
+    assert_eq!(
+        preview_of(cx, window),
+        "public String combine(String left, String right, int times)"
+    );
+
+    press(cx, window, "alt-up");
+    draw(cx, window);
+    assert_eq!(
+        preview_of(cx, window),
+        "public String combine(String left, int times, String right)"
+    );
+
+    press(cx, window, "alt-delete");
+    draw(cx, window);
+    assert_eq!(
+        preview_of(cx, window),
+        "public String combine(String left, String right)"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn refactor_applies_the_chosen_visibility_and_a_new_parameter(cx: &mut TestAppContext) {
+    let (window, _language, open) = open_form(cx, "signature-refactor-changed");
+    let view = editor_of(cx, window, &open);
+
+    click(cx, window, "change-signature-visibility");
+    click(cx, window, "change-signature-visibility-option-private");
+    press(cx, window, "alt-insert");
+    click(cx, window, "change-signature-type-2");
+    type_text(cx, window, "int");
+    click(cx, window, "change-signature-name-2");
+    type_text(cx, window, "times");
+    click(cx, window, "change-signature-default-2");
+    type_text(cx, window, "9");
+    draw(cx, window);
+    assert!(
+        !shown(cx, window, "change-signature-default-warning"),
+        "a value for the call sites clears the warning"
+    );
+    assert_eq!(
+        preview_of(cx, window),
+        "private String combine(String left, String right, int times)"
+    );
+
+    click(cx, window, "change-signature-refactor");
+    cx.run_until_parked();
+    draw(cx, window);
+    let text = crate::window_tests::buffer_of(cx, &view);
+    assert!(
+        text.contains("private String combine(String left, String right, int times)"),
+        "{text}"
+    );
+    assert!(text.contains("combine(\"a\", \"b\", 9)"), "{text}");
 }

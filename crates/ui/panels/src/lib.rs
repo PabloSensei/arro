@@ -25,6 +25,7 @@ mod commit;
 mod compare;
 mod composer;
 mod conflict;
+mod console_follow;
 mod console_input;
 mod console_links;
 mod console_search;
@@ -1146,7 +1147,27 @@ fn connect_project_problems(
                     }
                 }
                 Some(_) => {}
-                None => notified.clear(),
+                None => {
+                    // The import ended well, so the notification of the failure this
+                    // window showed closes itself. One that the user closed or another
+                    // one that replaced it stays as it is.
+                    let text = std::mem::take(&mut notified);
+                    if !text.is_empty() {
+                        let expected = format!("import failed: {text}");
+                        let updated = workspace.update(cx, |workspace, cx| {
+                            let ours =
+                                workspace.last_notification().is_some_and(|(title, shown)| {
+                                    title == "Language Server" && shown == expected
+                                });
+                            if ours {
+                                workspace.close_notification(cx);
+                            }
+                        });
+                        if updated.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
             // The hub reads the workspace for the icons of its rows, so it is updated while
             // the workspace is free: a lease of the workspace here would panic in that read.
@@ -1494,6 +1515,7 @@ fn install(
     .detach();
     let debug_tools = crate::mcp_debug::DebugBridge::new();
     debug.update(cx, |panel, _| panel.set_tool_debug(debug_tools.clone()));
+    debug.update(cx, |panel, _| panel.bind_window(window.window_handle()));
     cx.set_global(debug::ActiveDebug(debug));
 
     let hub = Arc::new(debug::DebugHub::default());
@@ -2217,3 +2239,55 @@ mod window_tests_import_retry;
 
 #[cfg(test)]
 mod window_tests_completion_members;
+
+#[cfg(test)]
+mod window_tests_import_retry_attempt;
+
+#[cfg(test)]
+mod window_tests_intentions_after_import;
+
+#[cfg(test)]
+mod window_tests_rename_in_place_errors;
+
+#[cfg(test)]
+mod window_tests_no_usages;
+
+#[cfg(test)]
+mod window_tests_test_marks_menu;
+
+#[cfg(test)]
+mod window_tests_debug_console_ansi;
+#[cfg(test)]
+mod window_tests_debug_console_follow;
+#[cfg(test)]
+mod window_tests_test_enter;
+
+#[cfg(test)]
+mod window_tests_structure_window;
+
+#[cfg(test)]
+mod window_tests_debug_stop_view;
+
+#[cfg(test)]
+mod window_tests_find_in_files_preview;
+
+#[cfg(test)]
+mod window_tests_surround_list;
+
+#[cfg(test)]
+mod window_tests_usages_rows;
+
+#[cfg(test)]
+mod window_tests_debug_live_shape;
+
+#[cfg(test)]
+mod window_tests_debug_build_front;
+
+#[cfg(test)]
+mod window_tests_debug_frames;
+
+#[cfg(test)]
+mod window_tests_find_action_new;
+
+#[cfg(test)]
+mod window_tests_usages_searching;

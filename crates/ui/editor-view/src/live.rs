@@ -22,17 +22,38 @@ use crate::state::EditorState;
 use crate::view::{EditorView, TemplateSettings};
 
 const SHOWN: usize = 12;
+/// The Surround With list shows every standard template of IDEA and the live templates
+/// that follow them.
+const SURROUND_SHOWN: usize = 16;
+/// The keys the standard Surround With entries answer to, in the order of the list.
+const SURROUND_KEYS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "A"];
 
 /// The list Ctrl+J or Ctrl+Alt+T opened, or the expressions a postfix template can
 /// follow when its type is not enough to choose one.
 pub struct TemplateList {
     pub kind: Kind,
     pub items: Vec<Template>,
+    /// The key left of each item that picks it without Enter.
+    pub keys: Vec<String>,
     pub chosen: usize,
     /// The expressions of a postfix key, longest first, when several fit.
     pub expressions: Vec<Range<usize>>,
     /// The postfix template the expressions belong to.
     pub template: Option<Template>,
+    /// The items go in at the caret and leave the word around it alone.
+    pub at_caret: bool,
+}
+
+impl TemplateList {
+    /// How many items the list shows.
+    fn shown(&self) -> usize {
+        let cap = if self.kind == Kind::Surround {
+            SURROUND_SHOWN
+        } else {
+            SHOWN
+        };
+        self.items.len().min(cap)
+    }
 }
 
 /// What a key did.
@@ -347,12 +368,22 @@ impl LiveTemplates {
                     .map_or("", |word| &line[word])
                     .to_lowercase();
                 let place = context(language, state, caret - prefix.len());
-                let fitting = self.fitting(Kind::Abbreviation, place);
-                let items = fitting
+                let matching: Vec<Template> = self
+                    .fitting(Kind::Abbreviation, place)
                     .filter(|entry| entry.template.key.to_lowercase().starts_with(&prefix))
                     .map(|entry| entry.template)
                     .collect();
-                self.open(Kind::Abbreviation, items);
+                // A word that matches no abbreviation is not a prefix: the list then
+                // offers every template of the place and inserts one at the caret.
+                if matching.is_empty() {
+                    let items = self
+                        .fitting(Kind::Abbreviation, place)
+                        .map(|entry| entry.template)
+                        .collect();
+                    self.open_list(Kind::Abbreviation, items, true);
+                } else {
+                    self.open(Kind::Abbreviation, matching);
+                }
                 Some(None)
             }
             actions::SURROUND_WITH => {
@@ -360,6 +391,8 @@ impl LiveTemplates {
                 let place = context(language, state, head);
                 let items = self
                     .fitting(Kind::Surround, place)
+                    .chain(self.fitting(Kind::SurroundLive, place))
+                    .filter(|entry| entry.template.body.contains("$SELECTION$"))
                     .map(|entry| entry.template)
                     .collect();
                 self.open(Kind::Surround, items);
@@ -483,12 +516,32 @@ impl LiveTemplates {
     }
 
     fn open(&mut self, kind: Kind, items: Vec<Template>) {
+        self.open_list(kind, items, false);
+    }
+
+    fn open_list(&mut self, kind: Kind, items: Vec<Template>, at_caret: bool) {
+        let keys = if kind == Kind::Surround {
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, template)| match template.kind {
+                    Kind::SurroundLive => template.key.to_owned(),
+                    _ => SURROUND_KEYS
+                        .get(index)
+                        .map_or_else(String::new, |key| (*key).to_owned()),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.list = (!items.is_empty()).then_some(TemplateList {
             kind,
             items,
+            keys,
             chosen: 0,
             expressions: Vec::new(),
             template: None,
+            at_caret,
         });
     }
 
@@ -496,9 +549,11 @@ impl LiveTemplates {
         self.list = Some(TemplateList {
             kind: Kind::Postfix,
             items: Vec::new(),
+            keys: Vec::new(),
             chosen: 0,
             expressions,
             template: Some(template),
+            at_caret: false,
         });
     }
 
@@ -562,19 +617,44 @@ impl LiveTemplates {
                 let caret = lone_caret(state)?;
                 let (line, start) = line_before(state, caret);
                 let word = word_before(&line).unwrap_or(line.len()..line.len());
-                let indent = indent_of(&line);
-                let unit = unit_for(indent, state);
-                let site = ExpansionSite {
-                    indent,
-                    unit: &unit,
-                    selection: None,
-                    expression: None,
-                    variables: self.variables(state, caret, cx),
-                };
-                let expansion = expand_fields(&entry.template, &entry.fields, &site);
-                self.insert(state, start + word.start..caret, &expansion)
+                self.expand_abbreviation(state, &entry, start + word.start..caret, caret, cx)
             }
         }
+    }
+
+    /// Inserts an abbreviation at the caret, leaving the word around it as it is.
+    fn apply_at_caret(
+        &mut self,
+        state: &mut EditorState,
+        template: &Template,
+        cx: Option<&App>,
+    ) -> Option<Change> {
+        self.language?;
+        let entry = self.entry(template)?.clone();
+        let caret = lone_caret(state)?;
+        self.expand_abbreviation(state, &entry, caret..caret, caret, cx)
+    }
+
+    fn expand_abbreviation(
+        &mut self,
+        state: &mut EditorState,
+        entry: &ResolvedTemplate,
+        range: Range<usize>,
+        at: usize,
+        cx: Option<&App>,
+    ) -> Option<Change> {
+        let (line, _) = line_before(state, range.start);
+        let indent = indent_of(&line);
+        let unit = unit_for(indent, state);
+        let site = ExpansionSite {
+            indent,
+            unit: &unit,
+            selection: None,
+            expression: None,
+            variables: self.variables(state, at, cx),
+        };
+        let expansion = expand_fields(&entry.template, &entry.fields, &site);
+        self.insert(state, range, &expansion)
     }
 
     /// Keys of the open list and of the fields: arrows, Enter, Tab, Shift+Tab, Escape.
@@ -612,16 +692,36 @@ impl LiveTemplates {
                 }
                 return KeyUse::Used(None);
             }
-            let count = list.items.len().min(SHOWN);
+            let count = list.shown();
             match stroke.key.as_str() {
                 "up" if plain => list.chosen = (list.chosen + count - 1) % count,
                 "down" if plain => list.chosen = (list.chosen + 1) % count,
                 "enter" | "tab" if plain && !stroke.shift => {
                     let template = list.items[list.chosen];
+                    let at_caret = list.at_caret;
+                    self.list = None;
+                    let change = if at_caret {
+                        self.apply_at_caret(state, &template, cx)
+                    } else {
+                        self.apply_app(state, &template, cx)
+                    };
+                    return KeyUse::Used(change);
+                }
+                "escape" => self.list = None,
+                _ if plain && list.kind == Kind::Surround => {
+                    let typed = stroke.key.to_lowercase();
+                    let chosen = list.keys.iter().position(|key| {
+                        let key = key.to_lowercase();
+                        key == typed || (key.len() > 1 && key.starts_with(&typed))
+                    });
+                    let Some(chosen) = chosen else {
+                        self.list = None;
+                        return KeyUse::Unused;
+                    };
+                    let template = list.items[chosen];
                     self.list = None;
                     return KeyUse::Used(self.apply_app(state, &template, cx));
                 }
-                "escape" => self.list = None,
                 _ => {
                     self.list = None;
                     return KeyUse::Unused;
@@ -873,11 +973,16 @@ impl EditorView {
             .min_w(px(280.))
             .py(px(4.));
         if list.expressions.is_empty() {
-            for (index, template) in list.items.iter().take(SHOWN).enumerate() {
+            for (index, template) in list.items.iter().take(list.shown()).enumerate() {
                 let chosen = *template;
-                let row = div()
+                let at_caret = list.at_caret;
+                let key = list.keys.get(index).cloned().unwrap_or_default();
+                let name = template.key;
+                let mut row = div()
                     .id(("template", index))
+                    .debug_selector(move || format!("template-item-{name}"))
                     .flex()
+                    .items_center()
                     .gap(px(12.))
                     .px(px(10.))
                     .py(px(3.))
@@ -887,17 +992,27 @@ impl EditorView {
                         cx.listener(move |this, _, _, cx| {
                             let change = this.state.as_mut().and_then(|state| {
                                 this.live.list = None;
-                                this.live.apply_with(state, &chosen, cx)
+                                if at_caret {
+                                    this.live.apply_at_caret(state, &chosen, Some(cx))
+                                } else {
+                                    this.live.apply_with(state, &chosen, cx)
+                                }
                             });
                             this.changed(change, cx);
                         }),
-                    )
-                    .child(div().text_color(theme.text).child(template.key))
-                    .child(
-                        div()
-                            .text_color(theme.text_secondary)
-                            .child(template.description),
                     );
+                if !key.is_empty() {
+                    row = row.child(div().text_color(theme.text_secondary).child(key));
+                }
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .text_color(theme.text)
+                        .child(template.description),
+                );
+                if list.kind != Kind::Surround {
+                    row = row.child(div().text_color(theme.text_secondary).child(template.key));
+                }
                 shown = shown.child(row);
             }
         } else {

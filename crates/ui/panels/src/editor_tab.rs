@@ -1184,13 +1184,19 @@ fn open(
                 })
                 .ok();
         }
-        EditorEvent::Usages(usages) => {
+        EditorEvent::UsagesSearchStarted {
+            search,
+            name,
+            in_file,
+        } => {
             let Some(hub) = cx.try_global::<ActiveUsages>() else {
                 return;
             };
             let hub = hub.0.clone();
-            let usages = usages.clone();
-            hub.update(cx, |hub, cx| hub.set_usages(usages, cx));
+            let (search, name, in_file) = (*search, name.clone(), *in_file);
+            hub.update(cx, |hub, cx| {
+                hub.start_search(search, name, in_file, cx)
+            });
             let workspace = reports.clone();
             handle
                 .update(cx, |_, window, cx| {
@@ -1200,55 +1206,44 @@ fn open(
                 })
                 .ok();
         }
-        EditorEvent::UsagesInFile(usages) => {
+        EditorEvent::Usages { search, usages } => {
             let Some(hub) = cx.try_global::<ActiveUsages>() else {
                 return;
             };
             let hub = hub.0.clone();
-            let usages = usages.clone();
-            hub.update(cx, |hub, cx| hub.set_usages_in_file(usages, cx));
-            let workspace = reports.clone();
-            handle
-                .update(cx, |_, window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| workspace.show_tool(USAGES_TOOL, window, cx))
-                        .ok();
-                })
-                .ok();
+            let (search, usages) = (*search, usages.clone());
+            hub.update(cx, |hub, cx| hub.set_usages_at(search, usages, cx));
         }
-        EditorEvent::UsagesDetailed(usages) => {
+        EditorEvent::UsagesInFile { search, usages } => {
             let Some(hub) = cx.try_global::<ActiveUsages>() else {
                 return;
             };
             let hub = hub.0.clone();
-            let usages = usages.clone();
-            hub.update(cx, |hub, cx| hub.set_detailed_usages(usages, cx));
-            let workspace = reports.clone();
-            handle
-                .update(cx, |_, window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| workspace.show_tool(USAGES_TOOL, window, cx))
-                        .ok();
-                })
-                .ok();
+            let (search, usages) = (*search, usages.clone());
+            hub.update(cx, |hub, cx| {
+                hub.set_usages_in_file_at(search, usages, cx)
+            });
         }
-        EditorEvent::UsagesDetailedInFile(usages) => {
+        EditorEvent::UsagesDetailed { search, usages } => {
             let Some(hub) = cx.try_global::<ActiveUsages>() else {
                 return;
             };
             let hub = hub.0.clone();
-            let usages = usages.clone();
-            hub.update(cx, |hub, cx| hub.set_detailed_usages_in_file(usages, cx));
-            let workspace = reports.clone();
-            handle
-                .update(cx, |_, window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| workspace.show_tool(USAGES_TOOL, window, cx))
-                        .ok();
-                })
-                .ok();
+            let (search, usages) = (*search, usages.clone());
+            hub.update(cx, |hub, cx| hub.set_detailed_usages(search, usages, cx));
+        }
+        EditorEvent::UsagesDetailedInFile { search, usages } => {
+            let Some(hub) = cx.try_global::<ActiveUsages>() else {
+                return;
+            };
+            let hub = hub.0.clone();
+            let (search, usages) = (*search, usages.clone());
+            hub.update(cx, |hub, cx| {
+                hub.set_detailed_usages_in_file(search, usages, cx)
+            });
         }
         EditorEvent::UsagesWaiting {
+            search,
             name,
             in_file,
             cancel,
@@ -1257,8 +1252,11 @@ fn open(
                 return;
             };
             let hub = hub.0.clone();
-            let (name, in_file, cancel) = (name.clone(), *in_file, cancel.clone());
-            hub.update(cx, |hub, cx| hub.wait_for_search(name, in_file, cancel, cx));
+            let (search, name, in_file, cancel) =
+                (*search, name.clone(), *in_file, cancel.clone());
+            hub.update(cx, |hub, cx| {
+                hub.wait_for_search(search, name, in_file, cancel, cx)
+            });
             let workspace = reports.clone();
             handle
                 .update(cx, |_, window, cx| {

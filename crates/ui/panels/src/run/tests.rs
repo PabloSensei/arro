@@ -181,6 +181,18 @@ impl TestView {
         Some((node.node.suite.clone()?, node.node.case.clone()))
     }
 
+    /// The row of the first test as the rows show them, for Enter without a selection.
+    fn first_test_id(&self) -> Option<String> {
+        self.rows()
+            .into_iter()
+            .find(|row| {
+                self.tree
+                    .get(&row.id)
+                    .is_some_and(|node| node.node.case.is_some())
+            })
+            .map(|row| row.id)
+    }
+
     /// The name, the message, the stack and the file of the failure of a test, for the
     /// message the window sends to the agent. `None` when the test did not fail.
     pub fn failure_for_ai(
@@ -416,6 +428,14 @@ impl RunPanel {
     /// Whether the build tool of the project runs tests at all.
     pub fn can_test(&self) -> bool {
         self.test_provider.is_some()
+    }
+
+    /// Whether the test provider collects coverage, so the menu of a test offers Run with
+    /// Coverage.
+    pub fn supports_test_coverage(&self) -> bool {
+        self.test_provider
+            .as_ref()
+            .is_some_and(|provider| provider.supports_coverage())
     }
 
     /// Finds the sites of tests in a source, for the marks and for Run at caret.
@@ -895,6 +915,19 @@ impl RunPanel {
         true
     }
 
+    /// Enter opens the selected test. With no row selected it selects the first test of the
+    /// tree and opens that one; a tree without a test opens nothing.
+    fn open_test_on_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tests.selected.is_none() {
+            let Some(id) = self.tests.first_test_id() else {
+                return;
+            };
+            let files = self.file_list(cx);
+            self.tests.select(&id, &files);
+        }
+        self.open_selected_test(window, cx);
+    }
+
     /// Opens the source of the test selected in the tree, as F4 does in IDEA.
     pub fn open_selected_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((suite, case)) = self.tests.selected_test() else {
@@ -979,7 +1012,11 @@ impl RunPanel {
                 cx.stop_propagation();
                 cx.notify();
             }
-            "enter" | "f4" => {
+            "enter" => {
+                cx.stop_propagation();
+                self.open_test_on_enter(window, cx);
+            }
+            "f4" => {
                 cx.stop_propagation();
                 self.open_selected_test(window, cx);
             }

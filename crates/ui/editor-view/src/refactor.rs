@@ -615,15 +615,16 @@ impl EditorView {
         self.usages = (!ranges.is_empty()).then_some(ranges);
     }
 
-    /// How often a search that waits for the language server asks whether it is ready, in
-    /// milliseconds.
-    const WAIT_TICK_MS: u64 = 200;
+    /// How often a search or a list that waits for the language server asks whether it is
+    /// ready, in milliseconds.
+    pub(crate) const WAIT_TICK_MS: u64 = 200;
 
     /// Alt+F7 or Ctrl+F7 while the server imports. The Usages window opens at once with the
     /// waiting line, and the search runs by itself when the server is ready, at the caret
     /// it was asked at. Escape, a closed tab or a hidden window cancel the wait.
     fn wait_for_usages(
         &mut self,
+        search: u64,
         name: String,
         in_file: bool,
         caret: usize,
@@ -631,6 +632,7 @@ impl EditorView {
     ) {
         let cancel = ::base::Cancel::new();
         cx.emit(EditorEvent::UsagesWaiting {
+            search,
             name,
             in_file,
             cancel: cancel.clone(),
@@ -651,7 +653,7 @@ impl EditorView {
             }
             this.update(cx, |this, cx| {
                 if !cancel.is_cancelled() {
-                    this.usage_search_at(caret, false, in_file, true, cx);
+                    this.usage_search_at(caret, false, in_file, true, search, cx);
                 }
             })
             .ok();
@@ -661,12 +663,30 @@ impl EditorView {
 
     /// The end of a search that waited for the server, when the server then gives no
     /// answer: the Usages window shows no uses, so its waiting line does not stay.
-    fn end_waiting_search(&mut self, in_file: bool, detailed: bool, cx: &mut Context<Self>) {
+    fn end_waiting_search(
+        &mut self,
+        search: u64,
+        in_file: bool,
+        detailed: bool,
+        cx: &mut Context<Self>,
+    ) {
         cx.emit(match (detailed, in_file) {
-            (true, true) => EditorEvent::UsagesDetailedInFile(Vec::new()),
-            (true, false) => EditorEvent::UsagesDetailed(Vec::new()),
-            (false, true) => EditorEvent::UsagesInFile(Vec::new()),
-            (false, false) => EditorEvent::Usages(Vec::new()),
+            (true, true) => EditorEvent::UsagesDetailedInFile {
+                search,
+                usages: Vec::new(),
+            },
+            (true, false) => EditorEvent::UsagesDetailed {
+                search,
+                usages: Vec::new(),
+            },
+            (false, true) => EditorEvent::UsagesInFile {
+                search,
+                usages: Vec::new(),
+            },
+            (false, false) => EditorEvent::Usages {
+                search,
+                usages: Vec::new(),
+            },
         });
     }
 
@@ -683,7 +703,8 @@ impl EditorView {
         let Some((_, caret)) = self.spot() else {
             return;
         };
-        self.usage_search_at(caret, popup, in_file, false, cx);
+        let search = crate::next_usages_search();
+        self.usage_search_at(caret, popup, in_file, false, search, cx);
     }
 
     /// The search of [`EditorView::usage_search`] for the caret at `caret`. A search that
@@ -695,6 +716,7 @@ impl EditorView {
         popup: bool,
         in_file: bool,
         resumed: bool,
+        search: u64,
         cx: &mut Context<Self>,
     ) {
         let Some(len) = self.state.as_ref().map(|state| state.store().len()) else {
@@ -711,7 +733,7 @@ impl EditorView {
         let searches = support.usages().is_some() || support.references().is_some();
         if searches && !self.server_ready() {
             if !popup {
-                return self.wait_for_usages(name, in_file, caret, cx);
+                return self.wait_for_usages(search, name, in_file, caret, cx);
             }
             self.importing_note(caret, cx);
         }
@@ -722,13 +744,21 @@ impl EditorView {
                 let replies = ask(provider, spot);
                 let support = support.clone();
                 let here = in_file.then(|| self.path.clone());
+                // A search that the window can show opens it before the answer comes.
+                if !resumed {
+                    cx.emit(EditorEvent::UsagesSearchStarted {
+                        search,
+                        name: name.clone(),
+                        in_file,
+                    });
+                }
                 cx.spawn(async move |this, cx| {
                     let answer = first(replies).await;
                     this.update(cx, |this, cx| match answer {
                         Some((_, Confidence::Unknown)) => {
                             this.show_note(caret, NO_ANSWER, cx);
                             if resumed {
-                                this.end_waiting_search(in_file, true, cx);
+                                this.end_waiting_search(search, in_file, true, cx);
                             }
                         }
                         Some((mut entries, _)) => {
@@ -737,14 +767,14 @@ impl EditorView {
                             }
                             let usages = detailed_usages_of(&name, entries, &*support);
                             cx.emit(if here.is_some() {
-                                EditorEvent::UsagesDetailedInFile(usages)
+                                EditorEvent::UsagesDetailedInFile { search, usages }
                             } else {
-                                EditorEvent::UsagesDetailed(usages)
+                                EditorEvent::UsagesDetailed { search, usages }
                             });
                         }
                         None => {
                             if resumed {
-                                this.end_waiting_search(in_file, true, cx);
+                                this.end_waiting_search(search, in_file, true, cx);
                             }
                         }
                     })
@@ -758,13 +788,20 @@ impl EditorView {
             };
             let replies = ask(provider, spot);
             let here = in_file.then(|| self.path.clone());
+            if !resumed {
+                cx.emit(EditorEvent::UsagesSearchStarted {
+                    search,
+                    name: name.clone(),
+                    in_file,
+                });
+            }
             cx.spawn(async move |this, cx| {
                 let answer = first(replies).await;
                 this.update(cx, |this, cx| match answer {
                     Some((_, Confidence::Unknown)) => {
                         this.show_note(caret, NO_ANSWER, cx);
                         if resumed {
-                            this.end_waiting_search(in_file, false, cx);
+                            this.end_waiting_search(search, in_file, false, cx);
                         }
                     }
                     Some((mut spans, _)) => {
@@ -774,14 +811,14 @@ impl EditorView {
                         this.set_usage_ranges(&spans);
                         let usages = usages_of(&name, spans);
                         cx.emit(if here.is_some() {
-                            EditorEvent::UsagesInFile(usages)
+                            EditorEvent::UsagesInFile { search, usages }
                         } else {
-                            EditorEvent::Usages(usages)
+                            EditorEvent::Usages { search, usages }
                         });
                     }
                     None => {
                         if resumed {
-                            this.end_waiting_search(in_file, false, cx);
+                            this.end_waiting_search(search, in_file, false, cx);
                         }
                     }
                 })

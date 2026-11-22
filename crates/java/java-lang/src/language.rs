@@ -213,6 +213,12 @@ impl lang_api::EndpointProvider for JavaProject {
     }
 }
 
+impl lang_api::ImplicitUseProvider for JavaProject {
+    fn implicit_use_spans(&self, text: &str) -> Vec<std::ops::Range<u32>> {
+        java_syntax::implicit_use_spans(text)
+    }
+}
+
 impl LanguageSupport for JavaProject {
     fn id(&self) -> LanguageId {
         LANGUAGE_ID
@@ -376,6 +382,10 @@ impl LanguageSupport for JavaProject {
     }
 
     fn endpoints(&self) -> Option<&dyn lang_api::EndpointProvider> {
+        Some(self)
+    }
+
+    fn implicit_uses(&self) -> Option<&dyn lang_api::ImplicitUseProvider> {
         Some(self)
     }
 

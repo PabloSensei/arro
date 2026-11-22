@@ -49,8 +49,9 @@ pub struct ImportFailure {
     /// The tool that failed, when the report names it.
     pub tool: Option<BuildTool>,
     /// One more import of the same project may clear this failure without the user
-    /// seeing it. Set for the first failure of a server session that names an
-    /// initialization script the server asks for before it unpacks it.
+    /// seeing it. Set for every refusal of an import attempt that names an
+    /// initialization script the server asks for before it unpacks it, as long as the
+    /// repeat import has not begun. A refusal after that begin is a real error.
     pub retry: bool,
 }
 
@@ -170,19 +171,76 @@ fn tool_of(message: &str, file: &Path) -> Option<BuildTool> {
     None
 }
 
+/// The header of the report the server publishes when a build of the workspace left
+/// errors. Its entries follow as `message:` lines, the refusal of the build tool first.
+const WORKSPACE_BUILD: &str = "Error occured while building workspace";
+
 /// Reports that a build tool could not import the project. A report of another kind,
-/// such as the stack trace of a failed request, is not an import failure.
+/// such as the stack trace of a failed request, is not an import failure. The report of
+/// a build of the workspace is read apart: it names the refusal of the build tool and
+/// then every source of the project that does not compile, and only the refusal is an
+/// import failure.
 fn import_report(message: &str) -> bool {
     [
         "JavaHomeException",
         "; resource:",
         "Could not fetch model",
-        "Error occured while building workspace",
         "failed due to an error connecting to the",
         "failed due to an error in the referenced",
     ]
     .iter()
     .any(|marker| message.contains(marker))
+}
+
+/// The entries of a build report of the workspace. The server puts the refusal of the
+/// build tool first and then one line for every source that does not compile.
+fn build_report(message: &str) -> Option<Vec<&str>> {
+    let body = message.split_once(WORKSPACE_BUILD)?.1;
+    let mut entries = Vec::new();
+    let mut rest = body;
+    while let Some((_, after)) = rest.split_once(" message: ") {
+        let end = after.find("\n message: ").unwrap_or(after.len());
+        entries.push(after[..end].trim_end());
+        rest = &after[end..];
+    }
+    (!entries.is_empty()).then_some(entries)
+}
+
+/// A source of the project that does not compile names its line and its file in fields.
+/// A build script names them the same way and is still the failure of the import.
+fn source_error(entry: &str) -> bool {
+    entry.contains("; line: ") && marker_file(entry).is_none()
+}
+
+/// The text of a report entry without the fields the server appends to it.
+fn cause_body(entry: &str) -> &str {
+    entry.split_once("; code: ").map_or(entry, |(body, _)| body)
+}
+
+/// An import failure whose cause is `cause`; `text` is the whole text of the report.
+fn failure_of(cause: &str, text: &str) -> ImportFailure {
+    let (file, line) = build_file(cause)
+        .or_else(|| marker_file(cause))
+        .map(|(file, line)| (file, line.saturating_sub(1)))
+        .unwrap_or_default();
+    let jdk = java_home_problem(cause);
+    let summary = match &jdk {
+        Some(home) => format!(
+            "JDK at {} was not removed completely: {} is missing",
+            home.display(),
+            home.join("bin").join(executable("java")).display()
+        ),
+        None => short(cause),
+    };
+    ImportFailure {
+        tool: tool_of(cause, &file),
+        file,
+        line,
+        summary,
+        message: text.to_owned(),
+        jdk,
+        retry: false,
+    }
 }
 
 /// An import failure from `window/logMessage` or `window/showMessage`, where the server
@@ -191,31 +249,15 @@ fn import_report(message: &str) -> bool {
 /// it in the exception when it names one at all. A report about the JDK of the build tool
 /// names no script: the summary then names the JDK that is gone.
 fn from_log(message: &str) -> Option<ImportFailure> {
-    if !import_report(message) {
-        return None;
+    // A build of the workspace that left sources without a type lists the refusal of the
+    // import first and then one line per source. The source errors are diagnostics of
+    // the project, which the editor shows like any other, so only the first entry that
+    // names no source is the failure of the import.
+    if let Some(entries) = build_report(message) {
+        let cause = entries.iter().find(|entry| !source_error(entry))?;
+        return Some(failure_of(cause, cause_body(cause)));
     }
-    let (file, line) = build_file(message)
-        .or_else(|| marker_file(message))
-        .map(|(file, line)| (file, line.saturating_sub(1)))
-        .unwrap_or_default();
-    let jdk = java_home_problem(message);
-    let summary = match &jdk {
-        Some(home) => format!(
-            "JDK at {} was not removed completely: {} is missing",
-            home.display(),
-            home.join("bin").join(executable("java")).display()
-        ),
-        None => short(message),
-    };
-    Some(ImportFailure {
-        tool: tool_of(message, &file),
-        file,
-        line,
-        summary,
-        message: message.to_owned(),
-        jdk,
-        retry: false,
-    })
+    import_report(message).then(|| failure_of(message, message))
 }
 
 /// The progress titles of a Gradle import. A new import makes the old failure say
@@ -260,16 +302,22 @@ pub(crate) struct ImportState {
     /// The tokens of the Gradle imports whose progress began and has not ended.
     running: Mutex<HashSet<String>>,
     running_now: watch::Sender<bool>,
+    /// The Gradle imports that began in this server session, in order. A repeat import
+    /// raises it, so a reader tells the refusals of the first attempt from the refusals
+    /// of the repeat.
+    starts: watch::Sender<u64>,
 }
 
 impl ImportState {
     pub(crate) fn new() -> Self {
         let (failures, _) = watch::channel(None);
         let (running_now, _) = watch::channel(false);
+        let (starts, _) = watch::channel(0);
         Self {
             failures,
             running: Mutex::new(HashSet::new()),
             running_now,
+            starts,
         }
     }
 
@@ -281,6 +329,12 @@ impl ImportState {
     /// on this line, the way the first start of the project does.
     pub(crate) fn watch_running(&self) -> watch::Receiver<bool> {
         self.running_now.subscribe()
+    }
+
+    /// How many Gradle imports have begun in this server session. A refusal that comes
+    /// after a begin newer than the one the repeat was asked for belongs to the repeat.
+    pub(crate) fn watch_starts(&self) -> watch::Receiver<u64> {
+        self.starts.subscribe()
     }
 
     /// A new server imports the project again, so an old failure says nothing.
@@ -379,6 +433,7 @@ impl ImportState {
                 if !import_started(params) {
                     return;
                 }
+                self.starts.send_modify(|starts| *starts += 1);
                 self.set_running(&token, true);
                 if self.failures.borrow().is_some() {
                     self.failures.send_replace(None);
@@ -778,6 +833,84 @@ mod tests {
     }
 
     #[test]
+    fn the_build_report_of_the_workspace_names_the_refusal_not_a_source_error() {
+        // The session of 2026-11-21 11:54 of `petclinic-check`: the Gradle import refused
+        // the JVM of the project, and the build that followed listed every source the
+        // missing class path left without a type. The last line of the report was a test
+        // source, which used to become the summary shown as the failed import.
+        let failures = ImportState::new();
+        let message = "Error occured while building workspace. Details: \r\n \
+             message: Could not run phased build action using connection to Gradle distribution \
+             'https://services.gradle.org/distributions/gradle-9.5.1-bin.zip'.\r\n\
+             Gradle requires JVM 17 or later to run. Your build is currently configured to use \
+             JVM 8.; code: 0; resource: E:/java-ide-live/petclinic-check;\r\n \
+             message: The import org.junit cannot be resolved; code: 268435846; resource: \
+             E:/java-ide-live/petclinic-check/src/test/java/org/springframework/samples/petclinic/vet/VetTests.java; \
+             line: 18\r\n \
+             message: Test cannot be resolved to a type; code: 16777218; resource: \
+             E:/java-ide-live/petclinic-check/src/test/java/org/springframework/samples/petclinic/vet/VetTests.java; \
+             line: 28";
+        observe(
+            "window/logMessage",
+            &json!({"type": 1, "message": message}),
+            &failures,
+        );
+        let failure = failures.failures.borrow().clone().unwrap();
+        assert_eq!(failure.tool, Some(super::BuildTool::Gradle));
+        assert_eq!(
+            failure.summary,
+            "Gradle requires JVM 17 or later to run. Your build is currently configured to use JVM 8."
+        );
+        assert!(
+            !failure.summary.contains("Test cannot be resolved"),
+            "a source error is a diagnostic, not the cause of the failure: {}",
+            failure.summary
+        );
+        assert!(
+            !failure.message.contains("; code:"),
+            "the raw fields of the report are not the text of the failure: {}",
+            failure.message
+        );
+        assert!(failure.file.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn a_build_report_of_sources_alone_is_not_an_import_failure() {
+        let failures = ImportState::new();
+        let message = "Error occured while building workspace. Details: \r\n \
+             message: The import org.junit cannot be resolved; code: 268435846; \
+             resource: E:/p/src/test/java/demo/AppTests.java; line: 18\r\n \
+             message: Test cannot be resolved to a type; code: 16777218; \
+             resource: E:/p/src/test/java/demo/AppTests.java; line: 28";
+        observe(
+            "window/showMessage",
+            &json!({"type": 1, "message": message}),
+            &failures,
+        );
+        assert!(
+            failures.failures.borrow().is_none(),
+            "the source errors reach Problems as diagnostics"
+        );
+    }
+
+    #[test]
+    fn a_build_report_of_a_build_script_is_an_import_failure() {
+        let failures = ImportState::new();
+        let message = "Error occured while building workspace. Details: \r\n \
+             message: Could not configure the build.; code: 0; \
+             resource: E:/p/build.gradle; line: 24";
+        observe(
+            "window/logMessage",
+            &json!({"type": 1, "message": message}),
+            &failures,
+        );
+        let failure = failures.failures.borrow().clone().unwrap();
+        assert!(failure.file.ends_with("build.gradle"));
+        assert_eq!(failure.line, 23);
+        assert_eq!(failure.summary, "Could not configure the build.");
+    }
+
+    #[test]
     fn a_gradle_import_runs_from_its_begin_to_its_end() {
         let failures = ImportState::new();
         let running = failures.watch_running();
@@ -804,6 +937,51 @@ mod tests {
             &failures,
         );
         assert!(!*running.borrow(), "the import ended");
+    }
+
+    #[test]
+    fn every_gradle_import_begin_is_counted() {
+        let failures = ImportState::new();
+        let starts = failures.watch_starts();
+        assert_eq!(*starts.borrow(), 0);
+
+        observe(
+            "$/progress",
+            &json!({"token": "1", "value": {"kind": "begin", "title": "Building"}}),
+            &failures,
+        );
+        assert_eq!(
+            *starts.borrow(),
+            0,
+            "another task of the server is no import"
+        );
+
+        observe(
+            "$/progress",
+            &json!({
+                "token": "1",
+                "value": {"kind": "begin", "title": "Importing Gradle project(s)"}
+            }),
+            &failures,
+        );
+        assert_eq!(*starts.borrow(), 1, "the first import began");
+
+        observe(
+            "$/progress",
+            &json!({
+                "token": "2",
+                "value": {"kind": "begin", "title": "Synchronize Gradle projects with workspace"}
+            }),
+            &failures,
+        );
+        assert_eq!(*starts.borrow(), 2, "the repeat import began");
+
+        observe(
+            "$/progress",
+            &json!({"token": "2", "value": {"kind": "end"}}),
+            &failures,
+        );
+        assert_eq!(*starts.borrow(), 2, "the end of an import counts nothing");
     }
 
     #[test]

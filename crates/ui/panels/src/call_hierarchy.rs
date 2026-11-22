@@ -201,6 +201,15 @@ impl CallHierarchyPanel {
             .collect()
     }
 
+    /// Whether the first root is open, for the tests.
+    #[cfg(test)]
+    pub(crate) fn root_expanded(&self) -> bool {
+        self.roots
+            .first()
+            .and_then(|index| self.nodes.get(*index))
+            .is_some_and(|node| node.expanded)
+    }
+
     /// Ctrl+Alt+H: the hierarchy of the function at `spot`.
     pub fn start(&mut self, spot: DocumentSpot, cx: &mut Context<Self>) {
         self.support = cx
@@ -254,7 +263,9 @@ impl CallHierarchyPanel {
                     .map(|item| Node {
                         item,
                         depth: 0,
-                        expanded: false,
+                        // The root is open at once, as IDEA shows it: the callers appear
+                        // as soon as the language answers.
+                        expanded: true,
                         loading: false,
                         loaded: false,
                         children: Vec::new(),
@@ -267,7 +278,7 @@ impl CallHierarchyPanel {
                 }
                 cx.notify();
                 if !this.nodes.is_empty() {
-                    this.expand(0, cx);
+                    this.load_children(0, cx);
                 }
             })
             .ok();
@@ -275,33 +286,38 @@ impl CallHierarchyPanel {
         .detach();
     }
 
-    fn expand(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(node) = self.nodes.get_mut(index) else {
+    /// Asks the language for the children of a node and shows them, keeping the node open.
+    fn load_children(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(node) = self.nodes.get(index) else {
             return;
         };
-        if node.expanded {
-            node.expanded = false;
+        if node.loading {
+            return;
+        }
+        if node.loaded {
+            // The answer already came: opening the node again shows what it has.
+            if let Some(node) = self.nodes.get_mut(index) {
+                node.expanded = true;
+            }
             cx.notify();
             return;
         }
-        if !node.children.is_empty() {
-            node.expanded = true;
-            cx.notify();
-            return;
-        }
-        let (Some(support), Some(provider)) = (
-            self.support.clone(),
-            self.support
-                .as_ref()
-                .and_then(|support| support.call_hierarchy()),
-        ) else {
+        let Some(support) = self.support.clone() else {
             return;
         };
-        let _ = support;
-        let item = node.item.clone();
-        node.loading = true;
+        let Some(provider) = support.call_hierarchy() else {
+            return;
+        };
         let serial = self.serial;
         let direction = self.direction;
+        let item = {
+            let Some(node) = self.nodes.get_mut(index) else {
+                return;
+            };
+            node.loading = true;
+            node.expanded = true;
+            node.item.clone()
+        };
         cx.notify();
         let mut replies = ask(provider, CallHierarchyQuery::Calls { item, direction });
         cx.spawn(async move |this, cx| {
@@ -312,13 +328,13 @@ impl CallHierarchyPanel {
                 if this.serial != serial {
                     return;
                 }
-                let Some(calls) = calls else {
+                let Some(node) = this.nodes.get_mut(index) else {
                     return;
                 };
-                if let Some(node) = this.nodes.get_mut(index) {
-                    node.loading = false;
-                    node.loaded = true;
-                    node.expanded = true;
+                node.loading = false;
+                node.loaded = true;
+                node.expanded = true;
+                if let Some(calls) = calls {
                     let depth = node.depth + 1;
                     let start = this.nodes.len();
                     for item in calls {
@@ -341,6 +357,23 @@ impl CallHierarchyPanel {
             .ok();
         })
         .detach();
+    }
+
+    fn expand(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(node) = self.nodes.get_mut(index) else {
+            return;
+        };
+        if node.expanded {
+            node.expanded = false;
+            cx.notify();
+            return;
+        }
+        if !node.children.is_empty() {
+            node.expanded = true;
+            cx.notify();
+            return;
+        }
+        self.load_children(index, cx);
     }
 
     /// The node indices on screen, depth first, and their depths.

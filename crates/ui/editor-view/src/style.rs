@@ -33,6 +33,8 @@ pub struct EditorStyle {
     pub semantic_annotation: Hsla,
     pub caret: Hsla,
     pub caret_row: Hsla,
+    /// The line the stopped program is on: the tint of its row and the arrow in the gutter.
+    pub execution_line: Hsla,
     pub selection: Hsla,
     pub line_number: Hsla,
     pub line_number_current: Hsla,
@@ -109,6 +111,7 @@ impl EditorStyle {
             semantic_annotation: theme.semantic_annotation,
             caret: theme.caret,
             caret_row: theme.caret_row,
+            execution_line: theme.execution_line,
             selection: theme.selection,
             line_number: theme.line_number,
             line_number_current: theme.line_number_current,

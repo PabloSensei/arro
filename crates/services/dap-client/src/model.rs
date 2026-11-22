@@ -529,12 +529,13 @@ impl Debugger {
 }
 
 /// Reads a path sent in a `source`, `None` when the adapter sent an empty or unusable one.
+/// A `file:` URI is read as the path it names; any other text stays as the adapter wrote it.
 pub fn source_path(source: Option<&Value>) -> Option<PathBuf> {
     let path = source?.get("path")?.as_str()?.trim();
     if path.is_empty() || path == "<unknown>" {
         return None;
     }
-    Some(PathBuf::from(path))
+    Some(platform::path_from_uri(path).unwrap_or_else(|| PathBuf::from(path)))
 }
 
 /// A line from a DAP body, zero when it is absent or not a number.
@@ -645,6 +646,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_file_uri_of_a_source_is_read_as_the_path_it_names() {
+        let uri = "file:///c:/work/a%20b/Main.txt";
+        let read = source_path(Some(&json!({"path": uri})));
+        assert_eq!(read, platform::path_from_uri(uri));
+        assert!(
+            read.is_some_and(|path| !path.to_string_lossy().starts_with("file:")),
+            "the URI is read as a path"
+        );
+        // Plain paths and the names of other schemes stay exactly as the adapter wrote them.
+        assert_eq!(
+            source_path(Some(&json!({"path": "C:\\work\\Main.txt"}))),
+            Some(PathBuf::from("C:\\work\\Main.txt"))
+        );
+        assert_eq!(
+            source_path(Some(&json!({"path": "jdt://contents/a.jar/X.class"}))),
+            Some(PathBuf::from("jdt://contents/a.jar/X.class"))
+        );
+    }
 
     #[test]
     fn a_missing_source_and_a_zero_line_are_not_errors() {

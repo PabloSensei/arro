@@ -161,6 +161,8 @@ pub struct DockerCli {
     program: PathBuf,
     /// `None` uses the current context of the CLI.
     context: Option<String>,
+    /// How long one call may take before the CLI is ended, not merely abandoned.
+    timeout: Duration,
     /// Calls of the CLI, shared with the clones the watch holds, for the tests that count
     /// what an idle window does.
     calls: Arc<AtomicU64>,
@@ -171,6 +173,7 @@ impl DockerCli {
         Self {
             program: program.into(),
             context: None,
+            timeout: CALL_TIMEOUT,
             calls: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -190,6 +193,12 @@ impl DockerCli {
 
     pub fn with_context(mut self, context: Option<String>) -> Self {
         self.context = context;
+        self
+    }
+
+    /// The timeout of one call, for a test that must not wait for the default one.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -226,9 +235,12 @@ impl DockerCli {
         let spec = self.command().args(args);
         let cancel = Cancel::new();
         let timer = cancel.clone();
+        let timeout = self.timeout;
         let (done, finished) = std::sync::mpsc::channel::<()>();
         thread::spawn(move || {
-            if finished.recv_timeout(CALL_TIMEOUT).is_err() {
+            // Cancellation ends the child as well: `capture` shuts it down, so a CLI that
+            // hangs leaves no process behind for the next build to trip over.
+            if finished.recv_timeout(timeout).is_err() {
                 timer.cancel();
             }
         });
@@ -238,7 +250,7 @@ impl DockerCli {
             Ok(output) if output.status.success() => Ok(output.stdout),
             Ok(output) => Err(first_line(&output.stderr, &output.stdout)),
             Err(CaptureError::Cancelled) => Err(format!(
-                "docker {} did not answer in {CALL_TIMEOUT:?}",
+                "docker {} did not answer in {timeout:?}",
                 args.join(" ")
             )),
             Err(CaptureError::Io(error)) => Err(error.to_string()),

@@ -86,7 +86,7 @@ pub use process::{
 pub use process_stats::{
     ProcessEntry, is_console_process, process_created, process_table, terminate_process,
 };
-pub use process_stats::{ProcessMemory, label_process, process_tree};
+pub use process_stats::{ProcessMemory, label_process, parent_process_id, process_tree};
 pub use process_tree::ProcessTree;
 pub use resources::{resources_dir, resources_dir_of};
 pub use shell::{NO_BROWSER_ENV, open_url, recorded_urls};

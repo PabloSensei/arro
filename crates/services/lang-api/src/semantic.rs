@@ -393,8 +393,8 @@ pub struct ProjectProblem {
     /// Settings page, when the language names one.
     pub tool: Option<usize>,
     /// Another import of the project alone may clear this problem, and the window runs
-    /// it once instead of showing the problem. The language sets this only for the
-    /// first such problem of a server session.
+    /// it once instead of showing the problem. The language sets this for the failures
+    /// of an import attempt that arrive before the repeat import begins.
     pub retry: bool,
 }
 

@@ -279,7 +279,8 @@ pub struct Jdtls {
     config: JdtlsConfig,
     root: CanonPath,
     launcher_jar: PathBuf,
-    /// The release this state folder belongs to; another one clears the OSGi cache.
+    /// The release this state folder belongs to; another one clears the OSGi cache and
+    /// the model of the workspace.
     installation: install::InstallMark,
     autobuild: Autobuild,
     heap_mb: AtomicU32,
@@ -557,6 +558,13 @@ impl Jdtls {
     /// while a retry is in flight.
     pub fn watch_importing(&self) -> watch::Receiver<bool> {
         self.imports.watch_running()
+    }
+
+    /// How many Gradle imports have begun in this server session. A repeat import
+    /// raises it, so a reader tells a refusal of the first attempt from one of the
+    /// repeat.
+    pub fn watch_import_starts(&self) -> watch::Receiver<u64> {
+        self.imports.watch_starts()
     }
 
     fn section(&self, section: &str) -> Value {

@@ -730,7 +730,7 @@ impl Default for Settings {
             usage_group_module: false,
             usage_group_directory: false,
             usage_group_directory_structure: false,
-            usage_group_file_structure: false,
+            usage_group_file_structure: true,
             usage_flatten_modules: false,
             usage_show_read: true,
             usage_show_write: true,

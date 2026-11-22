@@ -85,12 +85,39 @@ impl Drop for Instance {
     }
 }
 
+/// Whether a program answers on the endpoint. A connection alone does not prove that a
+/// program waits there: on some systems the socket file of a listener that is gone still
+/// takes a connection. Only an answer does, and the start asks with a request that every
+/// version of the program takes.
+pub(super) fn answers(endpoint: &Path) -> bool {
+    let Ok(stream) = UnixStream::connect(endpoint) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(WAIT)).is_err() || stream.set_write_timeout(Some(WAIT)).is_err()
+    {
+        // The limits cannot be set: do not take the endpoint of a program that may wait.
+        return true;
+    }
+    if write_request(&mut &stream, &Request::Focus).is_err() {
+        return false;
+    }
+    let mut reader = BufReader::new(&stream);
+    match read_ack(&mut reader) {
+        Ok(()) => true,
+        // A program that did not answer in time may still be busy: its endpoint stays.
+        Err(error) => matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+    }
+}
+
 fn bind(endpoint: &Path) -> io::Result<UnixListener> {
     match UnixListener::bind(endpoint) {
         Ok(listener) => Ok(listener),
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
             // A live program answers. Then the endpoint is not a socket of a dead one.
-            if UnixStream::connect(endpoint).is_ok() {
+            if answers(endpoint) {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "another instance is listening",

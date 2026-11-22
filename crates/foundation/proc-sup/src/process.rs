@@ -231,20 +231,28 @@ impl Process {
         };
         let started = Instant::now();
         let mut child = spec.command().spawn()?;
-        // Read before the first instruction of the child: a later process that takes its id
-        // is not the one the tree belongs to.
-        let tree = job.as_ref().map(|_| ProcessTree::new(child.id()));
         if let Some(job) = &job {
-            // In the job before its first instruction, so that no grandchild can slip out.
+            // In the job before its first instruction, so that no grandchild can slip out,
+            // and before anything else takes time: an owner that dies now still ends it.
             #[cfg(windows)]
-            let resumed = job.assign(&child).and_then(|()| resume_process(&child));
+            let assigned = job.assign(&child);
             #[cfg(unix)]
-            let resumed = job.assign(child.id());
-            if let Err(error) = resumed {
+            let assigned = job.assign(child.id());
+            if let Err(error) = assigned {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error);
             }
+        }
+        // Read before the first instruction of the child: a later process that takes its id
+        // is not the one the tree belongs to. The child is in its job by now, so a read
+        // that outlasts the owner leaves no process behind.
+        let tree = job.as_ref().map(|_| ProcessTree::new(child.id()));
+        #[cfg(windows)]
+        if let Err(error) = resume_process(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
         if let Some(label) = spec.label {
             platform::label_process(child.id(), label);

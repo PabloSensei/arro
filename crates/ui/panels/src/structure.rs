@@ -51,6 +51,12 @@ impl StructurePanel {
     /// The file the panel shows, now the active one.
     pub fn show(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let editor = OpenEditors::get(cx, &path);
+        if let Some(editor) = &editor
+            && editor.read(cx).outline().is_empty()
+        {
+            // The tab may have been restored before a language could read it.
+            crate::outline::refresh(editor, false, cx);
+        }
         self._editor = editor
             .as_ref()
             .map(|editor| cx.observe(editor, |_, _, cx| cx.notify()));
@@ -60,6 +66,50 @@ impl StructurePanel {
         }
         self.path = Some(path);
         cx.notify();
+    }
+
+    /// The editor of the active tab. The panel reads it from the workspace rather than
+    /// waiting for the tab listener alone, so a window that opens with its tabs already in
+    /// place shows the file of the active one.
+    fn active_editor(&self, cx: &App) -> Option<(PathBuf, Entity<EditorView>)> {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let active = workspace.read_with(cx, |workspace, _| workspace.active_editor())?;
+            return active
+                .1
+                .downcast::<EditorView>()
+                .ok()
+                .map(|view| (active.0, view));
+        }
+        let path = self.path.clone()?;
+        let editor = self.editor.as_ref().and_then(WeakEntity::upgrade)?;
+        Some((path, editor))
+    }
+
+    /// Follows the editor of the active tab, and reads its declarations when it has just
+    /// been opened and the language had nothing to say about it yet.
+    fn follow(&mut self, cx: &mut Context<Self>) -> Option<Entity<EditorView>> {
+        let Some((path, editor)) = self.active_editor(cx) else {
+            if self.workspace.upgrade().is_some() {
+                self._editor = None;
+                self.editor = None;
+                self.path = None;
+                self.selected = None;
+            }
+            return None;
+        };
+        let shown = self.editor.as_ref().and_then(WeakEntity::upgrade);
+        if shown.as_ref().map(|view| view.entity_id()) != Some(editor.entity_id()) {
+            self._editor = Some(cx.observe(&editor, |_, _, cx| cx.notify()));
+            if self.path.as_ref() != Some(&path) {
+                self.selected = None;
+            }
+            self.path = Some(path);
+            self.editor = Some(editor.downgrade());
+            if editor.read(cx).outline().is_empty() {
+                crate::outline::refresh(&editor, false, cx);
+            }
+        }
+        Some(editor)
     }
 
     /// The names of the rows, indented, for scripts.
@@ -184,7 +234,7 @@ impl Render for StructurePanel {
                 })
                 .ok();
         };
-        let editor = self.editor.as_ref().and_then(WeakEntity::upgrade);
+        let editor = self.follow(cx);
         let (items, current) = match &editor {
             Some(editor) => {
                 let view = editor.read(cx);

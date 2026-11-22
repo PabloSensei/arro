@@ -636,6 +636,7 @@ impl StructuralSearch {
                 label: relative.display().to_string(),
                 depth: 0,
                 icon: icons.icon_for(path),
+                hint: None,
             });
             for found in matches {
                 let line_start = text[..found.start.min(text.len())]

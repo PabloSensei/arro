@@ -26,6 +26,7 @@ use workspace::{
 use crate::index::ProjectIndex;
 use crate::navigation;
 use crate::preview::{self, FilePreview, PreviewTarget};
+use crate::project::{ActiveProjectPanel, NEW_GROUP, NewAction};
 use crate::settings::SettingsView;
 use crate::settings_catalog::{self, SettingKind};
 
@@ -186,6 +187,8 @@ enum Item {
         visibility: Option<GraphVisibility>,
     },
     Action(&'static str),
+    /// A row of the New menu of the project tree, by its place in [`Palette::new_actions`].
+    NewAction(usize),
     /// A row of the settings list; choosing it shows that page of Settings.
     Setting(&'static str),
     /// A run configuration of the project, by name.
@@ -311,14 +314,23 @@ fn kind_icon(kind: SymbolKind) -> &'static str {
     }
 }
 
-/// Commands in alphabetical order, without regard to case. The name as written and the id
+/// Rows in alphabetical order, without regard to case. The name as written and the id
 /// come last, so that the order is the same from one run to the next.
-fn action_order(left: &ActionEntry, right: &ActionEntry) -> std::cmp::Ordering {
-    left.title
+fn row_order(left: (&str, &str), right: (&str, &str)) -> std::cmp::Ordering {
+    let ((left_title, left_id), (right_title, right_id)) = (left, right);
+    left_title
         .to_lowercase()
-        .cmp(&right.title.to_lowercase())
-        .then_with(|| left.title.cmp(&right.title))
-        .then_with(|| left.id.cmp(right.id))
+        .cmp(&right_title.to_lowercase())
+        .then_with(|| left_title.cmp(right_title))
+        .then_with(|| left_id.cmp(right_id))
+}
+
+/// A row of Find Action with the score of the query, before the cut.
+struct RankedRow {
+    score: u32,
+    /// What breaks a tie of the titles: the id of a command or the place of a New row.
+    id: String,
+    row: RowData,
 }
 
 /// The icon of a command that opens a tool window, from [`TOOL_COMMAND_ICONS`].
@@ -358,6 +370,9 @@ pub struct Palette {
     selected: usize,
     rows: Vec<RowData>,
     actions: Vec<ActionEntry>,
+    /// The rows of the New menu of the project tree, which Find Action lists with the
+    /// commands and runs as the menu does.
+    new_actions: Vec<NewAction>,
     recent: Vec<PathBuf>,
     /// The files that were edited in the project, the latest first.
     edited: Vec<PathBuf>,
@@ -415,6 +430,10 @@ impl Palette {
         let recent = navigation::recent(cx);
         let edited = workspace.recent_edited().to_vec();
         let open_tabs: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
+        let new_actions = cx
+            .try_global::<ActiveProjectPanel>()
+            .map(|panel| panel.0.read(cx).new_actions())
+            .unwrap_or_default();
         // The open editor knows the signatures the language sent; the project index only
         // has names, so it is the fallback for a tab that is not an editor.
         let structure = workspace
@@ -449,6 +468,7 @@ impl Palette {
                 selected: 0,
                 rows: Vec::new(),
                 actions,
+                new_actions,
                 recent,
                 edited,
                 open_tabs,
@@ -755,25 +775,18 @@ impl Palette {
         let matcher: &mut dyn FuzzyMatcher = &mut matcher;
         // Every match is ranked before the cut, so that the order of the ties decides which
         // commands stay in the list.
-        let mut found = rank(
+        let mut found: Vec<RankedRow> = rank(
             matcher,
             &self.query.text,
             self.actions.iter(),
             |action| &action.search,
             self.actions.len(),
-        );
-        // The commands with the same score come alphabetically, not by the length of their
-        // names. On an empty query every command has the same score.
-        found.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| action_order(left.item, right.item))
-        });
-        found.truncate(limit);
-        found
-            .into_iter()
-            .map(|ranked| RowData {
+        )
+        .into_iter()
+        .map(|ranked| RankedRow {
+            score: ranked.score,
+            id: ranked.item.id.to_owned(),
+            row: RowData {
                 title: ranked.item.title.clone(),
                 detail: String::new(),
                 icon: ranked.item.icon,
@@ -781,8 +794,46 @@ impl Palette {
                 indent: 0,
                 toggle: None,
                 item: Some(Item::Action(ranked.item.id)),
-            })
-            .collect()
+            },
+        })
+        .collect();
+        // The rows of the New menu of the project tree are found by their titles and by
+        // the word of their group, which stands at their right.
+        let mut new_matcher = NameMatcher::new();
+        let new_matcher: &mut dyn FuzzyMatcher = &mut new_matcher;
+        found.extend(
+            rank(
+                new_matcher,
+                &self.query.text,
+                self.new_actions.iter().enumerate(),
+                |(_, action)| action.search.as_str(),
+                self.new_actions.len(),
+            )
+            .into_iter()
+            .map(|ranked| RankedRow {
+                score: ranked.score,
+                id: format!("new:{}", ranked.item.0),
+                row: RowData {
+                    title: ranked.item.1.title.clone(),
+                    detail: NEW_GROUP.to_owned(),
+                    icon: ranked.item.1.icon,
+                    shortcut: None,
+                    indent: 0,
+                    toggle: None,
+                    item: Some(Item::NewAction(ranked.item.0)),
+                },
+            }),
+        );
+        // The rows with the same score come alphabetically, not by the length of their
+        // names. On an empty query every command has the same score.
+        found.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| row_order((&left.row.title, &left.id), (&right.row.title, &right.id)))
+        });
+        found.truncate(limit);
+        found.into_iter().map(|ranked| ranked.row).collect()
     }
 
     fn setting_rows(&self, limit: usize, cx: &App) -> Vec<RowData> {
@@ -967,7 +1018,7 @@ impl Palette {
                     if tab == Tab::Actions && !searching {
                         // Every command, so that the alphabetical end of the list is reachable
                         // without a query; the settings follow them.
-                        rows = self.action_rows(self.actions.len());
+                        rows = self.action_rows(self.actions.len() + self.new_actions.len());
                         rows.extend(self.setting_rows(MAX_ROWS, cx));
                     }
                 }
@@ -1084,6 +1135,17 @@ impl Palette {
             .iter()
             .filter(|row| matches!(row.item, Some(Item::Action(_))))
             .map(|row| (row.title.clone(), row.shortcut.clone(), row.icon))
+            .collect()
+    }
+
+    /// The rows of the New menu on screen with the group label at their right edge and the
+    /// icon at their left, for scripts and tests.
+    #[cfg(test)]
+    pub(crate) fn new_rows_text(&self) -> Vec<(String, String, &'static str)> {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row.item, Some(Item::NewAction(_))))
+            .map(|row| (row.title.clone(), row.detail.clone(), row.icon))
             .collect()
     }
 
@@ -1347,6 +1409,14 @@ impl Palette {
         // Shift+Enter opens the file in a split. In the list of run configurations it
         // still starts the chosen one under the debugger.
         let split = debug && !matches!(self.mode, Mode::ChooseRun { .. });
+        let new_action = match &item {
+            Item::NewAction(at) => self.new_actions.get(*at).cloned(),
+            _ => None,
+        };
+        let project_panel = cx
+            .try_global::<ActiveProjectPanel>()
+            .map(|panel| panel.0.clone());
+        let handle = window.window_handle();
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.dismiss(window, cx);
@@ -1371,6 +1441,21 @@ impl Palette {
                     }
                     Item::Action(id) => {
                         workspace.run_command(id, window, cx);
+                    }
+                    Item::NewAction(_) => {
+                        // The window of the row opens after the popup has closed, as the
+                        // row of the menu opens it: the prompt cannot be shown while the
+                        // window is being updated here.
+                        if let (Some(action), Some(panel)) = (new_action, project_panel) {
+                            cx.defer(move |cx| {
+                                let run = move |_: AnyView, window: &mut Window, cx: &mut App| {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.ask_new_action(action, window, cx)
+                                    });
+                                };
+                                handle.update(cx, run).ok();
+                            });
+                        }
                     }
                     Item::Setting(id) => {
                         SettingsView::show_at(workspace, window, cx, Some(id));

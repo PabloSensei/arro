@@ -620,6 +620,13 @@ pub struct AiProblem {
     pub text: String,
 }
 
+/// The number of the next usages search of the process. A late answer of an older search
+/// does not replace the list of a newer one.
+pub fn next_usages_search() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 #[derive(Clone, Debug)]
 pub enum EditorEvent {
     Loaded,
@@ -744,19 +751,43 @@ pub enum EditorEvent {
     },
     /// The language server sent the diagnostics of the file, empty when it has none.
     Diagnostics(Vec<DiagnosticEntry>),
+    /// Alt+F7 or Ctrl+F7 started a search: the Usages window opens at once with the name
+    /// of the symbol, and the answer comes later under the same number.
+    UsagesSearchStarted {
+        /// The number of the run, which its answer carries.
+        search: u64,
+        /// The name of the symbol, the label of the tab while the search runs.
+        name: String,
+        /// Whether the search looks in this file only.
+        in_file: bool,
+    },
     /// Alt+F7: the uses of the symbol, for the window that lists them by file.
-    Usages(Vec<Usage>),
+    Usages {
+        search: u64,
+        usages: Vec<Usage>,
+    },
     /// Alt+F7 with the language that tells the kind and the container of a use.
-    UsagesDetailed(Vec<DetailedUsage>),
+    UsagesDetailed {
+        search: u64,
+        usages: Vec<DetailedUsage>,
+    },
     /// Ctrl+F7: the uses of the symbol in this file, for the window that lists them.
-    UsagesInFile(Vec<Usage>),
+    UsagesInFile {
+        search: u64,
+        usages: Vec<Usage>,
+    },
     /// Ctrl+F7 with the language that tells the kind and the container of a use.
-    UsagesDetailedInFile(Vec<DetailedUsage>),
+    UsagesDetailedInFile {
+        search: u64,
+        usages: Vec<DetailedUsage>,
+    },
     /// Ctrl+Alt+F7: the uses of the symbol, for the popup at the caret.
     ShowUsages(UsagesUpdate),
     /// Alt+F7 or Ctrl+F7 while the language server imports: the Usages window opens with a
     /// waiting line. The search runs by itself when the server is ready; `cancel` ends the wait.
     UsagesWaiting {
+        /// The number of the run, which its answer carries.
+        search: u64,
         name: String,
         in_file: bool,
         cancel: ::base::Cancel,
@@ -1213,6 +1244,12 @@ pub struct EditorView {
     pending_frames: Vec<Instant>,
     /// The values of the stopped frame, by buffer line, drawn after the line.
     pub(crate) debug_values: Vec<InlineValue>,
+    /// The buffer line the stopped program is on, from zero: its row is tinted and the
+    /// gutter draws the arrow of it.
+    pub(crate) execution_line: Option<usize>,
+    /// The values of the stopped frame that came while the text of the file was still being
+    /// read, with their line: the text names their lines once it is there.
+    debug_source: Option<(usize, Vec<DebugValue>)>,
     /// The inline watches of the stopped program, by buffer line.
     pub(crate) inline_watches: Vec<InlineWatchRow>,
     /// The program is stopped in this file, so a caret expression can become an inline
@@ -1772,6 +1809,8 @@ impl EditorView {
             picture_cache: None,
             pending_frames: Vec::with_capacity(8),
             debug_values: Vec::new(),
+            execution_line: None,
+            debug_source: None,
             inline_watches: Vec::new(),
             inline_watch_ready: false,
             spelling_marks: Vec::new(),
@@ -2349,6 +2388,16 @@ impl EditorView {
         Some(ActionRows { rows, preview })
     }
 
+    /// The label of the selected row of an open Alt+Enter list. A test reads it; nothing else
+    /// does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn actions_selected(&self) -> Option<String> {
+        let menu = self.lsp.as_ref()?.actions.as_ref()?;
+        menu.rows
+            .get(menu.selected)
+            .map(|pick| pick.label().to_owned())
+    }
+
     /// The places of an open Ctrl+B list, from zero. A test reads them; nothing else does.
     #[cfg(any(test, feature = "test-support"))]
     pub fn navigation_targets(&self) -> Option<usize> {
@@ -2382,6 +2431,14 @@ impl EditorView {
         values: &[DebugValue],
         cx: &mut Context<Self>,
     ) {
+        // Until the text is read there are no names to find the values in: the loaded text
+        // takes them from here.
+        self.debug_source = match line {
+            Some(line) if self.state.is_none() && !values.is_empty() => {
+                Some((line, values.to_vec()))
+            }
+            _ => None,
+        };
         let shown = line
             .filter(|_| !values.is_empty())
             .and_then(|line| self.values_on_lines(line, values))
@@ -2390,6 +2447,21 @@ impl EditorView {
             self.debug_values = shown;
             cx.notify();
         }
+    }
+
+    /// Tints the row of `line`, the buffer line the stopped program is on, and draws its
+    /// arrow in the gutter. `None` takes both away, when the program runs or stops nowhere
+    /// in this file.
+    pub fn set_execution_line(&mut self, line: Option<usize>, cx: &mut Context<Self>) {
+        if self.execution_line != line {
+            self.execution_line = line;
+            cx.notify();
+        }
+    }
+
+    /// The buffer line the stopped program is on, from zero, for a test.
+    pub fn execution_line(&self) -> Option<usize> {
+        self.execution_line
     }
 
     /// The values of `values` grouped by the lines that name them, from the start of the
@@ -2557,6 +2629,10 @@ impl EditorView {
                 self.refresh_plain_spans(cx);
                 self.attach(cx);
                 self.reveal(cx);
+                // The values a window gave before the text was read name their lines now.
+                if let Some((line, values)) = self.debug_source.take() {
+                    self.set_debug_values(Some(line), &values, cx);
+                }
                 let saved = crate::bookmarks::bookmark_lines(&self.path, cx);
                 if let Some(state) = &mut self.state {
                     state.set_bookmarks(&saved);

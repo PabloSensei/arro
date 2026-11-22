@@ -30,6 +30,14 @@ pub fn label_process(pid: u32, role: &'static str) {
         .insert(pid, role);
 }
 
+/// The id of the process that started this one. A program watches it to go when its
+/// owner is gone.
+pub fn parent_process_id() -> Option<u32> {
+    // SAFETY: the call takes no arguments and reads a process-wide value.
+    let parent = unsafe { libc::getppid() };
+    (parent > 0).then_some(parent as u32)
+}
+
 /// This process and every process below it, in the order they were found.
 pub fn process_tree() -> Vec<ProcessMemory> {
     let root = std::process::id();

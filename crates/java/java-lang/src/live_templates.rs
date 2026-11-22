@@ -393,16 +393,10 @@ const TEMPLATES: &[Template] = &[
     ),
     surround("if", "if", "if ($CONDITION$) {\n\t$SELECTION$\n}$END$", &[]),
     surround(
-        "try",
-        "try / catch",
-        "try {\n\t$SELECTION$\n} catch ($EXCEPTION$ e) {\n\tthrow new RuntimeException(e);$END$\n}",
-        &[("EXCEPTION", "Exception")],
-    ),
-    surround(
-        "for",
-        "for",
-        "for (int $INDEX$ = 0; $INDEX$ < $LIMIT$; $INDEX$++) {\n\t$SELECTION$\n}$END$",
-        &[("INDEX", "i"), ("LIMIT", "")],
+        "ifelse",
+        "if / else",
+        "if ($CONDITION$) {\n\t$SELECTION$\n} else {\n\t$END$\n}",
+        &[],
     ),
     surround(
         "while",
@@ -411,11 +405,48 @@ const TEMPLATES: &[Template] = &[
         &[],
     ),
     surround(
+        "dowhile",
+        "do / while",
+        "do {\n\t$SELECTION$\n} while ($CONDITION$);$END$",
+        &[],
+    ),
+    surround(
+        "for",
+        "for",
+        "for (int $INDEX$ = 0; $INDEX$ < $LIMIT$; $INDEX$++) {\n\t$SELECTION$\n}$END$",
+        &[("INDEX", "i"), ("LIMIT", "")],
+    ),
+    surround(
+        "try",
+        "try / catch",
+        "try {\n\t$SELECTION$\n} catch ($EXCEPTION$ e) {\n\tthrow new RuntimeException(e);$END$\n}",
+        &[("EXCEPTION", "Exception")],
+    ),
+    surround(
+        "tryfinally",
+        "try / finally",
+        "try {\n\t$SELECTION$\n} finally {\n\t$END$\n}",
+        &[],
+    ),
+    surround(
+        "trycatchfinally",
+        "try / catch / finally",
+        "try {\n\t$SELECTION$\n} catch ($EXCEPTION$ e) {\n\tthrow new RuntimeException(e);\n} finally {\n\t$END$\n}",
+        &[("EXCEPTION", "Exception")],
+    ),
+    surround(
         "synchronized",
         "synchronized",
         "synchronized ($LOCK$) {\n\t$SELECTION$\n}$END$",
         &[("LOCK", "this")],
     ),
+    surround(
+        "runnable",
+        "Runnable",
+        "new Runnable() {\n\t@Override\n\tpublic void run() {\n\t\t$SELECTION$\n\t}\n};$END$",
+        &[],
+    ),
+    surround("block", "{ }", "{\n\t$SELECTION$\n}$END$", &[]),
     surround_live(
         "C",
         "Callable",
@@ -433,6 +464,12 @@ const TEMPLATES: &[Template] = &[
         "writeLock / unlock",
         "$LOCK$.writeLock().lock();\ntry {\n\t$SELECTION$\n} finally {\n\t$LOCK$.writeLock().unlock();\n}$END$",
         &[("LOCK", "lock")],
+    ),
+    surround_live(
+        "I",
+        "iterate",
+        "for ($TYPE$ $VAR$ : $ITERABLE$) {\n\t$SELECTION$\n}$END$",
+        &[("TYPE", "Object"), ("VAR", "item"), ("ITERABLE", "")],
     ),
 ];
 
@@ -1014,7 +1051,7 @@ pub fn declarations(
 
 #[cfg(test)]
 mod tests {
-    use templates::{context_at, expand};
+    use templates::{context_at, expand, surround};
     use tree_sitter::Parser;
 
     use super::*;
@@ -1150,5 +1187,68 @@ mod tests {
         assert_eq!(names.class_name, "Order");
         assert_eq!(names.method_name, "total");
         assert!(declarations(language(), "package a.b;\n", None, 0).package_name == "a.b");
+    }
+
+    #[test]
+    fn the_surround_with_list_is_the_idea_one_in_order() {
+        let java = language();
+        let described: Vec<&str> = TEMPLATES
+            .iter()
+            .filter(|template| template.kind == Kind::Surround)
+            .map(|template| template.description)
+            .collect();
+        assert_eq!(
+            described,
+            [
+                "if",
+                "if / else",
+                "while",
+                "do / while",
+                "for",
+                "try / catch",
+                "try / finally",
+                "try / catch / finally",
+                "synchronized",
+                "Runnable",
+                "{ }",
+            ]
+        );
+        for template in TEMPLATES
+            .iter()
+            .filter(|template| matches!(template.kind, Kind::Surround | Kind::SurroundLive))
+        {
+            assert!(
+                java.find(template.kind, template.key, "statement")
+                    .is_some(),
+                "{} fits a statement",
+                template.key
+            );
+            assert!(
+                template.body.contains("$SELECTION$"),
+                "{} wraps the selection",
+                template.key
+            );
+        }
+        let live: Vec<&str> = TEMPLATES
+            .iter()
+            .filter(|template| template.kind == Kind::SurroundLive)
+            .map(|template| template.key)
+            .collect();
+        assert_eq!(live, ["C", "RL", "WL", "I"]);
+    }
+
+    #[test]
+    fn if_else_wraps_the_selection_and_puts_the_caret_in_the_condition() {
+        let template = language()
+            .find(Kind::Surround, "ifelse", "statement")
+            .expect("the if / else template is there");
+        let expansion = surround(template, "    work();", "    ");
+
+        assert_eq!(
+            expansion.text,
+            "    if () {\n        work();\n    } else {\n        \n    }"
+        );
+        assert_eq!(expansion.fields[0].name, "CONDITION");
+        assert_eq!(expansion.fields[0].ranges, vec![8..8]);
     }
 }

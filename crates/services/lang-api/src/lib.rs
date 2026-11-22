@@ -37,7 +37,8 @@ pub use attach::{DebugProcess, DebugProcessProvider};
 pub use bundle::BundleFile;
 pub use code_lens::{
     CodeLensCommand, CodeLensEntry, CodeLensKind, CodeLensProvider, CodeLensQuery,
-    CodeLensResolveProvider, CodeLensResolveQuery, CodeVisionSettings, kind_of,
+    CodeLensResolveProvider, CodeLensResolveQuery, CodeVisionSettings, ImplicitUseProvider,
+    kind_of,
 };
 pub use coverage::{
     BranchCoverage, Counters, CoverageReport, FileCoverage, LineCoverage, LineState, TypeCoverage,

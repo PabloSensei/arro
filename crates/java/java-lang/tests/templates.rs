@@ -184,10 +184,29 @@ fn surround_with_try_wraps_the_selected_line_as_one_step() {
         .iter()
         .map(|it| it.key)
         .collect();
-    assert_eq!(keys, ["if", "try", "for", "while", "synchronized"]);
+    assert_eq!(
+        keys,
+        [
+            "if",
+            "ifelse",
+            "while",
+            "dowhile",
+            "for",
+            "try",
+            "tryfinally",
+            "trycatchfinally",
+            "synchronized",
+            "runnable",
+            "block",
+            "C",
+            "RL",
+            "WL",
+            "I",
+        ]
+    );
 
-    assert!(editor.key("down"));
-    assert!(editor.key("enter"));
+    // 6 is try / catch and picks it without Enter.
+    assert!(editor.key("6"));
     let wrapped = "    void run() {\n        try {\n            int size = 1;\n        } catch (Exception e) {\n            throw new RuntimeException(e);\n        }\n\n    }\n";
     assert!(editor.state.text().contains(wrapped), "{}", editor.shown());
     assert_eq!(editor.selected(), "Exception");

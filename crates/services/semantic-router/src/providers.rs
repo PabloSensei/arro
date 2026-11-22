@@ -2271,14 +2271,33 @@ impl Provider<RenameQuery, WorkspaceChange> for LspProviders {
     }
 }
 
+/// The words of a server error on `prepareRename` that say the name cannot be renamed, in
+/// lower case.
+const REFUSAL_WORDS: [&str; 4] = [
+    "cannot be renamed",
+    "can't be renamed",
+    "can not be renamed",
+    "renaming this element is not supported",
+];
+
+/// Whether a server error on `prepareRename` refuses the name: its text says the name cannot
+/// be renamed. A server that is busy, not ready or failed says nothing about the name.
+fn refuses_rename(error: &lsp_client::Error) -> bool {
+    let lsp_client::Error::Server(response) = error else {
+        return false;
+    };
+    let message = response.message.to_ascii_lowercase();
+    REFUSAL_WORDS.iter().any(|words| message.contains(words))
+}
+
 impl Provider<DocumentSpot, Option<PrepareRename>> for LspProviders {
     fn start(&self, spot: DocumentSpot, cancel: Cancel, reply: Reply<Option<PrepareRename>>) {
         let router = self.router.clone();
         self.answer(cancel, reply, async move {
             let answer = match router.prepare_rename(place(&spot)?).await {
-                // An error reply is the server's refusal, as a null answer is. A server that
-                // is not ready or does not answer in time stays unknown.
-                Err(RouteError::Server(_)) => Ok(None),
+                // An error that says the name cannot be renamed refuses it, as a null answer
+                // does. Any other error leaves the question unknown.
+                Err(RouteError::Server(error)) if refuses_rename(&error) => Ok(None),
                 answer => answer,
             };
             Some(answer.map(|accepted| {

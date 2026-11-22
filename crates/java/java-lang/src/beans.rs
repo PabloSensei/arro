@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use base::Cancel;
 use java_project::{Framework, FrameworkLookup, Frameworks};
+use java_syntax::{FACTORY, STEREOTYPES};
 use lang_api::{
     Answer, Bean, BeanModel, BeanQuery, BeanWarning, Confidence, InjectionPlace, InjectionPoint,
     Provider, Reply, SourceId,
@@ -27,15 +28,6 @@ use lsp_client::uri::file_path;
 use project_model::ProjectModel;
 
 const SOURCE: SourceId = SourceId::new("spring-beans");
-/// The annotations that declare a bean of a class.
-const STEREOTYPES: &[&str] = &[
-    "Component",
-    "Service",
-    "Repository",
-    "Controller",
-    "RestController",
-    "Configuration",
-];
 /// The scopes of CDI that declare a bean. Quarkus implements them with ArC.
 const CDI_SCOPES: &[&str] = &[
     "ApplicationScoped",
@@ -55,8 +47,6 @@ const FACTORY_CLASS: &str = "Factory";
 const MICRONAUT_BEANS: &[&str] = &["Bean", "Singleton", "Prototype"];
 /// The annotations that mark a field or a parameter as a point of an injection.
 const INJECTIONS: &[&str] = &["Autowired", "Inject", "Resource"];
-/// The annotation of a method that declares a bean in a configuration.
-const FACTORY: &str = "Bean";
 /// The annotation that narrows a point to the bean of a name.
 const QUALIFIER: &str = "Qualifier";
 /// The annotation that names a bean or a point.

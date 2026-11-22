@@ -498,6 +498,7 @@ pub fn regroup(panel: &mut ItemsPanel, cx: &mut Context<ItemsPanel>) {
                 label: key.0.clone(),
                 depth,
                 icon: key.1,
+                hint: None,
             });
         }
         previous = keys.iter().map(|(key, _)| key.clone()).collect();
@@ -512,6 +513,7 @@ pub fn regroup(panel: &mut ItemsPanel, cx: &mut Context<ItemsPanel>) {
                 label: name,
                 depth: previous.len(),
                 icon,
+                hint: None,
             });
             previous_file = Some(item.path.clone());
         }

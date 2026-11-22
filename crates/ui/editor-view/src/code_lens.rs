@@ -33,6 +33,9 @@ pub(crate) struct CodeLensItem {
     pub kind: CodeLensKind,
     pub resolve: Option<String>,
     pub command: Option<CodeLensCommand>,
+    /// The declaration is one that a framework or a test runner calls, so a count of no
+    /// usages says nothing about it.
+    pub implicit: bool,
 }
 
 impl CodeLensItem {
@@ -62,6 +65,7 @@ impl CodeLensItem {
             kind,
             resolve: entry.resolve,
             command,
+            implicit: false,
         }
     }
 }
@@ -148,6 +152,19 @@ impl EditorView {
             .map(|entry| CodeLensItem::from_entry(entry, &store))
             .collect();
         keep_shown_titles(&self.code_lens, &mut fresh);
+        // Each label learns whether its line holds a declaration that a framework or a test
+        // runner calls. The flag is set here, once per answer; a resolve keeps it.
+        let text = store.text();
+        let spans = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.support.implicit_uses())
+            .map(|provider| provider.implicit_use_spans(&text))
+            .unwrap_or_default();
+        for item in &mut fresh {
+            let line = store.offset_to_line(item.offset.min(store.len())) as u32;
+            item.implicit = spans.iter().any(|span| span.contains(&line));
+        }
         // A label that still shows its text keeps it: asking the server about the same
         // place again would run the search behind the count once more.
         self.code_lens_resolved.retain(|offset| {
@@ -361,11 +378,12 @@ impl EditorView {
                         return false;
                     };
                     let store = state.store();
-                    let resolved = CodeLensItem::from_entry(answer.value, &store);
+                    let mut resolved = CodeLensItem::from_entry(answer.value, &store);
                     let Some(item) = this.code_lens.iter_mut().find(|item| item.offset == offset)
                     else {
                         return false;
                     };
+                    resolved.implicit = item.implicit;
                     *item = resolved;
                     this.refresh_code_vision(cx);
                     true
@@ -513,7 +531,9 @@ fn code_vision_label(
     }
     let count = leading_count(title);
     match item.kind {
-        CodeLensKind::Usages if usages => Some((
+        // A declaration that a framework calls has no usages to count, so a count of none is
+        // not shown above it; the other counts stay.
+        CodeLensKind::Usages if usages && !(item.implicit && count == Some(0)) => Some((
             CodeLensKind::Usages,
             match count {
                 Some(0) => "no usages".to_owned(),
@@ -579,6 +599,7 @@ mod tests {
                 command: "show".to_owned(),
                 arguments: None,
             }),
+            implicit: false,
         }
     }
 

@@ -23,7 +23,7 @@ fn contrast(a: Color, b: Color) -> f32 {
 
 /// The pairs the window writes text and code on, with the least ratio WCAG asks.
 fn checks(theme: &Tokens<Color>) -> Vec<(&'static str, Color, Color, f32)> {
-    let code_backgrounds = [theme.editor_bg, theme.caret_row];
+    let code_backgrounds = [theme.editor_bg, theme.caret_row, theme.execution_line];
     let mut checks = vec![
         ("text on island", theme.text, theme.island_bg, 4.5),
         ("text on main", theme.text, theme.main_bg, 4.5),
@@ -74,6 +74,17 @@ fn checks(theme: &Tokens<Color>) -> Vec<(&'static str, Color, Color, f32)> {
         ("unused", theme.unused, theme.editor_bg),
         ("line_number", theme.line_number, theme.editor_bg),
         ("inlay", theme.inlay, theme.editor_bg),
+        // The values of the stop line and its arrow stand on the tint of the line.
+        (
+            "inlay on the execution line",
+            theme.inlay,
+            theme.execution_line,
+        ),
+        (
+            "accent on the execution line",
+            theme.accent,
+            theme.execution_line,
+        ),
     ] {
         checks.push((name, color, background, 3.));
     }

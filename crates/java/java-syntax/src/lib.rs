@@ -5,6 +5,7 @@ mod declarations;
 mod diagram;
 mod edit;
 mod endpoints;
+mod implicit;
 mod inline;
 mod spelling;
 mod spring_beans;
@@ -26,11 +27,13 @@ pub use edit::{
     unwrap_edits,
 };
 pub use endpoints::endpoints;
+pub use implicit::implicit_use_spans;
 pub use inline::identifiers_around;
 pub use lang_api::StructuralTemplate as ReadyTemplate;
 pub use spelling::{Place as SpellPlaceFound, places as spelling_places};
 pub use spring_beans::{
-    Annotation, Constructor, Field, File as SpringFile, Method, Parameter, Type, spring_file,
+    Annotation, Constructor, FACTORY, Field, File as SpringFile, Method, Parameter, STEREOTYPES,
+    Type, spring_file,
 };
 pub use spring_data::{
     Alias, AliasSource, Boundary, Condition, Connector, MethodCursor, MethodName, OPERATOR_WORDS,

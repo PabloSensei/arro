@@ -1,6 +1,7 @@
 //! A tool window that lists places in files: Problems and TODO. A click, or Enter, opens
 //! the place in the editor.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -75,6 +76,18 @@ pub struct Item {
     pub icon: &'static str,
 }
 
+/// The line of a file that an item shows, without its indent, and the place of the match
+/// inside it. A window that reads the text of a file uses it to draw a row of code rather
+/// than the name of a symbol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeLine {
+    /// The number of the line, counted from one.
+    pub number: usize,
+    pub text: String,
+    /// The bytes of the match in `text`.
+    pub highlight: Range<usize>,
+}
+
 /// The extra rows a window puts in the menu of an item. The row of a file with a path is
 /// added by the panel itself.
 pub type RowMenu = Rc<dyn Fn(&Item, Point<Pixels>, &mut App) -> Vec<MenuEntry>>;
@@ -93,6 +106,8 @@ pub enum PanelRow {
         label: String,
         depth: usize,
         icon: &'static str,
+        /// The grey text after the label, such as the package of a file.
+        hint: Option<String>,
     },
     Item {
         index: usize,
@@ -167,8 +182,12 @@ pub struct ItemsPanel {
     header_buttons: Vec<HeaderButton>,
     /// The items Delete took out of the result, by item index.
     excluded: Vec<bool>,
+    /// The line of the file each item shows, when the window has read it.
+    code: Vec<Option<CodeLine>>,
     /// The title with the number of the items that are not excluded, when set.
     counted_title: Option<String>,
+    /// Whether a search is still filling the list, which the panel marks with a line.
+    progress: bool,
     /// Told when Delete or Insert changes an item.
     on_toggle: Option<ToggleHandler>,
 }
@@ -198,7 +217,9 @@ impl ItemsPanel {
             tabs: Vec::new(),
             header_buttons: Vec::new(),
             excluded: Vec::new(),
+            code: Vec::new(),
             counted_title: None,
+            progress: false,
             on_toggle: None,
         })
     }
@@ -267,8 +288,24 @@ impl ItemsPanel {
         }
         self.items = items;
         self.rows = rows;
+        self.code = vec![None; self.items.len()];
         self.update_counted_title();
         cx.notify();
+    }
+
+    /// Sets the line of the file each item shows, in the order of the items. A row without
+    /// one keeps the name of its item.
+    pub fn set_code(&mut self, mut code: Vec<Option<CodeLine>>, cx: &mut Context<Self>) {
+        code.truncate(self.items.len());
+        code.resize(self.items.len(), None);
+        self.code = code;
+        cx.notify();
+    }
+
+    /// The line an item shows, for the tests.
+    #[cfg(test)]
+    pub(crate) fn code_line(&self, index: usize) -> Option<&CodeLine> {
+        self.code.get(index).and_then(Option::as_ref)
     }
 
     /// The title gets the number of the items that are not excluded.
@@ -329,6 +366,21 @@ impl ItemsPanel {
     #[cfg(test)]
     pub(crate) fn empty_text(&self) -> String {
         self.empty.to_string()
+    }
+
+    /// Marks the list as still being filled by a running search, with a line above it.
+    pub fn set_progress(&mut self, progress: bool, cx: &mut Context<Self>) {
+        if self.progress == progress {
+            return;
+        }
+        self.progress = progress;
+        cx.notify();
+    }
+
+    /// Whether the panel marks a search in progress, for the tests.
+    #[cfg(test)]
+    pub(crate) fn progress_shown(&self) -> bool {
+        self.progress
     }
 
     /// The buttons of the header, for the tests.
@@ -482,6 +534,73 @@ impl ItemsPanel {
     }
 }
 
+/// A row of one line of a file: its number and the code with the match in the search
+/// color of the theme. The indent of the line is dropped, so the code starts at the left.
+fn code_row(
+    index: usize,
+    depth: usize,
+    code: &CodeLine,
+    icon_name: &'static str,
+    selected: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let start = code.highlight.start.min(code.text.len());
+    let end = code.highlight.end.clamp(start, code.text.len());
+    let before = code.text.get(..start).unwrap_or_default().to_owned();
+    let found = code.text.get(start..end).unwrap_or_default().to_owned();
+    let after = code.text.get(end..).unwrap_or_default().to_owned();
+    let (match_bg, match_text) = (theme.match_bg, theme.match_text);
+    let hover = theme.selection_hover;
+    div()
+        .id(("item", index))
+        .flex()
+        .items_center()
+        .flex_none()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .pl(px(depth as f32 * 19. + ROW_PADDING_X))
+        .pr(px(ROW_PADDING_X))
+        .rounded(px(ROW_RADIUS))
+        .when(selected, |this| this.bg(theme.selection_inactive))
+        .when(!selected, move |this| {
+            this.hover(move |style| style.bg(hover))
+        })
+        .child(div().size(px(16.)).flex_none())
+        .child(
+            div()
+                .ml(px(SPACE_S))
+                .flex_none()
+                .child(icon(icon_name, theme)),
+        )
+        .child(
+            div()
+                .ml(px(TREE_ICON_GAP))
+                .w(px(40.))
+                .flex_none()
+                .text_color(theme.text_secondary)
+                .child(code.number.to_string()),
+        )
+        .child(
+            div()
+                .ml(px(SPACE_M))
+                .flex()
+                .items_center()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(before)
+                .child(
+                    div()
+                        .bg(match_bg)
+                        .text_color(match_text)
+                        .rounded(px(2.))
+                        .debug_selector(move || format!("item-code-match-{index}"))
+                        .child(found),
+                )
+                .child(after),
+        )
+}
+
 impl Render for ItemsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -493,12 +612,17 @@ impl Render for ItemsPanel {
                 .ok();
         };
         let rows = self.rows.iter().enumerate().map(|(at, row)| match row {
-            PanelRow::Group { label, depth, icon } => {
+            PanelRow::Group {
+                label,
+                depth,
+                icon,
+                hint,
+            } => {
                 let style = TreeRow {
                     id: ("group", at).into(),
                     depth: *depth,
                     label: label.clone().into(),
-                    hint: None,
+                    hint: hint.clone().map(Into::into),
                     icon,
                     expandable: false,
                     open: true,
@@ -519,53 +643,66 @@ impl Render for ItemsPanel {
                 let Some(item) = self.items.get(index) else {
                     return div();
                 };
-                let style = TreeRow {
-                    id: ("item", index).into(),
-                    depth,
-                    label: item.label.clone().into(),
-                    hint: Some(item.hint.clone().into()),
-                    icon: item.icon,
-                    expandable: false,
-                    open: false,
-                    selected: self.selected == Some(index),
-                };
                 let menu = self.row_menu.clone();
-                let row = tree_row(style, &theme)
-                    .debug_selector(move || format!("item-row-{index}"))
-                    .when(excluded, |this| this.text_color(theme.text_muted))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        window.focus(&this.focus, cx);
-                        this.selected = Some(index);
-                        if event.click_count() >= 2 {
-                            this.open(index, window, cx);
+                let code = self.code.get(index).and_then(Option::as_ref);
+                let row = match code {
+                    Some(code) => code_row(
+                        index,
+                        depth,
+                        code,
+                        item.icon,
+                        self.selected == Some(index),
+                        &theme,
+                    ),
+                    None => {
+                        let style = TreeRow {
+                            id: ("item", index).into(),
+                            depth,
+                            label: item.label.clone().into(),
+                            hint: Some(item.hint.clone().into()),
+                            icon: item.icon,
+                            expandable: false,
+                            open: false,
+                            selected: self.selected == Some(index),
+                        };
+                        tree_row(style, &theme)
+                    }
+                }
+                .debug_selector(move || format!("item-row-{index}"))
+                .when(excluded, |this| this.text_color(theme.text_muted))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    window.focus(&this.focus, cx);
+                    this.selected = Some(index);
+                    if event.click_count() >= 2 {
+                        this.open(index, window, cx);
+                    }
+                    cx.notify();
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        let Some(menu) = &menu else {
+                            return;
+                        };
+                        let Some(item) = this.items.get(index).cloned() else {
+                            return;
+                        };
+                        let mut entries = menu(&item, event.position, cx);
+                        if entries.is_empty() {
+                            return;
                         }
-                        cx.notify();
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            let Some(menu) = &menu else {
-                                return;
-                            };
-                            let Some(item) = this.items.get(index).cloned() else {
-                                return;
-                            };
-                            let mut entries = menu(&item, event.position, cx);
-                            if entries.is_empty() {
-                                return;
-                            }
-                            entries.push(MenuEntry::separator());
-                            let text = item.path.display().to_string();
-                            entries.push(MenuEntry::new("Copy Path", move |_, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
-                            }));
-                            this.workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.show_menu(event.position, entries, cx)
-                                })
-                                .ok();
-                        }),
-                    );
+                        entries.push(MenuEntry::separator());
+                        let text = item.path.display().to_string();
+                        entries.push(MenuEntry::new("Copy Path", move |_, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                        }));
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_menu(event.position, entries, cx)
+                            })
+                            .ok();
+                    }),
+                );
                 let row = div().relative().w_full().child(row);
                 let row = if excluded {
                     row.child(
@@ -585,6 +722,7 @@ impl Render for ItemsPanel {
         });
         let body = if self.items.is_empty() {
             div()
+                .debug_selector(|| "items-empty".to_owned())
                 .size_full()
                 .flex()
                 .items_center()
@@ -611,6 +749,22 @@ impl Render for ItemsPanel {
             .size_full()
             .into_any_element()
         };
+        // A search that still fills the list marks itself with a line above the body.
+        let body = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .when(self.progress, |this| {
+                this.child(
+                    div()
+                        .debug_selector(|| "items-progress".to_owned())
+                        .flex_none()
+                        .w_full()
+                        .h(px(2.))
+                        .bg(theme.accent),
+                )
+            })
+            .child(body);
         let buttons: Vec<_> = self
             .header_buttons
             .iter()
