@@ -460,7 +460,7 @@ fn generate_lists_the_source_actions_and_applies_one(cx: &mut TestAppContext) {
 }
 
 #[ui_kit::gpui::test]
-fn goto_implementation_skips_the_declaration_and_super_method_opens_it(cx: &mut TestAppContext) {
+fn goto_implementation_and_super_method_open_the_definition(cx: &mut TestAppContext) {
     let root = project(
         "keys-navigation",
         &[("src/Main.txt", "call\n"), ("src/Other.txt", "place\n")],
@@ -474,16 +474,15 @@ fn goto_implementation_skips_the_declaration_and_super_method_opens_it(cx: &mut 
     draw(cx, window);
     open_path(cx, window, &main);
 
-    // The fake answers every navigation with the declaration, and a declaration is no
-    // implementation: Ctrl+Alt+B stays here and says so.
     press(cx, window, "ctrl-alt-b");
     draw(cx, window);
-    assert_eq!(active_path(cx, window), Some(main.clone()));
+    assert_eq!(active_path(cx, window), Some(other.clone()));
     assert_eq!(
-        editor_of(cx, window, &main).read_with(cx, |view, _| view.note_text()),
-        Some("No implementations found".to_owned())
+        editor_of(cx, window, &other).read_with(cx, |view, _| view.caret()),
+        (0, 2)
     );
 
+    open_path(cx, window, &main);
     press(cx, window, "ctrl-u");
     draw(cx, window);
     assert_eq!(active_path(cx, window), Some(other));

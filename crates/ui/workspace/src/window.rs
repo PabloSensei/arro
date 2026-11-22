@@ -31,8 +31,8 @@ use crate::editor::{
 use crate::external::{OpenRequests, OpenTarget, Request, open_target};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{
-    BookmarkLayout, DockState, Layout, Location, LocationLog, PaneState, WindowPlacement,
-    has_saved_layout, save_layout, save_theme,
+    BookmarkLayout, DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_layout,
+    save_theme,
 };
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
@@ -340,9 +340,6 @@ const SKIPPED_KEY: &str = "updates.skipped_version";
 const MENU_OPEN_DELAY: Duration = Duration::from_millis(220);
 /// How long a message of the status bar stays before it goes away.
 const STATUS_MESSAGE_TIME: Duration = Duration::from_secs(5);
-/// How long an informational notification stays before it goes away, as in IDEA. One
-/// that offers a button waits for the user instead.
-const NOTIFICATION_TIME: Duration = Duration::from_secs(8);
 
 /// The build the distribution README names: the commit and its date.
 pub fn build_version() -> &'static str {
@@ -627,12 +624,7 @@ pub type CommandCheck = Rc<dyn Fn(&Workspace, &App) -> bool>;
 pub type ToolActivator = Rc<dyn Fn(&str, &mut App) -> bool>;
 
 /// Told which file became the active tab.
-pub type TabListener = Rc<dyn Fn(&mut Workspace, &Path, &mut Context<Workspace>)>;
-/// Told which file lost its tab.
-pub type TabClosedHook = Rc<dyn Fn(&Path, &mut Context<Workspace>)>;
-
-/// The files of Recent Files that a layout saves with the tabs, the latest first.
-pub type RecentFilesSource = Rc<dyn Fn(&App) -> Vec<PathBuf>>;
+pub type TabListener = Rc<dyn Fn(&Path, &mut Context<Workspace>)>;
 
 pub struct Workspace {
     pub(crate) root: PathBuf,
@@ -676,8 +668,6 @@ pub struct Workspace {
     pub(crate) recent: Vec<PathBuf>,
     /// Files edited in this project, the latest first, for Recent Files.
     recent_edited: Vec<PathBuf>,
-    /// The places of Recent Locations, the latest first.
-    recent_places: LocationLog,
     state_dir: PathBuf,
     settings_dir: PathBuf,
     pub(crate) overlay: Option<Overlay>,
@@ -803,10 +793,8 @@ pub struct Workspace {
     /// The commands whose menu row is grey while they do not apply.
     command_checks: HashMap<&'static str, CommandCheck>,
     tab_listener: Option<TabListener>,
-    /// Where the recent files of the layout come from; see `set_recent_files_source`.
-    recent_source: Option<RecentFilesSource>,
     /// The callbacks of the views that follow the files whose tabs close.
-    tab_closed_hooks: Vec<TabClosedHook>,
+    tab_closed_hooks: Vec<TabListener>,
     /// The buffers of files that no tab shows, by path: a view edits them through their
     /// text and Save All writes them.
     buffers: HashMap<PathBuf, EditorTab>,
@@ -1107,7 +1095,6 @@ impl Workspace {
             closed: Vec::new(),
             recent,
             recent_edited: layout.recent_edited.clone(),
-            recent_places: layout.recent_places.clone(),
             state_dir,
             settings_dir,
             overlay: None,
@@ -1182,7 +1169,6 @@ impl Workspace {
             handlers: HashMap::new(),
             command_checks: HashMap::new(),
             tab_listener: None,
-            recent_source: None,
             tab_closed_hooks: Vec::new(),
             buffers: HashMap::new(),
             placement: layout.window.or_else(|| placement_of(window, cx)),
@@ -1427,15 +1413,15 @@ impl Workspace {
             label: "Skip This Version".into(),
             action: BalloonAction::SkipUpdate,
         });
-        self.show_balloon(
-            Balloon {
-                title: format!("Arro {version} is available").into(),
-                text: line.into(),
-                action: None,
-                buttons,
-            },
-            cx,
-        );
+        self.balloon = Some(Balloon {
+            title: format!("Arro {version} is available").into(),
+            text: line.into(),
+            action: None,
+            buttons,
+        });
+        self.balloon_visible = true;
+        self.balloon_serial += 1;
+        cx.notify();
     }
 
     /// Keeps the offered version out of the automatic checks from now on.
@@ -1630,7 +1616,7 @@ impl Workspace {
         if restored
             && let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path())
         {
-            listener(self, &path, cx);
+            listener(&path, cx);
         }
     }
 
@@ -2875,15 +2861,15 @@ impl Workspace {
             label: "README".into(),
             action: BalloonAction::Url(README_URL.to_owned()),
         });
-        self.show_balloon(
-            Balloon {
-                title,
-                text: details,
-                action: None,
-                buttons,
-            },
-            cx,
-        );
+        self.balloon = Some(Balloon {
+            title,
+            text: details,
+            action: None,
+            buttons,
+        });
+        self.balloon_visible = true;
+        self.balloon_serial += 1;
+        cx.notify();
     }
 
     /// What the project tree wants to be restored next time.
@@ -3415,7 +3401,7 @@ impl Workspace {
         self.focus_active(window, cx);
         self.layout_changed(cx);
         if let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path()) {
-            listener(self, &path, cx);
+            listener(&path, cx);
         }
         cx.notify();
     }
@@ -3526,23 +3512,6 @@ impl Workspace {
         self.recent_edited.insert(0, path.to_path_buf());
         self.recent_edited.truncate(RECENT_EDITED_LIMIT);
         self.layout_changed(cx);
-    }
-
-    /// Records a place for Recent Locations, the latest first.
-    pub fn remember_place(&mut self, place: Location) {
-        self.recent_places.push(place);
-    }
-
-    /// The places of Recent Locations, the latest first.
-    pub fn recent_places(&self) -> &[Location] {
-        self.recent_places.places()
-    }
-
-    /// Drops the places of files that are gone. Returns whether the log changed.
-    pub fn prune_recent_places(&mut self) -> bool {
-        let before = self.recent_places.places().len();
-        self.recent_places.retain(|place| place.path.is_file());
-        self.recent_places.places().len() != before
     }
 
     /// The folder with the settings file, and what plugins and keys add to it.
@@ -3941,7 +3910,7 @@ impl Workspace {
         self.focus_active(window, cx);
         self.layout_changed(cx);
         if let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path()) {
-            listener(self, &path, cx);
+            listener(&path, cx);
         }
         cx.notify();
     }
@@ -5224,39 +5193,14 @@ impl Workspace {
         text: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        self.show_balloon(
-            Balloon {
-                title: title.into(),
-                text: text.into(),
-                action: None,
-                buttons: Vec::new(),
-            },
-            cx,
-        );
-    }
-
-    /// Shows `balloon` and, when it asks nothing of the user, hides it after a few
-    /// seconds as IDEA hides its informational notifications. A newer notification, an
-    /// opened one or a closed one bumps the serial, so an older timer leaves it alone.
-    fn show_balloon(&mut self, balloon: Balloon, cx: &mut Context<Self>) {
-        let informational = balloon.action.is_none() && balloon.buttons.is_empty();
-        self.balloon = Some(balloon);
+        self.balloon = Some(Balloon {
+            title: title.into(),
+            text: text.into(),
+            action: None,
+            buttons: Vec::new(),
+        });
         self.balloon_visible = true;
         self.balloon_serial += 1;
-        let serial = self.balloon_serial;
-        if informational {
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(NOTIFICATION_TIME).await;
-                this.update(cx, |this, cx| {
-                    if this.balloon_serial == serial && this.balloon_visible {
-                        this.balloon_visible = false;
-                        cx.notify();
-                    }
-                })
-                .ok();
-            })
-            .detach();
-        }
         cx.notify();
     }
 
@@ -5280,22 +5224,22 @@ impl Workspace {
         buttons: Vec<(&'static str, SharedString, &'static str)>,
         cx: &mut Context<Self>,
     ) {
-        self.show_balloon(
-            Balloon {
-                title: title.into(),
-                text: text.into(),
-                action: None,
-                buttons: buttons
-                    .into_iter()
-                    .map(|(id, label, command)| BalloonButton {
-                        id,
-                        label,
-                        action: BalloonAction::Command(command),
-                    })
-                    .collect(),
-            },
-            cx,
-        );
+        self.balloon = Some(Balloon {
+            title: title.into(),
+            text: text.into(),
+            action: None,
+            buttons: buttons
+                .into_iter()
+                .map(|(id, label, command)| BalloonButton {
+                    id,
+                    label,
+                    action: BalloonAction::Command(command),
+                })
+                .collect(),
+        });
+        self.balloon_visible = true;
+        self.balloon_serial += 1;
+        cx.notify();
     }
 
     /// A notification with one button that opens `action_path`.
@@ -5307,15 +5251,15 @@ impl Workspace {
         action_path: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        self.show_balloon(
-            Balloon {
-                title: title.into(),
-                text: text.into(),
-                action: Some((action.into(), action_path)),
-                buttons: Vec::new(),
-            },
-            cx,
-        );
+        self.balloon = Some(Balloon {
+            title: title.into(),
+            text: text.into(),
+            action: Some((action.into(), action_path)),
+            buttons: Vec::new(),
+        });
+        self.balloon_visible = true;
+        self.balloon_serial += 1;
+        cx.notify();
     }
 
     /// A notification with buttons that run commands of the window and one button that
@@ -5330,22 +5274,22 @@ impl Workspace {
         buttons: Vec<(&'static str, SharedString, &'static str)>,
         cx: &mut Context<Self>,
     ) {
-        self.show_balloon(
-            Balloon {
-                title: title.into(),
-                text: text.into(),
-                action: Some((action.into(), action_path)),
-                buttons: buttons
-                    .into_iter()
-                    .map(|(id, label, command)| BalloonButton {
-                        id,
-                        label,
-                        action: BalloonAction::Command(command),
-                    })
-                    .collect(),
-            },
-            cx,
-        );
+        self.balloon = Some(Balloon {
+            title: title.into(),
+            text: text.into(),
+            action: Some((action.into(), action_path)),
+            buttons: buttons
+                .into_iter()
+                .map(|(id, label, command)| BalloonButton {
+                    id,
+                    label,
+                    action: BalloonAction::Command(command),
+                })
+                .collect(),
+        });
+        self.balloon_visible = true;
+        self.balloon_serial += 1;
+        cx.notify();
     }
 
     /// The last notification, for scripts and tests.
@@ -5627,16 +5571,9 @@ impl Workspace {
 
     pub fn set_tab_listener(
         &mut self,
-        listener: impl Fn(&mut Workspace, &Path, &mut Context<Workspace>) + 'static,
+        listener: impl Fn(&Path, &mut Context<Workspace>) + 'static,
     ) {
         self.tab_listener = Some(Rc::new(listener));
-    }
-
-    /// The recent files that the layout saves: the panels keep the list and answer for
-    /// it each time the layout is written. Without a source the layout keeps the list it
-    /// opened with.
-    pub fn set_recent_files_source(&mut self, source: impl Fn(&App) -> Vec<PathBuf> + 'static) {
-        self.recent_source = Some(Rc::new(source));
     }
 
     /// The view of the active tab, for the commands that act on the editor.
@@ -5714,10 +5651,6 @@ impl Workspace {
         ] {
             tool_sides.extend(dock.tools.iter().map(|tool| (tool.id.to_owned(), side)));
         }
-        let recent_files = match &self.recent_source {
-            Some(source) => source(cx),
-            None => self.layout.recent_files.clone(),
-        };
         Layout {
             window: self.placement,
             left: self.left.state(),
@@ -5732,14 +5665,12 @@ impl Workspace {
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
             tool_sides,
             recent_edited: self.recent_edited.clone(),
-            recent_files,
             preview_modes,
             bundle_modes,
             services_collapsed: self.layout.services_collapsed.clone(),
             services_selected: self.layout.services_selected.clone(),
             services_show_all: self.layout.services_show_all,
             bookmarks: self.layout.bookmarks.clone(),
-            recent_places: self.recent_places.clone(),
         }
     }
 

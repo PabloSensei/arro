@@ -56,46 +56,6 @@ pub struct BookmarkGroupState {
     pub bookmarks: Vec<BookmarkState>,
 }
 
-/// A line of a file the user was at, with the text it had then.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Location {
-    pub path: PathBuf,
-    /// Buffer line from zero.
-    pub line: usize,
-    /// The text of the line when the place was remembered. It is not saved: the window
-    /// reads the line again from the file when it shows the list.
-    #[serde(skip)]
-    pub text: String,
-}
-
-/// The places of Recent Locations, the latest first.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LocationLog(Vec<Location>);
-
-impl LocationLog {
-    /// A place on a line that is already in the log moves to the front.
-    pub fn push(&mut self, place: Location) {
-        self.0
-            .retain(|known| !(known.path == place.path && known.line == place.line));
-        self.0.insert(0, place);
-        self.0.truncate(LOG_MAX);
-    }
-
-    pub fn places(&self) -> &[Location] {
-        &self.0
-    }
-
-    /// Drops the places the caller does not keep.
-    pub fn retain(&mut self, keep: impl FnMut(&Location) -> bool) {
-        self.0.retain(keep);
-    }
-}
-
-/// Places the log keeps.
-const LOG_MAX: usize = 50;
-
 /// The bookmarks of a project. A layout saved before the groups existed holds the plain
 /// list of the old store, or the map the store itself kept: either opens as one group
 /// named after the project.
@@ -153,10 +113,6 @@ pub struct Layout {
     /// Files that were edited in the project, the latest first. Opening a file alone
     /// does not put it here; saving does not take it away.
     pub recent_edited: Vec<PathBuf>,
-    /// Files that were active in the editors, the latest first, as the editors kept them
-    /// at the last save. Recent Files and the Switcher start from this list when the
-    /// project opens; files that are gone are left out then.
-    pub recent_files: Vec<PathBuf>,
     /// What each file with a rendered document showed: the text, the document, or both.
     pub preview_modes: Vec<(PathBuf, PreviewLayout)>,
     /// What each file of a localized set showed: its text or the table of the set.
@@ -169,8 +125,6 @@ pub struct Layout {
     pub services_show_all: bool,
     /// The groups of the bookmarks with the description of each one.
     pub bookmarks: BookmarkLayout,
-    /// The places of Recent Locations, the latest first.
-    pub recent_places: LocationLog,
 }
 
 impl Default for Layout {
@@ -198,14 +152,12 @@ impl Default for Layout {
             bottom_tool: None,
             tool_sides: Vec::new(),
             recent_edited: Vec::new(),
-            recent_files: Vec::new(),
             preview_modes: Vec::new(),
             bundle_modes: Vec::new(),
             services_collapsed: Vec::new(),
             services_selected: None,
             services_show_all: false,
             bookmarks: BookmarkLayout::default(),
-            recent_places: LocationLog::default(),
         }
     }
 }
@@ -431,21 +383,6 @@ mod tests {
         }
         assert_eq!(load_recent(&store).len(), RECENT_LIMIT);
         assert_eq!(load_recent(&store)[0], PathBuf::from("p19"));
-    }
-
-    #[test]
-    fn recent_files_are_saved_with_the_layout() {
-        let store = Store::in_memory().unwrap();
-        let root = Path::new("C:/project");
-        let mut layout = load_layout(&store, root);
-        assert!(layout.recent_files.is_empty());
-        layout.recent_files = vec![
-            PathBuf::from("C:/project/b.txt"),
-            PathBuf::from("C:/project/a.txt"),
-        ];
-        let json = serde_json::to_string(&layout).unwrap();
-        save_layout(&store, root, &json).unwrap();
-        assert_eq!(load_layout(&store, root).recent_files, layout.recent_files);
     }
 
     #[test]

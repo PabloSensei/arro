@@ -310,9 +310,6 @@ fn open(
                         crate::bundle_editor::files_changed(cx);
                     }
                     if matches!(event, EditorEvent::Loaded) {
-                        runner
-                            .update(cx, |workspace, cx| places::remember(&view, workspace, cx))
-                            .ok();
                         let path = view.read(cx).path().to_path_buf();
                         let pending = cx.default_global::<PendingSafeDelete>().0.take();
                         if let Some((wanted, offset)) = pending
@@ -334,9 +331,7 @@ fn open(
                     crate::git::editor_changed(&view, cx);
                     outline::refresh(&view, matches!(event, EditorEvent::Changed), cx);
                     if matches!(event, EditorEvent::Changed) {
-                        runner
-                            .update(cx, |workspace, cx| places::remember(&view, workspace, cx))
-                            .ok();
+                        places::remember(&view, cx);
                         let path = view.read(cx).path().to_path_buf();
                         runner
                             .update(cx, |workspace, cx| workspace.remember_edited(&path, cx))
@@ -1194,9 +1189,6 @@ fn open(
             name,
             in_file,
         } => {
-            reports
-                .update(cx, |workspace, cx| places::remember(&view, workspace, cx))
-                .ok();
             let Some(hub) = cx.try_global::<ActiveUsages>() else {
                 return;
             };

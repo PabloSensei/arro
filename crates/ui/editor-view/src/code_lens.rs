@@ -481,9 +481,7 @@ impl EditorView {
                 Some((_, Confidence::Unknown)) => {
                     this.show_transient_note(offset, crate::semantic::NO_ANSWER, cx)
                 }
-                Some(_) => {
-                    this.show_transient_note(offset, crate::semantic::NO_IMPLEMENTATIONS, cx)
-                }
+                Some(_) => this.show_transient_note(offset, "No implementations found", cx),
                 None => {}
             })
             .ok();

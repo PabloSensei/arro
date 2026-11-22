@@ -1816,8 +1816,7 @@ fn install(
             palette::Palette::show(mode, index.clone(), files.clone(), workspace, window, cx)
         }
     });
-    workspace.set_tab_listener(|workspace, path, cx| {
-        places::remember_path(workspace, path, cx);
+    workspace.set_tab_listener(|path, cx| {
         cx.default_global::<Navigator>().activated(path);
         project::follow_active_file(path, cx);
         if let Some(problems) = cx.try_global::<problems::ActiveProblems>() {
@@ -1837,7 +1836,6 @@ fn install(
             git.update(cx, |git, cx| git.active_editor_changed(path, cx));
         }
     });
-    navigation::bind_recent(workspace, cx);
     // What the watcher missed shows up when the window comes back to the front.
     let rescan = index.clone();
     cx.observe_window_activation(window, move |_, window, _| {
@@ -2293,12 +2291,3 @@ mod window_tests_find_action_new;
 
 #[cfg(test)]
 mod window_tests_usages_searching;
-
-#[cfg(test)]
-mod window_tests_recent_places;
-
-#[cfg(test)]
-mod window_tests_goto;
-
-#[cfg(test)]
-mod window_tests_switcher_tabs;

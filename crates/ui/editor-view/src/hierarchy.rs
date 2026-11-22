@@ -35,20 +35,6 @@ fn is_typed_key(key: &str) -> bool {
         )
 }
 
-/// The heading of a group of the Override or Implement list: the short name of the
-/// declaring type with short arguments, and the package it comes from for the grey tail
-/// of the row.
-pub(crate) fn owner_heading(owner: &str) -> (String, Option<String>) {
-    let owner = owner.trim();
-    let raw = owner.split('<').next().unwrap_or(owner).trim();
-    let package = raw
-        .rsplit_once('.')
-        .map(|(package, _)| package.trim())
-        .filter(|package| !package.is_empty())
-        .map(str::to_owned);
-    (lang_api::short_type_name(owner), package)
-}
-
 /// Ctrl+O and Ctrl+I: the methods of the type at the caret, filtered by typing. Space
 /// marks a method, Ctrl+A marks all of them, Enter adds the marked ones in one step.
 pub(crate) struct OverridePopup {

@@ -37,9 +37,6 @@ use crate::view::{EditorEvent, EditorView};
 use crate::{DocBlock, DocInline};
 
 pub(crate) const NO_ANSWER: &str = "The language server did not answer, try again";
-/// The note of an implementation question that no place answers. The code lens says the
-/// same when a label has none to show.
-pub(crate) const NO_IMPLEMENTATIONS: &str = "No implementations found";
 /// The note of a question that needs the language server while the server imports.
 pub(crate) const WAITING_NOTE: &str =
     "Waiting for the language server to finish importing the project…";
@@ -1826,17 +1823,6 @@ pub(crate) fn location_label(target: &SourceSpan) -> String {
             uri.rsplit(['/', '\\']).next().unwrap_or(uri).to_owned()
         });
     format!("{file}:{}", target.span.start.line + 1)
-}
-
-/// Whether two places of answers are the same text: the same file, and ranges that
-/// overlap. One answer names the name of a declaration and another its whole line.
-fn same_place(a: &SourceSpan, b: &SourceSpan) -> bool {
-    let same_file = match (uri_path(&a.uri), uri_path(&b.uri)) {
-        (Some(left), Some(right)) => platform::path_key(&left) == platform::path_key(&right),
-        _ => a.uri == b.uri,
-    };
-    let at = |point: TextPoint| (point.line, point.character);
-    same_file && at(a.span.start) <= at(b.span.end) && at(b.span.start) <= at(a.span.end)
 }
 
 pub(crate) struct Lsp {
@@ -3743,48 +3729,15 @@ impl EditorView {
             }
             None => return,
         };
-        // A server answers with the declaration itself when nothing implements the name, so
-        // the implementations are compared with the declaration asked at the same place.
-        let declarations = (kind == NavigationKind::Implementation).then(|| {
-            ask(
-                provider,
-                NavigationQuery {
-                    kind: NavigationKind::Definition,
-                    spot: spot.clone(),
-                },
-            )
-        });
         let replies = ask(provider, NavigationQuery { kind, spot });
         self.importing_note(caret, cx);
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
-            let declared = match declarations {
-                Some(declarations) => first(declarations).await,
-                None => None,
-            };
             this.update(cx, |this, cx| {
                 if let Some(lsp) = &mut this.lsp
                     && lsp.nav_asked == asked
                 {
                     lsp.nav_answered = asked;
-                }
-                if kind == NavigationKind::Implementation {
-                    let Some((spans, confidence)) = answer else {
-                        return;
-                    };
-                    let declared = declared.map_or_else(Vec::new, |(spans, _)| spans);
-                    let places = this.implementation_places(&spans, &declared, caret);
-                    if !places.is_empty() {
-                        if let Some(lsp) = &mut this.lsp {
-                            lsp.navigation_cache.insert(key, places.clone());
-                        }
-                        this.show_navigation_targets(places, caret, cx);
-                    } else if spans.is_empty() && confidence == Confidence::Unknown {
-                        this.show_unanswered(caret, true, cx);
-                    } else {
-                        this.show_transient_note(caret, NO_IMPLEMENTATIONS, cx);
-                    }
-                    return;
                 }
                 match answer {
                     Some((spans, _)) if !spans.is_empty() => {
@@ -3853,11 +3806,6 @@ impl EditorView {
         let [target] = spans else {
             return false;
         };
-        self.names_caret(target, caret)
-    }
-
-    /// Whether a place of an answer is the text the caret stands on, in this file.
-    fn names_caret(&self, target: &SourceSpan, caret: usize) -> bool {
         let Some(state) = &self.state else {
             return false;
         };
@@ -3869,24 +3817,6 @@ impl EditorView {
         let from = offset_at(&state.store(), target.span.start);
         let to = offset_at(&state.store(), target.span.end).max(from);
         from <= caret && caret <= to
-    }
-
-    /// The places of an implementation answer that are implementations. The declaration of
-    /// the name is no implementation, and neither is the name under the caret.
-    fn implementation_places(
-        &self,
-        spans: &[SourceSpan],
-        declared: &[SourceSpan],
-        caret: usize,
-    ) -> Vec<SourceSpan> {
-        spans
-            .iter()
-            .filter(|&target| {
-                !self.names_caret(target, caret)
-                    && !declared.iter().any(|place| same_place(place, target))
-            })
-            .cloned()
-            .collect()
     }
 
     /// Opens one place of a navigation answer at once, or shows the list of several,

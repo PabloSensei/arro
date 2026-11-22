@@ -67,7 +67,7 @@ pub use hierarchy::{
     MethodHierarchyEntry, MethodHierarchyProvider, MethodHierarchyQuery, MethodRelation,
     OverridableMethod, OverridableMethods, OverridableMethodsProvider, OverridableMethodsQuery,
     ReferenceQuery, ReferenceStringProvider, TypeHierarchyItem, TypeHierarchyProvider,
-    TypeHierarchyQuery, TypeKind, short_type_name,
+    TypeHierarchyQuery, TypeKind,
 };
 pub use inlay::{
     InlayHintEntry, InlayHintKind, InlayHintProvider, InlayHintQuery, InlayHintSettings,
