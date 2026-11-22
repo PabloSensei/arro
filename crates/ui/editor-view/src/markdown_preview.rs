@@ -757,7 +757,7 @@ impl EditorView {
             let (target, line) = split_line_fragment(&url);
             let relative = !target.is_empty()
                 && !target.starts_with("file:")
-                && !target.starts_with("jdt:")
+                && self.library_place(&target, cx).is_none()
                 && !target.contains("://");
             if relative
                 && let Some(uri) = self

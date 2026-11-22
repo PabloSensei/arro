@@ -1996,6 +1996,8 @@ impl Workspace {
                 command(editor_keys::REFORMAT, "Reformat Code"),
                 command(workspace_keys::SHOW_REFORMAT_DIALOG, "Reformat File..."),
                 command(editor_keys::OPTIMIZE_IMPORTS, "Optimize Imports"),
+                command(editor_keys::SORT_MEMBERS, "Sort Members"),
+                command(editor_keys::ADD_FINAL_MODIFIERS, "Add final Modifiers"),
                 command(editor_keys::AUTO_INDENT, "Auto-Indent Lines"),
                 MenuEntry::separator(),
                 command(workspace_keys::INSPECT_CODE, "Inspect Code..."),

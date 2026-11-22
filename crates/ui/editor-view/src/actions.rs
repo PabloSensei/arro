@@ -13,11 +13,19 @@ use lang_api::{
 use text_core::{Edit, RopeStore, TextStore, editing};
 use ui_kit::*;
 
+use crate::declaration::Declaration;
 use crate::semantic::{NO_ANSWER, first, offset_at, point_at, uri_path};
 use crate::view::{AiProblem, EditorEvent, EditorView};
 
 /// The caret rests this long before its occurrences are asked for.
 const HIGHLIGHT_DELAY: Duration = Duration::from_millis(250);
+
+/// The kind of the source action that Code → Sort Members runs.
+pub(crate) const SORT_MEMBERS_KIND: &str = "source.sortMembers";
+
+/// The kind of the source action that Code → Add final Modifiers runs. It changes the
+/// modifiers of the members, so it is a row of Code and not of Alt+Insert.
+pub(crate) const FINAL_MODIFIERS_KIND: &str = "source.generate.finalModifiers";
 
 /// A refactoring the editor runs itself, by the same code as its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +245,9 @@ pub(crate) struct ActionMenu {
     /// The wait for the server's actions while the server imports. Dropping the list ends
     /// the wait, so a list that closed never takes the actions of another place.
     pub waiting_task: Option<Task<()>>,
+    /// The question for the declaration at the caret, which the inline rows of the list wait
+    /// for. Dropping the list cancels it, so a closed list never takes the rows.
+    pub declaration_task: Option<Task<()>>,
     /// The heading of the list, for the menus that have one, such as Generate.
     pub title: Option<&'static str>,
 }
@@ -628,6 +639,7 @@ impl EditorView {
                 selected: 0,
                 preview_task: None,
                 waiting_task: None,
+                declaration_task: None,
                 title: None,
             });
             cx.notify();
@@ -874,16 +886,59 @@ impl EditorView {
                 let unknown = answer
                     .as_ref()
                     .is_none_or(|(_, confidence)| *confidence == Confidence::Unknown);
-                let mut rows = server_rows(answered_entries(answer));
+                let mut entries = answered_entries(answer);
+                // Inline rows wait for the declaration at the caret; the list does not wait.
+                let waiting = this.gate_inline(&mut entries);
+                let mut rows = server_rows(entries);
                 rows.extend(own);
+                if rows.is_empty() && !waiting.is_empty() {
+                    // The declaration decides the only rows there are, so the list waits for it.
+                    let task = this.ask_declaration(cx, move |this, declaration, cx| {
+                        let rows = if declaration == Declaration::Project {
+                            server_rows(waiting)
+                        } else {
+                            Vec::new()
+                        };
+                        if rows.is_empty() {
+                            if unknown {
+                                this.show_unanswered(caret, true, cx);
+                            } else {
+                                this.show_transient_note(caret, NO_ACTIONS, cx);
+                            }
+                        } else {
+                            this.show_action_sections(caret, rows, cx);
+                        }
+                    });
+                    if let Some(task) = task {
+                        task.detach();
+                    }
+                    return;
+                }
                 if rows.is_empty() {
                     if unknown {
                         this.show_unanswered(caret, true, cx);
                     } else {
                         this.show_transient_note(caret, NO_ACTIONS, cx);
                     }
+                    return;
+                }
+                // The question goes out before the list shows; the list does not wait for it.
+                let task = if waiting.is_empty() {
+                    None
                 } else {
-                    this.show_action_sections(caret, rows, cx);
+                    let version = this
+                        .state
+                        .as_ref()
+                        .map_or(0, |state| state.version() as i32);
+                    this.ask_declaration(cx, move |this, declaration, cx| {
+                        if declaration == Declaration::Project {
+                            this.join_declared_rows(caret, version, server_rows(waiting), cx);
+                        }
+                    })
+                };
+                this.show_action_sections(caret, rows, cx);
+                if let Some(task) = task {
+                    this.keep_declaration_task(Some(task));
                 }
             })
             .ok();
@@ -918,6 +973,7 @@ impl EditorView {
             selected: 0,
             preview_task: None,
             waiting_task: None,
+            declaration_task: None,
             title: None,
         });
         cx.notify();
@@ -981,6 +1037,8 @@ impl EditorView {
         answer: Option<(Vec<ActionEntry>, Confidence)>,
         cx: &mut Context<Self>,
     ) {
+        let mut entries = answered_entries(answer);
+        let waiting = self.gate_inline(&mut entries);
         if self
             .state
             .as_ref()
@@ -1000,7 +1058,7 @@ impl EditorView {
         let selected = menu.selected;
         // The rows are sorted by section again, as the list builds them: the sort is stable,
         // so the language's rows keep their order and come before the editor's rows.
-        let mut rows: Vec<(MenuSection, bool, Pick)> = server_rows(answered_entries(answer))
+        let mut rows: Vec<(MenuSection, bool, Pick)> = server_rows(entries)
             .into_iter()
             .map(|(section, pick)| (section, false, pick))
             .collect();
@@ -1018,6 +1076,14 @@ impl EditorView {
         menu.preview_task = None;
         cx.notify();
         self.request_action_preview(cx);
+        if !waiting.is_empty() {
+            let task = self.ask_declaration(cx, move |this, declaration, cx| {
+                if declaration == Declaration::Project {
+                    this.join_declared_rows(caret, version, server_rows(waiting), cx);
+                }
+            });
+            self.keep_declaration_task(task);
+        }
     }
 
     /// The change the selected row would make, in the current document, when the
@@ -1154,6 +1220,130 @@ impl EditorView {
             .ok();
         })
         .detach();
+    }
+
+    /// Runs a row of a list the way Enter does: an action whose edits come on resolve is
+    /// resolved first, and any other is applied at once.
+    fn apply_picked(&mut self, entry: ActionEntry, version: i32, cx: &mut Context<Self>) {
+        if entry.edits.is_empty() && entry.renames.is_empty() && entry.resolve.is_some() {
+            self.resolve_and_apply(entry, version, cx);
+        } else {
+            self.apply_entry(version, entry, cx);
+        }
+    }
+
+    /// Code → Sort Members and Add final Modifiers: the source action of the file with `code`,
+    /// run as Enter runs a row. A file the server gives no such action for says `missing` at
+    /// the caret.
+    pub(crate) fn source_action(
+        &mut self,
+        code: &'static str,
+        missing: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(span) = self.state.as_ref().map(|state| whole(&state.store())) else {
+            return;
+        };
+        let only = Some(ActionKind::Source);
+        self.ask_actions(
+            span,
+            only,
+            cx,
+            move |this, version, caret, entries, cx| match entries
+                .into_iter()
+                .find(|entry| entry.code.as_deref() == Some(code))
+            {
+                Some(entry) => this.apply_picked(entry, version, cx),
+                None => this.show_note(caret, missing, cx),
+            },
+        );
+    }
+
+    /// Takes the inline rows out of a language answer while the declaration at the caret is
+    /// not known. The rows the declaration allows stay in `entries`, the rows it does not
+    /// allow are dropped, and the rows of an unknown declaration are returned to wait for it.
+    pub(crate) fn gate_inline(&self, entries: &mut Vec<ActionEntry>) -> Vec<ActionEntry> {
+        if !entries.iter().any(is_inline_action) {
+            return Vec::new();
+        }
+        match self.known_declaration() {
+            Some(declaration) => {
+                if !declaration.offers_inline() {
+                    entries.retain(|entry| !is_inline_action(entry));
+                }
+                Vec::new()
+            }
+            None => {
+                let (waiting, kept): (Vec<ActionEntry>, Vec<ActionEntry>) = std::mem::take(entries)
+                    .into_iter()
+                    .partition(is_inline_action);
+                *entries = kept;
+                waiting
+            }
+        }
+    }
+
+    /// Adds the inline rows that the declaration allowed to the list that is open at the same
+    /// caret and text. They join the list the way the answer of a waiting list joins it: the
+    /// rows come first in their section, and the selection stays on its row.
+    fn join_declared_rows(
+        &mut self,
+        caret: usize,
+        version: i32,
+        rows: Vec<(MenuSection, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.version() as i32 != version)
+        {
+            return;
+        }
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let Some(menu) = &mut lsp.actions else {
+            return;
+        };
+        // Only the list of Alt+Enter: it has sections and no heading.
+        if menu.at != caret
+            || menu.title.is_some()
+            || !menu.has_sections()
+            || menu.rows.iter().any(Pick::is_waiting)
+        {
+            return;
+        }
+        let selected = menu.selected;
+        let mut all: Vec<(MenuSection, bool, Pick)> = rows
+            .into_iter()
+            .map(|(section, pick)| (section, false, pick))
+            .collect();
+        let sections = std::mem::take(&mut menu.sections);
+        all.extend(
+            std::mem::take(&mut menu.rows)
+                .into_iter()
+                .zip(sections)
+                .enumerate()
+                .map(|(row, (pick, section))| (section, row == selected, pick)),
+        );
+        all.sort_by_key(|(section, _, _)| *section != MenuSection::QuickFix);
+        menu.selected = all.iter().position(|(_, chosen, _)| *chosen).unwrap_or(0);
+        menu.sections = all.iter().map(|(section, _, _)| *section).collect();
+        menu.rows = all.into_iter().map(|(_, _, pick)| pick).collect();
+        menu.preview_task = None;
+        cx.notify();
+        self.request_action_preview(cx);
+    }
+
+    /// Keeps the question of a declaration in the list that waits for its answer. Closing the
+    /// list drops the task, and the question with it.
+    pub(crate) fn keep_declaration_task(&mut self, task: Option<Task<()>>) {
+        if let Some(lsp) = &mut self.lsp
+            && let Some(menu) = &mut lsp.actions
+        {
+            menu.declaration_task = task;
+        }
     }
 
     /// The rows of ALT+Enter that the window adds beside the language actions, such as
@@ -1467,14 +1657,7 @@ impl EditorView {
                 let version = self.state.as_ref().map(|state| state.version() as i32);
                 match (picked, version) {
                     (Some(Pick::Action(entry)), Some(version)) => {
-                        if entry.edits.is_empty()
-                            && entry.renames.is_empty()
-                            && entry.resolve.is_some()
-                        {
-                            self.resolve_and_apply(entry, version, cx);
-                        } else {
-                            self.apply_entry(version, entry, cx);
-                        }
+                        self.apply_picked(entry, version, cx)
                     }
                     (Some(Pick::ChangeSignature { .. }), _) => self.change_signature(cx),
                     (Some(Pick::Refactor { own, .. }), _) => self.run_own(own, cx),
@@ -1810,12 +1993,30 @@ const GENERATE_ROW_CODES: [&str; 6] = [
     "source.overrideMethods",
 ];
 
-/// The source actions of the language as rows of Alt+Insert. With the fixed rows of Source
-/// Generate (`fixed`), the actions those rows give are left out.
+/// Whether a source action is a part of Source Generate, which Alt+Insert lists: the kinds
+/// that write code. Code → Sort Members and Code → Add final Modifiers are other source
+/// actions, and the Code menu gives them.
+fn is_generate_kind(code: &str) -> bool {
+    code.starts_with("source.generate.") && code != FINAL_MODIFIERS_KIND
+}
+
+/// Whether a row of the server inlines a symbol: Inline Method, Inline Variable or Inline
+/// Constant. Whether it is offered depends on the declaration of the symbol.
+pub(crate) fn is_inline_action(entry: &ActionEntry) -> bool {
+    entry
+        .code
+        .as_deref()
+        .is_some_and(|code| code.starts_with("refactor.inline"))
+}
+
+/// The source actions of the language as rows of Alt+Insert: only the kinds of Source
+/// Generate. With the fixed rows of Source Generate (`fixed`), the actions those rows give
+/// are left out.
 pub(crate) fn source_rows(entries: Vec<ActionEntry>, fixed: bool) -> Vec<Pick> {
     entries
         .into_iter()
         .filter(|entry| entry.kind == Some(ActionKind::Source) && applicable(entry))
+        .filter(|entry| entry.code.as_deref().is_some_and(is_generate_kind))
         .filter(|entry| {
             let covered = entry
                 .code
@@ -2040,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_insert_lists_each_source_action_once() {
+    fn alt_insert_lists_only_the_generate_kinds_and_each_once() {
         use lang_api::{ActionEntry, ActionKind};
 
         let entry = |title: &str, kind: ActionKind, code: &str| ActionEntry {
@@ -2077,15 +2278,14 @@ mod tests {
         let labels = |rows: Vec<Pick>| -> Vec<String> {
             rows.iter().map(|pick| pick.label().to_owned()).collect()
         };
-        // The fixed rows of Source Generate give toString already.
-        assert_eq!(
-            labels(source_rows(answer(), true)),
-            ["Sort members", "Change modifiers"]
-        );
-        // Without them every source action is listed, but not Organize Imports.
+        // The fixed rows of Source Generate give toString already, and Sort Members and the
+        // final modifiers belong to Code, so nothing is left.
+        assert!(labels(source_rows(answer(), true)).is_empty());
+        // Without the fixed rows the generate kind is listed; neither Organize Imports nor the
+        // other source actions are.
         assert_eq!(
             labels(source_rows(answer(), false)),
-            ["Generate toString()", "Sort members", "Change modifiers"]
+            ["Generate toString()"]
         );
     }
 

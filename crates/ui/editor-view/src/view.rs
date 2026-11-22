@@ -3204,6 +3204,11 @@ impl EditorView {
         self.project_root = root;
     }
 
+    /// The root of the project the file belongs to, when the window knows it.
+    pub fn project_root(&self) -> Option<&Path> {
+        self.project_root.as_deref()
+    }
+
     fn apply_zoom(&mut self) {
         let base = self.base_style.clone();
         self.style = EditorStyle {
@@ -4738,6 +4743,20 @@ impl EditorView {
             }
             actions::REFORMAT => return self.reformat(cx),
             actions::OPTIMIZE_IMPORTS => return self.optimize_imports(cx),
+            actions::SORT_MEMBERS => {
+                return self.source_action(
+                    crate::actions::SORT_MEMBERS_KIND,
+                    "Nothing to sort here",
+                    cx,
+                );
+            }
+            actions::ADD_FINAL_MODIFIERS => {
+                return self.source_action(
+                    crate::actions::FINAL_MODIFIERS_KIND,
+                    "Nothing to change to final here",
+                    cx,
+                );
+            }
             actions::SHOW_ACTIONS => return self.show_actions(cx),
             actions::FIND_USAGES => return self.find_usages(cx),
             actions::SHOW_USAGES => return self.show_usages(cx),

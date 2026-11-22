@@ -488,6 +488,10 @@ impl LanguageSupport for JavaProject {
         Some(&self.library_sources)
     }
 
+    fn describe_library_uri(&self, uri: &str) -> Option<lang_api::LibraryPlace> {
+        crate::library_place::describe(uri)
+    }
+
     fn format(&self) -> Option<&FormatProvider> {
         Some(self.providers.as_ref())
     }

@@ -40,9 +40,6 @@ pub enum ClusterState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KubeContext {
     pub name: String,
-    pub cluster: String,
-    /// The namespace the context starts in; empty when the file leaves it out.
-    pub namespace: String,
     pub current: bool,
 }
 
@@ -227,8 +224,6 @@ struct ConfigContext {
 
 #[derive(Default, Deserialize)]
 struct ConfigContextBody {
-    #[serde(default)]
-    cluster: String,
     #[serde(default)]
     namespace: String,
 }
@@ -426,21 +421,49 @@ impl Kubectl {
     }
 
     /// Works with a cluster that does not answer: the contexts are entries of the
-    /// kubeconfig.
+    /// kubeconfig, and these calls never reach the server.
     pub fn contexts(&self) -> Result<Vec<KubeContext>, String> {
+        let names = self.run(&["config", "get-contexts", "-o", "name"])?;
+        let current = self.run(&["config", "current-context"])?;
+        let current = self
+            .context
+            .clone()
+            .unwrap_or_else(|| current.trim().to_owned());
+        Ok(names
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| KubeContext {
+                current: name == current,
+                name: name.to_owned(),
+            })
+            .collect())
+    }
+
+    /// The namespace the current context starts in; empty when the kubeconfig leaves it
+    /// out. The kubeconfig holds it, so the call answers while the cluster is down.
+    pub fn current_namespace(&self) -> Result<String, String> {
         let text = self.run(&["config", "view", "-o", "json"])?;
         let view: ConfigView =
             serde_json::from_str(text.trim()).map_err(|error| format!("kubeconfig: {error}"))?;
+        let current = self.context.as_deref().unwrap_or(&view.current_context);
         Ok(view
             .contexts
-            .into_iter()
-            .map(|context| KubeContext {
-                current: context.name == view.current_context,
-                name: context.name,
-                cluster: context.context.cluster,
-                namespace: context.context.namespace,
-            })
-            .collect())
+            .iter()
+            .find(|context| context.name == current)
+            .map(|context| context.context.namespace.clone())
+            .unwrap_or_default())
+    }
+
+    /// Writes the current context of the kubeconfig. Like the reads above, it never reaches
+    /// the server, so a dead cluster does not keep the user on it.
+    pub fn use_context(&self, name: &str) -> Result<(), String> {
+        // `--context` names the context a call talks to, not one to write: a stale value
+        // of the panel must not travel with this call.
+        self.clone()
+            .with_context(None)
+            .run(&["config", "use-context", name])
+            .map(drop)
     }
 
     pub fn namespaces(&self) -> Result<Vec<String>, String> {

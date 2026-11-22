@@ -530,6 +530,8 @@ pub fn register(
             editor_keys::CONVERT_INDENTS_TO_TABS,
             "Convert Indents to Tabs",
         ),
+        (editor_keys::SORT_MEMBERS, "Sort Members"),
+        (editor_keys::ADD_FINAL_MODIFIERS, "Add final Modifiers"),
     ] {
         workspace.register_command(id, title, move |workspace, _, cx| {
             if let Some(view) = workspace

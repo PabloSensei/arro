@@ -88,6 +88,7 @@ pub use profile::{
     ProfileSamples, ProfileSnapshot, ProfileType, ProfileTypeTree, ProfileUnit, bytes_text,
 };
 pub use run_points::{RunPoint, RunPointKind, RunPointQuery, RunPointsProvider};
+pub use semantic::LibraryPlace;
 pub use semantic::{
     ActionApplyProvider, ActionApplyRequest, ActionChoice, ActionEntry, ActionField, ActionKind,
     ActionMember, ActionOutcome, ActionParameters, ActionParametersProvider, ActionParametersQuery,

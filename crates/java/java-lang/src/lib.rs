@@ -15,6 +15,7 @@ mod hover_place;
 mod inspections;
 mod jshell;
 mod language;
+mod library_place;
 mod live_templates;
 mod lombok;
 mod members;

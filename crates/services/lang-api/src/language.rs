@@ -580,4 +580,11 @@ pub trait LanguageSupport: Send + Sync {
         let _ = (text, name, root, folder);
         None
     }
+
+    /// The place a library address names, such as a class of a jar, or `None` for any
+    /// other address. The editor opens the links to such places through the language.
+    fn describe_library_uri(&self, uri: &str) -> Option<crate::LibraryPlace> {
+        let _ = uri;
+        None
+    }
 }

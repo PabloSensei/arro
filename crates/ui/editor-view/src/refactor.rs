@@ -16,6 +16,7 @@ use text_core::{EditKind, TextStore};
 use ui_kit::*;
 
 use crate::actions::{Own, Pick};
+use crate::declaration::Declaration;
 use crate::rename::{
     NOT_READY, PrepareOutcome, REFUSED, RenameInPlace, WAITING_FOR_LANGUAGE, can_rename_in_place,
     prepare_outcome,
@@ -538,6 +539,23 @@ const EXTRACTION_PLACES: [(&str, usize); 8] = [
     ("refactor.extract.interface", 6),
     ("refactor.extract.superclass", 7),
 ];
+
+/// The note of Ctrl+Alt+N at a declaration of a library. The word is the kind the server's
+/// inline row names; a method when no row names one.
+fn library_inline_message(entries: &[ActionEntry]) -> String {
+    let title = entries
+        .iter()
+        .find(|entry| crate::actions::is_inline_action(entry))
+        .map_or_else(String::new, |entry| entry.title.to_lowercase());
+    let kind = if title.contains("constant") {
+        "constant"
+    } else if title.contains("variable") {
+        "variable"
+    } else {
+        "method"
+    };
+    format!("Cannot inline a {kind} of a library")
+}
 
 /// The group and the place of a row of the server, by the kind of its action. A kind that
 /// no group names goes to the end of its group, or of the list.
@@ -2432,7 +2450,8 @@ impl EditorView {
             .collect();
         self.ask_actions(span, only, cx, move |this, _, caret, entries, cx| {
             let mut codes = Vec::new();
-            let mut rows: Vec<(RefactorGroup, usize, Pick)> = Vec::new();
+            // Each row says whether it inlines a symbol: those rows wait for the declaration.
+            let mut rows: Vec<(RefactorGroup, usize, Pick, bool)> = Vec::new();
             for mut entry in entries {
                 let code = entry.code.clone().unwrap_or_default();
                 codes.push(code.clone());
@@ -2441,55 +2460,165 @@ impl EditorView {
                 if code.starts_with("refactor.move") {
                     continue;
                 }
+                let inline = code.starts_with("refactor.inline");
                 let (group, place) = server_place(&code);
                 entry.title = menu_label(&entry.title);
                 if code.starts_with("refactor.change.signature") {
-                    rows.push((group, place, Pick::ChangeSignature { label: entry.title }));
+                    let pick = Pick::ChangeSignature { label: entry.title };
+                    rows.push((group, place, pick, inline));
                     continue;
                 }
                 if let Some(handle) = entry.handle {
-                    rows.push((
-                        group,
-                        place,
-                        Pick::Form {
-                            label: entry.title,
-                            handle,
-                        },
-                    ));
+                    let pick = Pick::Form {
+                        label: entry.title,
+                        handle,
+                    };
+                    rows.push((group, place, pick, inline));
                     continue;
                 }
                 if !entry.edits.is_empty() || !entry.renames.is_empty() {
-                    rows.push((group, place, Pick::Action(entry)));
+                    rows.push((group, place, Pick::Action(entry), inline));
                 }
             }
             // The editor's own refactorings take their place in their group, and only when
-            // the server named no action of that kind.
+            // the server named no action of that kind. Its Inline waits for the declaration too.
             for ((own, label, _, _, code), hint) in own.into_iter().zip(hints) {
                 if code.is_some_and(|code| codes.iter().any(|known| known.starts_with(code))) {
                     continue;
                 }
                 let (group, place) = own_place(own);
-                rows.push((
-                    group,
-                    place,
-                    Pick::Refactor {
-                        label: menu_label(label),
-                        hint,
-                        own,
-                    },
-                ));
+                let pick = Pick::Refactor {
+                    label: menu_label(label),
+                    hint,
+                    own,
+                };
+                rows.push((group, place, pick, own == Own::Inline));
             }
-            // The sort is stable: a row keeps the order the server gave it in its group.
-            rows.sort_by_key(|(group, place, _)| (*group, *place));
-            let listed = !rows.is_empty();
-            let groups: Vec<usize> = rows.iter().map(|(group, _, _)| *group as usize).collect();
-            let picks: Vec<Pick> = rows.into_iter().map(|(_, _, pick)| pick).collect();
-            this.show_picks(caret, picks, "No refactorings here", cx);
-            if listed && let Some(menu) = this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
-                menu.title = Some("Refactor This");
-                menu.groups = groups;
+            let (inline_rows, rest): (Vec<_>, Vec<_>) =
+                rows.into_iter().partition(|(_, _, _, inline)| *inline);
+            let rest: Vec<(RefactorGroup, usize, Pick)> = rest
+                .into_iter()
+                .map(|(group, place, pick, _)| (group, place, pick))
+                .collect();
+            let inline_rows: Vec<(RefactorGroup, usize, Pick)> = inline_rows
+                .into_iter()
+                .map(|(group, place, pick, _)| (group, place, pick))
+                .collect();
+            // A language with no navigation keeps its rows. Otherwise the rows of an inline
+            // refactoring wait for the declaration at the caret, and the list opens without them.
+            let (shown, waiting) = match this.known_declaration() {
+                Some(declaration) if declaration.offers_inline() => {
+                    let mut shown = rest;
+                    shown.extend(inline_rows);
+                    (shown, Vec::new())
+                }
+                Some(_) => (rest, Vec::new()),
+                None if rest.is_empty() => (Vec::new(), inline_rows),
+                None => (rest, inline_rows),
+            };
+            if shown.is_empty() && !waiting.is_empty() {
+                // Nothing else to list: the list waits for the declaration instead of saying
+                // that there is no refactoring.
+                let task = this.ask_declaration(cx, move |this, declaration, cx| {
+                    let rows = if declaration == Declaration::Project {
+                        waiting
+                    } else {
+                        Vec::new()
+                    };
+                    this.show_refactor_rows(caret, rows, cx);
+                });
+                if let Some(task) = task {
+                    task.detach();
+                }
+                return;
+            }
+            // The question goes out before the list shows; the list does not wait for it.
+            let task = if waiting.is_empty() {
+                None
+            } else {
+                let version = this
+                    .state
+                    .as_ref()
+                    .map_or(0, |state| state.version() as i32);
+                this.ask_declaration(cx, move |this, declaration, cx| {
+                    if declaration == Declaration::Project {
+                        this.join_declared_refactorings(caret, version, waiting, cx);
+                    }
+                })
+            };
+            this.show_refactor_rows(caret, shown, cx);
+            if let Some(task) = task {
+                this.keep_declaration_task(Some(task));
             }
         });
+    }
+
+    /// Shows the rows of Refactor This in their groups, with the heading and the separators
+    /// of the list. The sort is stable: a row keeps the order the server gave it in its group.
+    fn show_refactor_rows(
+        &mut self,
+        caret: usize,
+        mut rows: Vec<(RefactorGroup, usize, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        rows.sort_by_key(|(group, place, _)| (*group, *place));
+        let listed = !rows.is_empty();
+        let groups: Vec<usize> = rows.iter().map(|(group, _, _)| *group as usize).collect();
+        let picks: Vec<Pick> = rows.into_iter().map(|(_, _, pick)| pick).collect();
+        self.show_picks(caret, picks, "No refactorings here", cx);
+        if listed && let Some(menu) = self.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+            menu.title = Some("Refactor This");
+            menu.groups = groups;
+        }
+    }
+
+    /// Adds the inline rows that the declaration allowed to the Refactor This list that is open
+    /// at the same caret and text. A row of the server's Inline comes last: its place is the
+    /// end of its group, and the group is the last of the list. The editor's own Inline comes
+    /// first in its group, which is its place.
+    fn join_declared_refactorings(
+        &mut self,
+        caret: usize,
+        version: i32,
+        rows: Vec<(RefactorGroup, usize, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.version() as i32 != version)
+        {
+            return;
+        }
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let Some(menu) = &mut lsp.actions else {
+            return;
+        };
+        if menu.at != caret
+            || menu.title != Some("Refactor This")
+            || menu.rows.iter().any(Pick::is_waiting)
+        {
+            return;
+        }
+        for (group, place, pick) in rows {
+            let len = menu.groups.len();
+            let index = if place == usize::MAX {
+                len
+            } else {
+                menu.groups
+                    .iter()
+                    .position(|known| *known >= group as usize)
+                    .unwrap_or(len)
+            };
+            menu.rows.insert(index, pick);
+            menu.groups.insert(index, group as usize);
+            if index <= menu.selected {
+                menu.selected += 1;
+            }
+        }
+        cx.notify();
     }
 
     /// Ctrl+Alt+M, V, F, C, P and Ctrl+Alt+N: the action of that kind for the selection.
@@ -2584,7 +2713,8 @@ impl EditorView {
     }
 
     /// The action of the refactoring for the span, which an extract with a choice of
-    /// expressions takes from the row the user picked.
+    /// expressions takes from the row the user picked. Inline of a declaration in a library
+    /// says so at the caret instead of running.
     pub(crate) fn refactor_span(
         &mut self,
         refactoring: Refactoring,
@@ -2593,96 +2723,126 @@ impl EditorView {
     ) {
         let only = Some(ActionKind::Refactor);
         self.ask_actions(span, only, cx, move |this, version, caret, entries, cx| {
-            let mut found: Vec<ActionEntry> = entries
-                .into_iter()
-                .filter(|entry| {
-                    entry
-                        .code
-                        .as_deref()
-                        .is_some_and(|code| code.starts_with(refactoring.code()))
-                })
-                .collect();
-            match found.len() {
-                0 => this.show_note(caret, refactoring.missing(), cx),
-                1 => {
-                    let entry = found.remove(0);
-                    if let Some(handle) = entry.handle {
-                        cx.emit(EditorEvent::RefactorForm(handle));
-                        return;
-                    }
-                    this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
-                }
-                _ => {
-                    // An extract of a value has two rows of the server, this place and
-                    // every place: they say what they replace before they run.
-                    let replacing = refactoring == Refactoring::ExtractVariable
-                        && found.iter().all(|entry| {
-                            entry
-                                .code
-                                .as_deref()
-                                .is_some_and(|code| code.starts_with("refactor.extract.variable"))
-                        });
-                    if replacing {
-                        let all = found
-                            .iter()
-                            .position(|entry| entry.title.to_lowercase().contains("all"));
-                        let places = all.map_or(0, |row| replaced_places(&found[row]));
-                        if places == 1 {
-                            // One occurrence has no choice to make: the row of this
-                            // place runs and the name of the new variable is typed
-                            // over, as IDEA goes straight to the name.
-                            let this_row = found
-                                .iter()
-                                .position(|entry| !entry.title.to_lowercase().contains("all"))
-                                .or(all)
-                                .unwrap_or(0);
-                            let entry = found.swap_remove(this_row);
-                            if let Some(handle) = entry.handle {
-                                cx.emit(EditorEvent::RefactorForm(handle));
-                                return;
-                            }
-                            this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
+            let choose = move |this: &mut Self,
+                               entries: Vec<ActionEntry>,
+                               cx: &mut Context<Self>| {
+                let mut found: Vec<ActionEntry> = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        entry
+                            .code
+                            .as_deref()
+                            .is_some_and(|code| code.starts_with(refactoring.code()))
+                    })
+                    .collect();
+                match found.len() {
+                    0 => this.show_note(caret, refactoring.missing(), cx),
+                    1 => {
+                        let entry = found.remove(0);
+                        if let Some(handle) = entry.handle {
+                            cx.emit(EditorEvent::RefactorForm(handle));
                             return;
                         }
+                        this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
                     }
-                    let mut all = false;
-                    let rows = found
-                        .into_iter()
-                        .filter_map(|entry| {
-                            let mut entry = entry;
-                            if replacing {
-                                let every = entry.title.to_lowercase().contains("all");
-                                if every && all {
-                                    return None;
+                    _ => {
+                        // An extract of a value has two rows of the server, this place and
+                        // every place: they say what they replace before they run.
+                        let replacing = refactoring == Refactoring::ExtractVariable
+                            && found.iter().all(|entry| {
+                                entry.code.as_deref().is_some_and(|code| {
+                                    code.starts_with("refactor.extract.variable")
+                                })
+                            });
+                        if replacing {
+                            let all = found
+                                .iter()
+                                .position(|entry| entry.title.to_lowercase().contains("all"));
+                            let places = all.map_or(0, |row| replaced_places(&found[row]));
+                            if places == 1 {
+                                // One occurrence has no choice to make: the row of this
+                                // place runs and the name of the new variable is typed
+                                // over, as IDEA goes straight to the name.
+                                let this_row = found
+                                    .iter()
+                                    .position(|entry| !entry.title.to_lowercase().contains("all"))
+                                    .or(all)
+                                    .unwrap_or(0);
+                                let entry = found.swap_remove(this_row);
+                                if let Some(handle) = entry.handle {
+                                    cx.emit(EditorEvent::RefactorForm(handle));
+                                    return;
                                 }
-                                all |= every;
-                                entry.title = if every {
-                                    format!("Replace all {} occurrences", replaced_places(&entry))
-                                } else {
-                                    "Replace this occurrence only".to_owned()
-                                };
+                                this.apply_entry_labeled(
+                                    version,
+                                    entry,
+                                    Some(refactoring.label()),
+                                    cx,
+                                );
+                                return;
                             }
-                            match entry.handle {
-                                Some(handle) => Some(Pick::Form {
-                                    label: entry.title,
-                                    handle,
-                                }),
-                                None if !entry.edits.is_empty() || !entry.renames.is_empty() => {
-                                    Some(Pick::Action(entry))
-                                }
-                                None => None,
-                            }
-                        })
-                        .collect();
-                    this.show_picks(caret, rows, refactoring.missing(), cx);
-                    if replacing {
-                        if let Some(menu) = this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
-                            menu.title = Some("Multiple occurrences found");
                         }
-                        this.highlight_action_row();
-                        cx.notify();
+                        let mut all = false;
+                        let rows = found
+                            .into_iter()
+                            .filter_map(|entry| {
+                                let mut entry = entry;
+                                if replacing {
+                                    let every = entry.title.to_lowercase().contains("all");
+                                    if every && all {
+                                        return None;
+                                    }
+                                    all |= every;
+                                    entry.title = if every {
+                                        format!(
+                                            "Replace all {} occurrences",
+                                            replaced_places(&entry)
+                                        )
+                                    } else {
+                                        "Replace this occurrence only".to_owned()
+                                    };
+                                }
+                                match entry.handle {
+                                    Some(handle) => Some(Pick::Form {
+                                        label: entry.title,
+                                        handle,
+                                    }),
+                                    None if !entry.edits.is_empty()
+                                        || !entry.renames.is_empty() =>
+                                    {
+                                        Some(Pick::Action(entry))
+                                    }
+                                    None => None,
+                                }
+                            })
+                            .collect();
+                        this.show_picks(caret, rows, refactoring.missing(), cx);
+                        if replacing {
+                            if let Some(menu) =
+                                this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut())
+                            {
+                                menu.title = Some("Multiple occurrences found");
+                            }
+                            this.highlight_action_row();
+                            cx.notify();
+                        }
                     }
                 }
+            };
+            if refactoring != Refactoring::Inline {
+                choose(this, entries, cx);
+                return;
+            }
+            let message = library_inline_message(&entries);
+            let task = this.with_declaration(cx, move |this, declaration, cx| {
+                if declaration == Declaration::Library {
+                    this.show_note(caret, message, cx);
+                } else {
+                    choose(this, entries, cx);
+                }
+            });
+            if let Some(task) = task {
+                task.detach();
             }
         });
     }

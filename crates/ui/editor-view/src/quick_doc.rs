@@ -1965,7 +1965,7 @@ impl EditorView {
             return;
         }
         let (uri, line) = split_line_fragment(&url);
-        if !uri.starts_with("file:") && !uri.starts_with("jdt:") {
+        if !uri.starts_with("file:") && self.library_place(&uri, cx).is_none() {
             return;
         }
         let point = TextPoint { line, character: 0 };

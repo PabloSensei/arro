@@ -160,6 +160,19 @@ pub struct HoverPlace {
     pub place: String,
 }
 
+/// The place a library address names, such as a class of a jar or of the JDK, for the
+/// header of a definition and for the links that open the class.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibraryPlace {
+    /// The name of the class, without its extension.
+    pub name: String,
+    /// The package or the module the class is in, empty when it has neither.
+    pub container: String,
+    /// Whether the address names a library of the language rather than a file of the
+    /// project.
+    pub library: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymbolEntry {
     pub name: String,

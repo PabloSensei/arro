@@ -101,10 +101,9 @@ fn quick_definition_has_a_header_and_coloured_code(cx: &mut TestAppContext) {
 
     let shown = shown(cx, window, &use_path);
     assert_eq!(shown.name, "Person.json", "the header names the file");
-    assert!(
-        shown.folder.ends_with("/src"),
-        "the header shows the folder: {}",
-        shown.folder
+    assert_eq!(
+        shown.folder, "src",
+        "the header shows the folder from the root of the project"
     );
 }
 

@@ -9,6 +9,7 @@ mod bookmarks;
 mod bundle;
 mod code_lens;
 mod completion_usage;
+mod declaration;
 mod decor;
 mod delete;
 mod element;

@@ -413,10 +413,8 @@ fn alt_insert_of_a_class_lists_the_source_actions_after_the_rows_of_source_gener
             "toString()",
             "Override Methods",
             "Implement Methods",
-            "Sort members",
-            "Change modifiers to final where possible",
         ],
         "the rows of Source Generate come first; the server's toString is not listed twice, \
-         and Organize Imports stays out"
+         and Sort Members, the final modifiers and Organize Imports stay out: they are Code rows"
     );
 }

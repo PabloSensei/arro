@@ -1,11 +1,12 @@
 //! Ctrl+O, Ctrl+I, Ctrl+Alt+H, Ctrl+Shift+B, Ctrl+Shift+I and Ctrl+Alt+Shift+C: the
 //! structure of the code around the caret, as the language describes it.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use lang_api::{
-    AddOverridableMethodsRequest, Confidence, DefinitionPreviewQuery, DocumentSpot, NavigationKind,
-    NavigationQuery, OverridableMethod, OverridableMethodsQuery, ReferenceQuery, SourceSpan, ask,
+    AddOverridableMethodsRequest, Confidence, DefinitionPreviewQuery, DocumentSpot,
+    LanguageSupport, NavigationKind, NavigationQuery, OverridableMethod, OverridableMethodsQuery,
+    ReferenceQuery, SourceSpan, ask,
 };
 use syntax::HighlightSpan;
 use ui_kit::metrics::*;
@@ -145,8 +146,9 @@ impl OverridePopup {
 
 /// The most lines of a definition the popup shows before it scrolls.
 const DEFINITION_MAX_LINES: usize = 20;
-/// The narrowest the popup gets.
-const DEFINITION_MIN_WIDTH: f32 = 240.;
+/// The narrowest the popup gets: the header and a few lines of code fit, as they do in
+/// the definition window of the reference IDE.
+const DEFINITION_MIN_WIDTH: f32 = 480.;
 /// The lowest the code area of the popup gets when the user drags its corner.
 const DEFINITION_MIN_HEIGHT: f32 = 32.;
 /// The width of one character of the code font of the popup, as a part of its size.
@@ -190,8 +192,13 @@ pub(crate) struct DefinitionHeader {
 }
 
 /// The name and the package or folder a definition comes from. A class of a jar or of
-/// the JDK has no file, so its header names the class and the package of its URI.
-fn definition_header(target: Option<&SourceSpan>) -> DefinitionHeader {
+/// the JDK has no file, so its header names the class and the package the language gives it.
+fn definition_header(
+    target: Option<&SourceSpan>,
+    library: Option<lang_api::LibraryPlace>,
+    root: Option<&Path>,
+    support: Option<&dyn LanguageSupport>,
+) -> DefinitionHeader {
     let Some(target) = target else {
         return DefinitionHeader {
             name: "Definition".to_owned(),
@@ -200,24 +207,12 @@ fn definition_header(target: Option<&SourceSpan>) -> DefinitionHeader {
             class: false,
         };
     };
-    if let Some(rest) = target.uri.strip_prefix("jdt://") {
-        let parts: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
-        let last = parts.last().copied().unwrap_or("Definition");
-        let name = last.strip_suffix(".class").unwrap_or(last).to_owned();
-        // `contents/<module>/<package>/<Class>.class`: the package is what stands
-        // between the module and the class.
-        let folder = if parts.len() >= 3 && parts.first() == Some(&"contents") {
-            parts[2..parts.len() - 1].join(".")
-        } else if parts.len() >= 2 {
-            parts[..parts.len() - 1].join(".")
-        } else {
-            String::new()
-        };
+    if let Some(place) = library {
         return DefinitionHeader {
-            name: name.clone(),
-            folder,
-            icon_path: PathBuf::from(format!("{name}.class")),
-            class: true,
+            icon_path: PathBuf::from(format!("{}.class", place.name)),
+            name: place.name,
+            folder: place.container,
+            class: place.library,
         };
     }
     if let Some(path) = uri_path(&target.uri) {
@@ -225,9 +220,7 @@ fn definition_header(target: Option<&SourceSpan>) -> DefinitionHeader {
             || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let folder = path.parent().map_or_else(String::new, |folder| {
-            folder.display().to_string().replace('\\', "/")
-        });
+        let folder = definition_folder(&path, root, support);
         return DefinitionHeader {
             name,
             folder,
@@ -249,6 +242,84 @@ fn definition_header(target: Option<&SourceSpan>) -> DefinitionHeader {
     }
 }
 
+/// The folder of a file: from the root of the project, or, for a file outside it, the
+/// package the language gives its folder, as a class of a library shows one. The header
+/// never shows the disk.
+fn definition_folder(
+    path: &Path,
+    root: Option<&Path>,
+    support: Option<&dyn LanguageSupport>,
+) -> String {
+    let folder = path.parent().unwrap_or(path);
+    if let Some(root) = root
+        && let Some(relative) = relative_to(folder, root)
+    {
+        return path_text(&relative);
+    }
+    if let Some(package) = support.and_then(|support| support.package_of(folder)) {
+        let package = package.trim();
+        // A package has no part of a disk in it; a language that answers with a folder
+        // falls through to the folders below, which never show one either.
+        if !package.is_empty() && !package.contains(['/', '\\', ':']) {
+            return package.to_owned();
+        }
+    }
+    let parts: Vec<String> = folder
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    parts.join(".")
+}
+
+/// `path` below `root`. A `file:` URI spells the drive letter in upper case, while the
+/// root of the launch may keep the one it was opened with, so Windows compares the two
+/// without case.
+fn relative_to(path: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    let parts: Vec<Component<'_>> = path.components().collect();
+    let count = root.components().count();
+    if parts.len() < count {
+        return None;
+    }
+    let same = parts.iter().zip(root.components()).all(|(part, root)| {
+        part.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&root.as_os_str().to_string_lossy())
+    });
+    same.then(|| parts[count..].iter().collect())
+}
+
+/// A path with the separators of the window, never the ones of the disk.
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// `text` cut in the middle with an ellipsis, when it is longer than `max` characters.
+fn shorten_middle(text: &str, max: usize) -> String {
+    let length = text.chars().count();
+    if length <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return "…".to_owned();
+    }
+    let keep = max - 1;
+    let front = keep / 3;
+    let back = keep - front;
+    let mut shortened: String = text.chars().take(front).collect();
+    shortened.push('…');
+    shortened.extend(text.chars().skip(length - back));
+    shortened
+}
+
 /// The icon of the header: the one the application gives the file, or a generic one.
 fn definition_icon(header: &DefinitionHeader, cx: &App) -> &'static str {
     cx.try_global::<FileIcon>().map_or_else(
@@ -261,6 +332,18 @@ fn definition_icon(header: &DefinitionHeader, cx: &App) -> &'static str {
         },
         |icons| (icons.0)(&header.icon_path),
     )
+}
+
+/// The width of the header without its folder: the icon, the file name and the button.
+fn definition_header_width(header: &DefinitionHeader, style: &EditorStyle) -> f32 {
+    let name = header.name.chars().count() as f32 * style.font_size * DEFINITION_CHAR;
+    let edit = "Edit Source".chars().count() as f32 * UI_SIZE * DEFINITION_CHAR + SPACE_S * 2.;
+    SPACE_S * 2. + ICON + SPACE_XS * 3. + name + edit
+}
+
+/// How many characters of the folder fit in the header of `width`.
+fn definition_folder_chars(header_width: f32, width: f32) -> usize {
+    ((width - header_width - SPACE_M) / (UI_SIZE * DEFINITION_CHAR)).floor() as usize
 }
 
 /// One run of a row of the definition popup: its text and its colour.
@@ -300,13 +383,19 @@ pub struct DefinitionRowView {
 }
 
 /// The rows of the definition popup: the lines of the text split by the colours of its
-/// spans, numbered from the line of the declaration.
-fn definition_rows(popup: &DefinitionPopup, style: &EditorStyle) -> Vec<DefinitionRow> {
+/// spans, numbered from the line of the declaration. The indent every line shares is
+/// dropped; the rest of the indent stays, and a tab takes the width it has in the editor.
+fn definition_rows(
+    popup: &DefinitionPopup,
+    style: &EditorStyle,
+    tab_width: usize,
+) -> Vec<DefinitionRow> {
     let text = popup.text.trim_end_matches('\n');
     let first = popup
         .target
         .as_ref()
         .map_or(1, |target| target.span.start.line as usize + 1);
+    let indent = common_indent(text);
     let mut rows = Vec::new();
     let mut line_start = 0;
     for (index, line) in text.split('\n').enumerate() {
@@ -343,6 +432,9 @@ fn definition_rows(popup: &DefinitionPopup, style: &EditorStyle) -> Vec<Definiti
                 color: style.code,
             });
         }
+        let kept = indent.min(line.len() - line.trim_start_matches([' ', '\t']).len());
+        strip_runs(&mut runs, kept);
+        expand_tabs(&mut runs, tab_width);
         rows.push(DefinitionRow {
             number: first + index,
             runs,
@@ -350,6 +442,69 @@ fn definition_rows(popup: &DefinitionPopup, style: &EditorStyle) -> Vec<Definiti
         line_start = line_end + 1;
     }
     rows
+}
+
+/// The prefix of spaces and tabs every non-empty line of `text` starts with.
+fn common_indent(text: &str) -> usize {
+    let mut common: Option<&str> = None;
+    for line in text.split('\n') {
+        if line.trim_matches([' ', '\t']).is_empty() {
+            continue;
+        }
+        let length = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let indent = &line[..length];
+        common = Some(match common {
+            None => indent,
+            Some(common) => {
+                let shared = common
+                    .bytes()
+                    .zip(indent.bytes())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                &common[..shared]
+            }
+        });
+    }
+    common.map_or(0, str::len)
+}
+
+/// Drops `prefix` bytes, the shared indent, from the start of the runs of a row.
+fn strip_runs(runs: &mut Vec<DefinitionRun>, mut prefix: usize) {
+    while prefix > 0 {
+        let Some(first) = runs.first_mut() else {
+            return;
+        };
+        let take = prefix.min(first.text.len());
+        first.text.drain(..take);
+        prefix -= take;
+        if first.text.is_empty() {
+            runs.remove(0);
+        }
+    }
+}
+
+/// Replaces a tab with the spaces up to the next stop, as the rows of the editor do.
+fn expand_tabs(runs: &mut [DefinitionRun], tab_width: usize) {
+    let tab_width = tab_width.max(1);
+    let mut column = 0;
+    for run in runs {
+        if !run.text.contains('\t') {
+            column += run.text.chars().count();
+            continue;
+        }
+        let mut text = String::with_capacity(run.text.len());
+        for character in run.text.chars() {
+            if character == '\t' {
+                let spaces = tab_width - column % tab_width;
+                text.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            } else {
+                text.push(character);
+                column += 1;
+            }
+        }
+        run.text = text;
+    }
 }
 
 /// The language of a definition: the language of its file, or the language of the editor
@@ -759,23 +914,36 @@ impl EditorView {
     ) -> Option<AnyElement> {
         let theme = *cx.global::<Theme>();
         let style = &self.style;
-        let rows = definition_rows(popup, style);
-        let header = definition_header(popup.target.as_ref());
+        let rows = definition_rows(popup, style, self.tab_width());
+        let library = popup
+            .target
+            .as_ref()
+            .and_then(|target| self.library_place(&target.uri, cx));
+        let header = definition_header(
+            popup.target.as_ref(),
+            library,
+            self.project_root(),
+            self.lsp.as_ref().map(|lsp| lsp.support.as_ref()),
+        );
         let icon = definition_icon(&header, cx);
         let (max_width, max_height) = self.definition_resize_limits();
         let char_width = style.font_size * DEFINITION_CHAR;
         let digits = rows.last().map_or(1, |row| row.number.to_string().len());
-        let gutter = digits as f32 * char_width + SPACE_S + SPACE_XS;
+        let number_width = digits as f32 * char_width;
+        let gutter = number_width + SPACE_M;
         let widest = rows
             .iter()
             .map(|row| row.runs.iter().map(|run| run.text.chars().count()).sum())
             .max()
             .unwrap_or(0);
-        let natural = widest as f32 * char_width + gutter + SPACE_M * 2. + SPACE_S;
+        let header_width = definition_header_width(&header, style);
+        let natural = (widest as f32 * char_width + gutter + SPACE_M * 2. + SPACE_S)
+            .max(header_width + SPACE_M);
         let width = popup
             .size
             .map_or(natural, |size| size.0)
             .clamp(DEFINITION_MIN_WIDTH, max_width);
+        let folder = shorten_middle(&header.folder, definition_folder_chars(header_width, width));
         let cap = popup
             .size
             .map_or(DEFINITION_MAX_LINES as f32 * style.line_height, |size| {
@@ -790,7 +958,7 @@ impl EditorView {
             .debug_selector(|| "quick-definition-rows".to_owned())
             .flex()
             .flex_col();
-        for row in &rows {
+        for (index, row) in rows.iter().enumerate() {
             let mut runs = Vec::new();
             for run in &row.runs {
                 if run.text.is_empty() {
@@ -815,12 +983,19 @@ impl EditorView {
                             .flex()
                             .flex_none()
                             .justify_end()
-                            .w(px(gutter))
-                            .pr(px(SPACE_S))
+                            .w(px(number_width))
+                            .mr(px(SPACE_M))
                             .text_color(style.line_number)
+                            .debug_selector(move || format!("quick-definition-number-{index}"))
                             .child(row.number.to_string()),
                     )
-                    .children(runs),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .debug_selector(move || format!("quick-definition-code-{index}"))
+                            .children(runs),
+                    ),
             );
         }
         let body = div()
@@ -880,7 +1055,7 @@ impl EditorView {
                     .truncate()
                     .text_size(px(UI_SIZE))
                     .text_color(theme.text_muted)
-                    .child(header.folder.clone()),
+                    .child(folder),
             )
             .child(edit);
         let grip = div()
@@ -955,8 +1130,17 @@ impl EditorView {
     #[cfg(any(test, feature = "test-support"))]
     pub fn definition_view(&self) -> Option<DefinitionView> {
         let popup = self.lsp.as_ref()?.definition.as_ref()?;
-        let header = definition_header(popup.target.as_ref());
-        let rows = definition_rows(popup, &self.style)
+        let library = popup
+            .target
+            .as_ref()
+            .and_then(|target| self.lsp.as_ref()?.support.describe_library_uri(&target.uri));
+        let header = definition_header(
+            popup.target.as_ref(),
+            library,
+            self.project_root(),
+            self.lsp.as_ref().map(|lsp| lsp.support.as_ref()),
+        );
+        let rows = definition_rows(popup, &self.style, self.tab_width())
             .into_iter()
             .map(|row| DefinitionRowView {
                 number: row.number,

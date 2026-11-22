@@ -4106,6 +4106,20 @@ impl EditorView {
         }
     }
 
+    /// The place a library address names. The language of this file answers first; a file
+    /// without one, or whose language does not know the address, such as a configuration
+    /// file, asks the language of the application, which shows the text of a class of a
+    /// library.
+    pub(crate) fn library_place(&self, uri: &str, cx: &App) -> Option<lang_api::LibraryPlace> {
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.support.describe_library_uri(uri))
+            .or_else(|| {
+                cx.try_global::<Semantic>()
+                    .and_then(|semantic| semantic.0.describe_library_uri(uri))
+            })
+    }
+
     pub(crate) fn go_to_location(&mut self, target: &SourceSpan, cx: &mut Context<Self>) {
         let caret = self.spot().map_or(0, |(_, caret)| caret);
         // A place of this very text moves the caret here: no tab and no reveal take part.

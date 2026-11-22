@@ -553,6 +553,8 @@ pub mod editor {
     pub const REVERSE_LINES: &str = "editor.reverse_lines";
     pub const CONVERT_INDENTS_TO_SPACES: &str = "editor.convert_indents_to_spaces";
     pub const CONVERT_INDENTS_TO_TABS: &str = "editor.convert_indents_to_tabs";
+    pub const SORT_MEMBERS: &str = "editor.sort_members";
+    pub const ADD_FINAL_MODIFIERS: &str = "editor.add_final_modifiers";
 
     /// The actions that expand the folds of the region at the caret to a level.
     pub const EXPAND_TO_LEVELS: [&str; 5] = [

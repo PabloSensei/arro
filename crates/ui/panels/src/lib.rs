@@ -2390,3 +2390,12 @@ mod window_tests_git_log_details;
 
 #[cfg(test)]
 mod window_tests_introduce_variable;
+
+#[cfg(test)]
+mod window_tests_services_contexts;
+
+#[cfg(test)]
+mod window_tests_definition_layout;
+
+#[cfg(test)]
+mod window_tests_source_inline;

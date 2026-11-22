@@ -71,7 +71,16 @@ goto unknown
 echo {{"clientVersion":{{"gitVersion":"v1.31.0"}},"serverVersion":{{"gitVersion":"v1.30.2"}}}}
 goto end
 :config
+if "%~2"=="get-contexts" goto config_names
+if "%~2"=="current-context" goto config_current
 echo {{"current-context":"kind-dev","contexts":[{{"name":"kind-dev","context":{{"cluster":"kind","namespace":"shop"}}}},{{"name":"prod","context":{{"cluster":"prod","namespace":"default"}}}}]}}
+goto end
+:config_names
+echo kind-dev
+echo prod
+goto end
+:config_current
+echo kind-dev
 goto end
 :get
 if "%~2"=="namespaces" goto namespaces
