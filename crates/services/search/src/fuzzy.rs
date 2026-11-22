@@ -12,6 +12,23 @@ pub trait FuzzyMatcher {
     fn indices(&mut self, candidate: &str, indices: &mut Vec<u32>) -> Option<u32>;
 }
 
+/// How a query matches a candidate, the best kinds first. A list that has matches of a
+/// better kind hides those of a worse one, so that scattered letters do not crowd out
+/// the names the user sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchKind {
+    /// The whole name is the query.
+    Exact,
+    /// The name begins with the query.
+    Prefix,
+    /// Every word of the query starts a word of the name, `tw` for Tool Window.
+    WordStarts,
+    /// The query stands in the name as written, anywhere.
+    Substring,
+    /// The letters of the query are in the name, with others between them.
+    Scattered,
+}
+
 /// Above any score nucleo gives a name of ordinary length.
 const HUMPS_BONUS: u32 = 1 << 12;
 const EXACT_BONUS: u32 = 1 << 14;
@@ -58,6 +75,33 @@ impl NameMatcher {
         }
         bonus
     }
+
+    /// The kind of the match of the pattern last given to [`FuzzyMatcher::set_pattern`],
+    /// and its score. `None` when the pattern does not match the candidate at all.
+    pub fn classify(&mut self, candidate: &str) -> Option<(MatchKind, u32)> {
+        let score = self.score(candidate)?;
+        Some((self.kind(candidate), score))
+    }
+
+    /// Whether the query spells a word of the name in full, not just its beginning.
+    /// `whitespace` spells a word of `Show whitespace` but not of `Show Whitespaces`.
+    pub fn spells_word(&self, candidate: &str) -> bool {
+        spells_word(&self.raw, candidate)
+    }
+
+    fn kind(&self, candidate: &str) -> MatchKind {
+        if self.raw.is_empty() || candidate.eq_ignore_ascii_case(&self.raw) {
+            MatchKind::Exact
+        } else if starts_with_ignore_case(candidate, &self.raw) {
+            MatchKind::Prefix
+        } else if matches_words(&self.raw, candidate) {
+            MatchKind::WordStarts
+        } else if contains_ignore_case(candidate, &self.raw) {
+            MatchKind::Substring
+        } else {
+            MatchKind::Scattered
+        }
+    }
 }
 
 impl Default for NameMatcher {
@@ -96,6 +140,112 @@ fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
         .chars()
         .flat_map(char::to_lowercase)
         .all(|wanted| text.next() == Some(wanted))
+}
+
+fn contains_ignore_case(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    let needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    text.windows(needle.len())
+        .any(|window| window == needle.as_slice())
+}
+
+/// Every word of the query starts a word of the name, in order: `tw` matches Tool
+/// Window and `PCC` matches PetClinicController.
+fn matches_words(pattern: &str, name: &str) -> bool {
+    let words = name_words(name);
+    if words.is_empty() {
+        return false;
+    }
+    let segments: Vec<String> = pattern
+        .split_whitespace()
+        .map(|word| word.chars().flat_map(char::to_lowercase).collect())
+        .filter(|word: &String| !word.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return false;
+    }
+    if fits_words(&segments, &words) {
+        return true;
+    }
+    // A word of the query may carry its own humps: `PetCC` is Pet, C, C.
+    let humps: Vec<String> = pattern.split_whitespace().flat_map(split_humps).collect();
+    humps.len() > segments.len() && fits_words(&humps, &words)
+}
+
+/// The words of a name: a separator, a space, an upper case letter or a digit run
+/// starts one. Unlike [`word_starts`], a word after a space starts there whatever its
+/// case, so `Show whitespace` has two words.
+fn name_words(name: &str) -> Vec<Vec<char>> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut words: Vec<Vec<char>> = Vec::new();
+    let mut current: Vec<char> = Vec::new();
+    for (index, &character) in chars.iter().enumerate() {
+        if character.is_whitespace() || is_separator(character) {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let boundary = match index.checked_sub(1).map(|before| chars[before]) {
+            None => true,
+            Some(before) if before.is_whitespace() || is_separator(before) => true,
+            Some(before) => {
+                (character.is_uppercase() && !before.is_uppercase())
+                    || (character.is_ascii_digit() && !before.is_ascii_digit())
+            }
+        };
+        if boundary && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(character.to_lowercase().next().unwrap_or(character));
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn fits_words(parts: &[String], words: &[Vec<char>]) -> bool {
+    fits_from(parts, words, 0)
+}
+
+fn fits_from(parts: &[String], words: &[Vec<char>], at: usize) -> bool {
+    let Some((part, rest)) = parts.split_first() else {
+        return true;
+    };
+    let part: Vec<char> = part.chars().collect();
+    if part.is_empty() {
+        return fits_from(rest, words, at);
+    }
+    for start in at..words.len() {
+        if words[start].starts_with(&part) && fits_from(rest, words, start + 1) {
+            return true;
+        }
+        if start + part.len() <= words.len()
+            && part
+                .iter()
+                .enumerate()
+                .all(|(offset, letter)| words[start + offset].first() == Some(letter))
+            && fits_from(rest, words, start + part.len())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the query spells whole words of the name, not only their beginnings.
+fn spells_word(pattern: &str, name: &str) -> bool {
+    let words = name_words(name);
+    let segments: Vec<Vec<char>> = pattern
+        .split_whitespace()
+        .map(|word| word.chars().flat_map(char::to_lowercase).collect())
+        .filter(|word: &Vec<char>| !word.is_empty())
+        .collect();
+    !segments.is_empty() && segments.iter().all(|segment| words.contains(segment))
 }
 
 /// Words of the pattern: an upper case letter, a digit run or a separator starts one.
@@ -258,5 +408,59 @@ mod tests {
         matcher.indices("OwnerController", &mut indices).unwrap();
         assert_eq!(indices, [0, 5]);
         assert_eq!(matcher.score("Vet"), None);
+    }
+
+    fn kind(pattern: &str, name: &str) -> Option<MatchKind> {
+        let mut matcher = NameMatcher::new();
+        matcher.set_pattern(pattern);
+        matcher.classify(name).map(|(kind, _)| kind)
+    }
+
+    #[test]
+    fn match_kinds_run_from_the_exact_name_to_scattered_letters() {
+        assert_eq!(kind("todo", "TODO"), Some(MatchKind::Exact));
+        assert_eq!(kind("todo", "TODO Tool Window"), Some(MatchKind::Prefix));
+        assert_eq!(kind("tw", "Tool Window"), Some(MatchKind::WordStarts));
+        assert_eq!(
+            kind("pcc", "PetClinicController"),
+            Some(MatchKind::WordStarts)
+        );
+        assert_eq!(
+            kind("petcc", "PetClinicController"),
+            Some(MatchKind::Scattered)
+        );
+        assert_eq!(
+            kind("PetCC", "PetClinicController"),
+            Some(MatchKind::WordStarts)
+        );
+        assert_eq!(kind("indow", "Tool Window"), Some(MatchKind::Substring));
+        assert_eq!(
+            kind("tdc", "Toggle rendered doc"),
+            Some(MatchKind::Scattered)
+        );
+        assert_eq!(
+            kind("todo", "Services"),
+            None,
+            "the letters are not all there"
+        );
+    }
+
+    #[test]
+    fn word_starts_need_every_word_of_the_query() {
+        assert_eq!(
+            kind("todo", "Toggle rendered doc"),
+            Some(MatchKind::Scattered),
+            "the letters do not begin the words"
+        );
+        assert_eq!(kind("tw", "TODO Tool Window"), Some(MatchKind::WordStarts));
+    }
+
+    #[test]
+    fn a_spelled_word_is_not_a_prefix_of_a_longer_one() {
+        let mut matcher = NameMatcher::new();
+        matcher.set_pattern("whitespace");
+        assert!(matcher.spells_word("Show whitespace"));
+        assert!(!matcher.spells_word("Show Whitespaces"));
+        assert!(matcher.spells_word("whitespace and tabs"));
     }
 }

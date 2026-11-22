@@ -42,6 +42,11 @@ pub struct RunConfig {
     /// configuration itself win over the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_file: Option<PathBuf>,
+    /// The optional fields the configurations dialog shows for this configuration, by
+    /// their keys there, such as `environment_file`. A field that holds a value is shown
+    /// anyway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shown_options: Vec<String>,
     /// The other configurations this one starts, for [`COMPOUND_PROVIDER`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compound: Vec<String>,
@@ -677,6 +682,7 @@ mod tests {
                 ]),
                 allow_multiple_instances: true,
                 environment_file: Some(".env.local".into()),
+                shown_options: vec!["environment_file".into()],
                 compound: Vec::new(),
                 settings,
             },
@@ -687,6 +693,7 @@ mod tests {
                 before_launch: Some(Vec::new()),
                 allow_multiple_instances: false,
                 environment_file: None,
+                shown_options: Vec::new(),
                 compound: vec!["App".into(), "Other".into()],
                 settings: Table::new(),
             },
@@ -709,6 +716,18 @@ mod tests {
         assert_eq!(config.before_launch_steps(), [BeforeLaunchStep::Build]);
         assert!(!config.allow_multiple_instances);
         assert!(config.environment_file.is_none());
+    }
+
+    #[test]
+    fn an_old_configuration_keeps_no_shown_options_and_writes_none() {
+        let file = temp_file("old-shown-options.toml");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "[[run]]\nname = \"App\"\nprovider = \"any\"\n").unwrap();
+
+        let loaded = load_configs(&file).unwrap();
+        assert!(loaded[0].shown_options.is_empty());
+        save_configs(&file, &loaded).unwrap();
+        assert!(!fs::read_to_string(&file).unwrap().contains("shown_options"));
     }
 
     #[test]

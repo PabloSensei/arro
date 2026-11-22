@@ -1294,6 +1294,8 @@ fn settings_keep_a_draft_and_apply_reaches_the_window_and_the_file(cx: &mut Test
     draw(cx, window);
 
     let before = cx.update(|cx| cx.global::<Settings>().font_size);
+    click(cx, window, "settings-page-font");
+    draw(cx, window);
     click(cx, window, "settings-font-up");
     let after = cx.update(|cx| cx.global::<Settings>().font_size);
     assert_eq!(

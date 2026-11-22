@@ -96,6 +96,11 @@ fn the_fields_of_run_configurations_start_on_one_line_and_have_one_height(cx: &m
     open_run_dialog(cx, window);
     click(cx, window, "run-config-item-0");
     draw(cx, window);
+    // The environment file is a field of the form once the Modify options menu checks it.
+    click(cx, window, "run-config-modify-options");
+    draw(cx, window);
+    click(cx, window, "run-config-option-environment_file");
+    draw(cx, window);
     let fields = [
         bounds_of(cx, window, "run-config-name"),
         bounds_of(cx, window, "run-config-environment"),

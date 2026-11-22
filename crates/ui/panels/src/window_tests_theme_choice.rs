@@ -1,6 +1,6 @@
 //! The Appearance page marks the theme the window shows. A window that does not follow
-//! the system marks the one theme of its settings and the Theme row names it; a window
-//! that follows the system marks the theme of each system look, as it always has.
+//! the system marks the one theme of its settings; a window that follows the system marks
+//! the theme of each system look, as it always has.
 
 use ui_kit::Theme;
 use ui_kit::ThemeCatalog;
@@ -37,17 +37,12 @@ fn marked_themes(cx: &TestAppContext, view: &gpui::Entity<SettingsView>) -> Vec<
     })
 }
 
-/// The text the Theme row shows.
-fn theme_row_label(cx: &TestAppContext, view: &gpui::Entity<SettingsView>) -> String {
-    view.read_with(cx, |view, cx| view.theme_label(cx.global::<Theme>()))
-}
-
 fn settings(cx: &TestAppContext) -> Settings {
     cx.read(|cx| cx.global::<Settings>().clone())
 }
 
 #[gpui::test]
-fn without_the_sync_the_page_marks_the_chosen_theme_and_the_row_names_it(cx: &mut TestAppContext) {
+fn without_the_sync_the_page_marks_the_chosen_theme(cx: &mut TestAppContext) {
     let (_, window) = open_sample_window(cx, "theme-choice-hand");
     window
         .update(cx, |workspace, _, cx| {
@@ -71,11 +66,6 @@ fn without_the_sync_the_page_marks_the_chosen_theme_and_the_row_names_it(cx: &mu
         ["mocha"],
         "the card of the theme of the window is the only one marked"
     );
-    assert_eq!(
-        theme_row_label(cx, &view),
-        "Mocha",
-        "the Theme row names the theme of the window"
-    );
 
     // A click on another card takes it for the window at once.
     click(cx, window, "theme-card-nord");
@@ -85,24 +75,10 @@ fn without_the_sync_the_page_marks_the_chosen_theme_and_the_row_names_it(cx: &mu
         ["nord"],
         "the card of the new theme is marked"
     );
-    assert_eq!(theme_row_label(cx, &view), "Nord");
     let chosen = settings(cx);
     assert_eq!(chosen.theme, "nord", "the theme of the window changed");
     assert_eq!(chosen.theme_dark, "nord", "the card filled its slot");
     assert!(!chosen.theme_sync_with_os, "the sync stays off");
-
-    // The Theme row opens the list of themes: the chosen one applies at once.
-    click(cx, window, "settings-theme");
-    draw(cx, window);
-    click(cx, window, "settings-choice-option-nord");
-    draw(cx, window);
-    assert_eq!(
-        marked_themes(cx, &view),
-        ["nord"],
-        "the chosen theme of the list is marked"
-    );
-    assert_eq!(theme_row_label(cx, &view), "Nord");
-    assert_eq!(settings(cx).theme, "nord", "the list changed the theme");
 }
 
 #[gpui::test]
@@ -130,11 +106,6 @@ fn with_the_sync_the_page_marks_the_theme_of_each_system_look(cx: &mut TestAppCo
         marked_themes(cx, &view),
         ["nord", "paper"],
         "the two slots of the system are marked, not the theme of an old file"
-    );
-    assert_eq!(
-        theme_row_label(cx, &view),
-        "Dark",
-        "the row names the look of the system"
     );
 
     // A click on a card fills the slot of its look and leaves the other one alone.

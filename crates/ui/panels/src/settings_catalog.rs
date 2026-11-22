@@ -43,6 +43,12 @@ pub enum SettingsPage {
     EditorTodo,
     /// The ignored file and folder masks of the project tree and the file index.
     EditorFileTypes,
+    /// The typeface, the size and the line height of the editor text.
+    EditorFont,
+    /// The group of the settings of the program itself.
+    SystemSettings,
+    /// The automatic check for a new version.
+    Updates,
 }
 
 /// The names the language gives its two build tools. They are no part of this crate:
@@ -70,7 +76,7 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 29] = [
+    pub const ALL: [SettingsPage; 32] = [
         SettingsPage::Appearance,
         SettingsPage::Keymap,
         SettingsPage::Editor,
@@ -84,6 +90,7 @@ impl SettingsPage {
         SettingsPage::EditorFileTemplates,
         SettingsPage::EditorTodo,
         SettingsPage::EditorFileTypes,
+        SettingsPage::EditorFont,
         SettingsPage::Debugger,
         SettingsPage::Project,
         SettingsPage::BuildTools,
@@ -100,6 +107,8 @@ impl SettingsPage {
         SettingsPage::Mcp,
         SettingsPage::HttpClient,
         SettingsPage::Plugins,
+        SettingsPage::SystemSettings,
+        SettingsPage::Updates,
     ];
 
     pub fn title(self) -> &'static str {
@@ -133,6 +142,9 @@ impl SettingsPage {
             SettingsPage::Mcp => "MCP Server",
             SettingsPage::EditorTodo => "TODO",
             SettingsPage::EditorFileTypes => "File Types",
+            SettingsPage::EditorFont => "Font",
+            SettingsPage::SystemSettings => "System Settings",
+            SettingsPage::Updates => "Updates",
         }
     }
 
@@ -158,6 +170,8 @@ impl SettingsPage {
             SettingsPage::ToolsAi => 1,
             SettingsPage::Mcp => 2,
             SettingsPage::EditorFileTypes => 1,
+            SettingsPage::EditorFont => 1,
+            SettingsPage::Updates => 1,
             _ => 0,
         }
     }
@@ -169,6 +183,7 @@ impl SettingsPage {
             SettingsPage::VersionControl => SettingsPage::Git,
             SettingsPage::Tools => SettingsPage::Terminal,
             SettingsPage::ToolsAi => SettingsPage::Mcp,
+            SettingsPage::SystemSettings => SettingsPage::Updates,
             page => page,
         }
     }
@@ -186,6 +201,8 @@ impl SettingsPage {
             | SettingsPage::EditorTodo => Some(SettingsPage::Editor),
             SettingsPage::EditorPostfix => Some(SettingsPage::EditorLiveTemplates),
             SettingsPage::EditorFileTypes => Some(SettingsPage::Editor),
+            SettingsPage::EditorFont => Some(SettingsPage::Editor),
+            SettingsPage::Updates => Some(SettingsPage::SystemSettings),
             SettingsPage::BuildToolsFirst | SettingsPage::BuildToolsSecond => {
                 Some(SettingsPage::BuildTools)
             }
@@ -217,7 +234,6 @@ pub enum SettingKind {
 /// The value of a setting in [`Settings`], for the ones that live in the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingField {
-    Theme,
     FontSize,
     UiScale,
     EditorFontFamily,
@@ -380,14 +396,6 @@ pub struct Setting {
 
 pub const SETTINGS: &[Setting] = &[
     Setting {
-        id: "theme",
-        title: "Theme",
-        page: SettingsPage::Appearance,
-        kind: SettingKind::Choice,
-        field: SettingField::Theme,
-        keywords: "dark light colors appearance",
-    },
-    Setting {
         id: "theme_sync_with_os",
         title: "Sync with OS",
         page: SettingsPage::Appearance,
@@ -410,14 +418,6 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Choice,
         field: SettingField::ThemeDark,
         keywords: "sync with os dark theme colors appearance",
-    },
-    Setting {
-        id: "font_size",
-        title: "Editor font size",
-        page: SettingsPage::Appearance,
-        kind: SettingKind::Number,
-        field: SettingField::FontSize,
-        keywords: "text size zoom appearance",
     },
     Setting {
         id: "soft_wrap",
@@ -454,7 +454,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting {
         id: "updates_check_automatically",
         title: "Check for updates automatically",
-        page: SettingsPage::Appearance,
+        page: SettingsPage::Updates,
         kind: SettingKind::Toggle,
         field: SettingField::UpdatesCheckAutomatically,
         keywords: "updates system settings network automatic",
@@ -469,19 +469,27 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         id: "editor_font_family",
-        title: "Editor typeface",
-        page: SettingsPage::Appearance,
+        title: "Font",
+        page: SettingsPage::EditorFont,
         kind: SettingKind::Choice,
         field: SettingField::EditorFontFamily,
-        keywords: "typeface family monospace text appearance",
+        keywords: "typeface family monospace text editor font",
+    },
+    Setting {
+        id: "font_size",
+        title: "Size",
+        page: SettingsPage::EditorFont,
+        kind: SettingKind::Number,
+        field: SettingField::FontSize,
+        keywords: "font size text editor",
     },
     Setting {
         id: "line_spacing",
-        title: "Line spacing",
-        page: SettingsPage::Appearance,
+        title: "Line height",
+        page: SettingsPage::EditorFont,
         kind: SettingKind::Number,
         field: SettingField::LineSpacing,
-        keywords: "line height spacing text appearance",
+        keywords: "line height spacing text editor font",
     },
     Setting {
         id: "show_line_numbers",
@@ -1183,6 +1191,7 @@ pub fn section_of(id: &str) -> Option<&'static str> {
         "markdown_images_from_internet" => Some("Markdown"),
         "code_vision_usages" | "code_vision_implementations" => Some("Code Vision"),
         "debug_hide_library_frames" | "debug_type_renderers" => Some("Data Views"),
+        "ui_scale" => Some("UI"),
         "presentation_font_size"
         | "toolbar_visible"
         | "tool_window_bars_visible"
@@ -1215,6 +1224,19 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static Setting> {
         .collect()
 }
 
+/// The page the search opens for `query`: the page of the first setting of the list that
+/// matches it, or of the group that holds that page. None for an empty query, which keeps
+/// the page in force.
+pub fn page_matching(query: &str) -> Option<SettingsPage> {
+    if query.trim().is_empty() {
+        return None;
+    }
+    SETTINGS
+        .iter()
+        .find(|setting| setting.matches(query))
+        .map(|setting| setting.page.target())
+}
+
 /// The pages the search keeps, in the order of the tree: the pages of the settings that
 /// match and the groups above them. The Keymap and template pages have a search of their
 /// own and stay when the query is empty only.
@@ -1236,6 +1258,42 @@ pub fn pages_matching(query: &str) -> Vec<SettingsPage> {
         .iter()
         .copied()
         .filter(|page| kept.contains(page))
+        .collect()
+}
+
+/// The page a row of the tree opens when the tree keeps `kept`. A row whose own page the tree
+/// keeps opens that page; a group opens its first part the tree keeps, or else its own page.
+pub fn opened_by(row: SettingsPage, kept: &[SettingsPage]) -> SettingsPage {
+    let target = row.target();
+    if kept.contains(&target) {
+        return target;
+    }
+    kept.iter()
+        .copied()
+        .find(|page| page.parent() == Some(row))
+        .unwrap_or(row)
+}
+
+/// The pages of the tree `kept` that show their own content, in the order of the tree. A group
+/// row is left out: it opens a part that the tree lists in its own place.
+pub fn shown_pages(kept: &[SettingsPage]) -> Vec<SettingsPage> {
+    kept.iter()
+        .copied()
+        .filter(|page| opened_by(*page, kept) == *page)
+        .collect()
+}
+
+/// The pages with a setting that matches `query`, in the order of the tree. A page that is only
+/// the group of a matching page is left out, so a search opens the page that holds the match.
+pub fn matching_pages(query: &str) -> Vec<SettingsPage> {
+    SettingsPage::ALL
+        .iter()
+        .copied()
+        .filter(|page| {
+            SETTINGS
+                .iter()
+                .any(|setting| setting.page == *page && setting.matches(query))
+        })
         .collect()
 }
 
@@ -1308,8 +1366,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::ShowGutterIcons => Some(settings.show_gutter_icons),
         SettingField::ShowBreadcrumbs => Some(settings.show_breadcrumbs),
         SettingField::ShowStickyLines => Some(settings.show_sticky_lines),
-        SettingField::Theme
-        | SettingField::FontSize
+        SettingField::FontSize
         | SettingField::UiScale
         | SettingField::EditorFontFamily
         | SettingField::LineSpacing
@@ -1510,8 +1567,7 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             settings.show_sticky_lines = !settings.show_sticky_lines;
         }
         Some(
-            SettingField::Theme
-            | SettingField::FontSize
+            SettingField::FontSize
             | SettingField::UiScale
             | SettingField::EditorFontFamily
             | SettingField::LineSpacing
@@ -1772,21 +1828,6 @@ pub fn chosen_theme<'a>(settings: &'a Settings, dark: bool, on_screen: &'a str) 
     }
 }
 
-/// The text of the Theme row: the name of the chosen theme, or the look the system picks
-/// while Sync with OS is on, as the row has always written it.
-#[cfg(test)]
-pub fn theme_label(settings: &Settings, system_dark: bool, on_screen: &str) -> String {
-    if settings.theme_sync_with_os {
-        if system_dark {
-            "Dark".to_owned()
-        } else {
-            "Light".to_owned()
-        }
-    } else {
-        Theme::label(chosen_theme(settings, system_dark, on_screen))
-    }
-}
-
 /// The chosen name of a setting with named choices, for the window to show.
 pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
     let label = match find(id)?.field {
@@ -2003,10 +2044,19 @@ mod tests {
     #[test]
     fn the_search_keeps_the_pages_of_the_matching_settings_and_their_groups() {
         let pages = super::pages_matching("font");
-        assert!(pages.contains(&super::SettingsPage::Appearance));
+        assert!(pages.contains(&super::SettingsPage::EditorFont));
+        assert!(
+            pages.contains(&super::SettingsPage::Editor),
+            "the group above the page stays, so the tree keeps its shape"
+        );
         assert!(
             !pages.contains(&super::SettingsPage::Project),
             "a page without a matching setting leaves the tree"
+        );
+        assert_eq!(
+            super::page_matching("font size"),
+            Some(super::SettingsPage::EditorFont),
+            "the search opens the page of the setting, not the group above it"
         );
         let pages = super::pages_matching("tab size");
         assert!(pages.contains(&super::SettingsPage::EditorCodeStyle));
@@ -2088,8 +2138,6 @@ mod tests {
         };
         assert_eq!(super::chosen_theme(&settings, true, "dark"), "mocha");
         assert_eq!(super::chosen_theme(&settings, false, "dark"), "mocha");
-        assert_eq!(super::theme_label(&settings, true, "dark"), "Mocha");
-        assert_eq!(super::theme_label(&settings, false, "dark"), "Mocha");
 
         // A file written before themes became files names no theme: the look of the
         // window is the one the page marks.
@@ -2102,7 +2150,5 @@ mod tests {
         settings.theme_sync_with_os = true;
         assert_eq!(super::chosen_theme(&settings, true, "mocha"), "nord");
         assert_eq!(super::chosen_theme(&settings, false, "mocha"), "paper");
-        assert_eq!(super::theme_label(&settings, true, "mocha"), "Dark");
-        assert_eq!(super::theme_label(&settings, false, "mocha"), "Light");
     }
 }

@@ -82,7 +82,7 @@ fn no_more_button_and_settings_opens_its_window(cx: &mut TestAppContext) {
     click(cx, window, "t-settings");
     wait_for(cx, "the Settings window", |cx| {
         draw(cx, window);
-        has(cx, window, "settings-font-up")
+        has(cx, window, "settings-theme-sync-with-os")
     });
     assert!(!has(cx, window, "t-more"), "the toolbar has no ⋮ button");
     assert!(

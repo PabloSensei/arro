@@ -48,6 +48,17 @@ fn open_settings(cx: &mut TestAppContext, name: &str) -> (WindowHandle<Workspace
     (window, file)
 }
 
+/// Opens the Settings window on Editor > Font, where the editor font size is.
+fn open_settings_on_font(
+    cx: &mut TestAppContext,
+    name: &str,
+) -> (WindowHandle<Workspace>, PathBuf) {
+    let (window, file) = open_settings(cx, name);
+    click(cx, window, "settings-page-font");
+    draw(cx, window);
+    (window, file)
+}
+
 /// Drags the pointer from `from` by `(dx, dy)` with the left button held.
 fn drag_by(
     cx: &mut TestAppContext,
@@ -79,7 +90,7 @@ fn drag_by(
 
 #[gpui::test]
 fn cancel_keeps_the_settings_and_the_file(cx: &mut TestAppContext) {
-    let (window, file) = open_settings(cx, "settings-window-cancel");
+    let (window, file) = open_settings_on_font(cx, "settings-window-cancel");
     let before = fs::read_to_string(&file).ok();
 
     click(cx, window, "settings-font-up");
@@ -102,7 +113,7 @@ fn cancel_keeps_the_settings_and_the_file(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn apply_writes_the_settings_and_leaves_the_window_open(cx: &mut TestAppContext) {
-    let (window, file) = open_settings(cx, "settings-window-apply");
+    let (window, file) = open_settings_on_font(cx, "settings-window-apply");
 
     click(cx, window, "settings-font-up");
     draw(cx, window);
@@ -118,7 +129,7 @@ fn apply_writes_the_settings_and_leaves_the_window_open(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn ok_writes_the_settings_and_closes_the_window(cx: &mut TestAppContext) {
-    let (window, file) = open_settings(cx, "settings-window-ok");
+    let (window, file) = open_settings_on_font(cx, "settings-window-ok");
 
     click(cx, window, "settings-font-up");
     draw(cx, window);
@@ -155,7 +166,7 @@ fn apply_does_nothing_while_nothing_changed(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_close_button_and_escape_cancel(cx: &mut TestAppContext) {
-    let (window, file) = open_settings(cx, "settings-window-close");
+    let (window, file) = open_settings_on_font(cx, "settings-window-close");
     let before = fs::read_to_string(&file).ok();
 
     click(cx, window, "settings-font-up");
@@ -173,6 +184,8 @@ fn the_close_button_and_escape_cancel(cx: &mut TestAppContext) {
     );
 
     press(cx, window, "ctrl-alt-s");
+    draw(cx, window);
+    click(cx, window, "settings-page-font");
     draw(cx, window);
     click(cx, window, "settings-font-up");
     draw(cx, window);
@@ -196,7 +209,7 @@ fn the_search_leaves_the_pages_with_font_settings(cx: &mut TestAppContext) {
     draw(cx, window);
 
     assert!(
-        has(cx, window, "settings-page-appearance"),
+        has(cx, window, "settings-page-font"),
         "the page with the font settings stays"
     );
     assert!(
@@ -222,7 +235,7 @@ fn the_search_leaves_the_pages_with_font_settings(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_click_outside_keeps_the_window_and_the_draft(cx: &mut TestAppContext) {
-    let (window, file) = open_settings(cx, "settings-window-outside");
+    let (window, file) = open_settings_on_font(cx, "settings-window-outside");
     let before = Settings::default().font_size;
 
     click(cx, window, "settings-font-up");
@@ -313,7 +326,7 @@ fn typing_right_after_the_shortcut_reaches_the_search(cx: &mut TestAppContext) {
         "the caret stays in the search field while typing"
     );
     assert!(
-        has(cx, window, "settings-page-appearance"),
+        has(cx, window, "settings-page-font"),
         "the page with the font settings stays"
     );
     assert!(
@@ -345,7 +358,7 @@ fn a_click_on_a_setting_takes_the_caret_and_a_click_in_the_search_brings_it_back
 ) {
     let (window, _file) = open_settings(cx, "settings-window-search-return");
 
-    click(cx, window, "settings-font-up");
+    click(cx, window, "settings-ui-scale-up");
     draw(cx, window);
     assert!(
         !has(cx, window, "settings-search-field-caret"),
@@ -386,7 +399,7 @@ fn a_setting_of_find_action_opens_with_the_caret_in_the_search(cx: &mut TestAppC
         has(cx, window, "settings-chosen-font-size"),
         "the target row is drawn as chosen"
     );
-    type_text(cx, window, "size");
+    type_text(cx, window, "font");
     draw(cx, window);
 
     assert!(
@@ -394,7 +407,7 @@ fn a_setting_of_find_action_opens_with_the_caret_in_the_search(cx: &mut TestAppC
         "the caret stays in the search field while typing"
     );
     assert!(
-        has(cx, window, "settings-page-appearance"),
+        has(cx, window, "settings-page-font"),
         "the page of the target stays"
     );
     assert!(
@@ -411,7 +424,7 @@ fn a_setting_of_find_action_opens_with_the_caret_in_the_search(cx: &mut TestAppC
 fn the_arrows_of_the_search_walk_the_pages(cx: &mut TestAppContext) {
     let (window, _file) = open_settings(cx, "settings-window-search-arrows");
     assert!(
-        has(cx, window, "settings-font-up"),
+        has(cx, window, "settings-theme-sync-with-os"),
         "the window opens on Appearance"
     );
 
@@ -426,7 +439,7 @@ fn the_arrows_of_the_search_walk_the_pages(cx: &mut TestAppContext) {
     press(cx, window, "up");
     draw(cx, window);
     assert!(
-        has(cx, window, "settings-font-up"),
+        has(cx, window, "settings-theme-sync-with-os"),
         "Up returns to the page before it"
     );
 }

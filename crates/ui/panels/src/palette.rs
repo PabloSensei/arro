@@ -11,8 +11,8 @@ use editor_view::{EditorView, OutlineItem, OutlineKind, Spot};
 use futures_util::StreamExt;
 use lang_api::{GraphVisibility, SymbolKind, ask};
 use search::{
-    FuzzyMatcher, GotoQuery, NameMatcher, SymbolRequest, SymbolRow, SymbolScope, Tab, Target,
-    merge_rows, rank, rank_files,
+    FuzzyMatcher, GotoQuery, MatchKind, NameMatcher, SymbolRequest, SymbolRow, SymbolScope, Tab,
+    Target, merge_rows, rank, rank_files,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -277,6 +277,35 @@ const TOOL_COMMAND_ICONS: [(&str, &str); 12] = [
 /// is also called Data Sources and Drivers, and IDEA's search finds it by that name.
 const COMMAND_ALIASES: [(&str, &str); 1] = [("database.data_sources", "Data Sources and Drivers")];
 
+/// The commands that already open a tool window, by tool id. Find Action lists such a
+/// command instead of a second row for the same window, and finds it by the name of the
+/// window as well.
+const TOOL_COMMANDS: [(&str, &str); 6] = [
+    (PROJECT_TOOL, "window.toggle_project"),
+    (TERMINAL_TOOL, "window.toggle_terminal"),
+    (AI_TOOL, "window.toggle_assistant"),
+    (DATABASE_TOOL, "window.database"),
+    (LOG_TOOL, "git.show_log"),
+    (ENDPOINTS_TOOL, "window.show_endpoints"),
+];
+
+/// The window action that opens a tool, by tool id. Its key is the one Find Action writes
+/// at the right edge of the row of that window.
+const TOOL_WINDOW_ACTIONS: [(&str, &str); 12] = [
+    (PROJECT_TOOL, "workspace::ToggleProject"),
+    (COMMIT_TOOL, "workspace::ToggleCommit"),
+    (LOG_TOOL, "workspace::ToggleLog"),
+    (STRUCTURE_TOOL, "workspace::ToggleStructure"),
+    (RUN_TOOL, "workspace::ToggleRun"),
+    (DEBUG_TOOL, "workspace::ToggleDebug"),
+    (TERMINAL_TOOL, "workspace::ToggleTerminal"),
+    (SERVICES_TOOL, "workspace::ToggleServices"),
+    (DATABASE_TOOL, "workspace::ToggleDatabase"),
+    (PROBLEMS_TOOL, "workspace::ToggleProblems"),
+    (USAGES_TOOL, "workspace::ToggleUsages"),
+    (COVERAGE_TOOL, "workspace::ToggleCoverage"),
+];
+
 /// The text that Find Action matches a command against: its title, and its alias if it has one.
 fn search_text(id: &str, title: &str) -> String {
     match COMMAND_ALIASES.iter().find(|(command, _)| *command == id) {
@@ -327,10 +356,120 @@ fn row_order(left: (&str, &str), right: (&str, &str)) -> std::cmp::Ordering {
 
 /// A row of Find Action with the score of the query, before the cut.
 struct RankedRow {
+    /// Which of the five kinds of a match this row is.
+    kind: MatchKind,
+    /// The query spells a word of the row's title in full, `whitespace` for `Show whitespace`.
+    word_exact: bool,
+    /// Settings come after commands and windows with the same match, as IDEA lists them.
+    setting: bool,
+    /// The row opens a tool window, so it comes before another command that matches its
+    /// name as well: `Project` finds the Project window, not Project Structure.
+    tool: bool,
+    /// The place of a setting in the catalog: settings with the same match keep the
+    /// order of the page.
+    order: usize,
     score: u32,
     /// What breaks a tie of the titles: the id of a command or the place of a New row.
     id: String,
     row: RowData,
+}
+
+/// A tool window that no command opens yet, as Find Action lists it: the row runs the
+/// window itself.
+struct ToolEntry {
+    id: &'static str,
+    title: &'static str,
+    icon: &'static str,
+    shortcut: Option<String>,
+}
+
+/// The key that opens a tool window, as the menus write it, when the window has one.
+fn tool_shortcut(workspace: &Workspace, tool: &str) -> Option<String> {
+    TOOL_WINDOW_ACTIONS
+        .iter()
+        .find(|(id, _)| *id == tool)
+        .and_then(|(_, action)| workspace.shortcut_of_key(action))
+}
+
+/// Whether a command is the row of a tool window in Find Action.
+fn is_tool_command(id: &str) -> bool {
+    TOOL_COMMANDS.iter().any(|(_, command)| *command == id)
+}
+
+/// The text a command is matched by, with the name of its tool window when the title of
+/// the command does not carry that name: `AI Assistant Tool Window` is found as `AI Sessions`.
+fn search_with_window_name(search: &str, name: &str) -> String {
+    if search.to_lowercase().contains(&name.to_lowercase()) {
+        search.to_owned()
+    } else {
+        format!("{search} {name}")
+    }
+}
+
+/// Adds a row with the kind of the match of its text, when the text matches at all.
+fn push_ranked(
+    matcher: &mut NameMatcher,
+    found: &mut Vec<RankedRow>,
+    search: &str,
+    setting: bool,
+    tool: bool,
+    id: String,
+    row: RowData,
+) {
+    if let Some((kind, score)) = matcher.classify(search) {
+        let word_exact = matcher.spells_word(search);
+        found.push(RankedRow {
+            kind,
+            word_exact,
+            setting,
+            tool,
+            order: 0,
+            score,
+            id,
+            row,
+        });
+    }
+}
+
+/// Drops the matches of scattered letters when a row matches better: IDEA does not show
+/// `Toggle rendered doc` for `TODO` beside the names that begin with it.
+fn keep_best_kinds(found: &mut Vec<RankedRow>) {
+    let best = found.iter().map(|row| row.kind).min();
+    if best.is_some_and(|kind| kind < MatchKind::Scattered) {
+        found.retain(|row| row.kind < MatchKind::Scattered);
+    }
+}
+
+/// The order of Find Action: the better kind of a match first, then the row that spells
+/// a whole word, then an action before a setting, a tool window before another command,
+/// and the score.
+fn sort_ranked(found: &mut [RankedRow]) {
+    found.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| right.word_exact.cmp(&left.word_exact))
+            .then_with(|| left.setting.cmp(&right.setting))
+            .then_with(|| right.tool.cmp(&left.tool))
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| left.order.cmp(&right.order))
+            .then_with(|| row_order((&left.row.title, &left.id), (&right.row.title, &right.id)))
+    });
+}
+
+/// The better kind of the match of a setting: its title, or all the words the settings
+/// search reads, which carry its page and the extra words.
+fn best_kind(matcher: &mut NameMatcher, title: &str, text: &str) -> (MatchKind, u32) {
+    match (matcher.classify(title), matcher.classify(text)) {
+        (Some(title), Some(text)) => {
+            if text.0 < title.0 {
+                text
+            } else {
+                title
+            }
+        }
+        (Some(found), None) | (None, Some(found)) => found,
+        (None, None) => (MatchKind::Scattered, 0),
+    }
 }
 
 /// The icon of a command that opens a tool window, from [`TOOL_COMMAND_ICONS`].
@@ -408,6 +547,9 @@ pub struct Palette {
     selected: usize,
     rows: Vec<RowData>,
     actions: Vec<ActionEntry>,
+    /// The tool windows without a command of their own, which Find Action lists as rows
+    /// that open the window.
+    tools: Vec<ToolEntry>,
     /// The rows of the New menu of the project tree, which Find Action lists with the
     /// commands and runs as the menu does.
     new_actions: Vec<NewAction>,
@@ -452,7 +594,7 @@ impl Palette {
         // show, so that a command has the icon of its menu row here as well. A command that
         // opens a tool window has the icon of that window instead.
         let menu_icons = menu_icons(&workspace.main_menu(cx));
-        let actions = workspace
+        let mut actions: Vec<ActionEntry> = workspace
             .commands()
             .visible()
             .map(|command| ActionEntry {
@@ -465,6 +607,35 @@ impl Palette {
                     .unwrap_or(""),
             })
             .collect();
+        // Every tool window is a row of Find Action. A window that already has a command
+        // keeps that row, found by the name of the window too and with the key of the
+        // window; the others get a row that opens the window itself.
+        let mut tools = Vec::new();
+        for (id, title, icon) in TOOLS {
+            let shortcut = tool_shortcut(workspace, id);
+            let command = TOOL_COMMANDS
+                .iter()
+                .find(|(tool, _)| *tool == id)
+                .map(|(_, command)| *command);
+            if let Some(action) =
+                command.and_then(|command| actions.iter_mut().find(|action| action.id == command))
+            {
+                action.search = search_with_window_name(&action.search, title);
+                if action.shortcut.is_none() {
+                    action.shortcut = shortcut;
+                }
+                if action.icon.is_empty() {
+                    action.icon = icon;
+                }
+            } else {
+                tools.push(ToolEntry {
+                    id,
+                    title,
+                    icon,
+                    shortcut,
+                });
+            }
+        }
         let recent = navigation::recent(cx);
         let edited = workspace.recent_edited().to_vec();
         let open_tabs: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
@@ -507,6 +678,7 @@ impl Palette {
                 selected: 0,
                 rows: Vec::new(),
                 actions,
+                tools,
                 new_actions,
                 recent,
                 edited,
@@ -834,70 +1006,134 @@ impl Palette {
             .collect()
     }
 
+    /// The commands, the rows of the New menu and the tool windows as rows of Find
+    /// Action, with the kind of their match but without the settings.
     fn action_rows(&self, limit: usize) -> Vec<RowData> {
         let mut matcher = NameMatcher::new();
-        let matcher: &mut dyn FuzzyMatcher = &mut matcher;
-        // Every match is ranked before the cut, so that the order of the ties decides which
-        // commands stay in the list.
-        let mut found: Vec<RankedRow> = rank(
-            matcher,
-            &self.query.text,
-            self.actions.iter(),
-            |action| &action.search,
-            self.actions.len(),
-        )
-        .into_iter()
-        .map(|ranked| RankedRow {
-            score: ranked.score,
-            id: ranked.item.id.to_owned(),
-            row: RowData {
-                title: ranked.item.title.clone(),
-                detail: String::new(),
-                icon: ranked.item.icon,
-                shortcut: ranked.item.shortcut.clone(),
-                indent: 0,
-                toggle: None,
-                item: Some(Item::Action(ranked.item.id)),
-            },
-        })
-        .collect();
+        matcher.set_pattern(&self.query.text);
+        let mut found = self.matched_actions(&mut matcher);
+        keep_best_kinds(&mut found);
+        sort_ranked(&mut found);
+        found.truncate(limit);
+        found.into_iter().map(|ranked| ranked.row).collect()
+    }
+
+    /// Find Action ranks the commands, the tool windows and the settings together: a
+    /// name that matches better comes first, whatever the kind of the row, and an
+    /// action comes before a setting with the same match.
+    fn find_action_rows(&self, limit: usize, cx: &App) -> Vec<RowData> {
+        let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let mut matcher = NameMatcher::new();
+        matcher.set_pattern(&self.query.text);
+        let mut found = self.matched_actions(&mut matcher);
+        for (order, setting) in settings_catalog::all()
+            .iter()
+            .enumerate()
+            .filter(|(_, setting)| setting.matches(&self.query.text))
+        {
+            let text = format!(
+                "{} {} {}",
+                setting.title,
+                setting.page.title(),
+                setting.keywords
+            );
+            let (kind, score) = best_kind(&mut matcher, setting.title, &text);
+            let word_exact = matcher.spells_word(setting.title) || matcher.spells_word(&text);
+            let toggle = if setting.kind == SettingKind::Toggle {
+                settings_catalog::value(&settings, setting.id)
+            } else {
+                None
+            };
+            found.push(RankedRow {
+                kind,
+                word_exact,
+                setting: true,
+                tool: false,
+                order,
+                score,
+                id: format!("setting:{}", setting.id),
+                row: RowData {
+                    title: setting.title.to_owned(),
+                    detail: setting.page.title().to_owned(),
+                    icon: "general/settings",
+                    shortcut: None,
+                    indent: 0,
+                    toggle,
+                    item: Some(Item::Setting(setting.id)),
+                },
+            });
+        }
+        keep_best_kinds(&mut found);
+        sort_ranked(&mut found);
+        found.truncate(limit);
+        found.into_iter().map(|ranked| ranked.row).collect()
+    }
+
+    fn matched_actions(&self, matcher: &mut NameMatcher) -> Vec<RankedRow> {
+        let mut found = Vec::new();
+        // The windows lead the rows of their names while the user searches; without a
+        // query the list keeps the alphabetical order of every action.
+        let searching = !self.query.text.trim().is_empty();
+        for action in &self.actions {
+            push_ranked(
+                matcher,
+                &mut found,
+                &action.search,
+                false,
+                searching && is_tool_command(action.id),
+                action.id.to_owned(),
+                RowData {
+                    title: action.title.clone(),
+                    detail: String::new(),
+                    icon: action.icon,
+                    shortcut: action.shortcut.clone(),
+                    indent: 0,
+                    toggle: None,
+                    item: Some(Item::Action(action.id)),
+                },
+            );
+        }
         // The rows of the New menu of the project tree are found by their titles and by
         // the word of their group, which stands at their right.
-        let mut new_matcher = NameMatcher::new();
-        let new_matcher: &mut dyn FuzzyMatcher = &mut new_matcher;
-        found.extend(
-            rank(
-                new_matcher,
-                &self.query.text,
-                self.new_actions.iter().enumerate(),
-                |(_, action)| action.search.as_str(),
-                self.new_actions.len(),
-            )
-            .into_iter()
-            .map(|ranked| RankedRow {
-                score: ranked.score,
-                id: format!("new:{}", ranked.item.0),
-                row: RowData {
-                    title: ranked.item.1.title.clone(),
+        for (at, action) in self.new_actions.iter().enumerate() {
+            push_ranked(
+                matcher,
+                &mut found,
+                &action.search,
+                false,
+                false,
+                format!("new:{at}"),
+                RowData {
+                    title: action.title.clone(),
                     detail: NEW_GROUP.to_owned(),
-                    icon: ranked.item.1.icon,
+                    icon: action.icon,
                     shortcut: None,
                     indent: 0,
                     toggle: None,
-                    item: Some(Item::NewAction(ranked.item.0)),
+                    item: Some(Item::NewAction(at)),
                 },
-            }),
-        );
-        // The rows with the same score come alphabetically, not by the length of their
-        // names. On an empty query every command has the same score.
-        found.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| row_order((&left.row.title, &left.id), (&right.row.title, &right.id)))
-        });
-        found.truncate(limit);
-        found.into_iter().map(|ranked| ranked.row).collect()
+            );
+        }
+        for tool in &self.tools {
+            push_ranked(
+                matcher,
+                &mut found,
+                tool.title,
+                false,
+                searching,
+                format!("tool:{}", tool.id),
+                RowData {
+                    title: tool.title.to_owned(),
+                    detail: String::new(),
+                    icon: tool.icon,
+                    shortcut: tool.shortcut.clone(),
+                    indent: 0,
+                    toggle: None,
+                    item: Some(Item::Tool(tool.id)),
+                },
+            );
+        }
+        found
     }
 
     fn setting_rows(&self, limit: usize, cx: &App) -> Vec<RowData> {
@@ -1066,21 +1302,22 @@ impl Palette {
                         group("Symbols", self.symbol_rows(at, limit), &mut rows);
                     }
                     if matches!(tab, Tab::All | Tab::Actions) && searching {
-                        let settings = self.setting_rows(limit, cx);
                         if all {
-                            group("Settings", settings, &mut rows);
+                            group("Settings", self.setting_rows(limit, cx), &mut rows);
+                            group("Actions", self.action_rows(limit), &mut rows);
                         } else {
-                            // Find Action lists settings before commands, as IDEA does.
-                            rows.extend(settings);
+                            // Find Action ranks commands, tool windows and settings
+                            // together: the name that matches better comes first, and an
+                            // action comes before a setting with the same match.
+                            rows = self.find_action_rows(limit, cx);
                         }
-                    }
-                    if matches!(tab, Tab::All | Tab::Actions) && searching {
-                        group("Actions", self.action_rows(limit), &mut rows);
                     }
                     if tab == Tab::Actions && !searching {
                         // Every command, so that the alphabetical end of the list is reachable
                         // without a query; the settings follow them.
-                        rows = self.action_rows(self.actions.len() + self.new_actions.len());
+                        rows = self.action_rows(
+                            self.actions.len() + self.new_actions.len() + self.tools.len(),
+                        );
                         rows.extend(self.setting_rows(MAX_ROWS, cx));
                     }
                 }
@@ -1215,6 +1452,20 @@ impl Palette {
     #[cfg(test)]
     pub(crate) fn selected_row(&self) -> usize {
         self.selected
+    }
+
+    /// The tool window the selected row opens, for a row of a window or of a command
+    /// that opens one; `None` for every other row.
+    #[cfg(test)]
+    pub(crate) fn selected_tool(&self) -> Option<&'static str> {
+        match self.rows.get(self.selected)?.item.as_ref()? {
+            Item::Tool(id) => Some(*id),
+            Item::Action(id) => TOOL_COMMANDS
+                .iter()
+                .find(|(_, command)| command == id)
+                .map(|(tool, _)| *tool),
+            _ => None,
+        }
     }
 
     /// Whether every source has answered for the query on screen, for a test that reads

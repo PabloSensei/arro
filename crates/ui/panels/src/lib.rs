@@ -2311,3 +2311,15 @@ mod window_tests_commit_untracked;
 
 #[cfg(test)]
 mod window_tests_quick_doc_header;
+
+#[cfg(test)]
+mod window_tests_settings_appearance;
+
+#[cfg(test)]
+mod window_tests_run_config_form;
+
+#[cfg(test)]
+mod window_tests_settings_search;
+
+#[cfg(test)]
+mod window_tests_find_action_ranking;
