@@ -6568,7 +6568,7 @@ pub(crate) fn run_line(
     let source = panel.read(cx).source_of_script(&path);
     let Some(source) = source else {
         if sql_file {
-            workspace.notify_user(
+            workspace.notify_warning(
                 "Run SQL Script",
                 "Choose a data source in the bar above the file.",
                 cx,
@@ -6624,7 +6624,7 @@ pub(crate) fn run_script(
     };
     let source = panel.read(cx).source_of_script(&path);
     let Some(source) = source else {
-        workspace.notify_user(
+        workspace.notify_warning(
             "Run SQL Script",
             "Choose a data source in the bar above the file.",
             cx,

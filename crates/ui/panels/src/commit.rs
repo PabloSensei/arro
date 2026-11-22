@@ -176,6 +176,9 @@ struct OpenFile {
 enum CommitProblem {
     NoMessage,
     NoFiles,
+    /// Amend without a ticked file and with the message the last commit has: nothing would
+    /// change.
+    NothingToAmend,
     Save(String),
 }
 
@@ -184,9 +187,16 @@ impl CommitProblem {
         match self {
             Self::NoMessage => "Write a commit message first",
             Self::NoFiles => "Tick at least one file",
+            Self::NothingToAmend => "Change the message or tick a file",
             Self::Save(message) => message,
         }
     }
+}
+
+/// Whether Amend changes the last commit: its message must be known and differ from the
+/// message in the field. Without ticked files that is the only change an Amend makes.
+fn amend_changes(message: &str, last_subject: Option<&str>) -> bool {
+    last_subject.is_some_and(|subject| subject.trim() != message.trim())
 }
 
 /// Builds the request for git from the message and the ticked files, writing the open
@@ -199,15 +209,18 @@ fn prepare_commit(
     open: Vec<OpenFile>,
     save: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<CommitRequest, CommitProblem> {
-    prepare_commit_with(message, paths, open, false, save)
+    prepare_commit_with(message, paths, open, false, None, save)
 }
 
-/// Like [`prepare_commit`], with `amend` saying whether the last commit is rewritten.
+/// Like [`prepare_commit`], with `amend` saying whether the last commit is rewritten and
+/// `last_subject` the message it has. An Amend without ticked files only rewrites the
+/// message, so it needs one that differs from `last_subject`.
 fn prepare_commit_with(
     message: &str,
     paths: &[String],
     open: Vec<OpenFile>,
     amend: bool,
+    last_subject: Option<&str>,
     mut save: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<CommitRequest, CommitProblem> {
     let message = message.trim();
@@ -215,7 +228,12 @@ fn prepare_commit_with(
         return Err(CommitProblem::NoMessage);
     }
     if paths.is_empty() {
-        return Err(CommitProblem::NoFiles);
+        if !amend {
+            return Err(CommitProblem::NoFiles);
+        }
+        if !amend_changes(message, last_subject) {
+            return Err(CommitProblem::NothingToAmend);
+        }
     }
     for file in open {
         if !file.dirty || !paths.contains(&file.relative) {
@@ -408,6 +426,8 @@ pub struct CommitDraft {
     checked_untracked: HashSet<String>,
     /// Alt+M: the next commit rewrites the last one.
     amend: bool,
+    /// The message of the last commit, which Amend rewrites. Known once Amend is on.
+    last_subject: Option<String>,
     /// The switches of the commit options popup.
     sign_off: bool,
     author: Option<String>,
@@ -440,6 +460,7 @@ impl CommitDraft {
             unchecked: HashSet::new(),
             checked_untracked: HashSet::new(),
             amend: false,
+            last_subject: None,
             sign_off: false,
             author: None,
             analysis,
@@ -529,6 +550,8 @@ pub struct CommitPanel {
     files_focused: bool,
     /// Alt+M: the next commit rewrites the last one.
     amend: bool,
+    /// The message of the last commit, copied from the draft.
+    last_subject: Option<String>,
     /// The switches of the commit options popup.
     sign_off: bool,
     author: Option<String>,
@@ -589,6 +612,7 @@ impl CommitPanel {
             let checked_untracked = shared.checked_untracked.clone();
             let partial = shared.excluded_hunks.clone();
             let amend = shared.amend;
+            let last_subject = shared.last_subject.clone();
             let sign_off = shared.sign_off;
             let author = shared.author.clone();
             let analysis = shared.analysis;
@@ -613,6 +637,7 @@ impl CommitPanel {
                 scroll_shelf_diff: ScrollHandle::new(),
                 files_focused: false,
                 amend,
+                last_subject,
                 sign_off,
                 author,
                 analysis,
@@ -663,6 +688,7 @@ impl CommitPanel {
         self.checked_untracked = draft.checked_untracked.clone();
         self.partial = draft.excluded_hunks.clone();
         self.amend = draft.amend;
+        self.last_subject = draft.last_subject.clone();
         self.sign_off = draft.sign_off;
         self.author = draft.author.clone();
         self.analysis = draft.analysis;
@@ -807,6 +833,7 @@ impl CommitPanel {
             draft.amend = amend;
             if !amend {
                 draft.message.text.clear();
+                draft.last_subject = None;
             }
         });
         if !amend {
@@ -829,7 +856,10 @@ impl CommitPanel {
                 if this.amend
                     && let Some(message) = message
                 {
-                    this.change(cx, |draft| draft.message.text = message);
+                    this.change(cx, |draft| {
+                        draft.last_subject = Some(message.clone());
+                        draft.message.text = message;
+                    });
                 }
                 cx.notify();
             })
@@ -936,6 +966,13 @@ impl CommitPanel {
             .collect()
     }
 
+    /// Whether Commit and Commit and Push run: a file is ticked, or Amend changes the
+    /// message of the last commit.
+    fn can_commit(&self, checked: &[String]) -> bool {
+        !checked.is_empty()
+            || (self.amend && amend_changes(&self.message.text, self.last_subject.as_deref()))
+    }
+
     /// The text beside the buttons: how many ticked files the commit takes and the branch,
     /// or what git is doing.
     fn summary(&self, cx: &App) -> String {
@@ -945,6 +982,8 @@ impl CommitPanel {
         let branch = git.status().branch.clone();
         let summary = match (busy, branch) {
             (Some(what), _) => format!("{what}..."),
+            // An Amend without files only changes the message.
+            (None, _) if self.amend && count == 0 => "message only".to_string(),
             (None, Some(branch)) => format!("{count} changed on {branch}"),
             (None, None) => format!("{count} changed"),
         };
@@ -1700,20 +1739,26 @@ impl CommitPanel {
         let paths = self.checked_paths(cx);
         self.warn_crlf(&paths, cx);
         let open = self.open_files(cx);
-        let request =
-            match prepare_commit_with(&self.message.text, &paths, open, self.amend, |path| {
+        let request = match prepare_commit_with(
+            &self.message.text,
+            &paths,
+            open,
+            self.amend,
+            self.last_subject.as_deref(),
+            |path| {
                 self.workspace
                     .update(cx, |workspace, cx| workspace.save_editor_now(path, cx))
                     .unwrap_or_else(|_| Err("the window is gone".to_string()))
-            }) {
-                Ok(request) => request,
-                Err(problem) => {
-                    let text = problem.text().to_string();
-                    self.git
-                        .update(cx, |git, cx| git.report("Commit", text, cx));
-                    return;
-                }
-            };
+            },
+        ) {
+            Ok(request) => request,
+            Err(problem) => {
+                let text = problem.text().to_string();
+                self.git
+                    .update(cx, |git, cx| git.report("Commit", text, cx));
+                return;
+            }
+        };
         let options = CommitOptions {
             sign_off: self.sign_off,
             author: self.author.clone(),
@@ -1774,7 +1819,7 @@ impl CommitPanel {
         };
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user("Commit", text, cx)
+                workspace.notify_warning("Commit", text, cx)
             })
             .ok();
     }
@@ -1818,6 +1863,7 @@ impl CommitPanel {
                         this.change(cx, |draft| {
                             draft.message.text.clear();
                             draft.amend = false;
+                            draft.last_subject = None;
                             draft.excluded_hunks.clear();
                             draft.unchecked.clear();
                             draft.checked_untracked.clear();
@@ -3227,7 +3273,12 @@ impl Render for CommitPanel {
         let theme = *cx.global::<Theme>();
         let visible = self.visible_files(cx).len();
         let checked = self.checked_paths(cx);
-        let can_commit = !checked.is_empty();
+        let can_commit = self.can_commit(&checked);
+        let idle_hint = if self.amend {
+            "Change the message or tick a file"
+        } else {
+            "Tick at least one file"
+        };
         let workspace = self.workspace.clone();
         let options =
             crate::tool_menu::options_menu(workspace.clone(), workspace::COMMIT_TOOL, |_| {
@@ -3255,7 +3306,7 @@ impl Render for CommitPanel {
         } else {
             commit_button
                 .opacity(0.4)
-                .tooltip(|_, cx| tooltip("Tick at least one file", None, cx))
+                .tooltip(move |_, cx| tooltip(idle_hint, None, cx))
                 .child(
                     div()
                         .debug_selector(|| "commit-go-disabled".to_owned())
@@ -3268,7 +3319,7 @@ impl Render for CommitPanel {
         } else {
             push_button
                 .opacity(0.4)
-                .tooltip(|_, cx| tooltip("Tick at least one file", None, cx))
+                .tooltip(move |_, cx| tooltip(idle_hint, None, cx))
         };
         let body = if self.tab == Tab::Shelf {
             self.shelf_body(&theme, window, cx)
@@ -3582,7 +3633,7 @@ impl Render for PointerView {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{CommitProblem, OpenFile, prepare_commit};
+    use super::{CommitProblem, OpenFile, prepare_commit, prepare_commit_with};
 
     fn open(path: &str, relative: &str, dirty: bool) -> OpenFile {
         OpenFile {
@@ -3654,5 +3705,33 @@ mod tests {
             "Write a commit message first"
         );
         assert_eq!(CommitProblem::NoFiles.text(), "Tick at least one file");
+    }
+
+    #[test]
+    fn amend_without_files_needs_a_message_that_differs() {
+        let mut no_save = |_: &Path| -> Result<(), String> { panic!("nothing may be saved") };
+
+        assert_eq!(
+            prepare_commit_with("base", &[], Vec::new(), true, Some("base"), &mut no_save),
+            Err(CommitProblem::NothingToAmend)
+        );
+        assert_eq!(
+            prepare_commit_with("base", &[], Vec::new(), true, None, &mut no_save),
+            Err(CommitProblem::NothingToAmend),
+            "a message of the last commit that is not known changes nothing"
+        );
+        let request =
+            prepare_commit_with(" new ", &[], Vec::new(), true, Some("base"), &mut no_save)
+                .unwrap();
+        assert_eq!(request.message, "new");
+        assert!(request.amend && request.paths.is_empty());
+        assert_eq!(
+            prepare_commit_with("new", &[], Vec::new(), false, Some("base"), &mut no_save),
+            Err(CommitProblem::NoFiles)
+        );
+        assert_eq!(
+            CommitProblem::NothingToAmend.text(),
+            "Change the message or tick a file"
+        );
     }
 }

@@ -396,7 +396,7 @@ impl LivePanel {
         window.defer(cx, move |window, cx| {
             if !file.is_file() {
                 let _ = workspace.update(cx, |workspace, cx| {
-                    workspace.notify_user(
+                    workspace.notify_error(
                         "Live Data",
                         format!("{} does not exist", file.display()),
                         cx,

@@ -394,8 +394,14 @@ impl ItemsPanel {
         let mut lines = Vec::new();
         for row in &self.rows {
             match row {
-                PanelRow::Group { label, depth, .. } => {
-                    lines.push(format!("{}{}", "  ".repeat(*depth), label));
+                PanelRow::Group {
+                    label, depth, hint, ..
+                } => {
+                    let hint = hint
+                        .as_deref()
+                        .map(|hint| format!("\t{hint}"))
+                        .unwrap_or_default();
+                    lines.push(format!("{}{label}{hint}", "  ".repeat(*depth)));
                 }
                 PanelRow::Item {
                     index,
@@ -629,6 +635,8 @@ impl Render for ItemsPanel {
                     selected: false,
                 };
                 div().w_full().px(px(ROW_MARGIN)).child(
+                    // A group keeps the hint right after its label: it names the detail of
+                    // the node rather than a column of the list.
                     tree_row(style, &theme).debug_selector(move || format!("item-group-{at}")),
                 )
             }
@@ -665,7 +673,7 @@ impl Render for ItemsPanel {
                             open: false,
                             selected: self.selected == Some(index),
                         };
-                        tree_row(style, &theme)
+                        tree_row_hint_at_end(style, &theme)
                     }
                 }
                 .debug_selector(move || format!("item-row-{index}"))

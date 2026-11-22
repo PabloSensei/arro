@@ -905,7 +905,7 @@ fn append_request(
 ) {
     let folder = workspace.state_dir().join("scratches");
     if let Err(error) = fs::create_dir_all(&folder) {
-        workspace.notify_user(
+        workspace.notify_error(
             "HTTP Client",
             format!("The request file cannot be created: {error}"),
             cx,
@@ -924,7 +924,7 @@ fn append_request(
     content.push_str(title);
     content.push_str(text);
     if let Err(error) = fs::write(&file, content) {
-        workspace.notify_user(
+        workspace.notify_error(
             "HTTP Client",
             format!("The request file cannot be written: {error}"),
             cx,

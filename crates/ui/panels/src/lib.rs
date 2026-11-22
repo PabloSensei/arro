@@ -1005,7 +1005,7 @@ pub fn apply_setup(workspace: &mut Workspace, setup: LanguageSetup, cx: &mut Con
                 while let Some(started) = receiver.next().await {
                     let Some(started) = started else {
                         let updated = workspace.update(cx, |workspace, cx| {
-                            workspace.notify_user(
+                            workspace.notify_warning(
                                 "Language Server",
                                 "The tool was not found. Install it, then press Check again.",
                                 cx,
@@ -1046,7 +1046,7 @@ fn watch_status(
             };
             let shown = workspace.update(cx, |workspace, cx| {
                 if let Some(reason) = reason.clone() {
-                    workspace.notify_user_with_command(
+                    workspace.notify_error_with_command(
                         "Language Server",
                         reason,
                         "Retry",
@@ -1210,7 +1210,7 @@ fn notify_project_problem(
         ),
     ];
     match &problem.log {
-        Some(log) => workspace.notify_user_with_action_and_commands(
+        Some(log) => workspace.notify_error_with_action_and_commands(
             "Language Server",
             text,
             "Show Log",
@@ -1218,7 +1218,7 @@ fn notify_project_problem(
             buttons,
             cx,
         ),
-        None => workspace.notify_user_with_commands("Language Server", text, buttons, cx),
+        None => workspace.notify_error_with_commands("Language Server", text, buttons, cx),
     }
 }
 
@@ -2335,3 +2335,15 @@ mod window_tests_dialog_escape;
 
 #[cfg(test)]
 mod window_tests_services_offline;
+
+#[cfg(test)]
+mod window_tests_items_hint;
+
+#[cfg(test)]
+mod window_tests_commit_amend;
+
+#[cfg(test)]
+mod window_tests_notification_levels;
+
+#[cfg(test)]
+mod window_tests_switcher_columns;

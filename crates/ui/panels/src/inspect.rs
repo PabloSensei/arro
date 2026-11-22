@@ -1721,7 +1721,7 @@ fn export(
                     format!("Exported to {}", target.display()),
                     cx,
                 ),
-                Err(error) => workspace.notify_user(
+                Err(error) => workspace.notify_error(
                     "Export failed",
                     format!("{}: {error}", target.display()),
                     cx,

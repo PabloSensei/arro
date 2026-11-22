@@ -4377,7 +4377,7 @@ impl DebugPanel {
         cx.defer(move |cx| {
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user_with_command(
+                    workspace.notify_error_with_command(
                         "Build failed",
                         format!("{name} did not start: the build output is in the Console."),
                         "Show Console",

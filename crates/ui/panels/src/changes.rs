@@ -450,7 +450,7 @@ fn apply_cause(
     };
     if !failed.is_empty() {
         let text = format!("Not applied: {}", failed.join(", "));
-        workspace.notify_user("Refactoring", text, cx);
+        workspace.notify_error("Refactoring", text, cx);
         return;
     }
     if let Some(label) = &label {

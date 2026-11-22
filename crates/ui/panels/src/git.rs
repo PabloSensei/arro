@@ -786,7 +786,7 @@ impl GitState {
         let title = title.to_string();
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user(title, message, cx)
+                workspace.notify_error(title, message, cx)
             })
             .ok();
     }
@@ -804,7 +804,7 @@ impl GitState {
         let title = title.to_string();
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user_with_command(
+                workspace.notify_error_with_command(
                     title,
                     message,
                     "Show in Console",
@@ -822,7 +822,7 @@ impl GitState {
         let (title, text) = (title.to_string(), text.into());
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user_with_command(
+                workspace.notify_warning_with_command(
                     title,
                     text,
                     "Show in Console",
@@ -967,6 +967,14 @@ impl GitState {
                 groups.push((root.repo.clone(), paths, hunks));
             }
         }
+        // An Amend without files rewrites only the message of the last commit of the project,
+        // the one the message field starts from. Its group has no paths: nothing is staged.
+        if request.amend
+            && request.paths.is_empty()
+            && let Some(root) = self.roots.iter().find(|root| root.prefix.is_empty())
+        {
+            groups.push((root.repo.clone(), Vec::new(), Vec::new()));
+        }
         if groups.is_empty() {
             self.report("Commit", "Tick at least one file".to_string(), cx);
             return;
@@ -979,15 +987,19 @@ impl GitState {
         let job = cx.background_executor().spawn(async move {
             let mut ids = Vec::new();
             for (repo, paths, partial) in groups {
-                let request = CommitRequest {
-                    message: message.clone(),
-                    paths,
-                    amend,
-                };
-                let id = if partial.is_empty() {
-                    repo.commit_with(&request, &options)?
+                let id = if paths.is_empty() {
+                    repo.amend_message(&message, &options)?
                 } else {
-                    repo.commit_partial(&request, &options, &partial)?
+                    let request = CommitRequest {
+                        message: message.clone(),
+                        paths,
+                        amend,
+                    };
+                    if partial.is_empty() {
+                        repo.commit_with(&request, &options)?
+                    } else {
+                        repo.commit_partial(&request, &options, &partial)?
+                    }
                 };
                 if push {
                     repo.push()?;
@@ -1866,7 +1878,7 @@ impl GitState {
             let text = format!("Rebase stopped at {} for editing", short_commit(&id));
             self.workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user_with_command(
+                    workspace.notify_warning_with_command(
                         "Rebase",
                         text,
                         "Continue Rebase",

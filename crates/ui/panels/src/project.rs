@@ -847,7 +847,7 @@ impl ProjectPanel {
                 let text = format!("{}: {error}", folder.display());
                 self.workspace
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user("Cannot read folder", text, cx)
+                        workspace.notify_error("Cannot read folder", text, cx)
                     })
                     .ok();
             }
@@ -1602,7 +1602,7 @@ impl ProjectPanel {
     fn report(&mut self, title: &str, text: String, cx: &mut Context<Self>) {
         let title = title.to_string();
         self.workspace
-            .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+            .update(cx, |workspace, cx| workspace.notify_error(title, text, cx))
             .ok();
     }
 

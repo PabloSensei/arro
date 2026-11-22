@@ -127,19 +127,46 @@ pub struct TreeRow {
     pub selected: bool,
 }
 
+/// Where the grey hint of a tree row stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HintPlacement {
+    /// Right after the label, as a group shows its count.
+    #[default]
+    AfterLabel,
+    /// At the right edge of the row, as IDEA lists the line of a place.
+    End,
+}
+
 pub fn tree_row(row: TreeRow, theme: &Theme) -> Stateful<Div> {
     tree_row_with_badge(row, "", theme)
+}
+
+/// A tree row whose hint is pinned to the right edge of the row. The label takes the rest
+/// of the width and ends with an ellipsis when it does not fit; the hint keeps its text
+/// until it would take more than a third of the row.
+pub fn tree_row_hint_at_end(row: TreeRow, theme: &Theme) -> Stateful<Div> {
+    tree_row_with(row, "", HintPlacement::End, theme)
 }
 
 /// A tree row with a small icon right of its icon, such as the mark of a visibility; `""`
 /// shows none.
 pub fn tree_row_with_badge(row: TreeRow, badge: &'static str, theme: &Theme) -> Stateful<Div> {
+    tree_row_with(row, badge, HintPlacement::AfterLabel, theme)
+}
+
+fn tree_row_with(
+    row: TreeRow,
+    badge: &'static str,
+    placement: HintPlacement,
+    theme: &Theme,
+) -> Stateful<Div> {
     let hover = theme.selection_hover;
     #[cfg(any(test, feature = "test-support"))]
     let (name, label) = (row.id.to_string(), Some(row.label.clone()));
     // The icon and the name carry selectors of their own, so that a test measures the gap
     // between them. They are not probes: the overlap check reads the probes of a frame.
     let (icon_id, name_id, badge_id) = (row.id.clone(), row.id.clone(), row.id.clone());
+    let hint_id = row.id.clone();
     let icon_part = div()
         .ml(px(SPACE_S))
         .flex_none()
@@ -150,6 +177,23 @@ pub fn tree_row_with_badge(row: TreeRow, badge: &'static str, theme: &Theme) -> 
         .flex_none()
         .debug_selector(move || format!("{name_id}-label"))
         .child(row.label);
+    let name_part = match placement {
+        HintPlacement::AfterLabel => name_part,
+        // The label yields the room to the hint and is cut rather than pushing it away.
+        HintPlacement::End => name_part.flex_1().min_w_0().truncate(),
+    };
+    let hint_part = row.hint.map(|hint| {
+        let part = div()
+            .ml(px(SPACE_M))
+            .text_color(theme.text_secondary)
+            .flex_none()
+            .debug_selector(move || format!("{hint_id}-hint"));
+        let part = match placement {
+            HintPlacement::AfterLabel => part,
+            HintPlacement::End => part.max_w(relative(1. / 3.)).min_w_0().truncate(),
+        };
+        part.child(hint)
+    });
     let row = div()
         .id(row.id)
         .flex()
@@ -188,13 +232,7 @@ pub fn tree_row_with_badge(row: TreeRow, badge: &'static str, theme: &Theme) -> 
             )
         })
         .child(name_part)
-        .children(row.hint.map(|hint| {
-            div()
-                .ml(px(SPACE_M))
-                .text_color(theme.text_secondary)
-                .flex_none()
-                .child(hint)
-        }));
+        .children(hint_part);
     #[cfg(any(test, feature = "test-support"))]
     let row = row.child(crate::bounds_probe(name, label));
     row

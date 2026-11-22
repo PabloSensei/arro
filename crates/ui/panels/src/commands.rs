@@ -1321,7 +1321,7 @@ fn copy_element_now(
     let target = match crate::copy_class::copy_file(workspace, source, name, folder, cx) {
         Ok(target) => target,
         Err(error) => {
-            workspace.notify_user("Copy Element", error, cx);
+            workspace.notify_error("Copy Element", error, cx);
             return;
         }
     };
@@ -1547,7 +1547,7 @@ fn exit(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
                     }
                 }
                 if let Some(text) = failure {
-                    workspace.notify_user("Cannot save", text, cx);
+                    workspace.notify_error("Cannot save", text, cx);
                     return;
                 }
                 workspace.close_all_windows(true, window, cx);
@@ -1577,7 +1577,7 @@ fn toggle_read_only(workspace: &mut Workspace, _window: &mut Window, cx: &mut Co
         return;
     };
     let Ok(metadata) = std::fs::metadata(&path) else {
-        workspace.notify_user(
+        workspace.notify_error(
             "Read-Only",
             format!("{} is not on disk", path.display()),
             cx,
@@ -1588,7 +1588,7 @@ fn toggle_read_only(workspace: &mut Workspace, _window: &mut Window, cx: &mut Co
     let mut permissions = metadata.permissions();
     permissions.set_readonly(read_only);
     if let Err(error) = std::fs::set_permissions(&path, permissions) {
-        workspace.notify_user("Read-Only", format!("{}: {error}", path.display()), cx);
+        workspace.notify_error("Read-Only", format!("{}: {error}", path.display()), cx);
         return;
     }
     view.update(cx, |view, cx| view.set_read_only(read_only, cx));
@@ -2154,7 +2154,7 @@ fn ask_endpoint(
             Err(message) => {
                 workspace_weak
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user("Attach to JVM", message, cx)
+                        workspace.notify_warning("Attach to JVM", message, cx)
                     })
                     .ok();
                 return;
@@ -2197,7 +2197,7 @@ fn begin_attach(
     let Some(service) = runs.read(cx).debug_service() else {
         workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user("Attach to JVM", "The language server is not running", cx)
+                workspace.notify_warning("Attach to JVM", "The language server is not running", cx)
             })
             .ok();
         return;
@@ -2223,7 +2223,7 @@ fn begin_attach(
         Err(error) => {
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("Attach to JVM", error, cx)
+                    workspace.notify_error("Attach to JVM", error, cx)
                 })
                 .ok();
         }

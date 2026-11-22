@@ -40,6 +40,8 @@ pub(crate) const MIN_HEIGHT: f32 = 300.;
 const PREVIEW_WIDTH: f32 = 330.;
 const GROUP_ROWS: usize = 5;
 const MAX_ROWS: usize = 200;
+/// The width of the column of tool windows in the Switcher, left of its files.
+const SWITCHER_TOOLS_WIDTH: f32 = 240.;
 
 actions!(
     search_everywhere,
@@ -148,7 +150,8 @@ pub enum Mode {
     /// The files that were edited, the latest first, with the checkbox of Recent Files
     /// already on.
     RecentChanged,
-    /// Ctrl+Tab while Ctrl is held: the recent files and the tool windows. Releasing
+    /// Ctrl+Tab while Ctrl is held: the open files in a column on the right and the tool
+    /// windows in a column on the left. Left and Right switch the column, and releasing
     /// Ctrl opens what is selected.
     Switcher,
     /// The declarations of the file that is open.
@@ -222,6 +225,11 @@ impl RowData {
             item: None,
         }
     }
+}
+
+/// Whether a row is a tool window, which the Switcher lists in its left column.
+fn is_tool(row: &RowData) -> bool {
+    matches!(row.item, Some(Item::Tool(_)))
 }
 
 const TABS: [(Tab, &str); 5] = [
@@ -542,6 +550,8 @@ pub struct Palette {
     icons: FileIcons,
     focus: FocusHandle,
     scroll: ScrollHandle,
+    /// The scroll of the Switcher's column of tool windows; `scroll` is the one of its files.
+    tool_scroll: ScrollHandle,
     mode: Mode,
     query: TextField,
     selected: usize,
@@ -550,6 +560,9 @@ pub struct Palette {
     /// The tool windows without a command of their own, which Find Action lists as rows
     /// that open the window.
     tools: Vec<ToolEntry>,
+    /// Every tool window of the Switcher's left column, in the order of [`TOOLS`], with the
+    /// key that opens it.
+    switcher_tools: Vec<ToolEntry>,
     /// The rows of the New menu of the project tree, which Find Action lists with the
     /// commands and runs as the menu does.
     new_actions: Vec<NewAction>,
@@ -636,6 +649,15 @@ impl Palette {
                 });
             }
         }
+        let switcher_tools: Vec<ToolEntry> = TOOLS
+            .iter()
+            .map(|&(id, title, icon)| ToolEntry {
+                id,
+                title,
+                icon,
+                shortcut: tool_shortcut(workspace, id),
+            })
+            .collect();
         let recent = navigation::recent(cx);
         let edited = workspace.recent_edited().to_vec();
         let open_tabs: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
@@ -673,12 +695,14 @@ impl Palette {
                 icons,
                 focus: cx.focus_handle(),
                 scroll: ScrollHandle::new(),
+                tool_scroll: ScrollHandle::new(),
                 mode,
                 query: TextField::default(),
                 selected: 0,
                 rows: Vec::new(),
                 actions,
                 tools,
+                switcher_tools,
                 new_actions,
                 recent,
                 edited,
@@ -920,19 +944,27 @@ impl Palette {
         self.edited.clone()
     }
 
-    /// The tool windows of the Switcher, with the rows of the recent files.
+    /// The tool windows of the Switcher's left column, each with the key that opens it. The
+    /// query keeps the windows whose names it matches, as it keeps the files.
     fn tool_rows(&self) -> Vec<RowData> {
-        TOOLS
-            .iter()
-            .map(|(id, title, icon)| RowData {
-                title: (*title).to_owned(),
-                detail: String::new(),
-                icon,
-                shortcut: None,
-                indent: 0,
-                toggle: None,
-                item: Some(Item::Tool(id)),
-            })
+        let rows = self.switcher_tools.iter().map(|tool| RowData {
+            title: tool.title.to_owned(),
+            detail: String::new(),
+            icon: tool.icon,
+            shortcut: tool.shortcut.clone(),
+            indent: 0,
+            toggle: None,
+            item: Some(Item::Tool(tool.id)),
+        });
+        let pattern = GotoQuery::parse(&self.query.text).pattern;
+        if pattern.is_empty() {
+            return rows.collect();
+        }
+        let mut matcher = NameMatcher::new();
+        let matcher: &mut dyn FuzzyMatcher = &mut matcher;
+        rank(matcher, &pattern, rows, |row| row.title.as_str(), MAX_ROWS)
+            .into_iter()
+            .map(|ranked| ranked.item)
             .collect()
     }
 
@@ -942,6 +974,15 @@ impl Palette {
         self.tool_rows()
             .into_iter()
             .map(|row| (row.title, row.icon))
+            .collect()
+    }
+
+    /// The titles and the keys of the tool rows, as the Switcher draws them, for tests.
+    #[cfg(test)]
+    pub(crate) fn tool_shortcuts(&self) -> Vec<(String, Option<String>)> {
+        self.tool_rows()
+            .into_iter()
+            .map(|row| (row.title, row.shortcut))
             .collect()
     }
 
@@ -1572,7 +1613,7 @@ impl Palette {
     /// of Search Everywhere keep Tab for their tabs.
     fn iterate(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.mode == Mode::Switcher {
-            self.move_selection_wrapping(delta, cx);
+            self.move_in_column(delta, true, cx);
             return;
         }
         if delta > 0 && self.complete_command(cx) {
@@ -1606,7 +1647,7 @@ impl Palette {
     /// groups that find nothing are not in the list at all.
     fn next_group(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.mode == Mode::Switcher {
-            self.move_selection_wrapping(delta, cx);
+            self.move_in_column(delta, true, cx);
             return;
         }
         let headers: Vec<usize> = self
@@ -1640,28 +1681,91 @@ impl Palette {
         };
         self.selected = header + 1;
         self.navigated = true;
-        self.scroll.scroll_to_item(self.selected);
+        self.scroll_to_selected();
         self.show_selected_preview(cx);
         cx.notify();
     }
 
-    fn move_selection_wrapping(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.rows.len();
-        if count == 0 {
-            return;
-        }
-        let mut at = self.selected as isize;
-        for _ in 0..count {
-            at = (at + delta).rem_euclid(count as isize);
-            if self.rows[at as usize].item.is_some() {
-                self.selected = at as usize;
-                self.navigated = true;
-                break;
-            }
-        }
-        self.scroll.scroll_to_item(self.selected);
+    /// Whether the selected row is a tool window, in the Switcher's left column.
+    fn selected_is_tool(&self) -> bool {
+        self.rows.get(self.selected).is_some_and(is_tool)
+    }
+
+    /// The rows of one column of the Switcher, the tool windows or the files, in order. Only
+    /// the Switcher has columns; the other modes never ask for one.
+    fn column_of(&self, tool: bool) -> Vec<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.item.is_some() && is_tool(row) == tool)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Selects the row `index` and brings it on screen.
+    fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selected = index;
+        self.navigated = true;
+        self.scroll_to_selected();
         self.show_selected_preview(cx);
         cx.notify();
+    }
+
+    /// Scrolls the list that holds the selected row so that the row is on screen. The
+    /// Switcher has two lists, and each counts only its own rows.
+    fn scroll_to_selected(&self) {
+        if self.mode != Mode::Switcher {
+            self.scroll.scroll_to_item(self.selected);
+            return;
+        }
+        let tool = self.selected_is_tool();
+        let at = self
+            .rows
+            .iter()
+            .take(self.selected)
+            .filter(|row| is_tool(row) == tool)
+            .count();
+        if tool {
+            self.tool_scroll.scroll_to_item(at);
+        } else {
+            self.scroll.scroll_to_item(at);
+        }
+    }
+
+    /// The Switcher's Tab, Shift+Tab and PgDn walk the column of the selected row and wrap
+    /// from its end to its start; the arrow keys stop at either end.
+    fn move_in_column(&mut self, delta: isize, wrap: bool, cx: &mut Context<Self>) {
+        let column = self.column_of(self.selected_is_tool());
+        let Some(at) = column.iter().position(|index| *index == self.selected) else {
+            return;
+        };
+        let count = column.len() as isize;
+        let next = at as isize + delta;
+        let target = if wrap {
+            next.rem_euclid(count)
+        } else if (0..count).contains(&next) {
+            next
+        } else {
+            return;
+        };
+        self.select_index(column[target as usize], cx);
+    }
+
+    /// Left goes to the tool windows and Right to the files of the Switcher. The selection
+    /// keeps its place in the column, or takes the last row of a shorter column.
+    fn switch_column(&mut self, to_tools: bool, cx: &mut Context<Self>) {
+        if self.mode != Mode::Switcher || self.selected_is_tool() == to_tools {
+            return;
+        }
+        let from = self.column_of(self.selected_is_tool());
+        let Some(at) = from.iter().position(|index| *index == self.selected) else {
+            return;
+        };
+        let target = self.column_of(to_tools);
+        let Some(last) = target.len().checked_sub(1) else {
+            return;
+        };
+        self.select_index(target[at.min(last)], cx);
     }
 
     /// Ctrl released: the Switcher opens what its list points at.
@@ -1676,6 +1780,17 @@ impl Palette {
         if key.key == "escape" {
             cx.stop_propagation();
             self.dismiss(window, cx);
+            return;
+        }
+        // The Switcher's columns: Left goes to the tool windows and Right to the files, also
+        // with Ctrl held. The keys do not reach the query, so its caret stays where it is.
+        if self.mode == Mode::Switcher
+            && !key.modifiers.alt
+            && matches!(key.key.as_str(), "left" | "right")
+        {
+            cx.stop_propagation();
+            self.switch_column(key.key == "left", cx);
+            self.ask_for_frame(window);
             return;
         }
         if key.key == "right"
@@ -1696,6 +1811,10 @@ impl Palette {
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.mode == Mode::Switcher {
+            self.move_in_column(delta, false, cx);
+            return;
+        }
         let mut at = self.selected as isize;
         loop {
             at += delta;
@@ -1709,7 +1828,7 @@ impl Palette {
                 None => break,
             }
         }
-        self.scroll.scroll_to_item(self.selected);
+        self.scroll_to_selected();
         self.show_selected_preview(cx);
         cx.notify();
     }
@@ -1885,7 +2004,12 @@ impl Palette {
                 )
                 .into_any_element(),
             _ if declaration => div().into_any_element(),
+            // The path or the key stands at the right edge; a long path shrinks and is cut with
+            // an ellipsis instead of running past the row.
             _ => div()
+                .debug_selector(move || format!("palette-detail-{index}"))
+                .min_w_0()
+                .truncate()
                 .text_color(theme.text_secondary)
                 .child(data.shortcut.clone().unwrap_or(data.detail.clone()))
                 .into_any_element(),
@@ -1978,7 +2102,7 @@ fn open_symbol(
                 navigation::go_to(workspace, path, spot, true, window, cx);
             }
         }
-        Target::Uri(uri) => workspace.notify_user("Cannot open", uri, cx),
+        Target::Uri(uri) => workspace.notify_error("Cannot open", uri, cx),
     }
 }
 
@@ -1986,19 +2110,39 @@ impl Render for Palette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let viewport = window.viewport_size();
+        // The Switcher is as tall as its taller column, up to HEIGHT. It has a key of its own,
+        // because the window keeps the size of each key and Search Everywhere keeps a height.
+        let switcher = self.mode == Mode::Switcher;
+        let key: &'static str = if switcher { "switcher" } else { "palette" };
+        let mut top = f32::from(viewport.height) * 0.205;
+        if switcher {
+            // Its height is only known after the layout and may reach HEIGHT, so on a short
+            // window it starts as high as a window of HEIGHT would, to stay on screen.
+            top = top.min(f32::from(viewport.height) - HEIGHT).max(0.);
+        }
         let first = DialogPlace {
             left: (f32::from(viewport.width) - WIDTH) / 2.,
-            top: f32::from(viewport.height) * 0.205,
+            top,
             width: WIDTH,
-            height: Some(HEIGHT),
+            height: (!switcher).then_some(HEIGHT),
         };
         let query = self.query.clone();
+        // The Switcher shows its query line only once something is typed.
+        let show_input = !switcher || !query.text.is_empty();
         let collapsed =
             self.rows.is_empty() && query.text.is_empty() && self.mode != Mode::Structure;
         let empty = self.rows.is_empty();
-        let rows: Vec<_> = (0..self.rows.len())
-            .map(|index| self.row(index, &theme, cx))
-            .collect();
+        // The tool windows of the Switcher stand in their own column; the rest share one list.
+        let mut tool_column = Vec::new();
+        let mut rows = Vec::new();
+        for index in 0..self.rows.len() {
+            let row = self.row(index, &theme, cx);
+            if switcher && is_tool(&self.rows[index]) {
+                tool_column.push(row);
+            } else {
+                rows.push(row);
+            }
+        }
         let active = self.tab();
         let active_name = TABS
             .iter()
@@ -2068,7 +2212,7 @@ impl Render for Palette {
             .debug_selector(move || format!("palette-tab-{active_name}"))
             .child(popup_drag_header(
                 cx,
-                "palette",
+                key,
                 (MIN_WIDTH, MIN_HEIGHT),
                 div()
                     .flex()
@@ -2136,38 +2280,40 @@ impl Render for Palette {
                 }))
                 .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
                 .child(header)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_none()
-                        .debug_selector(|| "palette-input".to_owned())
-                        .gap(px(SPACE_S))
-                        .h(px(CONTROL_HEIGHT))
-                        .mb(px(POPUP_PADDING))
-                        .px(px(SPACE_M))
-                        .rounded(px(CONTROL_RADIUS))
-                        .border_2()
-                        .border_color(theme.accent)
-                        .child(icon("general/search", &theme))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .children(text_field_children(
-                                    FieldMouse::new(cx, |this| Some(&mut this.query)),
-                                    &self.query,
-                                    theme.text,
-                                    theme.text,
-                                    theme.selection,
-                                    theme.caret,
-                                    18.,
-                                    true,
-                                )),
-                        ),
-                )
+                .when(show_input, |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_none()
+                            .debug_selector(|| "palette-input".to_owned())
+                            .gap(px(SPACE_S))
+                            .h(px(CONTROL_HEIGHT))
+                            .mb(px(POPUP_PADDING))
+                            .px(px(SPACE_M))
+                            .rounded(px(CONTROL_RADIUS))
+                            .border_2()
+                            .border_color(theme.accent)
+                            .child(icon("general/search", &theme))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .children(text_field_children(
+                                        FieldMouse::new(cx, |this| Some(&mut this.query)),
+                                        &self.query,
+                                        theme.text,
+                                        theme.text,
+                                        theme.selection,
+                                        theme.caret,
+                                        18.,
+                                        true,
+                                    )),
+                            ),
+                    )
+                })
                 .when(
                     matches!(
                         self.mode,
@@ -2194,6 +2340,78 @@ impl Render for Palette {
                     },
                 )
                 .when(!collapsed, |this| {
+                    // Two lists side by side, each with its own scroll and bar: the tool
+                    // windows on the left, the files on the right. The popup is as tall as
+                    // the taller of them.
+                    if switcher {
+                        let tools = scrollable(
+                            "palette-tools",
+                            &self.tool_scroll,
+                            div()
+                                .id("palette-tools")
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.tool_scroll)
+                                .children(tool_column),
+                            &theme,
+                            window,
+                            cx,
+                        )
+                        .flex_1()
+                        .min_h_0();
+                        let files = scrollable(
+                            "palette-list",
+                            &self.scroll,
+                            div()
+                                .id("palette-list")
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll)
+                                .children(rows)
+                                .when(empty, |this| {
+                                    this.items_center()
+                                        .justify_center()
+                                        .text_color(theme.text_secondary)
+                                        .child("Nothing found")
+                                }),
+                            &theme,
+                            window,
+                            cx,
+                        )
+                        .flex_1()
+                        .min_h_0();
+                        return this.child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "palette-tools-column".to_owned())
+                                        .flex()
+                                        .flex_col()
+                                        .flex_none()
+                                        .w(px(SWITCHER_TOOLS_WIDTH))
+                                        .min_h_0()
+                                        .border_r_1()
+                                        .border_color(theme.border)
+                                        .child(tools),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "palette-files-column".to_owned())
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .min_h_0()
+                                        .child(files),
+                                ),
+                        );
+                    }
                     let list = scrollable(
                         "palette-list",
                         &self.scroll,
@@ -2238,11 +2456,11 @@ impl Render for Palette {
 
         popup_window(
             PopupSpec {
-                key: "palette",
+                key,
                 place: first,
                 min: (MIN_WIDTH, MIN_HEIGHT),
-                content_height: false,
-                max_height: None,
+                content_height: switcher,
+                max_height: switcher.then_some(HEIGHT),
             },
             body,
             window,

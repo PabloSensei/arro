@@ -346,12 +346,18 @@ pub(crate) fn download_all(_window: &mut Window, cx: &mut App) {
     cx.default_global::<Downloads>().cancel = Some(cancel.clone());
     let replies = {
         let Some(semantic) = cx.try_global::<Semantic>() else {
-            notify(cx, "Download Sources", "The language is not ready");
+            notify(
+                cx,
+                NotificationLevel::Warning,
+                "Download Sources",
+                "The language is not ready",
+            );
             return;
         };
         let Some(provider) = semantic.0.library_sources() else {
             notify(
                 cx,
+                NotificationLevel::Warning,
                 "Download Sources",
                 "The language has no sources to fetch",
             );
@@ -409,29 +415,40 @@ fn all_event(event: SourcesEvent, cx: &mut App) {
             if failed > 0 {
                 text.push_str(&format!(", {failed} failed"));
             }
-            notify(cx, "Download Sources", &text);
+            let level = if failed > 0 {
+                NotificationLevel::Warning
+            } else {
+                NotificationLevel::Info
+            };
+            notify(cx, level, "Download Sources", &text);
         }
         SourcesEvent::Missing { name } => {
             cx.default_global::<Downloads>().cancel = None;
             notify(
                 cx,
+                NotificationLevel::Warning,
                 "Download Sources",
                 &format!("No repository has the sources of {name}"),
             );
         }
         SourcesEvent::Failed { message } => {
             cx.default_global::<Downloads>().cancel = None;
-            notify(cx, "Download Sources", &message);
+            notify(cx, NotificationLevel::Error, "Download Sources", &message);
         }
         SourcesEvent::Cancelled => {
             cx.default_global::<Downloads>().cancel = None;
-            notify(cx, "Download Sources", "The download was stopped");
+            notify(
+                cx,
+                NotificationLevel::Info,
+                "Download Sources",
+                "The download was stopped",
+            );
         }
         SourcesEvent::Attached { .. } => {}
     }
 }
 
-fn notify(cx: &mut App, title: &str, text: &str) {
+fn notify(cx: &mut App, level: NotificationLevel, title: &str, text: &str) {
     let window = cx
         .try_global::<SourceWindow>()
         .map(|window| window.0.clone());
@@ -441,7 +458,11 @@ fn notify(cx: &mut App, title: &str, text: &str) {
         // after that update is over.
         cx.defer(move |cx| {
             window
-                .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+                .update(cx, |workspace, cx| match level {
+                    NotificationLevel::Info => workspace.notify_user(title, text, cx),
+                    NotificationLevel::Warning => workspace.notify_warning(title, text, cx),
+                    NotificationLevel::Error => workspace.notify_error(title, text, cx),
+                })
                 .ok();
         });
     }

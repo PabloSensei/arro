@@ -857,7 +857,7 @@ impl DockerPanel {
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| match sent {
                         Ok(()) => workspace.show_tool(TERMINAL_TOOL, window, cx),
-                        Err(error) => workspace.notify_user("Terminal", error, cx),
+                        Err(error) => workspace.notify_error("Terminal", error, cx),
                     })
                 })
                 .ok();
@@ -868,7 +868,7 @@ impl DockerPanel {
         let workspace = self.workspace.clone();
         cx.defer(move |cx| {
             workspace
-                .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+                .update(cx, |workspace, cx| workspace.notify_error(title, text, cx))
                 .ok();
         });
     }

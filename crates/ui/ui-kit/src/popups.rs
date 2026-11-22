@@ -890,10 +890,43 @@ pub struct NotificationAction {
     pub on_click: NotificationClick,
 }
 
+/// How important a notification is: the icon of its balloon, and whether it goes away on
+/// its own. Only the informational one fades, as in IDEA; a warning and an error stay
+/// until the user closes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationLevel {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+impl NotificationLevel {
+    /// The icon of the balloon, from the `status` group of every icon set.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Info => "status/info",
+            Self::Warning => "status/warning",
+            Self::Error => "status/error",
+        }
+    }
+
+    /// The name the icon of the balloon has in the debug selectors of the tests.
+    pub fn selector(self) -> &'static str {
+        match self {
+            Self::Info => "notification-icon-info",
+            Self::Warning => "notification-icon-warning",
+            Self::Error => "notification-icon-error",
+        }
+    }
+}
+
 /// The balloon at the bottom right.
+#[allow(clippy::too_many_arguments)]
 pub fn notification(
     title: SharedString,
     text: SharedString,
+    level: NotificationLevel,
     actions: Vec<NotificationAction>,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     scripted: bool,
@@ -940,7 +973,9 @@ pub fn notification(
             div()
                 .flex()
                 .gap(px(SPACE_M))
-                .child(icon("status/info", theme))
+                .child(
+                    icon(level.icon(), theme).debug_selector(move || level.selector().to_owned()),
+                )
                 .child(
                     div()
                         .flex()
@@ -959,6 +994,7 @@ pub fn notification(
                         None,
                         theme,
                     )
+                    .debug_selector(|| "notification-close".to_owned())
                     .size(px(20.))
                     .on_click(on_close),
                 ),

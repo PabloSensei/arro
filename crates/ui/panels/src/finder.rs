@@ -968,13 +968,20 @@ impl Finder {
         let workspace = self.workspace.clone();
         cx.spawn(async move |this, cx| {
             let outcome = work.await;
-            let text = match outcome {
-                Ok(count) => format!("{} replacements in {files} files", done + count),
-                Err(message) => message,
+            let (text, failed) = match outcome {
+                Ok(count) => (
+                    format!("{} replacements in {files} files", done + count),
+                    false,
+                ),
+                Err(message) => (message, true),
             };
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("Replace in Files", text, cx)
+                    if failed {
+                        workspace.notify_error("Replace in Files", text, cx)
+                    } else {
+                        workspace.notify_user("Replace in Files", text, cx)
+                    }
                 })
                 .ok();
             this.update(cx, |this, cx| this.refresh(cx)).ok();

@@ -266,7 +266,7 @@ fn save_as(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Work
                 let text = format!("{}: {error}", path.display());
                 workspace
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user("Cannot save", text, cx)
+                        workspace.notify_error("Cannot save", text, cx)
                     })
                     .ok();
             }

@@ -517,6 +517,44 @@ impl Repository {
             .map(drop)
     }
 
+    /// Gives the last commit the new message, as an Amend without files does: its tree and
+    /// its parents stay, and the index and the working tree are not touched, so a change
+    /// that is only there stays out of the commit. Returns the new commit.
+    pub fn amend_message(&self, message: &str, options: &CommitOptions) -> io::Result<String> {
+        let index = temp_path("amend-index");
+        let _ = std::fs::remove_file(&index);
+        let env = [("GIT_INDEX_FILE", index.as_os_str())];
+        let result = self.amend_message_with(message, options, &env);
+        let _ = std::fs::remove_file(&index);
+        result?;
+        Ok(self.run(["rev-parse", "HEAD"])?.trim().to_owned())
+    }
+
+    /// The body of [`Repository::amend_message`] with the temporary index in `env`.
+    fn amend_message_with(
+        &self,
+        message: &str,
+        options: &CommitOptions,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> io::Result<()> {
+        self.run_env_check(&["read-tree", "HEAD"], env)?;
+        let mut commit = vec!["commit", "--amend", "-F", "-"];
+        if options.sign_off {
+            commit.push("--signoff");
+        }
+        let author = options
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|author| !author.is_empty());
+        if let Some(author) = author {
+            commit.push("--author");
+            commit.push(author);
+        }
+        self.run_env_with_input(&commit, env, Some(message.as_bytes()))
+            .map(drop)
+    }
+
     /// Whether the commit belongs to the user of the repository.
     pub fn is_own_commit(&self, commit: &str) -> io::Result<bool> {
         let email = self.run(["show", "-s", "--format=%ae", commit])?;

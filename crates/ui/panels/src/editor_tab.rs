@@ -1063,7 +1063,7 @@ fn open(
             let message = message.clone();
             reports
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user(title, message, cx)
+                    workspace.notify_error(title, message, cx)
                 })
                 .ok();
         }
@@ -1079,7 +1079,7 @@ fn open(
             let message = message.clone();
             reports
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("Actions on Save", message, cx)
+                    workspace.notify_warning("Actions on Save", message, cx)
                 })
                 .ok();
         }
@@ -1099,7 +1099,7 @@ fn open(
             );
             reports
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("File changed on disk", text, cx)
+                    workspace.notify_warning("File changed on disk", text, cx)
                 })
                 .ok();
         }

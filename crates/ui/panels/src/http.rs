@@ -1535,7 +1535,7 @@ pub(crate) fn copy_as_curl(
         Ok(prepared) => {
             cx.write_to_clipboard(ClipboardItem::new_string(to_curl(&prepared, shell)));
         }
-        Err(error) => workspace.notify_user("Copy as cURL", error.to_string(), cx),
+        Err(error) => workspace.notify_error("Copy as cURL", error.to_string(), cx),
     }
 }
 

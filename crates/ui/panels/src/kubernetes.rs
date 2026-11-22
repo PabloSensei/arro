@@ -1593,7 +1593,7 @@ impl KubeSection {
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| match sent {
                         Ok(()) => workspace.show_tool(TERMINAL_TOOL, window, cx),
-                        Err(error) => workspace.notify_user("Terminal", error, cx),
+                        Err(error) => workspace.notify_error("Terminal", error, cx),
                     })
                 })
                 .ok();
@@ -1657,7 +1657,7 @@ impl KubeSection {
         let workspace = self.workspace.clone();
         cx.defer(move |cx| {
             workspace
-                .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+                .update(cx, |workspace, cx| workspace.notify_error(title, text, cx))
                 .ok();
         });
     }
@@ -2172,6 +2172,7 @@ fn apply_document(
     if document.name.is_empty() {
         notify(
             &workspace,
+            NotificationLevel::Warning,
             "Kubernetes",
             "The document has no metadata.name",
             cx,
@@ -2179,7 +2180,13 @@ fn apply_document(
         return;
     }
     let Some(cli) = cli_of(cx) else {
-        notify(&workspace, "Kubernetes", NO_CLI, cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Kubernetes",
+            NO_CLI,
+            cx,
+        );
         return;
     };
     let task = cx
@@ -2191,9 +2198,21 @@ fn apply_document(
             cx.update(|_, cx| match result {
                 Ok(output) => {
                     let text = first_line(&output).unwrap_or_else(|| "applied".to_owned());
-                    notify(&workspace, "Apply to Cluster", &text, cx);
+                    notify(
+                        &workspace,
+                        NotificationLevel::Info,
+                        "Apply to Cluster",
+                        &text,
+                        cx,
+                    );
                 }
-                Err(error) => notify(&workspace, "Apply to Cluster", &error, cx),
+                Err(error) => notify(
+                    &workspace,
+                    NotificationLevel::Error,
+                    "Apply to Cluster",
+                    &error,
+                    cx,
+                ),
             })
             .ok();
         })
@@ -2210,6 +2229,7 @@ fn delete_document(
     if document.name.is_empty() {
         notify(
             &workspace,
+            NotificationLevel::Warning,
             "Kubernetes",
             "The document has no metadata.name",
             cx,
@@ -2217,7 +2237,13 @@ fn delete_document(
         return;
     }
     let Some(cli) = cli_of(cx) else {
-        notify(&workspace, "Kubernetes", NO_CLI, cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Kubernetes",
+            NO_CLI,
+            cx,
+        );
         return;
     };
     let cli =
@@ -2243,8 +2269,20 @@ fn delete_document(
                     cx.spawn(async move |cx| {
                         let result = task.await;
                         cx.update(|cx| match result {
-                            Ok(()) => notify(&weak, "Delete from Cluster", "deleted", cx),
-                            Err(error) => notify(&weak, "Delete from Cluster", &error, cx),
+                            Ok(()) => notify(
+                                &weak,
+                                NotificationLevel::Info,
+                                "Delete from Cluster",
+                                "deleted",
+                                cx,
+                            ),
+                            Err(error) => notify(
+                                &weak,
+                                NotificationLevel::Error,
+                                "Delete from Cluster",
+                                &error,
+                                cx,
+                            ),
                         });
                     })
                     .detach();
@@ -2265,12 +2303,19 @@ fn diff_document(
     cx: &mut App,
 ) {
     let Some(cli) = cli_of(cx) else {
-        notify(&workspace, "Kubernetes", NO_CLI, cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Kubernetes",
+            NO_CLI,
+            cx,
+        );
         return;
     };
     if document.name.is_empty() {
         notify(
             &workspace,
+            NotificationLevel::Warning,
             "Kubernetes",
             "The document has no metadata.name",
             cx,
@@ -2281,7 +2326,13 @@ fn diff_document(
         .try_global::<crate::git::ActiveGit>()
         .map(|git| git.0.clone())
     else {
-        notify(&workspace, "Diff with Cluster", "Git is not ready", cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Diff with Cluster",
+            "Git is not ready",
+            cx,
+        );
         return;
     };
     let kind = document.kind_word.clone();
@@ -2300,8 +2351,16 @@ fn diff_document(
     window
         .spawn(cx, async move |cx| match task.await {
             Ok(None) => {
-                cx.update(|_, cx| notify(&workspace, "Diff with Cluster", "No differences", cx))
-                    .ok();
+                cx.update(|_, cx| {
+                    notify(
+                        &workspace,
+                        NotificationLevel::Info,
+                        "Diff with Cluster",
+                        "No differences",
+                        cx,
+                    )
+                })
+                .ok();
             }
             Ok(Some(cluster)) => {
                 let weak = workspace.clone();
@@ -2322,8 +2381,16 @@ fn diff_document(
                 .ok();
             }
             Err(error) => {
-                cx.update(|_, cx| notify(&workspace, "Diff with Cluster", &error, cx))
-                    .ok();
+                cx.update(|_, cx| {
+                    notify(
+                        &workspace,
+                        NotificationLevel::Error,
+                        "Diff with Cluster",
+                        &error,
+                        cx,
+                    )
+                })
+                .ok();
             }
         })
         .detach();
@@ -2335,9 +2402,19 @@ fn cli_of(cx: &App) -> Option<Kubectl> {
     find_cli(cx)
 }
 
-fn notify(workspace: &WeakEntity<Workspace>, title: &str, text: &str, cx: &mut App) {
+fn notify(
+    workspace: &WeakEntity<Workspace>,
+    level: NotificationLevel,
+    title: &str,
+    text: &str,
+    cx: &mut App,
+) {
     workspace
-        .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+        .update(cx, |workspace, cx| match level {
+            NotificationLevel::Info => workspace.notify_user(title, text, cx),
+            NotificationLevel::Warning => workspace.notify_warning(title, text, cx),
+            NotificationLevel::Error => workspace.notify_error(title, text, cx),
+        })
         .ok();
 }
 

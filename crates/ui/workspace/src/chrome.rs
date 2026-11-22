@@ -3189,9 +3189,13 @@ impl Workspace {
         if !self.balloon_visible {
             return None;
         }
-        let (title, text) = match &self.balloon {
-            Some(balloon) => (balloon.title.clone(), balloon.text.clone()),
-            None => ("Notifications".into(), "Nothing new.".into()),
+        let (title, text, level) = match &self.balloon {
+            Some(balloon) => (balloon.title.clone(), balloon.text.clone(), balloon.level),
+            None => (
+                "Notifications".into(),
+                "Nothing new.".into(),
+                NotificationLevel::Info,
+            ),
         };
         let close = cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_balloon(cx));
         let mut actions = Vec::new();
@@ -3247,6 +3251,7 @@ impl Workspace {
         let body = notification(
             title,
             text,
+            level,
             actions,
             close,
             cx.has_global::<ScriptSpots>(),

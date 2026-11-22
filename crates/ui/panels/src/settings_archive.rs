@@ -59,7 +59,7 @@ fn export(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Works
                     );
                     workspace.notify_user("Settings exported", text, cx);
                 }
-                Err(error) => workspace.notify_user("Cannot export the settings", error, cx),
+                Err(error) => workspace.notify_error("Cannot export the settings", error, cx),
             })
             .ok();
     })
@@ -128,7 +128,7 @@ fn import(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Works
             Err(error) => {
                 workspace
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user("Cannot read the settings archive", error, cx)
+                        workspace.notify_error("Cannot read the settings archive", error, cx)
                     })
                     .ok();
             }
@@ -270,7 +270,7 @@ impl ImportSettingsDialog {
                             cx,
                         );
                     }
-                    Err(error) => workspace.notify_user("Cannot import the settings", error, cx),
+                    Err(error) => workspace.notify_error("Cannot import the settings", error, cx),
                 })
                 .ok();
         })

@@ -918,7 +918,7 @@ impl RunPanel {
     /// a build file does. An old model stays readable meanwhile.
     pub fn reload_project(&mut self, cx: &mut Context<Self>) {
         let Some(tool) = self.tool.clone() else {
-            self.tell("Reload", "The project has no build tool", cx);
+            self.tell_warning("Reload", "The project has no build tool", cx);
             return;
         };
         let (session, sync) = open_project(tool, self.root.clone(), &self.cache_root);
@@ -1242,7 +1242,7 @@ impl RunPanel {
             return;
         };
         if let Err(error) = tool.choose(&self.root, &next) {
-            self.tell("Build Settings", error.to_string(), cx);
+            self.tell_error("Build Settings", error.to_string(), cx);
             return;
         }
         self.selection = next;
@@ -1312,7 +1312,7 @@ impl RunPanel {
             this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     let text = format!("The configurations are not saved: {error}");
-                    this.tell("Run configurations", text, cx);
+                    this.tell_error("Run configurations", text, cx);
                 }
                 this.changed(cx);
             })
@@ -1677,7 +1677,7 @@ impl RunPanel {
         let provider = self.providers.iter().find(|p| p.id() == config.provider);
         let Some(provider) = provider.cloned() else {
             let text = format!("Nothing runs configurations of kind {}", config.provider);
-            self.tell("Cannot run", text, cx);
+            self.tell_error("Cannot run", text, cx);
             return;
         };
         if config.is_compound() {
@@ -1753,7 +1753,7 @@ impl RunPanel {
                     Err(message) => {
                         this.run_service.stopped();
                         this.note(&message, true);
-                        this.tell("Cannot run", message, cx);
+                        this.tell_error("Cannot run", message, cx);
                     }
                 }
                 this.changed(cx);
@@ -1781,7 +1781,7 @@ impl RunPanel {
             else {
                 let message = format!("Compound names a configuration that is not there: {name}");
                 self.note(&message, true);
-                self.tell("Cannot run", message, cx);
+                self.tell_error("Cannot run", message, cx);
                 return;
             };
             let Some(provider) = self
@@ -1792,13 +1792,13 @@ impl RunPanel {
             else {
                 let message = format!("Nothing runs configurations of kind {}", child.provider);
                 self.note(&message, true);
-                self.tell("Cannot run", message, cx);
+                self.tell_error("Cannot run", message, cx);
                 return;
             };
             if child.is_compound() {
                 let message = format!("A compound configuration cannot start {name}");
                 self.note(&message, true);
-                self.tell("Cannot run", message, cx);
+                self.tell_error("Cannot run", message, cx);
                 return;
             }
             children.push((child, provider));
@@ -1806,7 +1806,7 @@ impl RunPanel {
         if children.is_empty() {
             let message = "This compound configuration lists nothing to run".to_owned();
             self.note(&message, true);
-            self.tell("Cannot run", message, cx);
+            self.tell_error("Cannot run", message, cx);
             return;
         }
         let (cancel, generation) = self.begin_launch();
@@ -1916,7 +1916,7 @@ impl RunPanel {
                     Err(message) => {
                         this.run_service.stopped();
                         this.note(&message, true);
-                        this.tell("Cannot run", message, cx);
+                        this.tell_error("Cannot run", message, cx);
                     }
                 }
                 this.changed(cx);
@@ -1934,7 +1934,7 @@ impl RunPanel {
             return;
         }
         if self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(config) = self
@@ -1946,7 +1946,7 @@ impl RunPanel {
         };
         let model = self.session.as_ref().and_then(ProjectSession::model);
         let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
-            self.tell("Cannot run", "The project is still loading", cx);
+            self.tell_warning("Cannot run", "The project is still loading", cx);
             return;
         };
         let Some(provider) = self
@@ -1956,7 +1956,7 @@ impl RunPanel {
             .cloned()
         else {
             let text = format!("Nothing runs configurations of kind {}", config.provider);
-            self.tell("Cannot run", text, cx);
+            self.tell_error("Cannot run", text, cx);
             return;
         };
         self.begin_coverage();
@@ -2004,7 +2004,7 @@ impl RunPanel {
                         let message = error.to_string();
                         this.run_service.stopped();
                         this.note(&message, true);
-                        this.tell("Cannot run with coverage", message, cx);
+                        this.tell_error("Cannot run with coverage", message, cx);
                     }
                 }
                 this.changed(cx);
@@ -2030,16 +2030,16 @@ impl RunPanel {
             return;
         }
         if self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(provider) = self.test_provider.clone() else {
-            self.tell("Cannot run tests", "The project has no build tool", cx);
+            self.tell_warning("Cannot run tests", "The project has no build tool", cx);
             return;
         };
         let model = self.session.as_ref().and_then(ProjectSession::model);
         let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
-            self.tell("Cannot run tests", "The project is still loading", cx);
+            self.tell_warning("Cannot run tests", "The project is still loading", cx);
             return;
         };
         self.begin_coverage();
@@ -2082,7 +2082,7 @@ impl RunPanel {
                     }
                     Err(message) => {
                         this.note(&message, true);
-                        this.tell("Cannot run tests with coverage", message, cx);
+                        this.tell_error("Cannot run tests with coverage", message, cx);
                         this.tests.finished = true;
                     }
                 }
@@ -2103,15 +2103,15 @@ impl RunPanel {
             return;
         }
         if self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(provider) = self.test_provider.clone() else {
-            self.tell("Cannot run tests", "The project has no build tool", cx);
+            self.tell_warning("Cannot run tests", "The project has no build tool", cx);
             return;
         };
         if !provider.supports_profiler() {
-            self.tell(
+            self.tell_warning(
                 "Cannot profile the tests",
                 "The build tool cannot record the test JVMs",
                 cx,
@@ -2120,7 +2120,7 @@ impl RunPanel {
         }
         let model = self.session.as_ref().and_then(ProjectSession::model);
         let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
-            self.tell("Cannot run tests", "The project is still loading", cx);
+            self.tell_warning("Cannot run tests", "The project is still loading", cx);
             return;
         };
         self.begin_profile(cx);
@@ -2162,7 +2162,7 @@ impl RunPanel {
                     }
                     Err(message) => {
                         this.note(&message, true);
-                        this.tell("Cannot run tests with profiler", message, cx);
+                        this.tell_error("Cannot run tests with profiler", message, cx);
                         this.tests.finished = true;
                     }
                 }
@@ -2287,7 +2287,7 @@ impl RunPanel {
             return;
         }
         if self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(config) = self
@@ -2299,7 +2299,7 @@ impl RunPanel {
         };
         let model = self.session.as_ref().and_then(ProjectSession::model);
         let Some(model) = model.filter(|model| model.resolved || !self.loading) else {
-            self.tell("Cannot profile", "The project is still loading", cx);
+            self.tell_warning("Cannot profile", "The project is still loading", cx);
             return;
         };
         let Some(provider) = self
@@ -2309,7 +2309,7 @@ impl RunPanel {
             .cloned()
         else {
             let text = format!("Nothing runs configurations of kind {}", config.provider);
-            self.tell("Cannot profile", text, cx);
+            self.tell_error("Cannot profile", text, cx);
             return;
         };
         self.begin_profile(cx);
@@ -2359,7 +2359,7 @@ impl RunPanel {
                         this.run_service.stopped();
                         this.note(&message, true);
                         this.profile_error = Some(message.clone());
-                        this.tell("Cannot run with profiler", message, cx);
+                        this.tell_error("Cannot run with profiler", message, cx);
                         this.profile_changed(cx);
                     }
                 }
@@ -2449,11 +2449,11 @@ impl RunPanel {
     /// configuration, or the first provider that can read one.
     pub fn open_profile_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
-            self.tell("Cannot read a profile", "The project is still loading", cx);
+            self.tell_warning("Cannot read a profile", "The project is still loading", cx);
             return;
         };
         let Some(provider) = self.profiler_provider() else {
-            self.tell(
+            self.tell_error(
                 "Cannot read a profile",
                 "The project has no profiler provider",
                 cx,
@@ -2691,7 +2691,7 @@ impl RunPanel {
         cx: &mut Context<Self>,
     ) {
         if self.starting || self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(tool) = self.tool.clone() else {
@@ -2719,7 +2719,7 @@ impl RunPanel {
     /// Runs a line typed in the build tool window, in the root project.
     pub fn run_goal(&mut self, line: &str, cx: &mut Context<Self>) {
         if self.starting || self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(tool) = self.tool.clone() else {
@@ -2751,11 +2751,11 @@ impl RunPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(service) = self.debug_service.clone() else {
-            self.tell("Cannot debug", "The language server is not running", cx);
+            self.tell_warning("Cannot debug", "The language server is not running", cx);
             return;
         };
         let Some(tool) = self.tool.clone() else {
-            self.tell("Cannot debug", "The project has no build tool", cx);
+            self.tell_warning("Cannot debug", "The project has no build tool", cx);
             return;
         };
         let module = module.and_then(|id| self.module_named(id));
@@ -2778,7 +2778,7 @@ impl RunPanel {
             let plan = match plan.await {
                 Ok(plan) => plan,
                 Err(error) => {
-                    this.update(cx, |this, cx| this.tell("Cannot debug", error, cx))
+                    this.update(cx, |this, cx| this.tell_error("Cannot debug", error, cx))
                         .ok();
                     return;
                 }
@@ -2820,16 +2820,16 @@ impl RunPanel {
     /// console of its own: the test run keeps its console and its tree.
     pub fn build_project(&mut self, cx: &mut Context<Self>) {
         if self.starting || (self.build_console.is_some() && self.build_running) {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let debugging_tests = self.debugging_tests && self.tests.running();
         if self.busy() && !debugging_tests {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(tool) = self.tool.clone() else {
-            self.tell("Cannot build", "The project has no build tool", cx);
+            self.tell_warning("Cannot build", "The project has no build tool", cx);
             return;
         };
         let (root, tests) = (self.root.clone(), self.debugging_tests);
@@ -2873,11 +2873,11 @@ impl RunPanel {
         cx: &mut Context<Self>,
     ) {
         if self.starting || self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(tool) = self.tool.clone() else {
-            self.tell("Cannot compile", "The project has no build tool", cx);
+            self.tell_warning("Cannot compile", "The project has no build tool", cx);
             return;
         };
         let module = file.as_deref().and_then(|file| {
@@ -2915,11 +2915,11 @@ impl RunPanel {
     /// Rebuild Project: builds the whole project again from scratch.
     pub fn rebuild_project(&mut self, cx: &mut Context<Self>) {
         if self.starting || self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(tool) = self.tool.clone() else {
-            self.tell("Cannot rebuild", "The project has no build tool", cx);
+            self.tell_warning("Cannot rebuild", "The project has no build tool", cx);
             return;
         };
         let (root, tests) = (self.root.clone(), self.debugging_tests);
@@ -2946,11 +2946,11 @@ impl RunPanel {
     /// Generate Sources and Update Folders: runs the source generator of the build tool.
     pub fn generate_sources(&mut self, cx: &mut Context<Self>) {
         if self.starting || self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(tool) = self.tool.clone() else {
-            self.tell(
+            self.tell_warning(
                 "Cannot generate sources",
                 "The project has no build tool",
                 cx,
@@ -4105,7 +4105,7 @@ impl RunPanel {
                     Err(message) => {
                         this.building_project = false;
                         this.note(&message, true);
-                        this.tell("Cannot run", message, cx);
+                        this.tell_error("Cannot run", message, cx);
                     }
                 }
                 this.changed(cx);
@@ -4173,7 +4173,7 @@ impl RunPanel {
                         this.refresh_build_view();
                         this.run_service.stopped();
                         this.note(&message, true);
-                        this.tell("Cannot run", message, cx);
+                        this.tell_error("Cannot run", message, cx);
                     }
                 }
                 this.changed(cx);
@@ -4396,15 +4396,15 @@ impl RunPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(service) = self.debug_service.clone() else {
-            self.tell("Cannot debug", "The language server is not running", cx);
+            self.tell_warning("Cannot debug", "The language server is not running", cx);
             return;
         };
         let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
-            self.tell("Cannot debug", "The project is still loading", cx);
+            self.tell_warning("Cannot debug", "The project is still loading", cx);
             return;
         };
         let Some(selected) = self.selected else {
-            self.tell("Cannot debug", "There is no configuration to debug", cx);
+            self.tell_warning("Cannot debug", "There is no configuration to debug", cx);
             return;
         };
         let Some(selected_config) = self.configs.get(selected).cloned() else {
@@ -4416,7 +4416,7 @@ impl RunPanel {
             .iter()
             .find(|provider| provider.id() == config.provider)
         else {
-            self.tell("Cannot debug", "The configuration has no provider", cx);
+            self.tell_warning("Cannot debug", "The configuration has no provider", cx);
             return;
         };
         // The plan may look at every source file to see whether a build is due, so it is
@@ -4440,7 +4440,7 @@ impl RunPanel {
                 Ok(plan) => plan,
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.tell("Cannot debug", error.to_string(), cx)
+                        this.tell_error("Cannot debug", error.to_string(), cx)
                     })
                     .ok();
                     return;
@@ -4463,7 +4463,7 @@ impl RunPanel {
                     if let Err(error) = started {
                         workspace
                             .update(cx, |workspace, cx| {
-                                workspace.notify_user("Cannot attach", error, cx)
+                                workspace.notify_error("Cannot attach", error, cx)
                             })
                             .ok();
                         return;
@@ -4542,19 +4542,19 @@ impl RunPanel {
         cx: &mut Context<Self>,
     ) {
         if self.starting || self.busy() {
-            self.tell("Busy", "Stop what is running first", cx);
+            self.tell_warning("Busy", "Stop what is running first", cx);
             return;
         }
         let Some(service) = self.debug_service.clone() else {
-            self.tell("Cannot debug", "The language server is not running", cx);
+            self.tell_warning("Cannot debug", "The language server is not running", cx);
             return;
         };
         let Some(provider) = self.test_provider.clone() else {
-            self.tell("Cannot debug tests", "The project has no build tool", cx);
+            self.tell_warning("Cannot debug tests", "The project has no build tool", cx);
             return;
         };
         let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
-            self.tell("Cannot debug tests", "The project is still loading", cx);
+            self.tell_warning("Cannot debug tests", "The project is still loading", cx);
             return;
         };
         self.waiting_tests = None;
@@ -4625,7 +4625,7 @@ impl RunPanel {
                         if let Err(error) = attached {
                             this.debugging_tests = false;
                             this.stop_running();
-                            this.tell("Cannot debug tests", error, cx);
+                            this.tell_error("Cannot debug tests", error, cx);
                         }
                     }
                     Err(message) if stopped || message == STOPPED_BY_USER => {
@@ -4636,7 +4636,7 @@ impl RunPanel {
                     Err(message) => {
                         this.debugging_tests = false;
                         this.note(&message, true);
-                        this.tell("Cannot debug tests", message, cx);
+                        this.tell_error("Cannot debug tests", message, cx);
                         this.tests.finished = true;
                     }
                 }
@@ -5012,7 +5012,7 @@ impl RunPanel {
             return;
         };
         let _ = self.workspace.update(cx, |workspace, cx| {
-            workspace.notify_user("Project", message, cx);
+            workspace.notify_warning("Project", message, cx);
         });
     }
 
@@ -5049,7 +5049,7 @@ impl RunPanel {
                         }
                         None => {
                             self.tool_setup = None;
-                            self.tell("Project sync failed", message, cx);
+                            self.tell_error("Project sync failed", message, cx);
                         }
                     }
                     start_waiting = true;
@@ -5096,7 +5096,7 @@ impl RunPanel {
             buttons.push(("settings", label.clone().into(), command));
         }
         let _ = self.workspace.update(cx, |workspace, cx| {
-            workspace.notify_user_with_commands(
+            workspace.notify_warning_with_commands(
                 setup.title.clone(),
                 setup.text.clone(),
                 buttons,
@@ -5291,7 +5291,7 @@ impl RunPanel {
                 let _ = self.workspace.update(cx, |workspace, cx| {
                     workspace
                         .set_language_status(Some(format!("{name} was not downloaded").into()), cx);
-                    workspace.notify_user_with_commands(
+                    workspace.notify_error_with_commands(
                         format!("{name} download failed"),
                         text,
                         buttons,
@@ -5385,7 +5385,11 @@ impl RunPanel {
             ),
         };
         self.note(&text, error);
-        self.tell(title, text, cx);
+        if error {
+            self.tell_error(title, text, cx);
+        } else {
+            self.tell(title, text, cx);
+        }
     }
 
     fn discover(&mut self, cx: &mut Context<Self>) {
@@ -5416,7 +5420,7 @@ impl RunPanel {
                 }
                 this.merge_lists();
                 for problem in problems {
-                    this.tell("Run configurations", problem, cx);
+                    this.tell_error("Run configurations", problem, cx);
                 }
                 this.changed(cx);
                 cx.emit(ConfigsChanged);
@@ -5444,7 +5448,7 @@ impl RunPanel {
                     Some(error) => {
                         this.saved.clear();
                         this.store_broken = Some(error.clone());
-                        this.tell("Run configurations", error, cx);
+                        this.tell_error("Run configurations", error, cx);
                     }
                     None => {
                         this.saved = stored.configs;
@@ -5467,11 +5471,37 @@ impl RunPanel {
 
     /// Deferred, like every call into the workspace: the toolbar may be what called.
     fn tell(&self, title: &str, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.tell_with_level(NotificationLevel::Info, title, text, cx);
+    }
+
+    /// The same, for something that went wrong: the notification stays until the user
+    /// closes it.
+    fn tell_error(&self, title: &str, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.tell_with_level(NotificationLevel::Error, title, text, cx);
+    }
+
+    /// The same, for a state the user has to know about: it stays until the user closes
+    /// it.
+    fn tell_warning(&self, title: &str, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.tell_with_level(NotificationLevel::Warning, title, text, cx);
+    }
+
+    fn tell_with_level(
+        &self,
+        level: NotificationLevel,
+        title: &str,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         let (title, text) = (title.to_string(), text.into());
         let workspace = self.workspace.clone();
         cx.defer(move |cx| {
             workspace
-                .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+                .update(cx, |workspace, cx| match level {
+                    NotificationLevel::Info => workspace.notify_user(title, text, cx),
+                    NotificationLevel::Warning => workspace.notify_warning(title, text, cx),
+                    NotificationLevel::Error => workspace.notify_error(title, text, cx),
+                })
                 .ok();
         });
     }

@@ -352,7 +352,7 @@ fn only_changed(
         .try_global::<ActiveGit>()
         .and_then(|git| git.0.read(cx).repo());
     let Some(repo) = repo else {
-        workspace.notify_user("Reformat", "The project is not in a repository", cx);
+        workspace.notify_warning("Reformat", "The project is not in a repository", cx);
         return;
     };
     let relative = path
@@ -406,11 +406,11 @@ fn start(
         .try_global::<Semantic>()
         .map(|semantic| semantic.0.clone())
     else {
-        workspace.notify_user("Reformat", "No language server for this file", cx);
+        workspace.notify_warning("Reformat", "No language server for this file", cx);
         return;
     };
     if support.format().is_none() && support.range_format().is_none() {
-        workspace.notify_user(
+        workspace.notify_warning(
             "Reformat",
             "The language server cannot format this file",
             cx,
@@ -845,11 +845,11 @@ fn run_paths(
         .try_global::<Semantic>()
         .map(|semantic| semantic.0.clone())
     else {
-        workspace.notify_user("Reformat", "No language server for these files", cx);
+        workspace.notify_warning("Reformat", "No language server for these files", cx);
         return;
     };
     if support.format().is_none() {
-        workspace.notify_user(
+        workspace.notify_warning(
             "Reformat",
             "The language server cannot format these files",
             cx,
@@ -858,7 +858,7 @@ fn run_paths(
     }
     let changed = if only_changed {
         let Some(changed) = changed_files(cx) else {
-            workspace.notify_user("Reformat", "The project is not in a repository", cx);
+            workspace.notify_warning("Reformat", "The project is not in a repository", cx);
             return;
         };
         Some(changed)

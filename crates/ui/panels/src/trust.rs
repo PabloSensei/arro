@@ -54,7 +54,7 @@ impl TrustDialog {
             let text = format!("{}: {error}", self.project.display());
             self.workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("Trust is not saved", text, cx)
+                    workspace.notify_error("Trust is not saved", text, cx)
                 })
                 .ok();
         }

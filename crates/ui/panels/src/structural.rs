@@ -862,14 +862,21 @@ impl StructuralSearch {
         });
         cx.spawn(async move |this, cx| {
             let outcome = work.await;
-            let text = match outcome {
-                Ok(count) => format!("{} replacements in {files} files", done + count),
-                Err(message) => message,
+            let (text, failed) = match outcome {
+                Ok(count) => (
+                    format!("{} replacements in {files} files", done + count),
+                    false,
+                ),
+                Err(message) => (message, true),
             };
             this.update(cx, |this, cx| {
                 if let Some(workspace) = this.workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
-                        workspace.notify_user("Replace Structurally", text, cx)
+                        if failed {
+                            workspace.notify_error("Replace Structurally", text, cx)
+                        } else {
+                            workspace.notify_user("Replace Structurally", text, cx)
+                        }
                     });
                 }
                 this.refresh(None, cx);

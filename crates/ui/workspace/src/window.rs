@@ -350,8 +350,8 @@ const MENU_OPEN_DELAY: Duration = Duration::from_millis(220);
 /// How long a message of the status bar stays before it goes away.
 const STATUS_MESSAGE_TIME: Duration = Duration::from_secs(5);
 /// How long an informational notification stays before it goes away, as in IDEA. One
-/// that offers a button waits for the user instead.
-const NOTIFICATION_TIME: Duration = Duration::from_secs(8);
+/// that offers a button, or a warning or an error, waits for the user instead.
+pub const NOTIFICATION_TIME: Duration = Duration::from_secs(8);
 
 /// The build the distribution README names: the commit and its date.
 pub fn build_version() -> &'static str {
@@ -594,6 +594,8 @@ pub struct MenuRow {
 }
 
 pub(crate) struct Balloon {
+    /// How important the notification is: its icon, and whether it goes away on its own.
+    pub level: NotificationLevel,
     pub title: SharedString,
     pub text: SharedString,
     /// A button of the balloon, and the file it opens.
@@ -1344,7 +1346,7 @@ impl Workspace {
         }
         let Some(current) = updater::parse_version(self.info.version) else {
             if !automatic {
-                self.notify_user(
+                self.notify_error(
                     "Update check failed",
                     format!("The build version {} is not a version", self.info.version),
                     cx,
@@ -1396,7 +1398,7 @@ impl Workspace {
             Err(error) => {
                 eprintln!("update check failed: {error}");
                 if !automatic {
-                    self.notify_user("Update check failed", error.to_string(), cx);
+                    self.notify_error("Update check failed", error.to_string(), cx);
                 }
             }
         }
@@ -1438,6 +1440,7 @@ impl Workspace {
         });
         self.show_balloon(
             Balloon {
+                level: NotificationLevel::Info,
                 title: format!("Arro {version} is available").into(),
                 text: line.into(),
                 action: None,
@@ -1467,7 +1470,7 @@ impl Workspace {
             return;
         };
         let Ok(install) = updater::install_dir() else {
-            self.notify_user(
+            self.notify_error(
                 "The update did not install",
                 "The program folder is unknown",
                 cx,
@@ -1492,7 +1495,7 @@ impl Workspace {
                 Ok(program) => this.restart_after_update(program, cx),
                 Err(error) => {
                     this.installing_update = false;
-                    this.notify_user("The update did not install", error.to_string(), cx)
+                    this.notify_error("The update did not install", error.to_string(), cx)
                 }
             })
             .ok();
@@ -1517,7 +1520,7 @@ impl Workspace {
         }
         match crate::launch::spawn_project_after(&self.state_dir, &root, Some(std::process::id())) {
             Ok(()) => cx.quit(),
-            Err(error) => self.notify_user("Cannot restart the project", error.to_string(), cx),
+            Err(error) => self.notify_error("Cannot restart the project", error.to_string(), cx),
         }
     }
 
@@ -1540,7 +1543,7 @@ impl Workspace {
         );
         match started {
             Ok(()) => cx.quit(),
-            Err(error) => self.notify_user(
+            Err(error) => self.notify_error(
                 "The update is installed",
                 format!("Restart Arro: {error}"),
                 cx,
@@ -2886,6 +2889,7 @@ impl Workspace {
         });
         self.show_balloon(
             Balloon {
+                level: NotificationLevel::Info,
                 title,
                 text: details,
                 action: None,
@@ -3783,7 +3787,7 @@ impl Workspace {
                 }
                 Err(error) => {
                     workspace.keymap_broken = true;
-                    workspace.notify_user(
+                    workspace.notify_error(
                         "Keymap",
                         format!("{KEYMAP_FILE} is not read: {error}"),
                         cx,
@@ -3861,7 +3865,7 @@ impl Workspace {
     }
 
     fn refuse_keymap_edit(&mut self, cx: &mut Context<Self>) {
-        self.notify_user(
+        self.notify_warning(
             "Keymap",
             format!("{KEYMAP_FILE} is broken and left as it is. Fix it and try again."),
             cx,
@@ -4447,7 +4451,7 @@ impl Workspace {
             if let Err(error) = start.await {
                 let text = error.to_string();
                 let report = |this: &mut Self, cx: &mut Context<Self>| {
-                    this.notify_user("Cannot open the project", text, cx)
+                    this.notify_error("Cannot open the project", text, cx)
                 };
                 this.update(cx, report).ok();
             }
@@ -4471,7 +4475,7 @@ impl Workspace {
             Request::Open(path) => path,
         };
         if !path.exists() {
-            self.notify_user(
+            self.notify_error(
                 "Cannot open",
                 format!("{} does not exist", path.display()),
                 cx,
@@ -5235,8 +5239,40 @@ impl Workspace {
         text: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        self.notify_with_level(NotificationLevel::Info, title, text, cx);
+    }
+
+    /// An informational notification that stays only a few seconds, unless it offers a
+    /// button.
+    pub fn notify_warning(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_level(NotificationLevel::Warning, title, text, cx);
+    }
+
+    /// An error notification: it stays until the user closes it.
+    pub fn notify_error(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_level(NotificationLevel::Error, title, text, cx);
+    }
+
+    fn notify_with_level(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         self.show_balloon(
             Balloon {
+                level,
                 title: title.into(),
                 text: text.into(),
                 action: None,
@@ -5246,11 +5282,14 @@ impl Workspace {
         );
     }
 
-    /// Shows `balloon` and, when it asks nothing of the user, hides it after a few
-    /// seconds as IDEA hides its informational notifications. A newer notification, an
-    /// opened one or a closed one bumps the serial, so an older timer leaves it alone.
+    /// Shows `balloon` and, when it is informational and asks nothing of the user, hides
+    /// it after a few seconds as IDEA hides its informational notifications. A warning and
+    /// an error stay until the user closes them. A newer notification, an opened one or a
+    /// closed one bumps the serial, so an older timer leaves it alone.
     fn show_balloon(&mut self, balloon: Balloon, cx: &mut Context<Self>) {
-        let informational = balloon.action.is_none() && balloon.buttons.is_empty();
+        let informational = balloon.level == NotificationLevel::Info
+            && balloon.action.is_none()
+            && balloon.buttons.is_empty();
         self.balloon = Some(balloon);
         self.balloon_visible = true;
         self.balloon_serial += 1;
@@ -5280,7 +5319,37 @@ impl Workspace {
         command: &'static str,
         cx: &mut Context<Self>,
     ) {
-        self.notify_user_with_commands(title, text, vec![("command", button.into(), command)], cx);
+        self.notify_with_command(NotificationLevel::Info, title, text, button, command, cx);
+    }
+
+    /// An error notification with one button that runs a command of the window.
+    pub fn notify_error_with_command(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        button: impl Into<SharedString>,
+        command: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_command(NotificationLevel::Error, title, text, button, command, cx);
+    }
+
+    fn notify_with_command(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        button: impl Into<SharedString>,
+        command: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_commands(
+            level,
+            title,
+            text,
+            vec![("command", button.into(), command)],
+            cx,
+        );
     }
 
     /// A notification with several buttons that run commands of the window, in order.
@@ -5291,8 +5360,54 @@ impl Workspace {
         buttons: Vec<(&'static str, SharedString, &'static str)>,
         cx: &mut Context<Self>,
     ) {
+        self.notify_with_commands(NotificationLevel::Info, title, text, buttons, cx);
+    }
+
+    /// An error notification with several buttons that run commands of the window.
+    pub fn notify_error_with_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_commands(NotificationLevel::Error, title, text, buttons, cx);
+    }
+
+    /// A warning notification with several buttons that run commands of the window.
+    pub fn notify_warning_with_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_commands(NotificationLevel::Warning, title, text, buttons, cx);
+    }
+
+    /// A warning notification with one button that runs a command of the window.
+    pub fn notify_warning_with_command(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        button: impl Into<SharedString>,
+        command: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_command(NotificationLevel::Warning, title, text, button, command, cx);
+    }
+
+    fn notify_with_commands(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
         self.show_balloon(
             Balloon {
+                level,
                 title: title.into(),
                 text: text.into(),
                 action: None,
@@ -5320,6 +5435,7 @@ impl Workspace {
     ) {
         self.show_balloon(
             Balloon {
+                level: NotificationLevel::Info,
                 title: title.into(),
                 text: text.into(),
                 action: Some((action.into(), action_path)),
@@ -5341,8 +5457,54 @@ impl Workspace {
         buttons: Vec<(&'static str, SharedString, &'static str)>,
         cx: &mut Context<Self>,
     ) {
+        self.notify_with_action_and_commands(
+            NotificationLevel::Info,
+            title,
+            text,
+            action,
+            action_path,
+            buttons,
+            cx,
+        );
+    }
+
+    /// An error notification with buttons that run commands of the window and one button
+    /// that opens `action_path`. The command buttons come first, the file last.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify_error_with_action_and_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        action: impl Into<SharedString>,
+        action_path: PathBuf,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_action_and_commands(
+            NotificationLevel::Error,
+            title,
+            text,
+            action,
+            action_path,
+            buttons,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn notify_with_action_and_commands(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        action: impl Into<SharedString>,
+        action_path: PathBuf,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
         self.show_balloon(
             Balloon {
+                level,
                 title: title.into(),
                 text: text.into(),
                 action: Some((action.into(), action_path)),
@@ -5364,6 +5526,11 @@ impl Workspace {
         self.balloon
             .as_ref()
             .map(|balloon| (balloon.title.clone(), balloon.text.clone()))
+    }
+
+    /// The importance of the last notification, for scripts and tests.
+    pub fn last_notification_level(&self) -> Option<NotificationLevel> {
+        self.balloon.as_ref().map(|balloon| balloon.level)
     }
 
     /// How many notifications the window has shown, for a test that tells a new one

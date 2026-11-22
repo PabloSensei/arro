@@ -45,7 +45,7 @@ pub(crate) fn import(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
             Err(error) => {
                 workspace
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user(
+                        workspace.notify_error(
                             "Cannot read the colour scheme",
                             format!("{}: {error}", scheme.display()),
                             cx,
@@ -60,7 +60,7 @@ pub(crate) fn import(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
             Err(error) => {
                 workspace
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user(
+                        workspace.notify_error(
                             "Cannot import the colour scheme",
                             error.to_string(),
                             cx,
@@ -96,7 +96,7 @@ pub(crate) fn import(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
                         cx,
                     );
                 }
-                Err(error) => workspace.notify_user(
+                Err(error) => workspace.notify_error(
                     "Cannot write the theme",
                     format!("{}: {error}", folder.display()),
                     cx,

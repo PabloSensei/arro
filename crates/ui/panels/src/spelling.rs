@@ -205,7 +205,7 @@ pub(crate) fn save_word(word: &str, project: bool, cx: &mut Context<Workspace>) 
     let spelled = state.clone();
     cx.spawn(async move |workspace, cx| {
         let result = write.await;
-        let text = match result {
+        let (text, failed) = match result {
             Ok(()) => {
                 spelled.speller.add_word(&word);
                 workspace
@@ -214,13 +214,17 @@ pub(crate) fn save_word(word: &str, project: bool, cx: &mut Context<Workspace>) 
                         cx.notify();
                     })
                     .ok();
-                format!("'{word}' is saved to the dictionary")
+                (format!("'{word}' is saved to the dictionary"), false)
             }
-            Err(error) => format!("The dictionary is not saved: {error}"),
+            Err(error) => (format!("The dictionary is not saved: {error}"), true),
         };
         workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user("Spelling", text.clone(), cx);
+                if failed {
+                    workspace.notify_error("Spelling", text.clone(), cx);
+                } else {
+                    workspace.notify_user("Spelling", text.clone(), cx);
+                }
             })
             .ok();
     })

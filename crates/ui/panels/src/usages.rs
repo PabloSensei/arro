@@ -683,7 +683,7 @@ impl UsagesHub {
         if let Err(error) = outcome {
             self.workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("Find in Files", error.to_string(), cx)
+                    workspace.notify_error("Find in Files", error.to_string(), cx)
                 })
                 .ok();
         }
@@ -1307,11 +1307,17 @@ impl UsagesHub {
                         || display_path(&item.path),
                         |name| name.to_string_lossy().into_owned(),
                     );
+                    // The path follows the name in grey, and the count ends it, as IDEA
+                    // shows the file of a usage.
+                    let hint = match self.package_of(&item.path, cx) {
+                        Some(path) => format!("{path} ({count})"),
+                        None => format!("({count})"),
+                    };
                     panel_rows.push(PanelRow::Group {
-                        label: format!("{name}  ({count})"),
+                        label: name,
                         depth: keys.len(),
                         icon: icons.icon_for(&item.path),
-                        hint: self.package_of(&item.path, cx),
+                        hint: Some(hint),
                     });
                     previous_file = Some(item.path.clone());
                 }

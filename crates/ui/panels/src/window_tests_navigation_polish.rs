@@ -264,6 +264,9 @@ fn the_switcher_lists_the_tool_windows(cx: &mut TestAppContext) {
 
     press(cx, window, "ctrl-tab");
     draw(cx, window);
+    // The tool windows are the left column of the Switcher: Left moves the selection there,
+    // and Tab walks down that column to Commit.
+    press(cx, window, "left");
     let rows = palette(cx, window).read_with(cx, |palette, _| palette.rows_text());
     let commit = rows
         .iter()
@@ -271,7 +274,7 @@ fn the_switcher_lists_the_tool_windows(cx: &mut TestAppContext) {
         .expect("the tool windows are in the list");
     let selected = palette(cx, window).read_with(cx, |palette, _| palette.selected_row());
     for _ in selected..commit {
-        press(cx, window, "ctrl-tab");
+        press(cx, window, "tab");
     }
     release_ctrl(cx, window);
     assert!(
